@@ -42,7 +42,7 @@ use snafu::prelude::*;
 use tokio_stream::adapters::Peekable;
 use tonic::{Request, Response, Status, Streaming};
 
-use super::{DecodableSchema, prepared_statement_handle};
+use super::{DecodableSchema, prepared_statement_handle, within_decompression_bound};
 use crate::{
     datafusion::{
         query::{run_transaction, schema_statement, transaction_statements},
@@ -471,6 +471,7 @@ pub(crate) async fn do_put_query(
         move |flight_data| {
             flight_data
                 .map_err(|status| FlightError::Tonic(Box::new(status)))
+                .and_then(within_decompression_bound)
                 .map(|message| decodable.repair(message))
         }
     });
