@@ -36,6 +36,7 @@ use model_capabilities::{Capability, DecisionsBackend, MessagesBackend, ModelCap
 use runtime_auth::{HttpAuth, api_key::ApiKeyAuth, layer::http::AuthLayer};
 use runtime_search::search_engine::{SearchEngine, parse_explicit_primary_keys};
 use serde_json::{Value, json};
+use spicepod::component::embeddings::Embeddings;
 use spicepod::component::model::Model;
 use spicepod::component::runtime::{ApiKey, CorsConfig};
 use spicepod::component::worker::Worker;
@@ -147,19 +148,57 @@ async fn responses(State(seen): State<Seen>, Json(body): Json<Value>) -> Json<Va
     }))
 }
 
-/// `OpenAI`'s Decisions API: every predicate holds with probability 0.9.
+/// `OpenAI`'s Decisions API: every predicate holds with probability 0.9, and every choice
+/// and score question is answered with its first option or level.
 async fn decisions(State(seen): State<Seen>, Json(body): Json<Value>) -> Json<Value> {
     let model = record(&seen, "/v1/decisions", &body);
     let answers: Vec<Value> = body["questions"]
         .as_array()
         .into_iter()
         .flatten()
-        .map(|question| json!({"type": "predicate", "name": question["name"], "probability": 0.9}))
+        .map(|question| match question["type"].as_str() {
+            Some("choice") => {
+                let probabilities: Vec<Value> = question["choices"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .map(|(i, option)| json!({"value": option["value"], "probability": if i == 0 { 1.0 } else { 0.0 }}))
+                    .collect();
+                json!({"type": "choice", "name": question["name"], "choice": question["choices"][0]["value"], "probabilities": probabilities, "confidence": 1.0})
+            }
+            Some("score") => {
+                let probabilities: Vec<Value> = question["levels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .map(|(i, level)| json!({"value": i, "label": level["label"], "probability": if i == 0 { 1.0 } else { 0.0 }}))
+                    .collect();
+                json!({"type": "score", "name": question["name"], "score": 0.0, "probabilities": probabilities, "confidence": 1.0})
+            }
+            _ => json!({"type": "predicate", "name": question["name"], "probability": 0.9}),
+        })
         .collect();
     Json(json!({
         "model": model,
         "answers": answers,
         "usage": {"input_tokens": 1, "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}, "output_tokens": 0, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 1}
+    }))
+}
+
+/// `OpenAI` embeddings: every input is embedded as `[0.25, 0.5, 0.75]`.
+async fn embeddings(State(seen): State<Seen>, Json(body): Json<Value>) -> Json<Value> {
+    let model = record(&seen, "/v1/embeddings", &body);
+    let count = body["input"].as_array().map_or(1, Vec::len);
+    let data: Vec<Value> = (0..count)
+        .map(|index| json!({"object": "embedding", "index": index, "embedding": [0.25, 0.5, 0.75]}))
+        .collect();
+    Json(json!({
+        "object": "list",
+        "data": data,
+        "model": model,
+        "usage": {"prompt_tokens": 1, "total_tokens": 1}
     }))
 }
 
@@ -193,6 +232,7 @@ async fn start_provider(seen: &Seen) -> String {
         .route("/v1/chat/completions", post(chat))
         .route("/v1/responses", post(responses))
         .route("/v1/decisions", post(decisions))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/systemone", post(systemone))
         .route("/v1/models", get(typesafe_models))
         .route("/v1/models/{id}", get(openai_model))
@@ -352,7 +392,7 @@ async fn luna_serves_chat_and_native_decisions() {
 
 /// SQL model functions call a model, so a read-only API key cannot run them; a read-write
 /// key can.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn model_functions_need_a_read_write_api_key() {
     const READ_ONLY_KEY: &str = "read-only-test-key";
     const READ_WRITE_KEY: &str = "read-write-test-key";
@@ -360,12 +400,22 @@ async fn model_functions_need_a_read_write_api_key() {
 
     let seen = Seen::default();
     let endpoint = start_provider(&seen).await;
-    let (rt, _) = runtime_with(vec![model(
-        "luna",
-        "openai:gpt-6-luna-2026-10-01",
-        &endpoint,
-    )])
-    .await;
+    let mut embedding = Embeddings::new("openai:text-embedding-3-small", "vectors");
+    for (key, value) in [
+        ("endpoint", format!("{endpoint}/v1")),
+        ("openai_api_key", "test-key".to_string()),
+    ] {
+        embedding
+            .params
+            .insert(key.to_string(), Value::String(value));
+    }
+    let app = AppBuilder::new("model_function_access")
+        .with_model(model("luna", "openai:gpt-6-luna-2026-10-01", &endpoint))
+        .with_embedding(embedding)
+        .build();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    Arc::clone(&rt).load_models().await;
+    rt.load_embeddings().await;
     let search = Arc::new(SearchEngine::new(
         Arc::clone(&rt.df) as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
         parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
@@ -405,30 +455,33 @@ async fn model_functions_need_a_read_write_api_key() {
         }
     };
 
-    // (SQL, the text a read-write answer contains when the mock provider serves it)
+    // (SQL, the read-write answer)
     let calls = [
-        ("SELECT ai('ping', 'luna')", Some("pong")),
+        ("SELECT ai('ping', 'luna') AS answer", json!("pong")),
         (
-            "SELECT ai_if('The screen arrived broken.', 'Is the item damaged?', model => 'luna')",
-            Some("true"),
+            "SELECT ai_if('The screen arrived broken.', 'Is the item damaged?', model => 'luna') AS answer",
+            json!(true),
         ),
         (
-            "SELECT ai_probability('The screen arrived broken.', 'Is the item damaged?', model => 'luna')",
-            None,
+            "SELECT ai_probability('The screen arrived broken.', 'Is the item damaged?', model => 'luna') AS answer",
+            json!(0.9),
         ),
         (
-            "SELECT ai_classify('The screen arrived broken.', ['damaged', 'fine'], model => 'luna')",
-            None,
+            "SELECT ai_classify('The screen arrived broken.', ['damaged', 'fine'], model => 'luna') AS answer",
+            json!("damaged"),
         ),
         (
-            "SELECT ai_score('The screen arrived broken.', 'How damaged?', ['none', 'some', 'broken'], model => 'luna')",
-            None,
+            "SELECT ai_score('The screen arrived broken.', 'How damaged?', ['none', 'some', 'broken'], model => 'luna') AS answer",
+            json!(0.0),
         ),
         (
-            r#"SELECT ai_decide('The screen arrived broken.', '{"damaged": {"type": "noul", "instructions": "Is the item damaged?"}}', model => 'luna')"#,
-            None,
+            r#"SELECT ai_decide('The screen arrived broken.', '{"damaged": {"type": "noul", "instructions": "Is the item damaged?"}}', model => 'luna') AS answer"#,
+            json!({"damaged": {"probability": 0.9}}),
         ),
-        ("SELECT embed('ping', 'luna')", None),
+        (
+            "SELECT embed('ping', 'vectors') AS answer",
+            json!([0.25, 0.5, 0.75]),
+        ),
     ];
     for (sql, answer) in calls {
         let (status, body) = post_sql_as(READ_ONLY_KEY, sql).await;
@@ -438,16 +491,16 @@ async fn model_functions_need_a_read_write_api_key() {
         );
 
         let (status, body) = post_sql_as(READ_WRITE_KEY, sql).await;
-        assert!(
-            !body.contains(REFUSAL),
-            "{sql} with a read-write key: {status} {body}"
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{sql} with a read-write key: {body}"
         );
-        if let Some(answer) = answer {
-            assert!(
-                status.is_success() && body.contains(answer),
-                "{sql} with a read-write key: {status} {body}"
-            );
-        }
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("query result"),
+            json!([{"answer": answer}]),
+            "{sql} with a read-write key"
+        );
     }
 }
 
