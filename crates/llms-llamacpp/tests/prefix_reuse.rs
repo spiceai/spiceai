@@ -48,6 +48,16 @@ const GEMMA_FILE: &str = "gemma-3-270m-it-Q8_0.gguf";
 /// The positions Gemma 3 270M's sliding-window layers attend over.
 const SLIDING_WINDOW: usize = 512;
 
+/// `lines` numbered lines of filler, a long prompt's bulk.
+fn notes(lines: usize) -> String {
+    use std::fmt::Write;
+    let mut notes = String::new();
+    for i in 1..=lines {
+        let _ = write!(notes, "Line {i} of the notes says nothing that matters. ");
+    }
+    notes
+}
+
 async fn gemma_gguf() -> std::path::PathBuf {
     llms::chat::hf_files::download_model(
         "unsloth/gemma-3-270m-it-GGUF:c90975dbd40c0c7b275fefaae758c3415c906238",
@@ -240,10 +250,7 @@ async fn a_sliding_window_cache_reuses_the_shared_prompt() {
 #[tokio::test]
 async fn a_sliding_window_cache_reuses_past_its_window() {
     let gguf = gemma_gguf().await;
-    let preamble: String = (1..=200)
-        .map(|i| format!("Line {i} of the notes says nothing that matters. "))
-        .collect::<String>()
-        + "\n\n";
+    let preamble = notes(200) + "\n\n";
     let (prompts, reused) =
         held_and_fresh_replies_agree(&gguf, "gemma-3-270m-past-window", &preamble).await;
     eprintln!("prompts {prompts:?}, reused {reused:?}");
@@ -270,11 +277,6 @@ async fn a_sliding_window_cache_reuses_past_its_window() {
 async fn a_sliding_window_cache_is_cut_back_more_than_a_window() {
     let gguf = gemma_gguf().await;
     let name = "gemma-3-270m-cut-back";
-    let notes = |lines: usize| -> String {
-        (1..=lines)
-            .map(|i| format!("Line {i} of the notes says nothing that matters. "))
-            .collect()
-    };
     let long = vec![json!({
         "role": "user",
         "content": format!("{}\n\nName three colors of the rainbow, separated by commas.", notes(200)),
