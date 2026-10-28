@@ -1101,7 +1101,7 @@ impl CayenneDeletionSink {
                         table_name,
                     )?;
                     return self
-                        .prepare_staged_pk_deletions(staged)
+                        .prepare_staged_pk_deletions(staged, None)
                         .map(|prepared| Some(prepared.with_sentinel_count()));
                 }
                 Some(ExtractedPkDeletes::RowKeys(row_keys)) => {
@@ -1124,7 +1124,7 @@ impl CayenneDeletionSink {
                         table_name,
                     )?;
                     return self
-                        .prepare_staged_pk_deletions(staged)
+                        .prepare_staged_pk_deletions(staged, None)
                         .map(|prepared| Some(prepared.with_sentinel_count()));
                 }
                 None => {}
