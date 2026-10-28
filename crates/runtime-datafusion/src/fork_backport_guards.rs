@@ -549,3 +549,28 @@ async fn a_sort_over_aggregate_output_slices_charges_each_slice_for_its_own_rows
         panic!("row {index} is {got}, expected {want}: groups must sort by their sum, descending");
     }
 }
+
+/// The SQL planner refuses a data type nested more than 64 array or struct
+/// levels deep, and still plans one at the limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cast_to_a_type_nested_past_the_limit_is_refused() {
+    let ctx = spice_session(|_| {});
+    assert_eq!(
+        answer(
+            &ctx,
+            &format!("SELECT CAST(NULL AS INT{}) IS NULL", "[]".repeat(64))
+        )
+        .await,
+        Ok(owned(&["true"]))
+    );
+    let error = answer(
+        &ctx,
+        &format!("SELECT CAST(NULL AS INT{}) IS NULL", "[]".repeat(65)),
+    )
+    .await
+    .expect_err("65 levels exceed the limit");
+    assert!(
+        error.contains("SQL data type nesting depth exceeds the maximum of 64"),
+        "{error}"
+    );
+}
