@@ -2451,18 +2451,17 @@ impl<S> Drop for QueryTrackerStream<S> {
         let Some(tracker) = self.tracker.take() else {
             return;
         };
-        let message = "Query was cancelled before its results were fully read";
+        // The query's task-history row collects only events inside its span,
+        // and a stream can be dropped outside it.
+        let _span = self.inner_span.enter();
         tracker
             .schema(Arc::clone(&self.schema))
             .rows_produced(self.num_records)
             .finish_with_error(
                 &self.request_context,
-                message.to_string(),
+                "Query was cancelled before its results were fully read".to_string(),
                 ErrorCode::QueryExecutionError,
             );
-        if self.capture_task_history {
-            tracing::error!(target: "task_history", parent: &self.inner_span, "{message}");
-        }
     }
 }
 
@@ -6061,8 +6060,11 @@ mod tests {
         #[derive(Clone, Default)]
         struct TaskHistoryErrors(Arc<parking_lot::Mutex<Vec<String>>>);
 
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TaskHistoryErrors {
-            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        impl<S> tracing_subscriber::Layer<S> for TaskHistoryErrors
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
                 struct Message<'a>(&'a mut String);
                 impl tracing::field::Visit for Message<'_> {
                     fn record_debug(
@@ -6080,7 +6082,8 @@ mod tests {
                 {
                     let mut message = String::new();
                     event.record(&mut Message(&mut message));
-                    self.0.lock().push(message);
+                    let span = ctx.event_span(event).map_or("", |span| span.name());
+                    self.0.lock().push(format!("{span}: {message}"));
                 }
             }
         }
@@ -6121,7 +6124,7 @@ mod tests {
 
         assert_eq!(
             *errors.0.lock(),
-            ["Query was cancelled before its results were fully read"]
+            ["sql_query: Query was cancelled before its results were fully read"]
         );
     }
 
