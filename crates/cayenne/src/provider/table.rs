@@ -4039,9 +4039,14 @@ const COLD_MERGE_MIN_RUNS: usize = 4;
 /// Most datalake generations one cold compaction merges.
 const COLD_MERGE_MAX_WIDTH: usize = 16;
 
-/// Geometric growth factor between datalake generation size tiers; tier 0 holds
-/// generations no larger than one cold target file.
+/// Geometric growth factor between datalake generation size tiers.
 const COLD_TIER_GROWTH: u64 = 4;
+
+/// Largest datalake generation in size tier 0. A promotion writes a few MiB at
+/// a time, so tier 0 must sit near that size: sized at the cold target file
+/// (hundreds of MiB), a whole table's datalake stays in tier 0 and every merge
+/// folds the growing base back in, rewriting it on each pass.
+const COLD_TIER_BASE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Bytes of merge input one protected-snapshot pass may select, per byte of the
 /// memory pool it accounts against.
@@ -27904,16 +27909,15 @@ impl CayenneTableProvider {
             .iter()
             .map(|(max_sequence, (bytes, _))| (max_sequence.to_string(), *max_sequence, *bytes))
             .collect();
-        let base_bytes = u64::try_from(vc.cold_target_file_size_mb)
-            .unwrap_or(u64::MAX)
-            .saturating_mul(1024 * 1024);
+        // The same per-pass input budget as a protected-snapshot merge, so a tier
+        // of large generations merges a few at a time.
         let ProtectedMergeSelection::Merge(selected) = select_protected_snapshot_merge_tier(
             &runs,
             COLD_MERGE_MIN_RUNS,
             COLD_MERGE_MAX_WIDTH,
-            base_bytes,
+            COLD_TIER_BASE_BYTES,
             COLD_TIER_GROWTH,
-            None,
+            self.protected_merge_input_budget_bytes(),
             None,
         ) else {
             return Ok(false);
@@ -47775,6 +47779,38 @@ mod tests {
                 oldest_pair_bytes: 8 * gib,
             },
             "the two 1 GiB runs would fit, but the walk is oldest-first by design"
+        );
+    }
+
+    #[test]
+    fn datalake_merge_leaves_the_large_base_generation_alone() {
+        // Measured on the Anise rig: a 300 MiB datalake base and promotion outputs
+        // of about 1.3 MiB. Four promotions merge with each other; the base is
+        // not rewritten to absorb them.
+        let mib = 1024 * 1024;
+        let inputs = vec![
+            sized("base", 300 * mib),
+            sized("p1", 1_300_000),
+            sized("p2", 1_400_000),
+            sized("p3", 2_200_000),
+            sized("p4", 900_000),
+        ];
+        assert_eq!(
+            select_protected_snapshot_merge_tier(
+                &inputs,
+                COLD_MERGE_MIN_RUNS,
+                COLD_MERGE_MAX_WIDTH,
+                COLD_TIER_BASE_BYTES,
+                COLD_TIER_GROWTH,
+                None,
+                None,
+            ),
+            ProtectedMergeSelection::Merge(
+                ["p1", "p2", "p3", "p4"]
+                    .into_iter()
+                    .map(|id| (id.to_string(), 0))
+                    .collect()
+            ),
         );
     }
 
