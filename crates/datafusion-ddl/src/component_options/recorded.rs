@@ -79,9 +79,18 @@ impl<'a> RecordedStatement<'a> {
 /// stopped at, and a connector can repeat a value it could not use.
 #[must_use]
 pub fn redact_values<'m>(message: &'m str, removed: &[String]) -> Cow<'m, str> {
+    // Each value, and each part of it that a source can repeat on its own, as
+    // a database client repeats a connection string's `password=...` without
+    // the rest of it.
     let mut present: Vec<&str> = removed
         .iter()
-        .map(String::as_str)
+        .flat_map(|value| {
+            std::iter::once(value.as_str()).chain(
+                value
+                    .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '?'))
+                    .filter(|part| part.chars().count() >= SHORTEST_BARE_VALUE),
+            )
+        })
         .filter(|value| !value.is_empty() && message.contains(value))
         .collect();
     if present.is_empty() {
@@ -90,6 +99,7 @@ pub fn redact_values<'m>(message: &'m str, removed: &[String]) -> Cow<'m, str> {
     // The longest first, so a quoted value goes whole rather than leaving its
     // quotes behind.
     present.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    present.dedup();
     let mut message = message.to_string();
     for value in present {
         message = message.replace(value, REDACTED);

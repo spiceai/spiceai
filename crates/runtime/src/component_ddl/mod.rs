@@ -228,14 +228,15 @@ impl ComponentDdlHandler for RuntimeComponentDdl {
                         "`{statement}` finished after its client disconnected: {message}"
                     ),
                     Err(e) => {
-                        tracing::warn!(
-                            "`{statement}` failed after its client disconnected, so it was not applied. Cause: {e}"
-                        );
-                        // Any API key reads task history: the cause is recorded
+                        // Any API key reads task history, and a log is no place
+                        // for a credential either: the cause is recorded
                         // without the values of the statement it may repeat.
                         let cause = e.to_string();
                         let cause =
                             datafusion_ddl::component_options::redact_values(&cause, &values);
+                        tracing::warn!(
+                            "`{statement}` failed after its client disconnected, so it was not applied. Cause: {cause}"
+                        );
                         tracing::error!(
                             target: "task_history",
                             parent: &record,
@@ -778,6 +779,37 @@ impl Runtime {
         known: SqlDefinitions,
     ) -> Result<SqlDefinitions, String> {
         let stored = store.load().await.map_err(|e| e.to_string())?;
+        self.serve_definitions(store, known, stored).await
+    }
+
+    /// Serve the change another instance made to the definitions a statement
+    /// raced with: the statement's error names it, and `SHOW CREATE` shows it
+    /// from then on. When it cannot be served, the check that runs every 10
+    /// seconds serves it. The caller holds `apply_app_lock`.
+    async fn serve_change_by_another(
+        self: &Arc<Self>,
+        store: &DefinitionsStore,
+        known: SqlDefinitions,
+        stored: SqlDefinitions,
+    ) {
+        if let Err(cause) = self.serve_definitions(store, known, stored).await {
+            tracing::warn!(
+                "Failed to apply a change another instance made to the datasets and catalogs defined with SQL in {}, so this instance keeps serving its earlier definitions and retries every {} seconds. Cause: {cause}",
+                store.location(),
+                SQL_DEFINITIONS_CHECK_INTERVAL.as_secs()
+            );
+        }
+    }
+
+    /// Serve `stored`, the definitions `store` holds, when they differ from
+    /// `known`, the ones this instance serves. The caller holds
+    /// `apply_app_lock`. Returns the definitions now served.
+    async fn serve_definitions(
+        self: &Arc<Self>,
+        store: &DefinitionsStore,
+        known: SqlDefinitions,
+        stored: SqlDefinitions,
+    ) -> Result<SqlDefinitions, String> {
         if stored == known {
             return Ok(known);
         }
@@ -925,15 +957,20 @@ impl Runtime {
                 let unread = self.sql_components.unread.lock().clone();
                 let (location, cause) =
                     unread.unwrap_or_else(|| (store.location().to_string(), "unknown".to_string()));
-                return Err(not_applied(&format!(
-                    "the datasets and catalogs defined with SQL could not be read from '{location}'. Cause: {cause}"
-                )));
+                return Err(not_applied(&unreadable(&location, &cause)));
             };
             // Another instance that shares the state location may have changed
             // the definitions since this one read them: the statement is
             // planned against what is stored, served first.
+            let stored = store.load().await.map_err(|e| {
+                if e.is_unreadable() {
+                    not_applied(&unreadable(e.location(), &e.cause()))
+                } else {
+                    not_applied(&e)
+                }
+            })?;
             let defined = self
-                .serve_stored_definitions(&store, known)
+                .serve_definitions(&store, known, stored)
                 .await
                 .map_err(|cause| not_applied(&cause))?;
             let served = self
@@ -994,6 +1031,7 @@ impl Runtime {
                 let stored = store.load().await.map_err(|e| not_applied(&e))?;
                 if stored != defined {
                     if plan::changes_component(&op, &defined, &stored) {
+                        self.serve_change_by_another(&store, defined, stored).await;
                         return Err(not_applied(&changed_by_another(&op)));
                     }
                     if attempt < CONFLICT_ATTEMPTS {
@@ -1030,6 +1068,7 @@ impl Runtime {
                         && let Ok(stored) = store.load().await
                     {
                         if plan::changes_component(&op, &defined, &stored) {
+                            self.serve_change_by_another(&store, defined, stored).await;
                             cause = changed_by_another(&op);
                         } else if attempt < CONFLICT_ATTEMPTS {
                             continue;
@@ -1359,6 +1398,15 @@ impl Runtime {
             ),
         }
     }
+}
+
+/// Why a statement is refused while the definitions at `location` cannot be
+/// read.
+fn unreadable(location: &str, cause: &str) -> String {
+    format!(
+        "the datasets and catalogs defined with SQL could not be read from '{location}'; Spice retries every {} seconds, so run the statement again once they are read. Cause: {cause}",
+        SQL_DEFINITIONS_CHECK_INTERVAL.as_secs()
+    )
 }
 
 /// Why a statement was not applied when another instance changed its own

@@ -1039,6 +1039,21 @@ fn values_taken_out_of_the_text_are_taken_out_of_its_error() {
         Cow::Borrowed(_)
     ));
 
+    // Each part of a value that a source repeats on its own: a database client
+    // quotes a connection string without its scheme.
+    let recorded = recorded_statement(
+        "CREATE CATALOG c WITH (from = 'ducklake:meta', ducklake_connection_string = 'postgres:dbname=x host=db port=5432 user=u password=hunter2')",
+        &dialect,
+        &shown,
+    );
+    assert_eq!(
+        redact_values(
+            r#"Unable to connect to Postgres at "dbname=x host=db port=5432 user=u password=hunter2": connection refused"#,
+            &recorded.removed
+        ),
+        r#"Unable to connect to Postgres at "dbname=x <redacted> <redacted> <redacted> <redacted>": connection refused"#
+    );
+
     // Each value in a parameters map that is not a map, which the definition's
     // reader quotes when it cannot read the map.
     let recorded = recorded_statement(

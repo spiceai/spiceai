@@ -154,12 +154,22 @@ fn recorded_input(arg: &str) -> (Cow<'_, str>, Vec<String>) {
         recorded_unparsed_statement(&query, &dialect, &|_| false)
     };
     match recorded.text {
-        Cow::Borrowed(_) => (Cow::Borrowed(arg), Vec::new()),
+        // Fields beside the query run nothing, and are not recorded.
+        Cow::Borrowed(_) if has_only_query(arg) => (Cow::Borrowed(arg), Vec::new()),
+        Cow::Borrowed(text) => (
+            Cow::Owned(serde_json::json!({ "query": text }).to_string()),
+            Vec::new(),
+        ),
         Cow::Owned(text) => (
             Cow::Owned(serde_json::json!({ "query": text }).to_string()),
             recorded.removed,
         ),
     }
+}
+
+/// Whether `arg`, the tool's JSON, holds the query and nothing else.
+fn has_only_query(arg: &str) -> bool {
+    serde_json::from_str::<serde_json::Map<String, Value>>(arg).is_ok_and(|map| map.len() == 1)
 }
 
 #[cfg(test)]
@@ -201,6 +211,12 @@ mod tests {
         ] {
             assert!(matches!(recorded_input(arg).0, Cow::Borrowed(text) if text == arg));
         }
+
+        // Fields beside the query run nothing, and are left out.
+        assert_eq!(
+            recorded_input(r#"{"query": "SELECT 1", "pg_pass": "hunter2"}"#).0,
+            r#"{"query":"SELECT 1"}"#
+        );
     }
 
     /// Arguments that are not the tool's JSON run nothing, and are recorded

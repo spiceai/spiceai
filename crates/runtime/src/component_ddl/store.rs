@@ -112,6 +112,11 @@ impl Error {
         }
     }
 
+    /// Whether the definitions could not be read.
+    pub fn is_unreadable(&self) -> bool {
+        matches!(self, Self::Read { .. })
+    }
+
     /// What failed, without the layers that passed it on.
     pub fn cause(&self) -> String {
         match self {
