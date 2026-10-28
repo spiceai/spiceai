@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `3a75c403e4db3bc2f76f0d8c2cfce610f52f3675` | `spiceai-55` |
+| [datafusion](#datafusion) | `bd3d95cc17680cccf976a0c442dc389122752b20` | `lukim/eager-agg-ungrouped-count-zero-on-3a75c40` (TEMPORARY: spiceai/datafusion#276) |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `4a2920746865562e604150fbee49eea6241c0b85` | `spiceai-55` |
@@ -219,7 +219,10 @@ sort shares with its producer for the slice's own rows, #261, which keeps a unio
 `ORDER BY` and `LIMIT` inside that input, #262, which keeps a cast that drops decimal digits out
 of `unwrap_cast`, the unparser fixes #246, #247 and #264, and #268, which narrows #266's copy to
 batches whose rows are slices of larger buffers, and #273, upstream apache/datafusion#23232
-cherry-picked from `main`; the pin is #273's merge commit. None changes a
+cherry-picked from `main`. The pin is temporarily #273's merge commit plus the two commits of
+[spiceai/datafusion#276](https://github.com/spiceai/datafusion/pull/276), which keep an ungrouped
+`COUNT` at 0 when eager aggregation sees no join rows; it moves to #276's merge commit on `spiceai-55`
+once that merges. None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
 code, and removes no line of it. The branch also carries
