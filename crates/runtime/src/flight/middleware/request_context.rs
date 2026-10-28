@@ -232,7 +232,7 @@ mod tests {
                 let user_agent_collected = context
                     .to_dimensions()
                     .iter()
-                    .any(|dimension| dimension.key.as_str() == "user_agent");
+                    .any(|dimension| dimension.key.as_str() == "client");
 
                 observed
                     .lock()

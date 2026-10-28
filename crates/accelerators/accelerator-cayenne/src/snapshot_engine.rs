@@ -53,12 +53,13 @@ limitations under the License.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use cayenne::MetadataCatalog;
 use cayenne::metastore::EXPECTED_TABLES;
 use cayenne::metastore::snapshot::{DatasetMetastoreSlice, SliceValue};
+use datafusion::datasource::TableProvider;
 use runtime_acceleration::snapshot::engine::{
     DirectoryArchiveExtra, DirectoryArchiveFile, DirectorySnapshotPlan, SnapshotEngine,
     SnapshotEngineError,
@@ -469,6 +470,22 @@ fn is_file_name(value: &str) -> bool {
         && components.next().is_none()
 }
 
+/// The provider serving each dataset's restored snapshot, by dataset name. Held
+/// weakly so a replaced provider is not kept alive.
+#[derive(Default)]
+pub(crate) struct ServingProviders(parking_lot::Mutex<HashMap<String, Weak<dyn TableProvider>>>);
+
+impl ServingProviders {
+    /// Record `provider` as the one serving `dataset`'s restored snapshot.
+    pub(crate) fn record(&self, dataset: String, provider: &Arc<dyn TableProvider>) {
+        self.0.lock().insert(dataset, Arc::downgrade(provider));
+    }
+
+    fn get(&self, dataset: &str) -> Option<Arc<dyn TableProvider>> {
+        self.0.lock().get(dataset).and_then(Weak::upgrade)
+    }
+}
+
 /// Snapshot engine for Cayenne accelerators.
 ///
 /// Holds an [`Arc<dyn MetadataCatalog>`] so it can call
@@ -484,6 +501,8 @@ pub struct CayenneSnapshotEngine {
     /// the absolute paths stored in the metastore as a strict prefix; the
     /// import-side anchor is where the new paths will be re-rooted.
     data_dir_anchor: PathBuf,
+    /// The providers a restore quiesces before extracting.
+    serving: Arc<ServingProviders>,
 }
 
 impl CayenneSnapshotEngine {
@@ -496,7 +515,15 @@ impl CayenneSnapshotEngine {
             catalog,
             dataset_name: dataset_name.into(),
             data_dir_anchor,
+            serving: Arc::default(),
         }
+    }
+
+    /// Quiesce the provider `serving` records for this dataset before a restore.
+    #[must_use]
+    pub(crate) fn with_serving_providers(mut self, serving: Arc<ServingProviders>) -> Self {
+        self.serving = serving;
+        self
     }
 
     /// Returns the dataset name this engine snapshots.
@@ -611,6 +638,27 @@ impl SnapshotEngine for CayenneSnapshotEngine {
             extra_entries: extras,
             optional_files,
         })
+    }
+
+    /// Quiesce the serving instance. It may have retired the directory of the
+    /// snapshot being restored (a partial extraction left by a restart), and its
+    /// sweep would delete files extraction keeps or writes there. It keeps
+    /// serving queries until the reload swaps it out.
+    async fn prepare_directory_restore(
+        &self,
+        _dirs: &[(PathBuf, String)],
+        dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError> {
+        if dataset_name != self.dataset_name {
+            return Err(SnapshotEngineError::from_display(format!(
+                "CayenneSnapshotEngine constructed for dataset '{}' but asked to restore '{}'",
+                self.dataset_name, dataset_name
+            )));
+        }
+        if let Some(provider) = self.serving.get(dataset_name) {
+            crate::change_sink::quiesce_table_maintenance(&provider).await;
+        }
+        Ok(())
     }
 
     async fn finalize_directory_snapshot(
