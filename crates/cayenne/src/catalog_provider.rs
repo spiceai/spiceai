@@ -320,8 +320,19 @@ impl CayenneCatalogProvider {
 
         // Initialize SQLite catalog
         let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
-        let catalog = Arc::new(CayenneCatalog::new(connection_string).context(CatalogInitSnafu)?)
-            as Arc<dyn MetadataCatalog>;
+        let catalog = CayenneCatalog::new(connection_string).context(CatalogInitSnafu)?;
+        // Prototype instrumentation, compiled in only with `--cfg cayenne_metastore_tap`:
+        // record every committed metastore transaction as object-native metastore actions.
+        #[cfg(cayenne_metastore_tap)]
+        let catalog = {
+            let path = format!("{metadata_dir}/metastore-tap.jsonl");
+            let tap = crate::metastore_tap::MetastoreTap::new(Some(path.clone().into()), false)
+                .map_err(|e| Error::InvalidConfiguration {
+                    message: format!("Failed to create the metastore tap at '{path}': {e}"),
+                })?;
+            catalog.with_tap(Arc::new(tap))
+        };
+        let catalog = Arc::new(catalog) as Arc<dyn MetadataCatalog>;
 
         catalog.init().await.context(CatalogInitSnafu)?;
 

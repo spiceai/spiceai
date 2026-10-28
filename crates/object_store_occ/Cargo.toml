@@ -13,6 +13,7 @@ blake3.workspace = true
 futures.workspace = true
 object_store.workspace = true
 parking_lot.workspace = true
+prost = { workspace = true, features = ["derive"] }
 rand.workspace = true
 rayon.workspace = true
 serde.workspace = true

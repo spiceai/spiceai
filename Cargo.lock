@@ -14212,6 +14212,7 @@ dependencies = [
  "futures",
  "object_store 0.13.2",
  "parking_lot",
+ "prost 0.14.3",
  "rand 0.10.1",
  "rayon",
  "serde",

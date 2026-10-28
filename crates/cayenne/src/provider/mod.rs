@@ -108,6 +108,8 @@ pub(crate) mod overwrite_postpass;
 pub mod partitioned_wal;
 pub(crate) mod pk_deletion_mode;
 pub(crate) mod pk_index;
+#[cfg(test)]
+mod seq_shift_bench;
 pub(crate) mod pk_keyset_budget;
 pub(crate) mod pk_validation;
 pub(crate) mod predicate_stats;
