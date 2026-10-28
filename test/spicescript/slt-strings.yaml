@@ -1,6 +1,3 @@
-# Known failing (#15538): Over federated MySQL, char_length() returns byte counts: Spice rewrites it
-# to MySQL's LENGTH(), which counts bytes.
-# Move this script to test/spicescript/ once it passes.
 name: slt-strings
 description: >
   String functions over non-ASCII text answer as recorded through Spice, over
@@ -27,6 +24,6 @@ spicepod:
       params: ${sources.src.params}
 
 steps:
-  - slt-setup: { file: ../../slt/strings.slt, source: src }
+  - slt-setup: { file: slt/strings.slt, source: src }
   - start: {}
-  - slt: { file: ../../slt/strings.slt, source: src }
+  - slt: { file: slt/strings.slt, source: src }
