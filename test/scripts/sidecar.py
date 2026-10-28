@@ -398,6 +398,14 @@ def main():
         else None,
         "platform": platform.platform(),
         "machine": platform.machine(),
+        "host_logical_cpus": os.cpu_count(),
+        "cpu_model": subprocess.check_output(
+            ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"], text=True
+        ).strip()
+        if platform.system() == "Darwin"
+        else platform.processor(),
+        "host_memory_bytes": os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"),
+        "load_average_at_start": os.getloadavg(),
         "cpu_entitlement_per_instance": 2,
         "topology": "standalone"
         if args.executors == 0
