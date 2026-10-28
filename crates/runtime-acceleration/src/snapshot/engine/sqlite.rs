@@ -1303,18 +1303,12 @@ mod tests {
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
             .expect("checkpoint");
         drop(checkpoint);
-        let before: Vec<_> = std::fs::read_dir(tmp.path())
-            .expect("list")
-            .map(|entry| entry.expect("entry").file_name())
-            .collect();
+        let before = std::fs::read_dir(tmp.path()).expect("list").count();
         engine
             .verify_downloaded_file(&database, "orders")
             .await
             .expect("a database passes the check");
-        let after: Vec<_> = std::fs::read_dir(tmp.path())
-            .expect("list")
-            .map(|entry| entry.expect("entry").file_name())
-            .collect();
-        assert_eq!(before.len(), after.len(), "the check must not create files");
+        let after = std::fs::read_dir(tmp.path()).expect("list").count();
+        assert_eq!(before, after, "the check must not create files");
     }
 }

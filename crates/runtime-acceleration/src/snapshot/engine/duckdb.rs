@@ -347,10 +347,10 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("'orders'"), "{err}");
-        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+        let entries = std::fs::read_dir(tmp.path())
             .expect("list the directory")
-            .collect();
-        assert_eq!(entries.len(), 1, "the check must not create files");
+            .count();
+        assert_eq!(entries, 1, "the check must not create files");
     }
 
     /// A real database passes the check unchanged.
