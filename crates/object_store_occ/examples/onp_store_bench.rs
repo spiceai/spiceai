@@ -29,7 +29,13 @@ limitations under the License.
 //! latency wrapper: simulated latency). Sample counts: `ONP_N_SMALL`,
 //! `ONP_N_1M`, `ONP_N_8M`, `ONP_N_64M`.
 
-#![expect(clippy::expect_used, reason = "an experiment binary")]
+#![expect(
+    clippy::expect_used,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "an experiment binary computing percentiles and rates"
+)]
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;

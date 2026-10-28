@@ -307,7 +307,25 @@ impl CayenneCatalog {
                 .map_err(|source| CatalogError::Io { source })?
                 .panicking_on_divergence(),
         ));
-        #[cfg(not(cayenne_metastore_tap_verify))]
+        // Prototype instrumentation, compiled in only with `--cfg cayenne_metastore_tap`:
+        // record every committed transaction as object-native metastore actions,
+        // one JSON line per touched table, under the system temp directory so the
+        // file outlives a harness's per-run working directory.
+        #[cfg(all(cayenne_metastore_tap, not(cayenne_metastore_tap_verify)))]
+        let tap = {
+            let dir = std::env::temp_dir().join("cayenne-metastore-tap");
+            std::fs::create_dir_all(&dir).map_err(|source| CatalogError::Io { source })?;
+            let name: String = connection_string
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            let path = dir.join(format!("{}-{name}.jsonl", std::process::id()));
+            Some(Arc::new(
+                crate::metastore_tap::MetastoreTap::new(Some(path), false)
+                    .map_err(|source| CatalogError::Io { source })?,
+            ))
+        };
+        #[cfg(not(any(cayenne_metastore_tap, cayenne_metastore_tap_verify)))]
         let tap = None;
         Ok(Self {
             connection_string,

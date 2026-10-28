@@ -27,7 +27,13 @@ limitations under the License.
 //! Store: `local-durable:<dir>` or `rustfs`. Arm: `<uploaders>x<size_kib>`,
 //! e.g. `0x0 4x1024 16x1024 4x65536`.
 
-#![expect(clippy::expect_used, reason = "an experiment binary")]
+#![expect(
+    clippy::expect_used,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "an experiment binary computing percentiles and rates"
+)]
 
 use std::fmt::Write as _;
 use std::sync::Arc;
