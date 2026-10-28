@@ -1527,7 +1527,7 @@ mod tests {
     /// body breaks off after the headers.
     #[tokio::test]
     async fn csv_of_a_nested_column_is_an_error_status_not_a_broken_body() {
-        use arrow::array::ListArray;
+        use arrow::array::{Array, ListArray};
         use arrow::datatypes::Int32Type;
         use datafusion::execution::memory_pool::UnboundedMemoryPool;
 
