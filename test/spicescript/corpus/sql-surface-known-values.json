@@ -1,0 +1,10 @@
+{
+  "6 ^ 3": {
+    "reason": "The documentation calls ^ interchangeable with XOR #, but the PostgreSQL-dialect result is exponentiation: 216 instead of 5.",
+    "observed_head": "814e639e8eb55eacbe3f3fadaad2ec0aaf712c05",
+    "observed_date": "2026-10-27",
+    "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
+    "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
+    "artifact": "target/sql-surface-current-corrected.log"
+  }
+}

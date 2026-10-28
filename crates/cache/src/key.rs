@@ -352,6 +352,34 @@ mod tests {
         assert_eq!(hash1, hash2);
     }
 
+    /// A key is the whole entry identity, so a million point lookups must get a
+    /// million keys under every configured algorithm.
+    #[test]
+    fn distinct_queries_get_distinct_keys() {
+        use spicepod::component::caching::HashingAlgorithm;
+
+        for algorithm in [
+            HashingAlgorithm::Ahash,
+            HashingAlgorithm::Siphash,
+            HashingAlgorithm::Blake3,
+            HashingAlgorithm::XXH3,
+            HashingAlgorithm::XXH32,
+            HashingAlgorithm::XXH64,
+            HashingAlgorithm::XXH128,
+        ] {
+            let builder = crate::get_hash_builder(algorithm).expect("a supported algorithm");
+            let keys: std::collections::HashSet<u64> = (0..1_000_000)
+                .map(|id| {
+                    let sql = format!("SELECT * FROM accounts WHERE id = {id}");
+                    CacheKey::Query(&sql, None)
+                        .as_raw_key_in_namespace(builder.build_hasher(), 0, b"")
+                        .as_u64()
+                })
+                .collect();
+            assert_eq!(keys.len(), 1_000_000, "{algorithm:?}");
+        }
+    }
+
     /// A plan's key is the value of hashing that plan write by write, for every
     /// configured algorithm — including `ahash`, which folds integer writes.
     #[test]

@@ -447,10 +447,7 @@ pub async fn apply_function_diff(
     new_app: &Arc<app::App>,
 ) {
     if apply_function_diff_inner(runtime, current_app, new_app).await {
-        runtime.df.clear_cached_plans().await;
-        if let Some(results) = runtime.df.results_cache_provider() {
-            results.invalidate_all().await;
-        }
+        runtime.df.clear_cached_plans_and_results().await;
     }
 }
 
