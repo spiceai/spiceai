@@ -352,6 +352,14 @@ def main():
     )
     parser.add_argument("--testoperator", type=Path)
     parser.add_argument(
+        "--legacy-spiced",
+        type=Path,
+        help="Older upstream without Spice Substrait extensions",
+    )
+    parser.add_argument(
+        "--legacy-source-commit", help="Source identity of --legacy-spiced"
+    )
+    parser.add_argument(
         "--modes",
         nargs="+",
         choices=["server", "sidecar"],
@@ -374,6 +382,10 @@ def main():
         help="Use a scheduler and this many executors; 0 selects a standalone upstream",
     )
     args = parser.parse_args()
+    if bool(args.legacy_spiced) != bool(args.legacy_source_commit):
+        parser.error(
+            "--legacy-spiced and --legacy-source-commit must be supplied together"
+        )
     if any(concurrency < 2 for concurrency in args.concurrency):
         parser.error("testoperator load requires concurrency >= 2")
     args.out = args.out.resolve()
@@ -391,6 +403,11 @@ def main():
             Path(__file__).with_name("sidecar.py").read_bytes()
         ).hexdigest(),
         "binary_sha256": hashlib.sha256(args.spiced.read_bytes()).hexdigest(),
+        "legacy_binary_sha256": hashlib.sha256(
+            args.legacy_spiced.read_bytes()
+        ).hexdigest()
+        if args.legacy_spiced
+        else None,
         "testoperator_sha256": hashlib.sha256(
             args.testoperator.read_bytes()
         ).hexdigest()
@@ -472,6 +489,85 @@ def main():
         flush=True,
     )
     database, source_path = fixture(args.out, args.rows)
+    if args.legacy_spiced:
+        legacy = Instance(
+            args.legacy_spiced.resolve(),
+            args.out / "legacy-upstream",
+            base_pod(
+                "legacy-upstream",
+                [
+                    {
+                        "from": f"file:{source_path}",
+                        "name": "remote_orders",
+                        "params": {"file_format": "csv"},
+                    }
+                ],
+            ),
+        )
+        observations = []
+        try:
+            legacy.start()
+            for mode in ["server", "sidecar"]:
+                instance = Instance(
+                    args.spiced,
+                    args.out / f"legacy-{mode}",
+                    base_pod(
+                        mode,
+                        [
+                            {
+                                "from": "spice.ai:remote_orders",
+                                "name": "orders",
+                                "params": {
+                                    "spiceai_endpoint": f"http://127.0.0.1:{legacy.flight}"
+                                },
+                            }
+                        ],
+                        mode,
+                    ),
+                )
+                try:
+                    instance.start()
+                    sql = "SELECT id FROM orders WHERE id < 3 ORDER BY id"
+                    try:
+                        rows, _ = instance.query(sql)
+                    except urllib.error.HTTPError as error:
+                        body = error.read().decode()
+                        observations.append(
+                            {
+                                "mode": mode,
+                                "sql": sql,
+                                "status": error.code,
+                                "error": body,
+                            }
+                        )
+                        assert mode == "sidecar" and error.code == 400, observations
+                        assert (
+                            "Upgrade the upstream runtime" in body
+                            and "runtime.mode: server" in body
+                        ), observations
+                    else:
+                        observations.append(
+                            {
+                                "mode": mode,
+                                "sql": sql,
+                                "actual": rows,
+                                "expected": expected(database, sql),
+                            }
+                        )
+                        assert mode == "server" and rows == expected(database, sql), (
+                            observations
+                        )
+                finally:
+                    instance.stop()
+        finally:
+            (args.out / "legacy-results.json").write_text(
+                json.dumps(observations, indent=2)
+            )
+            legacy.stop()
+        print(
+            "legacy upstream: server mode returned exact rows; sidecar returned the upgrade/rollback diagnostic",
+            flush=True,
+        )
     cluster_pod = base_pod(
         "upstream",
         [
