@@ -2106,31 +2106,33 @@ A library change, with no Cayenne or runtime change.
     `data/<generation>/` folder in the destination, with local disk as a
     cache. Cayenne already builds scan URLs for an `s3://` table path
     (`snapshot_dir_url`), so this is mainly placement and the cache.
-  - A read-only instance opens a dataset from the shadow's head and polls it,
-    instead of importing a metastore slice. It registers its reader pins in
+  - A reader opens a dataset from the shadow's head and polls it, instead of
+    importing a metastore slice. Like the shadow, it is reached through the
+    Cayenne builder in tests and the benchmark harness; running replicas from
+    a Spicepod is Milestone 2's replicated ingestion. It registers its reader pins in
     the shadow's head, and the writer's GC, still driven by the SQL
-    metastore, keeps every file those pins protect. Without that, a replica
+    metastore, keeps every file those pins protect. Without that, a reader's
     query whose files GC removed fails: an error, never wrong rows, but a
     failure the step 4 benchmark would show.
-  - Both change user-visible behavior: where files live, and how a replica
-    starts. They are specified in the Enhancement before they ship.
+  - Where files live is user-visible, so it is specified in the Enhancement
+    before it ships.
 - **Why before authority:** readers are the cheaper half to get wrong. A
-  reader bug shows up as a wrong or failed query on a replica while the writer
+  reader bug shows up as a wrong or failed query on the reader while the writer
   and its SQL metastore are untouched, and every reader exercises the cold
   open and the poll.
 - **Exit proof:**
-  - `spiced` with a writer and a read replica on one bucket: `testoperator
-    run bench … --validate` gives the same answers on both;
-  - replica visibility lag at P99 and P99.9 at the chosen staleness bound,
+  - a writer and a reader on one bucket in the benchmark harness give the
+    same answers over the `mutation_model_test` histories and a CH-benCH run;
+  - reader visibility lag at P99 and P99.9 at the chosen staleness bound,
     and head reads per node against the number of datasets in use;
-  - replica start time against today's slice import.
+  - reader open time against today's slice import.
 
 ### Step 5: the object-native metastore as authority for new datasets
 
 - **Change:** an `ObjectCatalog` implements `MetadataCatalog` over the dataset
   state and the head log, and SQL is not written for those datasets. It is
-  chosen by `runtime.experimental_cayenne_metastore: enabled`, once the
-  Enhancement is signed off. It adds what a shadow never needed:
+  chosen by the feature flag the Enhancement defines, once it is signed
+  off. It adds what a shadow never needed:
   - the lease, fencing and failover;
   - resolution of uncertain writes, reported as "commit outcome unknown";
   - commits at acknowledgement points, with group commit;
@@ -2181,9 +2183,10 @@ A library change, with no Cayenne or runtime change.
 
 ### Step 8: remove the SQL metastore
 
-- **Change:** remove the SQLite and Turso metastore backends,
-  `MetastoreBackend` and the `turso` feature, the SQL inline tier, the flag,
-  and `mode`.
+- **Change:** remove the SQLite metastore backend, `MetastoreBackend`, the
+  SQL inline tier, the flag and the surface it made obsolete. The Turso
+  metastore and the `turso` build feature go earlier, with the accelerator
+  deprecation.
 - **Gate:** re-bootstrap, compatibility and recovery have been shown in
   production releases; the local-directory destination covers
   on-prem deployments without object storage; the inline tier's replacement

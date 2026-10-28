@@ -188,7 +188,8 @@ Its GC then roots in the destination instead of the local metastore.
 datalake location keep working. Folding the tier into compaction, and
 retiring its settings, waits for re-bootstrap, compatibility and recovery to
 be shown. Retiring the settings is a user-facing change, so it goes through the
-same Enhancement review as the flag below.
+same Enhancement review as the rest of the
+[user-facing surface](#user-facing-surface-proposal-for-the-enhancement).
 
 **One gap this closes.** The tier's GC has no reader pins, so a query still
 reading cold files when GC sweeps them fails. A Cayenne integration test that
@@ -221,7 +222,7 @@ destination, is the prerequisite for everything else.
 - SQLite and Turso replaced everywhere, by one implementation for object-store
 and local-directory destinations.
 - A replacement instance that recovers from the bucket without a reload.
-- Query replicas that read the same state directly.
+- State any instance can read directly, which Milestone 2's replicas build on.
 - No metastore choice and no metastore knobs.
 
 **Limits it leaves:**
@@ -272,8 +273,8 @@ row correct with neither.
   - *Durable resume.* Source positions commit with the state they cover
     (decision 1.9), so the new holder resumes from the head, not from the old
     holder's disk.
-  - *Shared reads.* Standby replicas already answer queries from committed
-    state.
+  - *Shared reads.* Any instance can already read committed state from the
+    destination, so standbys answer queries from it.
 
   What each source needs on top:
   - *Consume only while holding the lease.* A PostgreSQL replication slot
@@ -406,19 +407,19 @@ One writer per dataset holds a lease; any number of readers.
 
 **What the user sees.** Nothing new to configure. A restarted or replacement
 instance pointed at the same bucket recovers the acceleration without a full
-reload. Query replicas read the same state directly instead of importing
-snapshots.
+reload. Running several instances on one destination (replicas and
+standbys) comes with Milestone 2, also with nothing new to configure.
 
 **What it removes:**
 
-- SQLite and Turso as metastores, and the `turso` feature. Replacing them is the
-goal of this work, but the old storage is removed only after the new path has
+- SQLite and Turso as metastores (the `turso` build feature goes earlier, with
+the accelerator deprecation). Replacing them is the goal of this work, but the old storage is removed only after the new path has
 proven its durability, re-bootstrap and operating behavior.
 - **Running a database inside every instance:** its locking, tuning and
   upkeep, such as busy timeouts, write queueing, checkpointing and vacuum.
-- **Copying acceleration state between instances.** Replicas and replacement
-  instances read the destination directly instead of importing a metastore
-  slice.
+- **Copying acceleration state between instances.** A replacement instance
+  reads the destination directly instead of importing a metastore slice, and
+  so do Milestone 2's replicas.
 - **A metastore round trip on every write.** Writes commit once per
   acknowledgement point.
 - **A separate small-write tier inside the database,** once its replacement is
@@ -648,27 +649,13 @@ depends on a grace period.
 The surface change needs its own Enhancement with PM and UX/DX sign-off before
 it is built. This is the proposal that Enhancement would review.
 
-**Rollout shape.** The replacement is the goal of the work, but the existing
-storage is removed only after the new path is proven. Until then the new path is
-an opt-in experiment, enabled runtime-wide, not a new `acceleration.mode` value.
-`mode` is meant to disappear entirely, so adding a value to it would only grow
-what has to be deprecated. Once the new path is proven it becomes the default,
-and the flag and `mode` both retire.
-
-The flag is `runtime.experimental_cayenne_metastore`, which takes `enabled` or
-`disabled` (the default). The name says what it is: an experiment that changes
-Cayenne's metastore. It is not under `runtime.state`, because that block names
-where the runtime keeps its shared state, and Cayenne's data may later live in
-other locations as well (see
-[multiple data locations](object-native-metastore-technical.md#future-multiple-data-locations)).
-An enum rather than a boolean follows the Spicepod convention against boolean
-settings.
-
-- *Alternatives considered:* `runtime.state.object_native`, which reads as a
-  property of the runtime-state location rather than of Cayenne; a
-  `runtime.params.object_native_metastore` key; a comma-separated
-  `runtime.params.experiments` list; and a new `runtime.experiments` list
-  field.
+**Rollout shape.** The new path is developed behind a feature flag, off by
+default, so nothing changes for users until they opt in. Once the new path is
+proven, it becomes the default, and the flag is removed together with the
+surface it makes obsolete: the metastore backend choice, the separate metadata
+directory and the small-write inlining settings. The flag's name and shape, and
+each deprecation and its timing, are defined and reviewed in the Enhancement,
+not here.
 
 **Location: reuse `runtime.state.location` rather than add
 `runtime.object_store`.** Spicepods already have one root for shared runtime
@@ -687,13 +674,12 @@ configure the same thing.
 ```yaml
 runtime:
   state:
-    location: s3://my-bucket/spice          # existing field; Cayenne uses <location>/cayenne/v1/
-  experimental_cayenne_metastore: enabled   # runtime-wide opt-in during rollout; default disabled
+    location: s3://my-bucket/spice   # existing field; Cayenne uses <location>/cayenne/v1/
 datasets:
   - from: postgres:public.orders
     name: orders
     acceleration:
-      enabled: true                         # no mode value: the runtime-wide experiment decides the path
+      enabled: true
 ```
 
 **Questions for the review:**
@@ -850,7 +836,8 @@ as discrete changes, each shipping on its own, and each with an exit proof:
 2. Cayenne's catalog changes expressed as actions, with the SQL metastore
    still authoritative and a differential check that both agree.
 3. A shadow log written alongside the SQL metastore, on real workloads.
-4. Data files in the destination, and read replicas that open from the shadow.
+4. Data files in the destination, and readers that open from the shadow in
+   tests and the benchmark harness.
 5. The object-native metastore as the authority for new datasets, behind the
    flag.
 6. Existing datasets re-bootstrap from their sources; metastore contents are
