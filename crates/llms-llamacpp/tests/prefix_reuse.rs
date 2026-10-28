@@ -359,6 +359,74 @@ async fn a_caller_reuses_only_its_own_prompts() {
     assert_eq!(again, cold, "bob's repeated reply against an empty cache's");
 }
 
+/// Asks `messages` of `model` as a streamed request: the reply's text joined from its chunks,
+/// and its prompt length from the usage the stream reports.
+async fn ask_streamed(model: &LlamaCpp, name: &str, messages: &[Value]) -> (String, usize) {
+    use futures::StreamExt;
+    let mut stream = model
+        .chat_stream(request(json!({
+            "model": name,
+            "messages": messages,
+            "temperature": 0,
+            "reasoning_effort": "none",
+            "max_tokens": 32,
+            "stream": true,
+        })))
+        .await
+        .expect("a stream");
+    let (mut content, mut usage) = (String::new(), None);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("a chunk");
+        usage = chunk.usage.or(usage);
+        for choice in chunk.choices {
+            content.push_str(choice.delta.content.as_deref().unwrap_or_default());
+        }
+    }
+    let prompt_tokens = usage.expect("usage").prompt_tokens;
+    let prompt_tokens = usize::try_from(prompt_tokens).expect("a prompt length fits");
+    (content, prompt_tokens)
+}
+
+/// A streamed request is scoped to its caller as a whole reply is: `chat_stream` reads the
+/// caller's cache namespace on its own path, so another caller's streamed request reads none
+/// of a conversation's cached turns. Each streamed reply is the one an empty cache gives.
+#[tokio::test]
+async fn a_streamed_request_reuses_only_its_callers_prompts() {
+    let gguf = crate::qwen3_gguf().await;
+    let name = "qwen3-0.6b-per-caller-streamed";
+    let model = load(&gguf, name).await;
+    let first = vec![json!({ "role": "user", "content": USER_TURNS[0] })];
+    let (reply, _) = as_caller("alice", ask_streamed(&model, name, &first)).await;
+    let mut second = first.clone();
+    second.push(json!({ "role": "assistant", "content": reply }));
+    second.push(json!({ "role": "user", "content": USER_TURNS[1] }));
+
+    let (alice, alice_tokens) = as_caller("alice", ask_streamed(&model, name, &second)).await;
+    let alice_reused = model.reused_prompt_tokens();
+    let (bob, bob_tokens) = as_caller("bob", ask_streamed(&model, name, &second)).await;
+    let bob_reused = model.reused_prompt_tokens();
+    eprintln!(
+        "streamed: alice reused {alice_reused} of {alice_tokens}, bob {bob_reused} of {bob_tokens}"
+    );
+
+    assert!(
+        alice_reused > 0 && alice_reused < alice_tokens,
+        "alice's next streamed turn reuses her first: {alice_reused} of {alice_tokens}"
+    );
+    assert_eq!(
+        bob_reused, 0,
+        "bob's streamed request reads nothing alice's requests left"
+    );
+    drop(model);
+    let fresh = load(&gguf, name).await;
+    let (cold, _) = ask(&fresh, name, &second).await;
+    assert_eq!(
+        alice, cold,
+        "alice's streamed reply against an empty cache's"
+    );
+    assert_eq!(bob, cold, "bob's streamed reply against an empty cache's");
+}
+
 /// `n` choices run one after another on the same prompt, so every choice after the first
 /// reuses the whole prompt but its last token, and greedy, all choices are the same reply.
 #[tokio::test]
