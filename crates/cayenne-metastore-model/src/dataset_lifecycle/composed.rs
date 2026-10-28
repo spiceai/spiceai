@@ -472,18 +472,9 @@ impl Model for Protocol {
             }
             Action::Decide(commit) => n.decision = Some(commit),
             Action::Resolve => {
-                let mut ops = s.dataset.data.prepared.clone();
-                if self.has("resolve-seq") && !self.has("no-resolve-seq") {
-                    let mut high = s.dataset.data.high;
-                    for o in &mut ops {
-                        high[o.table] += 1;
-                        o.delete = high[o.table];
-                        high[o.table] += usize::from(o.value.is_some());
-                        o.insert = high[o.table];
-                    }
-                }
+                let ops = &s.dataset.data.prepared;
                 let mut r = if s.decision? {
-                    Self::mutation(&s.dataset, &ops)
+                    Self::mutation(&s.dataset, ops)
                 } else {
                     Local::empty_record(&s.dataset)
                 };
@@ -512,19 +503,6 @@ impl Model for Protocol {
                     n.dataset.buffer.clear();
                     self.accept(&mut n, r)?;
                 } else if let LocalAction::Compact(mask) = a {
-                    if self.has("input-reservation")
-                        && !self.has("no-input-reservation")
-                        && s.dataset.data.files.iter().enumerate().any(|(i, f)| {
-                            mask & (1 << i) != 0
-                                && s.dataset
-                                    .data
-                                    .prepared
-                                    .iter()
-                                    .any(|o| o.table == f.table && o.key == f.key)
-                        })
-                    {
-                        return None;
-                    }
                     let r = self.rewrite(s, mask, false);
                     self.accept(&mut n, r)?;
                     n.rewrites += 1;
@@ -536,19 +514,6 @@ impl Model for Protocol {
                             .iter()
                             .any(|o| o.value.is_none() && self.cutoff(s, o.table) > o.delete);
                 } else if matches!(a, LocalAction::Promote) {
-                    if self.has("input-reservation")
-                        && !self.has("no-input-reservation")
-                        && s.dataset.data.files.iter().any(|f| {
-                            f.cold
-                                && s.dataset
-                                    .data
-                                    .prepared
-                                    .iter()
-                                    .any(|o| o.table == f.table && o.key == f.key)
-                        })
-                    {
-                        return None;
-                    }
                     let r = self.rewrite(s, usize::MAX, true);
                     self.accept(&mut n, r)?;
                     n.promoted = true;

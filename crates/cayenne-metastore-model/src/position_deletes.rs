@@ -54,7 +54,6 @@ pub(crate) struct State {
     planned_rewrite: bool,
     remapped: bool,
     consumed: bool,
-    error: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -120,7 +119,6 @@ impl Model for Protocol {
             planned_rewrite: false,
             remapped: false,
             consumed: false,
-            error: false,
         }]
     }
     fn actions(&self, state: &State, action: &mut Vec<Action>) {
@@ -223,10 +221,6 @@ impl Model for Protocol {
                     };
                     d.target = (r.output.id, position);
                     next.remapped = true;
-                } else if self.has("reject-dropped-target") {
-                    next.error = true;
-                    next.delete = None;
-                    return Some(next);
                 } else if self.has("no-row-identity-mapping") {
                     d.target = (r.output.id, 0);
                     next.remapped = true;
@@ -303,9 +297,6 @@ impl Model for Protocol {
             ),
             Property::sometimes("already deleted target consumed", |_, state: &State| {
                 state.consumed && state.log.iter().any(|r| matches!(r, Record::Delete { .. }))
-            }),
-            Property::sometimes("dropped target reports conflict", |_, state: &State| {
-                state.error
             }),
             Property::sometimes(
                 "compaction remaps winning position delete",

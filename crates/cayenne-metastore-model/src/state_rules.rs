@@ -99,28 +99,22 @@ pub(crate) enum Action {
 }
 impl Protocol {
     fn state_name(&self, s: &State) -> usize {
-        if self.has("design") && !self.has("no-number") {
-            s.step
-        } else {
+        if self.has("no-number") {
             s.high
+        } else {
+            s.step
         }
     }
     fn clear_covered(&self, n: &mut State, cutoff: usize) {
         let files = &n.files;
         n.tombstones.retain(|&(_, d)| {
             d > cutoff
-                || (self.has("design")
-                    && files.iter().any(|f| {
-                        if self.has("no-cold") && f.cold {
-                            return false;
-                        }
-                        f.min_seq <= d
-                            && if self.has("iceberg") {
-                                f.seq < d
-                            } else {
-                                f.applied.is_none_or(|c| c < d)
-                            }
-                    }))
+                || files.iter().any(|f| {
+                    if self.has("no-cold") && f.cold {
+                        return false;
+                    }
+                    f.min_seq <= d && f.applied.is_none_or(|c| c < d)
+                })
         });
     }
     fn identity_actions(&self, s: &State, a: &mut Vec<Action>) {
@@ -147,10 +141,10 @@ impl Protocol {
         }
         // Compare the complete allocated range against the publication base.
         if record.iter().any(|r| {
-            r.3 <= if self.has("design") && !self.has("no-table-scope") {
-                s.table_high[r.0]
-            } else {
+            r.3 <= if self.has("no-table-scope") {
                 s.high
+            } else {
+                s.table_high[r.0]
             }
         }) {
             n.refused = Some(record);
@@ -180,7 +174,7 @@ impl Protocol {
                 .any(|f| f.key == key && !s.tombstones.iter().any(|&(k, d)| k == key && d >= f.seq))
         })
     }
-    fn rewrite(&self, s: &State, n: &mut State, mask: usize, cold: bool) {
+    fn rewrite(s: &State, n: &mut State, mask: usize, cold: bool) {
         for (i, file) in s.files.iter().enumerate() {
             if file.cold == cold && mask & (1 << i) != 0 {
                 n.files.retain(|f| f.id != file.id);
@@ -192,10 +186,6 @@ impl Protocol {
                     let mut output = file.clone();
                     output.id = 1000 + s.step * 32 + i;
                     output.applied = Some(s.high);
-                    if self.has("iceberg") {
-                        output.seq = s.high;
-                        output.min_seq = s.high;
-                    }
                     n.files.push(output);
                 }
             }
@@ -303,7 +293,7 @@ impl Model for Protocol {
                 if s.files.iter().any(|f| f.cold) {
                     a.push(Action::Promote);
                 }
-                if self.has("design") && !s.tombstones.is_empty() {
+                if !s.tombstones.is_empty() {
                     a.push(Action::Clear);
                 }
             }
@@ -378,12 +368,8 @@ impl Model for Protocol {
                 } else {
                     next.floor = state.step;
                     next.checkpoint = Some((state.step, state.keys));
-                    if self.has("design") && !self.has("no-refresh") {
-                        next.index = if self.has("drop") {
-                            None
-                        } else {
-                            Some((state.step, state.keys))
-                        };
+                    if !self.has("no-refresh") {
+                        next.index = Some((state.step, state.keys));
                     }
                 }
             }
@@ -418,12 +404,12 @@ impl Model for Protocol {
                 next.step += 1;
             }
             Action::Compact(mask) => {
-                self.rewrite(state, &mut next, mask, false);
+                Self::rewrite(state, &mut next, mask, false);
                 self.clear_covered(&mut next, state.high);
                 next.step += 1;
             }
             Action::Promote => {
-                self.rewrite(state, &mut next, usize::MAX, true);
+                Self::rewrite(state, &mut next, usize::MAX, true);
                 next.step += 1;
             }
             Action::Clear => {
@@ -461,11 +447,7 @@ impl Model for Protocol {
             Action::Scan => {
                 let mut keep = Self::retained(state, state.floor);
                 if let Some(v) = state.pin {
-                    if self.has("design") {
-                        keep = Self::retained(state, v.min(state.floor));
-                    } else {
-                        keep.extend(&state.versions[v]);
-                    }
+                    keep = Self::retained(state, v.min(state.floor));
                 }
                 next.scan = Some(
                     state
@@ -491,11 +473,7 @@ impl Model for Protocol {
                 next.step += 1;
             }
             Action::Index => {
-                next.index = Some(if self.has("design") {
-                    state.checkpoint.unwrap_or((0, [false; 2]))
-                } else {
-                    (state.step, state.keys)
-                });
+                next.index = Some(state.checkpoint.unwrap_or((0, [false; 2])));
             }
             Action::Recover => {
                 let (base, mut keys) = state.index.or(state.checkpoint).unwrap_or((0, [false; 2]));
@@ -654,8 +632,7 @@ impl Model for Protocol {
                 Property::always(
                     "checkpoint index reference aligned",
                     |model, state: &State| {
-                        !model.has("design")
-                            || model.has("no-refresh")
+                        model.has("no-refresh")
                             || state.index.is_none_or(|(base, _)| base == state.floor)
                     },
                 ),
