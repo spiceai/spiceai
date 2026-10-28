@@ -562,6 +562,16 @@ impl SnapshotEngine for CayenneSnapshotEngine {
         Ok(())
     }
 
+    /// Nothing to check: Cayenne snapshots are directory-layout, and only the
+    /// file-layout restore invokes this hook.
+    async fn verify_downloaded_file(
+        &self,
+        _downloaded: &std::path::Path,
+        _dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError> {
+        Ok(())
+    }
+
     async fn prepare_for_upload(
         &self,
         source_path: &std::path::Path,

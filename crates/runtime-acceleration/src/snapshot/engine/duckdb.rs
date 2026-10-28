@@ -176,6 +176,33 @@ impl SnapshotEngine for DuckDBSnapshotEngine {
         })
     }
 
+    /// Attaches the file read-only to an in-memory database, as compaction does, so the
+    /// check neither writes the file nor leaves a write-ahead log beside it. `DuckDB`
+    /// refuses a file that is not a database or that uses an unsupported storage version.
+    async fn verify_downloaded_file(
+        &self,
+        downloaded: &Path,
+        dataset_name: &str,
+    ) -> Result<(), super::SnapshotEngineError> {
+        let path = downloaded.to_path_buf();
+        let opened = tokio::task::spawn_blocking(move || {
+            let conn = duckdb::Connection::open_in_memory().map_err(|e| e.to_string())?;
+            let escaped = escape_duckdb_string(&path.to_string_lossy());
+            conn.execute(&format!("ATTACH '{escaped}' AS downloaded (READ_ONLY)"), [])
+                .map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| format!("the check ended unexpectedly: {e}"))
+        .and_then(|opened| opened);
+        opened.map_err(|reason| super::SnapshotEngineError::Unopenable {
+            dataset: dataset_name.to_string(),
+            path: downloaded.to_path_buf(),
+            engine: "duckdb",
+            reason,
+        })
+    }
+
     async fn prepare_for_upload(
         &self,
         source_path: &Path,
@@ -298,6 +325,55 @@ mod tests {
             .checkpoint_live(&live, "ds_empty")
             .await
             .expect("checkpointing an empty database must succeed");
+    }
+
+    /// A downloaded file that `DuckDB` cannot open is refused before it can replace the
+    /// accelerator's file, and the check leaves no file beside it.
+    #[tokio::test]
+    async fn a_downloaded_file_that_is_not_a_database_is_refused() {
+        let tmp = TempDir::new().expect("temp dir");
+        let downloaded = tmp.path().join("downloaded.db");
+        std::fs::write(&downloaded, [0x5a_u8; 4096]).expect("write random-looking bytes");
+
+        let err = DuckDBSnapshotEngine::new(false)
+            .verify_downloaded_file(&downloaded, "orders")
+            .await
+            .expect_err("a file that is not a database must be refused");
+
+        assert!(
+            matches!(err, super::super::SnapshotEngineError::Unopenable { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("'orders'"), "{err}");
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("list the directory")
+            .collect();
+        assert_eq!(entries.len(), 1, "the check must not create files");
+    }
+
+    /// A real database passes the check unchanged.
+    #[tokio::test]
+    async fn a_downloaded_database_passes_the_check() {
+        let tmp = TempDir::new().expect("temp dir");
+        let downloaded = tmp.path().join("downloaded.db");
+        {
+            let conn = Connection::open(&downloaded).expect("create a database");
+            conn.execute_batch("CREATE TABLE t(id INTEGER); INSERT INTO t VALUES (1);")
+                .expect("write a row");
+        }
+        let before = std::fs::read(&downloaded).expect("read the database");
+
+        DuckDBSnapshotEngine::new(false)
+            .verify_downloaded_file(&downloaded, "orders")
+            .await
+            .expect("a database passes the check");
+
+        assert_eq!(
+            std::fs::read(&downloaded).expect("read the database"),
+            before,
+            "the check must not change the file"
+        );
+        assert_eq!(count_rows(&downloaded), 1);
     }
 
     /// The snapshot must fail rather than ship a file whose pending writes could not be

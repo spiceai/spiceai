@@ -634,6 +634,13 @@ pub enum SnapshotDownloadError {
     },
     #[snafu(display("Snapshot {path} uses unsupported checksum algorithm {algorithm}"))]
     UnsupportedChecksumAlgorithm { path: String, algorithm: String },
+    #[snafu(display(
+        "Snapshot {path} matches its checksum but cannot be opened, so it did not replace the local acceleration: {source}"
+    ))]
+    Unopenable {
+        path: String,
+        source: Box<engine::SnapshotEngineError>,
+    },
     #[snafu(display("Snapshot {path} size mismatch. expected={expected} actual={actual}"))]
     SizeMismatch {
         path: String,
@@ -1211,6 +1218,43 @@ impl Not for &ForceCreate {
     }
 }
 
+/// A downloaded single-file snapshot that matched its recorded size and checksum and
+/// that the engine opened. Only this can replace the accelerator's file, so a download
+/// the engine cannot open never takes the place of a file it can.
+pub(crate) struct VerifiedDownload {
+    path: PathBuf,
+}
+
+impl VerifiedDownload {
+    /// Has `engine` open the download at `path`, which already matched its checksum.
+    /// `snapshot` names the snapshot in the error.
+    async fn verify(
+        engine: &dyn SnapshotEngine,
+        path: &Path,
+        dataset_name: &str,
+        snapshot: &str,
+    ) -> Result<Self, SnapshotDownloadError> {
+        engine
+            .verify_downloaded_file(path, dataset_name)
+            .await
+            .map_err(|source| SnapshotDownloadError::Unopenable {
+                path: snapshot.to_string(),
+                source: Box::new(source),
+            })?;
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// For tests of the replacement itself, which hand it a file directly.
+    #[cfg(all(test, feature = "sqlite"))]
+    pub(crate) fn assume_verified(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+}
+
 /// Renames a downloaded snapshot file over the accelerator's file.
 ///
 /// [`SnapshotEngine::prepare_file_restore`] runs first. If the rename does not
@@ -1218,10 +1262,11 @@ impl Not for &ForceCreate {
 /// whatever that call moved aside before this returns the rename error.
 pub(crate) async fn replace_downloaded_file(
     engine: &dyn SnapshotEngine,
-    temp_path: &Path,
+    download: VerifiedDownload,
     local_path: &Path,
     dataset_name: &str,
 ) -> Result<(), SnapshotDownloadError> {
+    let temp_path = download.path.as_path();
     // Finish a previous process's interrupted restore before this attempt
     // takes the journal. The guard then keeps a pool open in this process
     // from putting the parked WAL back while the rename is still in progress.
@@ -3002,7 +3047,8 @@ impl SnapshotManager {
                         | SnapshotDownloadError::SizeMismatch { ref path, .. }
                         | SnapshotDownloadError::UnsupportedChecksumAlgorithm {
                             ref path, ..
-                        } => {
+                        }
+                        | SnapshotDownloadError::Unopenable { ref path, .. } => {
                             tracing::warn!(
                                 "Snapshot integrity issue; attempting next available snapshot. dataset={} snapshot={path} sha={sha}",
                                 self.dataset_name,
@@ -3482,6 +3528,22 @@ impl SnapshotManager {
                 return Err(e);
             }
         };
+        // A file can match its checksum and still be one the engine cannot open. Once
+        // it replaced the primary path, the dataset could not load after a restart.
+        let verified = match VerifiedDownload::verify(
+            self.snapshot_engine.as_ref(),
+            &temp_path,
+            &self.dataset_name,
+            path_display,
+        )
+        .await
+        {
+            Ok(verified) => verified,
+            Err(e) => {
+                let _ = fs::remove_file(&temp_path).await;
+                return Err(e);
+            }
+        };
 
         // `tokio::fs::rename` defers to `std::fs::rename`, which on every
         // tier-1 platform we ship for performs a destination-replacing move:
@@ -3508,7 +3570,7 @@ impl SnapshotManager {
         // the file. See `replace_downloaded_file`.
         replace_downloaded_file(
             self.snapshot_engine.as_ref(),
-            &temp_path,
+            verified,
             local_path,
             &self.dataset_name,
         )
@@ -8323,11 +8385,13 @@ mod tests {
 
     /// Generic test: Download snapshot succeeds with valid metadata (for any engine).
     async fn generic_download_snapshot_with_valid_metadata(engine: &AccelerationEngine) {
-        download_and_verify_snapshot(
-            engine,
-            Bytes::from_static(b"engine-agnostic-snapshot-bytes"),
-        )
-        .await;
+        // A database of the engine's own format: a file engine refuses to restore one it
+        // cannot open.
+        let source_dir = TempDir::new().expect("create temp dir");
+        let source = source_dir.path().join("published.db");
+        write_sample_local_db(&source, engine);
+        let contents = Bytes::from(std::fs::read(&source).expect("read the sample database"));
+        download_and_verify_snapshot(engine, contents).await;
     }
 
     /// Publishes `contents` as the current snapshot, downloads it, and checks the result.
@@ -11604,5 +11668,134 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ========== A download the engine cannot open ==========
+
+    /// Publishes `contents` as snapshot `snapshot_id` in `entries`, at a distinct key.
+    #[cfg(feature = "duckdb")]
+    async fn put_duckdb_snapshot(
+        store: &InMemory,
+        snapshot_id: u64,
+        contents: &Bytes,
+    ) -> SnapshotEntry {
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let instant = Utc
+            .with_ymd_and_hms(
+                2026,
+                10,
+                27,
+                4,
+                0,
+                u32::try_from(snapshot_id).expect("small id"),
+            )
+            .single()
+            .expect("valid time");
+        let location = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB)
+            .build_location(&base, instant);
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+        SnapshotEntry {
+            snapshot_id,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: compute_sha256_hex(contents.as_ref()),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+            snapshot_engine: Some("duckdb".to_string()),
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        }
+    }
+
+    /// A newer snapshot whose file matches its checksum but that `DuckDB` cannot open
+    /// must not replace the file of the snapshot a reader serves. It used to be renamed
+    /// over that file before the reload found it unreadable, so the dataset failed to
+    /// load after the next restart. The poll reports the snapshot as not loaded instead,
+    /// and a bootstrap continues without it.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_snapshot_the_engine_cannot_open_does_not_replace_the_local_file() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("accelerated.db");
+        write_sample_local_db(&local_path, &AccelerationEngine::DuckDB);
+        let loaded = Bytes::from(std::fs::read(&local_path).expect("read the loaded file"));
+
+        let good = put_duckdb_snapshot(&store, 0, &loaded).await;
+        let junk = put_duckdb_snapshot(&store, 1, &Bytes::from(vec![0x5a_u8; 8192])).await;
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: Utc::now().timestamp_millis(),
+            datasets: HashMap::from([(
+                DATASET_NAME.to_string(),
+                dataset_metadata(&schema, vec![good, junk], Some(1)),
+            )]),
+        };
+        write_metadata(
+            &store,
+            &Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME),
+            &metadata,
+        )
+        .await;
+
+        let manager = build_manager_for_engine(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            &AccelerationEngine::DuckDB,
+            false,
+        );
+        let poll = manager
+            .download_if_newer(Some(0), None, None)
+            .await
+            .expect("the poll succeeds");
+        match &poll.outcome {
+            SnapshotPollOutcome::DownloadFailed {
+                published_id: 1,
+                loaded_id: 0,
+                cause,
+            } => assert!(cause.contains("cannot be opened"), "{cause}"),
+            other => panic!("expected DownloadFailed, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&local_path).expect("read the local file"),
+            loaded.as_ref(),
+            "the served file stays in place"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .filter(|name| name.to_string_lossy().contains("download"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the download is removed: {leftovers:?}"
+        );
+
+        let bootstrap_dir = TempDir::new().expect("create temp dir");
+        let bootstrap_path = bootstrap_dir.path().join("accelerated.db");
+        let bootstrapping = build_manager_for_engine(
+            Arc::clone(&store),
+            bootstrap_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            &AccelerationEngine::DuckDB,
+            false,
+        );
+        let restored = bootstrapping
+            .download_latest_snapshot()
+            .await
+            .expect("a bootstrap that fails continues");
+        assert!(restored.is_none());
+        assert!(
+            !bootstrap_path.exists(),
+            "a bootstrap leaves no file the engine cannot open"
+        );
     }
 }
