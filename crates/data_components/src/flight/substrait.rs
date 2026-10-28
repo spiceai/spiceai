@@ -30,7 +30,7 @@ use datafusion::{
     datasource::empty::EmptyTable,
     error::DataFusionError,
     execution::{TaskContext, context::SessionState},
-    logical_expr::{Expr, ExprSchemable, Extension, LogicalPlan, LogicalPlanBuilder, TableScan},
+    logical_expr::{Expr, Extension, LogicalPlan, LogicalPlanBuilder, TableScan},
     optimizer::{Analyzer, AnalyzerRule},
     physical_expr::EquivalenceProperties,
     physical_plan::{
@@ -49,7 +49,10 @@ use datafusion_substrait::{
     extensions::Extensions,
     logical_plan::producer::{SubstraitProducer, from_table_scan},
     substrait::{
-        proto::{Plan, PlanRel, Rel, RelRoot, plan_rel, read_rel::ReadType, rel::RelType},
+        proto::{
+            Expression, FunctionArgument, Plan, PlanRel, Rel, RelRoot, expression::RexType,
+            function_argument::ArgType, plan_rel, read_rel::ReadType, rel::RelType,
+        },
         version::version_with_producer,
     },
 };
@@ -85,7 +88,7 @@ impl SubstraitProducer for SpiceProducer {
         &mut self,
         _expression: &datafusion::logical_expr::expr::InSubquery,
         _schema: &datafusion::common::DFSchemaRef,
-    ) -> Result<datafusion_substrait::substrait::proto::Expression> {
+    ) -> Result<Expression> {
         // IN can become a NULL-aware anti/mark join during optimization.
         // The Substrait join codec cannot represent that NULL contract.
         Err(DataFusionError::NotImplemented(
@@ -106,8 +109,7 @@ impl SubstraitProducer for SpiceProducer {
         &mut self,
         expression: &Expr,
         schema: &datafusion::common::DFSchemaRef,
-    ) -> Result<datafusion_substrait::substrait::proto::Expression> {
-        use datafusion_substrait::substrait::proto::expression::RexType;
+    ) -> Result<Expression> {
         let mut encoded = datafusion_substrait::logical_plan::producer::to_substrait_rex(
             self, expression, schema,
         )?;
@@ -148,7 +150,7 @@ impl SubstraitProducer for SpiceProducer {
         &mut self,
         function: &datafusion::logical_expr::expr::ScalarFunction,
         schema: &datafusion::common::DFSchemaRef,
-    ) -> Result<datafusion_substrait::substrait::proto::Expression> {
+    ) -> Result<Expression> {
         if runtime_udfs_api::is_user_function(function.func.name())
             || function.func.as_async().is_some()
             || matches!(function.func.name(), "embed" | "rerank")
@@ -158,41 +160,27 @@ impl SubstraitProducer for SpiceProducer {
                 function.func.name(),
             )));
         }
-        use datafusion_substrait::substrait::proto::{
-            Expression, FunctionArgument,
-            expression::{RexType, ScalarFunction},
-            function_argument::ArgType,
-        };
-        let (_, output) = Expr::ScalarFunction(function.clone()).to_field(schema)?;
-        let output_type = datafusion_substrait::logical_plan::producer::to_substrait_type(
-            self,
-            output.data_type(),
-            output.is_nullable(),
+        let mut encoded = datafusion_substrait::logical_plan::producer::from_scalar_function(
+            self, function, schema,
         )?;
-        let arguments = function
-            .args
-            .iter()
-            .map(|arg| {
-                Ok(FunctionArgument {
-                    arg_type: Some(ArgType::Value(self.handle_expr(arg, schema)?)),
+        if let Some(RexType::ScalarFunction(scalar)) = &mut encoded.rex_type {
+            // Rebuild arguments in original order. Canonical Substrait rewrites
+            // (for example log's argument swap) do not apply to exact functions.
+            scalar.arguments = function
+                .args
+                .iter()
+                .map(|arg| {
+                    Ok(FunctionArgument {
+                        arg_type: Some(ArgType::Value(self.handle_expr(arg, schema)?)),
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // Preserve exact DataFusion names and argument order: canonical
-        // Substrait aliases and rewrites may bind to a different upstream UDF.
-        let function_reference = self
-            .extensions
-            .register_function(&format!("spice.function.{}", function.func.name()));
-        #[expect(deprecated, reason = "the protobuf retains the legacy args field")]
-        Ok(Expression {
-            rex_type: Some(RexType::ScalarFunction(ScalarFunction {
-                function_reference,
-                arguments,
-                output_type: Some(output_type),
-                options: vec![],
-                args: vec![],
-            })),
-        })
+                .collect::<Result<Vec<_>>>()?;
+            // Canonical aliases (isnan -> is_nan) may bind a different UDF.
+            scalar.function_reference = self
+                .extensions
+                .register_function(&format!("spice.function.{}", function.func.name()));
+        }
+        Ok(encoded)
     }
 
     fn register_function(&mut self, signature: String) -> u32 {
