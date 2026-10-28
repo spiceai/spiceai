@@ -91,6 +91,22 @@ pub fn engine_for(weights: &[PathBuf]) -> Option<&'static LocalChatEngine> {
         .find(|engine| (engine.serves)(weights))
 }
 
+/// The engine for a rank other than 0 of a distributed model whose weights it does not hold
+/// and cannot name by their files, such as a model given as a directory only the head has:
+/// the registered engine that splits models across nodes, as such a rank can only hold a share
+/// for the head (mistral.rs's ring reads the weights on every node). `None` when this node
+/// holds any of `weights`.
+pub async fn engine_without_weights(weights: &[PathBuf]) -> Option<&'static LocalChatEngine> {
+    for weight in weights {
+        if tokio::fs::try_exists(weight).await.unwrap_or(false) {
+            return None;
+        }
+    }
+    LOCAL_CHAT_ENGINES
+        .iter()
+        .find(|engine| engine.distributed.is_some())
+}
+
 /// Registers a [`LocalChatEngine`] as the static `$name`.
 ///
 /// The registration is a `linkme` distributed-slice entry, which the linker keeps only when
