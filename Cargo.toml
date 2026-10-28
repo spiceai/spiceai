@@ -286,7 +286,7 @@ datafusion-common-runtime = "55.2.0"
 datafusion-datasource = "55.2.0"
 datafusion-execution = "55.2.0"
 datafusion-expr = "55.2.0"
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "bd808b3ebc51796cce7a30f805971dd3613bd014", features = ["sql"] } # branch: ben/preserve-computed-projection-names
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "300acfcfb51abfa9c477f57bff3e0529ec4f5f1a", features = ["sql"] } # branch: spiceai-55
 datafusion-functions = "55.2.0"
 datafusion-functions-aggregate = "55.2.0"
 datafusion-functions-aggregate-common = "55.2.0"
@@ -301,7 +301,7 @@ datafusion-proto-common = "55.2.0"
 datafusion-pruning = "55.2.0"
 datafusion-spark = "55.2.0"
 datafusion-substrait = "55.2.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "a7503c43013bafc22239aaaba2a933536a589e86" } # branch: ben/result-column-identity-and-union-scope
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "3cd2af82c74e5ab322e8a8282c52ce441cf82697" } # branch: ben/result-column-identity-and-union-scope
 delta_kernel = { version = "0.27.1", features = ["arrow-59", "internal-api"] }
 delta_kernel_default_engine = { version = "0.27.1", default-features = false, features = [
     "arrow-59",

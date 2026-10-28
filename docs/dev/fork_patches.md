@@ -117,8 +117,8 @@ own section below — a count here would be one more thing to keep true by hand.
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
 | [datafusion](#datafusion) | `7f887215833c82112d94188adb8855cda8a4e47e` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
-| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `bd808b3ebc51796cce7a30f805971dd3613bd014` | `ben/preserve-computed-projection-names` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `a7503c43013bafc22239aaaba2a933536a589e86` | `ben/result-column-identity-and-union-scope` |
+| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `300acfcfb51abfa9c477f57bff3e0529ec4f5f1a` | `spiceai-55` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `3cd2af82c74e5ab322e8a8282c52ce441cf82697` | `ben/result-column-identity-and-union-scope` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
