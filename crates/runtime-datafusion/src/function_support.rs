@@ -2254,6 +2254,12 @@ mod tests {
                     );
                 }
             }
+            // SQLite keeps every `LIKE` local on purpose (its `LIKE` folds
+            // ASCII case; see `sqlite_can_evaluate_expression`), so only the
+            // other policies are expected to federate a plain one.
+            if policy == "SQLite" {
+                continue;
+            }
             let like = plan_filtering(col("s").like(lit("cust_%")));
             assert!(
                 pushes(&like, &support),
