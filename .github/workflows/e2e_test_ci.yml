@@ -2991,10 +2991,12 @@ jobs:
           echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
 
       # Upgrade scripts start on the release their `from:` names and upgrade
-      # to this build: spicescript downloads each release it needs from the
-      # GitHub release into ~/.cache/spicescript (test/spicescript/releases.json
-      # pins what `X.Y.x` means), so no `--from` is passed here.
+      # to this build: spicescript resolves `X.Y.x` against the GitHub releases
+      # and downloads each release it needs into ~/.cache/spicescript, so no
+      # `--from` is passed here. The token is for the releases API's rate limit.
       - name: Run scenario scripts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           "${{ steps.spicescript.outputs.path }}" --jobs 4 \
             --partition ${{ matrix.partition }} \

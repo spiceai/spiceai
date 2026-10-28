@@ -73,6 +73,7 @@ DuckDB CLI matching Spice's embedded DuckDB into `~/.cache/spicescript/`
 | `<SCRIPTS>…` | Script files, or directories of `*.yaml` scripts (not their subdirectories, except that `known-failing/` includes its group directories). |
 | `--spiced [NAME=]PATH` | A `spiced` to test; repeat it to run every script on several binaries, which must give identical answers. Default: `~/.spice/bin/spiced`. |
 | `--from PATH` | Start every instance on this binary instead of the release its script's `from:` names (see [Upgrades](#upgrades)); each `upgrade` step moves it to the binary under test, over the same data. Combine it with `--matrix from=…` to run one base version. |
+| `--from-release FROM=VERSION` | Start the runs whose `from:` is `FROM` (such as `2.3.x`) on release `VERSION` (such as `2.3.2`) instead of the one it resolves to (see [Upgrades](#upgrades)). Repeat it for several. |
 | `--cluster` | Run every instance as a scheduler plus one executor over node mTLS. Scripts that can't run distributed (memory-mode Cayenne, DuckDB or SQLite accelerations) are skipped. |
 | `--jobs N` | Run up to N `spiced` processes at once (default 1). Every instance of every matrix combination is a job of its own, taking a slot per process, executors included, and freeing it when it finishes. A combination that stops and starts a source its instances share, or whose variants work together (`run-variants: side-by-side`), runs its instances a step at a time as one job; a script with `defaults.exclusive` runs alone. Scripts ask for slots longest first, from recorded durations. Each script's output is printed when it finishes, with progress lines and the slowest scripts at the end. |
 | `--partition I/N` | Run only share I of N (1-based), for splitting a suite across CI jobs. Scripts go longest first, by recorded duration, to the share with the least work so far, so every job computes the same split and the shares take about as long. |
@@ -252,19 +253,33 @@ steps:
   - query: SELECT * FROM orders
 ```
 
-`from:` names the release a script's instances start on, as `X.Y.Z` or `X.Y.x`
-(the newest X.Y release in
-[`test/spicescript/releases.json`](../../test/spicescript/releases.json), the
-nearest `releases.json` at or above the script). Since the list is checked in,
-a commit always upgrades from the same binary; it gains each release as it
-ships. Before running, spicescript downloads each release the selected runs
-need (`spiced_<os>_<arch>.tar.gz` from the GitHub release) once into
-`~/.cache/spicescript/spiced-<version>/`, checks its `--version`, and prints
-which release each run starts on. Executors start on it too, and `upgrade`
-moves the scheduler and executors to the binary under test.
+`from:` names the release a script's instances start on, as `X.Y.Z` or `X.Y.x`,
+the newest published X.Y release on GitHub with a `spiced` build for this host.
+Before running, spicescript lists the releases once (with `GITHUB_TOKEN` or
+`GH_TOKEN` if set, for the API's rate limit) and caches the list for an hour in
+`~/.cache/spicescript/releases.json`, which records what each `X.Y.x` resolved
+to and when; if GitHub can't be reached, an older cached list is used with a
+warning. It then downloads each release the selected runs need
+(`spiced_<os>_<arch>.tar.gz` from the GitHub release) once into
+`~/.cache/spicescript/spiced-<version>/` and checks its `--version`. The output
+names the release behind each `from:`, and each run the release it starts on:
+
+```
+from 2.3.x: v2.3.3 (newest published), ~/.cache/spicescript/spiced-2.3.3/spiced
+from 2.4.x: v2.4.0 (newest published), ~/.cache/spicescript/spiced-2.4.0/spiced
+== orders-upgrade[from=2.3.x]: …
+   from   v2.3.3 (2.3.x)
+```
+
+Executors start on the release too, and `upgrade` moves the scheduler and
+executors to the binary under test. Because `X.Y.x` follows the releases, a
+new patch release changes what the same commit upgrades from.
 
 - Without `from:`, instances start on the binary under test and `upgrade` is a
   restart. A `from:` on a script with no `upgrade` step is rejected.
+- `--from-release 2.3.x=2.3.2` starts the runs whose `from:` is `2.3.x` on
+  v2.3.2 instead; repeat it for several. With `--matrix from=2.3.x` it narrows
+  the run to that one base release.
 - `--from PATH` starts every instance on that binary instead, whatever the
   script names.
 - OSS release builds have only the `release` and `models` features. A release

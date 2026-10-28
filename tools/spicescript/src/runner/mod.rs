@@ -316,8 +316,8 @@ pub struct Options {
     /// `--from`: the binary every instance starts on, in place of any
     /// script's `from:`; an `upgrade` step moves it to its target's.
     pub from_override: Option<PathBuf>,
-    /// Each script directory's rendered `from:` mapped to its exact release and binary.
-    pub releases: BTreeMap<(PathBuf, String), crate::release::BaseRelease>,
+    /// Each rendered `from:` of the selected runs, with its release and binary.
+    pub releases: BTreeMap<String, crate::release::BaseRelease>,
     /// Run every instance as a cluster scheduler with one executor.
     pub cluster: bool,
     pub work_dir: PathBuf,
@@ -631,11 +631,11 @@ async fn run_combination(
     if options.from_override.is_none()
         && let Some(from) = script.render_from(combo)?
     {
-        let version = script
+        let release = options
             .releases
             .get(&from)
-            .context("base release was not resolved at load")?;
-        say!("   from   v{version} ({from})");
+            .context("base release was not fetched")?;
+        say!("   from   v{} ({from})", release.version);
     }
     // The steps of this matrix combination.
     let steps: Vec<Step> = script
@@ -796,7 +796,7 @@ async fn create_instances(
             .map(|from| {
                 options
                     .releases
-                    .get(&(script.dir.clone(), from))
+                    .get(&from)
                     .context("base release was not fetched")
             })
             .transpose()?

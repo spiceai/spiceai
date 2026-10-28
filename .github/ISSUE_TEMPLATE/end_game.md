@@ -276,7 +276,6 @@ Testing focus DRIs are responsible for:
 - [ ] Update [brew taps](https://github.com/spiceai/homebrew-spiceai/actions/workflows/update-formula.yml) after the final build completes.
 - [ ] Remove or mark the released version in the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md).
 - [ ] Update the supported version in `SECURITY.md` if necessary.
-- [ ] Add the release to [`test/spicescript/releases.json`](https://github.com/spiceai/spiceai/blob/trunk/test/spicescript/releases.json) in `trunk`, so upgrade scripts (`from: X.Y.x`) start upgrading from it.
 - [ ] Confirm docs/install refs for Skills point at the matching release (or trunk if intentional).
 
 ## Announcement Checklist

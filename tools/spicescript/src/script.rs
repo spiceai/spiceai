@@ -44,9 +44,6 @@ pub struct Script {
     /// The OSS release each combination starts on before an `upgrade`.
     #[serde(default)]
     pub from: Option<String>,
-    /// Rendered `from:` values and their exact releases, resolved at load.
-    #[serde(skip)]
-    pub releases: BTreeMap<String, String>,
     /// Named spicepod patches. Every variant of a run must return identical
     /// rows for every query.
     #[serde(default)]
@@ -973,7 +970,6 @@ impl Script {
                     .any(|s| matches!(s.action, Action::Restart { upgrade: true, .. })),
                 "`from:` names a release to upgrade from, but the script has no `upgrade` step, so it would run entirely on that release"
             );
-            let mut rendered = Vec::new();
             // Check placeholders even when a matrix dimension is empty.
             if let Some(from) = &script.from {
                 for tail in from.split("${matrix.").skip(1) {
@@ -987,14 +983,7 @@ impl Script {
             for combo in matrix_combinations(&script.matrix) {
                 if let Some(from) = script.render_from(&combo)? {
                     crate::release::validate(&from)?;
-                    rendered.push(from);
                 }
-            }
-            let releases = crate::release::Releases::find(base)?;
-            for from in rendered {
-                script
-                    .releases
-                    .insert(from.clone(), releases.resolve(&from)?);
             }
         }
         let mut ids = std::collections::BTreeSet::new();
