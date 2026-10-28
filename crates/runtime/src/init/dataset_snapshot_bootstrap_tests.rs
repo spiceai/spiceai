@@ -123,7 +123,7 @@ impl Fixture {
             .create_snapshot(
                 &schema,
                 Arc::new(Mutex::new(())).lock_owned().await,
-                None,
+                runtime_acceleration::snapshot::LocalData::synced(None),
                 Some(1),
                 ForceCreate(true),
             )
