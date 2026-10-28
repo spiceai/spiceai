@@ -57,6 +57,7 @@ members = [
     "crates/otel-arrow",
     "crates/podswatcher",
     "crates/cayenne",
+    "crates/cayenne-metastore-model",
     "crates/runtime-object-store",
     "crates/runtime-otel-push",
     "crates/runtime-state-location",
@@ -446,6 +447,7 @@ spice-cloud-client = { path = "crates/spice-cloud-client" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "f5557381f79f1535014e0dc0555c53ac8de1cafc" } # branch: spiceai-59
 sqlparser = "0.62.0"
 ssh2 = { version = "0.9.5" }
+stateright = "=0.31.0"
 suppaftp = { version = "6.3.0", features = ["async"] }
 syn = { version = "2", features = ["full", "extra-traits"] }
 sysinfo = "0.38.4"
