@@ -328,16 +328,42 @@ pub(crate) struct QueryTimeoutState {
 struct QueryTimeoutInner {
     fired: std::sync::atomic::AtomicBool,
     timeout: std::time::Duration,
+    deadline: Option<std::time::Instant>,
 }
 
 impl QueryTimeoutState {
-    fn armed(timeout: std::time::Duration) -> Self {
+    fn armed(timeout: std::time::Duration, started_at: std::time::Instant) -> Self {
         Self {
             inner: Some(Arc::new(QueryTimeoutInner {
                 fired: std::sync::atomic::AtomicBool::new(false),
                 timeout,
+                deadline: started_at.checked_add(timeout),
             })),
         }
+    }
+
+    fn deadline(&self) -> Option<std::time::Instant> {
+        self.inner.as_ref().and_then(|inner| inner.deadline)
+    }
+
+    /// A transport deadline can wake a stream before the timer task is polled.
+    /// Classify from the same absolute deadline while preserving a cancellation
+    /// that was already observed before expiry.
+    fn cancel_if_expired(&self, token: &tokio_util::sync::CancellationToken) {
+        if self
+            .deadline()
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            && !token.is_cancelled()
+        {
+            self.mark_fired();
+            token.cancel();
+        }
+    }
+
+    fn has_fired(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.fired.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     fn mark_fired(&self) {
@@ -409,6 +435,7 @@ impl Query {
         query_id: &str,
         timeout_state: &QueryTimeoutState,
     ) -> Result<()> {
+        timeout_state.cancel_if_expired(token);
         if token.is_cancelled() {
             return Err(timeout_state.cancellation_error(query_id));
         }
@@ -425,23 +452,34 @@ impl Query {
     /// query (via admin cancel endpoint) does not propagate upwards to the
     /// request and abort other in-progress work.
     fn lifetime_guards(&self, request_context: &RequestContext) -> QueryLifetimeGuards {
+        let started_at = std::time::Instant::now();
         let cancel_token = match &self.cancellation_token {
             Some(t) => t.clone(),
             None => request_context.child_cancellation_token(),
         };
         let (timeout_state, timeout_timer_guard) = match request_context.query_timeout() {
             Some(timeout) => {
-                let state = QueryTimeoutState::armed(timeout);
+                let state = QueryTimeoutState::armed(timeout, started_at);
+                let timer_deadline = state.deadline();
                 let timer_state = state.clone();
                 let timer_token = cancel_token.clone();
                 let handle = tokio::spawn(async move {
+                    let deadline = async move {
+                        match timer_deadline {
+                            Some(deadline) => {
+                                tokio::time::sleep_until(Instant::from_std(deadline)).await
+                            }
+                            None => std::future::pending::<()>().await,
+                        }
+                    };
                     tokio::select! {
+                        biased;
                         // The token fired first (explicit cancel, client
                         // disconnect): stand down so a cancellation observed
                         // lazily — after the timeout would have elapsed —
                         // keeps its `QueryCancelled` classification.
                         () = timer_token.cancelled() => {}
-                        () = tokio::time::sleep(timeout) => {
+                        () = deadline => {
                             // Mark before cancelling so observers of the fired
                             // token always classify the cancellation as a
                             // timeout.
@@ -470,7 +508,7 @@ impl Query {
             timeout_state,
             timeout_timer_guard,
             active_query_guard,
-            started_at: std::time::Instant::now(),
+            started_at,
         }
     }
 
@@ -2040,8 +2078,16 @@ impl Query {
                 Ok(instrument_query_result(result, trace_span))
             }
             Err(e) => {
-                tracing::error!(target: "task_history", parent: &span, "{e}");
-                Err(e)
+                // A source may finish planning with a transport error as its
+                // deadline expires, before the timer task gets a turn.
+                timeout_state.cancel_if_expired(&query_cancel_token);
+                let error = if timeout_state.has_fired() {
+                    timeout_state.cancellation_error(&query_id_str)
+                } else {
+                    e
+                };
+                tracing::error!(target: "task_history", parent: &span, "{error}");
+                Err(error)
             }
         }
     }
@@ -2712,6 +2758,7 @@ where
         if state.emitted_cancel {
             return None;
         }
+        state.timeout.cancel_if_expired(&state.token);
         if state.token.is_cancelled() {
             state.emitted_cancel = true;
             state.release_query_resources();
@@ -2728,7 +2775,14 @@ where
             }
             next = stream.next() => {
                 state.stream = Some(stream);
-                next.map(|item| (item, state))
+                state.timeout.cancel_if_expired(&state.token);
+                if state.token.is_cancelled() {
+                    state.emitted_cancel = true;
+                    state.release_query_resources();
+                    Some((Err(state.cancellation_error()), state))
+                } else {
+                    next.map(|item| (item, state))
+                }
             }
         }
     });
@@ -2781,6 +2835,7 @@ where
         if state.emitted_cancel {
             return None;
         }
+        state.timeout.cancel_if_expired(&state.token);
         if state.token.is_cancelled() {
             state.emitted_cancel = true;
             state.release_query_resources();
@@ -2797,7 +2852,14 @@ where
             }
             next = stream.next() => {
                 state.stream = Some(stream);
-                next.map(|item| (item, state))
+                state.timeout.cancel_if_expired(&state.token);
+                if state.token.is_cancelled() {
+                    state.emitted_cancel = true;
+                    state.release_query_resources();
+                    Some((Err(state.cancellation_error()), state))
+                } else {
+                    next.map(|item| (item, state))
+                }
             }
         }
     });

@@ -112,13 +112,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--spiced", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--source-commit", help="Commit that produced the prebuilt spiced binary; defaults to HEAD")
     args = parser.parse_args()
     args.out = args.out.resolve()
     args.out.mkdir(parents=True, exist_ok=False)
     args.spiced = args.spiced.resolve()
     (args.out / "provenance.json").write_text(json.dumps({
         "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        "commit": args.source_commit or subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        "harness_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "common_harness_sha256": hashlib.sha256(Path(__file__).with_name("sidecar.py").read_bytes()).hexdigest(),
         "binary_sha256": hashlib.sha256(args.spiced.read_bytes()).hexdigest(),
     }, indent=2))
     pki(args.out)

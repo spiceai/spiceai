@@ -39,6 +39,19 @@ import urllib.request
 from pathlib import Path
 
 
+def varint(value):
+    result = bytearray()
+    while value > 127:
+        result.append((value & 127) | 128)
+        value >>= 7
+    result.append(value)
+    return bytes(result)
+
+
+def field(number, payload):
+    return varint((number << 3) | 2) + varint(len(payload)) + payload
+
+
 def port():
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -254,7 +267,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--spiced", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--source-commit", help="Commit that produced the prebuilt spiced binary; defaults to HEAD")
     parser.add_argument("--testoperator", type=Path)
+    parser.add_argument("--modes", nargs="+", choices=["server", "sidecar"], default=["server", "sidecar"])
     parser.add_argument("--rows", type=int, default=100_000)
     parser.add_argument("--duration", type=int, default=30)
     parser.add_argument("--concurrency", type=int, nargs="+", default=[2, 8, 32, 128])
@@ -270,13 +285,17 @@ def main():
     args.out.mkdir(parents=True, exist_ok=False)
     record = {
         "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        "commit": args.source_commit or subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        "harness_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "common_harness_sha256": hashlib.sha256(Path(__file__).with_name("sidecar.py").read_bytes()).hexdigest(),
         "binary_sha256": hashlib.sha256(args.spiced.read_bytes()).hexdigest(),
         "testoperator_sha256": hashlib.sha256(args.testoperator.read_bytes()).hexdigest() if args.testoperator else None,
         "platform": platform.platform(),
         "machine": platform.machine(),
         "cpu_entitlement_per_instance": 2,
         "topology": "standalone" if args.executors == 0 else f"scheduler+{args.executors}executors",
+        "upstream_storage": "cayenne-memory" if args.executors == 0 else "csv-federation",
         "arguments": {key: str(value) for key, value in vars(args).items()},
     }
     (args.out / "provenance.json").write_text(json.dumps(record, indent=2))
@@ -293,7 +312,7 @@ def main():
         # Explicit executor manifests carry local runtime settings; scheduler
         # datasets arrive through the existing cluster protocol.
         if name != "executor-override":
-            arguments += ["--spicepod", str(folder / "spicepod.yaml")]
+            arguments += [str(folder / "spicepod.yaml")]
         startup_error(args.spiced, folder, base_pod(name, [], "sidecar"), arguments,
                       "runtime.mode: sidecar cannot run as a cluster scheduler or executor")
     print("configuration: invalid mode and incompatible cluster roles rejected", flush=True)
@@ -301,6 +320,10 @@ def main():
     cluster_pod = base_pod("upstream", [
         {"from": f"file:{source_path}", "name": "remote_orders", "params": {"file_format": "csv"}},
     ])
+    if not args.executors:
+        # Keep the standalone origin's working set in Cayenne memory so CSV
+        # parsing does not dominate the uplink comparison.
+        cluster_pod["datasets"][0]["acceleration"] = {"enabled": True, "engine": "cayenne", "mode": "memory"}
     scheduler_port = port()
     scheduler_args = []
     executors = []
@@ -331,13 +354,23 @@ def main():
              "params": {"spiceai_endpoint": f"http://127.0.0.1:{upstream.flight}"}}
             for prefix, name in [("spice.ai", "orders"), ("spiceai", "other_orders")]
         ]
-        for mode in ["server", "sidecar"]:
+        for mode in args.modes:
             instance = Instance(args.spiced, args.out / f"correctness-{mode}", base_pod(mode, datasets, mode))
             instance.start()
             try:
                 results = {}
                 for name, sql in correctness_queries().items():
-                    actual, _ = instance.query(sql)
+                    try:
+                        actual, _ = instance.query(sql)
+                    except urllib.error.HTTPError as error:
+                        observed = {"mode": mode, "name": name, "sql": sql, "status": error.code, "error": error.read().decode()}
+                        (instance.directory / f"{name}-error.json").write_text(json.dumps(observed, indent=2))
+                        if name == "null-in-projection" and "Physical plan does not support logical expression InSubquery" in observed["error"]:
+                            observed["expected_unsupported"] = True
+                            observed["expected_rows"] = expected(database, sql)
+                            (instance.directory / f"{name}-error.json").write_text(json.dumps(observed, indent=2))
+                            continue
+                        raise AssertionError(observed) from error
                     oracle = expected(database, sql)
                     results[name] = {"sql": sql, "actual": actual, "expected": oracle}
                     (instance.directory / "results.json").write_text(json.dumps(results, indent=2))
@@ -422,6 +455,51 @@ def main():
         finally:
             timeout_instance.stop()
         print("paused upstream: five requests returned HTTP 504", flush=True)
+
+        cancel_pod = base_pod("cancel", datasets, "sidecar")
+        cancel_pod["runtime"]["query"]["timeout"] = "2s"
+        cancel_instance = Instance(args.spiced, args.out / "cancel", cancel_pod)
+        cancellation = {}
+        worker = None
+        try:
+            cancel_instance.start()
+            os.kill(upstream.process.pid, signal.SIGSTOP)
+            try:
+                def pending_query():
+                    try:
+                        cancellation["rows"], _ = cancel_instance.query(QUERIES["point"])
+                    except urllib.error.HTTPError as error:
+                        cancellation.update(status=error.code, body=error.read().decode())
+                    except (OSError, ValueError) as error:
+                        cancellation["unexpected_error"] = repr(error)
+
+                worker = threading.Thread(target=pending_query)
+                worker.start()
+                limit = time.monotonic() + 1
+                while True:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{cancel_instance.http}/v1/sql/active", timeout=2) as response:
+                        active = json.load(response)["queries"]
+                    active = [query for query in active if query["sql_preview"] == QUERIES["point"]]
+                    if active:
+                        break
+                    assert time.monotonic() < limit, "query did not enter the active registry"
+                    time.sleep(0.01)
+                query_id = active[0]["query_id"]
+                request = urllib.request.Request(f"http://127.0.0.1:{cancel_instance.http}/v1/sql/{query_id}/cancel", data=b"")
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    cancellation["acknowledgement"] = json.load(response)
+                worker.join(timeout=5)
+                assert not worker.is_alive(), "cancelled query did not finish"
+                (cancel_instance.directory / "result.json").write_text(json.dumps(cancellation, indent=2))
+                assert cancellation.get("status") == 499, cancellation
+                assert "cancelled" in cancellation["body"].lower(), cancellation
+            finally:
+                os.kill(upstream.process.pid, signal.SIGCONT)
+        finally:
+            if worker:
+                worker.join(timeout=5)
+            cancel_instance.stop()
+        print("explicit cancellation before deadline: HTTP 499", flush=True)
 
         # An upstream-only UDF may use a Substrait operator's conventional
         # name. Local planning must preserve the SQL operator's meaning.

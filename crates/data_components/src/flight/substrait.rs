@@ -128,6 +128,13 @@ impl SubstraitProducer for SpiceProducer {
                     )
                 })?
                 .clone();
+            if matches!(expression, Expr::BinaryExpr(_))
+                && datafusion_substrait::logical_plan::consumer::name_to_op(&name).is_none()
+            {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "Operator '{name}' is evaluated in the sidecar",
+                )));
+            }
             if !name.starts_with("spice.operator.") {
                 function.function_reference = self
                     .extensions

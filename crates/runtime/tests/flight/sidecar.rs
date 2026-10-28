@@ -117,14 +117,13 @@ async fn sidecar_substrait_connector_roundtrip() -> anyhow::Result<()> {
             "SELECT id FROM orders WHERE value NOT IN (SELECT value FROM other_orders) ORDER BY id",
             "SELECT id FROM orders WHERE NOT (value IN (SELECT value FROM other_orders)) ORDER BY id",
             "SELECT id FROM orders WHERE value NOT IN (SELECT value FROM other_orders WHERE id < 0) ORDER BY id",
-            "SELECT id, value IN (SELECT value FROM other_orders) AS present FROM orders ORDER BY id",
             "SELECT CASE WHEN value IS NULL THEN 99 ELSE value END AS v FROM orders ORDER BY id",
             "SELECT arrow_cast(label, 'Utf8View') AS label FROM orders ORDER BY id",
             "SELECT CAST(value AS DECIMAL(20, 3)) AS decimal_value FROM orders ORDER BY id",
             "SELECT make_array(id, value) AS numbers FROM orders ORDER BY id",
             "SELECT named_struct('key', id, 'value', label) AS nested FROM orders ORDER BY id",
             "SELECT map(make_array('key', 'value'), make_array(id, value)) AS attributes FROM orders ORDER BY id",
-            "SELECT TIMESTAMP '2026-01-01 00:00:00' + id * INTERVAL '1 second' AS ts FROM orders ORDER BY id",
+            "SELECT to_timestamp_seconds(id) AS ts FROM orders ORDER BY id",
             "SELECT sidecar_roundtrip_identity(value) AS value FROM orders ORDER BY id",
         ];
         for sql in corpus {
@@ -139,6 +138,12 @@ async fn sidecar_substrait_connector_roundtrip() -> anyhow::Result<()> {
                 assert_eq!(actual.schema(), expected.schema(), "{sql}");
             }
         }
+        let unsupported = "SELECT id, value IN (SELECT value FROM other_orders) AS present FROM orders ORDER BY id";
+        let oracle_error = oracle.sql(unsupported).await?.collect().await.expect_err("projection IN is unsupported");
+        let remote_error = rows(&sidecar, unsupported).await.expect_err("projection IN is unsupported");
+        assert!(oracle_error.to_string().contains("Physical plan does not support logical expression InSubquery"), "{oracle_error}");
+        assert!(remote_error.to_string().contains("Physical plan does not support logical expression InSubquery"), "{remote_error}");
+
         let explained = rows(&sidecar,
             "EXPLAIN SELECT l.id FROM orders l JOIN other_orders r ON l.id = r.id").await?;
         let explain = pretty_format_batches(&explained)?.to_string();
