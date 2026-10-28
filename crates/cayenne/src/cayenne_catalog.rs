@@ -23,8 +23,6 @@ use super::metadata::{
     PkConflictDetection, SettingsChangeAction, SnapshotFile, SnapshotFileStatistics, TableMetadata,
     TableStatistics, TableStorageStats, VortexConfig,
 };
-use crate::metastore_tap::actions as tap;
-use cayenne_metastore_actions::proto::Select as TapSelect;
 use super::metastore::sqlite::{SqliteMetastore, is_memory_db_path};
 #[cfg(feature = "turso")]
 use super::metastore::turso::TursoMetastore;
@@ -32,8 +30,10 @@ use super::metastore::{
     ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreTransaction,
     MetastoreValue, QueryParams, QueryRowParams,
 };
+use crate::metastore_tap::actions as tap;
 use arrow_tools::map_entries::conforming_schema;
 use async_trait::async_trait;
+use cayenne_metastore_actions::proto::Select as TapSelect;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use std::collections::HashMap;
 use std::path::Path;
@@ -414,6 +414,62 @@ impl CayenneCatalog {
         if let Some(tap) = &self.tap {
             tap.commit(vec![(op, build())], Vec::new());
         }
+    }
+
+    // Slice transfer bypasses catalog mutation methods. Its payload supplies the
+    // incoming IDs; the tap's pre-state supplies identities replaced by import.
+    fn tap_slice_unconverted(
+        &self,
+        slice: &crate::metastore::snapshot::DatasetMetastoreSlice,
+        method: &str,
+    ) -> Vec<cayenne_metastore_actions::Action> {
+        use crate::metastore::snapshot::SliceValue;
+        use std::collections::BTreeSet;
+        let mut ids: BTreeSet<String> = slice
+            .tables
+            .get("cayenne_table")
+            .into_iter()
+            .flatten()
+            .filter_map(|row| match row.first() {
+                Some(SliceValue::Text(id)) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        if let Some(tap) = &self.tap {
+            let state = tap.state();
+            let mut names = BTreeSet::from([slice.dataset_name.clone()]);
+            for table in state
+                .tables
+                .values()
+                .filter(|t| t.name == slice.dataset_name)
+            {
+                for partition in table.partitions.values() {
+                    names.extend(crate::partition_naming::partition_child_candidate_names(
+                        &slice.dataset_name,
+                        &partition.values,
+                    ));
+                }
+            }
+            ids.extend(
+                state
+                    .tables
+                    .iter()
+                    .filter(|(_, table)| names.contains(&table.name))
+                    .map(|(id, _)| id.clone()),
+            );
+        }
+        ids.into_iter()
+            .map(|table_id| {
+                cayenne_metastore_actions::Action::new(
+                    cayenne_metastore_actions::Kind::Unconverted(
+                        cayenne_metastore_actions::proto::Unconverted {
+                            table_id,
+                            method: method.to_string(),
+                        },
+                    ),
+                )
+            })
+            .collect()
     }
 
     async fn tap_verify_pending(&self) {
@@ -815,12 +871,15 @@ impl CayenneCatalog {
             message: format!("Failed to update schema for table {table_id}"),
             source: Box::new(source),
         };
-        let tap_schema = cayenne_metastore_actions::Action::new(
-            cayenne_metastore_actions::Kind::SetSchema(cayenne_metastore_actions::proto::SetSchema {
-                table_id: table_id.to_string(),
-                schema: Some(cayenne_metastore_actions::ObjRef::of(schema_json.as_bytes())),
-            }),
-        );
+        let tap_schema =
+            cayenne_metastore_actions::Action::new(cayenne_metastore_actions::Kind::SetSchema(
+                cayenne_metastore_actions::proto::SetSchema {
+                    table_id: table_id.to_string(),
+                    schema: Some(cayenne_metastore_actions::ObjRef::of(
+                        schema_json.as_bytes(),
+                    )),
+                },
+            ));
         if !drop_statistics {
             return self
                 .tap_autocommit(
@@ -1057,8 +1116,7 @@ impl CayenneCatalog {
             }
         }
         for chunk in payload.delete_files.chunks(MAX_PARAMS / 10) {
-            let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
-            txn.execute(ExecuteParams { sql: &sql, params }).await?;
+            Self::insert_delete_files_tapped(&*txn, chunk).await?;
         }
         txn.execute(ExecuteParams {
             sql: SNAPSHOT_SEQUENCE_UPSERT_SQL,
@@ -1099,10 +1157,11 @@ impl CayenneCatalog {
             .await?;
         }
         crate::metastore_tap::push(&*txn, "apply_prepared_on_conflict", || {
-            let mut actions = vec![
-                tap::add_delete_files(table_id, &payload.delete_files),
-                tap::set_group(table_id, target_snapshot_id, snapshot_sequence),
-            ];
+            let mut actions = vec![tap::set_group(
+                table_id,
+                target_snapshot_id,
+                snapshot_sequence,
+            )];
             if let Some(tombstone) = &payload.inline_tombstone {
                 actions.push(cayenne_metastore_actions::Action::new(
                     cayenne_metastore_actions::Kind::AddInlinedDelete(
@@ -1395,6 +1454,7 @@ impl CayenneCatalog {
                                 id: updated.inlined_id.clone(),
                                 payload: updated.data_ipc.clone(),
                                 count: updated.record_count,
+                                require_present: false,
                             },
                         ),
                     )
@@ -1408,7 +1468,12 @@ impl CayenneCatalog {
                 ));
             }
             for (data_entry, id) in data.iter().zip(&inserted_ids) {
-                actions.push(tap::add_inlined(table_id, data_entry, id, assigned_sequence));
+                actions.push(tap::add_inlined(
+                    table_id,
+                    data_entry,
+                    id,
+                    assigned_sequence,
+                ));
             }
             actions
         });
@@ -1478,11 +1543,11 @@ impl CayenneCatalog {
              UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} WHERE table_id = {table_id_literal};"
         );
 
-        txn.execute_batch(&batch_sql)
-            .await
-            .map_err(|e| CatalogError::FailedToSetCurrentSnapshot {
+        txn.execute_batch(&batch_sql).await.map_err(|e| {
+            CatalogError::FailedToSetCurrentSnapshot {
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         crate::metastore_tap::push(&*txn, "commit_compaction", || {
             vec![
                 tap::remove_delete_files(table_id, TapSelect::All, &[], None),
@@ -1598,11 +1663,11 @@ impl CayenneCatalog {
                WHERE table_id = {table_id_literal};"
         );
 
-        txn.execute_batch(&batch_sql)
-            .await
-            .map_err(|e| CatalogError::FailedToSetCurrentSnapshot {
+        txn.execute_batch(&batch_sql).await.map_err(|e| {
+            CatalogError::FailedToSetCurrentSnapshot {
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         crate::metastore_tap::push(&*txn, "commit_compaction_fenced", || {
             let mut actions = vec![
                 tap::remove_delete_files(table_id, TapSelect::All, &[], Some(cutoff)),
@@ -1904,13 +1969,7 @@ impl CayenneCatalog {
         // The position deletes that hide the copies later copies superseded, after
         // the batch above cleared the previous snapshot's.
         for chunk in delete_files.chunks(32_000 / 10) {
-            let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
-            txn.execute(ExecuteParams { sql: &sql, params }).await?;
-        }
-        if !delete_files.is_empty() {
-            crate::metastore_tap::push(&*txn, "commit_overwrite", || {
-                vec![tap::add_delete_files(table_id, delete_files)]
-            });
+            Self::insert_delete_files_tapped(&*txn, chunk).await?;
         }
         Ok(())
     }
@@ -2042,6 +2101,22 @@ impl CayenneCatalog {
             })
             .await?;
         }
+        crate::metastore_tap::push(&*txn, "clear_pending_write_back", || {
+            vec![cayenne_metastore_actions::Action::new(
+                cayenne_metastore_actions::Kind::ClearDelivered(
+                    cayenne_metastore_actions::proto::AddKeys {
+                        table_id: table_id.to_string(),
+                        keys: keys
+                            .iter()
+                            .map(|(pk, seq)| cayenne_metastore_actions::proto::PkSeq {
+                                pk: pk.clone(),
+                                seq: *seq,
+                            })
+                            .collect(),
+                    },
+                ),
+            )]
+        });
         txn.commit().await?;
         Ok(())
     }
@@ -2408,14 +2483,22 @@ impl CayenneCatalog {
         let (sql, params) =
             Self::build_insert_records_chunk_sql(table_id, &pk_bytes_list, sequence_number);
 
-        self.tap_autocommit(ExecuteParams { sql: &sql, params }, "add_insert_records", || {
-            vec![tap_insert_records(table_id, &pk_bytes_list, sequence_number)]
-        })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to add insert record entries in batch".to_string(),
-                source: Box::new(e),
-            })?;
+        self.tap_autocommit(
+            ExecuteParams { sql: &sql, params },
+            "add_insert_records",
+            || {
+                vec![tap_insert_records(
+                    table_id,
+                    &pk_bytes_list,
+                    sequence_number,
+                )]
+            },
+        )
+        .await
+        .map_err(|e| CatalogError::InvalidOperation {
+            message: "Failed to add insert record entries in batch".to_string(),
+            source: Box::new(e),
+        })?;
         Ok(())
     }
 
@@ -2528,6 +2611,39 @@ impl CayenneCatalog {
 
         sql.push_str(SUFFIX);
         (sql, params)
+    }
+
+    async fn insert_delete_files_tapped(
+        txn: &dyn MetastoreTransaction,
+        files: &[DeleteFile],
+    ) -> CatalogResult<()> {
+        let (sql, params) = Self::build_insert_delete_files_chunk_sql(files);
+        // IDs are minted by the SQL builder; keep those exact bound values.
+        let ids: Vec<String> = if txn.tap().is_some() {
+            params
+                .as_chunks::<10>()
+                .0
+                .iter()
+                .map(|row| String::from_value(&row[0]))
+                .collect::<CatalogResult<_>>()?
+        } else {
+            Vec::new()
+        };
+        txn.execute(ExecuteParams { sql: &sql, params }).await?;
+        crate::metastore_tap::push(txn, "add_delete_files", || {
+            files
+                .iter()
+                .zip(ids)
+                .map(|(file, id)| {
+                    let file = DeleteFile {
+                        delete_file_id: id,
+                        ..file.clone()
+                    };
+                    tap::add_delete_files(&file.table_id, std::slice::from_ref(&file))
+                })
+                .collect()
+        });
+        Ok(())
     }
 
     /// Build a single batched `UPDATE … SET published = 1 WHERE table_id = ?
@@ -2677,8 +2793,7 @@ impl CayenneCatalog {
             // txn to pinpoint the offending delete file for the descriptive
             // validation error.
             for chunk in delete_files.chunks(MAX_DELETE_FILE_ROWS_PER_CHUNK) {
-                let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
-                let res = tx.execute(ExecuteParams { sql: &sql, params }).await;
+                let res = Self::insert_delete_files_tapped(&*tx, chunk).await;
                 if let Err(e) = res {
                     if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
                         drop(tx);
@@ -2692,10 +2807,11 @@ impl CayenneCatalog {
                     }
 
                     for delete_file in chunk {
-                        let (sql, params) = Self::build_insert_delete_files_chunk_sql(
+                        let res = Self::insert_delete_files_tapped(
+                            &*tx,
                             std::slice::from_ref(delete_file),
-                        );
-                        let res = tx.execute(ExecuteParams { sql: &sql, params }).await;
+                        )
+                        .await;
                         if let Err(e) = res {
                             if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
                                 drop(tx);
@@ -2804,6 +2920,21 @@ impl CayenneCatalog {
                 }
             }
 
+            crate::metastore_tap::push(&*tx, "commit_on_conflict_deletions", || {
+                let mut actions = Vec::new();
+                if let Some(seq) = &snapshot_sequence {
+                    actions.push(tap::set_group(
+                        table_id,
+                        &seq.snapshot_id,
+                        seq.sequence_number,
+                    ));
+                }
+                if clear_inlined {
+                    actions.push(tap::remove_inlined(table_id, TapSelect::All, &[]));
+                    actions.push(tap::remove_inlined_deletes(table_id, TapSelect::All, &[]));
+                }
+                actions
+            });
             match tx.commit().await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
@@ -3046,6 +3177,11 @@ impl CayenneCatalog {
                 source: Box::new(e),
             })?;
 
+        crate::metastore_tap::push(transaction, "drop_table", || {
+            vec![cayenne_metastore_actions::Action::new(
+                cayenne_metastore_actions::Kind::DropTable(tap::table(table_id)),
+            )]
+        });
         Ok(())
     }
 }
@@ -3277,7 +3413,9 @@ impl MetadataCatalog for CayenneCatalog {
             name: table_name.clone(),
             path: base_path.clone(),
             path_is_relative: false,
-            schema: Some(cayenne_metastore_actions::ObjRef::of(schema_json.as_bytes())),
+            schema: Some(cayenne_metastore_actions::ObjRef::of(
+                schema_json.as_bytes(),
+            )),
             primary_key_json: primary_key_json.clone(),
             on_conflict_json: on_conflict_json.clone(),
             partition_column: partition_column.clone(),
@@ -3286,8 +3424,9 @@ impl MetadataCatalog for CayenneCatalog {
             seq: 0,
         };
         let insert_result = self
-            .tap_autocommit(ExecuteParams {
-                sql: r"
+            .tap_autocommit(
+                ExecuteParams {
+                    sql: r"
                     INSERT INTO cayenne_table (
                         table_id, table_name, path, path_is_relative, schema_json, primary_key_json,
                         on_conflict_json, current_snapshot_id, partition_column, vortex_config_json
@@ -3295,25 +3434,26 @@ impl MetadataCatalog for CayenneCatalog {
                      ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
                     )
                 ",
-                params: vec![
-                    MetastoreValue::Text(table_id.clone()),
-                    MetastoreValue::Text(table_name.clone()),
-                    MetastoreValue::Text(base_path.clone()),
-                    MetastoreValue::Bool(false), // path_is_relative
-                    MetastoreValue::Text(schema_json),
-                    primary_key_json.map_or(MetastoreValue::Null, MetastoreValue::Text),
-                    on_conflict_json.map_or(MetastoreValue::Null, MetastoreValue::Text),
-                    MetastoreValue::Text(initial_snapshot_id.clone()),
-                    partition_column.map_or(MetastoreValue::Null, MetastoreValue::Text),
-                    MetastoreValue::Text(vortex_config_json),
-                ],
-            },
-            "create_table",
-            || {
-                vec![cayenne_metastore_actions::Action::new(
-                    cayenne_metastore_actions::Kind::CreateTable(tap_create),
-                )]
-            })
+                    params: vec![
+                        MetastoreValue::Text(table_id.clone()),
+                        MetastoreValue::Text(table_name.clone()),
+                        MetastoreValue::Text(base_path.clone()),
+                        MetastoreValue::Bool(false), // path_is_relative
+                        MetastoreValue::Text(schema_json),
+                        primary_key_json.map_or(MetastoreValue::Null, MetastoreValue::Text),
+                        on_conflict_json.map_or(MetastoreValue::Null, MetastoreValue::Text),
+                        MetastoreValue::Text(initial_snapshot_id.clone()),
+                        partition_column.map_or(MetastoreValue::Null, MetastoreValue::Text),
+                        MetastoreValue::Text(vortex_config_json),
+                    ],
+                },
+                "create_table",
+                || {
+                    vec![cayenne_metastore_actions::Action::new(
+                        cayenne_metastore_actions::Kind::CreateTable(tap_create),
+                    )]
+                },
+            )
             .await;
 
         match insert_result {
@@ -3547,8 +3687,9 @@ impl MetadataCatalog for CayenneCatalog {
             ..delete_file.clone()
         };
         let insert_result = self
-            .tap_autocommit(ExecuteParams {
-                sql: r"
+            .tap_autocommit(
+                ExecuteParams {
+                    sql: r"
                 INSERT INTO cayenne_delete_file (
                     delete_file_id, table_id, path, path_is_relative,
                     format, delete_count, file_size_bytes, source_data_file_path, sequence_number,
@@ -3557,26 +3698,32 @@ impl MetadataCatalog for CayenneCatalog {
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
                 )
             ",
-                params: vec![
-                    MetastoreValue::Text(delete_file_id.clone()),
-                    MetastoreValue::Text(delete_file.table_id.clone()),
-                    MetastoreValue::Text(delete_file.path.clone()),
-                    MetastoreValue::Bool(delete_file.path_is_relative),
-                    MetastoreValue::Text(delete_file.format.clone()),
-                    MetastoreValue::Integer(delete_file.delete_count),
-                    MetastoreValue::Integer(delete_file.file_size_bytes),
-                    delete_file
-                        .source_data_file_path
-                        .clone()
-                        .map_or(MetastoreValue::Null, MetastoreValue::Text),
-                    MetastoreValue::Integer(delete_file.sequence_number),
-                    delete_file
-                        .reinsert_sequence
-                        .map_or(MetastoreValue::Null, MetastoreValue::Integer),
-                ],
-            },
-            "add_delete_file",
-            || vec![tap::add_delete_files(&tap_dv.table_id, std::slice::from_ref(&tap_dv))])
+                    params: vec![
+                        MetastoreValue::Text(delete_file_id.clone()),
+                        MetastoreValue::Text(delete_file.table_id.clone()),
+                        MetastoreValue::Text(delete_file.path.clone()),
+                        MetastoreValue::Bool(delete_file.path_is_relative),
+                        MetastoreValue::Text(delete_file.format.clone()),
+                        MetastoreValue::Integer(delete_file.delete_count),
+                        MetastoreValue::Integer(delete_file.file_size_bytes),
+                        delete_file
+                            .source_data_file_path
+                            .clone()
+                            .map_or(MetastoreValue::Null, MetastoreValue::Text),
+                        MetastoreValue::Integer(delete_file.sequence_number),
+                        delete_file
+                            .reinsert_sequence
+                            .map_or(MetastoreValue::Null, MetastoreValue::Integer),
+                    ],
+                },
+                "add_delete_file",
+                || {
+                    vec![tap::add_delete_files(
+                        &tap_dv.table_id,
+                        std::slice::from_ref(&tap_dv),
+                    )]
+                },
+            )
             .await;
 
         match insert_result {
@@ -3633,12 +3780,8 @@ impl MetadataCatalog for CayenneCatalog {
         }
         let txn = self.begin_transaction().await?;
         for chunk in delete_files.chunks(MAX_PARAMS / PARAMS_PER_ROW) {
-            let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
-            txn.execute(ExecuteParams { sql: &sql, params }).await?;
+            Self::insert_delete_files_tapped(&*txn, chunk).await?;
         }
-        crate::metastore_tap::push(&*txn, "add_delete_files", || {
-            vec![tap::add_delete_files(table_id, &delete_files)]
-        });
         txn.commit().await
     }
 
@@ -3673,56 +3816,33 @@ impl MetadataCatalog for CayenneCatalog {
             }
         }
         let txn = self.begin_transaction().await?;
-        crate::metastore_tap::push(&*txn, "commit_delete_files_with_inlined_rewrite", || {
-            let mut actions = Vec::new();
-            if !replaced_delete_file_ids.is_empty() {
-                actions.push(tap::remove_delete_files(
-                    table_id,
-                    TapSelect::Listed,
-                    &replaced_delete_file_ids,
-                    None,
-                ));
-            }
-            actions.push(tap::add_delete_files(table_id, &delete_files));
-            for updated in &updated_data {
-                actions.push(cayenne_metastore_actions::Action::new(
-                    cayenne_metastore_actions::Kind::UpdateInlinedData(
-                        cayenne_metastore_actions::proto::UpdateInlinedData {
-                            table_id: table_id.to_string(),
-                            id: updated.inlined_id.clone(),
-                            payload: updated.data_ipc.clone(),
-                            count: updated.record_count,
-                        },
-                    ),
-                ));
-            }
-            if !deleted_inlined_ids.is_empty() {
-                actions.push(tap::remove_inlined(
-                    table_id,
-                    TapSelect::Listed,
-                    &deleted_inlined_ids,
-                ));
-            }
-            actions
-        });
         if !replaced_delete_file_ids.is_empty() {
             txn.execute_many(
                 "DELETE FROM cayenne_delete_file WHERE table_id = ?1 AND delete_file_id = ?2",
                 replaced_delete_file_ids
-                    .into_iter()
+                    .iter()
                     .map(|id| {
                         vec![
                             MetastoreValue::Text(table_id.to_string()),
-                            MetastoreValue::Text(id),
+                            MetastoreValue::Text(id.clone()),
                         ]
                     })
                     .collect(),
             )
             .await?;
         }
+        if !replaced_delete_file_ids.is_empty() {
+            crate::metastore_tap::push(&*txn, "commit_delete_files_with_inlined_rewrite", || {
+                vec![tap::remove_delete_files(
+                    table_id,
+                    TapSelect::Listed,
+                    &replaced_delete_file_ids,
+                    None,
+                )]
+            });
+        }
         for chunk in delete_files.chunks(MAX_PARAMS / PARAMS_PER_DELETE_FILE) {
-            let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
-            txn.execute(ExecuteParams { sql: &sql, params }).await?;
+            Self::insert_delete_files_tapped(&*txn, chunk).await?;
         }
         for updated in &updated_data {
             txn.query_row_values(QueryRowParams {
@@ -3754,6 +3874,30 @@ impl MetadataCatalog for CayenneCatalog {
             })
             .await?;
         }
+        crate::metastore_tap::push(&*txn, "commit_delete_files_with_inlined_rewrite", || {
+            let mut actions = Vec::new();
+            for updated in &updated_data {
+                actions.push(cayenne_metastore_actions::Action::new(
+                    cayenne_metastore_actions::Kind::UpdateInlinedData(
+                        cayenne_metastore_actions::proto::UpdateInlinedData {
+                            table_id: table_id.to_string(),
+                            id: updated.inlined_id.clone(),
+                            payload: updated.data_ipc.clone(),
+                            count: updated.record_count,
+                            require_present: true,
+                        },
+                    ),
+                ));
+            }
+            if !deleted_inlined_ids.is_empty() {
+                actions.push(tap::remove_inlined(
+                    table_id,
+                    TapSelect::Listed,
+                    &deleted_inlined_ids,
+                ));
+            }
+            actions
+        });
         txn.commit().await
     }
 
@@ -3879,14 +4023,18 @@ impl MetadataCatalog for CayenneCatalog {
             params.push(MetastoreValue::Text(id.clone()));
         }
 
-        self.tap_autocommit(ExecuteParams { sql: &sql, params }, "remove_delete_files", || {
-            vec![tap::remove_delete_files(
-                table_id,
-                TapSelect::Listed,
-                delete_file_ids,
-                None,
-            )]
-        })
+        self.tap_autocommit(
+            ExecuteParams { sql: &sql, params },
+            "remove_delete_files",
+            || {
+                vec![tap::remove_delete_files(
+                    table_id,
+                    TapSelect::Listed,
+                    delete_file_ids,
+                    None,
+                )]
+            },
+        )
         .await
     }
 
@@ -3897,12 +4045,19 @@ impl MetadataCatalog for CayenneCatalog {
                 params: vec![MetastoreValue::Text(table_id.to_string())],
             },
             "clear_delete_files",
-            || vec![tap::remove_delete_files(table_id, TapSelect::All, &[], None)],
+            || {
+                vec![tap::remove_delete_files(
+                    table_id,
+                    TapSelect::All,
+                    &[],
+                    None,
+                )]
+            },
         )
-            .await
-            .map_err(|e| CatalogError::FailedToGetTableDeleteFiles {
-                source: Box::new(e),
-            })?;
+        .await
+        .map_err(|e| CatalogError::FailedToGetTableDeleteFiles {
+            source: Box::new(e),
+        })?;
         Ok(())
     }
 
@@ -4032,7 +4187,8 @@ impl MetadataCatalog for CayenneCatalog {
     ) -> CatalogResult<()> {
         // Use INSERT OR REPLACE to update sequence if the (table_id, pk_bytes)
         // composite PK already exists.
-        let tap_action = tap_insert_records(table_id, std::slice::from_ref(&pk_bytes), sequence_number);
+        let tap_action =
+            tap_insert_records(table_id, std::slice::from_ref(&pk_bytes), sequence_number);
         self.tap_autocommit(
             ExecuteParams {
                 sql: "INSERT OR REPLACE INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES (?1, ?2, ?3)",
@@ -4085,16 +4241,14 @@ impl MetadataCatalog for CayenneCatalog {
         // Multiple chunks required — use a proper transaction for atomicity.
         // The transaction holds exclusive access to the connection, preventing
         // concurrent operations from interleaving BEGIN/COMMIT boundaries.
-        let tx = self.begin_transaction().await.map_err(|e| {
-            CatalogError::InvalidOperation {
+        let tx = self
+            .begin_transaction()
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
                 message: "Failed to begin transaction for batch insert records".to_string(),
                 source: Box::new(e),
-            }
-        })?;
+            })?;
 
-        crate::metastore_tap::push(&*tx, "add_insert_records", || {
-            vec![tap_insert_records(table_id, &pk_bytes_list, sequence_number)]
-        });
         for chunk in pk_bytes_list.chunks(MAX_ROWS_PER_CHUNK) {
             let (sql, params) =
                 Self::build_insert_records_chunk_sql(table_id, chunk, sequence_number);
@@ -4107,6 +4261,13 @@ impl MetadataCatalog for CayenneCatalog {
             }
         }
 
+        crate::metastore_tap::push(&*tx, "add_insert_records", || {
+            vec![tap_insert_records(
+                table_id,
+                &pk_bytes_list,
+                sequence_number,
+            )]
+        });
         tx.commit()
             .await
             .map_err(|e| CatalogError::InvalidOperation {
@@ -4159,11 +4320,11 @@ impl MetadataCatalog for CayenneCatalog {
             "clear_insert_records",
             || vec![tap::clear_insert_records(table_id, None)],
         )
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to clear insert records".to_string(),
-                source: Box::new(e),
-            })?;
+        .await
+        .map_err(|e| CatalogError::InvalidOperation {
+            message: "Failed to clear insert records".to_string(),
+            source: Box::new(e),
+        })?;
         Ok(())
     }
 
@@ -4185,11 +4346,11 @@ impl MetadataCatalog for CayenneCatalog {
             "set_snapshot_sequence",
             || vec![tap::set_group(table_id, snapshot_id, sequence_number)],
         )
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to set snapshot sequence".to_string(),
-                source: Box::new(e),
-            })?;
+        .await
+        .map_err(|e| CatalogError::InvalidOperation {
+            message: "Failed to set snapshot sequence".to_string(),
+            source: Box::new(e),
+        })?;
         Ok(())
     }
 
@@ -4663,9 +4824,7 @@ impl MetadataCatalog for CayenneCatalog {
         let partition_id = uuid::Uuid::now_v7().to_string();
 
         // Insert partition metadata with composite key support
-        let insert_result = self
-            .metastore
-            .execute_helper(ExecuteParams {
+        let insert_result = self.tap_autocommit(ExecuteParams {
                 sql: r"
                 INSERT INTO cayenne_partition (
                     partition_id, table_id, partition_columns_json, partition_values_json, partition_key, path, path_is_relative, record_count, file_size_bytes
@@ -4683,7 +4842,7 @@ impl MetadataCatalog for CayenneCatalog {
                     MetastoreValue::Integer(partition.record_count),
                     MetastoreValue::Integer(partition.file_size_bytes),
                 ],
-            })
+            }, "add_partition", || vec![cayenne_metastore_actions::Action::new(cayenne_metastore_actions::Kind::AddPartition(cayenne_metastore_actions::proto::AddPartition { table_id: partition.table_id.clone(), partition_id: partition_id.clone(), columns: partition.partition_columns.clone(), values: partition.partition_values.clone(), path: partition.path.clone(), path_is_relative: partition.path_is_relative, record_count: partition.record_count, size: partition.file_size_bytes }))])
             .await;
 
         match insert_result {
@@ -4769,8 +4928,8 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn upsert_table_statistics(&self, stats: &TableStatistics) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
+        self.tap_autocommit(
+            ExecuteParams {
                 sql: TABLE_STATISTICS_UPSERT_SQL,
                 params: vec![
                     MetastoreValue::Text(stats.table_id.clone()),
@@ -4782,8 +4941,28 @@ impl MetadataCatalog for CayenneCatalog {
                         .map_or(MetastoreValue::Null, MetastoreValue::Blob),
                     MetastoreValue::Integer(i64::from(stats.num_rows_exact)),
                 ],
-            })
-            .await
+            },
+            "upsert_table_statistics",
+            || {
+                vec![cayenne_metastore_actions::Action::new(
+                    cayenne_metastore_actions::Kind::SetTableStats(
+                        cayenne_metastore_actions::proto::SetTableStats {
+                            table_id: stats.table_id.clone(),
+                            blob: Some(cayenne_metastore_actions::ObjRef::of(
+                                &stats.statistics_blob,
+                            )),
+                            num_rows: stats.num_rows,
+                            ndv: stats
+                                .ndv_sketches
+                                .as_deref()
+                                .map(cayenne_metastore_actions::ObjRef::of),
+                            exact: stats.num_rows_exact,
+                        },
+                    ),
+                )]
+            },
+        )
+        .await
     }
 
     async fn get_table_statistics(&self, table_id: &str) -> CatalogResult<Option<TableStatistics>> {
@@ -4816,20 +4995,23 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn clear_table_statistics(&self, table_id: &str) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
+        self.tap_autocommit(
+            ExecuteParams {
                 sql: "DELETE FROM cayenne_table_statistics WHERE table_id = ?1",
                 params: vec![MetastoreValue::Text(table_id.to_string())],
-            })
-            .await
+            },
+            "clear_table_statistics",
+            || vec![tap::clear_table_stats(table_id)],
+        )
+        .await
     }
 
     async fn upsert_snapshot_file_statistics(
         &self,
         stats: &SnapshotFileStatistics,
     ) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
+        self.tap_autocommit(
+            ExecuteParams {
                 sql: SNAPSHOT_FILE_STATISTICS_UPSERT_SQL,
                 params: vec![
                     MetastoreValue::Text(stats.table_id.clone()),
@@ -4839,8 +5021,11 @@ impl MetadataCatalog for CayenneCatalog {
                     MetastoreValue::Integer(stats.num_rows),
                     MetastoreValue::Blob(stats.statistics_blob.clone()),
                 ],
-            })
-            .await
+            },
+            "upsert_snapshot_file_statistics",
+            || vec![tap::set_file_stats(stats)],
+        )
+        .await
     }
 
     async fn get_snapshot_file_statistics(
@@ -4903,6 +5088,12 @@ impl MetadataCatalog for CayenneCatalog {
             ],
         })
         .await?;
+        crate::metastore_tap::push(&*txn, "clear_snapshot_cached_metadata", || {
+            vec![
+                tap::remove_files(table_id, TapSelect::Listed, &[snapshot_id.to_string()]),
+                tap::remove_file_stats(table_id, TapSelect::Listed, &[snapshot_id.to_string()]),
+            ]
+        });
         txn.commit().await
     }
 
@@ -4911,34 +5102,49 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         snapshot_id: &str,
     ) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
+        self.tap_autocommit(
+            ExecuteParams {
                 sql: "DELETE FROM cayenne_snapshot_file_statistics \
                       WHERE table_id = ?1 AND snapshot_id != ?2",
                 params: vec![
                     MetastoreValue::Text(table_id.to_string()),
                     MetastoreValue::Text(snapshot_id.to_string()),
                 ],
-            })
-            .await
+            },
+            "clear_snapshot_file_statistics_except",
+            || {
+                vec![tap::remove_file_stats(
+                    table_id,
+                    TapSelect::AllExcept,
+                    &[snapshot_id.to_string()],
+                )]
+            },
+        )
+        .await
     }
 
     async fn clear_snapshot_file_statistics(&self, table_id: &str) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
+        self.tap_autocommit(
+            ExecuteParams {
                 sql: "DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = ?1",
                 params: vec![MetastoreValue::Text(table_id.to_string())],
-            })
-            .await
+            },
+            "clear_snapshot_file_statistics",
+            || vec![tap::remove_file_stats(table_id, TapSelect::All, &[])],
+        )
+        .await
     }
 
     async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
+        self.tap_autocommit(
+            ExecuteParams {
                 sql: SNAPSHOT_FILE_UPSERT_SQL,
                 params: snapshot_file_params(file),
-            })
-            .await
+            },
+            "upsert_snapshot_file",
+            || tap::upsert_files(std::slice::from_ref(file)),
+        )
+        .await
     }
 
     async fn replace_snapshot_files(
@@ -4974,6 +5180,12 @@ impl MetadataCatalog for CayenneCatalog {
             files.iter().map(snapshot_file_params).collect(),
         )
         .await?;
+        crate::metastore_tap::push(&*txn, "replace_snapshot_files", || {
+            vec![
+                tap::remove_files(table_id, TapSelect::Listed, &[snapshot_id.to_string()]),
+                tap::add_files(table_id, snapshot_id, files, false),
+            ]
+        });
         txn.commit().await
     }
 
@@ -5043,25 +5255,37 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         snapshot_id: &str,
     ) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
+        self.tap_autocommit(
+            ExecuteParams {
                 sql: "DELETE FROM cayenne_snapshot_file \
                       WHERE table_id = ?1 AND snapshot_id != ?2",
                 params: vec![
                     MetastoreValue::Text(table_id.to_string()),
                     MetastoreValue::Text(snapshot_id.to_string()),
                 ],
-            })
-            .await
+            },
+            "clear_snapshot_files_except",
+            || {
+                vec![tap::remove_files(
+                    table_id,
+                    TapSelect::AllExcept,
+                    &[snapshot_id.to_string()],
+                )]
+            },
+        )
+        .await
     }
 
     async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
+        self.tap_autocommit(
+            ExecuteParams {
                 sql: "DELETE FROM cayenne_snapshot_file WHERE table_id = ?1",
                 params: vec![MetastoreValue::Text(table_id.to_string())],
-            })
-            .await
+            },
+            "clear_snapshot_files",
+            || vec![tap::remove_files(table_id, TapSelect::All, &[])],
+        )
+        .await
     }
 
     async fn list_cold_tier_files(&self, table_id: &str) -> CatalogResult<Vec<ColdTierFile>> {
@@ -5171,16 +5395,29 @@ impl MetadataCatalog for CayenneCatalog {
         snapshot_id: &str,
         index_blob: &[u8],
     ) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
+        self.tap_autocommit(
+            ExecuteParams {
                 sql: PK_INDEX_UPSERT_SQL,
                 params: vec![
                     MetastoreValue::Text(table_id.to_string()),
                     MetastoreValue::Text(snapshot_id.to_string()),
                     MetastoreValue::Blob(index_blob.to_vec()),
                 ],
-            })
-            .await
+            },
+            "upsert_pk_index",
+            || {
+                vec![cayenne_metastore_actions::Action::new(
+                    cayenne_metastore_actions::Kind::SetPkIndex(
+                        cayenne_metastore_actions::proto::SetPkIndex {
+                            table_id: table_id.to_string(),
+                            snapshot_id: snapshot_id.to_string(),
+                            index: Some(cayenne_metastore_actions::ObjRef::of(index_blob)),
+                        },
+                    ),
+                )]
+            },
+        )
+        .await
     }
 
     async fn get_pk_index(&self, table_id: &str) -> CatalogResult<Option<(String, Vec<u8>)>> {
@@ -5202,17 +5439,24 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn clear_pk_index(&self, table_id: &str) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
+        self.tap_autocommit(
+            ExecuteParams {
                 sql: "DELETE FROM cayenne_pk_index WHERE table_id = ?1",
                 params: vec![MetastoreValue::Text(table_id.to_string())],
-            })
-            .await
+            },
+            "clear_pk_index",
+            || {
+                vec![cayenne_metastore_actions::Action::new(
+                    cayenne_metastore_actions::Kind::ClearPkIndex(tap::table(table_id)),
+                )]
+            },
+        )
+        .await
     }
 
     async fn register_index_run(&self, run: &IndexRunRecord) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
+        self.tap_autocommit(
+            ExecuteParams {
                 sql: "INSERT OR REPLACE INTO cayenne_index_run \
                       (table_id, index_key, run_name, row_count, size_bytes) \
                       VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -5223,8 +5467,23 @@ impl MetadataCatalog for CayenneCatalog {
                     MetastoreValue::Integer(i64::try_from(run.row_count).unwrap_or(i64::MAX)),
                     MetastoreValue::Integer(i64::try_from(run.size_bytes).unwrap_or(i64::MAX)),
                 ],
-            })
-            .await
+            },
+            "register_index_run",
+            || {
+                vec![cayenne_metastore_actions::Action::new(
+                    cayenne_metastore_actions::Kind::AddIndexRun(
+                        cayenne_metastore_actions::proto::IndexRun {
+                            table_id: run.table_id.clone(),
+                            index_key: run.index_key.clone(),
+                            run_name: run.run_name.clone(),
+                            rows: run.row_count.min(i64::MAX.unsigned_abs()),
+                            size: run.size_bytes.min(i64::MAX.unsigned_abs()),
+                        },
+                    ),
+                )]
+            },
+        )
+        .await
     }
 
     async fn list_index_runs(&self, table_id: &str) -> CatalogResult<Vec<IndexRunRecord>> {
@@ -5258,8 +5517,8 @@ impl MetadataCatalog for CayenneCatalog {
         index_key: &str,
         run_name: &str,
     ) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
+        self.tap_autocommit(
+            ExecuteParams {
                 sql: "DELETE FROM cayenne_index_run \
                       WHERE table_id = ?1 AND index_key = ?2 AND run_name = ?3",
                 params: vec![
@@ -5267,15 +5526,38 @@ impl MetadataCatalog for CayenneCatalog {
                     MetastoreValue::Text(index_key.to_string()),
                     MetastoreValue::Text(run_name.to_string()),
                 ],
-            })
-            .await
+            },
+            "remove_index_run",
+            || {
+                vec![cayenne_metastore_actions::Action::new(
+                    cayenne_metastore_actions::Kind::RemoveIndexRun(
+                        cayenne_metastore_actions::proto::IndexRun {
+                            table_id: table_id.to_string(),
+                            index_key: index_key.to_string(),
+                            run_name: run_name.to_string(),
+                            rows: 0,
+                            size: 0,
+                        },
+                    ),
+                )]
+            },
+        )
+        .await
     }
 
     async fn add_inlined_data(&self, data: InlinedData) -> CatalogResult<String> {
         let table_id = data.table_id.clone();
         let sequence_number = data.sequence_number;
-        let (inlined_id, insert) = inlined_data_insert(data, &table_id, sequence_number);
-        self.metastore.execute_helper(insert).await?;
+        let (inlined_id, insert) = inlined_data_insert(data.clone(), &table_id, sequence_number);
+        self.tap_autocommit(insert, "add_inlined_data", || {
+            vec![tap::add_inlined(
+                &table_id,
+                &data,
+                &inlined_id,
+                sequence_number,
+            )]
+        })
+        .await?;
         Ok(inlined_id)
     }
 
@@ -5582,12 +5864,15 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
+        self.tap_autocommit(
+            ExecuteParams {
                 sql: "DELETE FROM cayenne_inlined_data WHERE table_id = ?1",
                 params: vec![MetastoreValue::Text(table_id.to_string())],
-            })
-            .await
+            },
+            "clear_inlined_data",
+            || vec![tap::remove_inlined(table_id, TapSelect::All, &[])],
+        )
+        .await
     }
 
     async fn clear_inlined_data_and_deletes(&self, table_id: &str) -> CatalogResult<()> {
@@ -5597,19 +5882,27 @@ impl MetadataCatalog for CayenneCatalog {
              DELETE FROM cayenne_inlined_delete WHERE table_id = {table_id_literal};"
         );
 
+        let _guard = self.tap_guard().await;
         self.metastore
             .execute_transaction_batch_helper(&batch_sql)
-            .await
+            .await?;
+        self.tap_record("clear_inlined_data_and_deletes", || {
+            vec![
+                tap::remove_inlined(table_id, TapSelect::All, &[]),
+                tap::remove_inlined_deletes(table_id, TapSelect::All, &[]),
+            ]
+        });
+        Ok(())
     }
 
     async fn add_inlined_delete(&self, delete: InlinedDelete) -> CatalogResult<String> {
         let inlined_id = if delete.inlined_id.is_empty() {
             uuid::Uuid::now_v7().to_string()
         } else {
-            delete.inlined_id
+            delete.inlined_id.clone()
         };
-        self.metastore
-            .execute_helper(ExecuteParams {
+        self.tap_autocommit(
+            ExecuteParams {
                 sql: r"
                 INSERT INTO cayenne_inlined_delete
                     (inlined_id, table_id, delete_ipc, delete_count, sequence_number, published)
@@ -5617,14 +5910,17 @@ impl MetadataCatalog for CayenneCatalog {
                 ",
                 params: vec![
                     MetastoreValue::Text(inlined_id.clone()),
-                    MetastoreValue::Text(delete.table_id),
-                    MetastoreValue::Blob(delete.delete_ipc),
+                    MetastoreValue::Text(delete.table_id.clone()),
+                    MetastoreValue::Blob(delete.delete_ipc.clone()),
                     MetastoreValue::Integer(delete.delete_count),
                     MetastoreValue::Integer(delete.sequence_number),
                     MetastoreValue::Integer(i64::from(delete.published)),
                 ],
-            })
-            .await?;
+            },
+            "add_inlined_delete",
+            || vec![tap::inlined_delete(&delete, &inlined_id, false)],
+        )
+        .await?;
         Ok(inlined_id)
     }
 
@@ -5633,16 +5929,26 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         inlined_id: &str,
     ) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
+        self.tap_autocommit(
+            ExecuteParams {
                 sql: "UPDATE cayenne_inlined_delete SET published = 1 \
                       WHERE table_id = ?1 AND inlined_id = ?2",
                 params: vec![
                     MetastoreValue::Text(table_id.to_string()),
                     MetastoreValue::Text(inlined_id.to_string()),
                 ],
-            })
-            .await
+            },
+            "mark_inlined_delete_published",
+            || {
+                vec![tap::set_published(
+                    table_id,
+                    TapSelect::Listed,
+                    &[inlined_id.to_string()],
+                    true,
+                )]
+            },
+        )
+        .await
     }
 
     async fn mark_inlined_delete_unpublished(
@@ -5650,16 +5956,26 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         inlined_id: &str,
     ) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
+        self.tap_autocommit(
+            ExecuteParams {
                 sql: "UPDATE cayenne_inlined_delete SET published = 0 \
                       WHERE table_id = ?1 AND inlined_id = ?2",
                 params: vec![
                     MetastoreValue::Text(table_id.to_string()),
                     MetastoreValue::Text(inlined_id.to_string()),
                 ],
-            })
-            .await
+            },
+            "mark_inlined_delete_unpublished",
+            || {
+                vec![tap::set_published(
+                    table_id,
+                    TapSelect::Listed,
+                    &[inlined_id.to_string()],
+                    false,
+                )]
+            },
+        )
+        .await
     }
 
     async fn publish_orphan_inlined_deletes(&self, table_id: &str) -> CatalogResult<u64> {
@@ -5681,13 +5997,16 @@ impl MetadataCatalog for CayenneCatalog {
             .await?;
 
         if pending > 0 {
-            self.metastore
-                .execute_helper(ExecuteParams {
+            self.tap_autocommit(
+                ExecuteParams {
                     sql: "UPDATE cayenne_inlined_delete SET published = 1 \
                           WHERE table_id = ?1 AND published = 0",
                     params: vec![MetastoreValue::Text(table_id.to_string())],
-                })
-                .await?;
+                },
+                "publish_orphan_inlined_deletes",
+                || vec![tap::set_published(table_id, TapSelect::All, &[], true)],
+            )
+            .await?;
         }
 
         Ok(u64::try_from(pending).unwrap_or(0))
@@ -5760,12 +6079,13 @@ impl MetadataCatalog for CayenneCatalog {
         }
 
         for attempt in 1..=max_attempts {
-            let tx = self.begin_transaction().await.map_err(|e| {
-                CatalogError::InvalidOperation {
-                    message: "Failed to begin inline mutation transaction".to_string(),
-                    source: Box::new(e),
-                }
-            })?;
+            let tx =
+                self.begin_transaction()
+                    .await
+                    .map_err(|e| CatalogError::InvalidOperation {
+                        message: "Failed to begin inline mutation transaction".to_string(),
+                        source: Box::new(e),
+                    })?;
 
             // Lever B2: NO counter mutation here. Allocation moved to the
             // in-memory `SeqAllocator` on the provider; the DB high-water is kept
@@ -5989,8 +6309,7 @@ impl MetadataCatalog for CayenneCatalog {
             };
 
             for chunk in delete_files.chunks(MAX_DELETE_FILE_ROWS_PER_CHUNK) {
-                let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
-                let res = tx.execute(ExecuteParams { sql: &sql, params }).await;
+                let res = Self::insert_delete_files_tapped(&*tx, chunk).await;
                 if let Err(e) = res {
                     if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
                         drop(tx);
@@ -6004,10 +6323,11 @@ impl MetadataCatalog for CayenneCatalog {
                     }
 
                     for delete_file in chunk {
-                        let (sql, params) = Self::build_insert_delete_files_chunk_sql(
+                        let res = Self::insert_delete_files_tapped(
+                            &*tx,
                             std::slice::from_ref(delete_file),
-                        );
-                        let res = tx.execute(ExecuteParams { sql: &sql, params }).await;
+                        )
+                        .await;
                         if let Err(e) = res {
                             if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
                                 drop(tx);
@@ -6158,6 +6478,28 @@ impl MetadataCatalog for CayenneCatalog {
                 continue 'attempts;
             }
 
+            crate::metastore_tap::push(&*tx, "commit_on_conflict_deletions_with_tombstone", || {
+                let mut actions = Vec::new();
+                if let Some(seq) = &snapshot_sequence {
+                    actions.push(tap::set_group(
+                        table_id,
+                        &seq.snapshot_id,
+                        seq.sequence_number,
+                    ));
+                }
+                if let Some(tombstone) = &tombstone_with_id {
+                    actions.push(tap::inlined_delete(tombstone, &tombstone.inlined_id, false));
+                }
+                if !pending_durable_flips.is_empty() {
+                    actions.push(tap::set_published(
+                        table_id,
+                        TapSelect::Listed,
+                        pending_durable_flips,
+                        true,
+                    ));
+                }
+                actions
+            });
             match tx.commit().await {
                 Ok(()) => return Ok(inlined_id),
                 Err(e) => {
@@ -6253,12 +6595,15 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn clear_inlined_deletes(&self, table_id: &str) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
+        self.tap_autocommit(
+            ExecuteParams {
                 sql: "DELETE FROM cayenne_inlined_delete WHERE table_id = ?1",
                 params: vec![MetastoreValue::Text(table_id.to_string())],
-            })
-            .await
+            },
+            "clear_inlined_deletes",
+            || vec![tap::remove_inlined_deletes(table_id, TapSelect::All, &[])],
+        )
+        .await
     }
 
     async fn drop_table(&self, table_name: &str) -> CatalogResult<bool> {
@@ -6295,7 +6640,8 @@ impl MetadataCatalog for CayenneCatalog {
         dataset_name: &str,
         data_dir_anchor: &std::path::Path,
     ) -> CatalogResult<crate::metastore::snapshot::DatasetMetastoreSlice> {
-        match &self.metastore.backend {
+        let _guard = self.tap_guard().await;
+        let result = match &self.metastore.backend {
             MetastoreBackendImpl::Sqlite(m) => {
                 crate::metastore::snapshot::export_dataset(m, dataset_name, data_dir_anchor).await
             }
@@ -6303,7 +6649,11 @@ impl MetadataCatalog for CayenneCatalog {
             MetastoreBackendImpl::Turso(m) => {
                 crate::metastore::snapshot::export_dataset(m, dataset_name, data_dir_anchor).await
             }
-        }
+        }?;
+        self.tap_record("export_dataset_slice", || {
+            self.tap_slice_unconverted(&result, "export_dataset_slice")
+        });
+        Ok(result)
     }
 
     async fn import_dataset_slice(
@@ -6311,7 +6661,12 @@ impl MetadataCatalog for CayenneCatalog {
         slice: &crate::metastore::snapshot::DatasetMetastoreSlice,
         data_dir_anchor: &std::path::Path,
     ) -> CatalogResult<()> {
-        match &self.metastore.backend {
+        let _guard = self.tap_guard().await;
+        let actions = self
+            .tap
+            .as_ref()
+            .map(|_| self.tap_slice_unconverted(slice, "import_dataset_slice"));
+        let result = match &self.metastore.backend {
             MetastoreBackendImpl::Sqlite(m) => {
                 crate::metastore::snapshot::import_dataset(m, slice, data_dir_anchor).await
             }
@@ -6319,7 +6674,10 @@ impl MetadataCatalog for CayenneCatalog {
             MetastoreBackendImpl::Turso(m) => {
                 crate::metastore::snapshot::import_dataset(m, slice, data_dir_anchor).await
             }
-        }
+        };
+        result?;
+        self.tap_record("import_dataset_slice", || actions.unwrap_or_default());
+        Ok(())
     }
 }
 
@@ -6590,7 +6948,11 @@ fn insert_record_table_id_blob_literal(table_id: &str) -> String {
     hex
 }
 
-fn tap_insert_records(table_id: &str, pks: &[Vec<u8>], seq: i64) -> cayenne_metastore_actions::Action {
+fn tap_insert_records(
+    table_id: &str,
+    pks: &[Vec<u8>],
+    seq: i64,
+) -> cayenne_metastore_actions::Action {
     cayenne_metastore_actions::Action::new(cayenne_metastore_actions::Kind::AddInsertRecords(
         cayenne_metastore_actions::proto::AddKeys {
             table_id: table_id.to_string(),

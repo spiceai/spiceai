@@ -57,10 +57,18 @@ impl TxnTap {
 
     fn note_sql(&self, sql: &str) {
         let trimmed = sql.trim_start();
-        let upper: String = trimmed.chars().take(6).collect::<String>().to_ascii_uppercase();
+        let upper: String = trimmed
+            .chars()
+            .take(6)
+            .collect::<String>()
+            .to_ascii_uppercase();
         if upper.starts_with("INSERT") || upper.starts_with("UPDATE") || upper.starts_with("DELETE")
         {
-            let prefix: String = trimmed.split_whitespace().take(4).collect::<Vec<_>>().join(" ");
+            let prefix: String = trimmed
+                .split_whitespace()
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(" ");
             self.mutating_statements.lock().push(prefix);
         }
     }
@@ -175,7 +183,10 @@ impl MetastoreTap {
         let mut inner = self.inner.lock();
         inner.report.verified_tables += 1;
         for difference in differences {
-            inner.report.differences.push(format!("{table}: {difference}"));
+            inner
+                .report
+                .differences
+                .push(format!("{table}: {difference}"));
         }
     }
 
@@ -195,6 +206,22 @@ impl MetastoreTap {
         for op in &ops {
             *inner.report.ops.entry((*op).to_string()).or_default() += 1;
         }
+        for (_, actions) in &pushed {
+            for action in actions {
+                if let Some(cayenne_metastore_actions::Kind::Unconverted(a)) = &action.kind {
+                    *inner
+                        .report
+                        .unconverted
+                        .entry(format!("{}: {}", a.method, a.table_id))
+                        .or_default() += 1;
+                }
+            }
+        }
+        let touched: BTreeSet<String> = pushed
+            .iter()
+            .flat_map(|(_, actions)| actions)
+            .filter_map(|a| a.table_id().map(str::to_string))
+            .collect();
         let actions: Vec<Action> = pushed
             .into_iter()
             .flat_map(|(_, actions)| actions)
@@ -202,17 +229,15 @@ impl MetastoreTap {
             .collect();
         let record = Record { actions };
         let record_bytes = encoded_len(&record);
-        let touched: BTreeSet<String> = record
-            .actions
-            .iter()
-            .filter_map(|a| a.table_id().map(str::to_string))
-            .collect();
         let before: BTreeMap<String, Option<TableState>> = touched
             .iter()
             .map(|t| (t.clone(), inner.state.tables.get(t).cloned()))
             .collect();
         if let Err(err) = inner.state.apply(&record) {
-            inner.report.apply_errors.push(format!("commit {commit} ({ops:?}): {err}"));
+            inner
+                .report
+                .apply_errors
+                .push(format!("commit {commit} ({ops:?}): {err}"));
             return;
         }
         let now = Instant::now();
@@ -238,7 +263,13 @@ impl MetastoreTap {
             };
             let size = after.map(checkpoint_size).unwrap_or_default();
             let (name, live_files, dvs) = after.map_or_else(
-                || ((*before[table_id].as_ref().map_or("", |t| t.name.as_str())).to_string(), 0, 0),
+                || {
+                    (
+                        (*before[table_id].as_ref().map_or("", |t| t.name.as_str())).to_string(),
+                        0,
+                        0,
+                    )
+                },
                 |t| (t.name.clone(), t.live_files().len(), t.delete_files.len()),
             );
             if let Some(out) = inner.out.as_mut() {
@@ -333,7 +364,10 @@ impl MetastoreTransaction for TappedTxn {
             _serial,
         } = *self;
         inner.commit().await?;
-        tap.commit(txn.pushed.into_inner(), txn.mutating_statements.into_inner());
+        tap.commit(
+            txn.pushed.into_inner(),
+            txn.mutating_statements.into_inner(),
+        );
         drop(_serial);
         Ok(())
     }
@@ -349,7 +383,11 @@ impl MetastoreTransaction for TappedTxn {
 
 /// Pushes the actions `build` returns into `txn`'s tap, if it has one; builds
 /// nothing otherwise.
-pub(crate) fn push(txn: &dyn MetastoreTransaction, op: &'static str, build: impl FnOnce() -> Vec<Action>) {
+pub(crate) fn push(
+    txn: &dyn MetastoreTransaction,
+    op: &'static str,
+    build: impl FnOnce() -> Vec<Action>,
+) {
     if let Some(tap) = txn.tap() {
         tap.push(op, build());
     }

@@ -30,7 +30,10 @@ use crate::proto::{
 #[derive(Debug, Snafu, PartialEq, Eq)]
 pub enum ApplyError {
     #[snafu(display("action {action} names table {table_id}, which does not exist"))]
-    NoTable { action: &'static str, table_id: String },
+    NoTable {
+        action: &'static str,
+        table_id: String,
+    },
     #[snafu(display("action {action} on table {table_id}: guard failed: {guard}"))]
     Guard {
         action: &'static str,
@@ -154,10 +157,12 @@ fn selects(select_kind: Select, ids: &[String], id: &str) -> bool {
 
 impl DatasetState {
     fn table(&mut self, action: &'static str, table_id: &str) -> Result<&mut TableState> {
-        self.tables.get_mut(table_id).ok_or_else(|| ApplyError::NoTable {
-            action,
-            table_id: table_id.to_string(),
-        })
+        self.tables
+            .get_mut(table_id)
+            .ok_or_else(|| ApplyError::NoTable {
+                action,
+                table_id: table_id.to_string(),
+            })
     }
 
     /// Applies every action of `record`, in order, or none of them.
@@ -299,7 +304,9 @@ impl DatasetState {
                 let table = self.table(name, &a.table_id)?;
                 if a.require_present {
                     ensure!(
-                        a.snapshot_ids.iter().all(|id| table.groups.contains_key(id)),
+                        a.snapshot_ids
+                            .iter()
+                            .all(|id| table.groups.contains_key(id)),
                         GuardSnafu {
                             action: name,
                             table_id: a.table_id.clone(),
@@ -353,8 +360,8 @@ impl DatasetState {
                 let table = self.table(name, &a.table_id)?;
                 let kind = select(a.select);
                 table.delete_files.retain(|id, dv| {
-                    let chosen = selects(kind, &a.ids, id)
-                        && a.seq_le.is_none_or(|seq_le| dv.seq <= seq_le);
+                    let chosen =
+                        selects(kind, &a.ids, id) && a.seq_le.is_none_or(|seq_le| dv.seq <= seq_le);
                     !chosen
                 });
             }
@@ -417,6 +424,14 @@ impl DatasetState {
             }
             Kind::UpdateInlinedData(a) => {
                 let table = self.table(name, &a.table_id)?;
+                ensure!(
+                    !a.require_present || table.inlined_data.contains_key(&a.id),
+                    GuardSnafu {
+                        action: name,
+                        table_id: a.table_id.clone(),
+                        guard: format!("inline row {} is present", a.id)
+                    }
+                );
                 if let Some(row) = table.inlined_data.get_mut(&a.id) {
                     row.payload = ObjRef::of(&a.payload);
                     row.count = a.count;
@@ -425,7 +440,9 @@ impl DatasetState {
             Kind::RemoveInlinedData(a) => {
                 let table = self.table(name, &a.table_id)?;
                 let kind = select(a.select);
-                table.inlined_data.retain(|id, _| !selects(kind, &a.ids, id));
+                table
+                    .inlined_data
+                    .retain(|id, _| !selects(kind, &a.ids, id));
             }
             Kind::AddInlinedDelete(a) => {
                 let table = self.table(name, &a.table_id)?;
@@ -461,7 +478,9 @@ impl DatasetState {
             Kind::RemoveInlinedDeletes(a) => {
                 let table = self.table(name, &a.table_id)?;
                 let kind = select(a.select);
-                table.inlined_deletes.retain(|id, _| !selects(kind, &a.ids, id));
+                table
+                    .inlined_deletes
+                    .retain(|id, _| !selects(kind, &a.ids, id));
             }
             Kind::AddInsertRecords(a) => {
                 let table = self.table(name, &a.table_id)?;
@@ -478,7 +497,10 @@ impl DatasetState {
             Kind::MarkDirty(a) => {
                 let table = self.table(name, &a.table_id)?;
                 for key in &a.keys {
-                    let stored = table.pending_write_back.entry(key.pk.clone()).or_insert(key.seq);
+                    let stored = table
+                        .pending_write_back
+                        .entry(key.pk.clone())
+                        .or_insert(key.seq);
                     *stored = (*stored).max(key.seq);
                 }
             }
@@ -550,12 +572,32 @@ pub fn differences(expected: &TableState, actual: &TableState) -> Vec<String> {
     scalar!(stats);
     scalar!(pk_index);
     map_differences("files", &expected.files, &actual.files, &mut out);
-    map_differences("file_stats", &expected.file_stats, &actual.file_stats, &mut out);
+    map_differences(
+        "file_stats",
+        &expected.file_stats,
+        &actual.file_stats,
+        &mut out,
+    );
     map_differences("groups", &expected.groups, &actual.groups, &mut out);
-    map_differences("delete_files", &expected.delete_files, &actual.delete_files, &mut out);
+    map_differences(
+        "delete_files",
+        &expected.delete_files,
+        &actual.delete_files,
+        &mut out,
+    );
     map_differences("cold", &expected.cold, &actual.cold, &mut out);
-    map_differences("index_runs", &expected.index_runs, &actual.index_runs, &mut out);
-    map_differences("inlined_data", &expected.inlined_data, &actual.inlined_data, &mut out);
+    map_differences(
+        "index_runs",
+        &expected.index_runs,
+        &actual.index_runs,
+        &mut out,
+    );
+    map_differences(
+        "inlined_data",
+        &expected.inlined_data,
+        &actual.inlined_data,
+        &mut out,
+    );
     map_differences(
         "inlined_deletes",
         &expected.inlined_deletes,
@@ -574,7 +616,12 @@ pub fn differences(expected: &TableState, actual: &TableState) -> Vec<String> {
         &actual.pending_write_back,
         &mut out,
     );
-    map_differences("partitions", &expected.partitions, &actual.partitions, &mut out);
+    map_differences(
+        "partitions",
+        &expected.partitions,
+        &actual.partitions,
+        &mut out,
+    );
     out
 }
 
@@ -597,7 +644,9 @@ fn map_differences<K: Ord + std::fmt::Debug, V: PartialEq + std::fmt::Debug>(
             Some(found) if found != value => {
                 shown += 1;
                 if shown <= LIMIT {
-                    out.push(format!("{name}[{key:?}]: expected {value:?}, found {found:?}"));
+                    out.push(format!(
+                        "{name}[{key:?}]: expected {value:?}, found {found:?}"
+                    ));
                 }
             }
             Some(_) => {}
@@ -615,4 +664,3 @@ fn map_differences<K: Ord + std::fmt::Debug, V: PartialEq + std::fmt::Debug>(
         out.push(format!("{name}: {} more differences", shown - LIMIT));
     }
 }
-

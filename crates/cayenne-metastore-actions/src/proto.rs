@@ -356,6 +356,9 @@ pub struct UpdateInlinedData {
     pub payload: Vec<u8>,
     #[prost(int64, tag = "4")]
     pub count: i64,
+    /// Guard: the SQL transaction required this inline row to exist.
+    #[prost(bool, tag = "5")]
+    pub require_present: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, prost::Message)]
@@ -587,9 +590,7 @@ impl Action {
             Kind::RemoveInlinedData(a) | Kind::RemoveInlinedDeletes(a) => &a.table_id,
             Kind::AddInlinedDelete(a) => &a.table_id,
             Kind::SetInlinedDeletesPublished(a) => &a.table_id,
-            Kind::AddInsertRecords(a) | Kind::MarkDirty(a) | Kind::ClearDelivered(a) => {
-                &a.table_id
-            }
+            Kind::AddInsertRecords(a) | Kind::MarkDirty(a) | Kind::ClearDelivered(a) => &a.table_id,
             Kind::ClearInsertRecords(a) => &a.table_id,
             Kind::AddPartition(a) => &a.table_id,
             Kind::Unconverted(a) => &a.table_id,

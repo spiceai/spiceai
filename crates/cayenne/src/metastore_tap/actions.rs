@@ -248,3 +248,20 @@ pub(crate) fn overwrite_clear(table_id: &str, new_snapshot_id: &str) -> Vec<Acti
         set_current(table_id, new_snapshot_id, None),
     ]
 }
+
+/// The exact inline tombstone payload and id bound by the catalog method.
+pub(crate) fn inlined_delete(
+    delete: &crate::metadata::InlinedDelete,
+    id: &str,
+    idempotent: bool,
+) -> Action {
+    Action::new(Kind::AddInlinedDelete(proto::InlinedDelete {
+        table_id: delete.table_id.clone(),
+        id: id.to_string(),
+        payload: delete.delete_ipc.clone(),
+        count: delete.delete_count,
+        seq: delete.sequence_number,
+        published: delete.published,
+        idempotent,
+    }))
+}
