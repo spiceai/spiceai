@@ -250,8 +250,9 @@ impl Visitor for DepthCollector {
         ControlFlow::Continue(())
     }
 
-    // A single-part name that matches a CTE in scope reads that CTE. Names
-    // match case-insensitively, which can only overstate the depth.
+    // A single-part name reads the deepest CTE in scope it could resolve to.
+    // Names match case-insensitively in every enclosing query, which can only
+    // overstate the depth.
     fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<()> {
         let [part] = relation.0.as_slice() else {
             return ControlFlow::Continue(());
@@ -259,14 +260,14 @@ impl Visitor for DepthCollector {
         let Some(name) = part.as_ident().map(|ident| ident.value.as_str()) else {
             return ControlFlow::Continue(());
         };
-        let cte_depth = self.queries.iter().rev().find_map(|frame| {
-            frame
-                .ctes
-                .iter()
-                .find(|(cte, _, _)| cte.eq_ignore_ascii_case(name))
-                .map(|(_, _, depth)| *depth)
-        });
-        if let (Some(Some(depth)), Some(frame)) = (cte_depth, self.queries.last_mut()) {
+        let cte_depth = self
+            .queries
+            .iter()
+            .flat_map(|frame| &frame.ctes)
+            .filter(|(cte, _, _)| cte.eq_ignore_ascii_case(name))
+            .filter_map(|(_, _, depth)| *depth)
+            .max();
+        if let (Some(depth), Some(frame)) = (cte_depth, self.queries.last_mut()) {
             frame.deepest_read = frame.deepest_read.max(depth);
         }
         ControlFlow::Continue(())
@@ -1173,6 +1174,20 @@ mod tests {
         assert_eq!(err.to_string(), too_deep_query_error().to_string());
         let err = depth_check(&format!("EXPLAIN {}", cte_chain(MAX_QUERY_NESTING_DEPTH)))
             .expect_err("EXPLAIN of an over-deep chain is rejected");
+        assert_eq!(err.to_string(), too_deep_query_error().to_string());
+    }
+
+    /// Identifiers are case-sensitive in the runtime, so `C1` and `c1` can be
+    /// different CTEs. A chain whose links differ from shallow CTEs only by
+    /// case still counts at its full depth.
+    #[test]
+    fn case_distinct_cte_chain_is_bounded() {
+        let n = MAX_QUERY_NESTING_DEPTH;
+        let mut ctes: Vec<String> = (0..n).map(|i| format!("c{i} AS (SELECT 1 AS x)")).collect();
+        ctes.push("\"C0\" AS (SELECT 1 AS x)".to_string());
+        ctes.extend((1..n).map(|i| format!("\"C{i}\" AS (SELECT x FROM \"C{}\")", i - 1)));
+        let sql = format!("WITH {} SELECT x FROM \"C{}\"", ctes.join(", "), n - 1);
+        let err = depth_check(&sql).expect_err("the case-distinct chain is over the cap");
         assert_eq!(err.to_string(), too_deep_query_error().to_string());
     }
 
