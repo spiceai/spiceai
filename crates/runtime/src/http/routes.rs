@@ -751,6 +751,7 @@ async fn track_metrics(
     req.extensions_mut().insert(Arc::clone(&request_context));
 
     let request_dimensions = request_context.to_dimensions();
+    let protocol_dimensions = request_context.to_protocol_dimensions();
 
     // Read before the request is handed on: whether a `/v1/sql` stream can carry
     // its `Server-Timing` total as a trailer depends on the request.
@@ -790,6 +791,7 @@ async fn track_metrics(
         .await;
 
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let unauthenticated = response.status() == http::StatusCode::UNAUTHORIZED;
     let status = http_status_label(response.status().as_u16());
 
     let mut labels = vec![
@@ -798,7 +800,14 @@ async fn track_metrics(
         KeyValue::new("status", status),
     ];
 
-    labels.extend(request_dimensions);
+    // This layer wraps the auth layer, so it also sees requests the auth layer
+    // rejected. Their client dimensions come from headers a caller chose without
+    // proving who it is, so a `401` carries only the runtime-defined labels.
+    if unauthenticated {
+        labels.extend_from_slice(protocol_dimensions);
+    } else {
+        labels.extend(request_dimensions);
+    }
 
     metrics::REQUESTS_TOTAL.add(1, &labels);
     metrics::REQUESTS.add(1, &labels);
