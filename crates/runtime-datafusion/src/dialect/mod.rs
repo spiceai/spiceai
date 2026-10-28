@@ -369,11 +369,11 @@ pub(crate) fn divides_by_a_possible_zero(expr: &Expr) -> bool {
         return true;
     };
     if let Some(value) = integer_value(&divisor) {
-        return value != 0 && value != -1;
+        return value == 0 || value == -1;
     }
     match divisor {
-        ScalarValue::Float32(Some(value)) => value.is_finite() && value != 0.0,
-        ScalarValue::Float64(Some(value)) => value.is_finite() && value != 0.0,
+        ScalarValue::Float32(Some(value)) => !value.is_finite() || value == 0.0,
+        ScalarValue::Float64(Some(value)) => !value.is_finite() || value == 0.0,
         _ => true,
     }
 }
