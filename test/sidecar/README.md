@@ -40,6 +40,9 @@ python3 test/scripts/sidecar.py \
 uv run --python 3.12 --with pyarrow==26.0.0 python test/scripts/sidecar_types.py \
   --spiced /path/to/spiced --source-commit COMMIT --out /tmp/sidecar-types
 
+python3 test/scripts/sidecar_schema.py \
+  --spiced /path/to/spiced --source-commit COMMIT --out /tmp/sidecar-schema
+
 uv run --python 3.12 --with datafusion==55.0.0 --with pyarrow==26.0.0 \
   python test/scripts/substrait_cache.py \
   --spiced /path/to/spiced --source-commit COMMIT --out /tmp/sidecar-cache
