@@ -45,6 +45,21 @@ const CHECKPOINT_BEFORE_END: usize = 4;
 /// unsloth's Gemma 3 270M at a pinned revision: sliding-window attention, small enough for CI.
 const GEMMA_FILE: &str = "gemma-3-270m-it-Q8_0.gguf";
 
+/// The positions Gemma 3 270M's sliding-window layers attend over.
+const SLIDING_WINDOW: usize = 512;
+
+async fn gemma_gguf() -> std::path::PathBuf {
+    llms::chat::hf_files::download_model(
+        "unsloth/gemma-3-270m-it-GGUF:c90975dbd40c0c7b275fefaae758c3415c906238",
+        &[GEMMA_FILE],
+        llms::hf::HubParams::default(),
+        "gemma-3-270m",
+    )
+    .await
+    .expect("Gemma 3 270M downloads")
+    .join(GEMMA_FILE)
+}
+
 /// One request of the conversation, and what came of it.
 struct Turn {
     messages: Vec<Value>,
@@ -97,12 +112,18 @@ async fn record(model: &LlamaCpp, name: &str, messages: Vec<Value>) -> Turn {
     }
 }
 
-/// The conversation on one loaded model, then its last turn again.
-async fn converse(model: &LlamaCpp, name: &str) -> Vec<Turn> {
+/// The conversation on one loaded model, its first message led by `preamble`, then its last
+/// turn again.
+async fn converse(model: &LlamaCpp, name: &str, preamble: &str) -> Vec<Turn> {
     let mut messages = Vec::new();
     let mut turns = Vec::new();
-    for &user in USER_TURNS {
-        messages.push(json!({ "role": "user", "content": user }));
+    for (i, &user) in USER_TURNS.iter().enumerate() {
+        let content = if i == 0 {
+            format!("{preamble}{user}")
+        } else {
+            user.to_string()
+        };
+        messages.push(json!({ "role": "user", "content": content }));
         let turn = record(model, name, messages.clone()).await;
         messages.push(json!({ "role": "assistant", "content": turn.reply }));
         turns.push(turn);
@@ -120,8 +141,24 @@ async fn replies_as_from_an_empty_cache(
     name: &'static str,
     expected: impl Fn(&[usize]) -> Vec<usize>,
 ) {
+    let (prompt_tokens, reused) = held_and_fresh_replies_agree(gguf, name, "").await;
+    assert_eq!(
+        reused,
+        expected(&prompt_tokens),
+        "prompt tokens {prompt_tokens:?}"
+    );
+}
+
+/// Holds the conversation, its first message led by `preamble`, and asks each turn again of a
+/// freshly loaded model, whose empty cache reuses nothing, for the same reply. Returns each
+/// turn's prompt length and how many of its tokens it reused.
+async fn held_and_fresh_replies_agree(
+    gguf: &Path,
+    name: &'static str,
+    preamble: &str,
+) -> (Vec<usize>, Vec<usize>) {
     let model = load(gguf, name).await;
-    let turns = converse(&model, name).await;
+    let turns = converse(&model, name, preamble).await;
     drop(model);
     for turn in &turns {
         eprintln!(
@@ -142,11 +179,7 @@ async fn replies_as_from_an_empty_cache(
     }
     let prompt_tokens: Vec<usize> = turns.iter().map(|turn| turn.prompt_tokens).collect();
     let reused: Vec<usize> = turns.iter().map(|turn| turn.reused).collect();
-    assert_eq!(
-        reused,
-        expected(&prompt_tokens),
-        "prompt tokens {prompt_tokens:?}"
-    );
+    (prompt_tokens, reused)
 }
 
 /// Qwen3-0.6B keeps only an attention cache, which truncates to any position: each turn reuses
@@ -189,15 +222,7 @@ async fn a_recurrent_state_resumes_from_its_checkpoint() {
 /// turn reuses everything it shares with the cache, as an attention cache does.
 #[tokio::test]
 async fn a_sliding_window_cache_reuses_the_shared_prompt() {
-    let gguf = llms::chat::hf_files::download_model(
-        "unsloth/gemma-3-270m-it-GGUF:c90975dbd40c0c7b275fefaae758c3415c906238",
-        &[GEMMA_FILE],
-        llms::hf::HubParams::default(),
-        "gemma-3-270m",
-    )
-    .await
-    .expect("Gemma 3 270M downloads")
-    .join(GEMMA_FILE);
+    let gguf = gemma_gguf().await;
     // Gemma's template repeats a reply as it was generated, so a turn shares the last prompt and
     // its reply: llama-server (`--swa-full`, the same full-size window) reports `cache_n`
     // 0/40/65/87 on this conversation, and 0/15/59/83 with its default sliding window.
@@ -206,6 +231,78 @@ async fn a_sliding_window_cache_reuses_the_shared_prompt() {
         vec![0, 40, 65, 87]
     })
     .await;
+}
+
+/// Gemma 3 270M's sliding window holds 512 positions. With a first message long enough that
+/// every prompt passes the window, each turn still reuses the whole of the last prompt, more
+/// than a window of it, and replies as a freshly loaded model does, and the repeated turn reuses
+/// all of its prompt but the last token.
+#[tokio::test]
+async fn a_sliding_window_cache_reuses_past_its_window() {
+    let gguf = gemma_gguf().await;
+    let preamble: String = (1..=200)
+        .map(|i| format!("Line {i} of the notes says nothing that matters. "))
+        .collect::<String>()
+        + "\n\n";
+    let (prompts, reused) =
+        held_and_fresh_replies_agree(&gguf, "gemma-3-270m-past-window", &preamble).await;
+    eprintln!("prompts {prompts:?}, reused {reused:?}");
+    assert!(prompts[0] > SLIDING_WINDOW, "prompts {prompts:?}");
+    assert_eq!(reused[0], 0, "reused {reused:?}");
+    for i in 1..3 {
+        assert!(
+            reused[i] >= prompts[i - 1] && reused[i] < prompts[i],
+            "turn {i} reuses the whole last prompt: prompts {prompts:?}, reused {reused:?}"
+        );
+    }
+    assert_eq!(
+        reused[3],
+        prompts[3] - 1,
+        "the repeated turn: reused {reused:?}"
+    );
+}
+
+/// A prompt that shares only the start of a cache longer than Gemma 3 270M's window cuts the
+/// cache back by more than a window: the sliding-window layers must still hold every position
+/// the shared prefix ends on, as a cache kept at full size does, so the reply is a freshly
+/// loaded model's.
+#[tokio::test]
+async fn a_sliding_window_cache_is_cut_back_more_than_a_window() {
+    let gguf = gemma_gguf().await;
+    let name = "gemma-3-270m-cut-back";
+    let notes = |lines: usize| -> String {
+        (1..=lines)
+            .map(|i| format!("Line {i} of the notes says nothing that matters. "))
+            .collect()
+    };
+    let long = vec![json!({
+        "role": "user",
+        "content": format!("{}\n\nName three colors of the rainbow, separated by commas.", notes(200)),
+    })];
+    let short = vec![json!({
+        "role": "user",
+        "content": format!("{}\n\nWhich planet is closest to the Sun? Reply with one word.", notes(10)),
+    })];
+    let model = load(&gguf, name).await;
+    let (_, long_tokens) = ask(&model, name, &long).await;
+    let (held, short_tokens) = ask(&model, name, &short).await;
+    let reused = model.reused_prompt_tokens();
+    drop(model);
+    eprintln!("long {long_tokens}, short {short_tokens}, reused {reused}: {held:?}");
+    assert!(
+        long_tokens > short_tokens + SLIDING_WINDOW,
+        "the cache is cut back by more than a window: {long_tokens} and {short_tokens} tokens"
+    );
+    assert!(
+        reused > 0 && reused < short_tokens,
+        "the short prompt reuses the start it shares: {reused} of {short_tokens}"
+    );
+    let fresh = load(&gguf, name).await;
+    let (cold, _) = ask(&fresh, name, &short).await;
+    assert_eq!(
+        held, cold,
+        "the reply after the cut against a fresh model's"
+    );
 }
 
 /// `n` choices run one after another on the same prompt, so every choice after the first
