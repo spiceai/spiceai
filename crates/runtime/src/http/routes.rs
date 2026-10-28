@@ -1206,13 +1206,17 @@ const CORS_ALLOWED_HEADERS: &[&str] = &[
     "anthropic-version",
     "anthropic-beta",
     "anthropic-dangerous-direct-browser-access",
+    // The Gemini API's headers, which Google's web SDK sends on every call: the key in
+    // `x-goog-api-key`, and `x-goog-api-client`.
+    "x-goog-api-key",
+    "x-goog-api-client",
 ];
 
 /// Closed-set `Access-Control-Allow-Headers` when a requested name is
 /// not a valid [`HeaderValue`]. Must stay aligned with
 /// [`CORS_ALLOWED_HEADERS`].
 const CORS_ALLOWED_HEADERS_VALUE: HeaderValue = HeaderValue::from_static(
-    "accept, content-type, authorization, mcp-protocol-version, mcp-method, mcp-name, mcp-session-id, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access",
+    "accept, content-type, authorization, mcp-protocol-version, mcp-method, mcp-name, mcp-session-id, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, x-goog-api-key, x-goog-api-client",
 );
 
 fn is_allowed_cors_request_header(name: &str) -> bool {

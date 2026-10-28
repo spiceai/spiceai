@@ -327,12 +327,22 @@ pub(super) async fn runtime_with_workers(models: Vec<Model>, workers: Vec<Worker
 /// A runtime whose routes accept only requests carrying `api_key`, as `runtime.auth.api_key`
 /// configures.
 pub(super) async fn runtime_with_api_key(models: Vec<Model>, api_key: &str) -> Router {
+    runtime_with_cors_and_api_key(models, &CorsConfig::default(), api_key).await
+}
+
+/// A runtime that answers browsers as `cors` configures, and whose routes accept only
+/// requests carrying `api_key`.
+pub(super) async fn runtime_with_cors_and_api_key(
+    models: Vec<Model>,
+    cors: &CorsConfig,
+    api_key: &str,
+) -> Router {
     let auth =
         runtime_auth::api_key::ApiKeyAuth::new(vec![ApiKey::parse_str(&format!("{api_key}:rw"))]);
     runtime_with_options(
         models,
         Vec::new(),
-        &CorsConfig::default(),
+        cors,
         Some(runtime_auth::layer::http::AuthLayer::new(Arc::new(auth))),
     )
     .await

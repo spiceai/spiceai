@@ -21,17 +21,18 @@ limitations under the License.
 use axum::{
     Router,
     body::Body,
-    http::{Request, StatusCode},
+    http::{Method, Request, StatusCode, header},
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+use spicepod::component::runtime::CorsConfig;
 use spicepod::component::worker::{LoadBalanceParams, RouterConfig, Worker};
 
 use super::messages_tests::{
-    Seen, model, runtime_with, runtime_with_api_key, runtime_with_workers, send, sse_events,
-    start_provider, taken,
+    Seen, model, runtime_with, runtime_with_api_key, runtime_with_cors_and_api_key,
+    runtime_with_workers, send, sse_events, start_provider, taken,
 };
 
 async fn get(routes: &Router, path: &str) -> (StatusCode, Value) {
@@ -303,6 +304,94 @@ async fn a_request_without_a_valid_api_key_is_refused_with_the_gemini_error_body
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+}
+
+/// A browser on another origin calls the Gemini API as Google's web SDK does: with the key in
+/// `x-goog-api-key` and the SDK's `x-goog-api-client`. The CORS preflight has to allow both
+/// headers for the browser to send the call at all.
+#[tokio::test]
+async fn a_browser_on_another_origin_calls_the_gemini_api_with_its_api_key_header() {
+    let seen = Seen::default();
+    let endpoint = start_provider(&seen).await;
+    let origin = "https://app.example.com";
+    let routes = runtime_with_cors_and_api_key(
+        vec![model("gpt", "openai:gpt-4o", &endpoint, &[])],
+        &CorsConfig {
+            enabled: true,
+            allowed_origins: vec![origin.to_string()],
+        },
+        "spice-key",
+    )
+    .await;
+    taken(&seen);
+
+    let requested = "content-type, x-goog-api-client, x-goog-api-key";
+    for (method, path) in [
+        ("GET", "/v1beta/models"),
+        ("GET", "/v1beta/models/gpt"),
+        ("POST", "/v1beta/models/gpt:generateContent"),
+        ("POST", "/v1beta/models/gpt:streamGenerateContent"),
+    ] {
+        let response = routes
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri(path)
+                    .header(header::ORIGIN, origin)
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, method)
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, requested)
+                    .body(Body::empty())
+                    .expect("a preflight"),
+            )
+            .await
+            .expect("a response");
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let header_of = |name| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_ascii_lowercase)
+        };
+        assert_eq!(
+            header_of(header::ACCESS_CONTROL_ALLOW_ORIGIN).as_deref(),
+            Some(origin),
+            "{path}"
+        );
+        let allowed = header_of(header::ACCESS_CONTROL_ALLOW_HEADERS).unwrap_or_default();
+        let allowed: Vec<&str> = allowed.split(',').map(str::trim).collect();
+        for name in requested.split(',').map(str::trim) {
+            assert!(
+                allowed.contains(&name),
+                "{path}: {name} is not allowed: {allowed:?}"
+            );
+        }
+    }
+
+    let (status, headers, body) = send(
+        &routes,
+        "/v1beta/models/gpt:generateContent",
+        &[
+            ("origin", origin),
+            ("x-goog-api-client", "google-genai-sdk/2.31.0 gl-node/web"),
+            ("x-goog-api-key", "spice-key"),
+        ],
+        &ping(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        headers
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+        Some(origin)
+    );
+    assert_eq!(
+        parsed(&body)["candidates"][0]["content"],
+        json!({"role": "model", "parts": [{"text": "pong"}]})
+    );
+    assert_eq!(taken(&seen).len(), 1, "the call reaches the model");
 }
 
 #[tokio::test]
