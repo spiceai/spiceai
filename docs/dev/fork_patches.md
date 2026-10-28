@@ -220,7 +220,7 @@ sort shares with its producer for the slice's own rows, #261, which keeps a unio
 of `unwrap_cast`, the unparser fixes #246, #247 and #264, and #268, which narrows #266's copy to
 batches whose rows are slices of larger buffers, #273, upstream apache/datafusion#23232
 cherry-picked from `main`, and #275, which limits the nesting depth of a SQL data type; the pin
-is #275's merge commit. None changes a
+is #275's head commit until it merges. None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
 code, and removes no line of it. The branch also carries
