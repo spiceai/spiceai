@@ -699,10 +699,15 @@ separately from the metastore work.
 `data/<generation>/` folder with their current file names
 ([layout](object-native-metastore-technical.md#layout)). A file keeps the
 generation it was written in for life: ending a generation never copies or
-moves a file, and GC only deletes files no protected state references. The open
-question is whether today's per-dataset
-overrides, such as S3 Express, stay. An override must still be an object
-store that every instance can read.
+moves a file, and GC only deletes files no protected state references.
+- **Data locations separate from the catalog.** By default the catalog and the
+data share one location. The format lets the catalog reference data in other
+locations, each with its own permissions, storage class or region (see
+[multiple data locations](object-native-metastore-technical.md#future-multiple-data-locations));
+today's per-dataset overrides, such as S3 Express, would become one. The open
+questions are the surface for configuring them and when it ships. Every data
+location must be an object store that every instance needing its files can
+read.
 
 ---
 
