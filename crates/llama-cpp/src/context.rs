@@ -102,6 +102,10 @@ impl ContextParams {
 }
 
 /// A llama.cpp context: the KV cache and compute state of the model's sequences.
+///
+/// `raw` is the context `llama_init_from_model` created for this value, which owns it: nothing
+/// else frees it, and `Drop` frees it once. So `raw` points to a live context for as long as
+/// `self` exists, which every `unsafe` call below relies on.
 #[derive(Debug)]
 pub struct Context<'m> {
     raw: NonNull<sys::llama_context>,
@@ -176,7 +180,8 @@ impl Context<'_> {
     /// context that keeps rollback snapshots rolls back only over them; otherwise two tokens are
     /// decoded into the emptied cache, and the second removed. Leaves the cache empty.
     pub fn truncation(&mut self) -> Truncation {
-        // SAFETY: the context is live.
+        // SAFETY: `raw` is live while `self` is (see `Context`), and `llama_n_rs_seq` only reads
+        // the context's parameters.
         if unsafe { sys::llama_n_rs_seq(self.raw.as_ptr()) } > 0 {
             return Truncation::Bounded;
         }
@@ -199,10 +204,12 @@ impl Context<'_> {
     /// full-attention cache. `None` when llama.cpp writes less than it sized.
     #[must_use]
     pub fn partial_state(&self) -> Option<Vec<u8>> {
-        // SAFETY: the context is live.
+        // SAFETY: `raw` is live while `self` is (see `Context`), and sizing a sequence's state
+        // reads the context without changing it.
         let size = unsafe { sys::llama_state_seq_get_size_ext(self.raw.as_ptr(), 0, PARTIAL_ONLY) };
         let mut state = vec![0u8; size];
-        // SAFETY: `state` holds `size` writable bytes.
+        // SAFETY: `raw` is live (see `Context`), and llama.cpp writes at most `size` bytes into
+        // `state`, which holds `size` writable bytes.
         let written = unsafe {
             sys::llama_state_seq_get_data_ext(
                 self.raw.as_ptr(),
@@ -218,7 +225,9 @@ impl Context<'_> {
     /// Restores a state `partial_state` saved, leaving the full-attention cache as it is.
     /// Returns false when llama.cpp does not read all of it.
     pub fn restore_partial_state(&mut self, state: &[u8]) -> bool {
-        // SAFETY: `state` holds `state.len()` readable bytes.
+        // SAFETY: `raw` is live (see `Context`), `&mut self` keeps every other call off the
+        // context while its state is replaced, and llama.cpp reads at most `state.len()` bytes
+        // from `state`, which holds that many.
         let read = unsafe {
             sys::llama_state_seq_set_data_ext(
                 self.raw.as_ptr(),
