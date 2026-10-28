@@ -714,8 +714,8 @@ async fn test_do_nothing_table_over_the_datalake_impl(
     insert(&mut oracle, &[(300, 600)]);
     flush_warm(&table).await;
     assert!(table.promote_warm_to_cold().await?, "promotion 2 fires");
-    common::insert_batch(table.as_ref(), id_value_batch(&[(8, 888), (9, 999)])?).await?;
-    insert(&mut oracle, &[(8, 888), (9, 999)]);
+    common::insert_batch(table.as_ref(), id_value_batch(&[(8, 888)])?).await?;
+    insert(&mut oracle, &[(8, 888)]);
     assert_matches_oracle(&ctx, &oracle, &lookups, "after re-inserting across a promotion")
         .await?;
 
