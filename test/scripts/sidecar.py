@@ -579,10 +579,21 @@ def main():
             finally:
                 instance.stop()
 
+        cache_source = args.out / "cache-orders.csv"
+        cache_source.write_bytes(source_path.read_bytes())
         cache_origin_pod = base_pod(
-            "plan-cache-origin", cluster_pod["datasets"], cache=True
+            "plan-cache-origin",
+            json.loads(json.dumps(cluster_pod["datasets"])),
+            cache=True,
         )
+        cache_origin_pod["datasets"][0]["from"] = f"file:{cache_source}"
+        cache_origin_pod["datasets"][0]["acceleration"] = {
+            "enabled": True,
+            "engine": "cayenne",
+            "mode": "memory",
+        }
         cache_origin_pod["runtime"]["caching"]["sql_results"]["cache_key_type"] = "plan"
+        cache_origin_pod["runtime"]["caching"]["sql_results"]["item_ttl"] = "10s"
         cache_origin = Instance(
             args.spiced, args.out / "plan-cache-upstream", cache_origin_pod
         )
@@ -650,6 +661,65 @@ def main():
             }, delta
             print(
                 "sidecar cache disabled: upstream serialized-plan cache recorded 5 misses and 5 hits",
+                flush=True,
+            )
+            count_sql = "SELECT COUNT(*) AS n FROM orders"
+            before_refresh = [cache_client.query(count_sql)[0] for _ in range(2)]
+            assert before_refresh == [[{"n": args.rows}]] * 2, before_refresh
+            with cache_source.open("a", newline="") as output:
+                csv.writer(output).writerow([args.rows, 123, "fresh"])
+            refresh = urllib.request.Request(
+                f"http://127.0.0.1:{cache_origin.http}/v1/datasets/remote_orders/acceleration/refresh",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(refresh, timeout=10) as response:
+                assert response.status == 201, response.status
+            observations = []
+            limit = time.monotonic() + 30
+            while True:
+                rows, _ = cache_origin.query(
+                    "SELECT COUNT(*) AS n FROM remote_orders",
+                    {"Cache-Control": "no-cache"},
+                )
+                observations.append(rows)
+                if rows == [{"n": args.rows + 1}]:
+                    break
+                assert time.monotonic() < limit, observations
+                time.sleep(0.05)
+            after_refresh = [cache_client.query(count_sql)[0] for _ in range(2)]
+            # A source refresh preserves eligible results until item_ttl. Client
+            # writes have a separate hard-invalidation contract.
+            assert after_refresh == [[{"n": args.rows}]] * 2, after_refresh
+            expiry_observations = []
+            limit = time.monotonic() + 15
+            while True:
+                rows, _ = cache_client.query(count_sql)
+                expiry_observations.append(rows)
+                if rows == [{"n": args.rows + 1}]:
+                    break
+                assert rows == [{"n": args.rows}] and time.monotonic() < limit, (
+                    expiry_observations
+                )
+                time.sleep(0.2)
+            after_expiry = cache_client.query(count_sql)[0]
+            assert after_expiry == [{"n": args.rows + 1}], after_expiry
+            (cache_client.directory / "refresh-results.json").write_text(
+                json.dumps(
+                    {
+                        "sql": count_sql,
+                        "before": before_refresh,
+                        "upstream_observations": observations,
+                        "after": after_refresh,
+                        "expected_after": [[{"n": args.rows}]] * 2,
+                        "expiry_observations": expiry_observations,
+                        "after_expiry": after_expiry,
+                    },
+                    indent=2,
+                )
+            )
+            print(
+                "upstream serialized-plan cache: refresh retained eligible results; TTL expiry returned updated rows",
                 flush=True,
             )
         finally:
