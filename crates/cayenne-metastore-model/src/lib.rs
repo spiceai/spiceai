@@ -276,22 +276,6 @@ pub fn runs() -> Vec<Run> {
             failure: "orphan eventually collected",
         },
         Run {
-            name: "delete-coverage-iceberg-no-cold",
-            family: "state-rules",
-            mode: "coverage-design-iceberg-no-cold",
-            bound: 4,
-            seed: None,
-            failure: "I9 coverage equals serial oracle",
-        },
-        Run {
-            name: "pk-index-drop-no-refresh",
-            family: "state-rules",
-            mode: "index-design-drop-no-refresh",
-            bound: 3,
-            seed: None,
-            failure: "I8 recovered index equals full key set",
-        },
-        Run {
             name: "removal-reuse",
             family: "removal",
             mode: "reuse",
@@ -396,14 +380,6 @@ pub fn runs() -> Vec<Run> {
             failure: "I9 coverage equals serial oracle",
         },
         Run {
-            name: "delete-coverage-iceberg",
-            family: "state-rules",
-            mode: "coverage-design-iceberg",
-            bound: 4,
-            seed: None,
-            failure: "",
-        },
-        Run {
             name: "pins-low-water",
             family: "state-rules",
             mode: "pins-design",
@@ -444,14 +420,6 @@ pub fn runs() -> Vec<Run> {
             failure: "I8 recovered index equals full key set",
         },
         Run {
-            name: "pk-index-drop",
-            family: "state-rules",
-            mode: "index-design-drop",
-            bound: 3,
-            seed: None,
-            failure: "",
-        },
-        Run {
             name: "delete-coverage-6-simulation-7",
             family: "state-rules",
             mode: "coverage-design",
@@ -474,46 +442,6 @@ pub fn runs() -> Vec<Run> {
             bound: 6,
             seed: Some(20_261_024),
             failure: "",
-        },
-        Run {
-            name: "naming-by-seq",
-            family: "state-rules",
-            mode: "identity-superseded",
-            bound: 3,
-            seed: None,
-            failure: "state name determines physical state",
-        },
-        Run {
-            name: "table-seq-dataset-wide",
-            family: "state-rules",
-            mode: "tables-superseded",
-            bound: 3,
-            seed: None,
-            failure: "per-table allocated record never refused",
-        },
-        Run {
-            name: "delete-coverage-cutoff-only",
-            family: "state-rules",
-            mode: "coverage-superseded",
-            bound: 4,
-            seed: None,
-            failure: "I9 coverage equals serial oracle",
-        },
-        Run {
-            name: "pins-oldest-query-only",
-            family: "state-rules",
-            mode: "pins-superseded",
-            bound: 3,
-            seed: None,
-            failure: "I7 every active query readable",
-        },
-        Run {
-            name: "pk-index-stale-reference",
-            family: "state-rules",
-            mode: "index-superseded",
-            bound: 3,
-            seed: None,
-            failure: "I8 recovered index equals full key set",
         },
         Run {
             name: "seq-order-2-exhaust",
@@ -1230,7 +1158,6 @@ pub fn runs() -> Vec<Run> {
     });
     declared.extend(additional_runs());
     for (name, mode) in [
-        ("read-rule1-minimal", "rule1-minimal"),
         ("read-rule2-minimal-blind", "rule2-minimal-blind"),
         ("read-rule2-select-minimal", "rule2-select"),
         ("read-rule2-absent-minimal", "rule2-absent"),
@@ -1263,48 +1190,7 @@ pub fn runs() -> Vec<Run> {
         failure: "commit-order program serializability",
     });
 
-    declared.push(Run {
-        name: "read-rule1-cross-table-insert-guard",
-        family: "read-programs",
-        mode: "rule1-cross-table-insert-guard",
-        bound: 3,
-        seed: None,
-        failure: "",
-    });
-    declared.push(Run {
-        name: "read-rule1-cross-table-insert-guard-write-table-token",
-        family: "read-programs",
-        mode: "rule1-cross-table-insert-guard-write-table-token",
-        bound: 3,
-        seed: None,
-        failure: "commit-order program serializability",
-    });
     for (name, mode, failure) in [
-        (
-            "read-rule1",
-            "rule1-full",
-            "commit-order program serializability",
-        ),
-        (
-            "read-rule1-no-exclusive-token",
-            "rule1-full-no-exclusive-token",
-            "commit-order program serializability",
-        ),
-        (
-            "read-rule1-table-validation",
-            "rule1-full-table-validation",
-            "",
-        ),
-        (
-            "read-rule1-gate",
-            "rule1-full-gate",
-            "commit-order program serializability",
-        ),
-        (
-            "read-rule1-gate-table-validation",
-            "rule1-full-gate-table-validation",
-            "",
-        ),
         ("read-rule2", "rule2-full", ""),
         (
             "read-rule2-stamp-at-commit",
@@ -1320,11 +1206,6 @@ pub fn runs() -> Vec<Run> {
         ("read-rule2-append", "rule2-full-append", ""),
         ("read-rule2-cross-table", "rule2-cross-table", ""),
         ("read-same-key", "rule2-same-key", ""),
-        (
-            "read-mixed-rules",
-            "mixed-minimal",
-            "commit-order program serializability",
-        ),
     ] {
         declared.push(Run {
             name,
@@ -1343,55 +1224,9 @@ pub fn runs() -> Vec<Run> {
         seed: None,
         failure: "",
     });
-    declared.push(Run {
-        name: "read-token-progress",
-        family: "token-progress",
-        mode: "rule1-crash-table-validation",
-        bound: 3,
-        seed: None,
-        failure: "",
-    });
 
-    declared.push(Run {
-        name: "read-progress-whole-table",
-        family: "predicate-progress",
-        mode: "whole-table",
-        bound: 3,
-        seed: None,
-        failure: "unrelated ingestion statement commits within attempts",
-    });
-    declared.push(Run {
-        name: "read-token-no-token-expiry",
-        family: "token-progress",
-        mode: "rule1-minimal-crash-table-validation-no-token-expiry",
-        bound: 3,
-        seed: None,
-        failure: "exclusive tokens eventually released",
-    });
     for (name, mode, failure) in [
-        (
-            "read-rule1-minimal-no-exclusive-token",
-            "rule1-minimal-no-exclusive-token",
-            "commit-order program serializability",
-        ),
-        (
-            "read-rule1-minimal-blind",
-            "rule1-minimal-blind",
-            "commit-order program serializability",
-        ),
         ("read-rule2-minimal", "rule2-minimal", ""),
-        ("read-rule1-cross-table", "rule1-cross-table", ""),
-        (
-            "read-rule1-cross-table-write-table-token",
-            "rule1-cross-table-write-table-token",
-            "commit-order program serializability",
-        ),
-        ("read-rule1-overlap-blind", "rule1-overlap-blind", ""),
-        (
-            "read-rule1-overlap-blind-no-blind-key-footprint",
-            "rule1-overlap-blind-no-blind-key-footprint",
-            "commit-order program serializability",
-        ),
         (
             "read-rule2-select-after-image-only",
             "rule2-select-after-image-only",
@@ -1629,13 +1464,6 @@ fn concurrent_maintenance_runs() -> Vec<Run> {
             "I9 position delete exact target",
         ),
         (
-            "position-delete-already-dropped-reject-dropped-target",
-            "position-deletes",
-            "already-dropped-reject-dropped-target",
-            1,
-            "",
-        ),
-        (
             "remote-maintenance-minimal-two-maintainers",
             "remote-maintenance",
             "minimal-two-maintainers",
@@ -1726,12 +1554,6 @@ fn program_family_runs() -> Vec<Run> {
         (
             "read-widened-stamp-at-commit-3",
             "rule2-widened-stamp-at-commit",
-            3,
-            "",
-        ),
-        (
-            "read-widened-token-predicate-validation-3",
-            "rule1-widened-predicate-validation",
             3,
             "",
         ),
@@ -1941,7 +1763,7 @@ fn additional_runs() -> Vec<Run> {
         ),
         (
             "dataset-prepare-no-write-reservation",
-            "prepare-input-reservation-no-write-reservation",
+            "prepare-cutoff-cap-no-write-reservation",
             6,
             "I9 lifecycle logical rows",
         ),
@@ -1951,35 +1773,10 @@ fn additional_runs() -> Vec<Run> {
             6,
             "I6 lifecycle prefix visibility",
         ),
-        (
-            "dataset-prepare-file-footprint",
-            "prepare-file-footprint",
-            6,
-            "I9 lifecycle logical rows",
-        ),
         ("dataset-prepare-cutoff-cap", "prepare-cutoff-cap", 6, ""),
         (
             "dataset-prepare-no-cutoff-cap",
             "prepare-no-cutoff-cap",
-            6,
-            "I9 lifecycle logical rows",
-        ),
-        (
-            "dataset-prepare-input-reservation",
-            "prepare-input-reservation",
-            6,
-            "",
-        ),
-        (
-            "dataset-prepare-no-input-reservation",
-            "prepare-no-input-reservation",
-            6,
-            "I9 lifecycle logical rows",
-        ),
-        ("dataset-prepare-resolve-seq", "prepare-resolve-seq", 6, ""),
-        (
-            "dataset-prepare-no-resolve-seq",
-            "prepare-no-resolve-seq",
             6,
             "I9 lifecycle logical rows",
         ),
@@ -2237,7 +2034,7 @@ where
                 | "abort after maintenance"
                 | "checkpoint retains prepared actions"
                 | "GC while prepared" => run.mode.contains("prepare"),
-                "higher cutoff while prepared" => run.mode == "prepare-file-footprint",
+                "higher cutoff while prepared" => run.mode == "prepare-no-cutoff-cap",
                 "warm subset rewrite" | "cold promotion" => true,
                 "row object collected" => {
                     run.failure.is_empty() && !run.mode.contains("no-sealed-floor")
@@ -2263,10 +2060,6 @@ where
                     | "conflict replans statement"
                     | "independent loser retries",
                 ) => run.mode.contains("full"),
-                (
-                    "token-progress",
-                    "crashed token expires" | "conflict releases token" | "commit releases token",
-                ) => true,
                 _ => false,
             };
         let widened_required = run.failure.is_empty()
@@ -2337,9 +2130,6 @@ where
                 }
                 ("position-deletes", "already deleted target consumed") => {
                     run.mode == "already-dropped"
-                }
-                ("position-deletes", "dropped target reports conflict") => {
-                    run.mode.contains("reject-dropped-target")
                 }
                 _ => false,
             };
@@ -2505,8 +2295,7 @@ pub fn run(name: &str) -> Result<(), String> {
         "removal" => check(removal::Protocol::new(r.mode, r.bound), r),
         "state-rules" => check(state_rules::Protocol::new(r.mode, r.bound), r),
         "seq-order" => check(seq_order::Protocol::new(r.mode, r.bound), r),
-        "predicate-progress" => check(read_programs::PredicateProgress::new(r.mode, r.bound), r),
-        "token-progress" => check(read_programs::TokenProgress::new(r.mode, r.bound), r),
+        "predicate-progress" => check(read_programs::PredicateProgress::new(r.bound), r),
         "cold-promotion" => check(dataset_lifecycle::promotion::Protocol::new(r.mode), r),
         "read-delivery" => check(read_programs::delivery::Protocol::new(r.mode, r.bound), r),
         "read-programs" => {

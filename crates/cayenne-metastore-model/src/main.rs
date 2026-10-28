@@ -22,7 +22,6 @@ fn main() -> Result<(), String> {
                 "read-widened-delivery-1",
                 "cold-promotion",
                 "read-progress",
-                "read-token-progress",
                 "read-same-key",
                 "pin-expiry",
                 "transaction-begin-pin",

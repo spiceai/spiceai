@@ -72,44 +72,6 @@ impl Program {
     fn dependent(&self) -> bool {
         !matches!(self, Self::Blind(_) | Self::Insert { .. } | Self::Append(_))
     }
-    fn tables(&self, writes_only: bool) -> Vec<usize> {
-        let mut tables = match self {
-            Self::Transaction(statements) => statements
-                .iter()
-                .flat_map(|p| p.tables(writes_only))
-                .collect(),
-            Self::Update { predicate, .. } | Self::Delete(predicate) => vec![predicate.table],
-            Self::InsertSelect {
-                predicate, target, ..
-            } => {
-                if writes_only {
-                    vec![*target]
-                } else {
-                    vec![predicate.table, *target]
-                }
-            }
-            Self::Aggregate { table, target, .. } => {
-                if writes_only {
-                    vec![target.0]
-                } else {
-                    vec![*table, target.0]
-                }
-            }
-            Self::Absent { lookup, target } => {
-                if writes_only {
-                    vec![target.0]
-                } else {
-                    vec![lookup.0, target.0]
-                }
-            }
-            Self::Blind(ops) => ops.iter().map(|(k, _)| k.0).collect(),
-            Self::Insert { target, .. } => vec![target.0],
-            Self::Append(ops) => ops.iter().map(|(k, _)| k.0).collect(),
-        };
-        tables.sort_unstable();
-        tables.dedup();
-        tables
-    }
     // Statement execution builds actions and dependencies from one immutable snapshot.
     fn plan(&self, rows: &Rows) -> Option<Plan> {
         let mut plan = Plan {
@@ -322,7 +284,6 @@ struct TransactionState {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Writer {
     program: Program,
-    rule: u8,
     phase: u8,
     snapshot: usize,
     base: usize,
@@ -367,8 +328,6 @@ pub(crate) enum Action {
     Next(usize),
     Cas(usize),
     Retry(usize),
-    Crash(usize),
-    Expire(usize),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CommitCost {
@@ -608,12 +567,6 @@ impl Protocol {
         if self.has("delete-keys") {
             return vec![update, Program::Delete(p(0, 1))];
         }
-        if self.has("overlap-blind") {
-            return vec![
-                update,
-                Program::Blind(vec![((0, 1), Some([1, 1])), ((1, 2), Some([0, 0]))]),
-            ];
-        }
         if self.has("cross-table") {
             return vec![
                 Program::InsertSelect {
@@ -621,21 +574,9 @@ impl Protocol {
                     target: 1,
                     key_offset: 0,
                 },
-                if self.has("insert-guard") {
-                    Program::InsertSelect {
-                        predicate: Predicate {
-                            table: 1,
-                            column: 0,
-                            equals: 1,
-                        },
-                        target: 0,
-                        key_offset: 0,
-                    }
-                } else {
-                    Program::Absent {
-                        lookup: (1, 1),
-                        target: (0, 0),
-                    }
+                Program::Absent {
+                    lookup: (1, 1),
+                    target: (0, 0),
                 },
                 Program::Blind(vec![((0, 2), Some([0, 0])), ((1, 2), Some([0, 0]))]),
             ];
@@ -676,31 +617,11 @@ impl Protocol {
         }
         vec![update, other, blind]
     }
-    fn token_tables(&self, w: &Writer) -> Vec<usize> {
-        w.program.tables(self.has("write-table-token"))
-    }
-    fn admitted(&self, s: &State, i: usize) -> bool {
-        let w = &s.writers[i];
-        !w.program.dependent()
-            || w.rule != 1
-            || self.has("no-exclusive-token")
-            || !s.writers.iter().enumerate().any(|(j, other)| {
-                i != j
-                    && other.rule == 1
-                    && other.program.dependent()
-                    && matches!(other.phase, 1 | 4 | 5 | 6)
-                    && self
-                        .token_tables(w)
-                        .iter()
-                        .any(|t| self.token_tables(other).contains(t))
-            })
-    }
-    fn footprint(&self, program: &Program, plan: &Plan) -> Vec<Key> {
+    fn footprint(&self, plan: &Plan) -> Vec<Key> {
         plan.actions
             .iter()
             .filter(|m| {
-                !(self.has("no-blind-key-footprint") && !program.dependent()
-                    || self.has("no-delete-keys") && m.value.is_none()
+                !(self.has("no-delete-keys") && m.value.is_none()
                     || self.has("no-inserted-keys") && !m.replace)
             })
             .map(|m| m.key)
@@ -776,7 +697,7 @@ impl Protocol {
             validation = combined;
         }
         let plan = &validation;
-        let written = self.footprint(&w.program, plan);
+        let written = self.footprint(plan);
         let mut conflict = false;
         let mut examined = 0;
         let mut evaluated = 0;
@@ -794,39 +715,30 @@ impl Protocol {
                             && !(self.has("no-absent-lookup")
                                 && s.versions[w.snapshot][lookup.0][lookup.1].is_none())
                     });
-                if w.rule == 2 || self.has("predicate-validation") {
-                    let before = s.versions[w.snapshot][key.0][key.1];
-                    let after = winner
-                        .plan
-                        .actions
-                        .iter()
-                        .filter(|m| m.key == *key)
-                        .filter_map(|m| m.value);
-                    for predicate in &plan.predicates {
-                        if predicate.table != key.0 {
-                            continue;
-                        }
-                        if !self.has("after-image-only")
-                            && let Some(row) = before
-                        {
-                            evaluated += 1;
-                            conflict |= predicate.matches(key.0, row);
-                        }
-                        if !self.has("before-image-only") {
-                            for row in after.clone() {
-                                evaluated += 1;
-                                conflict |= predicate.matches(key.0, row);
-                            }
-                        }
-                    }
-                }
-            }
-            if self.has("table-validation") && w.program.dependent() {
-                conflict |= winner
+                let before = s.versions[w.snapshot][key.0][key.1];
+                let after = winner
                     .plan
                     .actions
                     .iter()
-                    .any(|m| w.program.tables(false).contains(&m.key.0));
+                    .filter(|m| m.key == *key)
+                    .filter_map(|m| m.value);
+                for predicate in &plan.predicates {
+                    if predicate.table != key.0 {
+                        continue;
+                    }
+                    if !self.has("after-image-only")
+                        && let Some(row) = before
+                    {
+                        evaluated += 1;
+                        conflict |= predicate.matches(key.0, row);
+                    }
+                    if !self.has("before-image-only") {
+                        for row in after.clone() {
+                            evaluated += 1;
+                            conflict |= predicate.matches(key.0, row);
+                        }
+                    }
+                }
             }
         }
         (conflict, examined, evaluated)
@@ -841,14 +753,8 @@ impl Model for Protocol {
             writers: self
                 .programs()
                 .into_iter()
-                .enumerate()
-                .map(|(i, program)| Writer {
+                .map(|program| Writer {
                     program,
-                    rule: if self.has("rule1") || self.has("mixed") && i == 0 {
-                        1
-                    } else {
-                        2
-                    },
                     phase: 0,
                     snapshot: 0,
                     base: 0,
@@ -891,16 +797,12 @@ impl Model for Protocol {
                     if w.statements < if self.has("transaction") { 1 } else { 2 }
                         && s.writers.iter().map(|w| w.statements).sum::<usize>() < self.bound
                     {
-                        for (choice, program) in self.selected_choices(i).iter().enumerate() {
-                            let mut candidate = s.clone();
-                            candidate.writers[i].program = program.clone();
-                            if self.admitted(&candidate, i) {
-                                actions.push(Action::Choose(i, choice));
-                            }
+                        for choice in 0..self.selected_choices(i).len() {
+                            actions.push(Action::Choose(i, choice));
                         }
                     }
                 }
-                0 if self.admitted(s, i) => actions.push(Action::Start(i)),
+                0 => actions.push(Action::Start(i)),
                 2 | 3 if self.has("widened") && !self.has("transaction") && w.statements < 2 => {
                     actions.push(Action::Next(i));
                 }
@@ -911,11 +813,7 @@ impl Model for Protocol {
                     } else {
                         Action::Retry(i)
                     });
-                    if self.has("crash") && w.rule == 1 {
-                        actions.push(Action::Crash(i));
-                    }
                 }
-                4 if !self.has("no-token-expiry") => actions.push(Action::Expire(i)),
                 _ => (),
             }
         }
@@ -1033,12 +931,12 @@ impl Model for Protocol {
                     program: writer.program.clone(),
                     snapshot: writer.snapshot,
                     plan: plan.clone(),
-                    footprint: self.footprint(&writer.program, &plan),
+                    footprint: self.footprint(&plan),
                     stamped: writer.stamped.clone(),
                     examined: writer.examined,
                     evaluated: writer.evaluated,
                 });
-                if writer.rule == 2 && writer.program.dependent() {
+                if writer.program.dependent() {
                     self.counts[0].fetch_max(writer.examined, Ordering::Relaxed);
                     self.counts[1].fetch_max(writer.evaluated, Ordering::Relaxed);
                     self.profiles
@@ -1062,7 +960,6 @@ impl Model for Protocol {
                 out.examined += examined;
                 out.evaluated += evaluated;
                 if conflict && !self.has("no-conflict-replan") {
-                    // A failed attempt releases its token before admission of another attempt.
                     out.phase = if out.attempts >= if self.has("widened") { 3 } else { self.bound }
                     {
                         3
@@ -1095,8 +992,6 @@ impl Model for Protocol {
                     next.retried = true;
                 }
             }
-            Action::Crash(index) => next.writers[index].phase = 4,
-            Action::Expire(index) => next.writers[index].phase = 3,
         }
         Some(next)
     }
@@ -1239,71 +1134,10 @@ impl Model for Protocol {
     }
 }
 
-/// Finite fair servicing of every admitted token, including crashed holders.
-#[derive(Clone, Debug)]
-pub(crate) struct TokenProgress {
-    protocol: Protocol,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct TokenState {
-    inner: State,
-    history: Vec<Action>,
-}
-impl TokenProgress {
-    pub(crate) fn new(mode: &str, bound: usize) -> Self {
-        Self {
-            protocol: Protocol::new(mode, bound),
-        }
-    }
-}
-impl Model for TokenProgress {
-    type State = TokenState;
-    type Action = Action;
-    fn init_states(&self) -> Vec<TokenState> {
-        self.protocol
-            .init_states()
-            .into_iter()
-            .map(|inner| TokenState {
-                inner,
-                history: vec![],
-            })
-            .collect()
-    }
-    fn actions(&self, s: &TokenState, a: &mut Vec<Action>) {
-        self.protocol.actions(&s.inner, a);
-    }
-    fn next_state(&self, s: &TokenState, action: Action) -> Option<TokenState> {
-        let mut history = s.history.clone();
-        history.push(action.clone());
-        Some(TokenState {
-            inner: self.protocol.next_state(&s.inner, action)?,
-            history,
-        })
-    }
-    fn properties(&self) -> Vec<Property<Self>> {
-        vec![
-            Property::eventually(
-                "exclusive tokens eventually released",
-                |_, s: &TokenState| s.inner.writers.iter().all(|w| matches!(w.phase, 2 | 3)),
-            ),
-            Property::sometimes("crashed token expires", |_, s: &TokenState| {
-                s.history.iter().any(|a| matches!(a, Action::Expire(_)))
-            }),
-            Property::sometimes("conflict releases token", |_, s: &TokenState| {
-                s.inner.replanned
-            }),
-            Property::sometimes("commit releases token", |_, s: &TokenState| {
-                !s.inner.log.is_empty()
-            }),
-        ]
-    }
-}
-
 /// A bounded fair round: ingestion wins once or twice, then validation and a
 /// successful rebased CAS are serviced before the next ingestion round.
 #[derive(Clone, Debug)]
 pub(crate) struct PredicateProgress {
-    whole_table: bool,
     bound: usize,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1324,11 +1158,8 @@ pub(crate) enum ProgressAction {
     Publish,
 }
 impl PredicateProgress {
-    pub(crate) fn new(mode: &str, bound: usize) -> Self {
-        Self {
-            whole_table: mode.contains("whole-table"),
-            bound,
-        }
+    pub(crate) fn new(bound: usize) -> Self {
+        Self { bound }
     }
 }
 impl Model for PredicateProgress {
@@ -1383,7 +1214,7 @@ impl Model for PredicateProgress {
                     .into_iter()
                     .flatten()
                     .any(|r| r[0] == 1);
-                if self.whole_table || before_after_match {
+                if before_after_match {
                     n.exhausted = s.attempt == self.bound;
                     n.attempt += usize::from(!n.exhausted);
                     n.snapshot = s.rows;
@@ -1435,14 +1266,6 @@ impl Model for PredicateProgress {
                     execute(&p, &prior) == Some(s.rows)
                 }
             }),
-            Property::always(
-                "whole-table terminal schedules exhaust attempts",
-                |model, state: &ProgressState| {
-                    !model.whole_table
-                        || (!state.committed && (!state.exhausted || state.attempt == model.bound))
-                },
-            ),
-            Property::sometimes("all attempts exhausted", |_, s: &ProgressState| s.exhausted),
         ]
     }
 }

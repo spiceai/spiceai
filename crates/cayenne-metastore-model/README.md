@@ -39,12 +39,12 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 |---|---|---|
 | `remote-maintenance*` | Milestone 2: one ingest writer, remote file-set maintenance plans, guarded CAS retries without sequence shifting, warm subsets, warm-to-cold promotion, cold rewrites, coverage and PK checkpoints; optional Prepare cap; I4/I6/I8/I9 and multiplicity | 2 tables/keys, 2 drawn operations (minimal: 1), 3 accepted records (Prepare: 4), 1 or 2 maintainers; 2 plans/node, at most 2 commits with one maintainer or 1/node with two; one lease turnover/node; directed clear-retry uses 4 records |
 | `read-transaction-*` | BEGIN, two explicit statements over the BEGIN snapshot plus own overlay, one publication with union footprints, whole-transaction validation/re-plan, independent transaction-program replay; I9 and multiplicity | Fixed necessity pairs; widened pairs of 28 programs per dependent writer against 15 two-table blind programs, 2 writers plus blind, exhaustive 1/2 selected transactions or blind records, 3 attempts; 3 selections sampled |
-| `position-delete*` | Position deletes racing one compaction with changed output positions; either winner order, retained row mapping, exact target visibility and multiplicity; proven prior deletion or explicit conflict | 1 input/output file, 3 row identities, 2 output permutations, 1 position delete; optional prior deletion, every committed version |
-| `read-widened-*` | Full modeled program-family selection per statement, two sequential statements per writer, rule2 / stamping at commit / token plus predicate validation; program replay, I9 and live-row multiplicity | Exhaustive 2/3 total selected statements, 3 planning attempts per statement, 2 tables, 3 keys and columns 0..=2; six-selection samples |
+| `position-delete*` | Position deletes racing one compaction with changed output positions; either winner order, retained row mapping, exact target visibility and multiplicity; proven prior deletion completes as a no-op | 1 input/output file, 3 row identities, 2 output permutations, 1 position delete; optional prior deletion, every committed version |
+| `read-widened-*` | Full modeled program-family selection per statement, two sequential statements per writer, rule 2 / stamping at commit; program replay, I9 and live-row multiplicity | Exhaustive 2/3 total selected statements, 3 planning attempts per statement, 2 tables, 3 keys and columns 0..=2; six-selection samples |
 | `read-widened-delivery-*` / `read-delivery-*` | Immutable conditional requests, unknown outcomes, head-read resolution and delayed identical retries; program replay, I2/I5/I9 and multiplicity | Widened positives 1/2 selections; unknown-as-loss/exact-base controls 1, unknown-as-win 1/2; fixed single-writer comparisons; 1 explicit unknown event, 2 copies per request |
 | `cold-promotion` | Atomically remove live warm inputs and add cold outputs, checkpoint plus tail recovery, delayed duplicate publication; multiplicity and I8/I9 | 2 valid initial placements, 1 staged record, 2 deliveries, 1 checkpoint; tombstone-free inputs |
 | `dataset-lifecycle` | One dataset (parent and child), buffered per-table upserts/deletes, acknowledgement commits, arbitrary warm subsets, promotion-only cold rewrites, coverage, commit naming, checkpoint PK collection and tail recovery, pin-aware log collection, removal retirement, two low-water queries, takeover and late predecessor upload; I4/I7/I8/I9 | Exhaustive 2 total accepted records, 2 total buffered operations, 2 keys per table, 2 initial files in each of 2 tier placements, one checkpoint, one takeover and one upload; samples 4 records, seeds 7, 42, 20261024 |
-| `dataset-prepare-*` | Lifecycle file/deletion state and prepared keyed deletes/upserts, external decision and logged Resolve; I4/I6/I8/I9; literal file-footprint reading and three candidate rules | 6 accepted records, 2 buffered operations on parent table, 1 arbitrary warm subset, 1 cold promotion, 1 standalone clear, 1 checkpoint; no lease/staging actions |
+| `dataset-prepare-*` | Lifecycle file/deletion state and prepared keyed deletes/upserts, external decision and logged Resolve; I4/I6/I8/I9; cutoff cap with ordinary-write reservations | 6 accepted records, 2 buffered operations on parent table, 1 arbitrary warm subset, 1 cold promotion, 1 standalone clear, 1 checkpoint; no lease/staging actions |
 | `dataset-pin-expiry*` | Lifecycle maintenance/checkpoint/log collection with leased query, renewal/recheck, delayed GET and GC selection/deletion; rows or error | 2 accepted records, 2 clock advances, 1 renewal, 1 query, scan in key/file order |
 | `dataset-byte-window-metadata-prefix*` | Lifecycle actions in shared byte-window Store, delayed sealing, aligned floors, checkpoint PK pages and retention of every pinned state | 5 total records including 2 initial metadata records, 2 buffered operations, 2 warm rewrites, 1 promotion, 1 metadata removal, 2 checkpoint pages, 1 storage collection; early-floor controls use 3 total records |
 | `pin-expiry` | GC-observer monotonic clock, leased pins, partial immutable snapshot scan, delayed GET completion, lapse head recheck and missing-object errors; exact snapshot rows or error | 2 clock advances, 1 head advance, 2 snapshot objects, one query |
@@ -69,7 +69,7 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `table-seq` | Two per-table allocators under one head, upserts/deletes, a two-table record and an atomic partition key move; refusal safety predicate, I9 values versus serial oracle, per-table ranges | Exhaustive 3 accepted records, 2 keys, initial high-water marks [4, 0] |
 | `delete-coverage` | Arbitrary nonempty warm-file subsets, one cold file rewritten only by promotion, fresh upserts, coverage-aware later tombstone clearing; I9 existence versus serial oracle, including a separate cold-file predicate | Exhaustive 4 records, 2 keys, 2 initial files in each of 2 tier placements; samples 6 records, seeds 7, 42, 20261024 |
 | `pins` | One node, two concurrent query versions, transient data file, pin-write/recheck, floor, delayed GC; I7 | Exhaustive 3 version advances, one pin registration and one GC selection/delivery |
-| `pk-index` | PK-existence index, checkpoint collection, record collection and reopen; recovered keys equal full state (I8) | Exhaustive 3 mutations, 2 keys; checkpoint-aligned index and drop-old-reference alternatives |
+| `pk-index` | PK-existence index, checkpoint collection, record collection and reopen; recovered keys equal full state (I8) | Exhaustive 3 mutations, 2 keys; checkpoint-aligned index |
 | `removal` | Single-owner removal accounting, lease fencing, one predecessor sweep, delayed uploads/deletes, content-addressed reuse, low-water pins; I4/I7 | Exhaustive 3 commits, 2 lease generations, 2 object names per generation; samples 5 commits, seeds 7, 42, 20261024 |
 
 `commit-guards` and its three controls use one writer, one attempt, an original/retry
@@ -120,8 +120,7 @@ they do not encode real checkpoint pages.
 | `read-delivery-no-acceptance-evidence` / widened counterparts | Report unknown as accepted: acknowledgement without acceptance |
 | `read-delivery-no-exact-base` / widened counterpart | Ignore the original condition at duplicate delivery: two live physical rows |
 | `cold-promotion-no-input-removal` / `dataset-lifecycle-no-warm-input-removal` / `-no-cold-input-removal` | Keep replaced inputs live while adding outputs: multiplicity fails despite equal maximum values |
-| `dataset-prepare-file-footprint` | Literal reading that reserves logical write keys but permits file maintenance: coverage predating Resolve can clear a newly visible delete; I9 |
-| `dataset-prepare-no-cutoff-cap` / `-no-input-reservation` / `-no-resolve-seq` | Remove each candidate's safeguard: I9 resurrection; the matching positive runs compare the three alternatives independently |
+| `dataset-prepare-no-cutoff-cap` | Omit the cutoff cap while Prepare is unresolved: I9 resurrection |
 | `dataset-prepare-no-index-checkpoint` / `dataset-byte-window-metadata-prefix-no-index-checkpoint` | Keep the initial PK collection at a later checkpoint: I8 |
 | `dataset-prepare-no-prepare-roots` | Collect prepared upsert objects: I4 |
 | `dataset-prepare-no-write-reservation` | Admit an ordinary write on a reserved key: I9 |
@@ -173,12 +172,11 @@ they do not encode real checkpoint pages.
 | `seq-order-drawn-cutoff` | Compaction clears deletes through an allocated sequence rather than its captured committed cutoff: I9 resurrected row |
 | `seq-order-non-uniform` | Independent writer wins; loser assigns separate operation blocks in reverse buffer order (upserts keep delete < insert): I9 earlier value wins |
 | `generations-no-admission` | Admit a closed-generation orphan after rebase: I4 |
-| `naming-by-seq` / `naming-no-commit-number` | Name distinct retained states/checkpoints by mutation `seq`: state identity and I8 |
-| `table-seq-dataset-wide` / `table-seq-no-table-scope` | Compare independently allocated table sequences dataset-wide: valid record refused; accepted records still satisfy I9 |
-| `delete-coverage-cutoff-only` / `delete-coverage-no-cold` / `delete-coverage-iceberg-no-cold` | Clear through committed cutoff without full coverage / omit cold files from coverage: I9 resurrection |
-| `pins-oldest-query-only` | Retain only the oldest query's checkpoint and target range: I7 newer query loses a transient file |
+| `naming-no-commit-number` | Name distinct retained states/checkpoints by mutation `seq`: state identity and I8 |
+| `table-seq-no-table-scope` | Compare independently allocated table sequences dataset-wide: valid record refused; accepted records still satisfy I9 |
+| `delete-coverage-no-cold` | Omit cold files from coverage: I9 resurrection |
 | `pins-low-water-no-recheck` / `pins-low-water-past-active` | Omit post-pin floor validation / advance L past active queries: I7 |
-| `pk-index-stale-reference` / `pk-index-checkpoint-no-refresh` / `pk-index-drop-no-refresh` | Retain an older PK-index reference after checkpoint/record GC: I8 recovered keys disagree |
+| `pk-index-checkpoint-no-refresh` | Retain an older PK-index reference after checkpoint/record GC: I8 recovered keys disagree |
 | `removal-reuse` | Removal deletion races with staging/reuse of the same content address: I4/I7 |
 | `removal-serialized-own-sweep` / `removal-serialized-no-pins` | Sweep owner staging without excluding it / ignore pins when retiring removals: I4/I7 |
 
@@ -228,11 +226,7 @@ transaction, lease, byte-storage and GC compositions. Conflict re-planning redra
 sequences for the same absolute-value logical operations. Safety does not prove
 fairness or eventual completion of every buffered window.
 
-`naming-by-seq`, `table-seq-dataset-wide`, `delete-coverage-cutoff-only`,
-`pins-oldest-query-only` and `pk-index-stale-reference` encode earlier
-versions of the specification and are required failures; the specification
-now uses the designs that `naming`, `table-seq`, `delete-coverage`,
-`pins-low-water` and `pk-index-checkpoint` check. Identity separates commit numbering from mutation sequences;
+Identity separates commit numbering from mutation sequences;
 checkpoint creation itself is an object write, not an accepted state change.
 The table model checks actual per-key values, per-table record ranges and
 high-water marks; it has one writer and no buffered CAS losers. A refused record
@@ -241,24 +235,19 @@ is a safety counterexample, not a fairness theorem.
 Coverage tracks one symbolic row per file, with an inherited minimum sequence
 and a deletes-applied-through cutoff (absent on fresh files). Warm compaction
 never rewrites the cold file. Promotion applies deletes. Clearing checks all
-live files whose minimum sequence is at or below the tombstone. An alternative
-`delete-coverage-iceberg` stamps rewrite outputs at the captured committed
-cutoff and uses their data sequences for coverage. Both check the same visibility
-oracle; this is not a general equivalence proof for real file formats or every
-Iceberg delete type. Neither variant models stale asynchronous rewrite publication.
+live files whose minimum sequence is at or below the tombstone. The graph does
+not model stale asynchronous rewrite publication.
 
 The pin composition gives every version its own symbolic complete checkpoint,
-so the oldest query's base equals its target. The oldest-query pin therefore
-protects that snapshot but omits newer concurrent snapshots. Fixed L-only pins
+so each query's base equals its target. Fixed L-only pins
 retain every state from `min(floor, L)` onward; a node writes its pin before
 reading, rechecks the floor, and renews without passing an active query. Failed
 registration refuses the read. There is no expiry or query-release transition.
-The PK-index alternatives refresh the index as a checkpoint collection, or drop
-its reference so recovery starts from the checkpoint's full key collection.
-They do not model asynchronous index construction or real index bytes.
+The PK index refreshes as a checkpoint collection.
+The graph does not model asynchronous index construction or real index bytes.
 
-The exploratory `removal-reuse` variant is unsafe even with lease fencing and
-pin-aware deletion. `removal-serialized` additionally serializes retirement with
+`removal-reuse` is the control without serialization: it is unsafe even with
+lease fencing and pin-aware deletion. `removal-serialized` additionally serializes retirement with
 staging/reuse through delete completion: selection excludes ready uploads and
 plans, and new staging/reuse cannot acquire a selected address. It is safe only
 within this graph. A file removed at commit v can be selected when the retention
@@ -373,11 +362,10 @@ composition from multi-dataset reservations. Evidence expiry is not modeled;
 unavailable reads may stay unresolved indefinitely. Results are symbolic protocol
 evidence, not observations of the Spice engine or a storage provider.
 
-Every original declaration retains its bound, seed and expected outcome.
 All checkers use a 540-second watchdog. Incomplete budget probes establish no
 exhaustive outcome; sampled results mean no violation found, not exhaustive safety.
 
-The literal Prepare/maintenance reading is an expected unsafe run, not a claim that the specification has chosen it. `dataset-prepare-cutoff-cap` implements the design's cap; `dataset-prepare-input-reservation` and `dataset-prepare-resolve-seq` are separate alternatives. Capping cutoffs delays delete application/clearing above the oldest unresolved sequence across that table; input reservations delay only rewrites containing reserved keys; fresh Resolve stamps require the normal rebase of a disjoint buffer whose stamps are now below the high-water mark. Abort applies no prepared mutation and changes no coverage; allocated sequence gaps remain.
+`dataset-prepare-cutoff-cap` caps delete application/clearing below the oldest unresolved sequence across that table. Ordinary writes reserve prepared logical keys. Abort applies no prepared mutation and changes no coverage; allocated sequence gaps remain.
 
 The projection run mechanically checks every enabled outgoing transition of each sampled three-participant state against each two-participant projection, allowing stutters. It uses bound 0, where the global helper witness is false. This is sampled transition evidence, not an exhaustive projection theorem or a proof for arbitrary participant counts, global liveness, or atomic cross-dataset reads.
 
@@ -426,35 +414,6 @@ The original sequence, lifecycle (including all siblings), table-sequence, cover
 and source-replay compositions also assert live-row multiplicity. Boolean-only
 PK sets and symbolic object/transaction counters have no physical keyed row bag.
 
-### Rejected token-only rule and retained counterexamples
-
-`read-rule1-minimal-blind` and the full `read-rule1` fail the
-commit-order guarantee with the token intact. The specification rejects this
-token-only rule; these declarations retain its counterexamples. A blind winner changes a row the
-UPDATE passed over into one matching its predicate. Write-key footprints do not
-intersect the UPDATE's old selected keys; a compatible retry therefore misses the
-new row. The token excludes other read-dependent writers, not blind writers.
-This is a protocol-specification finding, not a change to its literal behavior.
-`read-rule1-gate` also fails with its token intact.
-
-`read-rule1-table-validation` and `read-rule1-gate-table-validation` are explicit
-proposed amendments: conflict on any winner writing a table read or written by the statement,
-then re-plan. They hold in their bounds but discard more work than predicate
-validation. They do not silently replace rule 1 in its literal runs. Mixed use is
-unsafe: `read-mixed-rules` fails when a rule-2 writer bypasses the rule-1 token and
-the rule-1 writer validates only written keys. A shared token or uniform read
-validation would need to be an explicit protocol rule.
-
-Rule-1 admission is an abstract exclusive token over every table read or written.
-It is released on successful publication, conflict/error report, or a failed
-attempt before re-admission; a crashed holder retains it until lease expiry.
-These non-delivery profiles include no real lease service, timer implementation,
-or uncertain CAS; the separate delivery composition adds the last.
-`read-rule1-cross-table` uses opposite-direction read/write dependencies and an
-unrelated two-table blind record. The full table sets serialize those statements.
-The `-insert-guard` pair separately checks INSERT SELECT in both directions,
-including a newly invalid destination guard. Both choices are retained.
-
 ### Necessity and controls
 
 Every new safeguard was first removed in a smaller profile before the full
@@ -462,9 +421,6 @@ profiles were added. All controls require their named downstream counterexample.
 
 | Control | Hazard demonstrated |
 |---|---|
-| `read-rule1-minimal-no-exclusive-token`, `read-rule1-no-exclusive-token` | The two UPDATEs use one snapshot and commit the write-skew result |
-| `read-rule1-cross-table-write-table-token` and the `-insert-guard-write-table-token` variant | Disjoint destination tokens admit read/write dependencies across tables; accepted actions disagree with commit-order execution |
-| `read-rule1-overlap-blind-no-blind-key-footprint` | A blind winner changes a selected row; the UPDATE reuses its old computed value |
 | `read-rule2-select-after-image-only`, `read-rule2-select-same-table-after-image-only` | A deleted source row is copied by a stale INSERT SELECT |
 | `read-rule2-minimal-blind-before-image-only` | A winner moves a previously skipped row into the predicate |
 | `read-rule2-absent-no-absent-lookup` | An absent lookup becomes present but its dependent write is still accepted |
@@ -472,16 +428,13 @@ profiles were added. All controls require their named downstream counterexample.
 | `read-rule2-minimal-no-conflict-replan` | A detected predicate conflict still publishes old computed actions |
 | `read-rule2-history-previous-winner-only` | A later unrelated winner hides a relevant winner since the snapshot |
 | `read-same-key-no-inserted-keys` | Both INSERTs publish, leaving two live rows for the absent key |
-| `read-progress-whole-table` | Every bounded ingestion round forces another re-plan and the attempt budget exhausts |
-| `read-token-no-token-expiry` | A crashed holder retains its token at a terminal state |
 
-The smaller safe comparisons `read-rule2-minimal`, `read-rule1-overlap-blind`,
-`read-rule1-cross-table` and `read-same-key` keep their matching graph shapes.
+The smaller safe comparisons `read-rule2-minimal` and `read-same-key` keep their
+matching graph shapes.
 Rule 2 uses exact written/lookup keys (including absence) and before/after predicate
 checks against every winner since the planning snapshot. Deleted keys must be in
 the winner's footprint so validation can retrieve their snapshot before images.
-There is no whole-table fallback in the safe rule-2 profiles. Unsupported or
-non-deterministic predicates, real digest collisions, source partition handoff,
+Unsupported or non-deterministic predicates, real digest collisions, source partition handoff,
 maintenance, leases, recovery, GC, NULL/type semantics and joins are outside these
 statement profiles; multi-statement transactions are checked separately below. The existing focused graphs retain their
 bounds and controls for the mechanisms they model.
@@ -493,18 +446,13 @@ In each round, a blind stream commits one or two changes to a row matching no
 predicate, then validation and the compatible rebased CAS are serviced before the
 next round. Thus it assumes bounded publication service, stronger than merely
 scheduling every writer: weak fairness alone cannot bound CAS losses. Predicate
-validation commits in the first planning attempt; the whole-table control cannot
-publish in any maximal bounded schedule and exhausts all three attempts.
-This establishes a bounded scheduler comparison, not starvation freedom under
+validation commits in the first planning attempt.
+This establishes bounded progress, not starvation freedom under
 arbitrary continuous contention or an unbounded eventual-success theorem.
 
-`read-token-progress` fairly drains every enabled operation, allows writer crashes,
-and requires eventual token release through commit, conflict/error, or expiry.
-Both progress models include full action history to avoid DAG joins. Stateright
-0.31 DFS checks `Property::eventually` on terminal paths of these finite trees;
-it does not detect arbitrary lassos or supply scheduler fairness. The controls
-produce enabled terminal paths that remain false; the driver validates them
-without shortening them as if they were safety counterexamples.
+The progress model includes full action history to avoid DAG joins. Stateright
+0.31 DFS checks `Property::eventually` on terminal paths of this finite tree;
+it does not detect arbitrary lassos or supply scheduler fairness.
 
 `MODEL_COUNTS` prints the maximum winners examined and row images evaluated per
 successful rule-2 statement, including its failed plans and repeated validations.
@@ -513,9 +461,8 @@ winners examined, row images evaluated) tuples reached at successful publication
 Counts include evaluation of nonmatching before and added-row after images and
 multiple predicates, if present; they exclude initial statement execution,
 key merges, I/O bytes and runtime. They are symbolic work counts, not performance
-measurements. Rule 1's measured model cost is exclusion of overlapping
-read-dependent programs; rule 2 additionally obtains winner additions and evaluates
-predicates while allowing independent read-dependent programs to stay in flight.
+measurements. Rule 2 obtains winner additions and evaluates predicates while
+allowing independent read-dependent programs to stay in flight.
 
 ### Program choice, sequential statements and uncertain delivery
 
@@ -532,9 +479,7 @@ with at most three planning attempts per statement. The exhaustive profiles use 
 bound limits total selected statements, errors included; it is separate from
 the two-statement limit per writer. Larger six-statement profiles are sampled.
 
-The three safety alternatives are optimistic rule 2, rule 2 with stamping at
-commit, and the proposed rule-1 token plus predicate validation. The last is an
-explicit amendment; the original literal rule-1 counterexamples remain.
+The safety profiles check optimistic rule 2 and rule 2 with stamping at commit.
 Each rule-2 safeguard-removal control also runs with nondeterministic choices.
 Required witnesses include two statements by one writer and, at total bounds
 of at least three, a commit by each distinct writer.
@@ -572,28 +517,24 @@ implementations. Delivery and maintenance are covered in separate compositions.
 
 ## Measured manual suite
 
-On 2026-10-27, `nice -n 10` execution and scoped two-pass lint completed cleanly.
-`quick` matched 34/34 declarations in 60.851 s; `EXHAUST=1 ... all` matched
-285/285 in 3508.816 s (about 58.5 minutes). All 246 earlier declarations retain
-their modes, bounds, seeds, expected outcomes, state/visit counts and maximum depth.
-Every checker uses one exploration thread. The inherited nice priority was 5;
-`nice -n 10` yielded priority 15 for the complete-suite process.
+On 2026-10-27, `EXHAUST=1 ... all` matched 251/251 declarations in 3368 s
+(about 56 minutes). Every checker uses one exploration thread.
 
 | Representative exhaustive profile | Bound | Visits / unique states | Wall s |
 |---|---:|---:|---:|
-| `read-widened-rule2-3` | 3 | 18,802,544 / 10,664,682 | 22.430 |
-| `read-widened-delivery-2` | 2 | 138,138,251 / 35,851,190 | 246.659 |
-| `transactions-three-participants-symmetry-0-exhaust` | 0 | 235,261,889 / 35,204,308 | 328.975 |
-| `remote-maintenance` | 3 | 20,332,538 / 11,941,276 | 45.670 |
-| `remote-maintenance-prepare` | 4 | 4,145,606 / 2,804,816 | 9.925 |
-| `remote-maintenance-no-file-set-lease` | 3 | 25,444,930 / 14,662,520 | 58.556 |
-| `read-transaction-widened-2` | 2 | 24,753,751 / 18,566,591 | 49.506 |
-| `read-transaction-widened-stamp-at-commit-2` | 2 | 24,753,751 / 18,566,591 | 38.555 |
+| `read-widened-rule2-3` | 3 | 18,802,544 / 10,664,682 | 20.507 |
+| `read-widened-delivery-2` | 2 | 138,138,251 / 35,851,190 | 232.903 |
+| `transactions-three-participants-symmetry-0-exhaust` | 0 | 235,261,889 / 35,204,308 | 311.349 |
+| `remote-maintenance` | 3 | 20,332,538 / 11,941,276 | 44.043 |
+| `remote-maintenance-prepare` | 4 | 4,145,606 / 2,804,816 | 9.593 |
+| `remote-maintenance-no-file-set-lease` | 3 | 25,444,930 / 14,662,520 | 54.460 |
+| `read-transaction-widened-2` | 2 | 24,753,751 / 18,566,591 | 30.190 |
+| `read-transaction-widened-stamp-at-commit-2` | 2 | 24,753,751 / 18,566,591 | 29.009 |
 | `position-delete` | 1 | 62 / 53 | 0.000 |
-| `remote-maintenance-clear-retry` | 4 | 3,492 / 2,637 | 0.014 |
+| `remote-maintenance-clear-retry` | 4 | 3,492 / 2,637 | 0.012 |
 
-The longest completed checker was the three-participant symmetry profile at
-328.975 s. All exhaustive declarations completed below the 540-second watchdog.
+The longest completed checker was `transactions-three-participants-symmetry-0-exhaust` at
+311.349 s. All exhaustive declarations completed below the 540-second watchdog.
 The original four-selection statement, three-selection delivery and two-selection
 unknown-as-loss budget probes remain incomplete evidence at their captured source;
 they are not declarations silently marked safe. New transactions exhaust two
@@ -645,7 +586,7 @@ Prepare, delivery uncertainty, maintenance, leases or GC.
 A position delete names an immutable file identity and row position. Rebase uses
 the accepted replacement's row mapping, preserving the targeted row identity as
 positions change. A complete mapping entry may instead prove prior deletion; the
-no-op and explicit-conflict alternatives are both checked. Missing/expired mappings
+operation then completes as a no-op. Missing/expired mappings
 are not modeled and cannot be treated as proof of deletion. Retain mapping evidence
 until outstanding operations can resolve or re-plan. The graph covers one rewrite,
 not chains, multiple output files, keyed replacements or mapping reclamation.
