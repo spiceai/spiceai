@@ -1437,6 +1437,10 @@ pub enum DeferredRefreshOutcome {
     TableChanged,
 }
 
+/// The plan-cache clear count when a session was copied from `DataFusion::ctx`.
+#[derive(Debug)]
+struct PlansGeneration(u64);
+
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     pub(crate) runtime_status: Arc<status::RuntimeStatus>,
@@ -1459,6 +1463,12 @@ pub struct DataFusion {
     /// default catalog, keyed by dataset name (see [`DatasetPlacement`]).
     dataset_placements: dashmap::DashMap<String, Arc<dyn DatasetPlacement>>,
     caching: Arc<Caching>,
+    /// Counts plan-cache clears; `ctx` carries the count as a [`PlansGeneration`]
+    /// extension. A plan is cached only if its session was copied after the last clear,
+    /// because a copied session keeps the functions it was copied with and a plan that
+    /// resolved a definition the clear retired would outlive it. A write holds the read
+    /// guard across its check and insert, so a clear cannot count in between.
+    plans_generation: TokioRwLock<u64>,
     /// First 10 distinct SQL results-cache plan shapes, replayed after the
     /// first full/append refresh until the cache is full. No-op unless
     /// `runtime.caching.sql_results.warmup` is `on_first_refresh`.
@@ -7017,6 +7027,10 @@ impl DataFusion {
             None
         };
 
+        let generation = session
+            .config()
+            .get_extension::<PlansGeneration>()
+            .map(|generation| generation.0);
         let (plan, placeholders) = self.create_logical_plan(session, sql, parameters).await?;
 
         // A plan is not cached when it holds substituted table-function parameters,
@@ -7029,7 +7043,10 @@ impl DataFusion {
             && !matches!(plan, LogicalPlan::Ddl(_))
         {
             tracing::trace!("caching plan for {sql}");
-            cache.put_raw_key(&cache_key.as_u64(), plan.clone()).await;
+            let current = self.plans_generation.read().await;
+            if generation == Some(*current) {
+                cache.put_raw_key(&cache_key.as_u64(), plan.clone()).await;
+            }
         }
 
         Ok(plan)
@@ -7114,6 +7131,15 @@ impl DataFusion {
 
     pub(crate) async fn clear_cached_plans(&self) {
         tracing::trace!("clearing cached logical plans");
+        {
+            let mut generation = self.plans_generation.write().await;
+            *generation += 1;
+            self.ctx
+                .state_ref()
+                .write()
+                .config_mut()
+                .set_extension(Arc::new(PlansGeneration(*generation)));
+        }
         if let Some(cache_provider) = self.plans_cache_provider() {
             cache_provider.invalidate_all().await;
         }
@@ -8512,6 +8538,61 @@ mod tests {
         assert!(df.has_table_function_placeholders(SQL));
         assert!(
             !df.has_table_function_placeholders("SELECT value FROM echo('fox') WHERE value <> $1")
+        );
+    }
+
+    /// A session copied before a reload clears the plan cache keeps the functions the
+    /// reload retired, so a plan built from it must not be cached.
+    #[tokio::test]
+    async fn a_plan_from_a_session_copied_before_a_plan_cache_clear_is_not_cached() {
+        static SQL: &str = "SELECT value FROM echo('fox')";
+        let raw_cache_key =
+            CacheKey::Query(SQL, None).as_raw_key(Box::new(std::hash::DefaultHasher::new()));
+
+        let runtime = RuntimeBuilder::new().build().await;
+        let plan_cache_provider = Arc::new(SimpleCache::new(
+            512,
+            Duration::from_hours(1),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
+        ));
+        let df = Arc::new(
+            DataFusion::builder(
+                status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+                Handle::current(),
+            )
+            .with_caching(Arc::new(
+                Caching::new().with_plans_cache(plan_cache_provider),
+            ))
+            .build(),
+        );
+        df.ctx.register_udtf("echo", Arc::new(EchoTableFunc));
+
+        let session = df.ctx.state();
+        df.clear_cached_plans().await;
+        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL, None)
+            .await
+            .expect("plan from the copied session");
+
+        let Some(cache_provider) = df.plans_cache_provider() else {
+            unreachable!("Cache provider should be available");
+        };
+        cache_provider.checkpoint().await;
+        assert_eq!(
+            cache_provider.item_count().await,
+            0,
+            "a plan from a session copied before a clear must not be cached"
+        );
+
+        let session = df.ctx.state();
+        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL, None)
+            .await
+            .expect("plan from a session copied after the clear");
+        cache_provider.checkpoint().await;
+        assert_eq!(
+            cache_provider.item_count().await,
+            1,
+            "a plan from a session copied after a clear is cached"
         );
     }
 
