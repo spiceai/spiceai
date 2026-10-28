@@ -438,6 +438,31 @@ def main():
         "configuration: invalid mode and incompatible cluster roles rejected",
         flush=True,
     )
+    for configured in [None, 3]:
+        partition_pod = base_pod("partitions", [], "sidecar")
+        if configured is None:
+            partition_pod["runtime"]["query"].pop("target_partitions")
+        else:
+            partition_pod["runtime"]["query"]["target_partitions"] = configured
+        instance = Instance(
+            args.spiced, args.out / f"partitions-{configured}", partition_pod
+        )
+        try:
+            instance.start()
+            rows, _ = instance.query("SHOW datafusion.execution.target_partitions")
+            (instance.directory / "result.json").write_text(json.dumps(rows, indent=2))
+            assert rows == [
+                {
+                    "name": "datafusion.execution.target_partitions",
+                    "value": str(1 if configured is None else configured),
+                }
+            ], rows
+        finally:
+            instance.stop()
+    print(
+        "configuration: sidecar defaults to one partition; explicit override selects three",
+        flush=True,
+    )
     database, source_path = fixture(args.out, args.rows)
     cluster_pod = base_pod(
         "upstream",
