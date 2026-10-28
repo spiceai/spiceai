@@ -17,7 +17,7 @@ limitations under the License.
 //! Refresh command implementation - triggers a dataset refresh.
 
 use crate::context::RuntimeContext;
-use crate::error::{self, InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
+use crate::error::{self, InvalidResponseSnafu, Result};
 use crate::output::{OutputFormat, write_json};
 use clap::Args;
 use serde::{Deserialize, Serialize};
@@ -110,12 +110,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &RefreshArgs) -> Result<()> {
     } else {
         ctx.post(&url, None).await
     }
-    .map_err(|_| {
-        RuntimeUnavailableSnafu {
-            endpoint: ctx.http_endpoint().to_string(),
-        }
-        .build()
-    })?;
+    .map_err(|e| error::runtime_unreachable(ctx.http_endpoint(), &e))?;
 
     let response = error::check_response(response, ctx.http_endpoint()).await?;
 

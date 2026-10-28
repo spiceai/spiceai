@@ -19,7 +19,7 @@ limitations under the License.
 use crate::error::{
     CreateDirectorySnafu, Error, HomeDirectoryNotFoundSnafu, HttpClientBuildSnafu, Result,
     RuntimeExecutionSnafu, RuntimeNotInstalledSnafu, RuntimeVersionSnafu,
-    SpicedPathNotAnchorableSnafu, SpicedPathOverrideNotRunnableSnafu,
+    SpicedPathNotAnchorableSnafu, SpicedPathOverrideNotRunnableSnafu, TlsRootCertificateSnafu,
     WindowsNativeRuntimeUnsupportedSnafu,
 };
 use snafu::{OptionExt, ResultExt, ensure};
@@ -109,10 +109,27 @@ const TEST_USER_AGENT: &str = "spice/test (test; test)";
 /// because it would carry neither the deadline nor the same-origin redirect policy, and these
 /// clients send the API key in a header.
 fn build_http_client(user_agent: String, deadline: Deadline) -> Result<reqwest::Client> {
-    let builder = reqwest::Client::builder()
+    build_http_client_trusting(user_agent, deadline, Vec::new())
+}
+
+/// [`build_http_client`], trusting only `root_certificates` when any are given.
+///
+/// `--tls-root-certificate-file` names the CA the runtime's certificate chains to, and the
+/// HTTP client trusts exactly that CA — the same as the Flight client `spice sql` builds
+/// from the flag. With no certificates the platform's roots are used.
+fn build_http_client_trusting(
+    user_agent: String,
+    deadline: Deadline,
+    root_certificates: Vec<reqwest::Certificate>,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
         .user_agent(user_agent)
         .connect_timeout(CONNECT_TIMEOUT)
         .redirect(same_origin_redirect_policy());
+
+    if !root_certificates.is_empty() {
+        builder = builder.tls_certs_only(root_certificates);
+    }
 
     let builder = match deadline {
         Deadline::Total(duration) => builder.timeout(duration),
@@ -120,6 +137,38 @@ fn build_http_client(user_agent: String, deadline: Deadline) -> Result<reqwest::
     };
 
     builder.build().context(HttpClientBuildSnafu)
+}
+
+/// Read the certificates in a `--tls-root-certificate-file`.
+///
+/// # Errors
+///
+/// Returns an error naming the file if it cannot be read or holds no PEM certificate. A file
+/// that yields nothing is not ignored: the client would quietly fall back to the platform's
+/// roots and fail later with a certificate error that hides the real problem.
+fn load_root_certificates(path: &str) -> Result<Vec<reqwest::Certificate>> {
+    let pem = std::fs::read(path).map_err(|e| {
+        TlsRootCertificateSnafu {
+            path,
+            message: e.to_string(),
+        }
+        .build()
+    })?;
+    let certificates = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
+        TlsRootCertificateSnafu {
+            path,
+            message: e.to_string(),
+        }
+        .build()
+    })?;
+    ensure!(
+        !certificates.is_empty(),
+        TlsRootCertificateSnafu {
+            path,
+            message: "the file holds no PEM certificate",
+        }
+    );
+    Ok(certificates)
 }
 
 /// Treat a blank credential as absent.
@@ -309,6 +358,19 @@ impl RuntimeContext {
         }
 
         ctx.api_key = normalize_credential(api_key);
+
+        // The flag is global, so every HTTP call the CLI makes to the runtime has to trust
+        // it, not only the Flight client `spice sql` builds.
+        if let Some(path) = &tls_root_certificate_file {
+            let roots = load_root_certificates(path)?;
+            ctx.http_client = build_http_client_trusting(
+                ctx.user_agent.clone(),
+                CONTROL_PLANE_DEADLINE,
+                roots.clone(),
+            )?;
+            ctx.inference_http_client =
+                build_http_client_trusting(ctx.user_agent.clone(), ctx.inference_deadline, roots)?;
+        }
         ctx.tls_root_certificate_file = tls_root_certificate_file;
 
         // Load API key from .env if not provided

@@ -17,7 +17,7 @@ limitations under the License.
 //! Status command implementation.
 
 use crate::context::RuntimeContext;
-use crate::error::{self, InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
+use crate::error::{self, InvalidResponseSnafu, Result};
 use crate::output::{OutputFormat, write_json};
 use clap::Args;
 use serde::{Deserialize, Serialize};
@@ -54,12 +54,10 @@ struct ComponentStatus {
 
 /// Execute the status command.
 pub async fn execute(ctx: &RuntimeContext, args: &StatusArgs) -> Result<()> {
-    let response = ctx.get("/v1/status").await.map_err(|_| {
-        RuntimeUnavailableSnafu {
-            endpoint: ctx.http_endpoint().to_string(),
-        }
-        .build()
-    })?;
+    let response = ctx
+        .get("/v1/status")
+        .await
+        .map_err(|e| error::runtime_unreachable(ctx.http_endpoint(), &e))?;
 
     let response = error::check_response(response, ctx.http_endpoint()).await?;
 
