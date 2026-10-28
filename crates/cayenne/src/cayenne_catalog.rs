@@ -4614,7 +4614,7 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         cutoff: i64,
     ) -> CatalogResult<()> {
-        let mut tx = self
+        let tx = self
             .begin_transaction()
             .await
             .map_err(|e| CatalogError::InvalidOperation {
