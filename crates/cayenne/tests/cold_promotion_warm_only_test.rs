@@ -665,7 +665,7 @@ test_with_backends!(test_do_nothing_table_over_the_datalake_impl);
 
 /// Insert-or-ignore over the datalake: an insert of a key deleted from the
 /// datalake is accepted, whether or not a promotion ran between the delete and
-/// the insert, and that still holds after a datalake merge and a reopen. The
+/// the insert, and after a datalake merge and a reopen. The
 /// exact keyset this depends on is rebuilt from the datalake with per-file
 /// cutoffs.
 async fn test_do_nothing_table_over_the_datalake_impl(
@@ -728,17 +728,25 @@ async fn test_do_nothing_table_over_the_datalake_impl(
     }
     assert!(table.compact_cold_tier().await?, "four generations merge");
     assert_eq!(generation_count(&manifest(&fixture.catalog, &table).await?), 1);
-    common::insert_batch(table.as_ref(), id_value_batch(&[(5, 555), (8, 8888)])?).await?;
-    insert(&mut oracle, &[(5, 555), (8, 8888)]);
     assert_matches_oracle(&ctx, &oracle, &lookups, "after the merge").await?;
+    // Delete then re-insert over the merged generation: accepted.
+    assert_eq!(delete_where(&table, col("id").eq(lit(9_i64))).await?, 1);
+    oracle.remove(&9);
+    common::insert_batch(table.as_ref(), id_value_batch(&[(9, 909)])?).await?;
+    insert(&mut oracle, &[(9, 909)]);
+    assert_matches_oracle(&ctx, &oracle, &lookups, "after re-inserting over the merge").await?;
 
     table.drain_in_flight_maintenance().await?;
     drop(ctx);
     drop(table);
     let (_catalog_2, reopened, ctx_2) = reopen(&fixture).await?;
-    common::insert_batch(reopened.as_ref(), id_value_batch(&[(9, 9999), (7, 7777)])?).await?;
-    insert(&mut oracle, &[(9, 9999), (7, 7777)]);
     assert_matches_oracle(&ctx_2, &oracle, &lookups, "after reopen").await?;
+    // The keyset rebuilt on reopen still accepts a delete then re-insert.
+    assert_eq!(delete_where(&reopened, col("id").eq(lit(5_i64))).await?, 1);
+    oracle.remove(&5);
+    common::insert_batch(reopened.as_ref(), id_value_batch(&[(5, 505)])?).await?;
+    insert(&mut oracle, &[(5, 505)]);
+    assert_matches_oracle(&ctx_2, &oracle, &lookups, "after re-inserting after reopen").await?;
     Ok(())
 }
 
