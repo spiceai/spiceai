@@ -807,7 +807,8 @@ fn combination_capture_dir(script_dir: &Path, script: &Script, run_label: &str) 
 /// container's output as `<source>.log`, for a failure that may be the
 /// source's (a broker that never came back, a database that restarted into
 /// recovery), and from `work`, the run's directory, every instance's
-/// `spiced.log`, spicepod and sqllogictest reports at their paths there.
+/// `spiced.log`, spicepod, sqllogictest reports and random-query
+/// failures at their paths there.
 /// A log that cannot be saved is a warning: the run's own failure is the one
 /// to report.
 async fn capture_combination(sources: &Sources, run_id: &str, work: &Path, dir: &Path) {
@@ -857,7 +858,8 @@ fn copy_instance_logs(root: &Path, dir: &Path, to: &Path) -> Result<()> {
             .unwrap_or_default();
         let wanted = name == "spiced.log"
             || name == "spicepod.yaml"
-            || (name.starts_with("slt-") && path.extension().is_some_and(|x| x == "txt"));
+            || ((name.starts_with("slt-") || name.starts_with("random-queries-seed"))
+                && path.extension().is_some_and(|x| x == "txt"));
         if !wanted {
             continue;
         }

@@ -514,6 +514,59 @@ fn shortened_batch(batch: &RecordBatch, width: usize) -> Result<RecordBatch, Arr
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
 }
 
+/// Protocols serialize the same result types, so equality is exact after
+/// normalizing row order and SQL's equivalent representations of zero.
+/// The ordinary comparator additionally checks explicit SQL sort contracts.
+pub fn compare_protocol(
+    name: &str,
+    sql: &str,
+    actual: &[RecordBatch],
+    expected: &[RecordBatch],
+    expect_empty: bool,
+) -> Result<Option<String>> {
+    if let Some(report) = compare(name, sql, actual, expected, expect_empty)? {
+        return Ok(Some(report));
+    }
+    let preserve_order = actual
+        .first()
+        .or_else(|| expected.first())
+        .is_some_and(|batch| {
+            result_compare::sort_order::resolve_sort_key(sql, &batch.schema()).hides_a_sort_term()
+        });
+    let rows = |batches: &[RecordBatch]| -> Result<Vec<Vec<Option<String>>>> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            for row in 0..batch.num_rows() {
+                rows.push(
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|column| result_compare::array_value_to_string(column.as_ref(), row))
+                        .collect::<Result<Vec<_>>>()?,
+                );
+            }
+        }
+        if !preserve_order {
+            rows.sort_unstable();
+        }
+        Ok(rows)
+    };
+    let actual_rows = rows(actual)?;
+    let expected_rows = rows(expected)?;
+    if actual_rows != expected_rows {
+        return Ok(Some(format!(
+            "protocol values differ (exact comparison); first different rows: {:?}\n--- actual\n{}\n--- expected\n{}",
+            actual_rows
+                .iter()
+                .zip(&expected_rows)
+                .find(|(actual, expected)| actual != expected),
+            preview(actual),
+            preview(expected)
+        )));
+    }
+    Ok(None)
+}
+
 /// The first rows of an answer, for a failure report.
 pub fn preview(batches: &[RecordBatch]) -> String {
     const ROWS: usize = 10;
@@ -551,6 +604,39 @@ mod tests {
     use result_compare::array_value_to_string;
 
     use super::*;
+
+    #[test]
+    fn protocol_values_use_exact_numeric_comparison() {
+        use arrow::array::Float64Array;
+        let batch = |values: Vec<f64>| {
+            RecordBatch::try_from_iter([("f", Arc::new(Float64Array::from(values)) as ArrayRef)])
+                .expect("float batch")
+        };
+        let left = vec![batch(vec![1.0, 1.000_001])];
+        let changed = vec![batch(vec![1.0, 1.000_002])];
+        assert!(
+            compare_protocol("protocols", "SELECT f FROM t", &left, &changed, false)
+                .expect("comparison")
+                .is_some()
+        );
+        let swapped = vec![batch(vec![1.000_001, 1.0])];
+        assert!(
+            compare_protocol("protocols", "SELECT f FROM t", &left, &swapped, false)
+                .expect("unordered comparison")
+                .is_none()
+        );
+        assert!(
+            compare_protocol(
+                "protocols",
+                "SELECT f FROM t ORDER BY hidden_key",
+                &left,
+                &swapped,
+                false
+            )
+            .expect("hidden order comparison")
+            .is_some()
+        );
+    }
 
     fn text(rows: &[&[Option<&str>]]) -> TextResult {
         TextResult {

@@ -2909,6 +2909,11 @@ jobs:
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
+      - name: Check documented SQL cases
+        run: |
+          python3 -m unittest discover -s test/spicescript/corpus -p test_sql_surface.py
+          python3 test/spicescript/corpus/sql_surface.py --check
+
       - name: Build spicescript
         uses: ./.github/actions/build-tool
         with:
@@ -2990,6 +2995,14 @@ jobs:
           unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
           echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
 
+      - name: Check harness rejects incorrect answers
+        if: ${{ matrix.partition == '1/4' }}
+        run: |
+          python3 test/spicescript/check_harness.py \
+            --runner "${{ steps.spicescript.outputs.path }}" \
+            --spiced "$(command -v spiced)" \
+            --work-dir "$RUNNER_TEMP/spicescript/harness-checks"
+
       - name: Run scenario scripts
         run: |
           "${{ steps.spicescript.outputs.path }}" --jobs 4 \
@@ -3019,7 +3032,9 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spicescript-logs-${{ strategy.job-index }}
-          path: ${{ runner.temp }}/spicescript-logs
+          path: |
+            ${{ runner.temp }}/spicescript-logs
+            ${{ runner.temp }}/spicescript/harness-checks/*.log
           if-no-files-found: warn
           retention-days: 7
 

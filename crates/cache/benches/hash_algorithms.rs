@@ -32,7 +32,6 @@ fn bench_hash_small_query(c: &mut Criterion) {
         ("ahash", HashingAlgorithm::Ahash),
         ("blake3", HashingAlgorithm::Blake3),
         ("xxh3", HashingAlgorithm::XXH3),
-        ("xxh32", HashingAlgorithm::XXH32),
         ("xxh64", HashingAlgorithm::XXH64),
         ("xxh128", HashingAlgorithm::XXH128),
     ];
@@ -64,7 +63,6 @@ fn bench_hash_medium_query(c: &mut Criterion) {
         ("ahash", HashingAlgorithm::Ahash),
         ("blake3", HashingAlgorithm::Blake3),
         ("xxh3", HashingAlgorithm::XXH3),
-        ("xxh32", HashingAlgorithm::XXH32),
         ("xxh64", HashingAlgorithm::XXH64),
         ("xxh128", HashingAlgorithm::XXH128),
     ];
@@ -132,7 +130,6 @@ fn bench_hash_large_query(c: &mut Criterion) {
         ("ahash", HashingAlgorithm::Ahash),
         ("blake3", HashingAlgorithm::Blake3),
         ("xxh3", HashingAlgorithm::XXH3),
-        ("xxh32", HashingAlgorithm::XXH32),
         ("xxh64", HashingAlgorithm::XXH64),
         ("xxh128", HashingAlgorithm::XXH128),
     ];
@@ -171,7 +168,6 @@ fn bench_hash_throughput(c: &mut Criterion) {
         ("ahash", HashingAlgorithm::Ahash),
         ("blake3", HashingAlgorithm::Blake3),
         ("xxh3", HashingAlgorithm::XXH3),
-        ("xxh32", HashingAlgorithm::XXH32),
         ("xxh64", HashingAlgorithm::XXH64),
         ("xxh128", HashingAlgorithm::XXH128),
     ];
@@ -207,7 +203,6 @@ fn bench_hash_distribution(c: &mut Criterion) {
         ("ahash", HashingAlgorithm::Ahash),
         ("blake3", HashingAlgorithm::Blake3),
         ("xxh3", HashingAlgorithm::XXH3),
-        ("xxh32", HashingAlgorithm::XXH32),
         ("xxh64", HashingAlgorithm::XXH64),
         ("xxh128", HashingAlgorithm::XXH128),
     ];
