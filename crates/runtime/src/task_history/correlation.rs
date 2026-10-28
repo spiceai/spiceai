@@ -395,12 +395,13 @@ mod tests {
 
         let pinned = TraceId::from_hex(PINNED).expect("valid trace id");
         let caller = SpanId::from_hex("b7ad6b7169203331").expect("valid parent id");
-        for (pin, propagated, joined) in [
-            (Some(PINNED), Some(PINNED), true),
-            (Some(PINNED), Some(PROPAGATED), false),
-            (Some(PINNED), None, false),
-            (None, Some(PINNED), true),
-            (None, None, false),
+        // A root that joins the propagated trace has a parent; one that does not, none.
+        for (pin, propagated, root_parent) in [
+            (Some(PINNED), Some(PINNED), caller),
+            (Some(PINNED), Some(PROPAGATED), SpanId::INVALID),
+            (Some(PINNED), None, SpanId::INVALID),
+            (None, Some(PINNED), TRACE_JOIN_ANCHOR),
+            (None, None, SpanId::INVALID),
         ] {
             let spans = Arc::new(std::sync::Mutex::new(Vec::new()));
             let provider = SdkTracerProvider::builder()
@@ -442,21 +443,13 @@ mod tests {
                 .iter()
                 .find(|span| span.name == "child")
                 .expect("child");
-            assert_eq!(root.span_context.trace_id() == pinned, joined);
+            assert_eq!(
+                root.span_context.trace_id() == pinned,
+                root_parent != SpanId::INVALID
+            );
             assert_eq!(child.span_context.trace_id(), root.span_context.trace_id());
             assert_eq!(child.parent_span_id, root.span_context.span_id());
-            assert_eq!(
-                root.parent_span_id,
-                if joined {
-                    if pin.is_some() {
-                        caller
-                    } else {
-                        TRACE_JOIN_ANCHOR
-                    }
-                } else {
-                    SpanId::INVALID
-                }
-            );
+            assert_eq!(root.parent_span_id, root_parent);
         }
     }
 

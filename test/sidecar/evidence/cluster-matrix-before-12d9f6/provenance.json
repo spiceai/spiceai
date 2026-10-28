@@ -1,8 +1,0 @@
-{
-  "date": "2026-10-28T11:56:02Z",
-  "source_commit": "12d9f6946ba3085816ab2230c7fdb5cb3bc6c503",
-  "spiced_sha256": "99aaf8f778ecb9ca4995601add20813e7a9611d2eadef0918221e6995c048f80",
-  "spicescript_sha256": "1f1d3c38b364ec3dc2c89144eb4a25d2f7e8395b99c15e6ad44485467fecd4fc",
-  "command": "env SPICE_CPU_CORES=2 /tmp/spice-sidecar-artifacts/candidate-12d9f6/spicescript --jobs 1 --cluster --spiced /tmp/spice-sidecar-artifacts/candidate-12d9f6/spiced --work-dir /tmp/spice-sidecar-artifacts/cluster-matrix-before-12d9f6/run test/spicescript/sidecar-local.yaml",
-  "exit_code": 1
-}

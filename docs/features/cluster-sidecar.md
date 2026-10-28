@@ -61,24 +61,7 @@ Ports, bindings, authentication, and readiness settings are configured as usual.
 For rollback, select `server` and restart; configured acceleration files remain.
 
 The [Enhancement](https://github.com/spiceai/spiceai/issues/15707) records the
-contract. [The native qualification driver](../../test/scripts/sidecar.py)
-compares SQLite answers with both federation paths, exercises local serving
-during an upstream outage, and drives the full client → sidecar → standalone
-upstream path with `testoperator` in interleaved SQL/Substrait arms. Example:
-
-```bash
-python3 test/scripts/sidecar.py \
-  --spiced target/release/spiced \
-  --testoperator target/release/testoperator \
-  --out /tmp/sidecar-qualification \
-  --concurrency 2 8 32 128 --duration 30
-```
-
-The driver holds CPU, memory, admission, and local partitions constant, starts
-a fresh standalone upstream for every comparison arm, and measures remote
-cache misses by default. Use `--cache-states hit` for a separate
-measurement of sidecar-cache hits. It keeps
-commands, provenance, expected/returned rows, plans, metrics, and benchmark
-outputs in the run directory. Add `--executors 2` for separate distributed
-cluster qualification. The [qualification record](../../test/sidecar/README.md)
-documents the independent oracles, reproduction commands and measurement limits.
+contract. `test/spicescript/results-cache.yaml` checks results-cache serving in
+both modes, and `crates/runtime/tests/flight/sidecar.rs` compares a sidecar's
+answers through Substrait federation with an independent DataFusion session
+over the same rows.

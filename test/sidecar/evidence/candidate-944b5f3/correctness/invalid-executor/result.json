@@ -1,1 +1,0 @@
-{"exit_code": 1, "expected_message": "runtime.mode: sidecar cannot run as a cluster scheduler or executor"}

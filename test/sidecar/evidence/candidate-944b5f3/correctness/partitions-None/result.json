@@ -1,6 +1,0 @@
-[
-  {
-    "name": "datafusion.execution.target_partitions",
-    "value": "1"
-  }
-]

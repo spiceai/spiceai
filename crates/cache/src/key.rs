@@ -96,7 +96,16 @@ impl<'a> From<(&'a str, &'a EmbeddingInput)> for CacheKey<'a> {
     }
 }
 
-impl CacheKey<'_> {
+impl<'a> CacheKey<'a> {
+    /// The key for a query plan: the digest of its serialized form when it
+    /// arrived serialized, otherwise the plan itself.
+    #[must_use]
+    pub fn for_plan(plan: &'a LogicalPlan, serialized_digest: Option<&'a str>) -> Self {
+        serialized_digest.map_or(Self::LogicalPlan(plan), |digest| {
+            Self::SerializedPlan(digest, plan)
+        })
+    }
+
     /// Hash this key's payload into `hasher`. Used by both [`Self::as_raw_key`]
     /// and [`Self::as_raw_key_in_namespace`] so the payload byte stream stays
     /// identical regardless of whether a namespace prefix was mixed in.

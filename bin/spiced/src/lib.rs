@@ -28,7 +28,7 @@ use tokio::sync::SetOnce;
 
 use app::spicepod::component::runtime::{
     ClientAuthMode as SpicepodClientAuthMode, OtelExporterConfig, OtelSignal,
-    Runtime as SpicepodRuntime, TelemetryConfig, validate_metric_prefix,
+    Runtime as SpicepodRuntime, RuntimeMode, TelemetryConfig, validate_metric_prefix,
 };
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser, ValueEnum};
@@ -712,11 +712,12 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         extension_factories.push(Box::new(tpc_extension_factory));
     }
 
+    // Check for explicit cluster role OR implicit executor role (scheduler_address set without explicit role)
+    let is_cluster_mode =
+        args.runtime.cluster.role.is_some() || args.runtime.cluster.scheduler_address.is_some();
+
     let runtime_config = app.as_ref().map(|app| &app.runtime);
-    if runtime_config.is_some_and(|runtime| {
-        runtime.mode == app::spicepod::component::runtime::RuntimeMode::Sidecar
-    }) && (args.runtime.cluster.role.is_some()
-        || args.runtime.cluster.scheduler_address.is_some())
+    if is_cluster_mode && runtime_config.is_some_and(|runtime| runtime.mode == RuntimeMode::Sidecar)
     {
         return Err(Error::InvalidClusterConfig {
             source: std::io::Error::other(
@@ -791,10 +792,6 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         .with_runtime_config(args.runtime.clone())
         .with_rate_limits(rate_limits)
         .with_io_runtime(Handle::current());
-
-    // Check for explicit cluster role OR implicit executor role (scheduler_address set without explicit role)
-    let is_cluster_mode =
-        args.runtime.cluster.role.is_some() || args.runtime.cluster.scheduler_address.is_some();
 
     // Create MetricsReader for cluster mode to enable on-demand OTLP metrics collection
     let metrics_reader = if is_cluster_mode {

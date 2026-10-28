@@ -1467,9 +1467,7 @@ impl Query {
                     Some(session) => *session,
                     None => ctx.get_session_state(&request_context),
                 };
-                if let Some(timeout) = request_context.query_timeout()
-                    && let Some(deadline) = started_at.checked_add(timeout)
-                {
+                if let Some(deadline) = timeout_state.deadline() {
                     session.config_mut().set_extension(Arc::new(
                         runtime_request_context::QueryDeadline(deadline),
                     ));
@@ -2729,71 +2727,17 @@ fn attach_cancellation_to_stream<G>(
 where
     G: Send + 'static,
 {
-    struct State<G> {
-        stream: Option<SendableRecordBatchStream>,
-        token: tokio_util::sync::CancellationToken,
-        query_id: Arc<str>,
-        timeout: QueryTimeoutState,
-        guard: Option<G>,
-        emitted_cancel: bool,
-    }
-
-    impl<G> State<G> {
-        fn release_query_resources(&mut self) {
-            self.stream.take();
-            self.guard.take();
-        }
-
-        fn cancellation_error(&self) -> DataFusionError {
-            DataFusionError::External(Box::new(self.timeout.cancellation_error(&self.query_id)))
-        }
-    }
-
     let schema = stream.schema();
-
-    let state = State {
-        stream: Some(stream),
-        token: cancellation_token,
-        query_id,
-        timeout: timeout_state,
-        guard: Some(guard),
-        emitted_cancel: false,
-    };
-
-    let wrapped = futures::stream::unfold(state, |mut state| async move {
-        if state.emitted_cancel {
-            return None;
-        }
-        state.timeout.cancel_if_expired(&state.token);
-        if state.token.is_cancelled() {
-            state.emitted_cancel = true;
-            state.release_query_resources();
-            return Some((Err(state.cancellation_error()), state));
-        }
-        let token = state.token.clone();
-        let mut stream = state.stream.take()?;
-        tokio::select! {
-            biased;
-            () = token.cancelled() => {
-                state.emitted_cancel = true;
-                state.release_query_resources();
-                Some((Err(state.cancellation_error()), state))
-            }
-            next = stream.next() => {
-                state.stream = Some(stream);
-                state.timeout.cancel_if_expired(&state.token);
-                if state.token.is_cancelled() {
-                    state.emitted_cancel = true;
-                    state.release_query_resources();
-                    Some((Err(state.cancellation_error()), state))
-                } else {
-                    next.map(|item| (item, state))
-                }
-            }
-        }
-    });
-
-    Box::pin(RecordBatchStreamAdapter::new(schema, Box::pin(wrapped)))
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        attach_cancellation_to_item_stream(
+            stream,
+            cancellation_token,
+            query_id,
+            timeout_state,
+            guard,
+        ),
+    ))
 }
 
 fn attach_cancellation_to_item_stream<S, I, G>(
@@ -2818,13 +2762,16 @@ where
     }
 
     impl<S, G> State<S, G> {
-        fn release_query_resources(&mut self) {
+        /// Ends the stream with its cancellation error, releasing the query's
+        /// resources first.
+        fn cancelled<I>(mut self) -> (Result<I, DataFusionError>, Self) {
+            self.emitted_cancel = true;
             self.stream.take();
             self.guard.take();
-        }
-
-        fn cancellation_error(&self) -> DataFusionError {
-            DataFusionError::External(Box::new(self.timeout.cancellation_error(&self.query_id)))
+            let error = DataFusionError::External(Box::new(
+                self.timeout.cancellation_error(&self.query_id),
+            ));
+            (Err(error), self)
         }
     }
 
@@ -2843,26 +2790,18 @@ where
         }
         state.timeout.cancel_if_expired(&state.token);
         if state.token.is_cancelled() {
-            state.emitted_cancel = true;
-            state.release_query_resources();
-            return Some((Err(state.cancellation_error()), state));
+            return Some(state.cancelled());
         }
         let token = state.token.clone();
         let mut stream = state.stream.take()?;
         tokio::select! {
             biased;
-            () = token.cancelled() => {
-                state.emitted_cancel = true;
-                state.release_query_resources();
-                Some((Err(state.cancellation_error()), state))
-            }
+            () = token.cancelled() => Some(state.cancelled()),
             next = stream.next() => {
                 state.stream = Some(stream);
                 state.timeout.cancel_if_expired(&state.token);
                 if state.token.is_cancelled() {
-                    state.emitted_cancel = true;
-                    state.release_query_resources();
-                    Some((Err(state.cancellation_error()), state))
+                    Some(state.cancelled())
                 } else {
                     next.map(|item| (item, state))
                 }

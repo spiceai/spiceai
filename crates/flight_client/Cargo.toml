@@ -35,6 +35,8 @@ tower.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+# The compressed-message guard test encodes a zstd-compressed batch.
+arrow-ipc = { workspace = true, features = ["zstd"] }
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
 tokio-stream = { workspace = true, features = ["net"] }
 

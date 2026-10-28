@@ -44,6 +44,7 @@ use runtime_acceleration::acceleration::{RefreshMode, unset_refresh_mode_for_con
 use runtime_metrics as metrics;
 use spicepod::component::caching::CacheKeyType;
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
+use spicepod::component::runtime::RuntimeMode;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;
 use spicepod::component::runtime::TelemetryConfig;
@@ -376,17 +377,14 @@ impl RuntimeBuilder {
         document_parse::register_all().await;
 
         let query = spicepod_rt.query.clone().unwrap_or_default();
-        if spicepod_rt.mode == spicepod::component::runtime::RuntimeMode::Sidecar {
+        if spicepod_rt.mode == RuntimeMode::Sidecar {
             tracing::info!(
                 "Runtime mode: sidecar. Remote Spice reads use Substrait plans created locally."
             );
         }
 
         let memory_limit = parse_memory_limit(query.memory_limit.clone());
-        let target_partitions = query.target_partitions.or_else(|| {
-            (spicepod_rt.mode == spicepod::component::runtime::RuntimeMode::Sidecar)
-                .then(|| cpu_budget::cpu_budget().sidecar_target_partitions())
-        });
+        let target_partitions = query.target_partitions;
         let max_concurrent_queries = query.max_concurrent_queries;
 
         // The effective timeout is resolved per request by
@@ -808,6 +806,7 @@ impl RuntimeBuilder {
         )
         .memory_limit(memory_limit)
         .target_partitions(target_partitions)
+        .runtime_mode(spicepod_rt.mode)
         .max_concurrent_queries(max_concurrent_queries)
         .prefer_hash_join(query.prefer_hash_join)
         .eager_aggregation(query.eager_aggregation)

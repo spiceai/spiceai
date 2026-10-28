@@ -1,6 +1,0 @@
-{
-  "source_commit": "f4f0d5dc7885fc4bc5d20dcc130ab3456a881682",
-  "command": "env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ CARGO_TARGET_DIR=/Users/Code/dev/spiceai/target cargo nextest run --cargo-profile release -p spiced -p runtime -p flight_client -p data_components --no-default-features --features release --lib -E 'test(/task_history::correlation::tests/) | test(/flight::traced_ticket::tests/)' --no-capture",
-  "date": "2026-10-28",
-  "result": "16 tests run: 16 passed, 3625 skipped; execution 0.383s, build 16m52s"
-}

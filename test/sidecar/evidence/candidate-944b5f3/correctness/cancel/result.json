@@ -1,8 +1,0 @@
-{
-  "acknowledgement": {
-    "query_id": "691f01fa-dcce-49f6-a325-959f8486221d",
-    "status": "cancelled"
-  },
-  "status": 499,
-  "body": "External error: Query 691f01fa-dcce-49f6-a325-959f8486221d was cancelled"
-}

@@ -350,28 +350,15 @@ impl FlightClient {
     /// it to SQL. Spice accepts the typed command directly as a `DoGet` ticket,
     /// so a sidecar that already knows the schema needs no `GetFlightInfo` call.
     ///
+    /// A `trace_id` travels in the opaque ticket and joins the upstream trace
+    /// without declaring a client override; explicit trace headers retain their
+    /// normal precedence. It must be normalized to 32 hexadecimal characters,
+    /// not all zero.
+    ///
     /// # Errors
     /// Returns an error on authentication, unsupported plans, invalid tickets,
     /// or transport failure. Stream errors remain visible to the caller.
     pub async fn query_substrait(
-        &self,
-        plan: Bytes,
-        timeout: Option<Duration>,
-    ) -> Result<FlightRecordBatchStream> {
-        self.query_substrait_with_trace_id(plan, timeout, None)
-            .await
-    }
-
-    /// Executes a plan carrying a runtime-generated trace id in its opaque ticket.
-    ///
-    /// The id joins the upstream trace without declaring a client override.
-    /// Explicit trace headers retain their normal precedence. `trace_id`, when
-    /// supplied, must be normalized to 32 hexadecimal characters, not all zero.
-    ///
-    /// # Errors
-    /// Returns the same authentication, plan and transport errors as
-    /// [`Self::query_substrait`].
-    pub async fn query_substrait_with_trace_id(
         &self,
         plan: Bytes,
         timeout: Option<Duration>,
@@ -405,12 +392,10 @@ impl FlightClient {
             .await
             .map_err(map_substrait_error)?
             .into_parts();
-        Ok(FlightRecordBatchStream::new_from_flight_data(
-            stream
-                .map_ok(conforming_map_entries)
-                .map_err(|status| FlightError::Tonic(Box::new(status))),
+        Ok(
+            FlightRecordBatchStream::new_from_flight_data(checked_flight_data(stream))
+                .with_headers(metadata),
         )
-        .with_headers(metadata))
     }
 
     /// Creates a new instance of `FlightClient`.
@@ -611,13 +596,10 @@ impl FlightClient {
                 .map_err(map_tonic_error_to_message)?
                 .into_parts();
 
-            return Ok(FlightRecordBatchStream::new_from_flight_data(
-                response_stream
-                    .map_err(|status| FlightError::Tonic(Box::new(status)))
-                    .and_then(|message| std::future::ready(within_decompression_bound(message)))
-                    .map_ok(conforming_map_entries),
-            )
-            .with_headers(md));
+            return Ok(
+                FlightRecordBatchStream::new_from_flight_data(checked_flight_data(response_stream))
+                    .with_headers(md),
+            );
         }
 
         NoEndpointsFoundSnafu.fail()
@@ -650,12 +632,7 @@ impl FlightClient {
             .map_err(map_tonic_error_to_message)?
             .into_parts();
 
-        Ok(FlightDataDecoder::new(
-            response_stream
-                .map_err(|status| FlightError::Tonic(Box::new(status)))
-                .and_then(|message| std::future::ready(within_decompression_bound(message)))
-                .map_ok(conforming_map_entries),
-        ))
+        Ok(FlightDataDecoder::new(checked_flight_data(response_stream)))
     }
 
     /// Publishes data to a dataset via the `DoPut` Flight method.
@@ -843,6 +820,17 @@ pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
         }
         _ => false,
     }
+}
+
+/// The messages of a `DoGet` or `DoExchange` response, each bounded and conformed before the
+/// caller decodes it.
+fn checked_flight_data(
+    response: tonic::Streaming<FlightData>,
+) -> impl Stream<Item = Result<FlightData, FlightError>> + Send + 'static {
+    response
+        .map_err(|status| FlightError::Tonic(Box::new(status)))
+        .and_then(|message| std::future::ready(within_decompression_bound(message)))
+        .map_ok(conforming_map_entries)
 }
 
 /// Passes `message` through unless it is a compressed batch that declares too large a

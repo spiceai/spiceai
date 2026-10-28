@@ -551,9 +551,7 @@ impl Query {
             df,
             &request_context,
             tracker,
-            &serialized_plan_cache_key.map_or(CacheKey::LogicalPlan(&plan), |digest| {
-                CacheKey::SerializedPlan(digest, &plan)
-            }),
+            &CacheKey::for_plan(&plan, serialized_plan_cache_key),
             sql,
             already_looked_up,
             // A `LogicalPlan` key carries the parameter values already bound
@@ -870,11 +868,7 @@ impl Query {
                     };
                     cached_plan.insert(plan)
                 };
-                self.serialized_plan_cache_key
-                    .as_deref()
-                    .map_or(CacheKey::LogicalPlan(plan), |digest| {
-                        CacheKey::SerializedPlan(digest, plan)
-                    })
+                CacheKey::for_plan(plan, self.serialized_plan_cache_key.as_deref())
                     .as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id)
             }
         };

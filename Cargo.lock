@@ -8858,6 +8858,7 @@ version = "2.5.0-unstable"
 dependencies = [
  "arrow",
  "arrow-flight",
+ "arrow-ipc",
  "arrow_tools",
  "base64 0.22.1",
  "bytes",

@@ -100,6 +100,22 @@ async fn decode_plan(
     Ok((plan, cache_key, session))
 }
 
+/// Decodes `cmd` for a request. A sessionless request also returns the session
+/// snapshot the plan was decoded against, for execution to reuse; a stateful
+/// Flight request keeps its own session-specific execution settings.
+async fn decode_request(
+    cmd: &sql::CommandStatementSubstraitPlan,
+    context: &RequestContext,
+    datafusion: &Arc<DataFusion>,
+) -> Result<(LogicalPlan, String, Option<SessionState>), Status> {
+    let (plan, cache_key, session) = decode_plan(cmd, datafusion).await?;
+    let session = context
+        .extension::<FlightSessionExtension>()
+        .is_none()
+        .then_some(session);
+    Ok((plan, cache_key, session))
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
@@ -136,13 +152,7 @@ pub(crate) async fn get_flight_info(
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
 
-    let (plan, cache_key, session) = decode_plan(&cmd, &datafusion).await?;
-    // Stateful Flight requests retain their session-specific execution settings.
-    // Sessionless requests reuse the snapshot already taken during decoding.
-    let session = context
-        .extension::<FlightSessionExtension>()
-        .is_none()
-        .then_some(session);
+    let (plan, cache_key, session) = decode_request(&cmd, &context, &datafusion).await?;
 
     let read_only = is_auth_read_only(&context);
     if read_only {
@@ -184,13 +194,7 @@ pub(crate) async fn do_get(
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
 
-    let (plan, cache_key, session) = decode_plan(&cmd, &datafusion).await?;
-    // Stateful Flight requests retain their session-specific execution settings.
-    // Sessionless requests reuse the snapshot already taken during decoding.
-    let session = context
-        .extension::<FlightSessionExtension>()
-        .is_none()
-        .then_some(session);
+    let (plan, cache_key, session) = decode_request(&cmd, &context, &datafusion).await?;
 
     if is_auth_read_only(&context) {
         validate_sql_query_read_only(&plan)

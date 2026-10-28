@@ -1,1 +1,0 @@
-["/private/tmp/spice-sidecar-artifacts/candidate-12d9f6/spiced", "--http", "127.0.0.1:57528", "--flight", "127.0.0.1:57529", "--metrics", "127.0.0.1:57530", "--role", "executor", "--allow-insecure-connections", "--node-bind-address", "127.0.0.1:57527", "--node-advertise-address", "127.0.0.1", "--scheduler-address", "http://127.0.0.1:57519"]

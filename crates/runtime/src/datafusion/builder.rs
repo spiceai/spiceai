@@ -105,7 +105,7 @@ use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::{
-    CteMaterialization, QueryErrorLogging, SpillCompression as SpiceSpillCompression,
+    CteMaterialization, QueryErrorLogging, RuntimeMode, SpillCompression as SpiceSpillCompression,
 };
 use spicepod::metric::Metrics;
 use tokio::{
@@ -350,6 +350,7 @@ pub struct DataFusionBuilder {
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     memory_limit: Option<u64>,
     target_partitions: Option<usize>,
+    runtime_mode: RuntimeMode,
     prefer_hash_join: Option<bool>,
     eager_aggregation: Option<bool>,
     eager_aggregation_min_reduction_factor: Option<usize>,
@@ -483,6 +484,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry,
             memory_limit: None,
             target_partitions: None,
+            runtime_mode: RuntimeMode::default(),
             prefer_hash_join: None,
             eager_aggregation: None,
             eager_aggregation_min_reduction_factor: None,
@@ -592,6 +594,13 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn target_partitions(mut self, target_partitions: Option<usize>) -> Self {
         self.target_partitions = target_partitions;
+        self
+    }
+
+    /// Selects the defaults for settings the Spicepod leaves unset.
+    #[must_use]
+    pub fn runtime_mode(mut self, runtime_mode: RuntimeMode) -> Self {
+        self.runtime_mode = runtime_mode;
         self
     }
 
@@ -989,7 +998,11 @@ impl DataFusionBuilder {
             // pod with a CPU request and no limit would fan every query out
             // across the whole node. Size from the CPU budget instead, which is
             // the same number wherever detection was already correct.
-            let target_partitions = cpu_budget::cpu_budget().target_partitions();
+            let budget = cpu_budget::cpu_budget();
+            let target_partitions = match self.runtime_mode {
+                RuntimeMode::Server => budget.target_partitions(),
+                RuntimeMode::Sidecar => budget.sidecar_target_partitions(),
+            };
             config = config.with_target_partitions(target_partitions);
             tracing::info!(
                 target_partitions,

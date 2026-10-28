@@ -20,14 +20,20 @@ use arrow_flight::{Ticket, sql::Any};
 use bytes::{BufMut, BytesMut};
 use prost::Message;
 
+/// Identifies a ticket wrapped by [`wrap`].
+///
+/// Not a Flight SQL command: `DoGet` matches on it before command dispatch, so
+/// it must not collide with a `type_url` the spec assigns.
 pub const TRACED_TICKET_TYPE_URL: &str = "type.googleapis.com/spiceai.flight.TracedTicket";
 const TRACE_ID_HEX_LEN: usize = 32;
 
-/// Carries a normalized trace id alongside an otherwise byte-exact ticket.
+/// Wraps `ticket` so it also carries `trace_id`, which must be normalized to 32
+/// hexadecimal characters, not all zero.
 ///
-/// Spice adopts this id before dispatching the inner command. Unlike a
-/// client-pinned header, it joins the trace without reconciling stored rows.
-/// `trace_id` must contain 32 hexadecimal characters, not all zero.
+/// The payload is the id's 32 hexadecimal characters followed by the original
+/// ticket bytes. A fixed-width prefix rather than a nested message: the id is
+/// one fixed-length field and the remainder is opaque, so the split needs no
+/// schema, and the inner ticket is passed through byte-for-byte.
 #[must_use]
 pub fn wrap(ticket: &Ticket, trace_id: &str) -> Ticket {
     debug_assert_eq!(trace_id.len(), TRACE_ID_HEX_LEN, "trace ids are normalized");

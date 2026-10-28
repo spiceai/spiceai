@@ -1,8 +1,0 @@
-{
-  "source_commit": "f4f0d5dc7885fc4bc5d20dcc130ab3456a881682",
-  "date": "2026-10-28",
-  "command": "env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ CARGO_TARGET_DIR=/Users/Code/dev/spiceai/target make lint-rust-fix PACKAGES='spiced testoperator spicescript runtime spicepod flight_client data_components cache runtime-request-context cpu-budget' FEATURES=release RUST_PROFILE=release _FEATURES_FLAGS='--no-default-features --features release'",
-  "exit_code": 0,
-  "duration": "21m09s",
-  "notes": "Warnings retained. Autofix removed imports used by gated acceleration/view tests; those exact import edits were restored before integration/build."
-}

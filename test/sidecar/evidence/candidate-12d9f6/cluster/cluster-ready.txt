@@ -1,3 +1,0 @@
-[+] components ok
-[+] executors: 2/2 ready (100%, registered=2, min=2)
-ready

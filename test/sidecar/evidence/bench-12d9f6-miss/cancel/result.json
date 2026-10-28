@@ -1,8 +1,0 @@
-{
-  "acknowledgement": {
-    "query_id": "0af291dc-df26-408d-8919-7fe42a611440",
-    "status": "cancelled"
-  },
-  "status": 499,
-  "body": "External error: Query 0af291dc-df26-408d-8919-7fe42a611440 was cancelled"
-}

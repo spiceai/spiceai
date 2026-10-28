@@ -20,7 +20,7 @@ use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
 };
-use arrow_flight::error::FlightError;
+use arrow_flight::{decode::FlightRecordBatchStream, error::FlightError};
 use arrow_tools::map_entries::{self, StreamNormalizer};
 use async_stream::stream;
 use async_trait::async_trait;
@@ -131,8 +131,8 @@ impl FlightFactory {
 
     /// Use plan federation for reads from another Spice runtime.
     #[must_use]
-    pub fn with_substrait(mut self) -> Self {
-        self.substrait = true;
+    pub fn with_substrait(mut self, substrait: bool) -> Self {
+        self.substrait = substrait;
         self
     }
 
@@ -439,13 +439,13 @@ impl TableProvider for FlightTable {
 
     async fn scan(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if self.substrait {
-            return substrait::scan(self, state, projection, filters, limit);
+            return substrait::scan(self, projection, filters, limit);
         }
         return self.create_physical_plan(projection, &self.schema(), filters, limit);
     }
@@ -593,11 +593,27 @@ fn query_to_stream(
     sql: String,
     table: String,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+    normalized_batches(
+        async move {
+            client
+                .query(sql.as_str())
+                .await
+                .map_err(|source| to_execution_error(Error::Flight { source }))
+        },
+        table,
+    )
+}
+
+/// The batches of the Flight stream that `query` opens, with their map entries normalized.
+fn normalized_batches(
+    query: impl Future<Output = DataFusionResult<FlightRecordBatchStream>> + Send,
+    table: String,
+) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     stream! {
         // The stream's schema is whatever its batches carry, so the normalizer is resolved from
         // the first one and reused for the rest.
         let mut normalizer = StreamNormalizer::new();
-        match client.query(sql.as_str()).await {
+        match query.await {
             Ok(mut stream) => {
                 while let Some(batch) = stream.next().await {
                     match batch {
@@ -610,7 +626,7 @@ fn query_to_stream(
                     }
                 }
             }
-            Err(error) => yield Err(to_execution_error(Error::Flight{ source: error}))
+            Err(error) => yield Err(error),
         }
     }
 }

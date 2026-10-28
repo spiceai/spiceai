@@ -1,11 +1,11 @@
 /*
-Copyright 2026 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    https://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,13 +18,13 @@ limitations under the License.
 
 use std::{fmt, sync::Arc};
 
-use arrow::datatypes::{DataType, Field, SchemaRef};
-use arrow_tools::map_entries::StreamNormalizer;
-use async_stream::try_stream;
+use arrow::{
+    array::RecordBatch,
+    datatypes::{DataType, Field, SchemaRef},
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::{
-    catalog::Session,
     common::{Result, tree_node::TreeNodeRecursion},
     config::ConfigOptions,
     datasource::empty::EmptyTable,
@@ -59,8 +59,9 @@ use datafusion_substrait::{
 use flight_client::FlightClient;
 use futures::StreamExt;
 use prost::Message;
+use runtime_request_context::{SPICE_TRACE_ID_HEADER, TRACEPARENT_HEADER};
 
-use super::{FlightTable, map_query_stream_error};
+use super::{FlightTable, normalized_batches};
 
 pub(super) fn federated_provider(table: Arc<FlightTable>) -> FederatedTableProviderAdaptor {
     let provider = Arc::new(SpiceFederation {
@@ -228,7 +229,9 @@ impl SubstraitProducer for SpiceProducer {
     }
 }
 
-fn encode_plan(plan: &LogicalPlan, direct_scan: bool) -> Result<Bytes> {
+/// The Substrait relation, root names and extensions for `plan`. Fails when any
+/// part of the plan cannot be represented for the upstream.
+fn produce(plan: &LogicalPlan, direct_scan: bool) -> Result<(Rel, Vec<String>, Extensions)> {
     let mut producer = SpiceProducer {
         direct_scan,
         ..Default::default()
@@ -240,7 +243,11 @@ fn encode_plan(plan: &LogicalPlan, direct_scan: bool) -> Result<Bytes> {
     for field in plan.schema().fields() {
         flatten_root_names(field, false, &mut names)?;
     }
-    let extensions = producer.get_extensions();
+    Ok((input, names, producer.get_extensions()))
+}
+
+fn encode_plan(plan: &LogicalPlan, direct_scan: bool) -> Result<Bytes> {
+    let (input, names, extensions) = produce(plan, direct_scan)?;
     // Extension maps do not have a stable iteration order. Serialize anchors
     // deterministically so identical fragments have identical wire cache keys.
     let mut extensions: Vec<
@@ -334,7 +341,8 @@ impl FederationProvider for SpiceFederation {
     fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
         // A failed conversion declines this candidate so the federation analyzer
         // can try smaller subtrees, keeping unsupported operators in the sidecar.
-        Some(if encode_plan(plan, false).is_ok() {
+        // The analyzer asks at every node, so this skips the wire encoding.
+        Some(if produce(plan, false).is_ok() {
             Arc::new(Analyzer::with_rules(vec![Arc::new(self.clone())])).into()
         } else {
             FederationAnalyzerForLogicalPlan::Unable
@@ -377,7 +385,6 @@ impl FederationPlanner for SpiceFederation {
 
 pub(super) fn scan(
     table: &FlightTable,
-    _session: &dyn Session,
     projection: Option<&Vec<usize>>,
     filters: &[Expr],
     limit: Option<usize>,
@@ -415,6 +422,9 @@ struct SubstraitExec {
     client: FlightClient,
     plan: Bytes,
     schema: SchemaRef,
+    /// The schema Flight delivers when `schema` has view columns, which Flight
+    /// expands to their large equivalents.
+    wire_schema: Option<SchemaRef>,
     datasets: String,
     properties: Arc<PlanProperties>,
 }
@@ -427,14 +437,39 @@ impl SubstraitExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
+        let wire_schema = arrow_tools::schema::expand_views_schema(&schema);
+        let wire_schema = (wire_schema.fields() != schema.fields()).then(|| Arc::new(wire_schema));
         Self {
             client,
             plan,
             schema,
+            wire_schema,
             datasets,
             properties,
         }
     }
+}
+
+/// Flight expands only top-level views. Reverse that exact representation
+/// change; never coerce arbitrary remote types.
+fn conform_batch(
+    batch: RecordBatch,
+    expected: &SchemaRef,
+    wire: Option<&SchemaRef>,
+) -> Result<RecordBatch> {
+    let batch = match wire {
+        Some(wire) if batch.schema().fields() == wire.fields() => {
+            arrow_tools::schema::cast_view_columns(batch, expected)?
+        }
+        _ => batch,
+    };
+    if batch.schema().fields() != expected.fields() {
+        return Err(DataFusionError::Execution(format!(
+            "Remote Substrait result schema differs from the planned schema: expected {expected:?}, received {:?}",
+            batch.schema(),
+        )));
+    }
+    Ok(batch)
 }
 
 impl DisplayAs for SubstraitExec {
@@ -494,23 +529,26 @@ impl ExecutionPlan for SubstraitExec {
             propagated_trace_id = request.settled_trace_id().cloned();
             if let Some(parent) = request.trace_parent() {
                 client = client
-                    .with_trace_header("traceparent", &parent.to_string())
+                    .with_trace_header(TRACEPARENT_HEADER, &parent.to_string())
                     .map_err(|error| DataFusionError::External(Box::new(error)))?;
             }
             if let Some(trace_id) = request.client_trace_id() {
                 client = client
-                    .with_trace_header("spice-trace-id", trace_id)
+                    .with_trace_header(SPICE_TRACE_ID_HEADER, trace_id)
                     .map_err(|error| DataFusionError::External(Box::new(error)))?;
             }
         }
         let plan = self.plan.clone();
-        let schema = Arc::clone(&self.schema);
-        let expected_schema = Arc::clone(&schema);
-        let wire_schema = Arc::new(arrow_tools::schema::expand_views_schema(&schema));
         let datasets = self.datasets.clone();
-        let stream = try_stream! {
-            let timeout = deadline.as_ref().map(|deadline| deadline.0.saturating_duration_since(std::time::Instant::now()));
-            let mut stream = client.query_substrait_with_trace_id(plan, timeout, propagated_trace_id.as_deref()).await
+        let query = async move {
+            let timeout = deadline.as_ref().map(|deadline| {
+                deadline
+                    .0
+                    .saturating_duration_since(std::time::Instant::now())
+            });
+            client
+                .query_substrait(plan, timeout, propagated_trace_id.as_deref())
+                .await
                 .map_err(|error| match error {
                     flight_client::Error::SubstraitUnsupported { source } => {
                         DataFusionError::Execution(format!(
@@ -518,26 +556,13 @@ impl ExecutionPlan for SubstraitExec {
                         ))
                     }
                     other => DataFusionError::External(Box::new(other)),
-                })?;
-            let mut normalizer = StreamNormalizer::new();
-            while let Some(batch) = stream.next().await {
-                let batch = batch.map_err(map_query_stream_error)?;
-                let batch = normalizer.normalize(batch)
-                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
-                let batch = if batch.schema().fields() == wire_schema.fields() {
-                    // Flight expands only top-level views. Reverse that exact
-                    // representation change; never coerce arbitrary remote types.
-                    arrow_tools::schema::cast_view_columns(batch, &expected_schema)?
-                } else { batch };
-                if batch.schema().fields() != expected_schema.fields() {
-                    Err(DataFusionError::Execution(format!(
-                        "Remote Substrait result schema differs from the planned schema: expected {expected_schema:?}, received {:?}",
-                        batch.schema(),
-                    )))?;
-                }
-                yield batch;
-            }
+                })
         };
+        let schema = Arc::clone(&self.schema);
+        let expected = Arc::clone(&schema);
+        let wire = self.wire_schema.clone();
+        let stream = normalized_batches(query, self.datasets.clone())
+            .map(move |batch| conform_batch(batch?, &expected, wire.as_ref()));
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }

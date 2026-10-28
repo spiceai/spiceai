@@ -1,8 +1,0 @@
-{
-  "acknowledgement": {
-    "query_id": "8b2560e3-ec0e-46df-87ae-48f72f54e4f0",
-    "status": "cancelled"
-  },
-  "status": 499,
-  "body": "External error: Query 8b2560e3-ec0e-46df-87ae-48f72f54e4f0 was cancelled"
-}

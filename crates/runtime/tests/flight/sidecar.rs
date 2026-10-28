@@ -15,8 +15,7 @@ limitations under the License.
 */
 
 //! Real Flight round trips through the configured sidecar connector. The input
-//! table and direct local evaluation are the round-trip oracle. Process outage
-//! and concurrent-load coverage belongs to the external sidecar scenario.
+//! table and direct local evaluation are the round-trip oracle.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -42,6 +41,19 @@ use spicepod::{
 
 use super::start_spice_test_app_with_metrics_port;
 use crate::utils::test_request_context;
+
+fn assert_same_rows(
+    actual: &[RecordBatch],
+    expected: &[RecordBatch],
+    sql: &str,
+) -> anyhow::Result<()> {
+    assert_eq!(
+        pretty_format_batches(actual)?.to_string(),
+        pretty_format_batches(expected)?.to_string(),
+        "{sql}"
+    );
+    Ok(())
+}
 
 async fn rows(runtime: &Arc<Runtime>, sql: &str) -> anyhow::Result<Vec<RecordBatch>> {
     Ok(QueryBuilder::new(sql, runtime.datafusion())
@@ -142,8 +154,7 @@ async fn sidecar_substrait_connector_roundtrip() -> anyhow::Result<()> {
             assert_eq!(result.data.schema().as_ref(), expected_frame.schema().as_arrow(), "{sql}");
             let expected = expected_frame.collect().await?;
             let actual: Vec<RecordBatch> = result.into_record_batch_stream().try_collect().await?;
-            assert_eq!(pretty_format_batches(&actual)?.to_string(),
-                pretty_format_batches(&expected)?.to_string(), "{sql}");
+            assert_same_rows(&actual, &expected, sql)?;
             if let (Some(actual), Some(expected)) = (actual.first(), expected.first()) {
                 assert_eq!(actual.schema(), expected.schema(), "{sql}");
             }
@@ -164,18 +175,19 @@ async fn sidecar_substrait_connector_roundtrip() -> anyhow::Result<()> {
         // must still send a Substrait plan rather than taking the SQL path.
         let client = FlightClient::try_new(endpoint.into(), Credentials::anonymous(), None, None).await?;
         #[expect(clippy::disallowed_methods, reason = "the test connects to a real Spice runtime")]
-        let factory = FlightFactory::new("spice.ai", client, Arc::new(DefaultDialect {})).with_substrait();
+        let factory = FlightFactory::new("spice.ai", client, Arc::new(DefaultDialect {})).with_substrait(true);
         let provider = factory.table_provider(TableReference::bare("remote_orders")).await
             .map_err(anyhow::Error::from_boxed)?;
         let fallback = SessionContext::new();
         fallback.register_table("orders", provider)?;
-        let actual = fallback.sql("SELECT id FROM orders WHERE value IS NULL ORDER BY id").await?.collect().await?;
-        let expected = oracle.sql("SELECT id FROM orders WHERE value IS NULL ORDER BY id").await?.collect().await?;
-        assert_eq!(pretty_format_batches(&actual)?.to_string(), pretty_format_batches(&expected)?.to_string());
-        for sql in ["SELECT COUNT(*) AS n FROM orders", "SELECT 1 AS constant FROM orders"] {
+        for sql in [
+            "SELECT id FROM orders WHERE value IS NULL ORDER BY id",
+            "SELECT COUNT(*) AS n FROM orders",
+            "SELECT 1 AS constant FROM orders",
+        ] {
             let actual = fallback.sql(sql).await?.collect().await?;
             let expected = oracle.sql(sql).await?.collect().await?;
-            assert_eq!(pretty_format_batches(&actual)?.to_string(), pretty_format_batches(&expected)?.to_string(), "{sql}");
+            assert_same_rows(&actual, &expected, sql)?;
         }
 
         sidecar.shutdown().await;
