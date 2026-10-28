@@ -146,6 +146,12 @@ struct Cli {
     /// `spiced.log` and spicepod, a directory per matrix combination.
     #[arg(long = "log-capture", value_name = "DIR")]
     log_capture: Option<PathBuf>,
+
+    /// The widest a value is drawn in a failure report's table, in
+    /// characters; a longer one keeps its start and end. 0 draws every value
+    /// whole.
+    #[arg(long = "cell-width", value_name = "CHARS", default_value_t = compare::DEFAULT_CELL_WIDTH)]
+    cell_width: usize,
 }
 
 #[tokio::main]
@@ -164,6 +170,7 @@ async fn run(cli: Cli) -> Result<bool> {
     // Retried comparisons would print every intermediate mismatch; the runner
     // reports the last one with both answers.
     result_compare::set_print_diagnostics(false);
+    compare::set_cell_width(cli.cell_width);
     let targets = targets(&cli.spiced)?;
     let mut paths = script_paths(&cli.scripts)?;
     // Parse everything first, so a typo in the last script fails before the
