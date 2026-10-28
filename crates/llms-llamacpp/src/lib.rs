@@ -547,8 +547,11 @@ impl LlamaCpp {
                 &obliged,
             )
         };
+        // Harmony is read only when the template this request renders with writes it: named
+        // templates may mix a Harmony one with one that is not.
+        let markers = request_markers(self.harmony, template);
         // A Harmony grammar holds the whole reply, by the vocabulary's markers.
-        let grammar = match &self.harmony {
+        let grammar = match &markers {
             Some(markers) if !obliged.is_empty() => Some(harmony_call(markers, &obliged)?),
             Some(markers) => content()?.map(|reply| harmony_reply(markers, &reply)),
             None => content()?,
@@ -592,9 +595,8 @@ impl LlamaCpp {
         let mut receivers = Vec::with_capacity(choices);
         for tools in matchers {
             let (events, rx) = mpsc::channel(STREAM_BUFFER);
-            let harmony = self
-                .harmony
-                .map(|markers| harmony::Reader::new(markers, nameable.clone(), held));
+            let harmony =
+                markers.map(|markers| harmony::Reader::new(markers, nameable.clone(), held));
             let job = Job {
                 reasoning: reasoning_parser(template, &prompt),
                 prompt: prompt.clone(),
@@ -1197,6 +1199,12 @@ fn check_reply_format(
             architecture: architecture.unwrap_or_else(|| "gpt-oss".to_string()),
             file,
         })
+}
+
+/// The markers a request's reply is read by: the model's, when the template the request renders
+/// with writes Harmony, and none for a template that does not.
+fn request_markers(markers: Option<harmony::Markers>, template: &str) -> Option<harmony::Markers> {
+    markers.filter(|_| is_harmony_template(template))
 }
 
 /// The file an error names: its name, or the whole path when it has none.
@@ -3162,6 +3170,19 @@ mod tests {
 
     const HARMONY: &str = "{{ '<|start|>assistant<|channel|>final<|message|>' }}{{ '<|end|>' }}";
     const HARMONY_MARKERS: harmony::Markers = harmony::TEST_MARKERS;
+
+    /// Named templates may mix a Harmony template with one that is not: a request rendered
+    /// with the other reads its reply as text, which a Harmony reader would hold as a header.
+    #[test]
+    fn only_a_request_whose_template_writes_harmony_reads_harmony() {
+        assert_eq!(
+            request_markers(Some(HARMONY_MARKERS), HARMONY),
+            Some(HARMONY_MARKERS)
+        );
+        let chatml = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>{% endfor %}";
+        assert_eq!(request_markers(Some(HARMONY_MARKERS), chatml), None);
+        assert_eq!(request_markers(None, HARMONY), None);
+    }
 
     /// An `Output` reading a Harmony reply that may call `tools`, with `stop` sequences and a
     /// token `limit`, and what it sends.
