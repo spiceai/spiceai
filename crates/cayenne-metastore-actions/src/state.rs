@@ -58,6 +58,8 @@ pub struct TableStats {
 pub struct Inlined {
     pub partition_key: Option<String>,
     pub payload: ObjRef,
+    /// Original inline bytes, retained so checkpoints can replay the row.
+    pub raw_payload: Vec<u8>,
     pub count: i64,
     pub seq: i64,
 }
@@ -65,6 +67,8 @@ pub struct Inlined {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InlinedDel {
     pub payload: ObjRef,
+    /// Original inline bytes, retained so checkpoints can replay the row.
+    pub raw_payload: Vec<u8>,
     pub count: i64,
     pub seq: i64,
     pub published: bool,
@@ -417,6 +421,7 @@ impl DatasetState {
                     Inlined {
                         partition_key: a.partition_key.clone(),
                         payload: ObjRef::of(&a.payload),
+                        raw_payload: a.payload.clone(),
                         count: a.count,
                         seq: a.seq,
                     },
@@ -434,6 +439,7 @@ impl DatasetState {
                 );
                 if let Some(row) = table.inlined_data.get_mut(&a.id) {
                     row.payload = ObjRef::of(&a.payload);
+                    row.raw_payload.clone_from(&a.payload);
                     row.count = a.count;
                 }
             }
@@ -448,6 +454,7 @@ impl DatasetState {
                 let table = self.table(name, &a.table_id)?;
                 let entry = InlinedDel {
                     payload: ObjRef::of(&a.payload),
+                    raw_payload: a.payload.clone(),
                     count: a.count,
                     seq: a.seq,
                     published: a.published,

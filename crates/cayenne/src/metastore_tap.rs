@@ -38,6 +38,11 @@ use cayenne_metastore_actions::proto::{Action, Record};
 use cayenne_metastore_actions::size::{checkpoint_size, design_record, encoded_len};
 use cayenne_metastore_actions::state::{DatasetState, TableState};
 use parking_lot::Mutex;
+use prost::Message as _;
+
+mod counting;
+mod shadow;
+pub use shadow::ShadowReport;
 
 use crate::catalog::CatalogResult;
 use crate::metastore::{ExecuteParams, MetastoreTransaction, MetastoreValue, QueryRowParams};
@@ -108,6 +113,9 @@ pub struct MetastoreTap {
     started: Instant,
     break_apply: Option<&'static str>,
     panic_on_divergence: bool,
+    shadow: Option<shadow::Shadow>,
+    shadow_out: Option<PathBuf>,
+    shadow_drop: Option<&'static str>,
 }
 
 impl std::fmt::Debug for MetastoreTap {
@@ -127,6 +135,11 @@ impl MetastoreTap {
     ///
     /// Returns an error if `out` cannot be created.
     pub fn new(out: Option<PathBuf>, verify_each_commit: bool) -> std::io::Result<Self> {
+        let shadow_out = out.as_ref().map(|p| {
+            let mut name = p.as_os_str().to_os_string();
+            name.push(".shadow.jsonl");
+            PathBuf::from(name)
+        });
         let out = out
             .map(|path| std::fs::File::create(path).map(std::io::BufWriter::new))
             .transpose()?;
@@ -144,7 +157,43 @@ impl MetastoreTap {
             started: Instant::now(),
             break_apply: None,
             panic_on_divergence: false,
+            shadow: None,
+            shadow_out,
+            shadow_drop: None,
         })
+    }
+
+    /// Attach an asynchronous, best-effort per-table head-log shadow.
+    #[must_use]
+    pub fn with_shadow(
+        mut self,
+        store: Arc<dyn object_store::ObjectStore>,
+        prefix: object_store::path::Path,
+        config: object_store_occ::headlog::HeadLogConfig,
+    ) -> Self {
+        self.shadow = Some(shadow::Shadow::start(
+            store,
+            prefix,
+            config,
+            self.shadow_out.clone(),
+            self.shadow_drop,
+        ));
+        self
+    }
+
+    /// Test-only negative control; set before attaching the shadow.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn breaking_shadow_of(mut self, kind: &'static str) -> Self {
+        self.shadow_drop = Some(kind);
+        self
+    }
+
+    pub(crate) async fn shadow_states(&self) -> (ShadowReport, BTreeMap<String, DatasetState>) {
+        match &self.shadow {
+            Some(s) => s.verify().await,
+            None => (ShadowReport::default(), BTreeMap::new()),
+        }
     }
 
     /// Panic on the first difference or apply error, so an existing test
@@ -165,6 +214,15 @@ impl MetastoreTap {
         let mut inner = self.inner.lock();
         inner.seeded = true;
         for (table_id, table) in tables {
+            if let Some(shadow) = &self.shadow {
+                shadow.enqueue(shadow::Payload {
+                    table: table_id.clone(),
+                    bytes: cayenne_metastore_actions::state_as_record(&table, &table_id)
+                        .encode_to_vec()
+                        .into(),
+                    enqueued: Instant::now(),
+                });
+            }
             inner.state.tables.insert(table_id, table);
         }
     }
@@ -296,6 +354,13 @@ impl MetastoreTap {
             let table_record = Record {
                 actions: table_actions.into_iter().cloned().collect(),
             };
+            if let Some(shadow) = &self.shadow {
+                shadow.enqueue(shadow::Payload {
+                    table: table_id.clone(),
+                    bytes: table_record.encode_to_vec().into(),
+                    enqueued: Instant::now(),
+                });
+            }
             let size = after.map(checkpoint_size).unwrap_or_default();
             let (name, live_files, dvs) = after.map_or_else(
                 || {
@@ -429,3 +494,73 @@ pub(crate) fn push(
 }
 
 pub(crate) mod actions;
+
+#[cfg(cayenne_metastore_tap)]
+impl MetastoreTap {
+    pub(crate) fn shadow_from_dev_file(mut self) -> Self {
+        use object_store::ObjectStore;
+        use object_store::aws::AmazonS3Builder;
+        use object_store::path::Path;
+        use object_store_occ::sim::latency::{Delay, LatencyProfile, LatencyStore};
+        use std::time::Duration;
+        let path = std::env::temp_dir().join("cayenne-metastore-tap/shadow.json");
+        let data = match std::fs::read(path) {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return self,
+            Err(e) => {
+                self.shadow = Some(shadow::Shadow::failed(e));
+                return self;
+            }
+        };
+        let configure = || -> Result<_, Box<dyn std::error::Error>> {
+            let v: serde_json::Value = serde_json::from_slice(&data)?;
+            let text = |key: &str| {
+                v[key]
+                    .as_str()
+                    .ok_or_else(|| format!("shadow configuration missing {key}"))
+            };
+            let store: Arc<dyn ObjectStore> = match text("kind")? {
+                "local" => Arc::new(object_store_occ::LocalConditionalPut::new_durable(text(
+                    "path",
+                )?)?),
+                "s3" => Arc::new(
+                    AmazonS3Builder::new()
+                        .with_endpoint(text("endpoint")?)
+                        .with_bucket_name(text("bucket")?)
+                        .with_access_key_id(text("access_key")?)
+                        .with_secret_access_key(text("secret")?)
+                        .with_region("us-east-1")
+                        .with_allow_http(true)
+                        .build()?,
+                ),
+                kind => return Err(format!("unknown shadow kind {kind}").into()),
+            };
+            let median = v["latency_median_ms"].as_u64().unwrap_or(0);
+            let p99 = v["latency_p99_ms"].as_u64().unwrap_or(median);
+            let store: Arc<dyn ObjectStore> = if median == 0 {
+                store
+            } else {
+                Arc::new(LatencyStore::new(
+                    store,
+                    LatencyProfile::uniform(Delay::new(
+                        Duration::from_millis(median),
+                        Duration::from_millis(p99),
+                    )),
+                    0,
+                ))
+            };
+            Ok((store, Path::parse(v["prefix"].as_str().unwrap_or(""))?))
+        };
+        match configure() {
+            Ok((store, prefix)) => self.with_shadow(
+                store,
+                prefix,
+                object_store_occ::headlog::HeadLogConfig::default(),
+            ),
+            Err(e) => {
+                self.shadow = Some(shadow::Shadow::failed(e));
+                self
+            }
+        }
+    }
+}

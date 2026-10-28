@@ -37,8 +37,36 @@ use crate::common;
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 async fn workload(broken: bool) -> TestResult<TapReport> {
+    workload_with_shadow(broken, None).await.map(|(tap, _)| tap)
+}
+
+async fn workload_with_shadow(
+    broken: bool,
+    shadow: Option<(Arc<dyn object_store::ObjectStore>, bool)>,
+) -> TestResult<(TapReport, cayenne::metastore_tap::ShadowReport)> {
+    let shadow_enabled = shadow.is_some();
+    let shadow_negative = shadow.as_ref().is_some_and(|(_, negative)| *negative);
     let dir = tempfile::tempdir()?;
     let tap = MetastoreTap::new(Some(dir.path().join("tap.jsonl")), true)?;
+    let tap = if let Some((store, negative)) = shadow {
+        let tap = if negative {
+            tap.breaking_shadow_of("AddDeleteFiles")
+        } else {
+            tap
+        };
+        tap.with_shadow(
+            store,
+            object_store::path::Path::from("shadow"),
+            object_store_occ::headlog::HeadLogConfig {
+                head_budget_bytes: 1024 * 1024,
+                batch_budget_bytes: 128 * 1024,
+                max_record_bytes: 128 * 1024,
+                batch_max_records: 1,
+            },
+        )
+    } else {
+        tap
+    };
     let tap = Arc::new(if broken {
         tap.breaking_apply_of("AddDeleteFiles")
     } else {
@@ -182,7 +210,53 @@ async fn workload(broken: bool) -> TestResult<TapReport> {
     assert!(report.unconverted.is_empty(), "{report:#?}");
     assert!(report.commits > 0);
     assert!(report.verified_tables > 0);
-    Ok(report)
+    let shadow = catalog.shadow_verify().await;
+    println!("shadow report: {shadow:#?}");
+    if shadow_enabled {
+        let lines = std::fs::read_to_string(dir.path().join("tap.jsonl.shadow.jsonl"))?;
+        let mut totals = std::collections::BTreeMap::new();
+        let mut accepted = 0;
+        for line in lines.lines() {
+            let v: serde_json::Value = serde_json::from_str(line)?;
+            for key in ["creates", "cas", "gets", "list", "deletes"] {
+                assert!(v["requests"][key].is_u64(), "{v}");
+            }
+            if v["outcome"] == "accepted" {
+                accepted += 1;
+                assert!(v["commit_latency_ms"].is_number(), "{v}");
+                assert!(v["head_bytes"].as_u64().expect("head bytes") > 0);
+            }
+            totals.insert(
+                v["table_id"].as_str().expect("table ID").to_string(),
+                (
+                    v["committed_metadata_bytes"]
+                        .as_u64()
+                        .expect("metadata bytes"),
+                    v["checkpoint_bytes_written"]
+                        .as_u64()
+                        .expect("checkpoint bytes"),
+                ),
+            );
+        }
+        // A negative control's dropped payload makes a later shadow commit fail,
+        // which disables that table's shadow; the counters then legitimately differ.
+        if !shadow_negative {
+            assert_eq!(accepted, shadow.commits);
+            assert_eq!(
+                totals.values().map(|(m, _)| m).sum::<u64>(),
+                shadow.committed_metadata_bytes
+            );
+        }
+        assert_eq!(
+            totals.values().map(|(_, c)| c).sum::<u64>(),
+            shadow.checkpoint_bytes_written
+        );
+        println!(
+            "shadow JSONL: accepted={accepted} tables={} counters match report",
+            totals.len()
+        );
+    }
+    Ok((report, shadow))
 }
 
 #[tokio::test]
@@ -228,6 +302,7 @@ async fn exercise_catalog(
             vortex_config: VortexConfig::default(),
         })
         .await?;
+    let _ = catalog.shadow_verify().await;
     let snapshot = uuid::Uuid::now_v7().to_string();
     let other = uuid::Uuid::now_v7().to_string();
     let partition = PartitionMetadata {
@@ -241,6 +316,7 @@ async fn exercise_catalog(
         file_size_bytes: 2,
     };
     let partition_id = catalog.add_partition(partition.clone()).await?;
+    let _ = catalog.shadow_verify().await;
     assert_eq!(catalog.add_partition(partition).await?, partition_id);
     for ndv in [None, Some(vec![]), Some(vec![1, 2])] {
         catalog
@@ -252,8 +328,10 @@ async fn exercise_catalog(
                 ndv_sketches: ndv,
             })
             .await?;
+        let _ = catalog.shadow_verify().await;
     }
     catalog.clear_table_statistics(&id).await?;
+    let _ = catalog.shadow_verify().await;
     let file = |snapshot: &str| SnapshotFile {
         table_id: id.clone(),
         snapshot_id: snapshot.to_string(),
@@ -274,23 +352,34 @@ async fn exercise_catalog(
     };
     for snap in [&snapshot, &other] {
         catalog.upsert_snapshot_file(&file(snap)).await?;
+        let _ = catalog.shadow_verify().await;
         catalog.upsert_snapshot_file_statistics(&stat(snap)).await?;
+        let _ = catalog.shadow_verify().await;
     }
     catalog.clear_snapshot_files_except(&id, &snapshot).await?;
+    let _ = catalog.shadow_verify().await;
     catalog
         .clear_snapshot_file_statistics_except(&id, &snapshot)
         .await?;
+    let _ = catalog.shadow_verify().await;
     catalog
         .clear_snapshot_cached_metadata(&id, &snapshot)
         .await?;
+    let _ = catalog.shadow_verify().await;
     catalog
         .replace_snapshot_files(&id, &snapshot, &[file(&snapshot)])
         .await?;
+    let _ = catalog.shadow_verify().await;
     catalog.replace_snapshot_files(&id, &snapshot, &[]).await?;
+    let _ = catalog.shadow_verify().await;
     catalog.clear_snapshot_file_statistics(&id).await?;
+    let _ = catalog.shadow_verify().await;
     catalog.clear_snapshot_files(&id).await?;
+    let _ = catalog.shadow_verify().await;
     catalog.upsert_pk_index(&id, &snapshot, &[9]).await?;
+    let _ = catalog.shadow_verify().await;
     catalog.clear_pk_index(&id).await?;
+    let _ = catalog.shadow_verify().await;
     for count in [2, u64::MAX] {
         catalog
             .register_index_run(&IndexRunRecord {
@@ -301,8 +390,10 @@ async fn exercise_catalog(
                 size_bytes: count,
             })
             .await?;
+        let _ = catalog.shadow_verify().await;
     }
     catalog.remove_index_run(&id, "index", "run").await?;
+    let _ = catalog.shadow_verify().await;
     let inline = || InlinedData {
         inlined_id: String::new(),
         table_id: id.clone(),
@@ -313,6 +404,7 @@ async fn exercise_catalog(
         created_at: String::new(),
     };
     let inline_id = catalog.add_inlined_data(inline()).await?;
+    let _ = catalog.shadow_verify().await;
     let mut updated = inline();
     updated.inlined_id.clone_from(&inline_id);
     updated.data_ipc = vec![3];
@@ -325,6 +417,7 @@ async fn exercise_catalog(
             vec![],
         )
         .await?;
+    let _ = catalog.shadow_verify().await;
     let mut missing = updated.clone();
     missing.inlined_id = "absent".to_string();
     assert!(
@@ -336,10 +429,13 @@ async fn exercise_catalog(
     catalog
         .commit_inlined_mutation(&id, vec![updated], vec![], vec![inline()], 2)
         .await?;
+    let _ = catalog.shadow_verify().await;
     catalog
         .commit_inlined_mutation(&id, vec![], vec![inline_id], vec![], 2)
         .await?;
+    let _ = catalog.shadow_verify().await;
     catalog.clear_inlined_data(&id).await?;
+    let _ = catalog.shadow_verify().await;
     let tombstone = || InlinedDelete {
         inlined_id: String::new(),
         table_id: id.clone(),
@@ -350,24 +446,33 @@ async fn exercise_catalog(
         created_at: String::new(),
     };
     let tombstone_id = catalog.add_inlined_delete(tombstone()).await?;
+    let _ = catalog.shadow_verify().await;
     catalog
         .mark_inlined_delete_published(&id, &tombstone_id)
         .await?;
+    let _ = catalog.shadow_verify().await;
     catalog
         .mark_inlined_delete_unpublished(&id, &tombstone_id)
         .await?;
+    let _ = catalog.shadow_verify().await;
     assert_eq!(catalog.publish_orphan_inlined_deletes(&id).await?, 1);
     assert_eq!(catalog.publish_orphan_inlined_deletes(&id).await?, 0);
     catalog.clear_inlined_deletes(&id).await?;
+    let _ = catalog.shadow_verify().await;
     catalog.add_inlined_data(inline()).await?;
+    let _ = catalog.shadow_verify().await;
     catalog.add_inlined_delete(tombstone()).await?;
+    let _ = catalog.shadow_verify().await;
     catalog.clear_inlined_data_and_deletes(&id).await?;
+    let _ = catalog.shadow_verify().await;
     catalog
         .commit_on_conflict_deletions(vec![], &id, vec![], 4, None)
         .await?;
+    let _ = catalog.shadow_verify().await;
     catalog
         .commit_on_conflict_deletions_and_clear_inlined(vec![], &id, vec![], 4, None)
         .await?;
+    let _ = catalog.shadow_verify().await;
     let tombstone_id = catalog
         .commit_on_conflict_deletions_with_tombstone(
             vec![],
@@ -391,6 +496,7 @@ async fn exercise_catalog(
             &[tombstone_id],
         )
         .await?;
+    let _ = catalog.shadow_verify().await;
     catalog
         .commit_overwrite_to_cold(
             &id,
@@ -407,10 +513,66 @@ async fn exercise_catalog(
             }],
         )
         .await?;
+    let _ = catalog.shadow_verify().await;
     catalog
         .update_table_schema_dropping_statistics(&id, schema)
         .await?;
+    let _ = catalog.shadow_verify().await;
     assert!(catalog.drop_table("metadata_cases").await?);
     assert!(!catalog.drop_table("metadata_cases").await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn metastore_shadow_memory_matches_sql() -> TestResult<()> {
+    let (_, report) = workload_with_shadow(
+        false,
+        Some((Arc::new(object_store::memory::InMemory::new()), false)),
+    )
+    .await?;
+    assert_shadow(&report);
+    Ok(())
+}
+
+#[tokio::test]
+async fn metastore_shadow_local_matches_sql() -> TestResult<()> {
+    let dir = tempfile::tempdir()?;
+    let store = Arc::new(object_store_occ::LocalConditionalPut::new_durable(
+        dir.path(),
+    )?);
+    let (_, report) = workload_with_shadow(false, Some((store, false))).await?;
+    assert_shadow(&report);
+    Ok(())
+}
+
+fn assert_shadow(report: &cayenne::metastore_tap::ShadowReport) {
+    assert!(report.differences.is_empty(), "{report:#?}");
+    assert!(report.failures.is_empty(), "{report:#?}");
+    assert!(report.verified_tables >= 2, "{report:#?}");
+    assert!(report.checkpoints > 0, "{report:#?}");
+    assert!(report.published_checkpoints > 0, "{report:#?}");
+    assert_eq!(
+        report.checkpoints, report.verified_checkpoints,
+        "{report:#?}"
+    );
+    assert_eq!(report.checkpoint_mismatches, 0, "{report:#?}");
+}
+
+#[tokio::test]
+async fn metastore_shadow_detects_dropped_payload() -> TestResult<()> {
+    let (_, report) = workload_with_shadow(
+        false,
+        Some((Arc::new(object_store::memory::InMemory::new()), true)),
+    )
+    .await?;
+    // Dropping every `AddDeleteFiles` from the shadow must leave the shadow
+    // without deletion vectors SQL holds, whatever else it disables.
+    assert!(
+        report
+            .differences
+            .iter()
+            .any(|difference| difference.contains("delete_files")),
+        "negative control: {report:#?}"
+    );
     Ok(())
 }

@@ -327,6 +327,11 @@ impl CayenneCatalog {
         };
         #[cfg(not(any(cayenne_metastore_tap, cayenne_metastore_tap_verify)))]
         let tap = None;
+        #[cfg(cayenne_metastore_tap)]
+        let tap = tap.map(|tap| match Arc::try_unwrap(tap) {
+            Ok(tap) => Arc::new(tap.shadow_from_dev_file()),
+            Err(tap) => tap,
+        });
         Ok(Self {
             connection_string,
             metastore,
@@ -401,6 +406,33 @@ impl CayenneCatalog {
     pub fn with_tap(mut self, tap: Arc<crate::metastore_tap::MetastoreTap>) -> Self {
         self.tap = Some(tap);
         self
+    }
+
+    /// Drain the shadow and compare a fresh storage-only replay with SQL.
+    pub async fn shadow_verify(&self) -> crate::metastore_tap::ShadowReport {
+        let Some(tap) = &self.tap else {
+            return crate::metastore_tap::ShadowReport::default();
+        };
+        let _serial = tap.enter().await;
+        self.tap_verify_pending().await;
+        let (mut report, states) = tap.shadow_states().await;
+        for (id, state) in states {
+            report.verified_tables += 1;
+            let diff = match self.tap_read_table_state(&id).await {
+                Ok(sql) => match (sql.as_ref(), state.tables.get(&id)) {
+                    (Some(sql), Some(shadow)) => {
+                        cayenne_metastore_actions::differences(sql, shadow)
+                    }
+                    (None, None) => Vec::new(),
+                    _ => vec!["table presence differs".to_string()],
+                },
+                Err(e) => vec![format!("SQL readback: {e}")],
+            };
+            report
+                .differences
+                .extend(diff.into_iter().map(|d| format!("{id}: {d}")));
+        }
+        report
     }
 
     /// The tap, if this catalog has one.
@@ -786,6 +818,7 @@ impl CayenneCatalog {
                         Inlined {
                             partition_key: row.get_optional_string(1)?,
                             payload: ObjRef::of(&row.get_blob(2)?),
+                            raw_payload: row.get_blob(2)?,
                             count: row.get_i64(3)?,
                             seq: row.get_i64(4)?,
                         },
@@ -809,6 +842,7 @@ impl CayenneCatalog {
                         row.get_string(0)?,
                         InlinedDel {
                             payload: ObjRef::of(&row.get_blob(1)?),
+                            raw_payload: row.get_blob(1)?,
                             count: row.get_i64(2)?,
                             seq: row.get_i64(3)?,
                             published: row.get_bool(4)?,
