@@ -31,12 +31,10 @@ use datafusion::logical_expr::ScalarUDF;
 use datafusion::prelude::SessionContext;
 use parking_lot::RwLock;
 #[cfg(feature = "models")]
-use runtime_datafusion_udfs::{ai::Ai, embed};
-// The UDF *names* are no longer part of any production path here — each function
-// registers its own deny-list entry — but both test modules still assert against
-// them, so they are imported for tests only.
-#[cfg(all(test, feature = "models"))]
-use runtime_datafusion_udfs::{ai::AI_UDF_NAME, embed::EMBED_UDF_NAME};
+use runtime_datafusion_udfs::{
+    ai::{AI_UDF_NAME, Ai},
+    embed::{self, EMBED_UDF_NAME},
+};
 use runtime_query_engine::query_engine::QueryEngine;
 use runtime_search::full_text_udtf::TextSearchTableFunc;
 use runtime_search::rerank::{RERANK_UDTF_NAME, RerankModelStores, RerankTableFunc};
@@ -163,6 +161,8 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
             .into_async_udf()
             .into_scalar_udf(),
         );
+        add_code_executing_function(EMBED_UDF_NAME);
+        add_code_executing_function(AI_UDF_NAME);
     }
 
     // `ai_if`, `ai_probability`, `ai_classify`, `ai_score` and `ai_decide`, answered by
@@ -175,6 +175,9 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         runtime.status(),
     )
     .register(ctx);
+    for name in runtime_decide::DECISION_FUNCTION_NAMES {
+        add_code_executing_function(name);
+    }
 
     // Places the remaining async calls (`ai`, async user functions). Runs after the
     // decision rule, which places decision calls itself.

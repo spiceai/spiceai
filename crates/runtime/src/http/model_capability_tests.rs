@@ -33,10 +33,11 @@ use axum::{
 use datafusion::datasource::MemTable;
 use http_body_util::BodyExt;
 use model_capabilities::{Capability, DecisionsBackend, MessagesBackend, ModelCapabilities};
+use runtime_auth::{HttpAuth, api_key::ApiKeyAuth, layer::http::AuthLayer};
 use runtime_search::search_engine::{SearchEngine, parse_explicit_primary_keys};
 use serde_json::{Value, json};
 use spicepod::component::model::Model;
-use spicepod::component::runtime::CorsConfig;
+use spicepod::component::runtime::{ApiKey, CorsConfig};
 use spicepod::component::worker::Worker;
 use tower::ServiceExt;
 
@@ -347,6 +348,107 @@ async fn luna_serves_chat_and_native_decisions() {
         ]
         .map(|(path, model)| (path.to_string(), model.to_string()))
     );
+}
+
+/// SQL model functions call a model, so a read-only API key cannot run them; a read-write
+/// key can.
+#[tokio::test]
+async fn model_functions_need_a_read_write_api_key() {
+    const READ_ONLY_KEY: &str = "read-only-test-key";
+    const READ_WRITE_KEY: &str = "read-write-test-key";
+    const REFUSAL: &str = "requires a read-write API key";
+
+    let seen = Seen::default();
+    let endpoint = start_provider(&seen).await;
+    let (rt, _) = runtime_with(vec![model(
+        "luna",
+        "openai:gpt-6-luna-2026-10-01",
+        &endpoint,
+    )])
+    .await;
+    let search = Arc::new(SearchEngine::new(
+        Arc::clone(&rt.df) as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
+        parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
+        crate::search::util::RuntimeTableProviderExplorer,
+    ));
+    let auth = AuthLayer::new(Arc::new(ApiKeyAuth::new(vec![
+        ApiKey::parse_str(&format!("{READ_ONLY_KEY}:ro")),
+        ApiKey::parse_str(&format!("{READ_WRITE_KEY}:rw")),
+    ])) as Arc<dyn HttpAuth + Send + Sync>);
+    let routes = super::routes::routes(
+        &rt,
+        Arc::new(Config::new()),
+        search,
+        Some(auth),
+        &CorsConfig::default(),
+        false,
+        #[cfg(feature = "mcp")]
+        None,
+    );
+    let post_sql_as = |api_key: &'static str, sql: &'static str| {
+        let routes = routes.clone();
+        async move {
+            let request = Request::post("/v1/sql")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .header("x-api-key", api_key)
+                .body(Body::from(sql))
+                .expect("request");
+            let response = routes.oneshot(request).await.expect("response");
+            let status = response.status();
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+
+    // (SQL, the text a read-write answer contains when the mock provider serves it)
+    let calls = [
+        ("SELECT ai('ping', 'luna')", Some("pong")),
+        (
+            "SELECT ai_if('The screen arrived broken.', 'Is the item damaged?', model => 'luna')",
+            Some("true"),
+        ),
+        (
+            "SELECT ai_probability('The screen arrived broken.', 'Is the item damaged?', model => 'luna')",
+            None,
+        ),
+        (
+            "SELECT ai_classify('The screen arrived broken.', ['damaged', 'fine'], model => 'luna')",
+            None,
+        ),
+        (
+            "SELECT ai_score('The screen arrived broken.', 'How damaged?', ['none', 'some', 'broken'], model => 'luna')",
+            None,
+        ),
+        (
+            r#"SELECT ai_decide('The screen arrived broken.', '{"damaged": {"type": "noul", "instructions": "Is the item damaged?"}}', model => 'luna')"#,
+            None,
+        ),
+        ("SELECT embed('ping', 'luna')", None),
+    ];
+    for (sql, answer) in calls {
+        let (status, body) = post_sql_as(READ_ONLY_KEY, sql).await;
+        assert!(
+            !status.is_success() && body.contains(REFUSAL),
+            "{sql} with a read-only key: {status} {body}"
+        );
+
+        let (status, body) = post_sql_as(READ_WRITE_KEY, sql).await;
+        assert!(
+            !body.contains(REFUSAL),
+            "{sql} with a read-write key: {status} {body}"
+        );
+        if let Some(answer) = answer {
+            assert!(
+                status.is_success() && body.contains(answer),
+                "{sql} with a read-write key: {status} {body}"
+            );
+        }
+    }
 }
 
 /// A path that serves a model, and the capability it needs from it.
