@@ -179,6 +179,30 @@ impl ClusterGrpcClientConfig {
     }
 }
 
+/// Function registry a cluster executor decodes task plans against.
+///
+/// Ballista resolves each function in a serialized plan by name in this
+/// registry before it asks the codec. The scheduler plans `sum` as checked
+/// integer `SUM` (partial state `Decimal128(38, 0)`); the default registry
+/// would decode it as the built-in (partial state `Int64`), and the stage
+/// would fail its own output schema. The checked scalar kernels are added too
+/// so they resolve here rather than through the codec fallback.
+fn executor_function_registry() -> BallistaFunctionRegistry {
+    let mut registry = BallistaFunctionRegistry::default();
+    for udf in runtime_datafusion::checked_arithmetic::checked_scalar_udfs() {
+        registry
+            .scalar_functions
+            .insert(udf.name().to_string(), udf);
+    }
+    let sum = runtime_datafusion::checked_arithmetic::checked_sum_udaf();
+    for name in std::iter::once(sum.name()).chain(sum.aliases().iter().map(String::as_str)) {
+        registry
+            .aggregate_functions
+            .insert(name.to_string(), Arc::clone(&sum));
+    }
+    registry
+}
+
 fn parse_cluster_grpc_param(params: &HashMap<String, String>, key: &str, default: u64) -> u64 {
     match params.get(key) {
         None => default,
@@ -1589,7 +1613,7 @@ pub async fn initialize_cluster_executor(
         &work_dir,
         runtime_producer,
         config_producer,
-        Arc::new(BallistaFunctionRegistry::default()),
+        Arc::new(executor_function_registry()),
         Arc::new(metrics_collector),
         concurrent_tasks as usize,
         None,
@@ -2647,6 +2671,9 @@ fn apply_distributed_execution_config(cfg: SessionConfig) -> SessionConfig {
     cfg
 }
 
+#[cfg(all(test, not(windows)))]
+mod eager_merge_tests;
+
 #[cfg(test)]
 mod tests {
     use super::ClusterTlsConfig;
@@ -2661,6 +2688,48 @@ mod tests {
         CapturedX509Certificate, EcdsaCurve, InMemorySigningKeyPair, KeyAlgorithm, Sign, Signer,
         X509Certificate,
     };
+
+    /// An executor decodes `sum` from its own registry. It must get the
+    /// scheduler's checked `SUM` (wide `Decimal128(38, 0)` partial state), not
+    /// the built-in (`Int64` state), or the stage fails its output schema.
+    #[test]
+    fn executor_registry_decodes_sum_with_the_schedulers_partial_state() {
+        use std::sync::Arc;
+
+        use arrow::datatypes::{DataType, Field, FieldRef};
+        use datafusion::execution::FunctionRegistry;
+        use datafusion::logical_expr::function::StateFieldsArgs;
+
+        let registry = super::executor_function_registry();
+        let input: FieldRef = Arc::new(Field::new("v", DataType::Int64, true));
+        let output: FieldRef = Arc::new(Field::new("sum(v)", DataType::Int64, true));
+        let state_types = |udaf: &datafusion::logical_expr::AggregateUDF| {
+            udaf.state_fields(StateFieldsArgs {
+                name: "sum",
+                input_fields: std::slice::from_ref(&input),
+                return_field: Arc::clone(&output),
+                ordering_fields: &[],
+                is_distinct: false,
+            })
+            .expect("state fields")
+            .iter()
+            .map(|f| f.data_type().clone())
+            .collect::<Vec<_>>()
+        };
+
+        let sum = registry.udaf("sum").expect("executor registry has sum");
+        let expected = runtime_datafusion::checked_arithmetic::checked_sum_udaf();
+        assert_eq!(state_types(&sum), state_types(&expected));
+        assert_eq!(state_types(&sum), vec![DataType::Decimal128(38, 0)]);
+
+        for udf in runtime_datafusion::checked_arithmetic::checked_scalar_udfs() {
+            assert!(
+                registry.udf(udf.name()).is_ok(),
+                "executor registry must resolve {}",
+                udf.name()
+            );
+        }
+    }
 
     #[test]
     fn cluster_roles_require_cluster_mtls_files() {
