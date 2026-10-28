@@ -163,17 +163,20 @@ impl SubstraitProducer for SpiceProducer {
         let mut encoded = datafusion_substrait::logical_plan::producer::from_scalar_function(
             self, function, schema,
         )?;
-        if let Some(RexType::ScalarFunction(scalar)) = &mut encoded.rex_type {
-            // DataFusion's producer swaps log(base, value) for Substrait's
-            // logb(value, base). Exact function binding uses DataFusion order.
-            if function.func.name() == "log" && scalar.arguments.len() == 2 {
-                scalar.arguments.swap(0, 1);
-            }
-            // Canonical aliases (isnan -> is_nan) may bind a different UDF.
-            scalar.function_reference = self
-                .extensions
-                .register_function(&format!("spice.function.{}", function.func.name()));
+        let Some(RexType::ScalarFunction(scalar)) = &mut encoded.rex_type else {
+            return Err(DataFusionError::Internal(
+                "Substrait scalar function producer returned an unexpected expression".into(),
+            ));
+        };
+        // DataFusion's producer swaps log(base, value) for Substrait's
+        // logb(value, base). Exact function binding uses DataFusion order.
+        if function.func.name() == "log" && scalar.arguments.len() == 2 {
+            scalar.arguments.swap(0, 1);
         }
+        // Canonical aliases (isnan -> is_nan) may bind a different UDF.
+        scalar.function_reference = self
+            .extensions
+            .register_function(&format!("spice.function.{}", function.func.name()));
         Ok(encoded)
     }
 
