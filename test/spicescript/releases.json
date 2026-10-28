@@ -1,0 +1,4 @@
+{
+  "description": "Spice OSS releases that spicescript scripts upgrade from (`from:`). `from: X.Y.x` resolves to the newest X.Y release listed here, so a commit always upgrades from the same binary. Add each OSS release when it ships.",
+  "releases": ["2.2.2", "2.3.3", "2.4.0"]
+}

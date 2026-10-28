@@ -48,3 +48,4 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
 ## Post-Release Housekeeping
 
 - [ ] Update the supported version in `SECURITY.md` if necessary.
+- [ ] Add the release to [`test/spicescript/releases.json`](https://github.com/spiceai/spiceai/blob/trunk/test/spicescript/releases.json) in `trunk`, so upgrade scripts (`from: X.Y.x`) start upgrading from it.

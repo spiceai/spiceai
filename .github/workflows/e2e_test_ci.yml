@@ -2990,6 +2990,10 @@ jobs:
           unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
           echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
 
+      # Upgrade scripts start on the release their `from:` names and upgrade
+      # to this build: spicescript downloads each release it needs from the
+      # GitHub release into ~/.cache/spicescript (test/spicescript/releases.json
+      # pins what `X.Y.x` means), so no `--from` is passed here.
       - name: Run scenario scripts
         run: |
           "${{ steps.spicescript.outputs.path }}" --jobs 4 \

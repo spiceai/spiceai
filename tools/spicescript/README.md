@@ -48,9 +48,11 @@ target/debug/spicescript --jobs 8 --spiced trunk=target/release/spiced test/spic
 target/debug/spicescript --jobs 4 \
   --spiced release=$HOME/.spice/bin/spiced --spiced dev=target/release/spiced \
   test/spicescript/postgres-cdc-parity.yaml
-# Start on a release and upgrade in place to the build under test at each `upgrade` step:
+# Upgrade scripts start on the release their `from:` names, downloaded once, and move
+# to the build under test at each `upgrade` step; --from replaces that release:
+target/debug/spicescript --spiced dev=target/release/spiced test/spicescript/postgres-cdc-upgrade.yaml
 target/debug/spicescript --from $HOME/.spice/bin/spiced \
-  --spiced dev=target/release/spiced test/spicescript/postgres-upgrade.yaml
+  --spiced dev=target/release/spiced test/spicescript/postgres-cdc-upgrade.yaml
 # Every instance as a scheduler with one executor, over node mTLS:
 target/debug/spicescript --cluster test/spicescript/query-coverage.yaml
 # Known-failing scripts of one group, without waiting out every limit:
@@ -70,7 +72,7 @@ DuckDB CLI matching Spice's embedded DuckDB into `~/.cache/spicescript/`
 | --- | --- |
 | `<SCRIPTS>…` | Script files, or directories of `*.yaml` scripts (not their subdirectories, except that `known-failing/` includes its group directories). |
 | `--spiced [NAME=]PATH` | A `spiced` to test; repeat it to run every script on several binaries, which must give identical answers. Default: `~/.spice/bin/spiced`. |
-| `--from PATH` | Start every instance on this binary; each `upgrade` step moves it to the binary under test, over the same data. |
+| `--from PATH` | Start every instance on this binary instead of the release its script's `from:` names (see [Upgrades](#upgrades)); each `upgrade` step moves it to the binary under test, over the same data. Combine it with `--matrix from=…` to run one base version. |
 | `--cluster` | Run every instance as a scheduler plus one executor over node mTLS. Scripts that can't run distributed (memory-mode Cayenne, DuckDB or SQLite accelerations) are skipped. |
 | `--jobs N` | Run up to N `spiced` processes at once (default 1). Every instance of every matrix combination is a job of its own, taking a slot per process, executors included, and freeing it when it finishes. A combination that stops and starts a source its instances share, or whose variants work together (`run-variants: side-by-side`), runs its instances a step at a time as one job; a script with `defaults.exclusive` runs alone. Scripts ask for slots longest first, from recorded durations. Each script's output is printed when it finishes, with progress lines and the slowest scripts at the end. |
 | `--partition I/N` | Run only share I of N (1-based), for splitting a suite across CI jobs. Scripts go longest first, by recorded duration, to the share with the least work so far, so every job computes the same split and the shares take about as long. |
@@ -199,7 +201,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `stop: {}` | SIGTERM, then SIGKILL after 45 s; fails if the shutdown wasn't clean. |
 | `kill-spiced: {}` | SIGKILL; `{ signal: STOP-then-KILL }` freezes it first. |
 | `restart: {}` | Stop (or `{ kill: KILL }`) and start again; takes `start`'s options. |
-| `upgrade: {}` | Like `restart`, but starts the binary under test (see `--from`). |
+| `upgrade: {}` | Like `restart`, but starts the binary under test (see [Upgrades](#upgrades)). |
 | `wait-ready: { timeout }` | Wait for `/v1/ready`. |
 | `edit-spicepod: <patch>` | Rewrite the running instance's spicepod (for `--pods-watcher-enabled`). |
 | `start-source`, `stop-source`, `pause-source`, `unpause-source: <name>` | Control a source container; it keeps its host port across a stop. |
@@ -235,6 +237,41 @@ Any step takes `only: <variant>` or `except: <variant>` (or a list), and
 `when: { <matrix key>: <value> }`. A failed lifecycle step (`start`, `stop`,
 `restart`, `upgrade`, `kill-spiced`, `wait-ready`) skips the rest of that
 instance; any other failure is a failed check and the script goes on.
+
+### Upgrades
+
+```yaml
+name: orders-upgrade
+matrix:
+  from: [2.3.x, 2.4.x]               # one run per base release: name[from=2.4.x]
+from: '${matrix.from}'               # or one release: from: 2.4.x, from: 2.4.0
+steps:
+  - start: {}                        # on the base release
+  - query: SELECT * FROM orders
+  - upgrade: {}                      # on the binary under test, over the same data
+  - query: SELECT * FROM orders
+```
+
+`from:` names the release a script's instances start on, as `X.Y.Z` or `X.Y.x`
+(the newest X.Y release in
+[`test/spicescript/releases.json`](../../test/spicescript/releases.json), the
+nearest `releases.json` at or above the script). Since the list is checked in,
+a commit always upgrades from the same binary; it gains each release as it
+ships. Before running, spicescript downloads each release the selected runs
+need (`spiced_<os>_<arch>.tar.gz` from the GitHub release) once into
+`~/.cache/spicescript/spiced-<version>/`, checks its `--version`, and prints
+which release each run starts on. Executors start on it too, and `upgrade`
+moves the scheduler and executors to the binary under test.
+
+- Without `from:`, instances start on the binary under test and `upgrade` is a
+  restart. A `from:` on a script with no `upgrade` step is rejected.
+- `--from PATH` starts every instance on that binary instead, whatever the
+  script names.
+- OSS release builds have only the `release` and `models` features. A release
+  asked for another one (acceleration snapshots, for one) starts anyway and
+  logs that the feature is in the Enterprise distribution. spicescript fails
+  the start on that line, naming the release, rather than letting a later
+  check fail for a reason it can't see.
 
 ### Source-neutral writes
 

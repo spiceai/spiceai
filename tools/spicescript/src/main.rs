@@ -32,6 +32,7 @@ mod generate;
 mod ledger;
 mod pki;
 mod reap;
+mod release;
 mod rqg;
 mod runner;
 mod script;
@@ -206,6 +207,39 @@ async fn run(cli: Cli) -> Result<bool> {
         return check(&paths, &scripts);
     }
 
+    // Each base release the selected runs start on, downloaded once; `--from`
+    // replaces them all.
+    let mut releases = std::collections::BTreeMap::new();
+    if cli.from.is_none() {
+        let mut fetched = std::collections::BTreeMap::<String, std::path::PathBuf>::new();
+        for script in &scripts {
+            for combo in script::matrix_combinations(&script.matrix) {
+                let Some(spec) = script.render_from(&combo)? else {
+                    continue;
+                };
+                let version = script
+                    .releases
+                    .get(&spec)
+                    .context("base release was not resolved at load")?
+                    .clone();
+                let binary = if let Some(binary) = fetched.get(&version) { binary.clone() } else {
+                    let binary = release::fetch(&version).await?;
+                    println!("base release v{version}: {}", binary.display());
+                    fetched.insert(version.clone(), binary.clone());
+                    binary
+                };
+                releases.insert(
+                    (script.dir.clone(), spec.clone()),
+                    release::BaseRelease {
+                        spec,
+                        version,
+                        binary,
+                    },
+                );
+            }
+        }
+    }
+
     let work_dir = std::path::absolute(&cli.work_dir)?;
     reap::reap(&work_dir);
     if cli.keep {
@@ -226,7 +260,8 @@ async fn run(cli: Cli) -> Result<bool> {
     let pki = pki::generate(&work_dir.join(format!("pki-{}", std::process::id())))?;
     let options = runner::Options {
         targets,
-        from: cli.from,
+        from_override: cli.from,
+        releases,
         cluster: cli.cluster,
         work_dir,
         keep: cli.keep,
