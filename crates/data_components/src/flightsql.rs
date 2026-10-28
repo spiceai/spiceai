@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::function_support::FunctionSupport;
-use crate::sql_expr::to_sql_preserving_precedence;
+use crate::sql_expr::{to_spice_sql, to_sql_preserving_precedence};
 use arrow::{
     array::{Array, RecordBatch, array},
     compute::cast,
@@ -234,6 +234,7 @@ pub struct FlightSQLTable {
     /// sent to the Flight SQL server. See issue #10703.
     function_support: Option<FunctionSupport>,
     token: Option<String>,
+    spice_sql: bool,
 }
 
 #[expect(clippy::needless_pass_by_value)]
@@ -261,6 +262,7 @@ impl FlightSQLTable {
             statistics: None,
             function_support: None,
             token: None,
+            spice_sql: false,
         })
     }
 
@@ -284,7 +286,15 @@ impl FlightSQLTable {
             statistics: None,
             function_support: None,
             token: None,
+            spice_sql: false,
         }
+    }
+
+    /// Use Spice's exact Arrow numeric SQL encoding for a trusted executor.
+    #[must_use]
+    pub fn with_spice_sql(mut self, enabled: bool) -> Self {
+        self.spice_sql = enabled;
+        self
     }
 
     /// Attach statistics to be reported by the scans this provider creates.
@@ -497,7 +507,9 @@ impl FlightSQLTable {
             limit,
             Arc::clone(&self.cookie_store),
         )?;
-        let exec = exec.with_token(self.token.clone());
+        let exec = exec
+            .with_token(self.token.clone())
+            .with_spice_sql(self.spice_sql);
         // Project the table-level statistics onto the scan's (projected) output
         // schema so the column-statistics list lines up with the output columns.
         //
@@ -551,7 +563,11 @@ impl TableProvider for FlightSQLTable {
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         let mut filter_push_down = vec![];
         for filter in filters {
-            match to_sql_preserving_precedence(filter) {
+            match if self.spice_sql {
+                to_spice_sql(filter)
+            } else {
+                to_sql_preserving_precedence(filter)
+            } {
                 Ok(_) => {
                     filter_push_down.push(TableProviderFilterPushDown::Exact);
                 }
@@ -596,9 +612,24 @@ pub struct FlightSqlExec {
     /// hash-join build-side selection can use them.
     statistics: Statistics,
     token: Option<String>,
+    spice_sql: bool,
 }
 
 impl FlightSqlExec {
+    /// Whether this scan targets a trusted Spice executor.
+    pub fn uses_spice_sql(&self) -> bool {
+        self.spice_sql
+    }
+
+    /// Render a filter with the same numeric encoding used by this scan.
+    pub fn filter_sql(&self, expr: &Expr) -> DataFusionResult<String> {
+        if self.spice_sql {
+            to_spice_sql(expr)
+        } else {
+            to_sql_preserving_precedence(expr)
+        }
+    }
+
     pub fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
@@ -628,7 +659,15 @@ impl FlightSqlExec {
             trace_parent: None,
             statistics,
             token: None,
+            spice_sql: false,
         })
+    }
+
+    /// Use Spice's exact Arrow numeric SQL encoding for a trusted executor.
+    #[must_use]
+    pub fn with_spice_sql(mut self, enabled: bool) -> Self {
+        self.spice_sql = enabled;
+        self
     }
 
     /// Attach statistics describing the rows this scan produces. The schema of
@@ -722,7 +761,7 @@ impl FlightSqlExec {
                 .filters
                 .iter()
                 .map(|f| {
-                    to_sql_preserving_precedence(f).map(|sql| {
+                    self.filter_sql(f).map(|sql| {
                         // Wrap each top-level filter in parentheses to preserve semantics when
                         // joining with AND, and recursively parenthesize nested binary
                         // expressions so mixed AND/OR trees inside a single filter keep the
@@ -869,6 +908,7 @@ impl ExecutionPlan for FlightSqlExec {
             trace_parent: self.trace_parent.clone(),
             statistics: self.statistics.clone(),
             token: self.token.clone(),
+            spice_sql: self.spice_sql,
         };
 
         Ok(SortOrderPushdownResult::Exact {
@@ -980,6 +1020,7 @@ impl ExecutionPlan for FlightSqlExec {
             trace_parent: self.trace_parent.clone(),
             statistics,
             token: self.token.clone(),
+            spice_sql: self.spice_sql,
         };
 
         Some(Arc::new(new_plan))

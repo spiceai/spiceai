@@ -1,0 +1,39 @@
+name: distinct-on-scopes
+description: >
+  DISTINCT ON preserves output bindings, duplicate elimination, NULL groups
+  and the position of filters when the local table has a different source name.
+sources:
+  src: { kind: postgres }
+variants:
+  federated: {}
+  arrow: arrow
+  cayenne: cayenne-file
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: distinct-on-scopes
+  datasets:
+    - { from: 'postgres:public.distinct_rows', name: app_table, params: '${sources.src.params}' }
+defaults:
+  expect: { oracle: src }
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE distinct_rows (id int PRIMARY KEY, a int, s text);
+        INSERT INTO distinct_rows VALUES
+          (1,1,'first'),(2,1,'second'),(3,NULL,NULL),
+          (4,NULL,'fourth'),(5,3,'third'),(6,3,NULL);
+        CREATE VIEW app_table AS SELECT * FROM distinct_rows;
+  - start: {}
+  - query: SELECT DISTINCT ON (a) a, s FROM app_table ORDER BY a NULLS LAST, id
+  - query: SELECT a FROM (SELECT DISTINCT ON (a) a FROM app_table ORDER BY a NULLS LAST, id) WHERE a > 0 ORDER BY a
+  - query: SELECT "app_table.a + Int64(1)" AS result FROM (SELECT DISTINCT ON (a) a + 1 FROM app_table ORDER BY a NULLS LAST, id) ORDER BY result NULLS LAST
+    oracle-sql: SELECT a + 1 AS result FROM (SELECT DISTINCT ON (a) a FROM app_table ORDER BY a NULLS LAST, id) q ORDER BY result NULLS LAST
+  - query: SELECT a, s FROM (SELECT DISTINCT ON (a) a, s FROM app_table ORDER BY a NULLS LAST, id) q WHERE s IS NOT NULL ORDER BY a NULLS LAST
+  - query: SELECT count(*) AS n FROM (SELECT DISTINCT ON (a) a FROM app_table ORDER BY a NULLS LAST, id) q
+  - explain: SELECT DISTINCT ON (a) a FROM app_table ORDER BY a NULLS LAST, id
+    contains: CayenneAccelerationExec
+    only: cayenne
+  - explain: SELECT a FROM (SELECT DISTINCT ON (a) a FROM app_table ORDER BY a NULLS LAST, id) WHERE a > 0 ORDER BY a
+    contains: FilterExec
+    only: federated

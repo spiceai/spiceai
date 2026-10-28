@@ -1,9 +1,3 @@
-# Known failing (#15538) wherever Spice sends SQL to an engine (federated PostgreSQL,
-# DuckDB accelerations): INTERSECT and EXCEPT are sent as
-# EXISTS / NOT EXISTS with `=`, where a set operation compares NULLs as equal,
-# so INTERSECT drops a shared NULL row and EXCEPT keeps one; and over one table
-# with a filter on the right, the SQL sent filters on a column its subquery
-# does not select, which fails.
 name: unparse-set-operations
 description: >
   INTERSECT and EXCEPT answer as PostgreSQL does, NULLs included, wherever the
@@ -45,3 +39,15 @@ steps:
   - query: SELECT a, s FROM w EXCEPT SELECT a, s FROM w2
   - query: SELECT a FROM w INTERSECT SELECT a FROM w WHERE id > 1
   - query: SELECT a, s FROM w EXCEPT SELECT a, s FROM w WHERE id IN (2, 4)
+  - query: SELECT a AS x FROM w INTERSECT SELECT a AS x FROM w WHERE id > 1
+  - query: SELECT a + 1 AS x FROM w EXCEPT SELECT a + 1 AS x FROM w WHERE id > 1
+    expect-empty: true
+  - query: SELECT count(*) AS n, sum(x) AS s FROM (SELECT a + 1 AS x FROM w INTERSECT SELECT a + 1 AS x FROM w WHERE id > 1) q
+  - query: SELECT count(*) AS n, sum(x) AS s FROM (SELECT a + 1 AS x FROM w EXCEPT SELECT a + 1 AS x FROM w WHERE id > 1) q
+  - query: >-
+      SELECT x FROM (SELECT y AS x FROM (SELECT a AS y, s AS label FROM w) q WHERE label IS NOT NULL INTERSECT SELECT y AS x FROM (SELECT a AS y, s AS label FROM w) q WHERE y > 0) r
+  - query: >-
+      SELECT x FROM (SELECT y AS x FROM (SELECT a AS y, s AS label FROM w) q WHERE label IS NOT NULL EXCEPT SELECT y AS x FROM (SELECT a AS y, s AS label FROM w) q WHERE y > 0) r
+  - query: >-
+      SELECT count(*) AS n, sum(x) AS s FROM (SELECT y + 1 AS x FROM (SELECT a AS y, s AS label FROM w) q WHERE label IS NOT NULL EXCEPT SELECT y + 1 AS x FROM (SELECT a AS y, s AS label FROM w) q WHERE y > 0) r
+  - query: SELECT count(*) AS n FROM (SELECT a + 1 FROM w INTERSECT SELECT a + 1 FROM w WHERE id > 1) q
