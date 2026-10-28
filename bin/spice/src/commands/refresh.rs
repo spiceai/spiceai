@@ -140,3 +140,41 @@ pub async fn execute(ctx: &RuntimeContext, args: &RefreshArgs) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TlsServer;
+
+    /// `refresh` posts rather than gets, so it reaches the runtime through a different
+    /// context helper; it has to report an untrusted certificate the same way.
+    #[tokio::test]
+    async fn refresh_reports_a_certificate_failure_rather_than_an_unavailable_runtime() {
+        let server = TlsServer::answering("{}");
+        let ctx = RuntimeContext::with_args(
+            Some(server.url().to_string()),
+            None,
+            None,
+            Some(server.unrelated_ca_file()),
+        )
+        .expect("context should build");
+        let args = RefreshArgs {
+            dataset: "accounts".to_string(),
+            refresh_sql: None,
+            refresh_mode: None,
+            refresh_jitter_max: None,
+            output: OutputFormat::Table,
+        };
+
+        let message = execute(&ctx, &args)
+            .await
+            .expect_err("refresh should fail when the certificate is not trusted")
+            .to_string();
+
+        assert!(
+            message.contains("TLS certificate verification failed")
+                && message.contains("--tls-root-certificate-file"),
+            "expected a certificate error, got: {message}"
+        );
+    }
+}

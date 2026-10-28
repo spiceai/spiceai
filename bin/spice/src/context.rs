@@ -2983,14 +2983,32 @@ mod tests {
 
     #[test]
     fn test_with_args_sets_tls_certificate() {
-        let ctx =
-            RuntimeContext::with_args(None, None, None, Some("/path/to/cert.pem".to_string()))
-                .expect("with_args should succeed");
+        let server = crate::test_support::TlsServer::answering("[]");
+        let ctx = RuntimeContext::with_args(None, None, None, Some(server.ca_file()))
+            .expect("with_args should succeed");
 
-        assert_eq!(
-            ctx.tls_root_certificate_file,
-            Some("/path/to/cert.pem".to_string())
-        );
+        assert_eq!(ctx.tls_root_certificate_file, Some(server.ca_file()));
+    }
+
+    /// The HTTP clients are built with the root certificate, so a file that cannot be used
+    /// is reported up front, naming it, rather than as a later connection failure.
+    #[test]
+    fn test_with_args_rejects_unusable_tls_root_certificate_file() {
+        let dir = TempDir::new().expect("temp dir should be created");
+        let missing = dir.path().join("missing.pem").display().to_string();
+        let not_pem = dir.path().join("not-a-certificate.pem");
+        std::fs::write(&not_pem, "not a certificate\n").expect("file should be written");
+        let not_pem = not_pem.display().to_string();
+
+        for path in [missing, not_pem] {
+            let message = RuntimeContext::with_args(None, None, None, Some(path.clone()))
+                .expect_err("an unusable root certificate file should be rejected")
+                .to_string();
+            assert!(
+                message.contains(&path) && message.contains("TLS root certificate"),
+                "expected an error naming {path}, got: {message}"
+            );
+        }
     }
 
     #[test]

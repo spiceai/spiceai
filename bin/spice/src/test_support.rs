@@ -312,3 +312,148 @@ fn read_request(stream: &TcpStream) -> std::io::Result<String> {
 
     Ok(target)
 }
+
+/// An HTTPS server whose certificate is issued by a CA made for the test.
+///
+/// It answers every request with `200 OK` and a fixed JSON body, so a test can tell "the
+/// client trusted the certificate and got an answer" from "the handshake failed". The CA
+/// certificate is written to disk for `--tls-root-certificate-file`, alongside the certificate
+/// of an unrelated CA, which did not issue the server's certificate.
+pub(crate) struct TlsServer {
+    url: String,
+    running: Arc<AtomicBool>,
+    dir: tempfile::TempDir,
+}
+
+impl TlsServer {
+    /// Answer every request with `body` as `application/json`.
+    pub(crate) fn answering(body: &'static str) -> Self {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+
+        fn ca(name: &str) -> (rcgen::Certificate, KeyPair) {
+            let mut params =
+                CertificateParams::new(Vec::<String>::new()).expect("CA params should build");
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            params.distinguished_name.push(DnType::CommonName, name);
+            let key = KeyPair::generate().expect("CA key should generate");
+            let cert = params.self_signed(&key).expect("CA should self-sign");
+            (cert, key)
+        }
+
+        let (ca_cert, ca_key) = ca("spice cli test CA");
+        let (other_ca_cert, _) = ca("spice cli unrelated CA");
+
+        let leaf_key = KeyPair::generate().expect("leaf key should generate");
+        let leaf_cert =
+            CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()])
+                .expect("leaf params should build")
+                .signed_by(
+                    &leaf_key,
+                    &Issuer::from_ca_cert_pem(&ca_cert.pem(), ca_key)
+                        .expect("CA should become an issuer"),
+                )
+                .expect("CA should sign the leaf");
+
+        let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        std::fs::write(dir.path().join("ca.pem"), ca_cert.pem()).expect("CA should be written");
+        std::fs::write(dir.path().join("other-ca.pem"), other_ca_cert.pem())
+            .expect("unrelated CA should be written");
+
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("default protocol versions should be supported")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![leaf_cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into(),
+        )
+        .expect("server certificate should be accepted");
+        let config = Arc::new(config);
+
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("test server should bind a loopback port");
+        let port = listener
+            .local_addr()
+            .expect("bound listener should have an address")
+            .port();
+        listener
+            .set_nonblocking(true)
+            .expect("test server listener should accept non-blocking");
+
+        let running = Arc::new(AtomicBool::new(true));
+        let accepting = Arc::clone(&running);
+        thread::spawn(move || {
+            while accepting.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let config = Arc::clone(&config);
+                        thread::spawn(move || serve_tls(stream, config, body));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            url: format!("https://127.0.0.1:{port}"),
+            running,
+            dir,
+        }
+    }
+
+    /// The server's base URL. Every path is answered identically.
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// The PEM file of the CA that issued the server's certificate.
+    pub(crate) fn ca_file(&self) -> String {
+        self.dir.path().join("ca.pem").display().to_string()
+    }
+
+    /// The PEM file of a CA that did not issue the server's certificate.
+    pub(crate) fn unrelated_ca_file(&self) -> String {
+        self.dir.path().join("other-ca.pem").display().to_string()
+    }
+}
+
+impl Drop for TlsServer {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Answer one TLS connection with `body`. A handshake the client rejects ends it quietly.
+fn serve_tls(stream: TcpStream, config: Arc<rustls::ServerConfig>, body: &str) {
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
+    let Ok(conn) = rustls::ServerConnection::new(config) else {
+        return;
+    };
+    let mut tls = rustls::StreamOwned::new(conn, stream);
+
+    // Read the request head; the CLI's requests carry no body this server needs.
+    let mut request = Vec::new();
+    let mut buf = [0_u8; 1024];
+    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+        match tls.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => request.extend_from_slice(&buf[..n]),
+        }
+    }
+
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    if tls.write_all(response.as_bytes()).is_ok() {
+        tls.conn.send_close_notify();
+        let _ = tls.flush();
+    }
+}

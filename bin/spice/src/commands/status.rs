@@ -83,3 +83,60 @@ pub async fn execute(ctx: &RuntimeContext, args: &StatusArgs) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TlsServer;
+
+    const STATUS_BODY: &str = r#"[{"name":"http","endpoint":"127.0.0.1:8090","status":"Ready"}]"#;
+
+    fn ctx_for(server: &TlsServer, root_cert: Option<String>) -> RuntimeContext {
+        RuntimeContext::with_args(Some(server.url().to_string()), None, None, root_cert)
+            .expect("context should build")
+    }
+
+    fn table() -> StatusArgs {
+        StatusArgs {
+            output: OutputFormat::Table,
+        }
+    }
+
+    /// `--tls-root-certificate-file` is a global flag, so the HTTP commands have to trust it
+    /// as `spice sql` does, not only the system roots.
+    #[tokio::test]
+    async fn status_trusts_the_tls_root_certificate_file() {
+        let server = TlsServer::answering(STATUS_BODY);
+        let ctx = ctx_for(&server, Some(server.ca_file()));
+
+        execute(&ctx, &table())
+            .await
+            .expect("status should succeed against a runtime whose CA was passed");
+    }
+
+    /// A certificate the client does not trust is a TLS problem with a known remedy, not a
+    /// runtime that is down.
+    #[tokio::test]
+    async fn status_reports_a_certificate_failure_rather_than_an_unavailable_runtime() {
+        let server = TlsServer::answering(STATUS_BODY);
+
+        for root_cert in [Some(server.unrelated_ca_file()), None] {
+            let ctx = ctx_for(&server, root_cert.clone());
+            let message = execute(&ctx, &table())
+                .await
+                .expect_err("status should fail when the certificate is not trusted")
+                .to_string();
+
+            assert!(
+                message.contains("TLS certificate verification failed")
+                    && message.contains(server.url())
+                    && message.contains("--tls-root-certificate-file"),
+                "root cert {root_cert:?}: expected a certificate error naming the endpoint and the flag, got: {message}"
+            );
+            assert!(
+                !message.contains("Is it running?"),
+                "root cert {root_cert:?}: a certificate failure is not an unavailable runtime, got: {message}"
+            );
+        }
+    }
+}
