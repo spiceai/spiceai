@@ -1164,10 +1164,15 @@ pub fn is_params_map(key: &str) -> bool {
     key == "params" || key.ends_with("_params")
 }
 
-/// Whether `value` is a `${ ... }` reference, which names where a secret is
-/// rather than what it is.
+/// Whether `value` is a `${ ... }` reference and nothing else, which names
+/// where a secret is rather than what it is. A value that holds a reference
+/// and other text may hold a secret too.
 fn is_reference(value: &str) -> bool {
-    value.trim_start().starts_with("${")
+    let value = value.trim();
+    value.starts_with("${")
+        && value.ends_with('}')
+        && value.matches("${").count() == 1
+        && value.matches('}').count() == 1
 }
 
 /// Whether the map at `key` is one the Spicepod keeps unordered: a parameters
@@ -1644,6 +1649,9 @@ fn options_in_text(sql: &str, dialect: &dyn Dialect) -> Option<Vec<OptionInText>
                                         Token::RParen | Token::RBracket if nested > 0 => {
                                             nested -= 1;
                                         }
+                                        // A `,` inside `ARRAY[...]` or `(...)` is
+                                        // part of the value.
+                                        Token::Comma if nested > 0 => {}
                                         Token::RParen | Token::Comma => break,
                                         _ => {}
                                     }
@@ -1770,17 +1778,23 @@ pub fn redact_secret_option_values<'a>(
             if path.len() > 1 && path[0] == "dataset" {
                 path.remove(0);
             }
+            // As the options are read: a key that does not start with a field
+            // is a connector parameter named by the whole key, and a key into a
+            // parameters map names the entry it ends with.
+            let first_is_field = path.first().is_some_and(|first| {
+                ComponentKind::Dataset.is_field(first) || ComponentKind::Catalog.is_field(first)
+            });
             let parameter = match path.as_slice() {
-                [] => false,
-                [name] => {
-                    !ComponentKind::Dataset.is_field(name) && !ComponentKind::Catalog.is_field(name)
+                [] => None,
+                _ if !first_is_field => Some(path.join(".")),
+                [map @ .., name] if map.iter().any(|segment| is_params_map(segment)) => {
+                    Some((*name).to_string())
                 }
-                [map @ .., _] => map.iter().any(|segment| is_params_map(segment)),
+                _ => None,
             };
-            if parameter {
-                let name: &str = path.last()?;
+            if let Some(name) = parameter {
                 let reference = value.string.as_deref().is_some_and(is_reference);
-                return (!reference && !shown(name))
+                return (!reference && !shown(&name))
                     .then(|| (value.range, REDACTED_SQL.to_string()));
             }
             // A structured value can hold parameters maps, or be one.

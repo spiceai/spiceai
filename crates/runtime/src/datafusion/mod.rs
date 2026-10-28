@@ -5492,7 +5492,8 @@ impl DataFusion {
     ///
     /// The checkpoint goes first, and must go, as in a settings rebuild: one
     /// that outlived the table would mark the next definition's empty table
-    /// loaded. A checkpoint that cannot be opened was never written.
+    /// loaded. A checkpoint store that does not exist was never written; any
+    /// other failure to open it fails the deletion.
     pub(crate) async fn delete_acceleration_data(&self, dataset: &Dataset) -> Result<()> {
         let Some(acceleration) = dataset.acceleration.as_ref().filter(|a| a.enabled) else {
             return Ok(());
@@ -5500,7 +5501,7 @@ impl DataFusion {
         if !dataset.is_file_accelerated() {
             return Ok(());
         }
-        if let Ok(checkpoint) = dataset_checkpointer(
+        let checkpoint = match dataset_checkpointer(
             dataset,
             self.accelerator_engine_registry(),
             OpenOption::OpenExisting,
@@ -5508,6 +5509,17 @@ impl DataFusion {
         )
         .await
         {
+            Ok(checkpoint) => Some(checkpoint),
+            // Nothing was ever written, so there is no checkpoint to clear.
+            Err(runtime_checkpoint_api::CheckpointError::NotFound { .. }) => None,
+            Err(source) => {
+                return Err(Error::AccelerationDataCheckpoint {
+                    dataset_name: dataset.name.to_string(),
+                    source: Box::new(source),
+                });
+            }
+        };
+        if let Some(checkpoint) = checkpoint {
             checkpoint
                 .delete()
                 .await
@@ -7178,16 +7190,18 @@ impl DataFusion {
         sql: &str,
         parameters: Option<&ParamValues>,
     ) -> Result<(LogicalPlan, TableFunctionPlaceholders), DataFusionError> {
+        // An option key may be written dotted and unquoted, in Spice statements
+        // too: quoted, it reads as one identifier.
+        let sql = &*datafusion_ddl::component_options::quote_dotted_option_keys(
+            sql,
+            &datafusion::sql::sqlparser::dialect::PostgreSqlDialect {},
+        );
         if let Some(handler) = self.component_ddl_handler()
             && let Some(statement) = component_planner::parse_spice_statement(sql)?
         {
             let plan = component_planner::plan_spice_statement(statement, handler).await?;
             return Ok((plan, TableFunctionPlaceholders::Absent));
         }
-        let sql = &*datafusion_ddl::component_options::quote_dotted_option_keys(
-            sql,
-            &datafusion::sql::sqlparser::dialect::PostgreSqlDialect {},
-        );
         let mut statement = planner::parse_sql_statement(sql, session)?;
         sql_depth_guard::ensure_statement_within_depth_limits(&statement)?;
         let placeholders = bind_table_function_args(&mut statement, parameters)?;
@@ -7222,16 +7236,18 @@ impl DataFusion {
         sql: &str,
         parameters: Option<&ParamValues>,
     ) -> Result<(LogicalPlan, TableFunctionPlaceholders), DataFusionError> {
+        // An option key may be written dotted and unquoted, in Spice statements
+        // too: quoted, it reads as one identifier.
+        let sql = &*datafusion_ddl::component_options::quote_dotted_option_keys(
+            sql,
+            &datafusion::sql::sqlparser::dialect::PostgreSqlDialect {},
+        );
         if let Some(handler) = self.component_ddl_handler()
             && let Some(statement) = component_planner::parse_spice_statement(sql)?
         {
             let plan = component_planner::plan_spice_statement(statement, handler).await?;
             return Ok((plan, TableFunctionPlaceholders::Absent));
         }
-        let sql = &*datafusion_ddl::component_options::quote_dotted_option_keys(
-            sql,
-            &datafusion::sql::sqlparser::dialect::PostgreSqlDialect {},
-        );
         let dialect = session.config().options().sql_parser.dialect;
         let mut statement = session.sql_to_statement(sql, &dialect)?;
         sql_depth_guard::ensure_statement_within_depth_limits(&statement)?;

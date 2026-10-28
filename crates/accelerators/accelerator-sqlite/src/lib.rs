@@ -437,8 +437,9 @@ impl DataAccelerator for SqliteAccelerator {
                     source: Box::new(source),
                 })?;
         if open_option == OpenOption::OpenExisting && !std::path::Path::new(&sqlite_file).exists() {
-            return Err(CheckpointError::Store {
-                source: format!("SQLite file does not exist at {sqlite_file}").into(),
+            return Err(CheckpointError::NotFound {
+                store: "SQLite file".to_string(),
+                path: sqlite_file,
             });
         }
 

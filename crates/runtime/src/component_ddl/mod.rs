@@ -188,7 +188,15 @@ impl ComponentDdlHandler for RuntimeComponentDdl {
     }
 
     async fn apply(&self, op: ComponentDdlOp) -> DFResult<String> {
-        self.runtime()?.apply_component_ddl(op).await
+        let runtime = self.runtime()?;
+        // On a task of its own: a change takes several steps that must all
+        // run, and a statement that is dropped, as by a client that
+        // disconnects or a query timeout, must not stop it partway.
+        tokio::spawn(runtime.apply_component_ddl(op))
+            .await
+            .map_err(|e| {
+                DataFusionError::Execution(format!("The statement did not finish. Cause: {e}"))
+            })?
     }
 
     async fn create_statement(&self, kind: ComponentKind, name: &str) -> DFResult<Option<String>> {
@@ -679,7 +687,9 @@ impl Runtime {
             .read()
             .await
             .clone()
-            .unwrap_or_else(|| Arc::new(plan::spicepod_part((*served).clone(), &known)));
+            // Unset only before the SQL definitions are read, when the app
+            // served holds none of them.
+            .unwrap_or_else(|| Arc::clone(&served));
         let retired = plan::retired_datasets(&spicepod, &known, &stored, None);
         let applied = self.retire(&spicepod, &served, &stored, &retired).await?;
         plan::warn_shadowed(&spicepod, &stored);
@@ -748,18 +758,18 @@ impl Runtime {
     }
 
     /// The app to serve for `app`, an app the Spicepods declare: it with the
-    /// SQL-defined components added.
+    /// SQL-defined components added. A component `app` declares is the
+    /// Spicepod's, even one identical to a SQL definition.
     pub(crate) async fn with_sql_definitions(&self, app: Arc<App>) -> Arc<App> {
         let Some(defined) = self.sql_components.defined().await else {
             return app;
         };
-        let spicepod = Arc::new(plan::spicepod_part((*app).clone(), &defined));
-        *self.sql_components.spicepod.write().await = Some(Arc::clone(&spicepod));
+        *self.sql_components.spicepod.write().await = Some(Arc::clone(&app));
         if defined.is_empty() {
-            return spicepod;
+            return app;
         }
-        plan::warn_shadowed(&spicepod, &defined);
-        Arc::new(plan::serve((*spicepod).clone(), &defined))
+        plan::warn_shadowed(&app, &defined);
+        Arc::new(plan::serve((*app).clone(), &defined))
     }
 
     /// Apply a component statement: validate the definition it makes, store
@@ -808,7 +818,9 @@ impl Runtime {
             .read()
             .await
             .clone()
-            .unwrap_or_else(|| Arc::new(plan::spicepod_part((*served).clone(), &defined)));
+            // Unset only before the SQL definitions are read, when the app
+            // served holds none of them.
+            .unwrap_or_else(|| Arc::clone(&served));
         let parameters = Self::altered_connector_parameters(&op, &defined).await;
         let Planned {
             definitions,
@@ -850,6 +862,23 @@ impl Runtime {
         // stops serving and loses its acceleration data before the change is
         // stored, so no definition ever loads data another one put there.
         let retired = plan::retired_datasets(&spicepod, &defined, &definitions, Some(&op));
+        if !retired.is_empty() {
+            // Checked again just before data is deleted: a change another
+            // instance stored since is refused here, before anything is deleted,
+            // rather than by the write below, after.
+            let stored = store
+                .load()
+                .await
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            if stored != defined {
+                return Err(DataFusionError::Execution(
+                    store::Error::Conflict {
+                        location: store.location().to_string(),
+                    }
+                    .to_string(),
+                ));
+            }
+        }
         let applied = self
             .retire(&spicepod, &served, &definitions, &retired)
             .await
@@ -858,12 +887,25 @@ impl Runtime {
             })?;
 
         if let Err(e) = store.replace(&defined, &definitions).await {
-            if !Arc::ptr_eq(&applied, &served) {
-                Arc::clone(&self)
-                    .apply_app_diff(Some(&applied), Arc::clone(&served))
-                    .await;
+            if retired.is_empty() {
+                return Err(DataFusionError::Execution(e.to_string()));
             }
-            return Err(DataFusionError::Execution(e.to_string()));
+            Arc::clone(&self)
+                .apply_app_diff(Some(&applied), Arc::clone(&served))
+                .await;
+            let names: Vec<String> = retired
+                .iter()
+                .map(|dataset| display_dataset_name(&dataset.name))
+                .collect();
+            return Err(DataFusionError::Execution(format!(
+                "{e} The acceleration data of {} {} was deleted before the change could be stored, so it is loaded again from the source.",
+                if names.len() == 1 {
+                    "dataset"
+                } else {
+                    "datasets"
+                },
+                names.join(", ")
+            )));
         }
         *self.sql_components.defined.write().await = Some(definitions);
         Arc::clone(&self).apply_app_diff(Some(&applied), next).await;

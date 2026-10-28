@@ -3861,11 +3861,9 @@ impl DataAccelerator for CayenneAccelerator {
             let metadata_db_path = format!("{metadata_dir}/cayenne.db");
 
             if open_option == OpenOption::OpenExisting && !path_exists(&metadata_db_path).await {
-                return Err(CheckpointError::Store {
-                    source: format!(
-                        "Cayenne metadata directory does not exist at {metadata_db_path}"
-                    )
-                    .into(),
+                return Err(CheckpointError::NotFound {
+                    store: "Cayenne metadata directory".to_string(),
+                    path: metadata_db_path,
                 });
             }
 

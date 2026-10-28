@@ -93,6 +93,11 @@ pub enum CheckpointError {
     Store {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    /// An existing store was asked for, and there is none: nothing was ever
+    /// written to it.
+    #[snafu(display("The checkpoint store does not exist: {store} was not found at {path}"))]
+    NotFound { store: String, path: String },
 }
 
 /// The **blob** checkpoint shape: a per-dataset store of one opaque `String` payload,

@@ -547,6 +547,30 @@ params:
     );
 }
 
+/// A value that holds a reference beside other text may hold a secret, so
+/// `SHOW CREATE` prints it only when the parameter is shown; a value that is
+/// a reference and nothing else is always printed.
+#[test]
+fn only_a_value_that_is_a_reference_is_printed_unshown() {
+    let dataset = dataset_from_yaml(
+        r#"
+from: postgres:public.orders
+name: orders
+params:
+  pg_connection_string: "${secrets:pg_host}/db?password=hunter2"
+  pg_pass: "${secrets:pg_pass}"
+"#,
+    );
+    assert_eq!(
+        create_statement(&dataset, &|_| false).expect("statement"),
+        "CREATE TABLE orders WITH (
+  from = 'postgres:public.orders',
+  pg_connection_string = '<redacted>',
+  pg_pass = '${secrets:pg_pass}'
+)"
+    );
+}
+
 /// Every parameters map is redacted the same way, at any depth: the
 /// accelerator's, a snapshot location's, and one inside a list printed as
 /// `JSON`. `shown` is given each entry's path in the component.
@@ -822,6 +846,35 @@ fn parameters_of_every_map_are_redacted_from_statement_text() {
         redact_secret_option_values(whole_map, &dialect, &shown),
         r#"ALTER TABLE o SET (acceleration.params = JSON '{"cayenne_s3_key":"<redacted>","cayenne_s3_region":"us-west-2"}')"#
     );
+    // A list's every element, a key that does not start with a field (a
+    // connector parameter named by the whole key), and a value that holds a
+    // reference beside other text.
+    for (option, recorded) in [
+        ("pg_pass = ARRAY['x', 'hunter2']", "pg_pass = '<redacted>'"),
+        (
+            "PARAMS.pg_pass = 'hunter2'",
+            "PARAMS.pg_pass = '<redacted>'",
+        ),
+        (
+            "pg_connection_string = '${secrets:pg_host}/db?password=hunter2'",
+            "pg_connection_string = '<redacted>'",
+        ),
+        (
+            "pg_pass = '${secrets:pg_pass}'",
+            "pg_pass = '${secrets:pg_pass}'",
+        ),
+    ] {
+        let sql = format!(
+            "CREATE TABLE o WITH (from = 'postgres:public.o', {option}, file_format = 'csv')"
+        );
+        assert_eq!(
+            redact_secret_option_values(&sql, &dialect, &shown),
+            format!(
+                "CREATE TABLE o WITH (from = 'postgres:public.o', {recorded}, file_format = 'csv')"
+            ),
+            "{option}"
+        );
+    }
     // A structured value with no parameters map is kept as written.
     let plain = r#"CREATE TABLE o WITH (from = 'file:o.csv', columns.body.embeddings = JSON '[{"from": "openai"}]')"#;
     assert!(matches!(

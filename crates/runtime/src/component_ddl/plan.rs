@@ -588,15 +588,6 @@ pub(crate) fn warn_shadowed(spicepod: &App, defined: &SqlDefinitions) {
     }
 }
 
-/// `app` without the SQL-defined components an earlier app carried over, as
-/// Spice Cloud Connect carries a catalog it cannot remove from the app it
-/// serves into the next: what remains is what the Spicepods declare.
-pub(crate) fn spicepod_part(mut app: App, defined: &SqlDefinitions) -> App {
-    app.datasets.retain(|ds| !defined.datasets.contains(ds));
-    app.catalogs.retain(|c| !defined.catalogs.contains(c));
-    app
-}
-
 #[cfg(test)]
 mod tests {
     use app::AppBuilder;
@@ -902,20 +893,31 @@ mod tests {
         );
     }
 
-    /// Spice Cloud Connect carries a catalog it cannot remove into the next app
-    /// it applies; a carried SQL-defined component is not a Spicepod one.
+    /// A Spicepod that declares a definition identical to one SQL made serves
+    /// its own: the SQL one is shadowed, and dropping it removes only the SQL
+    /// definition, retiring no data.
     #[test]
-    fn the_spicepod_part_of_an_app_excludes_carried_sql_components() {
+    fn an_identical_spicepod_definition_shadows_the_sql_one() {
         let spicepod = spicepod_with_dataset("orders");
         let defined = SqlDefinitions {
-            datasets: vec![dataset("customers")],
-            catalogs: vec![Catalog::new("iceberg".to_string(), "lake".to_string())],
+            datasets: vec![dataset("orders")],
+            ..SqlDefinitions::default()
         };
-        let served = serve(spicepod.clone(), &defined);
         assert_eq!(
-            served.datasets,
-            vec![dataset("orders"), dataset("customers")]
+            serve(spicepod.clone(), &defined).datasets,
+            vec![dataset("orders")]
         );
-        assert_eq!(spicepod_part(served, &defined), spicepod);
+        assert_eq!(shadowed_warnings(&spicepod, &defined).len(), 1);
+        let op = drop("orders", false);
+        let dropped = plan(&spicepod, &defined, &op).expect("drop the SQL definition");
+        assert!(dropped.definitions.datasets.is_empty());
+        assert_eq!(
+            retired_datasets(&spicepod, &defined, &dropped.definitions, Some(&op)),
+            Vec::<Dataset>::new()
+        );
+        assert_eq!(
+            serve(spicepod, &dropped.definitions).datasets,
+            vec![dataset("orders")]
+        );
     }
 }

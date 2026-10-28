@@ -43,14 +43,54 @@ impl Runtime {
         };
 
         let valid_catalogs = Arc::clone(&self).get_valid_catalogs(app, LogErrors(true));
-        let mut futures = vec![];
+        let mut loads = vec![];
         for catalog in &valid_catalogs {
             self.status
                 .update_catalog(&catalog.name, status::ComponentStatus::Initializing);
-            futures.push(Arc::clone(&self).load_catalog(catalog));
+            loads.push(self.start_catalog_load(catalog.clone(), false));
         }
 
-        let _ = join_all(futures).await;
+        // A load a later change stopped has nothing to report.
+        let _ = join_all(loads).await;
+    }
+
+    /// Load `catalog` on a task of its own, in place of any load of a catalog
+    /// of the same name still in progress, which is stopped: a load retries an
+    /// unreachable source without end, and one whose declaration has since
+    /// changed or gone must not register it later. `replaces` discards the
+    /// plans and results cached over the catalog once it is loaded.
+    fn start_catalog_load(
+        self: &Arc<Self>,
+        catalog: Catalog,
+        replaces: bool,
+    ) -> tokio::task::JoinHandle<()> {
+        let runtime = Arc::clone(self);
+        let name = catalog.name.clone();
+        let load = tokio::spawn(async move {
+            Arc::clone(&runtime).load_catalog(&catalog).await;
+            // A cached logical plan embeds the `TableSource` it was planned
+            // against, and so keeps reading through the provider the *previous*
+            // declaration built. Reloading a catalog registers a fresh provider
+            // under the same name, so every plan and result that resolved a
+            // table in it is now stale — the same reason dataset and view
+            // registration discard cached plans. Registering a catalog that was
+            // never registered before invalidates nothing: no cached plan can
+            // have resolved a table in it.
+            if replaces {
+                runtime.df.clear_cached_plans_and_results().await;
+            }
+        });
+        if let Some(previous) = self.catalog_loads.lock().insert(name, load.abort_handle()) {
+            previous.abort();
+        }
+        load
+    }
+
+    /// Stop the load of the catalog `name`, if it is still in progress.
+    fn stop_catalog_load(&self, name: &str) {
+        if let Some(load) = self.catalog_loads.lock().remove(name) {
+            load.abort();
+        }
     }
 
     async fn load_catalog(self: Arc<Self>, catalog: &Catalog) {
@@ -276,26 +316,9 @@ impl Runtime {
                     .update_catalog(&catalog.name, status::ComponentStatus::Initializing);
                 replaces
             };
-            let runtime = Arc::clone(&self);
-            let catalog = catalog.clone();
-            let name = catalog.name.clone();
             loads.push((
-                name,
-                tokio::spawn(async move {
-                    Arc::clone(&runtime).load_catalog(&catalog).await;
-                    // A cached logical plan embeds the `TableSource` it was planned
-                    // against, and so keeps reading through the provider the
-                    // *previous* declaration built. Reloading a catalog registers a
-                    // fresh provider under the same name, so every plan and result
-                    // that resolved a table in it is now stale — the same reason
-                    // dataset and view registration discard cached plans.
-                    // Registering a catalog that was never registered before
-                    // invalidates nothing: no cached plan can have resolved a table in
-                    // it.
-                    if replaces_a_registered_provider {
-                        runtime.df.clear_cached_plans_and_results().await;
-                    }
-                }),
+                catalog.name.clone(),
+                self.start_catalog_load(catalog.clone(), replaces_a_registered_provider),
             ));
         }
         let loading = futures::future::join_all(loads.iter_mut().map(|(_, load)| load));
@@ -320,6 +343,8 @@ impl Runtime {
             if new_app.catalogs.iter().any(|c| c.name == catalog.name) {
                 continue;
             }
+            // A load still retrying would register the catalog later.
+            self.stop_catalog_load(&catalog.name);
             // An accelerated catalog loads a dataset for each of its tables,
             // which removing the catalog does not unload yet.
             if catalog.acceleration.is_some() {
@@ -723,6 +748,41 @@ mod tests {
             valid.is_empty(),
             "an uncompilable include glob must make the declaration invalid for this test to mean anything"
         );
+    }
+
+    /// A catalog removed while its load still retries an unreachable source has that load
+    /// stopped, so the load cannot register the catalog after its removal.
+    #[tokio::test]
+    async fn removing_a_catalog_stops_its_load() {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let unreachable = app_with_catalog("iceberg:http://127.0.0.1:1/v1/namespaces");
+        let catalog = Arc::clone(&runtime)
+            .get_valid_catalogs(&unreachable, LogErrors(false))
+            .pop()
+            .expect("a valid catalog");
+        let load = runtime.start_catalog_load(catalog, false);
+        // Time for the first attempts to fail: the source refuses at once, and the load
+        // retries it without end.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !load.is_finished(),
+            "the load of an unreachable catalog keeps retrying"
+        );
+
+        Arc::clone(&runtime)
+            .apply_catalog_diff(
+                &unreachable,
+                &Arc::new(app::AppBuilder::new("catalog_reload").build()),
+            )
+            .await;
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(10), load)
+            .await
+            .expect("the load is stopped");
+        assert!(
+            stopped.is_err_and(|e| e.is_cancelled()),
+            "the load is cancelled, not finished"
+        );
+        assert!(!runtime.df.catalog_exists("reloaded"));
     }
 
     /// A reload whose declaration of a catalog fails to validate keeps the catalog loaded, as

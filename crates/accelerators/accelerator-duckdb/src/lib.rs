@@ -795,8 +795,9 @@ impl DataAccelerator for DuckDBAccelerator {
                     source: Box::new(source),
                 })?;
         if open_option == OpenOption::OpenExisting && !std::path::Path::new(&duckdb_file).exists() {
-            return Err(CheckpointError::Store {
-                source: format!("DuckDB file does not exist at {duckdb_file}").into(),
+            return Err(CheckpointError::NotFound {
+                store: "DuckDB file".to_string(),
+                path: duckdb_file,
             });
         }
 

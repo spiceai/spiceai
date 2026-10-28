@@ -772,6 +772,11 @@ pub struct Runtime {
 
     /// The datasets and catalogs defined with SQL.
     sql_components: Arc<component_ddl::SqlComponents>,
+
+    /// The load of each catalog, by name, while it may still be in progress:
+    /// a load retries an unreachable source without end, and is stopped when
+    /// its catalog is replaced or removed.
+    catalog_loads: parking_lot::Mutex<HashMap<String, tokio::task::AbortHandle>>,
 }
 
 impl Debug for Runtime {

@@ -638,6 +638,41 @@ mod tests {
         }
     }
 
+    /// An option key may be written dotted and unquoted in a Spice statement,
+    /// as in `CREATE TABLE ... WITH`: the statement is read after the keys are
+    /// quoted.
+    #[test]
+    fn spice_statements_read_unquoted_dotted_keys() {
+        let quoted = |sql: &str| {
+            datafusion_ddl::component_options::quote_dotted_option_keys(sql, &PostgreSqlDialect {})
+                .into_owned()
+        };
+        let Some(SpiceStatement::CreateCatalog { options, .. }) = parsed(&quoted(
+            "CREATE CATALOG lake WITH (from = 'iceberg', dataset_params.file_format = 'parquet')",
+        )) else {
+            panic!("CREATE CATALOG is a Spice statement");
+        };
+        let keys: Vec<String> = options_from_sql(&options)
+            .expect("options")
+            .into_iter()
+            .map(|option| option.key)
+            .collect();
+        assert_eq!(keys, vec!["from", "dataset_params.file_format"]);
+
+        assert_eq!(
+            parsed(&quoted(
+                "ALTER CATALOG lake SET (acceleration.enabled = true)"
+            )),
+            parsed("ALTER CATALOG lake SET (\"acceleration.enabled\" = true)")
+        );
+        let Some(SpiceStatement::ResetTable { keys, .. }) = parsed(&quoted(
+            "ALTER TABLE orders RESET (acceleration.refresh_check_interval, pg_host)",
+        )) else {
+            panic!("ALTER TABLE ... RESET is a Spice statement");
+        };
+        assert_eq!(keys, vec!["acceleration.refresh_check_interval", "pg_host"]);
+    }
+
     #[test]
     fn a_malformed_spice_statement_is_an_error() {
         let err =

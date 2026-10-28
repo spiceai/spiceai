@@ -614,8 +614,9 @@ impl DataAccelerator for TursoAccelerator {
                 source: Box::new(source),
             })?;
         if open_option == OpenOption::OpenExisting && !std::path::Path::new(&turso_file).exists() {
-            return Err(CheckpointError::Store {
-                source: format!("Turso file does not exist at {turso_file}").into(),
+            return Err(CheckpointError::NotFound {
+                store: "Turso file".to_string(),
+                path: turso_file,
             });
         }
 
