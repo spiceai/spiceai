@@ -35,7 +35,7 @@ runtime:
   auth:
     api-key:
       enabled: true
-      keys: [ro-key:ro, rw-key:rw]
+      keys: [ro-key, "rw-key:rw"]   # a bare key is read-only
 datasets: []
 ```
 
@@ -50,7 +50,7 @@ Start it on unused ports: `spiced --http 127.0.0.1:28090 --flight 127.0.0.1:2505
 | same with no `--tls-root-certificate-file` | same TLS error (the CA is not in the system roots) |
 | `--tls-root-certificate-file missing.pem` | `Could not load the TLS root certificate file 'missing.pem': ...` before any request |
 | `spice datasets ... ca.pem --api-key ro-key` | dataset table (empty is fine), exit 0 |
-| `spice refresh <dataset> ... wrongca.pem --api-key rw-key` | the TLS error, not `Is it running?` |
+| `spice refresh any_name ... wrongca.pem --api-key rw-key` | the TLS error, not `Is it running?` (fails at the handshake, so no dataset is needed) |
 | `spice status --http-endpoint https://127.0.0.1:1 --tls-root-certificate-file ca.pem` | still `The Spice runtime is unavailable ... Is it running?` (nothing listening) |
 
 Kill `spiced` and remove `$D` afterwards.
