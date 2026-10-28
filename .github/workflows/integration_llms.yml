@@ -322,4 +322,4 @@ jobs:
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
         run: |
-          cargo test -p llms-llamacpp --features metal --test integration -- model:: differential:: mtp:: hf_resolution:: unsupported::
+          cargo test -p llms-llamacpp --features metal --test integration -- model:: differential:: distributed:: mtp:: hf_resolution:: unsupported::

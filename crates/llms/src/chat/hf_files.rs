@@ -79,6 +79,59 @@ pub async fn download_model(
     hub: HubParams<'_>,
     name: &str,
 ) -> Result<Downloaded, DownloadError> {
+    let snapshot = open(model_id, hub, name).await?;
+    let gguf = resolve_gguf(&snapshot, files, budget, name, repo_of(model_id))?;
+    let paths: Vec<&str> = gguf.iter().map(String::as_str).collect();
+    let dir = download(&snapshot, &paths).await?;
+    Ok(Downloaded { dir, gguf })
+}
+
+/// What a model loads, resolved from the Hub without downloading the weights.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    /// The GGUF files the model loads, as [`Downloaded::gguf`]: empty for a model mistral.rs
+    /// loads from safetensors.
+    pub gguf: Vec<String>,
+    /// The architecture the first shard's header names; `None` when no header names one.
+    pub architecture: Option<String>,
+}
+
+/// The GGUF files the model `model_id` (`org/name[:revision]`) loads, resolved from `files` and
+/// `budget` as [`download_model`] resolves them, and the architecture their first shard's
+/// header names, both read from the Hub without downloading the weights. A node that holds a
+/// share of a model split across nodes decides from them which engine serves the model, as the
+/// node that downloads the weights does.
+///
+/// # Errors
+///
+/// Returns an error if the repository or revision cannot be read, `files` names something it
+/// lacks, no quantization fits, or a read fails.
+pub async fn model_architecture(
+    model_id: &str,
+    files: &[&str],
+    budget: Budget,
+    hub: HubParams<'_>,
+    name: &str,
+) -> Result<Resolved, DownloadError> {
+    let snapshot = open(model_id, hub, name).await?;
+    let gguf = resolve_gguf(&snapshot, files, budget, name, repo_of(model_id))?;
+    let paths: Vec<&str> = gguf.iter().map(String::as_str).collect();
+    let architecture = super::gguf_header::model_architecture(&paths, |file: &&str, len| {
+        let file = (*file).to_string();
+        let snapshot = &snapshot;
+        async move { snapshot.read_prefix(&file, len).await }
+    })
+    .await?;
+    Ok(Resolved { gguf, architecture })
+}
+
+/// The repository `model_id` (`org/name[:revision]`) names.
+fn repo_of(model_id: &str) -> &str {
+    model_id.split_once(':').map_or(model_id, |(repo, _)| repo)
+}
+
+/// Opens the model `model_id` (`org/name[:revision]`), named `name` in the Spicepod.
+async fn open(model_id: &str, hub: HubParams<'_>, name: &str) -> Result<Snapshot, DownloadError> {
     let requester = Requester {
         kind: "model",
         name: name.to_string(),
@@ -89,11 +142,7 @@ pub async fn download_model(
         Some((repo, revision)) => (repo, Some(revision).filter(|r| !r.is_empty())),
         None => (model_id, None),
     };
-    let snapshot = crate::hf::open_model(requester, repo, revision, hub).await?;
-    let gguf = resolve_gguf(&snapshot, files, budget, name, repo)?;
-    let paths: Vec<&str> = gguf.iter().map(String::as_str).collect();
-    let dir = download(&snapshot, &paths).await?;
-    Ok(Downloaded { dir, gguf })
+    crate::hf::open_model(requester, repo, revision, hub).await
 }
 
 /// The GGUF files a model loads from `snapshot`: those `files` resolve to, or with none named,

@@ -470,8 +470,9 @@ impl FlightClient {
 
             return Ok(FlightRecordBatchStream::new_from_flight_data(
                 response_stream
-                    .map_ok(conforming_map_entries)
-                    .map_err(|status| FlightError::Tonic(Box::new(status))),
+                    .map_err(|status| FlightError::Tonic(Box::new(status)))
+                    .and_then(|message| std::future::ready(within_decompression_bound(message)))
+                    .map_ok(conforming_map_entries),
             )
             .with_headers(md));
         }
@@ -508,8 +509,9 @@ impl FlightClient {
 
         Ok(FlightDataDecoder::new(
             response_stream
-                .map_ok(conforming_map_entries)
-                .map_err(|status| FlightError::Tonic(Box::new(status))),
+                .map_err(|status| FlightError::Tonic(Box::new(status)))
+                .and_then(|message| std::future::ready(within_decompression_bound(message)))
+                .map_ok(conforming_map_entries),
         ))
     }
 
@@ -688,6 +690,18 @@ pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
         }
         _ => false,
     }
+}
+
+/// Passes `message` through unless it is a compressed batch that declares too large a
+/// decompressed size for its body (see `arrow_tools::ipc::check_declared_decompressed_size`).
+///
+/// # Errors
+///
+/// Returns [`FlightError::DecodeError`] when the declared size is over the bound.
+pub fn within_decompression_bound(message: FlightData) -> Result<FlightData, FlightError> {
+    arrow_tools::ipc::check_declared_decompressed_size(&message.data_header, &message.data_body)
+        .map_err(FlightError::DecodeError)?;
+    Ok(message)
 }
 
 /// Returns `message` with a schema message that declares a `Map` whose `entries` field is
