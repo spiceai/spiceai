@@ -357,9 +357,11 @@ impl TaskHistoryExporter {
         let input: Arc<str> = Self::process_context_payload(
             &self.captured_context,
             task.as_ref(),
+            // The last value recorded: a query that fails to parse records
+            // its input again, fail-closed.
             span.attributes
                 .iter()
-                .position(|kv| kv.key.as_str() == "input")
+                .rposition(|kv| kv.key.as_str() == "input")
                 .map_or_else(
                     || "".into(),
                     |idx| span.attributes[idx].value.as_str().into(),

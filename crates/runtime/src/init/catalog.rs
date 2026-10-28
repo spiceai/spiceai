@@ -36,6 +36,13 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 /// it is applied without them.
 const CATALOG_LOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The load of a catalog, which a later change to the catalog stops.
+pub(crate) struct CatalogLoad {
+    task: tokio::task::AbortHandle,
+    /// Held by the load of the catalog that is running, stopped or not.
+    running: Arc<tokio::sync::Mutex<()>>,
+}
+
 impl Runtime {
     pub(crate) async fn load_catalogs(self: Arc<Self>) {
         let Some(ref app) = self.read_app().await else {
@@ -66,7 +73,21 @@ impl Runtime {
     ) -> tokio::task::JoinHandle<()> {
         let runtime = Arc::clone(self);
         let name = catalog.name.clone();
+        let mut loads = self.catalog_loads.lock();
+        // A stopped load ends at its next await, so one in the middle of
+        // registering its catalog still finishes that. Each load of a name
+        // holds the name's lock while it runs, so this one starts only once
+        // every earlier one has ended, and registers last.
+        let running = match loads.get(&name) {
+            Some(previous) => {
+                previous.task.abort();
+                Arc::clone(&previous.running)
+            }
+            None => Arc::default(),
+        };
+        let lock = Arc::clone(&running);
         let load = tokio::spawn(async move {
+            let _running = lock.lock_owned().await;
             Arc::clone(&runtime).load_catalog(&catalog).await;
             // A cached logical plan embeds the `TableSource` it was planned
             // against, and so keeps reading through the provider the *previous*
@@ -80,16 +101,23 @@ impl Runtime {
                 runtime.df.clear_cached_plans_and_results().await;
             }
         });
-        if let Some(previous) = self.catalog_loads.lock().insert(name, load.abort_handle()) {
-            previous.abort();
-        }
+        loads.insert(
+            name,
+            CatalogLoad {
+                task: load.abort_handle(),
+                running,
+            },
+        );
         load
     }
 
-    /// Stop the load of the catalog `name`, if it is still in progress.
-    fn stop_catalog_load(&self, name: &str) {
-        if let Some(load) = self.catalog_loads.lock().remove(name) {
-            load.abort();
+    /// Stop the load of the catalog `name`, and wait until no load of it can
+    /// register it any more.
+    async fn stop_catalog_load(&self, name: &str) {
+        let load = self.catalog_loads.lock().remove(name);
+        if let Some(load) = load {
+            load.task.abort();
+            let _ended = load.running.lock().await;
         }
     }
 
@@ -338,13 +366,15 @@ impl Runtime {
 
         // A catalog whose name the new app no longer declares is unloaded. One it still
         // declares, even in a declaration that fails to validate, stays loaded, as a dataset
-        // does: an edit with a mistake in it does not take the catalog away.
-        for catalog in &existing_catalogs {
+        // does: an edit with a mistake in it does not take the catalog away. So the catalogs
+        // to unload are read from every declaration of the current app, valid or not: one
+        // that stopped validating may still be loaded.
+        for catalog in &current_app.catalogs {
             if new_app.catalogs.iter().any(|c| c.name == catalog.name) {
                 continue;
             }
             // A load still retrying would register the catalog later.
-            self.stop_catalog_load(&catalog.name);
+            self.stop_catalog_load(&catalog.name).await;
             // An accelerated catalog loads a dataset for each of its tables,
             // which removing the catalog does not unload yet.
             if catalog.acceleration.is_some() {
@@ -355,10 +385,13 @@ impl Runtime {
                 continue;
             }
             match self.df.deregister_catalog(&catalog.name).await {
-                Ok(_) => {
+                Ok(unloaded) => {
                     self.status
                         .update_catalog(&catalog.name, status::ComponentStatus::Disabled);
-                    tracing::info!("Unloaded catalog '{}'", catalog.name);
+                    // A declaration that never validated loaded nothing.
+                    if unloaded {
+                        tracing::info!("Unloaded catalog '{}'", catalog.name);
+                    }
                 }
                 Err(e) => tracing::error!(
                     "Failed to unload catalog '{}', so its tables stay queryable until Spice restarts. Cause: {e}",
@@ -821,6 +854,44 @@ mod tests {
         assert!(
             !runtime.df.catalog_exists("reloaded"),
             "a catalog the app no longer declares is unloaded"
+        );
+    }
+
+    /// A catalog whose declaration stopped validating is still loaded, so the
+    /// change that then removes its declaration unloads it.
+    #[tokio::test]
+    async fn a_catalog_whose_declaration_stopped_validating_is_unloaded_when_removed() {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        runtime
+            .df
+            .register_catalog(
+                "reloaded",
+                &AccessMode::default(),
+                Arc::new(datafusion::catalog::MemoryCatalogProvider::new()),
+            )
+            .await
+            .expect("registers");
+        let invalid = app_with_invalid_catalog("not_a_real_catalog_connector:loaded");
+        Arc::clone(&runtime)
+            .apply_catalog_diff(
+                &app_with_catalog("not_a_real_catalog_connector:loaded"),
+                &invalid,
+            )
+            .await;
+        assert!(
+            runtime.df.catalog_exists("reloaded"),
+            "an edit that fails to validate leaves the catalog loaded"
+        );
+
+        Arc::clone(&runtime)
+            .apply_catalog_diff(
+                &invalid,
+                &Arc::new(app::AppBuilder::new("catalog_reload").build()),
+            )
+            .await;
+        assert!(
+            !runtime.df.catalog_exists("reloaded"),
+            "removing the declaration that stopped validating unloads the catalog"
         );
     }
 }

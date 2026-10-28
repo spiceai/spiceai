@@ -436,11 +436,12 @@ impl DataAccelerator for SqliteAccelerator {
                 .map_err(|source| CheckpointError::Store {
                     source: Box::new(source),
                 })?;
-        if open_option == OpenOption::OpenExisting && !std::path::Path::new(&sqlite_file).exists() {
-            return Err(CheckpointError::NotFound {
-                store: "SQLite file".to_string(),
-                path: sqlite_file,
-            });
+        if open_option == OpenOption::OpenExisting {
+            CheckpointError::require_existing(
+                "SQLite file",
+                &sqlite_file,
+                std::path::Path::new(&sqlite_file).try_exists(),
+            )?;
         }
 
         let pool = self

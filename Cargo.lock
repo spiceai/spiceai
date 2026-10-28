@@ -18830,6 +18830,7 @@ dependencies = [
  "cache",
  "chrono",
  "datafusion",
+ "datafusion-ddl",
  "fundu",
  "futures",
  "globset",

@@ -62,10 +62,13 @@ impl SqlDefinitions {
     }
 }
 
+/// A failure of the definitions store, written as the clause a message about
+/// the statement or the instance it stops goes on to explain.
 #[derive(Debug, Snafu)]
 pub(crate) enum Error {
     #[snafu(display(
-        "Failed to open the store of SQL-defined datasets and catalogs at '{location}': {source}"
+        "the store of the datasets and catalogs defined with SQL at '{location}' could not be opened. Cause: {}",
+        root_cause(source.as_ref())
     ))]
     Open {
         location: String,
@@ -74,7 +77,8 @@ pub(crate) enum Error {
     },
 
     #[snafu(display(
-        "Failed to read the SQL-defined datasets and catalogs from '{location}': {source}. Check that Spice can read the location."
+        "the datasets and catalogs defined with SQL could not be read from '{location}'. Cause: {}",
+        root_cause(source.as_ref())
     ))]
     Read {
         location: String,
@@ -83,7 +87,8 @@ pub(crate) enum Error {
     },
 
     #[snafu(display(
-        "Failed to save the SQL-defined datasets and catalogs to '{location}': {source}. The statement was not applied; check that Spice can write to the location, then run it again."
+        "the datasets and catalogs defined with SQL could not be saved to '{location}'; check that Spice can write to it, then run the statement again. Cause: {}",
+        root_cause(source.as_ref())
     ))]
     Write {
         location: String,
@@ -91,9 +96,40 @@ pub(crate) enum Error {
     },
 
     #[snafu(display(
-        "The SQL-defined datasets and catalogs at '{location}' changed while this statement ran, so it was not applied. Run it again."
+        "the datasets and catalogs defined with SQL at '{location}' changed while this statement ran. Run it again."
     ))]
     Conflict { location: String },
+}
+
+impl Error {
+    /// Where the definitions are kept.
+    pub fn location(&self) -> &str {
+        match self {
+            Self::Open { location, .. }
+            | Self::Read { location, .. }
+            | Self::Write { location, .. }
+            | Self::Conflict { location } => location,
+        }
+    }
+
+    /// What failed, without the layers that passed it on.
+    pub fn cause(&self) -> String {
+        match self {
+            Self::Open { source, .. } => root_cause(source.as_ref()),
+            Self::Read { source, .. } | Self::Write { source, .. } => root_cause(source.as_ref()),
+            Self::Conflict { .. } => "another instance changed them".to_string(),
+        }
+    }
+}
+
+/// The innermost error of `error`'s chain: what failed, without the layers
+/// that passed it on, such as `Object store operation 'get' failed`.
+fn root_cause(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut cause = error;
+    while let Some(source) = cause.source() {
+        cause = source;
+    }
+    cause.to_string()
 }
 
 pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
@@ -150,6 +186,9 @@ impl DefinitionsStore {
             Some(check) => check.guard(StateFeature::SqlDefinitions, store),
             None => store,
         };
+        if !guarded {
+            restrict_instance_folder(&state.location, &prefix).await;
+        }
         let location = format!(
             "{}/{prefix}/{DEFINITIONS_KEY}.json",
             state.location.trim_end_matches('/')
@@ -233,6 +272,36 @@ impl std::fmt::Display for StoredChanged {
 }
 
 impl std::error::Error for StoredChanged {}
+
+/// Make the definitions' folder in the instance directory readable by its owner
+/// only: the definitions keep their parameters as written, which can be
+/// credentials. A `runtime.state` location, which instances may share, keeps
+/// the permissions its operator gave it.
+#[cfg(unix)]
+async fn restrict_instance_folder(location: &str, prefix: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(base) = url::Url::parse(location)
+        .ok()
+        .filter(|url| url.scheme() == "file")
+        .and_then(|url| url.to_file_path().ok())
+    else {
+        return;
+    };
+    let folder = base.join(prefix);
+    let restricted = async {
+        tokio::fs::create_dir_all(&folder).await?;
+        tokio::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).await
+    };
+    if let Err(e) = restricted.await {
+        tracing::warn!(
+            "Failed to make '{}' readable by its owner only, so other users of this machine may read the datasets and catalogs defined with SQL there, and any credential written in them. Cause: {e}",
+            folder.display()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+async fn restrict_instance_folder(_location: &str, _prefix: &str) {}
 
 /// A `file://` URL for the instance directory.
 fn instance_dir_url(instance_dir: &Path) -> String {

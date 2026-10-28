@@ -28,7 +28,7 @@ use datafusion::common::{ResolvedTableReference, TableReference};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion_ddl::component_ddl::{ComponentDdlOp, OptionsChange};
 use datafusion_ddl::component_options::{
-    ConnectorParameters, component_with_options, component_without_options,
+    ComponentKind, ConnectorParameters, component_with_options, component_without_options,
 };
 use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
@@ -459,16 +459,53 @@ pub(crate) fn retired_datasets(
         .collect()
 }
 
+/// Whether `after` defines the component `op` names differently from
+/// `before`: whether a change another instance made between the two is to
+/// that component, and not only to others.
+pub(crate) fn changes_component(
+    op: &ComponentDdlOp,
+    before: &SqlDefinitions,
+    after: &SqlDefinitions,
+) -> bool {
+    let name = op.component_name();
+    match op.kind() {
+        ComponentKind::Dataset => {
+            let find = |defined: &SqlDefinitions| {
+                defined
+                    .datasets
+                    .iter()
+                    .find(|dataset| same_dataset(&dataset.name, name))
+                    .cloned()
+            };
+            find(before) != find(after)
+        }
+        ComponentKind::Catalog => {
+            let find = |defined: &SqlDefinitions| {
+                defined
+                    .catalogs
+                    .iter()
+                    .find(|catalog| catalog.name == name)
+                    .cloned()
+            };
+            find(before) != find(after)
+        }
+    }
+}
+
 /// How many components `defined` holds, for a message: `2 datasets and 1
-/// catalog`.
+/// catalog`, `1 catalog`. A kind it holds none of is left out.
 pub(crate) fn component_counts(defined: &SqlDefinitions) -> String {
     let count =
         |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-    format!(
-        "{} and {}",
-        count(defined.datasets.len(), "dataset", "datasets"),
-        count(defined.catalogs.len(), "catalog", "catalogs")
-    )
+    match (defined.datasets.len(), defined.catalogs.len()) {
+        (datasets, 0) => count(datasets, "dataset", "datasets"),
+        (0, catalogs) => count(catalogs, "catalog", "catalogs"),
+        (datasets, catalogs) => format!(
+            "{} and {}",
+            count(datasets, "dataset", "datasets"),
+            count(catalogs, "catalog", "catalogs")
+        ),
+    }
 }
 
 /// What changed from `known` to `stored`, for a message: each component that
@@ -889,8 +926,46 @@ mod tests {
                 datasets: vec![dataset("orders")],
                 ..SqlDefinitions::default()
             }),
-            "1 dataset and 0 catalogs"
+            "1 dataset"
         );
+        assert_eq!(
+            component_counts(&SqlDefinitions {
+                catalogs: vec![Catalog::new("iceberg".to_string(), "lake".to_string())],
+                ..SqlDefinitions::default()
+            }),
+            "1 catalog"
+        );
+    }
+
+    /// A conflict is retried only when the other change left the statement's
+    /// own component as it was planned against.
+    #[test]
+    fn only_a_change_to_the_statements_component_stops_it() {
+        let op = ComponentDdlOp::DropDataset {
+            name: "public.orders".to_string(),
+            if_exists: false,
+        };
+        let before = SqlDefinitions {
+            datasets: vec![dataset("orders"), dataset("customers")],
+            ..SqlDefinitions::default()
+        };
+        let other_changed = SqlDefinitions {
+            datasets: vec![dataset("orders")],
+            catalogs: vec![Catalog::new("iceberg".to_string(), "lake".to_string())],
+        };
+        assert!(!changes_component(&op, &before, &other_changed));
+        let mut changed = dataset("orders");
+        changed.description = Some("changed".to_string());
+        let own_changed = SqlDefinitions {
+            datasets: vec![changed, dataset("customers")],
+            ..SqlDefinitions::default()
+        };
+        assert!(changes_component(&op, &before, &own_changed));
+        let own_dropped = SqlDefinitions {
+            datasets: vec![dataset("customers")],
+            ..SqlDefinitions::default()
+        };
+        assert!(changes_component(&op, &before, &own_dropped));
     }
 
     /// A Spicepod that declares a definition identical to one SQL made serves

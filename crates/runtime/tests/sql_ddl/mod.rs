@@ -449,3 +449,46 @@ async fn a_redefined_dataset_never_serves_the_data_its_name_held_before() {
         })
         .await;
 }
+
+/// `CREATE TABLE` returns once the dataset is registered, so a query right
+/// after it finds the table: an accelerated dataset answers with its rows, or,
+/// while its acceleration loads, says so. It is never missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_accelerated_dataset_is_registered_when_its_statement_returns() {
+    test_request_context()
+        .scope(async {
+            let fixture = Fixture::new();
+            let rt = start(&fixture).await;
+            for round in 0..10 {
+                let name = format!("accelerated_{round}");
+                assert_eq!(
+                    message(
+                        &rt,
+                        &format!(
+                            "CREATE TABLE {name} WITH (from = 'file:{}', file_format = 'csv', \
+                             \"acceleration.engine\" = 'cayenne', \"acceleration.mode\" = 'file')",
+                            fixture.orders_csv.display()
+                        )
+                    )
+                    .await,
+                    format!("Created dataset '{name}'.")
+                );
+                match run(&rt, &format!("SELECT count(*) AS n FROM {name}")).await {
+                    Ok(batches) => assert_eq!(
+                        arrow::util::pretty::pretty_format_batches(&batches)
+                            .expect("format batches")
+                            .to_string(),
+                        "+---+\n| n |\n+---+\n| 3 |\n+---+",
+                        "{name}"
+                    ),
+                    Err(e) => assert!(
+                        e.contains(&format!(
+                            "Acceleration not ready; loading initial data for {name}"
+                        )),
+                        "{name}: {e}"
+                    ),
+                }
+            }
+        })
+        .await;
+}

@@ -792,11 +792,12 @@ fn secret_option_values_are_redacted_from_statement_text() {
             "{value}"
         );
     }
-    // After a comment, and under EXPLAIN, which records the statement's text
-    // without running it.
+    // After a comment, which is taken out, as one that held an old value
+    // would be, and under EXPLAIN, which records the statement's text without
+    // running it.
     for (prefix, kept) in [
-        ("-- add the orders\n", "-- add the orders\n"),
-        ("/* add the orders */ ", "/* add the orders */ "),
+        ("-- add the orders\n", "\n"),
+        ("/* add the orders */ ", "  "),
         ("EXPLAIN ", "EXPLAIN "),
     ] {
         let sql = format!(
@@ -883,6 +884,194 @@ fn parameters_of_every_map_are_redacted_from_statement_text() {
     ));
 }
 
+/// However a statement that defines a component is written -- behind
+/// comments the parser reads, mistyped, cut short, or after another statement
+/// -- its recorded text holds no value that is not known to be safe to show.
+#[test]
+fn a_statement_records_no_secret_however_it_is_written() {
+    let dialect = PostgreSqlDialect {};
+    let shown = |name: &str| {
+        matches!(
+            name,
+            "pg_host" | "pg_port" | "pg_db" | "file_format" | "s3_vectors_bucket"
+        )
+    };
+    let pg = "from = 'postgres:public.t', pg_host = '127.0.0.1', pg_port = 1, pg_db = 'd'";
+    for (sql, recorded) in [
+        // Comments end where the parser ends them.
+        (
+            format!("/*a/*b*/c*/ CREATE TABLE p1 WITH ({pg}, pg_pass = 'hunter2')"),
+            format!("  CREATE TABLE p1 WITH ({pg}, pg_pass = '<redacted>')"),
+        ),
+        (
+            format!("--comment\rCREATE TABLE p2 WITH ({pg}, pg_pass = 'hunter2')"),
+            format!("\rCREATE TABLE p2 WITH ({pg}, pg_pass = '<redacted>')"),
+        ),
+        // Text that does not tokenize is not recorded.
+        (
+            format!("CREATE TABLE p3 WITH ({pg}, pg_pass = 'hunter2') '"),
+            UNREADABLE_STATEMENT.to_string(),
+        ),
+        // `${key}` is not a reference the runtime resolves, so it is a value.
+        (
+            "CREATE TABLE p4 WITH (from = 'file:o.csv', acceleration.params.cayenne_s3_secret = '${hunter2}')".to_string(),
+            "CREATE TABLE p4 WITH (from = 'file:o.csv', acceleration.params.cayenne_s3_secret = '<redacted>')".to_string(),
+        ),
+        // Each element of a list, as an element's parameters maps.
+        (
+            r#"CREATE TABLE p5 WITH (from = 'file:o.csv', "columns.name.embeddings" = ARRAY[JSON '{"from": "m", "params": {"s3_vectors_aws_secret_access_key": "hunter2", "s3_vectors_bucket": "v"}}'])"#.to_string(),
+            r#"CREATE TABLE p5 WITH (from = 'file:o.csv', "columns.name.embeddings" = ARRAY[JSON '{"from":"m","params":{"s3_vectors_aws_secret_access_key":"<redacted>","s3_vectors_bucket":"v"}}'])"#.to_string(),
+        ),
+        // A parameter is named by all of the key after its map.
+        (
+            r#"CREATE TABLE p6 WITH (from = 'file:o.csv', "params.custom.file_format" = 'hunter2')"#.to_string(),
+            r#"CREATE TABLE p6 WITH (from = 'file:o.csv', "params.custom.file_format" = '<redacted>')"#.to_string(),
+        ),
+        // Mistyped: no `=`, no parentheses, a value of two literals.
+        (
+            format!("CREATE TABLE p7 WITH ({pg}, pg_pass 'hunter2')"),
+            format!("CREATE TABLE p7 WITH ({pg}, pg_pass '<redacted>')"),
+        ),
+        (
+            "CREATE TABLE p8 WITH pg_pass = 'hunter2'".to_string(),
+            "CREATE TABLE p8 WITH '<redacted>'".to_string(),
+        ),
+        (
+            "CREATE TABLE p9 WITH (from = 'file:o.csv', description = 'a' 'hunter2')".to_string(),
+            "CREATE TABLE p9 WITH (from = 'file:o.csv', description = '<redacted>')".to_string(),
+        ),
+        // After another statement.
+        (
+            format!("SELECT 1; CREATE TABLE p10 WITH ({pg}, pg_pass = 'hunter2')"),
+            format!("SELECT 1; CREATE TABLE p10 WITH ({pg}, pg_pass = '<redacted>')"),
+        ),
+        // Outside an option list: a word that is a value, and every literal.
+        (
+            "CREATE TABLE p11 (pg_pass = hunter2) WITH (from = 'file:o.csv')".to_string(),
+            "CREATE TABLE p11 (pg_pass = '<redacted>') WITH (from = 'file:o.csv')".to_string(),
+        ),
+        (
+            "CREATE TABLE p12 (id INT COMMENT 'hunter2') WITH (from = 'file:o.csv')".to_string(),
+            "CREATE TABLE p12 (id INT COMMENT '<redacted>') WITH (from = 'file:o.csv')".to_string(),
+        ),
+        // A commented-out option.
+        (
+            "CREATE TABLE p13 WITH (\n  from = 'file:o.csv',\n  -- pg_pass = 'hunter2',\n  file_format = 'csv'\n)".to_string(),
+            "CREATE TABLE p13 WITH (\n  from = 'file:o.csv',\n  \n  file_format = 'csv'\n)".to_string(),
+        ),
+    ] {
+        let recorded_text = redact_secret_option_values(&sql, &dialect, &shown);
+        assert_eq!(recorded_text, recorded, "{sql}");
+        assert!(!recorded_text.contains("hunter2"), "{sql}");
+        // A caller keeps the text it sent when the recorded text is borrowed.
+        assert!(matches!(recorded_text, Cow::Owned(_)), "{sql}");
+    }
+
+    // Text that cannot define a component is kept as written, including text
+    // that only looks like a definition.
+    for sql in [
+        "SELECT 'hunter2'",
+        "SELECT created_at FROM t WHERE altered = 'hunter2'",
+        "SELECT 'CREATE TABLE t WITH (pg_pass = ''hunter2'')'",
+        "DROP TABLE t",
+    ] {
+        assert!(
+            matches!(
+                redact_secret_option_values(sql, &dialect, &shown),
+                Cow::Borrowed(_)
+            ),
+            "{sql}"
+        );
+    }
+}
+
+/// An error a statement fails with is recorded without the values its text
+/// had taken out: the parser quotes the token it stopped at.
+#[test]
+fn values_taken_out_of_the_text_are_taken_out_of_its_error() {
+    let dialect = PostgreSqlDialect {};
+    let shown = |name: &str| name == "pg_host";
+    let recorded = recorded_statement(
+        "CREATE TABLE t WITH (from = 'postgres:public.t', pg_host = 'db', pg_user = 'ab', pg_pass 'hunter2')",
+        &dialect,
+        &shown,
+    );
+    assert_eq!(
+        recorded.text,
+        "CREATE TABLE t WITH (from = 'postgres:public.t', pg_host = 'db', pg_user = '<redacted>', pg_pass '<redacted>')"
+    );
+    assert_eq!(
+        redact_values(
+            r#"SQL error: ParserError("Expected: =, found: 'hunter2' at Line: 1, Column: 85")"#,
+            &recorded.removed
+        ),
+        r#"SQL error: ParserError("Expected: =, found: <redacted> at Line: 1, Column: 85")"#
+    );
+    // A short value goes only as it was written, quotes included, so it does
+    // not take other text with it.
+    assert_eq!(
+        redact_values(
+            "role 'ab' denied: ab hunter2 db",
+            &recorded.removed
+        ),
+        "role <redacted> denied: ab <redacted> db"
+    );
+    assert!(matches!(
+        redact_values("Dataset 't' cannot be loaded", &recorded.removed),
+        Cow::Borrowed(_)
+    ));
+}
+
+/// A value is a reference exactly when the runtime resolves it as one:
+/// `${ store:key }` and nothing else.
+#[test]
+fn only_a_value_the_runtime_resolves_is_a_reference() {
+    for value in [
+        "${secrets:pg_pass}",
+        "${ secrets:pg_pass }",
+        "${env:PG-PASS}",
+        " ${ secrets : pg_pass } ",
+        "${\tsecrets:pg_pass\n}",
+    ] {
+        assert!(is_secret_reference(value), "{value:?}");
+    }
+    for value in [
+        "${hunter2}",
+        "${secrets:pg_pass} and more",
+        "x${secrets:pg_pass}",
+        "${secrets:pg:pass}",
+        "${secrets:}",
+        "${:pg_pass}",
+        "${1secrets:pg_pass}",
+        "${secrets:pg_pass}}",
+        "$${secrets:pg_pass}",
+        "{secrets:pg_pass}",
+        "${secrets.pg_pass}",
+        "${secrets:pg pass}",
+        "",
+    ] {
+        assert!(!is_secret_reference(value), "{value:?}");
+    }
+
+    // SHOW CREATE prints a value that only looks like a reference as the
+    // secret it may be.
+    let dataset = dataset_from_yaml(
+        "
+from: postgres:public.orders
+name: orders
+params:
+  pg_pass: ${hunter2}
+",
+    );
+    assert_eq!(
+        create_statement(&dataset, &|_| false).expect("statement"),
+        "CREATE TABLE orders WITH (
+  from = 'postgres:public.orders',
+  pg_pass = '<redacted>'
+)"
+    );
+}
+
 #[test]
 fn the_first_word_skips_whitespace_and_comments() {
     assert_eq!(first_word("  CREATE TABLE t"), "CREATE");
@@ -891,6 +1080,12 @@ fn the_first_word_skips_whitespace_and_comments() {
     assert_eq!(first_word("-- only a comment"), "");
     assert_eq!(first_word("/* unterminated"), "");
     assert_eq!(first_word("(SELECT 1)"), "");
+    // As PostgreSQL reads them: a carriage return ends a line comment, and
+    // block comments nest.
+    assert_eq!(first_word("--one\rCREATE TABLE t"), "CREATE");
+    assert_eq!(first_word("/*a/*b*/c*/ CREATE TABLE t"), "CREATE");
+    assert_eq!(first_word("/*/ a */ALTER TABLE t"), "ALTER");
+    assert_eq!(first_word("/*a/*b*/ CREATE TABLE t"), "");
 }
 
 fn spicepod_files(dir: &Path, files: &mut Vec<PathBuf>) {

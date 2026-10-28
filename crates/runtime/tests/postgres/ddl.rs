@@ -28,7 +28,10 @@ use futures::TryStreamExt;
 use runtime::Runtime;
 
 use crate::postgres::common::{self, PG_PASSWORD};
-use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
+use crate::utils::{
+    init_tracing_with_task_history, register_test_connectors, runtime_ready_check,
+    test_request_context,
+};
 
 async fn start(instance_dir: &Path) -> Arc<Runtime> {
     register_test_connectors().await;
@@ -44,6 +47,24 @@ async fn start(instance_dir: &Path) -> Arc<Runtime> {
         .expect("components load within two minutes");
     runtime_ready_check(&rt).await;
     rt
+}
+
+/// `sql`'s answer read from the source, never from the results cache: what a
+/// write through another dataset over the same table changed.
+async fn run_uncached(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, String> {
+    let result = rt
+        .datafusion()
+        .query_builder(sql)
+        .results_cache_mode(runtime::datafusion::query::ResultsCacheMode::Bypass)
+        .build()
+        .run()
+        .await
+        .map_err(|e| e.to_string())?;
+    result
+        .data
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 async fn run(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, String> {
@@ -150,6 +171,8 @@ async fn sql_defined_postgres_dataset_and_catalog_serve_what_postgres_serves() {
             let dir = tempfile::tempdir().expect("temp dir");
             let instance_dir = dir.path().join(".spice");
             let rt = start(&instance_dir).await;
+            // Task history records the statements only through this tracing.
+            let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
             let connection = format!(
                 "pg_host = 'localhost', pg_port = {port}, pg_user = 'postgres', pg_pass = '{PG_PASSWORD}', pg_db = 'postgres', pg_sslmode = 'disable'"
             );
@@ -162,7 +185,7 @@ async fn sql_defined_postgres_dataset_and_catalog_serve_what_postgres_serves() {
                 .await,
                 "Created dataset 'orders'."
             );
-            let select = "SELECT CAST(id AS TEXT), name, CAST(amount AS TEXT) FROM orders ORDER BY id";
+            let select = "SELECT CAST(id AS TEXT) AS id_text, name, CAST(amount AS TEXT) AS amount_text FROM orders ORDER BY id";
             assert_eq!(rows(&run(&rt, select).await.expect("select")), oracle);
 
             assert_eq!(
@@ -173,29 +196,36 @@ async fn sql_defined_postgres_dataset_and_catalog_serve_what_postgres_serves() {
                 .await,
                 "Created catalog 'pg'."
             );
-            let catalog_select = "SELECT CAST(id AS TEXT), name, CAST(amount AS TEXT) FROM pg.public.orders ORDER BY id";
+            let catalog_select = "SELECT CAST(id AS TEXT) AS id_text, name, CAST(amount AS TEXT) AS amount_text FROM pg.public.orders ORDER BY id";
             assert_eq!(rows(&run(&rt, catalog_select).await.expect("select")), oracle);
 
             // The password is shown nowhere: not by SHOW CREATE, not in task history.
             let shown = message(&rt, "SHOW CREATE TABLE orders").await;
             assert!(shown.contains("pg_pass = '<redacted>'"), "{shown}");
             assert!(!shown.contains(PG_PASSWORD), "{shown}");
+            let _ = trace_provider.force_flush();
             let mut recorded = Vec::new();
+            let mut last_error = None;
             for _ in 0..100 {
-                recorded = rows(
-                    &run(
-                        &rt,
-                        "SELECT input FROM runtime.task_history WHERE input LIKE 'CREATE %' ORDER BY start_time",
-                    )
-                    .await
-                    .unwrap_or_default(),
-                );
+                match run(
+                    &rt,
+                    "SELECT input FROM runtime.task_history WHERE input LIKE 'CREATE %' ORDER BY start_time",
+                )
+                .await
+                {
+                    Ok(batches) => recorded = rows(&batches),
+                    Err(e) => last_error = Some(e),
+                }
                 if recorded.len() >= 2 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            assert_eq!(recorded.len(), 2, "both statements are recorded: {recorded:?}");
+            assert_eq!(
+                recorded.len(),
+                2,
+                "both statements are recorded: {recorded:?}, last error: {last_error:?}"
+            );
             for row in &recorded {
                 assert!(row[0].contains("pg_pass = '<redacted>'"), "{row:?}");
                 assert!(!row[0].contains(PG_PASSWORD), "{row:?}");
@@ -231,7 +261,10 @@ async fn sql_defined_postgres_dataset_and_catalog_serve_what_postgres_serves() {
                 "SELECT id::text, name, amount::text FROM public.orders ORDER BY id",
             )
             .await;
-            assert_eq!(rows(&run(&rt, select).await.expect("select")), oracle);
+            assert_eq!(
+                rows(&run_uncached(&rt, select).await.expect("select")),
+                oracle
+            );
 
             assert_eq!(message(&rt, "DROP CATALOG pg").await, "Dropped catalog 'pg'.");
             let err = run(&rt, catalog_select).await.expect_err("dropped catalog");

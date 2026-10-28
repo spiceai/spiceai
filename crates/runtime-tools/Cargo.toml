@@ -20,6 +20,7 @@ bytes = { workspace = true, optional = true }
 cache = { path = "../cache" }
 chrono.workspace = true
 datafusion.workspace = true
+datafusion-ddl = { path = "../datafusion-ddl" }
 fundu.workspace = true
 futures.workspace = true
 itertools.workspace = true

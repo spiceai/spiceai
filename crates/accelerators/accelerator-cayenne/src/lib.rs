@@ -3860,11 +3860,12 @@ impl DataAccelerator for CayenneAccelerator {
             let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
             let metadata_db_path = format!("{metadata_dir}/cayenne.db");
 
-            if open_option == OpenOption::OpenExisting && !path_exists(&metadata_db_path).await {
-                return Err(CheckpointError::NotFound {
-                    store: "Cayenne metadata directory".to_string(),
-                    path: metadata_db_path,
-                });
+            if open_option == OpenOption::OpenExisting {
+                CheckpointError::require_existing(
+                    "Cayenne metadata directory",
+                    &metadata_db_path,
+                    tokio::fs::try_exists(&metadata_db_path).await,
+                )?;
             }
 
             if let Some(parent) = std::path::Path::new(&metadata_db_path).parent() {

@@ -15,6 +15,10 @@ limitations under the License.
 */
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
+use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+use datafusion_ddl::component_options::{
+    UNREADABLE_STATEMENT, recorded_statement, redact_values,
+};
 use std::{borrow::Cow, sync::Arc};
 
 use crate::builtin::function_tool::current_principal_allows_write;
@@ -40,7 +44,7 @@ pub struct SqlToolParams {
 /// (e.g. the request is authenticated with a `:rw`-tagged API key); the
 /// strict read-only validator is still applied for `ReadOnly` / anonymous
 /// callers and for any deployment that hasn't configured `runtime.auth`.
-const DEFAULT_DESCRIPTION: &str = "Execute an SQL query in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions) against the Spice runtime and return the result rows as JSON. Use this for any deterministic lookup, aggregation, or filter where exact column names are known; prefer `search` for semantic or natural-language lookups. Quote identifiers containing capitals or reserved keywords, and quote each part of `catalog.schema.table` separately (e.g. \"spice\".\"public\".\"my_table\"). Avoid `SELECT *` and columns ending in `_offset` or `_embedding`. Write statements (INSERT/UPDATE/DELETE/DDL) require the request to be authenticated with a ReadWrite API key AND the target dataset to be configured `access: read_write`; otherwise they are rejected. Use `list_datasets` and `table_schema` first to discover tables and columns.";
+const DEFAULT_DESCRIPTION: &str = "Execute an SQL query in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions) against the Spice runtime and return the result rows as JSON. Use this for any deterministic lookup, aggregation, or filter where exact column names are known; prefer `search` for semantic or natural-language lookups. Quote identifiers containing capitals or reserved keywords, and quote each part of `catalog.schema.table` separately (e.g. \"spice\".\"public\".\"my_table\"). Avoid `SELECT *` and columns ending in `_offset` or `_embedding`. Write statements (INSERT/UPDATE/DELETE, and DDL in a catalog configured `access: read_write_create`) require the request to be authenticated with a ReadWrite API key AND the target to be writable, such as a dataset configured `access: read_write`; defining, changing, or dropping a dataset or catalog (`CREATE TABLE ... WITH (from = ...)`, `CREATE CATALOG`, and `ALTER` or `DROP` of one) requires an admin API key; otherwise they are rejected. Use `list_datasets` and `table_schema` first to discover tables and columns.";
 
 pub struct SqlTool {
     name: String,
@@ -82,7 +86,8 @@ impl SpiceModelTool for SqlTool {
     }
 
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name().to_string(), input = arg);
+        let (input, removed) = recorded_input(arg);
+        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name().to_string(), input = %input);
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let SqlToolParams { query } = serde_json::from_str(arg)?;
 
@@ -117,9 +122,68 @@ impl SpiceModelTool for SqlTool {
                 Ok(value)
             }
             Err(e) => {
-                tracing::error!(target: "task_history", parent: &span, "{e}");
+                let message = e.to_string();
+                let message = redact_values(&message, &removed);
+                tracing::error!(target: "task_history", parent: &span, "{message}");
                 Err(e)
             }
         }
+    }
+}
+
+/// The tool's arguments as task history records them, and the values that
+/// takes out: the statement they carry recorded as the query it runs is, but
+/// with every parameter's value redacted, since the tool cannot tell which are
+/// non-secret. Arguments that are not the tool's JSON are not recorded when
+/// they could carry a definition.
+fn recorded_input(arg: &str) -> (Cow<'_, str>, Vec<String>) {
+    if let Ok(SqlToolParams { query }) = serde_json::from_str::<SqlToolParams>(arg) {
+        let recorded = recorded_statement(&query, &PostgreSqlDialect {}, &|_| false);
+        return match recorded.text {
+            Cow::Borrowed(_) => (Cow::Borrowed(arg), Vec::new()),
+            Cow::Owned(text) => (
+                Cow::Owned(serde_json::json!({ "query": text }).to_string()),
+                recorded.removed,
+            ),
+        };
+    }
+    let lowercase = arg.to_ascii_lowercase();
+    if lowercase.contains("create") || lowercase.contains("alter") {
+        (Cow::Borrowed(UNREADABLE_STATEMENT), Vec::new())
+    } else {
+        (Cow::Borrowed(arg), Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The query a tool call carries is recorded without its credentials, as
+    /// the statement it runs is.
+    #[test]
+    fn a_tool_call_records_its_statement_without_credentials() {
+        let (input, removed) = recorded_input(
+            r#"{"query": "CREATE TABLE t WITH (from = 'postgres:public.t', pg_host = 'db', pg_pass = 'hunter2')"}"#,
+        );
+        assert_eq!(
+            input,
+            r#"{"query":"CREATE TABLE t WITH (from = 'postgres:public.t', pg_host = '<redacted>', pg_pass = '<redacted>')"}"#
+        );
+        assert!(removed.iter().any(|value| value == "hunter2"), "{removed:?}");
+        assert_eq!(
+            redact_values("password for 'hunter2' refused", &removed),
+            "password for <redacted> refused"
+        );
+
+        let query = r#"{"query": "SELECT * FROM t WHERE name = 'a'"}"#;
+        assert!(matches!(recorded_input(query).0, Cow::Borrowed(text) if text == query));
+
+        // Not the tool's arguments, and possibly a definition: not recorded.
+        assert_eq!(
+            recorded_input("CREATE TABLE t WITH (pg_pass = 'hunter2')").0,
+            UNREADABLE_STATEMENT
+        );
+        assert_eq!(recorded_input("not json").0, "not json");
     }
 }

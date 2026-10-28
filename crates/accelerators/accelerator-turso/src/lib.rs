@@ -613,11 +613,12 @@ impl DataAccelerator for TursoAccelerator {
             .map_err(|source| CheckpointError::Store {
                 source: Box::new(source),
             })?;
-        if open_option == OpenOption::OpenExisting && !std::path::Path::new(&turso_file).exists() {
-            return Err(CheckpointError::NotFound {
-                store: "Turso file".to_string(),
-                path: turso_file,
-            });
+        if open_option == OpenOption::OpenExisting {
+            CheckpointError::require_existing(
+                "Turso file",
+                &turso_file,
+                std::path::Path::new(&turso_file).try_exists(),
+            )?;
         }
 
         let pool = self

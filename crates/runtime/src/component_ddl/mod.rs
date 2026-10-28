@@ -59,6 +59,7 @@ use crate::Runtime;
 use crate::component::catalog::CatalogBuilder;
 use crate::component::dataset::builder::DatasetBuilder;
 use crate::dataconnector::get_connector_factory;
+use crate::status::ComponentStatus;
 use plan::{Component, Planned, display_dataset_name};
 
 /// How long a statement waits for the dataset it created or changed to
@@ -66,9 +67,23 @@ use plan::{Component, Planned, display_dataset_name};
 /// loading, and the statement says so.
 const REGISTRATION_WAIT: Duration = Duration::from_secs(30);
 
+/// How often a statement checks that the dataset it is waiting for is in the
+/// catalog, once its load has started registering it.
+const REGISTRATION_POLL: Duration = Duration::from_millis(5);
+
+/// How many times a statement is planned when another instance keeps changing
+/// the definitions under it: a change to other components does not stop the
+/// statement, which is planned again against it, as an Iceberg commit retries.
+const CONFLICT_ATTEMPTS: usize = 4;
+
 /// How long validating a new definition may take, which includes reaching its
 /// source.
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The status that holds the runtime not ready, as `ready_state: on_load`
+/// reads readiness, until the SQL definitions are read: until then, none of
+/// the datasets and catalogs they define is served.
+const SQL_DEFINITIONS_STATUS: &str = "sql_definitions:definitions";
 
 /// How often the SQL definitions are read again: while they could not be read,
 /// and, from a store other instances share, to serve the changes they make.
@@ -88,6 +103,9 @@ pub(crate) struct SqlComponents {
     /// added: what decides which components SQL may change.
     spicepod: RwLock<Option<Arc<App>>>,
     store: OnceCell<Arc<DefinitionsStore>>,
+    /// Where the definitions are kept and why they could not be read, while
+    /// they could not be: what a statement they refuse says.
+    unread: parking_lot::Mutex<Option<(String, String)>>,
     /// The instance directory, where the definitions are kept when
     /// `runtime.state.location` is unset.
     instance_dir: PathBuf,
@@ -107,6 +125,7 @@ impl SqlComponents {
             defined: RwLock::new(None),
             spicepod: RwLock::new(None),
             store: OnceCell::new(),
+            unread: parking_lot::Mutex::new(None),
             instance_dir,
         }
     }
@@ -189,14 +208,52 @@ impl ComponentDdlHandler for RuntimeComponentDdl {
 
     async fn apply(&self, op: ComponentDdlOp) -> DFResult<String> {
         let runtime = self.runtime()?;
+        let statement = format!("{} {}", op.label(), op.component_name());
+        // What a record any API key reads leaves out of the statement's error.
+        let values = statement_values(&op);
+        // The statement's record in task history, which is written when the
+        // last handle to it is dropped.
+        let record = tracing::Span::current();
+        let (reply, outcome) = tokio::sync::oneshot::channel();
         // On a task of its own: a change takes several steps that must all
         // run, and a statement that is dropped, as by a client that
-        // disconnects or a query timeout, must not stop it partway.
-        tokio::spawn(runtime.apply_component_ddl(op))
-            .await
-            .map_err(|e| {
-                DataFusionError::Execution(format!("The statement did not finish. Cause: {e}"))
-            })?
+        // disconnects or a query timeout, must not stop it partway. Its record
+        // stays open until the change is done, so it holds the change's real
+        // duration and outcome.
+        tokio::spawn(async move {
+            let result = runtime.apply_component_ddl(op).await;
+            if let Err(unsent) = reply.send(result) {
+                match unsent {
+                    Ok(message) => tracing::info!(
+                        "`{statement}` finished after its client disconnected: {message}"
+                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            "`{statement}` failed after its client disconnected, so it was not applied. Cause: {e}"
+                        );
+                        // Any API key reads task history: the cause is recorded
+                        // without the values of the statement it may repeat.
+                        let cause = e.to_string();
+                        let cause =
+                            datafusion_ddl::component_options::redact_values(&cause, &values);
+                        tracing::error!(
+                            target: "task_history",
+                            parent: &record,
+                            "`{statement}` failed after its client disconnected, so it was not applied. Cause: {cause}"
+                        );
+                    }
+                }
+                // A record ends when it is last exited, which the statement's
+                // client did when it left: exited now, it ends with the change.
+                drop(record.enter());
+            }
+            drop(record);
+        });
+        outcome.await.map_err(|_| {
+            DataFusionError::Execution(
+                "The statement stopped before it finished; the Spice log says why.".to_string(),
+            )
+        })?
     }
 
     async fn create_statement(&self, kind: ComponentKind, name: &str) -> DFResult<Option<String>> {
@@ -514,12 +571,24 @@ impl Runtime {
     /// runtime did not see, until a retry every
     /// [`SQL_DEFINITIONS_CHECK_INTERVAL`] reads them.
     pub(crate) async fn load_sql_definitions(self: &Arc<Self>) {
+        self.status
+            .update_component_status(SQL_DEFINITIONS_STATUS, ComponentStatus::Initializing);
         let (store, reported) = match self.read_sql_definitions(false).await {
-            Ok(store) if !store.is_shared() => return,
-            Ok(store) => (Some(store), None),
-            Err(cause) => {
-                tracing::error!("{}", self.unread_definitions_message(&cause).await);
-                (None, Some(cause))
+            Ok(store) => {
+                self.status
+                    .update_component_status(SQL_DEFINITIONS_STATUS, ComponentStatus::Ready);
+                if !store.is_shared() {
+                    return;
+                }
+                (Some(store), None)
+            }
+            Err(e) => {
+                tracing::error!("{}", self.unread_definitions_message(&e).await);
+                self.status.update_component_status(
+                    SQL_DEFINITIONS_STATUS,
+                    ComponentStatus::Error(Some(e.to_string())),
+                );
+                (None, Some(e.to_string()))
             }
         };
         let runtime = Arc::downgrade(self);
@@ -539,12 +608,22 @@ impl Runtime {
     async fn read_sql_definitions(
         self: &Arc<Self>,
         late: bool,
-    ) -> Result<Arc<DefinitionsStore>, String> {
-        let store = self
-            .sql_definitions_store()
-            .await
-            .map_err(|e| e.to_string())?;
-        let defined = store.load().await.map_err(|e| e.to_string())?;
+    ) -> Result<Arc<DefinitionsStore>, store::Error> {
+        let read = async {
+            let store = self.sql_definitions_store().await?;
+            let defined = store.load().await?;
+            Ok::<_, store::Error>((store, defined))
+        };
+        let (store, defined) = match read.await {
+            Ok(read) => {
+                *self.sql_components.unread.lock() = None;
+                read
+            }
+            Err(e) => {
+                *self.sql_components.unread.lock() = Some((e.location().to_string(), e.cause()));
+                return Err(e);
+            }
+        };
         // Serialized with every other change to the served app.
         let serialized = self.apply_app_lock.lock().await;
         let served = self.read_app().await;
@@ -572,7 +651,7 @@ impl Runtime {
     }
 
     /// The error a failed read of the SQL definitions logs.
-    async fn unread_definitions_message(&self, cause: &str) -> String {
+    async fn unread_definitions_message(&self, e: &store::Error) -> String {
         let shared = self
             .read_app()
             .await
@@ -583,8 +662,10 @@ impl Runtime {
             "Check that Spice can read its instance directory."
         };
         format!(
-            "Failed to read the datasets and catalogs defined with SQL, so none is served and defining one with SQL is refused; Spice retries every {} seconds. {check} Cause: {cause} See {RUNTIME_STATE_DOCS}",
-            SQL_DEFINITIONS_CHECK_INTERVAL.as_secs()
+            "Failed to read the datasets and catalogs defined with SQL from '{}', so none is served and defining one with SQL is refused; Spice retries every {} seconds. {check} See {RUNTIME_STATE_DOCS} Cause: {}",
+            e.location(),
+            SQL_DEFINITIONS_CHECK_INTERVAL.as_secs(),
+            e.cause()
         )
     }
 
@@ -613,16 +694,24 @@ impl Runtime {
                             "Read the datasets and catalogs defined with SQL from {}, and serving them.",
                             read.location()
                         );
+                        runtime
+                            .status
+                            .update_component_status(SQL_DEFINITIONS_STATUS, ComponentStatus::Ready);
                         if !read.is_shared() {
                             return;
                         }
                         store = Some(read);
                         reported = None;
                     }
-                    Err(cause) => {
+                    Err(e) => {
                         // Reported once until it changes.
+                        let cause = e.to_string();
                         if reported.as_deref() != Some(cause.as_str()) {
-                            tracing::error!("{}", runtime.unread_definitions_message(&cause).await);
+                            tracing::error!("{}", runtime.unread_definitions_message(&e).await);
+                            runtime.status.update_component_status(
+                                SQL_DEFINITIONS_STATUS,
+                                ComponentStatus::Error(Some(cause.clone())),
+                            );
                         }
                         reported = Some(cause);
                     }
@@ -630,14 +719,28 @@ impl Runtime {
                 continue;
             };
             // Compared without the lock first: a change is rare, and a statement
-            // or a Spicepod reload should not wait on every check. A failed read
-            // takes the locked path, which reports it.
-            let unchanged = match (shared.load().await, runtime.sql_components.defined().await) {
-                (_, None) => return,
-                (Ok(stored), Some(known)) => stored == known,
-                (Err(_), Some(_)) => false,
+            // or a Spicepod reload should not wait on every check.
+            let stored = match shared.load().await {
+                Ok(stored) => stored,
+                Err(e) => {
+                    // Reported once until it changes or a read succeeds.
+                    let cause = e.to_string();
+                    if reported.as_deref() != Some(cause.as_str()) {
+                        tracing::warn!(
+                            "Failed to read the datasets and catalogs defined with SQL from '{}', so this instance keeps serving the ones it read before; Spice retries every {} seconds. Cause: {}",
+                            e.location(),
+                            SQL_DEFINITIONS_CHECK_INTERVAL.as_secs(),
+                            e.cause()
+                        );
+                    }
+                    reported = Some(cause);
+                    continue;
+                }
             };
-            if unchanged {
+            let Some(known) = runtime.sql_components.defined().await else {
+                return;
+            };
+            if stored == known {
                 reported = None;
                 continue;
             }
@@ -731,6 +834,20 @@ impl Runtime {
         Arc::clone(self)
             .apply_app_diff(Some(served), Arc::clone(&without_app))
             .await;
+        // A dataset whose unload failed, as when its pending changes could not
+        // be drained, is still served from its acceleration data.
+        if let Some(dataset) = retired.iter().find(|dataset| {
+            self.df
+                .table_exists(&datafusion::common::TableReference::parse_str(&dataset.name))
+        }) {
+            Arc::clone(self)
+                .apply_app_diff(Some(&without_app), Arc::clone(served))
+                .await;
+            return Err(format!(
+                "dataset {} could not be unloaded, so it is still served, with its acceleration data. Run the statement again; the Spice log says why the unload failed.",
+                display_dataset_name(&dataset.name)
+            ));
+        }
         for dataset in retired {
             if let Err(e) = Arc::clone(self)
                 .delete_acceleration_data(dataset, served)
@@ -785,130 +902,156 @@ impl Runtime {
                 op.kind().noun()
             )));
         }
+        let not_applied = |cause: &dyn std::fmt::Display| {
+            DataFusionError::Execution(format!(
+                "{} {} was not applied: {cause}",
+                op.label(),
+                op.component_name()
+            ))
+        };
         let store = self
             .sql_definitions_store()
             .await
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            .map_err(|e| not_applied(&e))?;
 
         let serialized = self.apply_app_lock.lock().await;
-        let Some(known) = self.sql_components.defined().await else {
-            return Err(DataFusionError::Execution(format!(
-                "{} was not applied: the datasets and catalogs defined with SQL could not be read from {}. Spice retries every {} seconds, and its log reports why it fails; run the statement again once they are read.",
-                op.label(),
-                store.location(),
-                SQL_DEFINITIONS_CHECK_INTERVAL.as_secs()
-            )));
-        };
-        // Another instance that shares the state location may have changed
-        // the definitions since this one read them: the statement is planned
-        // against what is stored, served first.
-        let defined = self
-            .serve_stored_definitions(&store, known)
-            .await
-            .map_err(|cause| {
-                DataFusionError::Execution(format!("{} was not applied: {cause}", op.label()))
-            })?;
-        let served = self
-            .read_app()
-            .await
-            .unwrap_or_else(|| Arc::new(AppBuilder::new("spice").build()));
-        let spicepod = self
-            .sql_components
-            .spicepod
-            .read()
-            .await
-            .clone()
-            // Unset only before the SQL definitions are read, when the app
-            // served holds none of them.
-            .unwrap_or_else(|| Arc::clone(&served));
-        let parameters = Self::altered_connector_parameters(&op, &defined).await;
-        let Planned {
-            definitions,
-            message,
-            validate,
-        } = plan::plan(
-            &spicepod,
-            &defined,
-            &op,
-            parameters.as_ref().map(|p| p as &dyn ConnectorParameters),
-        )?;
-        let definitions = definitions.as_stored().map_err(|e| {
-            DataFusionError::Execution(format!(
-                "{} was not applied: its definition could not be stored. Cause: {e}",
-                op.label()
-            ))
-        })?;
-        if definitions == defined {
-            return Ok(message);
-        }
-
-        let next = Arc::new(plan::serve((*spicepod).clone(), &definitions));
-        if let Some(component) = &validate {
-            tokio::time::timeout(
-                VALIDATION_TIMEOUT,
-                Arc::clone(&self).validate_component(component, &next),
-            )
-            .await
-            .map_err(|_| {
-                DataFusionError::Execution(format!(
-                    "{} was not applied: validating it did not finish within {} seconds. Check that its source is reachable, then run it again.",
-                    op.label(),
-                    VALIDATION_TIMEOUT.as_secs()
-                ))
-            })??;
-        }
-
-        // A dataset this statement drops, replaces, or points at another source
-        // stops serving and loses its acceleration data before the change is
-        // stored, so no definition ever loads data another one put there.
-        let retired = plan::retired_datasets(&spicepod, &defined, &definitions, Some(&op));
-        if !retired.is_empty() {
-            // Checked again just before data is deleted: a change another
-            // instance stored since is refused here, before anything is deleted,
-            // rather than by the write below, after.
-            let stored = store
-                .load()
+        let mut attempt = 0;
+        let (message, validate) = loop {
+            attempt += 1;
+            let Some(known) = self.sql_components.defined().await else {
+                let unread = self.sql_components.unread.lock().clone();
+                let (location, cause) =
+                    unread.unwrap_or_else(|| (store.location().to_string(), "unknown".to_string()));
+                return Err(not_applied(&format!(
+                    "the datasets and catalogs defined with SQL could not be read from '{location}'. Cause: {cause}"
+                )));
+            };
+            // Another instance that shares the state location may have changed
+            // the definitions since this one read them: the statement is
+            // planned against what is stored, served first.
+            let defined = self
+                .serve_stored_definitions(&store, known)
                 .await
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            if stored != defined {
-                return Err(DataFusionError::Execution(
-                    store::Error::Conflict {
-                        location: store.location().to_string(),
-                    }
-                    .to_string(),
-                ));
-            }
-        }
-        let applied = self
-            .retire(&spicepod, &served, &definitions, &retired)
-            .await
-            .map_err(|cause| {
-                DataFusionError::Execution(format!("{} was not applied: {cause}", op.label()))
+                .map_err(|cause| not_applied(&cause))?;
+            let served = self
+                .read_app()
+                .await
+                .unwrap_or_else(|| Arc::new(AppBuilder::new("spice").build()));
+            let spicepod = self
+                .sql_components
+                .spicepod
+                .read()
+                .await
+                .clone()
+                // Unset only before the SQL definitions are read, when the app
+                // served holds none of them.
+                .unwrap_or_else(|| Arc::clone(&served));
+            let parameters = Self::altered_connector_parameters(&op, &defined).await;
+            let Planned {
+                definitions,
+                message,
+                validate,
+            } = plan::plan(
+                &spicepod,
+                &defined,
+                &op,
+                parameters.as_ref().map(|p| p as &dyn ConnectorParameters),
+            )?;
+            let definitions = definitions.as_stored().map_err(|e| {
+                not_applied(&format!("its definition could not be stored. Cause: {e}"))
             })?;
-
-        if let Err(e) = store.replace(&defined, &definitions).await {
-            if retired.is_empty() {
-                return Err(DataFusionError::Execution(e.to_string()));
+            if definitions == defined {
+                return Ok(message);
             }
-            Arc::clone(&self)
-                .apply_app_diff(Some(&applied), Arc::clone(&served))
-                .await;
-            let names: Vec<String> = retired
-                .iter()
-                .map(|dataset| display_dataset_name(&dataset.name))
-                .collect();
-            return Err(DataFusionError::Execution(format!(
-                "{e} The acceleration data of {} {} was deleted before the change could be stored, so it is loaded again from the source.",
-                if names.len() == 1 {
-                    "dataset"
-                } else {
-                    "datasets"
-                },
-                names.join(", ")
-            )));
-        }
-        *self.sql_components.defined.write().await = Some(definitions);
-        Arc::clone(&self).apply_app_diff(Some(&applied), next).await;
+
+            let next = Arc::new(plan::serve((*spicepod).clone(), &definitions));
+            if let Some(component) = &validate {
+                tokio::time::timeout(
+                    VALIDATION_TIMEOUT,
+                    Arc::clone(&self).validate_component(component, &next),
+                )
+                .await
+                .map_err(|_| {
+                    not_applied(&format!(
+                        "validating it did not finish within {} seconds. Check that its source is reachable, then run it again.",
+                        VALIDATION_TIMEOUT.as_secs()
+                    ))
+                })??;
+            }
+
+            // A dataset this statement drops, replaces, or points at another
+            // source stops serving and loses its acceleration data before the
+            // change is stored, so no definition ever loads data another one put
+            // there.
+            let retired = plan::retired_datasets(&spicepod, &defined, &definitions, Some(&op));
+            if !retired.is_empty() {
+                // Checked again just before data is deleted: a change another
+                // instance stored since is found here, before anything is
+                // deleted, rather than by the write below, after.
+                let stored = store.load().await.map_err(|e| not_applied(&e))?;
+                if stored != defined {
+                    if plan::changes_component(&op, &defined, &stored) {
+                        return Err(not_applied(&changed_by_another(&op)));
+                    }
+                    if attempt < CONFLICT_ATTEMPTS {
+                        continue;
+                    }
+                    return Err(not_applied(&store::Error::Conflict {
+                        location: store.location().to_string(),
+                    }));
+                }
+            }
+            let applied = self
+                .retire(&spicepod, &served, &definitions, &retired)
+                .await
+                .map_err(|cause| not_applied(&cause))?;
+
+            match store.replace(&defined, &definitions).await {
+                Ok(()) => {
+                    *self.sql_components.defined.write().await = Some(definitions);
+                    Arc::clone(&self).apply_app_diff(Some(&applied), next).await;
+                    break (message, validate);
+                }
+                Err(e) => {
+                    // What this statement retired is served again, from its source.
+                    if !retired.is_empty() {
+                        Arc::clone(&self)
+                            .apply_app_diff(Some(&applied), Arc::clone(&served))
+                            .await;
+                    }
+                    // A change another instance made to other components does
+                    // not stop this one: it is planned again against it. One
+                    // to this statement's own component does.
+                    let mut cause = e.to_string();
+                    if matches!(e, store::Error::Conflict { .. })
+                        && let Ok(stored) = store.load().await
+                    {
+                        if plan::changes_component(&op, &defined, &stored) {
+                            cause = changed_by_another(&op);
+                        } else if attempt < CONFLICT_ATTEMPTS {
+                            continue;
+                        }
+                    }
+                    if retired.is_empty() {
+                        return Err(not_applied(&cause));
+                    }
+                    let names: Vec<String> = retired
+                        .iter()
+                        .map(|dataset| display_dataset_name(&dataset.name))
+                        .collect();
+                    return Err(not_applied(&format!(
+                        "{}. The acceleration data of {} {} was deleted before the change could be stored, so it is loaded again from the source.",
+                        cause.trim_end_matches('.'),
+                        if names.len() == 1 {
+                            "dataset"
+                        } else {
+                            "datasets"
+                        },
+                        names.join(", ")
+                    )));
+                }
+            }
+        };
         drop(serialized);
 
         let message = match op {
@@ -1145,10 +1288,10 @@ impl Runtime {
     /// loading in the background.
     fn catalog_outcome(&self, catalog: &str, message: String) -> String {
         match self.status.get_catalog_statuses().get(catalog) {
-            Some(crate::status::ComponentStatus::Error(_)) => {
+            Some(ComponentStatus::Error(_)) => {
                 format!("{message} It failed to load and is retrying; the Spice log reports why.")
             }
-            Some(crate::status::ComponentStatus::Initializing) => {
+            Some(ComponentStatus::Initializing) => {
                 format!("{message} It is still loading.")
             }
             _ => message,
@@ -1182,20 +1325,78 @@ impl Runtime {
     async fn await_registration(&self, dataset: &Dataset, message: String) -> String {
         // The name the runtime registers the dataset, and its status, under.
         let reference = datafusion::common::TableReference::parse_str(&dataset.name);
-        let registered = tokio::time::timeout(
-            REGISTRATION_WAIT,
-            self.status.wait_for_dataset_registered(&reference),
-        )
+        let failed = || {
+            matches!(
+                self.status.get_dataset_status(&reference),
+                Some(ComponentStatus::Error(_))
+            )
+        };
+        let registered = tokio::time::timeout(REGISTRATION_WAIT, async {
+            if matches!(
+                self.status.wait_for_dataset_registered(&reference).await,
+                crate::status::WaitOutcome::ShuttingDown
+            ) {
+                return;
+            }
+            // The status leaves `Initializing` as the load starts to register
+            // the dataset, before its table is in the catalog: an accelerated
+            // table is opened first, so a query in between would not find it.
+            while !self.df.table_exists(&reference) && !failed() {
+                tokio::time::sleep(REGISTRATION_POLL).await;
+            }
+        })
         .await;
         match (registered, self.status.get_dataset_status(&reference)) {
-            (Ok(_), Some(crate::status::ComponentStatus::Error(_))) => format!(
+            (Ok(()), Some(ComponentStatus::Error(_))) => format!(
                 "{message} It failed to load and is retrying; GET /v1/datasets?status=true reports why."
             ),
-            (Ok(_), _) => message,
+            (Ok(()), _) => message,
             (Err(_), _) => format!(
                 "{message} It is still loading; GET /v1/datasets?status=true reports its progress."
             ),
         }
+    }
+}
+
+/// Why a statement was not applied when another instance changed its own
+/// dataset or catalog while it ran, and how to see that change.
+fn changed_by_another(op: &ComponentDdlOp) -> String {
+    let name = op.component_name();
+    let (noun, object) = match op.kind() {
+        ComponentKind::Dataset => ("dataset", "TABLE"),
+        ComponentKind::Catalog => ("catalog", "CATALOG"),
+    };
+    format!(
+        "another instance changed {noun} '{name}' while this statement ran. Run `SHOW CREATE {object} {name}` to see the change, then run the statement again if it still applies."
+    )
+}
+
+/// The values of `op`'s definition that a record any API key reads leaves out
+/// of the statement's error: every parameter's, and every value an `ALTER`
+/// sets.
+fn statement_values(op: &ComponentDdlOp) -> Vec<String> {
+    match op {
+        ComponentDdlOp::CreateDataset { dataset, .. } => {
+            datafusion_ddl::component_options::parameter_values(dataset.as_ref())
+        }
+        ComponentDdlOp::CreateCatalog { catalog, .. } => {
+            datafusion_ddl::component_options::parameter_values(catalog.as_ref())
+        }
+        ComponentDdlOp::AlterDataset {
+            change: OptionsChange::Set(options),
+            ..
+        }
+        | ComponentDdlOp::AlterCatalog {
+            change: OptionsChange::Set(options),
+            ..
+        } => options
+            .iter()
+            .filter_map(|option| match &option.value {
+                OptionValue::String(value) if value.chars().count() >= 4 => Some(value.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -1305,5 +1506,53 @@ mod tests {
                 .as_deref(),
             Some("localhost.evil.example")
         );
+    }
+
+    /// `SHOW CREATE` and the recorded text print a value unredacted only when
+    /// it is a reference and nothing else, so the check must agree with the
+    /// lexer the secret resolver reads references with: a value it would not
+    /// resolve is used as written, and may be the secret.
+    #[test]
+    fn a_reference_is_what_the_secret_resolver_reads_as_one() {
+        for value in [
+            "${secrets:pg_pass}",
+            "${ secrets:pg_pass }",
+            "${ secrets : pg_pass }",
+            "${\tenv:PG-PASS\n}",
+            "${env:pg_pass_2}",
+            "${hunter2}",
+            "${secrets:pg:pass}",
+            "${secrets:}",
+            "${:pg_pass}",
+            "${1secrets:pg_pass}",
+            "${secrets:pg_pass}}",
+            "${secrets:pg_pass} and more",
+            "x${secrets:pg_pass}",
+            "${secrets:a}${secrets:b}",
+            "${secrets.pg_pass}",
+            "${secrets:pg pass}",
+            "${secrets:_pass}",
+            "{secrets:pg_pass}",
+            "",
+        ] {
+            let references: Vec<_> = runtime_secrets::iter_secret_references(value).collect();
+            // A reference and nothing else: the value, without the whitespace
+            // the lexer skips, is exactly the one reference it reads.
+            let resolved_whole = match references.as_slice() {
+                [reference] => {
+                    let compact: String = value
+                        .chars()
+                        .filter(|c| !matches!(c, ' ' | '\t' | '\n' | '\x0C'))
+                        .collect();
+                    compact == format!("${{{}:{}}}", reference.store, reference.key)
+                }
+                _ => false,
+            };
+            assert_eq!(
+                datafusion_ddl::component_options::is_secret_reference(value),
+                resolved_whole,
+                "{value:?}"
+            );
+        }
     }
 }

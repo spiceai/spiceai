@@ -277,6 +277,9 @@ pub(super) enum QueryRuntimeBinding {
 pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
     sql: QueryMethod,
+    /// The SQL as task history and the list of running queries record it,
+    /// when the query has SQL: see [`DataFusion::recorded_statement`].
+    recorded_text: Option<Arc<str>>,
     tracker: Option<QueryTracker>,
     #[expect(
         clippy::struct_field_names,
@@ -402,16 +405,6 @@ impl Drop for QueryTimeoutTimerGuard {
     }
 }
 
-/// `sql` as the list of active queries shows it, and as task history records
-/// it: SQL that defines a component has the literal values of its secret
-/// parameters redacted.
-fn recorded_text(df: &DataFusion, sql: &Arc<str>) -> Arc<str> {
-    match df.recorded_statement_text(sql) {
-        std::borrow::Cow::Borrowed(_) => Arc::clone(sql),
-        std::borrow::Cow::Owned(redacted) => Arc::from(redacted),
-    }
-}
-
 impl Query {
     fn ensure_not_cancelled(
         token: &tokio_util::sync::CancellationToken,
@@ -463,10 +456,7 @@ impl Query {
             }
             _ => (QueryTimeoutState::default(), None),
         };
-        let sql_preview: Arc<str> = match &self.sql {
-            QueryMethod::Text { sql, .. } => recorded_text(&self.df, sql),
-            QueryMethod::Plan(_) => Arc::from("<logical plan>"),
-        };
+        let sql_preview = Self::sql_preview(self.recorded_text.as_ref());
         let active_query_guard = self.df.query_cancel_registry().register(
             self.query_id,
             sql_preview.as_ref(),
@@ -483,13 +473,20 @@ impl Query {
         }
     }
 
-    /// The query as task history records it: SQL that defines a component has
-    /// the literal values of its secret parameters redacted.
+    /// The query as task history records it: SQL that may define a component
+    /// has every value that may be a secret taken out.
     fn recorded_input(&self) -> std::borrow::Cow<'_, str> {
-        match &self.sql {
-            QueryMethod::Text { sql, .. } => self.df.recorded_statement_text(sql),
-            QueryMethod::Plan(_) => std::borrow::Cow::Owned(self.sql.to_string()),
+        match &self.recorded_text {
+            Some(text) => std::borrow::Cow::Borrowed(text),
+            None => std::borrow::Cow::Owned(self.sql.to_string()),
         }
+    }
+
+    /// The query as the list of running queries shows it, given its
+    /// `recorded_text`: a function of the field alone, so it can be read after
+    /// other fields have moved out of the query.
+    fn sql_preview(recorded_text: Option<&Arc<str>>) -> Arc<str> {
+        recorded_text.map_or_else(|| Arc::from("<logical plan>"), Arc::clone)
     }
 
     fn query_spans(&self, request_context: &RequestContext) -> QuerySpans {
@@ -926,10 +923,7 @@ impl Query {
         let tracker = self.tracker;
         let results_cache_mode = self.results_cache_mode;
         let query_start = std::time::Instant::now();
-        let sql_preview: Arc<str> = match &self.sql {
-            QueryMethod::Text { sql, .. } => recorded_text(&self.df, sql),
-            QueryMethod::Plan(_) => Arc::from("<logical plan>"),
-        };
+        let sql_preview = Self::sql_preview(self.recorded_text.as_ref());
 
         // Create session for this job. The
         // `SpiceRequestContextConfig` extension propagates the originating
@@ -1364,10 +1358,7 @@ impl Query {
 
         // Registered in `run` before the results-cache probe. The SQL preview
         // is owned here before moving `self.sql` into the planning match.
-        let sql_preview: Arc<str> = match &self.sql {
-            QueryMethod::Text { sql, .. } => recorded_text(&self.df, sql),
-            QueryMethod::Plan(_) => Arc::from("<logical plan>"),
-        };
+        let sql_preview = Self::sql_preview(self.recorded_text.as_ref());
         let skip_query_admission = matches!(
             self.runtime_binding,
             QueryRuntimeBinding::CurrentRuntimeUngated | QueryRuntimeBinding::QueryRuntimeUngated
@@ -2051,6 +2042,7 @@ impl Query {
         Self {
             df: Arc::clone(df),
             sql: QueryMethod::Plan(Box::new(plan)),
+            recorded_text: None,
             tracker: None,
             query_id: builder::new_query_id(),
             cancellation_token: None,
@@ -5858,6 +5850,8 @@ mod tests {
             query_duration_timer: tokio::time::Instant::now(),
             query_execution_duration_timer: tokio::time::Instant::now(),
             datasets: Arc::new(HashSet::new()),
+            redacted_values: Arc::from(Vec::new()),
+            sql: None,
         };
         let mut result = assemble_cached_query_result(
             QueryResult::new(
@@ -5919,6 +5913,8 @@ mod tests {
             query_duration_timer: tokio::time::Instant::now(),
             query_execution_duration_timer: tokio::time::Instant::now(),
             datasets: Arc::new(HashSet::new()),
+            redacted_values: Arc::from(Vec::new()),
+            sql: None,
         };
         let result = assemble_cached_query_result(
             QueryResult::from_cached_raw(
@@ -5987,6 +5983,8 @@ mod tests {
             query_duration_timer: tokio::time::Instant::now(),
             query_execution_duration_timer: tokio::time::Instant::now(),
             datasets: Arc::new(HashSet::new()),
+            redacted_values: Arc::from(Vec::new()),
+            sql: None,
         };
         let mut result = assemble_cached_query_result(
             QueryResult::from_cached_raw(

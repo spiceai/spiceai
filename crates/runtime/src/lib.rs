@@ -776,7 +776,7 @@ pub struct Runtime {
     /// The load of each catalog, by name, while it may still be in progress:
     /// a load retries an unreachable source without end, and is stopped when
     /// its catalog is replaced or removed.
-    catalog_loads: Arc<parking_lot::Mutex<HashMap<String, tokio::task::AbortHandle>>>,
+    catalog_loads: Arc<parking_lot::Mutex<HashMap<String, init::catalog::CatalogLoad>>>,
 }
 
 impl Debug for Runtime {

@@ -794,11 +794,12 @@ impl DataAccelerator for DuckDBAccelerator {
                 .map_err(|source| CheckpointError::Store {
                     source: Box::new(source),
                 })?;
-        if open_option == OpenOption::OpenExisting && !std::path::Path::new(&duckdb_file).exists() {
-            return Err(CheckpointError::NotFound {
-                store: "DuckDB file".to_string(),
-                path: duckdb_file,
-            });
+        if open_option == OpenOption::OpenExisting {
+            CheckpointError::require_existing(
+                "DuckDB file",
+                &duckdb_file,
+                std::path::Path::new(&duckdb_file).try_exists(),
+            )?;
         }
 
         let pool = self

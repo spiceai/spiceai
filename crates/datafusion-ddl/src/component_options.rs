@@ -1157,6 +1157,44 @@ pub fn create_statement<T: SqlComponent>(
     Ok(sql)
 }
 
+/// Every value in a parameters map of `component`, at any depth: what a message
+/// about a statement that defined it, read where it may not show secrets, must
+/// leave out. Values shorter than four characters are left in, since taking
+/// them out of a message would take out unrelated text.
+#[must_use]
+pub fn parameter_values<T: SqlComponent>(component: &T) -> Vec<String> {
+    fn collect(value: &Value, in_parameters: bool, values: &mut Vec<String>) {
+        match value {
+            Value::Mapping(mapping) => {
+                for (key, entry) in mapping {
+                    let key = yaml_key_text(key);
+                    collect(entry, in_parameters || is_params_map(&key), values);
+                }
+            }
+            Value::Sequence(items) => {
+                for item in items {
+                    collect(item, in_parameters, values);
+                }
+            }
+            Value::String(s) if in_parameters && s.chars().count() >= 4 => {
+                values.push(s.clone());
+            }
+            Value::Number(n) if in_parameters => {
+                let spelling = number_spelling(n);
+                if spelling.len() >= 4 {
+                    values.push(spelling);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut values = Vec::new();
+    if let Ok(value) = yaml::to_value(component) {
+        collect(&value, false, &mut values);
+    }
+    values
+}
+
 /// Whether `key` names a map of parameters: `params`, or a key ending in
 /// `_params` (`snapshots_params`, `dataset_params`).
 #[must_use]
@@ -1164,15 +1202,27 @@ pub fn is_params_map(key: &str) -> bool {
     key == "params" || key.ends_with("_params")
 }
 
-/// Whether `value` is a `${ ... }` reference and nothing else, which names
-/// where a secret is rather than what it is. A value that holds a reference
-/// and other text may hold a secret too.
-fn is_reference(value: &str) -> bool {
-    let value = value.trim();
-    value.starts_with("${")
-        && value.ends_with('}')
-        && value.matches("${").count() == 1
-        && value.matches('}').count() == 1
+/// Whether `value` is a secret reference and nothing else, `${ store:key }`,
+/// as the runtime reads one when it resolves secrets: `store` and `key` each a
+/// letter followed by letters, digits, `_`, or `-`, with spaces, tabs, line
+/// feeds, or form feeds allowed between the parts. Such a value names where a
+/// secret is rather than what it is. Any other value may be a secret,
+/// including one that holds a reference beside other text, or `${key}`, which
+/// the runtime does not resolve and so uses as it is written.
+#[must_use]
+pub fn is_secret_reference(value: &str) -> bool {
+    const SPACE: &[char] = &[' ', '\t', '\n', '\x0C'];
+    let identifier = |part: &str| {
+        let mut chars = part.trim_matches(SPACE).chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+    };
+    value
+        .trim_matches(SPACE)
+        .strip_prefix("${")
+        .and_then(|inner| inner.strip_suffix('}'))
+        .and_then(|inner| inner.split_once(':'))
+        .is_some_and(|(store, key)| identifier(store) && identifier(key))
 }
 
 /// Whether the map at `key` is one the Spicepod keeps unordered: a parameters
@@ -1197,7 +1247,7 @@ fn prepare_maps(path: &mut Vec<String>, value: &mut Value, shown: &dyn Fn(&[Stri
             for (key, entry) in mapping.iter_mut() {
                 path.push(yaml_key_text(key));
                 if in_parameters {
-                    let reference = matches!(&*entry, Value::String(s) if is_reference(s));
+                    let reference = matches!(&*entry, Value::String(s) if is_secret_reference(s));
                     if !reference && !shown(path) {
                         *entry = Value::String(REDACTED.to_string());
                     }
@@ -1215,40 +1265,6 @@ fn prepare_maps(path: &mut Vec<String>, value: &mut Value, shown: &dyn Fn(&[Stri
             }
         }
         _ => {}
-    }
-}
-
-/// Like [`prepare_maps`]' redaction, over a `JSON` option value, with `shown` given
-/// only the entry's name. `in_parameters` when `value` is itself a parameters
-/// map. Returns whether a value was replaced.
-fn redact_json_parameters(
-    value: &mut serde_json::Value,
-    in_parameters: bool,
-    shown: &dyn Fn(&str) -> bool,
-) -> bool {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut redacted = false;
-            for (key, entry) in map.iter_mut() {
-                if in_parameters {
-                    let keep = match &*entry {
-                        serde_json::Value::String(s) => is_reference(s) || s == REDACTED,
-                        _ => false,
-                    };
-                    if !keep && !shown(key) {
-                        *entry = serde_json::Value::String(REDACTED.to_string());
-                        redacted = true;
-                    }
-                } else {
-                    redacted |= redact_json_parameters(entry, is_params_map(key), shown);
-                }
-            }
-            redacted
-        }
-        serde_json::Value::Array(items) => items.iter_mut().fold(false, |redacted, item| {
-            redact_json_parameters(item, false, shown) || redacted
-        }),
-        _ => false,
     }
 }
 
@@ -1467,21 +1483,6 @@ struct OptionInText {
     dotted: bool,
     /// The byte range of the key.
     key: std::ops::Range<usize>,
-    /// The value, when the key has one.
-    value: Option<ValueInText>,
-}
-
-/// An option's value where the statement text has it: every token from the
-/// `=` to the `,` or `)` that ends the option, in any spelling the option
-/// reader takes.
-#[derive(Debug, Clone, PartialEq)]
-struct ValueInText {
-    /// The byte range of the whole value.
-    range: std::ops::Range<usize>,
-    /// The text of the value, when it is one string literal of any quoting.
-    string: Option<String>,
-    /// The JSON text of a `JSON '...'` value.
-    json: Option<String>,
 }
 
 /// The text of a string literal token, in any quoting.
@@ -1511,15 +1512,19 @@ fn starts_a_definition(sql: &str) -> bool {
 
 /// The first word of `sql`, after any whitespace and comments: what a cheap
 /// check of the kind of statement reads, before the statement is tokenized.
+/// Comments end as `PostgreSQL` ends them, the dialect statements are parsed
+/// with: `--` at a line feed or a carriage return, and `/* */` nested.
 #[must_use]
 pub fn first_word(sql: &str) -> &str {
     let mut rest = sql;
     loop {
         rest = rest.trim_start();
         if let Some(comment) = rest.strip_prefix("--") {
-            rest = comment.split_once('\n').map_or("", |(_, after)| after);
-        } else if let Some(comment) = rest.strip_prefix("/*") {
-            rest = comment.split_once("*/").map_or("", |(_, after)| after);
+            rest = comment
+                .find(['\n', '\r'])
+                .map_or("", |end| &comment[end + 1..]);
+        } else if rest.starts_with("/*") {
+            rest = after_block_comment(rest);
         } else {
             break;
         }
@@ -1528,6 +1533,29 @@ pub fn first_word(sql: &str) -> &str {
         .find(|c: char| !c.is_ascii_alphabetic())
         .unwrap_or(rest.len());
     &rest[..end]
+}
+
+/// The text after the `/* */` comment `sql` starts with, which may nest; empty
+/// when the comment does not end.
+fn after_block_comment(sql: &str) -> &str {
+    let bytes = sql.as_bytes();
+    let mut depth = 1_usize;
+    let mut i = 2;
+    while i < bytes.len() {
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            depth += 1;
+            i += 2;
+        } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return &sql[i..];
+            }
+        } else {
+            i += 1;
+        }
+    }
+    ""
 }
 
 /// The byte offset of each line start in `sql`, to turn token locations into
@@ -1637,13 +1665,11 @@ fn options_in_text(sql: &str, dialect: &dyn Dialect) -> Option<Vec<OptionInText>
                             }
                             let last = j;
                             j += 1;
-                            let mut value = None;
                             if matches!(significant.get(j).map(|t| &t.token), Some(Token::Eq)) {
                                 // The value runs to the `,` or `)` that ends the option.
-                                let start = j + 1;
-                                let mut end = start;
                                 let mut nested = 0_usize;
-                                while let Some(token) = significant.get(end) {
+                                j += 1;
+                                while let Some(token) = significant.get(j) {
                                     match &token.token {
                                         Token::LParen | Token::LBracket => nested += 1,
                                         Token::RParen | Token::RBracket if nested > 0 => {
@@ -1655,38 +1681,14 @@ fn options_in_text(sql: &str, dialect: &dyn Dialect) -> Option<Vec<OptionInText>
                                         Token::RParen | Token::Comma => break,
                                         _ => {}
                                     }
-                                    end += 1;
+                                    j += 1;
                                 }
-                                if end > start
-                                    && let Some(value_range) =
-                                        range(significant[start], significant[end - 1])
-                                {
-                                    let json_keyword = matches!(
-                                        &significant[start].token,
-                                        Token::Word(word)
-                                            if word.quote_style.is_none()
-                                                && word.value.eq_ignore_ascii_case("json")
-                                    );
-                                    value = Some(ValueInText {
-                                        range: value_range,
-                                        string: (end == start + 1)
-                                            .then(|| string_literal(&significant[start].token))
-                                            .flatten()
-                                            .map(str::to_string),
-                                        json: (end == start + 2 && json_keyword)
-                                            .then(|| string_literal(&significant[start + 1].token))
-                                            .flatten()
-                                            .map(str::to_string),
-                                    });
-                                }
-                                j = end;
                             }
                             if let Some(key) = range(significant[first], significant[last]) {
                                 options.push(OptionInText {
                                     dotted: dotted && parts.len() > 1,
                                     parts,
                                     key,
-                                    value,
                                 });
                             }
                             at_key = false;
@@ -1745,81 +1747,21 @@ pub fn quote_dotted_option_keys<'a>(sql: &'a str, dialect: &dyn Dialect) -> Cow<
     }
 }
 
-/// `sql`, a statement that may carry credentials, as it may be recorded: the
-/// value of each parameter that `shown` does not show replaced by the
-/// redaction placeholder, whatever its spelling. A parameter is an entry of a
-/// parameters map (`params.x`, `acceleration.params.x`, a key under a
-/// `_params` map, or one inside a `JSON '...'` value), or a connector
-/// parameter by its bare name; `shown` is given its name. A value that is a
-/// `${ ... }` reference is kept. Everything else in the text is kept as
-/// written.
+/// `sql` as it may be recorded: see [`recorded_statement`].
 #[must_use]
 pub fn redact_secret_option_values<'a>(
     sql: &'a str,
     dialect: &dyn Dialect,
     shown: &dyn Fn(&str) -> bool,
 ) -> Cow<'a, str> {
-    if !starts_a_definition(sql) {
-        return Cow::Borrowed(sql);
-    }
-    let Some(options) = options_in_text(sql, dialect) else {
-        return Cow::Borrowed(sql);
-    };
-    let replacements: Vec<_> = options
-        .into_iter()
-        .filter_map(|option| {
-            let value = option.value?;
-            let mut path: Vec<&str> = option
-                .parts
-                .iter()
-                .flat_map(|part| part.split('.'))
-                .collect();
-            // `dataset.` is an alias for the dataset's own fields.
-            if path.len() > 1 && path[0] == "dataset" {
-                path.remove(0);
-            }
-            // As the options are read: a key that does not start with a field
-            // is a connector parameter named by the whole key, and a key into a
-            // parameters map names the entry it ends with.
-            let first_is_field = path.first().is_some_and(|first| {
-                ComponentKind::Dataset.is_field(first) || ComponentKind::Catalog.is_field(first)
-            });
-            let parameter = match path.as_slice() {
-                [] => None,
-                _ if !first_is_field => Some(path.join(".")),
-                [map @ .., name] if map.iter().any(|segment| is_params_map(segment)) => {
-                    Some((*name).to_string())
-                }
-                _ => None,
-            };
-            if let Some(name) = parameter {
-                let reference = value.string.as_deref().is_some_and(is_reference);
-                return (!reference && !shown(&name))
-                    .then(|| (value.range, REDACTED_SQL.to_string()));
-            }
-            // A structured value can hold parameters maps, or be one.
-            let json = value.json.as_deref().or_else(|| {
-                value
-                    .string
-                    .as_deref()
-                    .filter(|s| s.trim_start().starts_with(['{', '[']))
-            })?;
-            let mut parsed: serde_json::Value = serde_json::from_str(json).ok()?;
-            let whole_map = path.last().is_some_and(|key| is_params_map(key));
-            redact_json_parameters(&mut parsed, whole_map, shown).then(|| {
-                (
-                    value.range,
-                    format!("JSON {}", quote_string(&parsed.to_string())),
-                )
-            })
-        })
-        .collect();
-    if replacements.is_empty() {
-        Cow::Borrowed(sql)
-    } else {
-        Cow::Owned(splice(sql, replacements))
-    }
+    recorded_statement(sql, dialect, shown).text
 }
+
+mod recorded;
+pub use recorded::{
+    RecordedStatement, UNREADABLE_STATEMENT, recorded_statement, recorded_unparsed_statement,
+    redact_values,
+};
 
 #[cfg(test)]
 mod tests;

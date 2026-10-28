@@ -1,0 +1,133 @@
+name: sql-ddl
+description: >
+  A dataset defined with SQL serves its source's rows, is registered when its
+  CREATE TABLE returns, and is kept across a restart until it is dropped. Only
+  an `:admin` key defines one. What a read-only key reads (SHOW CREATE, and the
+  task history of every statement, mistyped or cut short ones included) holds
+  none of a definition's secrets.
+
+sources:
+  lake: { kind: files }
+  ref: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: sql-ddl
+  runtime:
+    auth:
+      api-key:
+        enabled: true
+        keys: [admin-key:admin, writer-key:rw, reader-key:ro]
+
+defaults:
+  api-key: admin-key
+
+steps:
+  - generate:
+      lake:
+        table: orders
+        rows: 200
+        seed: 41
+        primary-key: id
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: region, choice: [us, eu, apac] }
+          - { name: amount, int: [0, 1000], nulls: 0.05 }
+    mirror: ref
+  - start: {}
+
+  # Only an `:admin` key defines a dataset.
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: writer-key
+      headers: { content-type: text/plain }
+      body: "CREATE TABLE orders WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv')"
+    expect: { status: 400, body-contains: "requires an API key ending in ':admin'" }
+
+  # Accelerated, and registered once the statement returns: a query right
+  # after it may find the acceleration loading, but always finds the table.
+  - spice-exec: "CREATE TABLE orders WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+  - http:
+      method: POST
+      path: /v1/sql
+      headers: { content-type: text/plain }
+      body: SELECT count(*) AS n FROM orders
+    expect: { body-lacks: ['not found'] }
+  - query: SELECT id, region, amount FROM orders ORDER BY id
+    expect: { oracle: ref }
+    eventually: 60s
+
+  # Kept across a restart, and gone for good once dropped.
+  - restart: {}
+  - query: SELECT id, region, amount FROM orders ORDER BY id
+    expect: { oracle: ref }
+    eventually: 60s
+  - spice-exec: DROP TABLE orders
+  - restart: {}
+  - query: SELECT count(*) FROM orders
+    expect-error: not found
+
+  # A secret in a definition is redacted from SHOW CREATE for a read-only key;
+  # a parameter declared non-secret is shown.
+  - spice-exec: "CREATE TABLE secret_accel WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file', acceleration.params.cayenne_s3_auth = 'iam_role', acceleration.params.cayenne_s3_secret = 'leak-accelerator-secret')"
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SHOW CREATE TABLE secret_accel
+    expect:
+      status: 200
+      body-matches: ["cayenne_s3_secret\\\\\" = '<redacted>'", "cayenne_s3_auth\\\\\" = 'iam_role'"]
+      body-lacks: ['leak-']
+
+  # Every way a statement can carry a secret: written correctly, behind
+  # comments the parser reads, mistyped, cut short, or after another statement.
+  # None of these is applied.
+  - spice-exec: "CREATE TABLE p1 WITH (from = 'postgres:public.t', pg_host = '127.0.0.1', pg_port = 1, pg_user = 'probe', pg_db = 'd', pg_pass = 'leak-plain')"
+    expect-error: true
+  - spice-exec: "/*a/*b*/c*/ CREATE TABLE p2 WITH (from = 'postgres:public.t', pg_host = '127.0.0.1', pg_port = 1, pg_db = 'd', pg_pass = 'leak-nested-comment')"
+    expect-error: true
+  - spice-exec: "CREATE TABLE p3 WITH (from = 'postgres:public.t', pg_host = '127.0.0.1', pg_port = 1, pg_db = 'd', pg_pass 'leak-missing-equals')"
+    expect-error: true
+  - spice-exec: "CREATE TABLE p4 WITH pg_pass = 'leak-missing-parentheses'"
+    expect-error: true
+  - spice-exec: "CREATE TABLE p5 WITH (from = 'postgres:public.t', pg_pass = 'leak-unterminated-quote') '"
+    expect-error: true
+  - spice-exec: "CREATE TABLE p6 WITH (from = 'postgres:public.t', pg_pass = $$leak-unterminated-dollar-quote"
+    expect-error: true
+  - spice-exec: "/* CREATE TABLE p7 WITH (from = 'postgres:public.t', pg_pass = 'leak-unterminated-comment')"
+    expect-error: true
+  - spice-exec: "SELECT 1; CREATE TABLE p8 WITH (from = 'postgres:public.t', pg_pass = 'leak-second-statement')"
+    expect-error: true
+  - spice-exec: "CREATE TABLE p9 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.params.cayenne_s3_secret = '${leak-not-a-reference:}', \"params.custom.file_format\" = 'leak-dotted-parameter')"
+    expect-error: true
+  # Fails to parse, whatever its first word.
+  - spice-exec: "CRATE TABLE p10 WITH (from = 'postgres:public.t', pg_pass = 'leak-mistyped-keyword')"
+    expect-error: true
+  - spice-exec: "ATTACH 'host=db.internal user=app password=leak-attach dbname=sales' AS p11 (TYPE postgres)"
+    expect-error: true
+  # Through the `sql` tool, as an agent runs it; MCP calls the same tool.
+  - http:
+      method: POST
+      path: /v1/tools/sql
+      headers: { content-type: application/json }
+      body: '{"query": "CREATE TABLE p12 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-tool-call'')"}'
+    expect: { body-contains: p12 }
+  - spice-exec: "CREATE TABLE p_last WITH (from = 'postgres:public.t', pg_host = '127.0.0.1', pg_port = 1, pg_db = 'd', pg_pass = 'leak-last')"
+    expect-error: true
+  # Task history, as a read-only key reads it, once the last statement is in it.
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SELECT task, input, error_message FROM runtime.task_history ORDER BY start_time
+    expect:
+      status: 200
+      body-contains: p_last
+      body-lacks: ['leak-']
+    eventually: 30s

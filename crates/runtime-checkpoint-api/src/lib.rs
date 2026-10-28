@@ -100,6 +100,34 @@ pub enum CheckpointError {
     NotFound { store: String, path: String },
 }
 
+impl CheckpointError {
+    /// The outcome of asking for the existing store `store` at `path`, given
+    /// whether a file there `exists`: [`CheckpointError::NotFound`] only when
+    /// it is known to be absent, and [`CheckpointError::Store`] when whether it
+    /// exists could not be told, as for a permission or I/O error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the store exists.
+    pub fn require_existing(
+        store: &str,
+        path: &str,
+        exists: std::io::Result<bool>,
+    ) -> Result<(), Self> {
+        match exists {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Self::NotFound {
+                store: store.to_string(),
+                path: path.to_string(),
+            }),
+            Err(source) => Err(Self::Store {
+                source: format!("Could not tell whether the {store} at {path} exists: {source}")
+                    .into(),
+            }),
+        }
+    }
+}
+
 /// The **blob** checkpoint shape: a per-dataset store of one opaque `String` payload,
 /// satisfied by the accelerator and called by a data-source connector. Object-safe and
 /// `#[async_trait]` so it is used as `Arc<dyn BlobCheckpointStore>`.

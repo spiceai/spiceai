@@ -2302,13 +2302,17 @@ impl DataFusion {
         let _ = self.recorded_parameter_names.set(names);
     }
 
-    /// `sql` as task history and the list of running queries record it: a
-    /// statement that defines a component has the value of each parameter
-    /// not known to be non-secret redacted, every one until the names are
-    /// installed.
-    pub(crate) fn recorded_statement_text<'a>(&self, sql: &'a str) -> std::borrow::Cow<'a, str> {
+    /// `sql` as task history and the list of running queries record it, and
+    /// the values that takes out of it: a statement that may define a
+    /// component keeps the value of a parameter only when the parameter is
+    /// known to be non-secret, none until the names are installed. Read with
+    /// the dialect statements are parsed with.
+    pub(crate) fn recorded_statement<'a>(
+        &self,
+        sql: &'a str,
+    ) -> datafusion_ddl::component_options::RecordedStatement<'a> {
         let recorded = self.recorded_parameter_names.get();
-        datafusion_ddl::component_options::redact_secret_option_values(
+        datafusion_ddl::component_options::recorded_statement(
             sql,
             &datafusion::sql::sqlparser::dialect::PostgreSqlDialect {},
             &|name| recorded.is_some_and(|names| names.contains(name)),
