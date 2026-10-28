@@ -2143,13 +2143,33 @@ A library change, with no Cayenne or runtime change.
   It lands in three parts, each behind the same flag: a local-directory
   destination on one node; object stores with failover; then GC with reader
   pins.
+- **Data placement is not a prerequisite.** Until step 4's placement lands,
+  records may reference data files where they are today, on the writer's
+  local disk. This decouples the metadata work from the data work, and is
+  temporary:
+  - Such references name an instance-local location in the location registry
+    (see [multiple data locations](#future-multiple-data-locations)), bound to
+    the writing instance's identity, so they are never mistaken for files in
+    the state location.
+  - Recovery is limited to that disk: a restart on the same disk continues from
+    the head, while another instance that opens the dataset finds references it
+    cannot read and reloads from the source. It never serves the dataset
+    without those files (a missing referenced file is an error, never an empty
+    snapshot).
+  - Files are still durable on local disk before the record that references
+    them commits, and GC deletes them as it would any other location's.
+  - The default (step 7) waits for data in the destination wherever the
+    destination is an object store; on a local-directory destination the two
+    are the same disk.
 - **Exit proof:**
   - a process kill at every storage step, injected lost responses, and a
     power-loss simulation for the local directory;
   - a model-based differential test over seeded histories, extending
     `crates/cayenne/tests/mutation_model_test.rs`;
-  - `spiced` with CDC and append Spicepods across restart, and failover to a
-    new instance on the same bucket, with `--validate`;
+  - `spiced` with CDC and append Spicepods across restart with `--validate`;
+    once data is in the destination, failover to a new instance on the same
+    bucket, and before that, a new instance reloading from the source instead
+    of serving the dataset;
   - `testoperator run bench` and `run htap` against the SQL metastore: query
     P99, and freshness P99 and P99.9, with no regression at any query or scale
     factor.

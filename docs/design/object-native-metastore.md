@@ -845,7 +845,9 @@ as discrete changes, each shipping on its own, and each with an exit proof:
 4. Data files in the destination, and readers that open from the shadow in
    tests and the benchmark harness.
 5. The object-native metastore as the authority for new datasets, behind the
-   flag.
+   flag. Its records can reference data files still on local disk until step
+   4's placement lands, so the metadata work does not wait on the data work;
+   until then, recovery is limited to that disk.
 6. Existing datasets re-bootstrap from their sources; metastore contents are
    not migrated.
 7. On by default, once a second instance on the same destination can no
