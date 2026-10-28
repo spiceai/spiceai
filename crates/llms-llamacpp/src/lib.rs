@@ -3195,6 +3195,7 @@ mod tests {
         let tools = tools.iter().map(ToString::to_string).collect();
         let job = Job {
             prompt: String::new(),
+            namespace: CacheNamespace::Public,
             limit,
             sampling: Sampling::default(),
             stop: stop.iter().map(ToString::to_string).collect(),
@@ -3355,6 +3356,7 @@ mod tests {
         let (events, _rx) = mpsc::channel(STREAM_BUFFER);
         let (_, _, mut output) = Output::new(Job {
             prompt: String::new(),
+            namespace: CacheNamespace::Public,
             limit: None,
             sampling: Sampling::default(),
             stop: Vec::new(),
