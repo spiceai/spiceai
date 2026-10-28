@@ -112,7 +112,21 @@ struct Counts {
     bytes: u64,
     cas_time: Duration,
 }
+const CHECKPOINT_BATCHES: usize = 64;
+
 impl Counts {
+    fn plus(self, other: Self) -> Self {
+        Self {
+            creates: self.creates + other.creates,
+            cas: self.cas + other.cas,
+            gets: self.gets + other.gets,
+            wal: self.wal + other.wal,
+            wal_created: self.wal_created + other.wal_created,
+            unchanged: self.unchanged + other.unchanged,
+            bytes: self.bytes + other.bytes,
+            cas_time: self.cas_time + other.cas_time,
+        }
+    }
     fn since(self, before: Self) -> Self {
         Self {
             creates: self.creates - before.creates,
@@ -328,9 +342,25 @@ async fn commit(args: &[String], store: Arc<CountingStore>, out: &mut Output) {
         let mut writer = writer(Arc::clone(&store) as Arc<dyn ObjectStore>, &prefix, config).await;
         let mut times = Vec::new();
         let mut cas_times = Vec::new();
+        let mut checkpoints = 0_u64;
+        let mut checkpoint_counts = Counts::default();
         let before = store.snapshot();
         let start = Instant::now();
         for i in 0..samples {
+            // The batch index is bounded until a checkpoint trims it. Checkpoint
+            // outside the timed commit, at the newest batch end, every
+            // CHECKPOINT_BATCHES listed batches; the next commit publishes it.
+            if let Some(&end) = writer.state().head.batches.last()
+                && writer.state().head.batches.len() >= CHECKPOINT_BATCHES
+            {
+                let counts = store.snapshot();
+                writer
+                    .publish_checkpoint(end, Bytes::from_static(b"bench"))
+                    .await
+                    .expect("checkpoint");
+                checkpoint_counts = checkpoint_counts.plus(store.snapshot().since(counts));
+                checkpoints += 1;
+            }
             let payloads = (0..group)
                 .map(|j| payload(size, (i * group + j + 1) as u64))
                 .collect();
@@ -356,7 +386,7 @@ async fn commit(args: &[String], store: Arc<CountingStore>, out: &mut Output) {
             .expect("raw");
         }
         let elapsed = start.elapsed().as_secs_f64();
-        let c = store.snapshot().since(before);
+        let c = store.snapshot().since(before).since(checkpoint_counts);
         out.report.push_str(&summary("commit_group", &mut times));
         out.report.push_str(&summary(
             "head CAS (sum of attempts per commit)",
@@ -364,6 +394,8 @@ async fn commit(args: &[String], store: Arc<CountingStore>, out: &mut Output) {
         ));
         writeln!(out.report, "logical payloads/s={:.3}; requests/commit: creates={:.3} CAS={:.3} GETs={:.3}; wal create attempts={} successful creates={} (per-commit in CSV)\n",
             (samples*group) as f64/elapsed, c.creates as f64/samples as f64, c.cas as f64/samples as f64, c.gets as f64/samples as f64, c.wal, c.wal_created).expect("report");
+        writeln!(out.report, "checkpoints every {CHECKPOINT_BATCHES} listed batches, untimed and excluded above: {checkpoints}; their creates={} GETs={} downloaded bytes={}\n",
+            checkpoint_counts.creates, checkpoint_counts.gets, checkpoint_counts.bytes).expect("report");
         out.flush();
     }
 }
