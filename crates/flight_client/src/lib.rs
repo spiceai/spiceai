@@ -284,12 +284,14 @@ pub struct FlightClient {
     client: FlightServiceClient<Channel>,
     credentials: Credentials,
     url: Arc<str>,
+    tls_identity_scope: Option<[u8; 32]>,
     metadata: Option<tonic::metadata::MetadataMap>,
 }
 
 impl FlightClient {
     /// Opaque federation identity covering the endpoint, credentials, and all
-    /// configured metadata. Different authorization scopes cannot share a plan.
+    /// configured metadata, including the resolved mTLS certificate identity.
+    /// Different authorization scopes cannot share a plan.
     #[must_use]
     pub fn federation_context(&self) -> String {
         use sha2::{Digest, Sha256};
@@ -301,6 +303,13 @@ impl FlightClient {
             digest.update(bytes);
         };
         field(self.url.as_bytes());
+        match self.tls_identity_scope {
+            Some(scope) => {
+                field(b"mtls");
+                field(&scope);
+            }
+            None => field(b"no-client-certificate"),
+        }
         match &self.credentials {
             Credentials::Anonymous => field(b"anonymous"),
             Credentials::UsernamePassword { username, password } => {
@@ -415,9 +424,10 @@ impl FlightClient {
         metadata: Option<tonic::metadata::MetadataMap>,
         tls_options: &tls::ClientTlsOptions,
     ) -> Result<Self> {
-        let flight_channel = tls::new_tls_flight_channel_with_options(&url, tls_options)
-            .await
-            .context(UnableToConnectToServerSnafu)?;
+        let (flight_channel, tls_identity_scope) =
+            tls::new_tls_flight_channel_with_scope(&url, tls_options)
+                .await
+                .context(UnableToConnectToServerSnafu)?;
 
         Ok(FlightClient {
             client: FlightServiceClient::new(flight_channel)
@@ -425,6 +435,7 @@ impl FlightClient {
                 .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
             credentials,
             url,
+            tls_identity_scope,
             metadata,
         })
     }

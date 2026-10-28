@@ -1581,10 +1581,11 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
             && let Ok(built_app) = AppBuilder::build_from_path(path.clone()).await
         {
             let mut app = App::default();
-            // Copy only runtime flight, telemetry, and CPU config from the
-            // spicepod. An executor is the deployment shape most likely to be
+            // Retain mode for role validation, plus local Flight, telemetry,
+            // and CPU config. An executor is the deployment shape most likely to be
             // running under a CPU request, so `runtime.cpu` must come across
             // too — everything else it needs arrives from the scheduler.
+            app.runtime.mode = built_app.runtime.mode;
             app.runtime.flight = built_app.runtime.flight;
             app.runtime.telemetry = built_app.runtime.telemetry;
             app.runtime.cpu = built_app.runtime.cpu;
@@ -1601,8 +1602,10 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
         tracing::info!(
             "Starting as a cluster executor, without a Spicepod. The runtime will initialize its components upon joining the cluster."
         );
+        let mut app = App::default();
+        app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
         return Ok(AppBundle {
-            app: Some(Arc::new(App::default())),
+            app: Some(Arc::new(app)),
             spicepod_load_error: None,
             running_deployment: None,
             deployment_note: None,

@@ -65,6 +65,15 @@ async fn sidecar_substrait_connector_roundtrip() -> anyhow::Result<()> {
             ("label", Arc::new(StringArray::from(vec![Some("雪"), Some(""), None, Some("x")]))),
         ])?;
         upstream.ctx.register_batch("remote_orders", input.clone())?;
+        let shadow_add = datafusion::logical_expr::create_udf(
+            "add", vec![arrow::datatypes::DataType::Int64; 2],
+            arrow::datatypes::DataType::Int64,
+            datafusion::logical_expr::Volatility::Immutable,
+            Arc::new(|_| Ok(datafusion::logical_expr::ColumnarValue::Scalar(
+                datafusion::common::ScalarValue::Int64(Some(-999)),
+            ))),
+        );
+        upstream.ctx.register_udf(shadow_add);
         let oracle = SessionContext::new();
         oracle.register_batch("orders", input.clone())?;
         oracle.register_batch("other_orders", input.clone())?;
@@ -97,6 +106,7 @@ async fn sidecar_substrait_connector_roundtrip() -> anyhow::Result<()> {
 
         let corpus = [
             "SELECT id, value, label FROM orders ORDER BY id",
+            "SELECT id + CAST(1 AS BIGINT) AS n FROM orders ORDER BY id",
             "SELECT id, label FROM other_orders WHERE value IS NULL ORDER BY id",
             "SELECT id FROM orders WHERE value < 0 OR value = 0 ORDER BY id",
             "SELECT COUNT(*) AS n, COUNT(value) AS nn, SUM(value) AS total FROM orders",
@@ -104,8 +114,17 @@ async fn sidecar_substrait_connector_roundtrip() -> anyhow::Result<()> {
             "SELECT l.id, l.label, r.value FROM orders l JOIN other_orders r ON l.id = r.id WHERE l.id > 1 ORDER BY l.id",
             "SELECT id FROM orders ORDER BY id DESC LIMIT 2 OFFSET 1",
             "SELECT id FROM orders WHERE id = 999",
+            "SELECT id FROM orders WHERE value NOT IN (SELECT value FROM other_orders) ORDER BY id",
+            "SELECT id FROM orders WHERE NOT (value IN (SELECT value FROM other_orders)) ORDER BY id",
+            "SELECT id FROM orders WHERE value NOT IN (SELECT value FROM other_orders WHERE id < 0) ORDER BY id",
+            "SELECT id, value IN (SELECT value FROM other_orders) AS present FROM orders ORDER BY id",
             "SELECT CASE WHEN value IS NULL THEN 99 ELSE value END AS v FROM orders ORDER BY id",
             "SELECT arrow_cast(label, 'Utf8View') AS label FROM orders ORDER BY id",
+            "SELECT CAST(value AS DECIMAL(20, 3)) AS decimal_value FROM orders ORDER BY id",
+            "SELECT make_array(id, value) AS numbers FROM orders ORDER BY id",
+            "SELECT named_struct('key', id, 'value', label) AS nested FROM orders ORDER BY id",
+            "SELECT map(make_array('key', 'value'), make_array(id, value)) AS attributes FROM orders ORDER BY id",
+            "SELECT TIMESTAMP '2026-01-01 00:00:00' + id * INTERVAL '1 second' AS ts FROM orders ORDER BY id",
             "SELECT sidecar_roundtrip_identity(value) AS value FROM orders ORDER BY id",
         ];
         for sql in corpus {
@@ -123,7 +142,7 @@ async fn sidecar_substrait_connector_roundtrip() -> anyhow::Result<()> {
         let explained = rows(&sidecar,
             "EXPLAIN SELECT l.id FROM orders l JOIN other_orders r ON l.id = r.id").await?;
         let explain = pretty_format_batches(&explained)?.to_string();
-        assert!(explain.contains("SubstraitExec"), "{explain}");
+        assert_eq!(explain.matches("SubstraitExec:").count(), 1, "{explain}");
         assert!(!explain.contains("FlightExec sql="), "{explain}");
 
         // An ordinary DataFusion session has no federation analyzer. Its scan
@@ -138,6 +157,11 @@ async fn sidecar_substrait_connector_roundtrip() -> anyhow::Result<()> {
         let actual = fallback.sql("SELECT id FROM orders WHERE value IS NULL ORDER BY id").await?.collect().await?;
         let expected = oracle.sql("SELECT id FROM orders WHERE value IS NULL ORDER BY id").await?.collect().await?;
         assert_eq!(pretty_format_batches(&actual)?.to_string(), pretty_format_batches(&expected)?.to_string());
+        for sql in ["SELECT COUNT(*) AS n FROM orders", "SELECT 1 AS constant FROM orders"] {
+            let actual = fallback.sql(sql).await?.collect().await?;
+            let expected = oracle.sql(sql).await?.collect().await?;
+            assert_eq!(pretty_format_batches(&actual)?.to_string(), pretty_format_batches(&expected)?.to_string(), "{sql}");
+        }
 
         sidecar.shutdown().await;
         runtime_udfs_api::remove_user_function("sidecar_roundtrip_identity");

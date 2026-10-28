@@ -22,14 +22,13 @@ uv run --python 3.12 --with datafusion==55.0.0 --with pyarrow==26.0.0 \
 import argparse
 import hashlib
 import json
-from pathlib import Path
 import subprocess
 import time
+from pathlib import Path
 
 from datafusion import SessionContext
 from datafusion.substrait import Producer
-import pyarrow.flight as flight
-
+from pyarrow import flight
 from sidecar import Instance, base_pod
 
 

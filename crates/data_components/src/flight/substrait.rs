@@ -18,7 +18,7 @@ limitations under the License.
 
 use std::{fmt, sync::Arc};
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow_tools::map_entries::StreamNormalizer;
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -30,7 +30,7 @@ use datafusion::{
     datasource::empty::EmptyTable,
     error::DataFusionError,
     execution::{TaskContext, context::SessionState},
-    logical_expr::{Expr, Extension, LogicalPlan, LogicalPlanBuilder, TableScan, TableScanBuilder},
+    logical_expr::{Expr, Extension, LogicalPlan, LogicalPlanBuilder, TableScan},
     optimizer::{Analyzer, AnalyzerRule},
     physical_expr::EquivalenceProperties,
     physical_plan::{
@@ -81,6 +81,62 @@ struct SpiceProducer {
 }
 
 impl SubstraitProducer for SpiceProducer {
+    fn handle_in_subquery(
+        &mut self,
+        _expression: &datafusion::logical_expr::expr::InSubquery,
+        _schema: &datafusion::common::DFSchemaRef,
+    ) -> Result<datafusion_substrait::substrait::proto::Expression> {
+        // IN can become a NULL-aware anti/mark join during optimization.
+        // The Substrait join codec cannot represent that NULL contract.
+        Err(DataFusionError::NotImplemented(
+            "IN subqueries are evaluated in the sidecar".into(),
+        ))
+    }
+
+    fn handle_join(&mut self, join: &datafusion::logical_expr::Join) -> Result<Box<Rel>> {
+        if join.null_aware {
+            return Err(DataFusionError::NotImplemented(
+                "NULL-aware joins are evaluated in the sidecar".into(),
+            ));
+        }
+        datafusion_substrait::logical_plan::producer::from_join(self, join)
+    }
+
+    fn handle_expr(
+        &mut self,
+        expression: &Expr,
+        schema: &datafusion::common::DFSchemaRef,
+    ) -> Result<datafusion_substrait::substrait::proto::Expression> {
+        use datafusion_substrait::substrait::proto::expression::RexType;
+        let mut encoded = datafusion_substrait::logical_plan::producer::to_substrait_rex(
+            self, expression, schema,
+        )?;
+        // Aliases delegate to an already-encoded child. Function calls retain
+        // function identity; SQL operators retain operator identity.
+        if !matches!(
+            expression,
+            Expr::Alias(_) | Expr::ScalarFunction(_) | Expr::HigherOrderFunction(_)
+        ) && let Some(RexType::ScalarFunction(function)) = &mut encoded.rex_type
+        {
+            let name = self
+                .extensions
+                .functions
+                .get(&function.function_reference)
+                .ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "Substrait operator is missing its declaration".into(),
+                    )
+                })?
+                .clone();
+            if !name.starts_with("spice.operator.") {
+                function.function_reference = self
+                    .extensions
+                    .register_function(&format!("spice.operator.{name}"));
+            }
+        }
+        Ok(encoded)
+    }
+
     fn handle_scalar_function(
         &mut self,
         function: &datafusion::logical_expr::expr::ScalarFunction,
@@ -152,24 +208,12 @@ fn encode_plan(plan: &LogicalPlan, direct_scan: bool) -> Result<Bytes> {
         ..Default::default()
     };
     let input = *producer.handle_plan(plan)?;
-    // A root uses the same flattened field names as a named read schema.
-    // Reuse the producer's public read serializer, including nested names and
-    // type registration, rather than duplicating its private schema codec.
-    let output_schema = Arc::new(plan.schema().as_arrow().clone());
-    let output = TableScanBuilder::new(
-        datafusion::common::TableReference::bare("__spice_substrait_output"),
-        datafusion::datasource::provider_as_source(Arc::new(EmptyTable::new(output_schema))),
-    )
-    .build()?;
-    let Some(RelType::Read(read)) = from_table_scan(&mut producer, &output)?.rel_type else {
-        return Err(DataFusionError::Internal(
-            "Expected a Substrait read schema".into(),
-        ));
-    };
-    let names = read
-        .base_schema
-        .ok_or_else(|| DataFusionError::Internal("Substrait output schema is missing".into()))?
-        .names;
+    // Preserve duplicate column names with distinct logical qualifiers. Building
+    // a synthetic scan would discard those qualifiers and reject valid joins.
+    let mut names = Vec::new();
+    for field in plan.schema().fields() {
+        flatten_root_names(field, false, &mut names)?;
+    }
     let extensions = producer.get_extensions();
     // Extension maps do not have a stable iteration order. Serialize anchors
     // deterministically so identical fragments have identical wire cache keys.
@@ -200,6 +244,41 @@ fn encode_plan(plan: &LogicalPlan, direct_scan: bool) -> Result<Bytes> {
     .into())
 }
 
+/// Substrait root names are depth-first struct names. List elements and map
+/// entries are structural wrappers and do not contribute their own names.
+fn flatten_root_names(field: &Field, skip_name: bool, names: &mut Vec<String>) -> Result<()> {
+    if !skip_name {
+        names.push(field.name().clone());
+    }
+    match field.data_type() {
+        DataType::Struct(fields) => {
+            for field in fields {
+                flatten_root_names(field, false, names)?;
+            }
+        }
+        DataType::List(element) | DataType::LargeList(element) => {
+            flatten_root_names(element, true, names)?;
+        }
+        DataType::Map(entries, _) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(DataFusionError::Plan(
+                    "Substrait map entries must be a struct".into(),
+                ));
+            };
+            if fields.len() != 2 {
+                return Err(DataFusionError::Plan(
+                    "Substrait map entries require key and value fields".into(),
+                ));
+            }
+            for field in fields {
+                flatten_root_names(field, true, names)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn table_names(plan: &LogicalPlan) -> Result<String> {
     let mut names = std::collections::BTreeSet::new();
     plan.apply_with_subqueries(|plan| {
@@ -218,7 +297,7 @@ struct SpiceFederation {
 }
 
 impl FederationProvider for SpiceFederation {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "spice_substrait"
     }
 
@@ -238,7 +317,7 @@ impl FederationProvider for SpiceFederation {
 }
 
 impl AnalyzerRule for SpiceFederation {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "federate_spice_substrait"
     }
 
@@ -399,6 +478,7 @@ impl ExecutionPlan for SubstraitExec {
         let plan = self.plan.clone();
         let schema = Arc::clone(&self.schema);
         let expected_schema = Arc::clone(&schema);
+        let wire_schema = Arc::new(arrow_tools::schema::expand_views_schema(&schema));
         let datasets = self.datasets.clone();
         let stream = try_stream! {
             let timeout = deadline.as_ref().map(|deadline| deadline.0.saturating_duration_since(std::time::Instant::now()));
@@ -416,6 +496,11 @@ impl ExecutionPlan for SubstraitExec {
                 let batch = batch.map_err(map_query_stream_error)?;
                 let batch = normalizer.normalize(batch)
                     .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                let batch = if batch.schema().fields() == wire_schema.fields() {
+                    // Flight expands only top-level views. Reverse that exact
+                    // representation change; never coerce arbitrary remote types.
+                    arrow_tools::schema::cast_view_columns(batch, &expected_schema)?
+                } else { batch };
                 if batch.schema().fields() != expected_schema.fields() {
                     Err(DataFusionError::Execution(format!(
                         "Remote Substrait result schema differs from the planned schema: expected {expected_schema:?}, received {:?}",

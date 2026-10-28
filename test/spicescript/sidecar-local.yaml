@@ -1,0 +1,36 @@
+name: sidecar-local
+description: >
+  Both runtime deployment profiles serve local SQL and results-cache hits with
+  the same literal answers, including NULLs and an empty result.
+
+matrix:
+  mode: [server, sidecar]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: sidecar-local
+  runtime:
+    mode: '${matrix.mode}'
+    cpu: { cores: 2 }
+    caching:
+      sql_results: { enabled: true, item_ttl: 1h, max_size: 16MiB }
+
+steps:
+  - start: {}
+  - query: SELECT COUNT(*) AS n, COUNT(v) AS nonnull, SUM(v) AS total FROM (VALUES (1, CAST(NULL AS BIGINT)), (2, 11), (3, -4)) AS t(id, v)
+    expect: { rows: [['3', '2', '7']] }
+  - http: { path: /v1/sql, body: SELECT 42 AS id }
+    expect: { status: 200, headers: { results-cache-status: MISS }, body-contains: '42' }
+  - http: { path: /v1/sql, body: SELECT 42 AS id }
+    expect: { status: 200, headers: { results-cache-status: HIT }, body-contains: '42' }
+  - http:
+      path: /v1/sql
+      body: SELECT 42 AS id
+      headers: { Cache-Control: no-cache }
+    expect: { status: 200, headers: { results-cache-status: BYPASS }, body-contains: '42' }
+  - http: { path: /v1/sql, body: 'SELECT id FROM (VALUES (1), (2)) AS t(id) WHERE id < 0' }
+    expect: { status: 200, headers: { results-cache-status: MISS }, body-contains: '[]' }
+  - http: { path: /v1/sql, body: 'SELECT id FROM (VALUES (1), (2)) AS t(id) WHERE id < 0' }
+    expect: { status: 200, headers: { results-cache-status: HIT }, body-contains: '[]' }
+  - assert-log: { clean: true }
