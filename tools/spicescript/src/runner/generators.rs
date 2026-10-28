@@ -25,7 +25,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use arrow::array::RecordBatch;
 
 use crate::compare;
-use crate::script::{Script, SltStep, TlpStep};
+use crate::script::{QueryProtocol, Script, SltStep, TlpStep};
 
 use super::{Instance, QueryFailure, QueryFailures, Sources, namespace, one_line, sanitize};
 
@@ -60,9 +60,8 @@ pub(super) async fn table_columns(
     Ok(columns)
 }
 
-/// Random queries over nested subqueries: each answer from Spice must be the
-/// oracle's answer to the same SQL. A query the oracle cannot answer is not
-/// counted.
+/// Checks generated queries against an oracle or across transports. A query
+/// an external oracle cannot answer is not counted.
 pub(super) async fn random_queries(
     instance: &mut Instance,
     step: &crate::script::RandomQueriesStep,
@@ -109,46 +108,63 @@ pub(super) async fn random_queries(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let source = sources.get(&step.oracle)?;
-    let namespace = namespace(instance, &step.oracle)?;
+    let oracle = step
+        .oracle
+        .as_deref()
+        .map(|name| Ok::<_, anyhow::Error>((sources.get(name)?, namespace(instance, name)?)))
+        .transpose()?;
     let mut generator = Generator::new(step.seed, &tables, &joins, step.avoid.clone());
     let (mut failures, mut compared, mut unanswerable, mut empty) = (Vec::new(), 0u64, 0u64, 0u64);
     for i in 0..step.queries {
         let sql = generator.query(step.depth);
         let labels = generator.take_touched();
-        let Ok(expected) = source.query(&namespace, &sql).await else {
-            unanswerable += 1;
-            continue;
+        let expected = if let Some((source, namespace)) = &oracle {
+            let Ok(expected) = source.query(namespace, &sql).await else {
+                unanswerable += 1;
+                continue;
+            };
+            Some(expected)
+        } else {
+            None
         };
-        let problem = match instance.spiced.query(&sql).await {
-            Err(e) => Some(format!(
-                "Spice rejected it: {}",
-                one_line(&format!("{e:#}"), 300)
-            )),
-            Ok(answer) => match answer.first().map(RecordBatch::schema) {
-                None if expected.rows.is_empty() => {
-                    empty += 1;
-                    None
-                }
-                None => Some(format!(
-                    "Spice returned no rows, the oracle {}",
-                    expected.rows.len()
-                )),
-                Some(schema) => {
-                    if expected.rows.is_empty() && answer.iter().all(|b| b.num_rows() == 0) {
-                        empty += 1;
-                        None
-                    } else {
-                        let typed = compare::type_oracle(&expected, &schema)?;
-                        compare::compare("random", &sql, &answer, &[typed], false)?.map(|diff| {
-                            format!(
-                                "the answer differs from the oracle's: {}",
-                                one_line(&diff, 300)
-                            )
-                        })
+        let problem = if step.protocols == [QueryProtocol::Flight] {
+            let expected = expected
+                .as_ref()
+                .context("a Flight oracle query needs an oracle")?;
+            let (problem, is_empty) = oracle_query(instance, &sql, expected).await?;
+            empty += u64::from(is_empty);
+            problem
+        } else {
+            let run = async {
+                let answer = protocol_answers(
+                    instance,
+                    &sql,
+                    &step.protocols,
+                    &crate::spiced::Key::Default,
+                )
+                .await?;
+                let is_empty = answer.iter().all(|b| b.num_rows() == 0);
+                if let Some(expected) = expected {
+                    if is_empty && expected.rows.is_empty() {
+                        return Ok(is_empty);
+                    }
+                    let schema = answer.first().context("Spice returned no schema")?.schema();
+                    let typed = compare::type_oracle(&expected, &schema)?;
+                    if let Some(diff) = compare::compare("random", &sql, &answer, &[typed], false)?
+                    {
+                        bail!("the answer differs from the oracle's: {diff}");
                     }
                 }
-            },
+                Ok::<_, anyhow::Error>(is_empty)
+            };
+            match tokio::time::timeout(Duration::from_secs(120), run).await {
+                Ok(Ok(is_empty)) => {
+                    empty += u64::from(is_empty);
+                    None
+                }
+                Ok(Err(e)) => Some(format!("{e:#}")),
+                Err(_) => Some("query did not return within 120s".into()),
+            }
         };
         compared += 1;
         if let Some(problem) = problem {
@@ -175,9 +191,14 @@ pub(super) async fn random_queries(
             .map(|f| format!("{}\n      {}", f.text, f.problem))
             .collect();
         tokio::fs::write(&path, all.join("\n\n")).await?;
+        let problem = if step.protocols == [QueryProtocol::Flight] {
+            "answered differently from the oracle"
+        } else {
+            "failed comparison"
+        };
         return Err(QueryFailures {
             summary: format!(
-                "{} of {compared} queries answered differently from the oracle (all in {}):\n{}",
+                "{} of {compared} queries {problem} (all in {}):\n{}",
                 failures.len(),
                 path.display(),
                 all.iter().take(8).cloned().collect::<Vec<_>>().join("\n")
@@ -186,9 +207,109 @@ pub(super) async fn random_queries(
         }
         .into());
     }
+    let protocols = if step.protocols == [QueryProtocol::Flight] {
+        String::new()
+    } else {
+        format!("; protocols: {:?}", step.protocols)
+    };
     Ok(format!(
-        "{compared} queries matched ({empty} empty on both sides, {unanswerable} the oracle refused)"
+        "{compared} queries matched ({empty} empty on both sides, {unanswerable} the oracle refused){protocols}"
     ))
+}
+
+/// One oracle comparison through the existing Flight query path.
+async fn oracle_query(
+    instance: &mut Instance,
+    sql: &str,
+    expected: &crate::source::TextResult,
+) -> Result<(Option<String>, bool)> {
+    let problem = match instance.spiced.query(sql).await {
+        Err(e) => Some(format!(
+            "Spice rejected it: {}",
+            one_line(&format!("{e:#}"), 300)
+        )),
+        Ok(answer) => match answer.first().map(RecordBatch::schema) {
+            None if expected.rows.is_empty() => return Ok((None, true)),
+            None => Some(format!(
+                "Spice returned no rows, the oracle {}",
+                expected.rows.len()
+            )),
+            Some(schema) => {
+                if expected.rows.is_empty() && answer.iter().all(|b| b.num_rows() == 0) {
+                    return Ok((None, true));
+                }
+                let typed = compare::type_oracle(expected, &schema)?;
+                compare::compare("random", sql, &answer, &[typed], false)?.map(|diff| {
+                    format!(
+                        "the answer differs from the oracle's: {}",
+                        one_line(&diff, 300)
+                    )
+                })
+            }
+        },
+    };
+    Ok((problem, false))
+}
+
+/// Compares transports against one Arrow result, retaining duplicate rows.
+pub(super) async fn protocol_answers(
+    instance: &mut Instance,
+    sql: &str,
+    protocols: &[QueryProtocol],
+    key: &crate::spiced::Key,
+) -> Result<Vec<RecordBatch>> {
+    let baseline = *protocols
+        .iter()
+        .find(|p| **p != QueryProtocol::Http)
+        .context("protocol comparison needs an Arrow transport")?;
+    let answer = match baseline {
+        QueryProtocol::Flight if protocols.len() == 1 => instance.spiced.query_as(sql, key).await,
+        QueryProtocol::Flight => instance.spiced.query_with_schema(sql, key).await,
+        QueryProtocol::FlightSql => instance.spiced.query_flightsql(sql, key).await,
+        QueryProtocol::Http => unreachable!("baseline is an Arrow transport"),
+    }
+    .with_context(|| format!("{baseline:?} rejected the query"))?;
+    if protocols.len() == 1 {
+        return Ok(answer);
+    }
+    let schema = answer
+        .first()
+        .context("protocol comparison received no schema")?
+        .schema();
+    let expect_empty = answer.iter().all(|b| b.num_rows() == 0);
+    for protocol in protocols.iter().filter(|p| **p != baseline) {
+        match protocol {
+            QueryProtocol::Http => {
+                let names: std::collections::BTreeSet<_> =
+                    schema.fields().iter().map(|f| f.name()).collect();
+                ensure!(
+                    names.len() == schema.fields().len(),
+                    "HTTP JSON comparison requires unique column names"
+                );
+                super::query::http_agrees_as(instance, sql, &answer, &schema, expect_empty, key)
+                    .await?;
+            }
+            QueryProtocol::Flight | QueryProtocol::FlightSql => {
+                let other = match protocol {
+                    QueryProtocol::Flight => instance.spiced.query_with_schema(sql, key).await?,
+                    QueryProtocol::FlightSql => instance.spiced.query_flightsql(sql, key).await?,
+                    QueryProtocol::Http => unreachable!("handled HTTP above"),
+                };
+                if let Some(other_schema) = other.first().map(RecordBatch::schema) {
+                    ensure!(
+                        schema.as_ref() == other_schema.as_ref(),
+                        "{baseline:?} and {protocol:?} returned different schemas: {schema:?} vs {other_schema:?}"
+                    );
+                }
+                if let Some(diff) =
+                    compare::compare_protocol("protocols", sql, &answer, &other, expect_empty)?
+                {
+                    bail!("{baseline:?} and {protocol:?} differ: {diff}");
+                }
+            }
+        }
+    }
+    Ok(answer)
 }
 
 /// Ternary logic partitioning: for each random predicate `p`, the table's
