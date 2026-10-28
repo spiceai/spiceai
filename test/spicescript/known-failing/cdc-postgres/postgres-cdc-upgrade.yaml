@@ -1,3 +1,8 @@
+# Known failing (#15543) from 2.3.x only, intermittently: v2.3.3 sometimes
+# acknowledges the replication slots past what it recorded as applied before a
+# clean stop, so the upgraded runtime rebuilds every dataset from the source
+# (rebuild_cause="acknowledged_past") instead of resuming. The rows still match;
+# the check that nothing was rebuilt fails. From 2.4.x it passes.
 name: postgres-cdc-upgrade
 description: >
   PostgreSQL change capture resumes across an upgrade in place from each of the last

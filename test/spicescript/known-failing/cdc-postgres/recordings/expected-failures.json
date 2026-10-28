@@ -283,6 +283,17 @@
       "may-pass": true
     }
   ],
+  "postgres-cdc-upgrade": [
+    {
+      "run": "postgres-cdc-upgrade[from=2.3.x]",
+      "who": "default",
+      "key": "assert-log: {\"lacks\":\"rebuilt the acceleration from the source\"}",
+      "kind": "other",
+      "signature": "1 log problem in <path>",
+      "group": "cdc-postgres",
+      "may-pass": true
+    }
+  ],
   "upgrade-cdc-after-kill": [
     {
       "run": "upgrade-cdc-after-kill[from=2.3.x]",

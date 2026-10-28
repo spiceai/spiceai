@@ -86,7 +86,6 @@
   "postgres-cdc-random-queries": 46,
   "postgres-cdc-shared-slot": 67,
   "postgres-cdc-truncate": 32,
-  "postgres-cdc-upgrade": 43,
   "postgres-dml": 4,
   "postgres-literals": 13,
   "postgres-types-acceleration": 6,

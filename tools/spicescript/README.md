@@ -50,9 +50,9 @@ target/debug/spicescript --jobs 4 \
   test/spicescript/postgres-cdc-parity.yaml
 # Upgrade scripts start on the release their `from:` names, downloaded once, and move
 # to the build under test at each `upgrade` step; --from replaces that release:
-target/debug/spicescript --spiced dev=target/release/spiced test/spicescript/postgres-cdc-upgrade.yaml
+target/debug/spicescript --spiced dev=target/release/spiced test/spicescript/cayenne-upgrade.yaml
 target/debug/spicescript --from $HOME/.spice/bin/spiced \
-  --spiced dev=target/release/spiced test/spicescript/postgres-cdc-upgrade.yaml
+  --spiced dev=target/release/spiced test/spicescript/cayenne-upgrade.yaml
 # Every instance as a scheduler with one executor, over node mTLS:
 target/debug/spicescript --cluster test/spicescript/query-coverage.yaml
 # Known-failing scripts of one group, without waiting out every limit:
