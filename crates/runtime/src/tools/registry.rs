@@ -25,6 +25,7 @@ use ::search::aggregation::reciprocal_rank::{
     DEFAULT_RRF_K, reciprocal_rank_fusion_scores, usize_to_f64,
 };
 use async_trait::async_trait;
+use datafusion_ddl::component_options::{UNREADABLE_STATEMENT, redact_values};
 use llms::embeddings::{Embed, EmbeddingInput};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -528,8 +529,39 @@ impl SpiceModelTool for ToolRegistryInvokeTool {
         parameters::<ToolInvokeParams>()
     }
 
+    /// The call as the tool it selects records its arguments. One that selects
+    /// no tool runs nothing and is recorded without its arguments, and
+    /// arguments that are not this tool's JSON only as a placeholder.
+    fn recorded_arguments<'a>(&self, arg: &'a str) -> (Cow<'a, str>, Vec<String>) {
+        let Ok(params) = serde_json::from_str::<ToolInvokeParams>(arg) else {
+            return (Cow::Borrowed(UNREADABLE_STATEMENT), Vec::new());
+        };
+        let selected = self.find_tool(&params.tool_id);
+        let (Some(tool), Ok(arguments)) = (selected, invoked_arguments(params.arguments)) else {
+            return (
+                Cow::Owned(json!({ "tool_id": params.tool_id }).to_string()),
+                Vec::new(),
+            );
+        };
+        let (recorded, removed) = tool.recorded_arguments(&arguments);
+        match recorded {
+            Cow::Borrowed(_) => (Cow::Borrowed(arg), removed),
+            Cow::Owned(recorded) => {
+                let arguments =
+                    serde_json::from_str::<Value>(&recorded).unwrap_or(Value::String(recorded));
+                (
+                    Cow::Owned(
+                        json!({ "tool_id": params.tool_id, "arguments": arguments }).to_string(),
+                    ),
+                    removed,
+                )
+            }
+        }
+    }
+
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::tool_invoke", tool = self.name().to_string(), input = arg);
+        let (input, removed) = self.recorded_arguments(arg);
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::tool_invoke", tool = self.name().to_string(), input = %input);
 
         let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let params: ToolInvokeParams = serde_json::from_str(arg)?;
@@ -549,11 +581,7 @@ impl SpiceModelTool for ToolRegistryInvokeTool {
             };
 
             let tool_id = tool.name().to_string();
-            let arguments = match params.arguments {
-                Some(Value::String(arguments)) => arguments,
-                Some(Value::Null) | None => "{}".to_string(),
-                Some(arguments) => serde_json::to_string(&arguments)?,
-            };
+            let arguments = invoked_arguments(params.arguments)?;
 
             let result = tool.call(&arguments).await.map_err(|source| {
                 ToolRegistryError::ToolInvokeFailed {
@@ -576,10 +604,21 @@ impl SpiceModelTool for ToolRegistryInvokeTool {
                 Ok(value)
             }
             Err(e) => {
-                tracing::error!(target: "task_history", parent: &span, "{e}");
+                let message = e.to_string();
+                let message = redact_values(&message, &removed);
+                tracing::error!(target: "task_history", parent: &span, "{message}");
                 Err(e)
             }
         }
+    }
+}
+
+/// The arguments a `tool_invoke` call passes to the tool it selects.
+fn invoked_arguments(arguments: Option<Value>) -> Result<String, serde_json::Error> {
+    match arguments {
+        Some(Value::String(arguments)) => Ok(arguments),
+        Some(Value::Null) | None => Ok("{}".to_string()),
+        Some(arguments) => serde_json::to_string(&arguments),
     }
 }
 
@@ -1667,6 +1706,87 @@ mod tests {
             .lock()
             .expect("received args lock should not be poisoned");
         assert_eq!(received_args.as_slice(), [r#"{"query":"select 1"}"#]);
+    }
+
+    /// A tool that records its arguments without the word `hunter2`.
+    struct RedactingTool;
+
+    #[async_trait]
+    impl SpiceModelTool for RedactingTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed("sql")
+        }
+
+        fn description(&self) -> Option<Cow<'_, str>> {
+            None
+        }
+
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+
+        async fn call(
+            &self,
+            _arg: &str,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(json!({"rows": 0}))
+        }
+
+        fn recorded_arguments<'a>(&self, arg: &'a str) -> (Cow<'a, str>, Vec<String>) {
+            (
+                Cow::Owned(arg.replace("hunter2", "<redacted>")),
+                vec!["hunter2".to_string()],
+            )
+        }
+    }
+
+    /// `tool_invoke` records the arguments it passes on as the tool it selects
+    /// records them, so an agent's definition keeps its credentials out of task
+    /// history on this path too.
+    #[test]
+    fn invoke_records_arguments_as_the_selected_tool_does() {
+        let advertised_tools = tool_registry_tools(
+            vec![Arc::new(RedactingTool) as Arc<dyn SpiceModelTool>],
+            mock_embed(),
+        );
+        let invoke_tool = advertised_tools
+            .iter()
+            .find(|tool| tool.name() == TOOL_INVOKE_NAME)
+            .expect("tool_invoke should be advertised");
+        let recorded_json = |arg: &str| -> Value {
+            serde_json::from_str(&invoke_tool.recorded_arguments(arg).0)
+                .expect("the recorded call is JSON")
+        };
+
+        let (recorded, removed) = invoke_tool.recorded_arguments(
+            r#"{"tool_id":"sql","arguments":{"query":"CREATE TABLE t WITH (pg_pass = 'hunter2')"}}"#,
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&recorded).expect("the recorded call is JSON"),
+            json!({"tool_id": "sql", "arguments": {"query": "CREATE TABLE t WITH (pg_pass = '<redacted>')"}})
+        );
+        assert_eq!(removed, ["hunter2"]);
+
+        // Arguments given as a string are recorded the same way.
+        assert_eq!(
+            recorded_json(
+                r#"{"tool_id":"sql","arguments":"{\"query\":\"CREATE TABLE t WITH (pg_pass = 'hunter2')\"}"}"#
+            ),
+            json!({"tool_id": "sql", "arguments": {"query": "CREATE TABLE t WITH (pg_pass = '<redacted>')"}})
+        );
+
+        // A call that selects no tool runs nothing, and keeps none of its
+        // arguments; arguments that are not JSON keep nothing at all.
+        assert_eq!(
+            recorded_json(r#"{"tool_id":"missing","arguments":{"query":"hunter2"}}"#),
+            json!({"tool_id": "missing"})
+        );
+        assert_eq!(
+            invoke_tool
+                .recorded_arguments("CREATE TABLE t WITH (pg_pass = 'hunter2')")
+                .0,
+            UNREADABLE_STATEMENT
+        );
     }
 
     #[tokio::test]

@@ -56,8 +56,10 @@ pub enum Error {
 }
 
 pub const PARAMETERS: &[ParameterSpec] = &[
+    // Secret: a metadata database's connection string carries its password.
     ParameterSpec::component("connection_string")
-        .description("The DuckLake connection string (e.g., 's3://bucket/path/metadata.ducklake'). If omitted, the catalog id from `from: ducklake:<connection_string>` is used."),
+        .description("The DuckLake connection string (e.g., 's3://bucket/path/metadata.ducklake'). If omitted, the catalog id from `from: ducklake:<connection_string>` is used.")
+        .secret(),
     ParameterSpec::component("name")
         .description("The name to attach the DuckLake catalog as in DuckDB. Defaults to 'ducklake'."),
     ParameterSpec::component("open")

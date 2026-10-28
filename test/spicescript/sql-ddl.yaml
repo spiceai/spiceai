@@ -117,6 +117,32 @@ steps:
       headers: { content-type: application/json }
       body: '{"query": "CREATE TABLE p12 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-tool-call'')"}'
     expect: { body-contains: p12 }
+  # A parameters map written as something other than a map.
+  - spice-exec: "CREATE TABLE p13 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.params = JSON '[{\"cayenne_s3_secret\": \"leak-params-not-a-map\"}]')"
+    expect-error: true
+  # `ATTACH`, which parses but which Spice does not run.
+  - spice-exec: "ATTACH 'host=db.internal user=app password=leak-attach-parses dbname=sales' AS p14"
+    expect-error: true
+  # Through the tool: a mistyped keyword, and arguments that are not its JSON.
+  - http:
+      method: POST
+      path: /v1/tools/sql
+      headers: { content-type: application/json }
+      body: '{"query": "CRATE TABLE p15 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-tool-typo'')"}'
+    expect: { body-contains: CRATE }
+  - http:
+      method: POST
+      path: /v1/tools/sql
+      headers: { content-type: application/json }
+      body: '{"query": "CRATE TABLE p16 WITH (pg_pass = ''leak-tool-not-json'')"'
+    expect: { body-contains: EOF }
+  # Through `tool_invoke`, which a model that searches for tools calls.
+  - http:
+      method: POST
+      path: /v1/tools/tool_invoke
+      headers: { content-type: application/json }
+      body: '{"tool_id": "sql", "arguments": {"query": "CREATE TABLE p17 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-tool-invoke'')"}}'
+    expect: { body-contains: p17 }
   - spice-exec: "CREATE TABLE p_last WITH (from = 'postgres:public.t', pg_host = '127.0.0.1', pg_port = 1, pg_db = 'd', pg_pass = 'leak-last')"
     expect-error: true
   # Task history, as a read-only key reads it, once the last statement is in it.

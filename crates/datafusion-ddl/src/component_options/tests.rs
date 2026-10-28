@@ -959,6 +959,26 @@ fn a_statement_records_no_secret_however_it_is_written() {
             "CREATE TABLE p13 WITH (\n  from = 'file:o.csv',\n  -- pg_pass = 'hunter2',\n  file_format = 'csv'\n)".to_string(),
             "CREATE TABLE p13 WITH (\n  from = 'file:o.csv',\n  \n  file_format = 'csv'\n)".to_string(),
         ),
+        // A parameters map written as something other than a map, at the top
+        // or inside a structured value, is taken out whole.
+        (
+            r#"CREATE TABLE p14 WITH (from = 'file:o.csv', params = JSON '[{"pg_pass": "hunter2"}]')"#.to_string(),
+            r#"CREATE TABLE p14 WITH (from = 'file:o.csv', params = JSON '"<redacted>"')"#.to_string(),
+        ),
+        (
+            r#"CREATE TABLE p15 WITH (from = 'file:o.csv', acceleration.params = JSON '"cayenne_s3_secret=hunter2"')"#.to_string(),
+            r#"CREATE TABLE p15 WITH (from = 'file:o.csv', acceleration.params = JSON '"<redacted>"')"#.to_string(),
+        ),
+        (
+            r#"CREATE TABLE p16 WITH (from = 'file:o.csv', "columns.name.embeddings" = JSON '[{"from": "m", "params": ["hunter2"]}]')"#.to_string(),
+            r#"CREATE TABLE p16 WITH (from = 'file:o.csv', "columns.name.embeddings" = JSON '[{"from":"m","params":"<redacted>"}]')"#.to_string(),
+        ),
+        // `ATTACH`, which Spice does not run but other engines connect a
+        // database with.
+        (
+            "ATTACH 'host=db user=app password=hunter2' AS pg".to_string(),
+            "ATTACH '<redacted>' AS pg".to_string(),
+        ),
     ] {
         let recorded_text = redact_secret_option_values(&sql, &dialect, &shown);
         assert_eq!(recorded_text, recorded, "{sql}");
@@ -973,6 +993,7 @@ fn a_statement_records_no_secret_however_it_is_written() {
         "SELECT 'hunter2'",
         "SELECT created_at FROM t WHERE altered = 'hunter2'",
         "SELECT 'CREATE TABLE t WITH (pg_pass = ''hunter2'')'",
+        "SELECT attachment FROM mail WHERE subject = 'hunter2'",
         "DROP TABLE t",
     ] {
         assert!(
@@ -1017,6 +1038,21 @@ fn values_taken_out_of_the_text_are_taken_out_of_its_error() {
         redact_values("Dataset 't' cannot be loaded", &recorded.removed),
         Cow::Borrowed(_)
     ));
+
+    // Each value in a parameters map that is not a map, which the definition's
+    // reader quotes when it cannot read the map.
+    let recorded = recorded_statement(
+        r#"CREATE TABLE t WITH (from = 'file:o.csv', acceleration.params = JSON '[{"cayenne_s3_secret": "hunter2"}]')"#,
+        &dialect,
+        &shown,
+    );
+    assert_eq!(
+        redact_values(
+            r#"YAML deserialization error: expected mapping, found Sequence([Mapping({String("cayenne_s3_secret"): String("hunter2")})])"#,
+            &recorded.removed
+        ),
+        r#"YAML deserialization error: expected mapping, found Sequence([Mapping({String("cayenne_s3_secret"): String("<redacted>")})])"#
+    );
 }
 
 /// A value is a reference exactly when the runtime resolves it as one:

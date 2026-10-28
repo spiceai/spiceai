@@ -59,9 +59,11 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .description("The ADBC driver name (e.g., 'duckdb', 'sqlite', 'postgres', 'snowflake')")
         .required(),
     ParameterSpec::component("driver_path").description("Optional path to the ADBC driver library"),
+    // Secret: a database URI can carry a user and password.
     ParameterSpec::component("uri")
         .description("Database URI/connection string for the ADBC driver")
-        .required(),
+        .required()
+        .secret(),
     ParameterSpec::component("username")
         .description("Username for database authentication")
         .secret(),

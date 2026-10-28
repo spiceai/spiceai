@@ -110,13 +110,32 @@ pub fn recorded_statement<'a>(
     dialect: &dyn Dialect,
     shown: &dyn Fn(&str) -> bool,
 ) -> RecordedStatement<'a> {
-    // Every statement that defines a component has the keyword `CREATE` or
-    // `ALTER`, which a dialect spells in ASCII in any case: a check cheap
-    // enough for every query, so only the text that passes it is tokenized.
-    if !mentions(sql, b"create") && !mentions(sql, b"alter") {
+    // A dialect spells each of the keywords in ASCII in any case: a check
+    // cheap enough for every query, so only the text that passes it is
+    // tokenized.
+    if !DEFINING_KEYWORDS
+        .iter()
+        .any(|(_, spelling)| mentions(sql, spelling))
+    {
         return RecordedStatement::unchanged(sql);
     }
     record(sql, dialect, shown, false)
+}
+
+/// The keywords of a statement that may define a component, with their
+/// spelling: `CREATE`, `ALTER`, and `ATTACH`, which Spice does not run but other
+/// engines connect a database with, so it may carry a credential.
+const DEFINING_KEYWORDS: [(Keyword, &[u8]); 3] = [
+    (Keyword::CREATE, b"create"),
+    (Keyword::ALTER, b"alter"),
+    (Keyword::ATTACH, b"attach"),
+];
+
+/// Whether `token` is one of the [`DEFINING_KEYWORDS`], unquoted.
+fn is_defining_keyword(token: &Token) -> bool {
+    matches!(token, Token::Word(word)
+        if word.quote_style.is_none()
+            && DEFINING_KEYWORDS.iter().any(|(keyword, _)| *keyword == word.keyword))
 }
 
 /// The text of `sql`, a statement that failed to parse, as it may be recorded:
@@ -143,6 +162,11 @@ fn record<'a>(
     let Ok(tokens) = Tokenizer::new(dialect, sql).tokenize_with_location() else {
         return RecordedStatement::unreadable();
     };
+    // Text that names a keyword only inside a word, as a `created_at` column
+    // does, defines nothing: it is returned before its tokens are placed.
+    if !every_statement && !tokens.iter().any(|token| is_defining_keyword(&token.token)) {
+        return RecordedStatement::unchanged(sql);
+    }
     let starts = line_starts(sql);
     let mut toks: Vec<Tok<'_>> = Vec::with_capacity(tokens.len());
     for token in &tokens {
@@ -215,13 +239,10 @@ fn statements(toks: &[Tok<'_>]) -> Vec<Range<usize>> {
     statements
 }
 
-/// Whether the statement `toks` may define a component: it has the keyword
-/// `CREATE` or `ALTER`, wherever it is, as after `EXPLAIN`.
+/// Whether the statement `toks` may define a component: it has one of the
+/// [`DEFINING_KEYWORDS`], wherever it is, as after `EXPLAIN`.
 fn defines(toks: &[Tok<'_>]) -> bool {
-    toks.iter().any(|tok| {
-        matches!(tok.token, Token::Word(word)
-            if word.quote_style.is_none() && matches!(word.keyword, Keyword::CREATE | Keyword::ALTER))
-    })
+    toks.iter().any(|tok| is_defining_keyword(tok.token))
 }
 
 /// Whether a token that is neither a word nor whitespace can carry a value, as
@@ -408,7 +429,7 @@ impl<'s, 't> Recording<'s, 't> {
             match self.token(i) {
                 Token::Word(word) => parts.push(word.value.clone()),
                 Token::SingleQuotedString(s) | Token::DoubleQuotedString(s) => {
-                    parts.push(s.clone())
+                    parts.push(s.clone());
                 }
                 _ => break,
             }
@@ -678,26 +699,30 @@ fn redact_json_parameters(
     shown: &dyn Fn(&str) -> bool,
     removed: &mut Vec<String>,
 ) -> bool {
+    if in_parameters {
+        // A parameters map that is not a map does not validate, and which of
+        // its parts would be a parameter's value cannot be told: all of it is
+        // taken out.
+        let serde_json::Value::Object(map) = value else {
+            take_out(value, removed);
+            return true;
+        };
+        let mut redacted = false;
+        for (key, entry) in map.iter_mut() {
+            let keep = matches!(&*entry,
+                serde_json::Value::String(s) if is_secret_reference(s) || s == REDACTED);
+            if !keep && !shown(key) {
+                take_out(entry, removed);
+                redacted = true;
+            }
+        }
+        return redacted;
+    }
     match value {
         serde_json::Value::Object(map) => {
             let mut redacted = false;
             for (key, entry) in map.iter_mut() {
-                if in_parameters {
-                    let keep = match &*entry {
-                        serde_json::Value::String(s) => is_secret_reference(s) || s == REDACTED,
-                        _ => false,
-                    };
-                    if !keep && !shown(key) {
-                        match &*entry {
-                            serde_json::Value::String(s) => remember(removed, s, true),
-                            other => remember(removed, &other.to_string(), true),
-                        }
-                        *entry = serde_json::Value::String(REDACTED.to_string());
-                        redacted = true;
-                    }
-                } else {
-                    redacted |= redact_json_parameters(entry, is_params_map(key), shown, removed);
-                }
+                redacted |= redact_json_parameters(entry, is_params_map(key), shown, removed);
             }
             redacted
         }
@@ -710,5 +735,36 @@ fn redact_json_parameters(
             redacted
         }
         _ => false,
+    }
+}
+
+/// Take `value` out of a statement: replace it with the placeholder, and
+/// remember it and each value in it.
+fn take_out(value: &mut serde_json::Value, removed: &mut Vec<String>) {
+    remember_json(removed, value);
+    *value = serde_json::Value::String(REDACTED.to_string());
+}
+
+/// Remember `value`, a JSON value taken out of a statement, and each value in
+/// it: an error can quote the whole, as its JSON text, or any part.
+fn remember_json(removed: &mut Vec<String>, value: &serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => remember(removed, s, true),
+        serde_json::Value::Null => {}
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            remember(removed, &value.to_string(), true);
+        }
+        serde_json::Value::Array(items) => {
+            remember(removed, &value.to_string(), true);
+            for item in items {
+                remember_json(removed, item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            remember(removed, &value.to_string(), true);
+            for item in map.values() {
+                remember_json(removed, item);
+            }
+        }
     }
 }

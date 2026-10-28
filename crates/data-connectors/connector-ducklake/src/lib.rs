@@ -95,9 +95,11 @@ impl DuckLakeFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
+    // Secret: a metadata database's connection string carries its password.
     ParameterSpec::component("connection_string")
         .description("The DuckLake connection string (e.g., 's3://bucket/path/metadata.ducklake').")
-        .required(),
+        .required()
+        .secret(),
     ParameterSpec::component("name").description(
         "The name to attach the DuckLake catalog as in DuckDB. Defaults to 'ducklake'.",
     ),
