@@ -503,8 +503,17 @@ impl MetastoreTap {
         use object_store::path::Path;
         use object_store_occ::sim::latency::{Delay, LatencyProfile, LatencyStore};
         use std::time::Duration;
-        let path = std::env::temp_dir().join("cayenne-metastore-tap/shadow.json");
-        let data = match std::fs::read(path) {
+        // Only `--cfg cayenne_metastore_tap` developer builds read this, so a
+        // release build gains no setting. The variable holds the shadow
+        // configuration as JSON, or the path of a JSON file; when it is unset,
+        // `<temp dir>/cayenne-metastore-tap/shadow.json` is read if present.
+        let configured = std::env::var("SPICE_CAYENNE_METASTORE_TAP_SHADOW").ok();
+        let data = match configured {
+            Some(value) if value.trim_start().starts_with('{') => Ok(value.into_bytes()),
+            Some(path) => std::fs::read(path),
+            None => std::fs::read(std::env::temp_dir().join("cayenne-metastore-tap/shadow.json")),
+        };
+        let data = match data {
             Ok(data) => data,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return self,
             Err(e) => {
@@ -555,7 +564,14 @@ impl MetastoreTap {
             Ok((store, prefix)) => self.with_shadow(
                 store,
                 prefix,
-                object_store_occ::headlog::HeadLogConfig::default(),
+                // Records above max_record_bytes / 2 spill to objects; the head keeps
+                // headroom over B + R for its own metadata and batch index.
+                object_store_occ::headlog::HeadLogConfig {
+                    head_budget_bytes: 256 * 1024,
+                    batch_budget_bytes: 64 * 1024,
+                    batch_max_records: 64,
+                    max_record_bytes: 16 * 1024,
+                },
             ),
             Err(e) => {
                 self.shadow = Some(shadow::Shadow::failed(e));

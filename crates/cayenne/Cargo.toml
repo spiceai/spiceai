@@ -9,6 +9,7 @@ version.workspace = true
 autotests = false
 
 [dependencies]
+blake3 = { workspace = true }
 object_store_occ = { path = "../object_store_occ" }
 prost.workspace = true
 cayenne-metastore-actions = { path = "../cayenne-metastore-actions" }

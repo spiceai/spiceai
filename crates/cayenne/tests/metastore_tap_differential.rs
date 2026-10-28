@@ -60,7 +60,9 @@ async fn workload_with_shadow(
             object_store_occ::headlog::HeadLogConfig {
                 head_budget_bytes: 1024 * 1024,
                 batch_budget_bytes: 128 * 1024,
-                max_record_bytes: 128 * 1024,
+                // Records above max_record_bytes / 2 spill to objects; 1 KiB makes
+                // this workload exercise both inline and spilled records.
+                max_record_bytes: 1024,
                 batch_max_records: 1,
             },
         )
@@ -216,13 +218,19 @@ async fn workload_with_shadow(
         let lines = std::fs::read_to_string(dir.path().join("tap.jsonl.shadow.jsonl"))?;
         let mut totals = std::collections::BTreeMap::new();
         let mut accepted = 0;
+        let mut spilled = 0;
         for line in lines.lines() {
             let v: serde_json::Value = serde_json::from_str(line)?;
             for key in ["creates", "cas", "gets", "list", "deletes"] {
                 assert!(v["requests"][key].is_u64(), "{v}");
             }
+            spilled = spilled.max(v["spilled_bytes"].as_u64().expect("spilled bytes"));
+            if v["outcome"] == "failed" {
+                eprintln!("shadow commit failed: {}", v["error"]);
+            }
             if v["outcome"] == "accepted" {
-                accepted += 1;
+                // One drain can pack its records into several group commits.
+                accepted += v["group_commits"].as_u64().expect("group commits");
                 assert!(v["commit_latency_ms"].is_number(), "{v}");
                 assert!(v["head_bytes"].as_u64().expect("head bytes") > 0);
             }
@@ -240,6 +248,7 @@ async fn workload_with_shadow(
         }
         // A negative control's dropped payload makes a later shadow commit fail,
         // which disables that table's shadow; the counters then legitimately differ.
+        assert!(spilled > 0, "no record was spilled to an object");
         if !shadow_negative {
             assert_eq!(accepted, shadow.commits);
             assert_eq!(

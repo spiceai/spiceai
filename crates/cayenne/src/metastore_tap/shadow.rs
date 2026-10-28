@@ -150,6 +150,8 @@ struct Table {
     disabled: bool,
     metadata_bytes: u64,
     checkpoint_bytes: u64,
+    spilled_bytes: u64,
+    config: HeadLogConfig,
     prefix: Path,
 }
 async fn table(store: Arc<dyn ObjectStore>, prefix: Path, config: HeadLogConfig) -> Result<Table> {
@@ -167,6 +169,8 @@ async fn table(store: Arc<dyn ObjectStore>, prefix: Path, config: HeadLogConfig)
         disabled: false,
         metadata_bytes: 0,
         checkpoint_bytes: 0,
+        spilled_bytes: 0,
+        config,
         prefix,
     })
 }
@@ -271,7 +275,7 @@ async fn run(
                 "payloads": count, "record_bytes": bytes, "head_bytes": t.writer.state().head.encoded_len(),
                 "requests": t.store.take_counts(), "checkpoint_bytes": report.checkpoint_bytes_written-checkpoint_before,
                 "commit_latency_ms": latency, "outcome": outcome, "error": result.as_ref().err().map(ToString::to_string),
-                "committed_metadata_bytes": t.metadata_bytes, "checkpoint_bytes_written": t.checkpoint_bytes});
+                "committed_metadata_bytes": t.metadata_bytes, "checkpoint_bytes_written": t.checkpoint_bytes, "spilled_bytes": t.spilled_bytes, "group_commits": report.commits - commits_before});
             if let Some(out) = output.as_mut()
                 && let Err(e) = writeln!(out, "{line}").and_then(|()| out.flush())
             {
@@ -298,6 +302,19 @@ async fn run(
     }
 }
 
+/// One record the tap committed: its original bytes, whether the shadow keeps
+/// it (a negative control may drop one), and its payload as the head log will
+/// carry it (inline, or a reference to a spilled object).
+struct Entry {
+    bytes: Bytes,
+    keep: bool,
+    payload: Option<Bytes>,
+}
+
+/// Bytes a group commit's envelope adds beyond its payloads (attempt id,
+/// generation, framing); a group is packed to stay this far under the budget.
+const GROUP_OVERHEAD: usize = 256;
+
 async fn commit(
     t: &mut Table,
     id: &str,
@@ -307,18 +324,56 @@ async fn commit(
     drop_kind: Option<&str>,
     dropped: &mut bool,
 ) -> Result<()> {
-    *t.store.accepted.lock() = None;
-    let mut records = Vec::new();
+    let config = t.config;
+    let limit = config.max_record_bytes.saturating_sub(GROUP_OVERHEAD);
+    // Pack the queued records into as few group commits as fit the record
+    // budget, in order; each chunk is one head CAS.
+    let mut chunks: Vec<Vec<Entry>> = vec![Vec::new()];
+    let mut size = 0;
     for p in payloads {
         let record = Record::decode(p.bytes.clone())?;
-        t.tap_state.apply(&record)?;
-        if !*dropped
-            && drop_kind.is_some_and(|kind| record.actions.iter().any(|a| a.name() == kind))
-        {
+        let keep = !(!*dropped
+            && drop_kind.is_some_and(|kind| record.actions.iter().any(|a| a.name() == kind)));
+        if !keep {
             *dropped = true;
+            chunks.last_mut().ok_or("no chunk")?.push(Entry { bytes: p.bytes, keep, payload: None });
             continue;
         }
-        records.push(p.bytes);
+        let payload = encode_payload(&mut t.writer, config, &p.bytes, &mut t.spilled_bytes).await?;
+        let len = payload.len() + 8;
+        let current = chunks.last().ok_or("no chunk")?;
+        if current.iter().any(|e| e.keep) && size + len > limit {
+            chunks.push(Vec::new());
+            size = 0;
+        }
+        size += len;
+        chunks
+            .last_mut()
+            .ok_or("no chunk")?
+            .push(Entry { bytes: p.bytes, keep, payload: Some(payload) });
+    }
+    for chunk in chunks {
+        commit_chunk(t, id, chunk, receipts, report).await?;
+    }
+    Ok(())
+}
+
+async fn commit_chunk(
+    t: &mut Table,
+    id: &str,
+    chunk: Vec<Entry>,
+    receipts: &std::path::Path,
+    report: &mut ShadowReport,
+) -> Result<()> {
+    *t.store.accepted.lock() = None;
+    let mut records = Vec::new();
+    let mut encoded = Vec::new();
+    for entry in chunk {
+        t.tap_state.apply(&Record::decode(entry.bytes.clone())?)?;
+        if entry.keep {
+            records.push(entry.bytes);
+            encoded.push(entry.payload.ok_or("kept entry without payload")?);
+        }
     }
     if records.is_empty() {
         return Ok(());
@@ -332,7 +387,7 @@ async fn commit(
     let previous_floor = t.writer.state().head.floor;
     let outcome = t
         .writer
-        .commit_group(records.clone(), |attempt| {
+        .commit_group(encoded, |attempt| {
             let persist = || -> Result<()> {
                 let data = serde_json::to_vec(attempt)?;
                 let mut f = std::fs::OpenOptions::new()
@@ -355,6 +410,7 @@ async fn commit(
     if t.writer.state().head.floor > previous_floor {
         report.published_checkpoints += 1;
     }
+    let records_count = records.len();
     for bytes in records {
         t.state.apply(&Record::decode(bytes)?)?;
     }
@@ -398,18 +454,33 @@ async fn commit(
         let stored = RootEnvelope::decode(stored)?;
         let mut rebuilt = DatasetState::default();
         rebuilt.apply(&Record::decode(stored.root.as_slice())?)?;
-        let same = match (rebuilt.tables.get(id), expected) {
-            (Some(actual), Some(expected)) => differences(expected, actual).is_empty(),
-            (None, None) => true,
-            _ => false,
+        let diffs = match (rebuilt.tables.get(id), expected) {
+            (Some(actual), Some(expected)) => differences(expected, actual),
+            (None, None) => Vec::new(),
+            (actual, expected) => vec![format!(
+                "table presence: checkpoint {}, tap {}",
+                actual.is_some(),
+                expected.is_some()
+            )],
         };
+        let same = diffs.is_empty();
         report.verified_checkpoints += 1;
         if !same {
             report.checkpoint_mismatches += 1;
             report.differences.push(format!(
                 "{id}: checkpoint {at} differs from tap at its commit"
             ));
-            return Err(format!("checkpoint {at} differs from tap").into());
+            let direct = match (state.tables.get(id), expected) {
+                (Some(actual), Some(expected)) => differences(expected, actual).len(),
+                _ => usize::MAX,
+            };
+            return Err(format!(
+                "checkpoint {at} differs from tap (head commit {}, saved ends {:?}, state-vs-tap diffs without the root round trip {direct}): {}",
+                t.writer.state().head.commit,
+                t.ends.keys().collect::<Vec<_>>(),
+                diffs.join("; ")
+            )
+            .into());
         }
         report.checkpoints += 1;
         report.checkpoint_bytes_written += root.len() as u64;
@@ -419,15 +490,64 @@ async fn commit(
     }
     Ok(())
 }
+/// Group payloads are tagged: an inline record, or a reference to a record that
+/// was too large to travel in the head and was written as an immutable object
+/// named by its BLAKE3 digest (the design's "data out of the log").
+const INLINE: u8 = 0;
+const SPILLED: u8 = 1;
+
+fn spill_threshold(config: HeadLogConfig) -> usize {
+    config.max_record_bytes / 2
+}
+
+async fn encode_payload(
+    writer: &mut Writer,
+    config: HeadLogConfig,
+    record: &Bytes,
+    spilled_bytes: &mut u64,
+) -> Result<Bytes> {
+    if record.len() <= spill_threshold(config) {
+        let mut out = Vec::with_capacity(record.len() + 1);
+        out.push(INLINE);
+        out.extend_from_slice(record);
+        return Ok(out.into());
+    }
+    let name = format!("records/{}", blake3::hash(record).to_hex());
+    let reference = writer.upload(&name, record.clone()).await?;
+    *spilled_bytes += record.len() as u64;
+    let mut out = Vec::with_capacity(reference.path.as_ref().len() + 1);
+    out.push(SPILLED);
+    out.extend_from_slice(reference.path.as_ref().as_bytes());
+    Ok(out.into())
+}
+
+async fn decode_payload(store: &Arc<dyn ObjectStore>, payload: &[u8]) -> Result<Record> {
+    match payload.split_first() {
+        Some((&INLINE, record)) => Ok(Record::decode(record)?),
+        Some((&SPILLED, path)) => {
+            let path = Path::parse(std::str::from_utf8(path)?)?;
+            let bytes = store.get(&path).await?.bytes().await?;
+            let expected = path
+                .filename()
+                .ok_or("spilled record reference has no name")?;
+            if blake3::hash(&bytes).to_hex().as_str() != expected {
+                return Err(format!("spilled record {path} does not match its digest").into());
+            }
+            Ok(Record::decode(bytes)?)
+        }
+        _ => Err("unknown shadow payload tag".into()),
+    }
+}
+
 async fn replay(store: Arc<dyn ObjectStore>, prefix: Path) -> Result<DatasetState> {
-    let (_, opened) = Reader::open(store, prefix).await?;
+    let (_, opened) = Reader::open(Arc::clone(&store), prefix).await?;
     let mut state = DatasetState::default();
     if let Some(root) = opened.checkpoint_root {
         state.apply(&Record::decode(root)?)?;
     }
     for entry in opened.records {
         for payload in Group::decode(entry.record.payload)?.payloads {
-            state.apply(&Record::decode(payload)?)?;
+            state.apply(&decode_payload(&store, &payload).await?)?;
         }
     }
     if !state.unknown.is_empty() {
