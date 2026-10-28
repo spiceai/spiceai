@@ -4015,12 +4015,15 @@ pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, 
     );
 }
 
-/// Tier-0 size ceiling for protected-snapshot leveling, in bytes (8 MiB).
+/// Tier-0 size ceiling for protected-snapshot leveling, in bytes (256 KiB).
 ///
 /// Runs at or below this size are tier 0; each subsequent tier is
-/// [`PROTECTED_TIER_GROWTH`]× larger. Function-scoped constant for now —
-/// promote to a `CayenneContext` config knob when the policy stabilizes.
-const PROTECTED_TIER_BASE_BYTES: u64 = 8 * 1024 * 1024;
+/// [`PROTECTED_TIER_GROWTH`]× larger. Tier 0 must sit near the size of one
+/// write's run, which for small CDC and OTLP batches is on the order of
+/// 100 KiB: with a ceiling of several MiB, each new run lands in the same tier
+/// as the growing merge output and is folded into it on every pass, rewriting
+/// that output dozens of times before it levels up.
+const PROTECTED_TIER_BASE_BYTES: u64 = 256 * 1024;
 
 /// Geometric growth factor between protected-snapshot size tiers.
 const PROTECTED_TIER_GROWTH: u64 = 8;
@@ -47779,6 +47782,30 @@ mod tests {
                 oldest_pair_bytes: 8 * gib,
             },
             "the two 1 GiB runs would fit, but the walk is oldest-first by design"
+        );
+    }
+
+    #[test]
+    fn protected_merge_leaves_a_merged_run_alone_when_small_runs_arrive() {
+        // Measured on the Anise warm rig: 500-row writes produce runs of about
+        // 100 KiB, and a merged output grows toward the tier-0 ceiling. Eight new
+        // runs merge with each other; the 7 MiB output is not rewritten to absorb
+        // them.
+        let mib = 1024 * 1024;
+        let mut inputs = vec![sized("merged", 7 * mib)];
+        let small: Vec<String> = (1..=8).map(|i| format!("s{i}")).collect();
+        inputs.extend(small.iter().map(|id| sized(id, 100 * 1024)));
+        assert_eq!(
+            select_protected_snapshot_merge_tier(
+                &inputs,
+                8,
+                PROTECTED_MERGE_MAX_WIDTH,
+                PROTECTED_TIER_BASE_BYTES,
+                PROTECTED_TIER_GROWTH,
+                None,
+                None,
+            ),
+            ProtectedMergeSelection::Merge(small.into_iter().map(|id| (id, 0)).collect()),
         );
     }
 
