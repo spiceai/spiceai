@@ -4,14 +4,17 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::future::try_join_all;
+use futures::{StreamExt, TryStreamExt};
 use object_store::{GetOptions, ObjectStore, ObjectStoreExt, path::Path};
 use prost::Message;
 
 use super::{
     Batch, Head, HeadState, Result, decode_head, decode_record, invalid, load_checkpoint, numbered,
-    read_head,
+    read_head, spilled_path,
 };
+
+/// Default bound on a reader's concurrent GETs (batches and spilled payloads).
+pub const DEFAULT_READ_CONCURRENCY: usize = 32;
 
 /// One accepted record with its dense commit number.
 #[derive(Clone, Debug, PartialEq)]
@@ -42,13 +45,29 @@ pub struct Reader {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
     state: HeadState,
+    concurrency: usize,
 }
 
 impl Reader {
-    /// GET head, then fetch the checkpoint and all listed batches concurrently.
+    /// GET head, then fetch the checkpoint and the listed batches, at most
+    /// [`DEFAULT_READ_CONCURRENCY`] GETs at a time.
     /// # Errors
     /// Missing referenced objects, malformed history, and transport failures are errors.
     pub async fn open(store: Arc<dyn ObjectStore>, prefix: Path) -> Result<(Self, Opened)> {
+        Self::open_with_concurrency(store, prefix, DEFAULT_READ_CONCURRENCY).await
+    }
+
+    /// [`Self::open`] with an explicit bound on concurrent GETs.
+    /// # Errors
+    /// Missing referenced objects, malformed history, and transport failures are errors.
+    pub async fn open_with_concurrency(
+        store: Arc<dyn ObjectStore>,
+        prefix: Path,
+        concurrency: usize,
+    ) -> Result<(Self, Opened)> {
+        if concurrency == 0 {
+            return invalid("read concurrency must be at least 1");
+        }
         let state = read_head(store.as_ref(), &prefix).await?;
         let head = &state.head;
         let checkpoint = async {
@@ -60,10 +79,12 @@ impl Reader {
                     .map(|c| Some(c.root))
             }
         };
-        let (checkpoint_root, records) = futures::try_join!(
-            checkpoint,
-            records_since(store.as_ref(), &prefix, head, head.floor)
-        )?;
+        let records = async {
+            let records =
+                records_since(store.as_ref(), &prefix, head, head.floor, concurrency).await?;
+            resolve_spilled(store.as_ref(), &prefix, records, concurrency).await
+        };
+        let (checkpoint_root, records) = futures::try_join!(checkpoint, records)?;
         let opened = Opened {
             checkpoint_root,
             floor: head.floor,
@@ -74,6 +95,7 @@ impl Reader {
                 store,
                 prefix,
                 state,
+                concurrency,
             },
             opened,
         ))
@@ -116,8 +138,11 @@ impl Reader {
             &self.prefix,
             &state.head,
             self.state.head.commit,
+            self.concurrency,
         )
         .await?;
+        let records =
+            resolve_spilled(self.store.as_ref(), &self.prefix, records, self.concurrency).await?;
         self.state = state;
         Ok(Poll::Records(records))
     }
@@ -128,6 +153,7 @@ pub(super) async fn records_since(
     prefix: &Path,
     head: &Head,
     after: u64,
+    concurrency: usize,
 ) -> Result<Vec<RecordWithCommit>> {
     let mut first = head.floor + 1;
     let mut reads = Vec::new();
@@ -164,7 +190,9 @@ pub(super) async fn records_since(
                 .collect::<Result<Vec<_>>>()
         });
     }
-    let mut records = try_join_all(reads)
+    let mut records = futures::stream::iter(reads)
+        .buffered(concurrency)
+        .try_collect::<Vec<_>>()
         .await?
         .into_iter()
         .flatten()
@@ -183,4 +211,30 @@ pub(super) async fn records_since(
         return invalid("replay does not cover requested commit range");
     }
     Ok(records)
+}
+
+/// Replace each spilled reference with its payload, verified by length and
+/// BLAKE3 digest. Order is preserved.
+async fn resolve_spilled(
+    store: &dyn ObjectStore,
+    prefix: &Path,
+    records: Vec<RecordWithCommit>,
+    concurrency: usize,
+) -> Result<Vec<RecordWithCommit>> {
+    futures::stream::iter(records.into_iter().map(|mut entry| async move {
+        if let Some(spilled) = entry.record.spilled.take() {
+            let path = spilled_path(prefix, entry.record.generation, &spilled.digest)?;
+            let bytes = store.get(&path).await?.bytes().await?;
+            if bytes.len() as u64 != spilled.len
+                || blake3::hash(&bytes).as_bytes()[..] != spilled.digest[..]
+            {
+                return invalid("spilled payload does not match its reference");
+            }
+            entry.record.payload = bytes;
+        }
+        Ok(entry)
+    }))
+    .buffered(concurrency)
+    .try_collect()
+    .await
 }

@@ -15,6 +15,10 @@ pub struct HeadLogConfig {
     pub max_record_bytes: usize,
     /// Most batch ends the head lists before a checkpoint must trim the index.
     pub max_listed_batches: usize,
+    /// A record whose encoding exceeds this stores its payload as an object and
+    /// keeps only a reference in the window. At most `max_record_bytes`; equal
+    /// to it, records are never spilled and a larger one is refused.
+    pub spill_above_bytes: usize,
 }
 
 impl Default for HeadLogConfig {
@@ -25,6 +29,7 @@ impl Default for HeadLogConfig {
             batch_max_records: 64,
             max_record_bytes: 32 * 1024,
             max_listed_batches: 1024,
+            spill_above_bytes: 16 * 1024,
         }
     }
 }
@@ -44,6 +49,7 @@ impl HeadLogConfig {
         if self.max_record_bytes == 0
             || self.batch_max_records == 0
             || self.max_record_bytes > self.batch_budget_bytes
+            || self.spill_above_bytes > self.max_record_bytes
         {
             return invalid("infeasible head/batch/record budgets".into());
         }
@@ -125,6 +131,18 @@ pub struct Record {
     pub generation: u64,
     #[prost(bytes = "bytes", tag = "3")]
     pub payload: bytes::Bytes,
+    /// Set when the payload is stored as its own object; `payload` is then empty.
+    #[prost(message, optional, tag = "4")]
+    pub spilled: Option<Spilled>,
+}
+
+/// A payload stored at `objects/<generation>/records/<blake3 hex>`.
+#[derive(Clone, PartialEq, Message)]
+pub struct Spilled {
+    #[prost(bytes = "vec", tag = "1")]
+    pub digest: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub len: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]

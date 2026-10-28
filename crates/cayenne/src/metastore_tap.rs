@@ -578,6 +578,8 @@ impl MetastoreTap {
                     batch_max_records: 64,
                     max_record_bytes: 16 * 1024,
                     max_listed_batches: 1024,
+                    // The shadow spills its own payloads above R/2 first.
+                    spill_above_bytes: 16 * 1024,
                 },
             ),
             Err(e) => {

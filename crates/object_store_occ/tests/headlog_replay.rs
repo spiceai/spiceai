@@ -126,6 +126,8 @@ impl Replay {
                 max_record_bytes: 20_000,
                 batch_max_records: 3,
                 max_listed_batches: 64,
+                // The model has no spill: keep every record inline.
+                spill_above_bytes: 20_000,
             }
         } else {
             HeadLogConfig {
@@ -134,6 +136,7 @@ impl Replay {
                 max_record_bytes: 100,
                 batch_max_records: 2,
                 max_listed_batches: 64,
+                spill_above_bytes: 100,
             }
         };
         HeadLog::create(Arc::clone(&object), Path::from("replay"), config)
@@ -686,6 +689,7 @@ impl Replay {
                     attempt_id: vec![0; 16],
                     generation: 1,
                     payload: Bytes::copy_from_slice(&payload),
+                    spilled: None,
                 })
                 .encoded_len()
                     < size
@@ -721,6 +725,7 @@ impl Replay {
                             attempt_id: vec![42; 16],
                             generation: lease,
                             payload: payload.clone(),
+                            spilled: None,
                         };
                         head.window.push(object_store_occ::headlog::WindowRecord {
                             encoded: record.encode_to_vec(),

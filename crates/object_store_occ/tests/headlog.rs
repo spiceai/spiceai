@@ -19,7 +19,7 @@ use object_store::{
     ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
 use object_store_occ::headlog::{
-    HeadLog, HeadLogConfig, Outcome, Poll, PreparedAttempt, Reader, Writer,
+    HeadLog, HeadLogConfig, Outcome, Poll, PreparedAttempt, Reader, Record, Writer,
 };
 use object_store_occ::{Expected, LocalConditionalPut, conditional_put};
 use prost::Message;
@@ -32,6 +32,7 @@ fn config() -> HeadLogConfig {
         max_record_bytes: 100,
         // headlog_500_records_cold_open_and_lagging_poll lists 125 batches.
         max_listed_batches: 256,
+        spill_above_bytes: 100,
     }
 }
 
@@ -879,6 +880,7 @@ async fn headlog_budget_below_b_plus_r_plus_m_is_refused_at_construction() {
             max_record_bytes: 100,
             batch_max_records: 64,
             max_listed_batches: 16,
+            spill_above_bytes: 100,
         };
         let error = HeadLog::create(Arc::clone(&backend.store), backend.prefix.clone(), bounds)
             .await
@@ -925,6 +927,97 @@ async fn headlog_budget_below_b_plus_r_plus_m_is_refused_at_construction() {
             head.batches.len() * 2 + head.window.len(),
             20,
             "two maximum records per batch"
+        );
+    }
+}
+
+#[tokio::test]
+async fn headlog_spills_large_records_and_verifies_them_on_read() {
+    for backend in backends() {
+        let spilling = HeadLogConfig {
+            spill_above_bytes: 70,
+            ..config()
+        };
+        HeadLog::create(Arc::clone(&backend.store), backend.prefix.clone(), spilling)
+            .await
+            .expect("create");
+        let mut writer = Writer::take_over(
+            Arc::clone(&backend.store),
+            backend.prefix.clone(),
+            spilling,
+            1,
+        )
+        .await
+        .expect("owner");
+        // Inline below the threshold, spilled above it, and spilled far above R.
+        let payloads = [vec![1_u8; 10], vec![2; 78], vec![3; 10_000]];
+        for payload in &payloads {
+            append(&mut writer, Bytes::from(payload.clone())).await;
+        }
+        let spilled = writer
+            .state()
+            .head
+            .window
+            .iter()
+            .map(|r| {
+                let record = Record::decode(r.encoded.as_slice()).expect("record");
+                (
+                    record.spilled.is_some(),
+                    record.payload.len(),
+                    r.encoded.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        // The reference record encodes to 58 bytes: id, generation, digest, length.
+        assert_eq!(
+            spilled,
+            vec![(false, 10, 32), (true, 0, 58), (true, 0, 59)],
+            "window keeps references, not payloads"
+        );
+        let digest = blake3::hash(&payloads[2]);
+        let path = backend
+            .prefix
+            .clone()
+            .join("objects")
+            .join("00000000000000000001")
+            .join("records")
+            .join(digest.to_hex().as_str());
+        assert_eq!(
+            backend
+                .store
+                .get(&path)
+                .await
+                .expect("spilled object")
+                .bytes()
+                .await
+                .expect("bytes"),
+            payloads[2]
+        );
+        let (_, opened) = Reader::open(Arc::clone(&backend.store), backend.prefix.clone())
+            .await
+            .expect("open");
+        assert_eq!(
+            opened
+                .records
+                .iter()
+                .map(|r| r.record.payload.to_vec())
+                .collect::<Vec<_>>(),
+            payloads.to_vec()
+        );
+        // A spilled object whose bytes no longer match the reference is an error,
+        // never a wrong payload.
+        backend
+            .store
+            .put(&path, Bytes::from(vec![4_u8; 10_000]).into())
+            .await
+            .expect("corrupt spilled object");
+        let error = Reader::open(Arc::clone(&backend.store), backend.prefix.clone())
+            .await
+            .err()
+            .expect("corrupt payload must fail the open");
+        assert_eq!(
+            error.to_string(),
+            "Invalid head log: spilled payload does not match its reference"
         );
     }
 }

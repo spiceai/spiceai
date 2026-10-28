@@ -501,6 +501,15 @@ async fn open(args: &[String], store: Arc<CountingStore>, out: &mut Output) {
         ..HeadLogConfig::default()
     };
     let record_size = 8160;
+    let concurrency = std::env::var("ONP_READ_CONCURRENCY")
+        .map_or(object_store_occ::headlog::DEFAULT_READ_CONCURRENCY, |v| {
+            v.parse().expect("ONP_READ_CONCURRENCY")
+        });
+    writeln!(
+        out.report,
+        "read concurrency (ONP_READ_CONCURRENCY): {concurrency}"
+    )
+    .expect("report");
     for arm in &args[4..] {
         let (tail, ckpt) = pair(arm);
         let prefix = Path::from(format!("open/{arm}"));
@@ -532,10 +541,13 @@ async fn open(args: &[String], store: Arc<CountingStore>, out: &mut Output) {
         for i in 0..samples {
             let c = store.snapshot();
             let start = Instant::now();
-            let (_, opened) =
-                Reader::open(Arc::clone(&store) as Arc<dyn ObjectStore>, prefix.clone())
-                    .await
-                    .expect("open");
+            let (_, opened) = Reader::open_with_concurrency(
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
+                prefix.clone(),
+                concurrency,
+            )
+            .await
+            .expect("open");
             let elapsed = start.elapsed();
             let c = store.snapshot().since(c);
             assert_eq!(opened.records.len() as u64, expected);

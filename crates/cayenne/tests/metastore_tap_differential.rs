@@ -74,6 +74,7 @@ async fn workload_with_reader(
                 max_record_bytes: 1024,
                 batch_max_records: 1,
                 max_listed_batches: 1024,
+                spill_above_bytes: 1024,
             },
         )
     } else {

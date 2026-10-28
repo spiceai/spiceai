@@ -21,8 +21,8 @@ use snafu::Snafu;
 
 use crate::{Expected, conditional_put, probe_conditional_writes};
 use format::{Batch, Checkpoint, decode_record};
-pub use format::{Group, Head, HeadLogConfig, Record, WindowRecord};
-pub use reader::{Opened, Poll, Reader, RecordWithCommit};
+pub use format::{Group, Head, HeadLogConfig, Record, Spilled, WindowRecord};
+pub use reader::{DEFAULT_READ_CONCURRENCY, Opened, Poll, Reader, RecordWithCommit};
 
 /// A protocol, transport, or encoding error. An error never implies rejection.
 #[derive(Debug, Snafu)]
@@ -307,12 +307,33 @@ impl Writer {
             return invalid("resolve the pending attempt before preparing another");
         }
         let attempt_id = uuid::Uuid::new_v4().as_bytes().to_vec();
-        let encoded = Record {
+        let mut record = Record {
             attempt_id: attempt_id.clone(),
             generation: self.generation,
             payload,
+            spilled: None,
+        };
+        let mut encoded = record.encode_to_vec();
+        // A large record would let a few records fill a batch; its payload
+        // goes to an immutable object before the CAS, and the window keeps
+        // only the reference.
+        if encoded.len() > self.config.spill_above_bytes
+            && self.config.spill_above_bytes < self.config.max_record_bytes
+        {
+            let digest = blake3::hash(&record.payload);
+            let spilled = Spilled {
+                digest: digest.as_bytes().to_vec(),
+                len: record.payload.len() as u64,
+            };
+            immutable(
+                self.store.as_ref(),
+                &spilled_path(&self.prefix, self.generation, &spilled.digest)?,
+                std::mem::take(&mut record.payload),
+            )
+            .await?;
+            record.spilled = Some(spilled);
+            encoded = record.encode_to_vec();
         }
-        .encode_to_vec();
         if encoded.len() > self.config.max_record_bytes {
             return invalid("encoded record exceeds max_record_bytes");
         }
@@ -491,8 +512,14 @@ impl Writer {
                 Some(Outcome::Unresolved)
             }
         } else if head.commit >= target {
-            let records =
-                reader::records_since(self.store.as_ref(), &self.prefix, head, target - 1).await?;
+            let records = reader::records_since(
+                self.store.as_ref(),
+                &self.prefix,
+                head,
+                target - 1,
+                reader::DEFAULT_READ_CONCURRENCY,
+            )
+            .await?;
             let record = records.first().ok_or_else(|| Error::Invalid {
                 reason: "resolution record missing".into(),
             })?;
@@ -639,11 +666,17 @@ impl Writer {
             Vec::new()
         };
         attempts.extend(
-            reader::records_since(self.store.as_ref(), &self.prefix, head, head.floor)
-                .await?
-                .into_iter()
-                .filter(|entry| entry.commit <= at)
-                .map(|entry| entry.record.attempt_id),
+            reader::records_since(
+                self.store.as_ref(),
+                &self.prefix,
+                head,
+                head.floor,
+                reader::DEFAULT_READ_CONCURRENCY,
+            )
+            .await?
+            .into_iter()
+            .filter(|entry| entry.commit <= at)
+            .map(|entry| entry.record.attempt_id),
         );
         let checkpoint = Checkpoint {
             root,
@@ -685,6 +718,17 @@ fn ensure_version(version: &UpdateVersion) -> Result<()> {
         return invalid("head store must return an ETag for conditional polling and CAS");
     }
     Ok(())
+}
+fn spilled_path(prefix: &Path, generation: u64, digest: &[u8]) -> Result<Path> {
+    let digest = <[u8; 32]>::try_from(digest).map_err(|_| Error::Invalid {
+        reason: "spilled payload digest is not 32 bytes".into(),
+    })?;
+    Ok(prefix
+        .clone()
+        .join("objects")
+        .join(format!("{generation:020}"))
+        .join("records")
+        .join(blake3::Hash::from_bytes(digest).to_hex().as_str()))
 }
 fn numbered(prefix: &Path, directory: &str, number: u64) -> Path {
     prefix.clone().join(directory).join(format!("{number:020}"))
