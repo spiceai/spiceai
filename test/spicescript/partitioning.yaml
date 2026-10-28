@@ -1,0 +1,65 @@
+name: partitioning
+description: >
+  Partitioned accelerations answer as PostgreSQL does, and scan less for a
+  filter on the partition expression: Arrow partitioned by bucket (with a
+  primary-key hash index and sort columns), Cayenne partitioned by bucket, by
+  two expressions, by a key with NULLs and by date_part, and Cayenne
+  unpartitioned (file pruning by statistics). A refresh_sql may use bucket(),
+  and a full refresh that narrows removes the rows it no longer reads.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  arrow-bucket: { datasets: { t: { acceleration: { engine: arrow, partition_by: ['bucket(3, id)'] } } } }
+  arrow-indexed:
+    datasets:
+      t: { acceleration: { engine: arrow, partition_by: ['bucket(3, id)'], primary_key: id, params: { sort_columns: score } } }
+  cayenne-bucket: { datasets: { t: { acceleration: { partition_by: ['bucket(4, id)'] } } } }
+  cayenne-multi: { datasets: { t: { acceleration: { partition_by: ['bucket(3, id)', 'bucket(2, score)'] } } } }
+  cayenne-name: { datasets: { t: { acceleration: { partition_by: ['bucket(3, name)'] } } } }
+  cayenne-date: { datasets: { t: { acceleration: { partition_by: ["date_part('month', order_date)"] } } } }
+  cayenne-plain: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: partitioning
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+    - from: postgres:public.b
+      name: b
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        refresh_sql: SELECT * FROM b WHERE bucket(5, id) = 0
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: { file: seed/partitioning-postgres.sql }
+  - start: {}
+  - corpus: corpus/partitioning.sql
+  - query: SELECT id FROM b ORDER BY id
+    expect: { rows: [['7'], ['8'], ['10']] }
+
+  # A full refresh narrowed by refresh_sql removes the rows it no longer reads.
+  - refresh: { dataset: t, refresh-sql: SELECT * FROM t WHERE id = 1 }
+  - query: SELECT * FROM t
+    oracle-sql: SELECT * FROM t WHERE id = 1
+    eventually: 30s
+  - refresh: { dataset: t, refresh-sql: SELECT * FROM t WHERE id > 1000000 }
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['0']] }
+    eventually: 30s

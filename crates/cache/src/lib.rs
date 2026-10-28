@@ -319,7 +319,6 @@ pub enum HashBuilder {
     Siphash(std::hash::RandomState),
     Blake3,
     XxHash3(std::hash::BuildHasherDefault<twox_hash::XxHash3_64>),
-    XxHash32(std::hash::BuildHasherDefault<twox_hash::XxHash32>),
     XxHash64(std::hash::BuildHasherDefault<twox_hash::XxHash64>),
     XxHash128,
 }
@@ -333,7 +332,6 @@ impl std::hash::BuildHasher for HashBuilder {
             HashBuilder::Siphash(builder) => KeyHasher::Siphash(builder.build_hasher()),
             HashBuilder::Blake3 => KeyHasher::Blake3(Box::new(blake3_compat::Blake3Wrapper::new())),
             HashBuilder::XxHash3(builder) => KeyHasher::XxHash3(builder.build_hasher()),
-            HashBuilder::XxHash32(builder) => KeyHasher::XxHash32(builder.build_hasher()),
             HashBuilder::XxHash64(builder) => KeyHasher::XxHash64(builder.build_hasher()),
             HashBuilder::XxHash128 => {
                 KeyHasher::XxHash128(xxhash_compat::XxHash3_128Wrapper::new())
@@ -354,7 +352,6 @@ pub enum KeyHasher {
     Siphash(std::collections::hash_map::DefaultHasher),
     Blake3(Box<blake3_compat::Blake3Wrapper>),
     XxHash3(twox_hash::XxHash3_64),
-    XxHash32(twox_hash::XxHash32),
     XxHash64(twox_hash::XxHash64),
     XxHash128(xxhash_compat::XxHash3_128Wrapper),
 }
@@ -366,7 +363,6 @@ macro_rules! dispatch_key_hasher {
             Self::Siphash(hasher) => hasher.$method($($arg),*),
             Self::Blake3(hasher) => hasher.$method($($arg),*),
             Self::XxHash3(hasher) => hasher.$method($($arg),*),
-            Self::XxHash32(hasher) => hasher.$method($($arg),*),
             Self::XxHash64(hasher) => hasher.$method($($arg),*),
             Self::XxHash128(hasher) => hasher.$method($($arg),*),
         }
@@ -443,12 +439,13 @@ pub fn get_hash_builder(hashing_algorithm: HashingAlgorithm) -> Result<HashBuild
         HashingAlgorithm::XXH3 => Ok(HashBuilder::XxHash3(std::hash::BuildHasherDefault::<
             twox_hash::XxHash3_64,
         >::default())),
-        HashingAlgorithm::XXH32 => Ok(HashBuilder::XxHash32(std::hash::BuildHasherDefault::<
-            twox_hash::XxHash32,
-        >::default())),
-        HashingAlgorithm::XXH64 => Ok(HashBuilder::XxHash64(std::hash::BuildHasherDefault::<
-            twox_hash::XxHash64,
-        >::default())),
+        // A cache key is the bare 64-bit hash, so a 32-bit hash would leave half of it
+        // zero and let distinct queries share an entry; `xxh32` keys with XXH64.
+        HashingAlgorithm::XXH32 | HashingAlgorithm::XXH64 => {
+            Ok(HashBuilder::XxHash64(std::hash::BuildHasherDefault::<
+                twox_hash::XxHash64,
+            >::default()))
+        }
         HashingAlgorithm::XXH128 => Ok(HashBuilder::XxHash128),
     }
 }
@@ -746,8 +743,15 @@ impl TableChangeClock {
             .or_insert(at);
     }
 
-    /// Returns the newest instant at which any of `tables` changed, or
-    /// `None` if none of them has been.
+    /// Records a change to every table, so a result whose read began at or before
+    /// `at` is never stored or served, whatever it read.
+    pub(crate) fn record_change_everywhere(&self, at: std::time::Instant) {
+        let mut state = self.state.write();
+        state.discarded_floor = state.discarded_floor.max(Some(at));
+    }
+
+    /// Returns the newest instant at which any of `tables` changed, including a
+    /// change recorded for every table, or `None` if there is none.
     ///
     /// The newest is what a result reading all of them is measured against: any
     /// one of its tables moving on is enough to leave the result behind, so the
@@ -756,13 +760,11 @@ impl TableChangeClock {
         &self,
         tables: &HashSet<TableReference, S>,
     ) -> Option<std::time::Instant> {
-        if tables.is_empty() {
-            return None;
-        }
         let state = self.state.read();
 
         // Any table whose own entry was collapsed away is covered by the floor,
-        // which is `>=` the true instant of every entry it replaced.
+        // which is `>=` the true instant of every entry it replaced. A result that
+        // read no table depends only on definitions, which the floor also covers.
         let mut latest = state.discarded_floor;
         for table_ref in tables {
             latest = latest.max(
@@ -1136,11 +1138,15 @@ impl QueryResultsCacheProvider {
     /// Drops every cached result.
     ///
     /// For a change no table change records: a result's key is the query, not
-    /// the definitions of the functions it called, so when a Spicepod reload
-    /// redefines or removes a user function, any entry may hold rows the old
+    /// the definitions of the functions, views or catalogs it read through, so when
+    /// a Spicepod reload redefines or removes one, any entry may hold rows the old
     /// definition computed. A `cache_key_type: sql` hit is answered before
     /// planning, so discarding cached plans does not reach it; this does.
     pub async fn invalidate_all(&self) {
+        // Stamp before evicting, so a query still running when the definitions
+        // changed cannot store its result once the eviction has finished.
+        self.table_changes
+            .record_change_everywhere(std::time::Instant::now());
         self.cache.invalidate_all().await;
     }
 
@@ -1679,8 +1685,8 @@ mod tests {
         assert_eq!(clock.latest_change(&empty), None);
     }
 
-    /// A table-less result (e.g. `SELECT 1`) records no input tables and must
-    /// stay cacheable — an empty set is not "everything".
+    /// A table-less result (e.g. `SELECT 1`) records no input tables, so a change
+    /// to one table must leave it cacheable.
     #[test]
     fn table_invalidation_clock_ignores_empty_table_set() {
         let clock = TableChangeClock::default();
@@ -1985,6 +1991,37 @@ mod tests {
         assert!(
             provider.tables_changed_since(&tables, read_started_at),
             "a result whose read began before the invalidation must not be stored"
+        );
+    }
+
+    /// A redefinition (a view, catalog or user function) can change what any query
+    /// returns, including one that read no table, so a read that began before
+    /// `invalidate_all` must not be stored afterwards.
+    #[tokio::test]
+    async fn invalidate_all_records_the_invalidation_for_every_read() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        let read_started_at = std::time::Instant::now();
+        let customer: HashSet<TableReference> = HashSet::from([TableReference::bare("customer")]);
+        let no_table: HashSet<TableReference> = HashSet::new();
+        assert!(!provider.tables_changed_since(&customer, read_started_at));
+        assert!(!provider.tables_changed_since(&no_table, read_started_at));
+
+        provider.invalidate_all().await;
+
+        assert!(
+            provider.tables_changed_since(&customer, read_started_at),
+            "a result whose read began before the invalidation must not be stored"
+        );
+        assert!(
+            provider.tables_changed_since(&no_table, read_started_at),
+            "a result that read no table must not be stored either"
+        );
+        assert!(
+            !provider.tables_changed_since(&customer, std::time::Instant::now()),
+            "a read that begins after the invalidation can be stored"
         );
     }
 

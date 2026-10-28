@@ -1,0 +1,98 @@
+name: layout-coverage
+description: >
+  How an acceleration lays data out never changes an answer: Cayenne
+  (default, sorted, clustered, partitioned, zstd), DuckDB and SQLite with
+  indexes answer the extended corpus and ternary logic partitioning as
+  PostgreSQL does, under full refresh and change capture, before and after
+  updates, deletes and inserts at the source. (Turso, an accelerator being
+  retired, is not covered.)
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  refresh_mode: [full, changes]
+
+variants:
+  cayenne: {}
+  cayenne-sorted: { datasets: { t: { acceleration: { params: { cayenne_sort_columns: 'i,dt' } } } } }
+  cayenne-clustered: { datasets: { t: { acceleration: { params: { cayenne_cluster_by: s } } } } }
+  cayenne-partitioned: { datasets: { t: { acceleration: { partition_by: ['bucket(4, id)'] } } } }
+  cayenne-zstd: { datasets: { '*': { acceleration: { params: { cayenne_compression_strategy: zstd } } } } }
+  duckdb:
+    datasets:
+      '*': { acceleration: { engine: duckdb, on_conflict: { id: upsert } } }
+      t: { acceleration: { indexes: { i: enabled, dt: enabled } } }
+  sqlite:
+    datasets:
+      '*': { acceleration: { engine: sqlite, on_conflict: { id: upsert } } }
+      t: { acceleration: { indexes: { i: enabled, dt: enabled } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: layout-coverage
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: '${matrix.refresh_mode}', primary_key: id }
+    - from: postgres:public.u
+      name: u
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: '${matrix.refresh_mode}', primary_key: id }
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - generate:
+      src:
+        table: t
+        rows: 400
+        seed: 31
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: i, int: [-50, 50], nulls: 0.1 }
+          - { name: big, bigint: [0, 10000000000] }
+          - { name: d, decimal: { range: [-100, 100], scale: 2 } }
+          - { name: f, float: [0, 50] }
+          - { name: s, choice: [apple, Apple, APPLE, banana, "O'Brien", naïve, '', under_score, b], nulls: 0.1 }
+          - { name: dt, date: ['2024-01-01', '2024-12-31'] }
+          - { name: ts, timestamp: ['2024-01-01', '2024-12-31'] }
+          - { name: b, bool: 0.33 }
+  - generate:
+      src:
+        table: u
+        rows: 150
+        seed: 32
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: t_id, int: [1, 440] }
+          - { name: label, choice: [red, blue, green] }
+  - start: {}
+  - corpus: corpus/queries-extended.sql
+    eventually: 30s
+
+  # Updates, deletes and inserts, then the same answers.
+  - source-exec:
+      src: |
+        UPDATE t SET i = i + 7, d = d * -1, s = upper(s) WHERE id % 9 = 0;
+        UPDATE t SET dt = dt + 3, b = NOT b WHERE id % 13 = 0;
+        DELETE FROM t WHERE id % 17 = 0;
+        INSERT INTO t SELECT id + 1000, i, big, d, f, s, dt, ts, b FROM t WHERE id % 23 = 0;
+        DELETE FROM u WHERE id % 5 = 0;
+        UPDATE u SET label = 'green' WHERE label = 'red' AND id % 2 = 0;
+  - refresh: t
+    when: { refresh_mode: full }
+  - refresh: u
+    when: { refresh_mode: full }
+  - corpus: corpus/queries-extended.sql
+    eventually: 30s
+  # `decimal-int` keeps clear of Cayenne refusing to filter its files on
+  # arithmetic between a decimal and an integer
+  # (known-failing/cayenne/cayenne-decimal-int-filter.yaml).
+  - tlp: { table: t, seed: 4, queries: 150, depth: 3, aggregate: d, oracle: src, avoid: [not, decimal-int] }

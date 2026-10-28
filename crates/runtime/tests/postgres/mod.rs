@@ -139,7 +139,7 @@ async fn test_postgres_types() -> Result<(), anyhow::Error> {
                 .value(0)
         );
 
-        running_container.remove().await?;
+        running_container.cleanup().await;
 
         Ok(())
     }).await
@@ -198,7 +198,7 @@ CREATE TABLE test_jsonb (
                 .sum::<usize>();
             assert_eq!(num_rows, 0);
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
 
             Ok(())
         })

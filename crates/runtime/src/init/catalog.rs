@@ -286,14 +286,14 @@ impl Runtime {
                     // A cached logical plan embeds the `TableSource` it was planned
                     // against, and so keeps reading through the provider the
                     // *previous* declaration built. Reloading a catalog registers a
-                    // fresh provider under the same name, so every plan that resolved
-                    // a table in it is now stale and must be replanned — the same
-                    // reason dataset and view registration discard cached plans.
+                    // fresh provider under the same name, so every plan and result
+                    // that resolved a table in it is now stale — the same reason
+                    // dataset and view registration discard cached plans.
                     // Registering a catalog that was never registered before
                     // invalidates nothing: no cached plan can have resolved a table in
                     // it.
                     if replaces_a_registered_provider {
-                        runtime.df.clear_cached_plans().await;
+                        runtime.df.clear_cached_plans_and_results().await;
                     }
                 }),
             ));

@@ -1,0 +1,57 @@
+name: flight-sessions
+description: >
+  SQL PREPARE and EXECUTE over Flight SQL: a statement prepared in a session
+  executes there with its arguments, as PostgreSQL answers with the values
+  written in; another session cannot see it; EXECUTE and DEALLOCATE of a
+  statement that was never prepared are refused naming it.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: flight-sessions
+  runtime:
+    auth:
+      api-key:
+        enabled: true
+        keys: [one:rw, two:rw]
+  datasets:
+    - { from: 'postgres:public.t', name: t, params: '${sources.src.params}' }
+
+defaults:
+  api-key: one
+  expect: { oracle: src }
+
+steps:
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, name text); INSERT INTO t SELECT i, 'name ' || i FROM generate_series(1, 50) i" }
+  - start: {}
+  - query: PREPARE by_id(INT) AS SELECT id, name FROM t WHERE id = $1
+    flight-session: one
+    expect: { rows: [] }
+    expect-empty: true
+  - query: EXECUTE by_id(7)
+    flight-session: one
+    oracle-sql: SELECT id, name FROM t WHERE id = 7
+  - query: EXECUTE by_id(8)
+    flight-session: one
+    oracle-sql: SELECT id, name FROM t WHERE id = 8
+  # Another session (another key) does not have it.
+  - query: EXECUTE by_id(7)
+    flight-session: two
+    api-key: two
+    expect-error: by_id
+  - query: EXECUTE never_prepared(1)
+    flight-session: one
+    expect-error: never_prepared
+  - query: DEALLOCATE never_prepared
+    flight-session: one
+    expect-error: never_prepared
+  - query: DEALLOCATE by_id
+    flight-session: one
+    expect: { rows: [] }
+    expect-empty: true
+  - query: EXECUTE by_id(7)
+    flight-session: one
+    expect-error: by_id

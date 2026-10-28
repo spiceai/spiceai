@@ -41,9 +41,9 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     compare,
-    script::{Action, RunVariants, Script, Step, Timing, VariantSpec},
+    script::{Action, RunVariants, Script, Step, Timing, VariantSpec, matrix_combinations},
     source::{self, Source},
-    spiced::Spiced,
+    spiced::{ContainerRun, Spiced},
     template,
 };
 
@@ -128,12 +128,103 @@ impl Slots {
         }
     }
 
-    /// Waits for `n` slots (all of them when `n` is more than there are).
-    async fn take(&self, n: u32) -> Result<tokio::sync::OwnedSemaphorePermit> {
-        Arc::clone(&self.semaphore)
+    /// Waits for `n` slots (all of them when `n` is more than there are),
+    /// counting the time they are held toward each of `busy`.
+    async fn take(&self, n: u32, busy: &[Arc<Busy>]) -> Result<Held> {
+        let permit = Arc::clone(&self.semaphore)
             .acquire_many_owned(n.clamp(1, self.size))
             .await
-            .context("the --jobs budget was closed")
+            .context("the --jobs budget was closed")?;
+        for b in busy {
+            b.enter();
+        }
+        Ok(Held {
+            _permit: permit,
+            busy: busy.to_vec(),
+        })
+    }
+}
+
+/// The time a script, or one of its matrix combinations, holds slots: the
+/// time it runs, without the time it waits for them. Overlapping holds by
+/// several instances count once.
+#[derive(Default)]
+pub struct Busy(parking_lot::Mutex<BusyState>);
+
+#[derive(Default)]
+struct BusyState {
+    holding: usize,
+    since: Option<Instant>,
+    total: Duration,
+}
+
+impl Busy {
+    fn enter(&self) {
+        self.enter_at(Instant::now());
+    }
+
+    fn leave(&self) {
+        self.leave_at(Instant::now());
+    }
+
+    pub fn total(&self) -> Duration {
+        self.total_at(Instant::now())
+    }
+
+    // The `_at` forms take the clock reading, so a test can drive them with
+    // exact instants instead of sleeping.
+    fn enter_at(&self, now: Instant) {
+        let mut state = self.0.lock();
+        if state.holding == 0 {
+            state.since = Some(now);
+        }
+        state.holding += 1;
+    }
+
+    fn leave_at(&self, now: Instant) {
+        let mut state = self.0.lock();
+        state.holding = state.holding.saturating_sub(1);
+        if state.holding == 0
+            && let Some(since) = state.since.take()
+        {
+            state.total += now.saturating_duration_since(since);
+        }
+    }
+
+    fn total_at(&self, now: Instant) -> Duration {
+        let state = self.0.lock();
+        state.total
+            + state
+                .since
+                .map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
+    }
+}
+
+/// [`Slots`] taken for one matrix combination of a script, their time counted
+/// toward the script's tracker and the combination's.
+struct ComboSlots<'a> {
+    slots: &'a Slots,
+    busy: [Arc<Busy>; 2],
+}
+
+impl ComboSlots<'_> {
+    async fn take(&self, n: u32) -> Result<Held> {
+        self.slots.take(n, &self.busy).await
+    }
+}
+
+/// Slots taken from [`Slots`]; their time counts toward each tracker until
+/// they are dropped.
+struct Held {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    busy: Vec<Arc<Busy>>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        for b in &self.busy {
+            b.leave();
+        }
     }
 }
 
@@ -230,6 +321,9 @@ pub struct Options {
     pub work_dir: PathBuf,
     pub keep: bool,
     pub spice_cli: PathBuf,
+    /// The directory holding this run's node mTLS CA and certificates
+    /// (`ca.crt`, `<role>.crt`, `<role>.key`), generated when it starts.
+    pub pki: PathBuf,
 }
 
 /// A failed check: where it ran, which step, and what went wrong.
@@ -318,9 +412,9 @@ impl std::error::Error for QueryFailures {}
 pub struct Report {
     pub passed: usize,
     pub failures: Vec<Failure>,
-    /// When the script first held slots: its run time starts here, not
-    /// while it waited for them.
-    pub started: Option<Instant>,
+    /// How long the script held slots: its run time, without the time it
+    /// waited for them.
+    pub ran: Duration,
 }
 
 struct Instance {
@@ -356,6 +450,9 @@ struct Instance {
     background: BTreeMap<String, Background>,
     /// `/metrics` scrapes taken by `mark-metrics`, by id.
     metric_marks: BTreeMap<String, String>,
+    /// When this instance began each corpus's queries, by corpus position:
+    /// the start of the `eventually` limit they share.
+    corpus_started: BTreeMap<usize, Instant>,
 }
 
 /// How long `spiced` gets to shut down after SIGTERM before `stop` and
@@ -369,6 +466,10 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(45);
 /// are killed. Shutdown itself is checked by `stop` and `restart` steps, at
 /// `STOP_TIMEOUT`; at the end of a script it only costs time.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The image cluster executors run in under `defaults.cluster.containers`:
+/// a Linux `spiced` needs nothing beyond its base libraries.
+const EXECUTOR_IMAGE: &str = "ubuntu:26.04";
 
 /// The partition assignment interval a cluster runs with (see
 /// `make_cluster_ready`).
@@ -450,59 +551,58 @@ impl Sources {
 }
 
 pub async fn run_script(script: &Script, options: &Options, slots: &Slots) -> Result<Report> {
+    let script_busy = Arc::new(Busy::default());
     let runs = matrix_combinations(&script.matrix)
         .into_iter()
         .enumerate()
-        .map(|(combo_index, combo)| async move {
-            let combo_label = combo
-                .iter()
-                .map(|(k, v)| {
-                    format!(
-                        "{k}={}",
-                        v.as_str().map_or_else(|| v.to_string(), str::to_string)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            let run_label = if combo_label.is_empty() {
-                script.name.clone()
-            } else {
-                format!("{}[{combo_label}]", script.name)
-            };
-            let run_id = format!(
-                "{}-{combo_index}-{}",
-                sanitize(&script.name),
-                std::process::id()
-            );
-            buffered(async {
-                match &script.description {
-                    Some(d) => say!("== {run_label}: {}", one_line(d, 120)),
-                    None => say!("== {run_label}"),
-                }
-                let started = Instant::now();
-                let mut report = Report::default();
-                if let Err(e) = run_combination(
-                    script,
-                    options,
-                    slots,
-                    &combo,
-                    &run_id,
-                    &run_label,
-                    &mut report,
-                )
-                .await
-                {
-                    report
-                        .failures
-                        .push(Failure::outside_steps(&run_label, "", &format!("{e:#}")));
-                }
-                say!(
-                    "== {run_label} finished in {:.1}s",
-                    started.elapsed().as_secs_f64()
+        .map(|(combo_index, combo)| {
+            let script_busy = Arc::clone(&script_busy);
+            async move {
+                let run_label = script.run_label(&combo);
+                let run_id = format!(
+                    "{}-{combo_index}-{}",
+                    sanitize(&script.name),
+                    std::process::id()
                 );
-                report
-            })
-            .await
+                buffered(async {
+                    match &script.description {
+                        Some(d) => say!("== {run_label}: {}", one_line(d, 120)),
+                        None => say!("== {run_label}"),
+                    }
+                    let started = Instant::now();
+                    let combo_busy = Arc::new(Busy::default());
+                    let combo_slots = ComboSlots {
+                        slots,
+                        busy: [Arc::clone(&script_busy), Arc::clone(&combo_busy)],
+                    };
+                    let mut report = Report::default();
+                    if let Err(e) = run_combination(
+                        script,
+                        options,
+                        &combo_slots,
+                        &combo,
+                        &run_id,
+                        &run_label,
+                        &mut report,
+                    )
+                    .await
+                    {
+                        report.failures.push(Failure::outside_steps(
+                            &run_label,
+                            "",
+                            &format!("{e:#}"),
+                        ));
+                    }
+                    let ran = combo_busy.total();
+                    say!(
+                        "== {run_label} finished: ran {:.1}s, waited {:.1}s for slots",
+                        ran.as_secs_f64(),
+                        started.elapsed().saturating_sub(ran).as_secs_f64()
+                    );
+                    report
+                })
+                .await
+            }
         });
     // Combinations run side by side as slots allow; their output keeps
     // their order.
@@ -511,18 +611,15 @@ pub async fn run_script(script: &Script, options: &Options, slots: &Slots) -> Re
         say!("{}", out.trim_end_matches('\n'));
         report.passed += part.passed;
         report.failures.extend(part.failures);
-        report.started = match (report.started, part.started) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
     }
+    report.ran = script_busy.total();
     Ok(report)
 }
 
 async fn run_combination(
     script: &Script,
     options: &Options,
-    slots: &Slots,
+    slots: &ComboSlots<'_>,
     combo: &Map<String, Value>,
     run_id: &str,
     run_label: &str,
@@ -548,11 +645,6 @@ async fn run_combination(
             Schedule::Exclusive => u32::MAX,
         })
         .await?;
-    report.started = Some(
-        report
-            .started
-            .map_or_else(Instant::now, |t| t.min(Instant::now())),
-    );
     let mut sources = Sources {
         by_name: IndexMap::new(),
         state: BTreeMap::new(),
@@ -726,6 +818,7 @@ async fn create_instances(
                 "instance": { "name": label, "dir": dir.display().to_string(), "port": crate::docker::free_port()?,
                     "executor_port": crate::docker::free_port()?, "http_port": crate::docker::free_port()? },
                 "script": { "dir": std::path::absolute(&script.dir)?.display().to_string() },
+                "pki": { "dir": options.pki.display().to_string() },
             });
             let mut spicepod = script.spicepod.clone();
             template::apply_variant(&mut spicepod, variant)
@@ -734,6 +827,12 @@ async fn create_instances(
             disable_results_cache_unless_configured(&mut spicepod);
             let cluster = (options.cluster || script.defaults.cluster.is_some())
                 && script.defaults.executor_args.is_none();
+            let containers = cluster
+                && script
+                    .defaults
+                    .cluster
+                    .as_ref()
+                    .is_some_and(|c| c.containers);
             if cluster {
                 if let Some(engine) = undistributed_engine(&spicepod) {
                     // A cluster accelerates only into Cayenne and Arrow.
@@ -742,6 +841,12 @@ async fn create_instances(
                 }
                 if let Some(reason) = unpartitionable_acceleration(&spicepod) {
                     say!("   skip {label:<20} {reason}");
+                    continue;
+                }
+                if containers && !cfg!(target_os = "linux") {
+                    // A container runs the binary under test, which must be
+                    // a Linux one, on the host's network.
+                    say!("   skip {label:<20} executors in containers run only on Linux");
                     continue;
                 }
                 make_cluster_ready(&mut spicepod, &dir, &script.defaults.cluster_partition_by);
@@ -761,7 +866,7 @@ async fn create_instances(
             let spare_count = script.defaults.cluster.as_ref().map_or(0, |c| c.spare);
             let cluster_args = if cluster {
                 Some(cluster_args(
-                    script,
+                    &options.pki,
                     &context,
                     executor_count + spare_count,
                 )?)
@@ -796,6 +901,22 @@ async fn create_instances(
                 let args = template::substitute(args, &context)?;
                 executor.set_extra_args(serde_json::from_value(args)?);
                 executor.set_api_key(script.defaults.api_key.clone())?;
+                if containers {
+                    let work_dir = std::path::absolute(&options.work_dir)?;
+                    let script_dir = std::path::absolute(&script.dir)?;
+                    executor.set_container(ContainerRun {
+                        image: EXECUTOR_IMAGE.to_string(),
+                        name: format!("spicescript-{}-{run_id}-{index}-{name}", std::process::id())
+                            .replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "-"),
+                        volumes: vec![
+                            format!("{0}:{0}", work_dir.display()),
+                            format!("{0}:{0}:ro", script_dir.display()),
+                            // The cluster's TLS clients load the system's root
+                            // certificates, which the image has none of.
+                            "/etc/ssl/certs:/etc/ssl/certs:ro".to_string(),
+                        ],
+                    });
+                }
                 executors.push(executor);
             }
             let mut spiced = Spiced::new(first_binary, dir, env)?;
@@ -831,6 +952,7 @@ async fn create_instances(
                 spice_cli: options.spice_cli.clone(),
                 background: BTreeMap::new(),
                 cache_dir: options.work_dir.join("cache"),
+                corpus_started: BTreeMap::new(),
             });
         }
     }
@@ -915,9 +1037,9 @@ async fn run_independent(
     steps: &[Step],
     instances: &mut [Instance],
     sources: &Sources,
-    slots: &Slots,
+    slots: &ComboSlots<'_>,
     weight: u32,
-    first_permit: tokio::sync::OwnedSemaphorePermit,
+    first_permit: Held,
     report: &mut Report,
     run_label: &str,
 ) {
@@ -1060,6 +1182,12 @@ fn table_from(kind: &str, entry: &Map<String, Value>) -> (String, String, bool) 
     let field = |key: &str| entry.get(key).and_then(Value::as_str).unwrap_or_default();
     match kind {
         "postgres" => ("postgres:public.".into(), String::new(), false),
+        "kafka" | "dynamodb" => (
+            format!("{kind}:{}_", field("namespace")),
+            String::new(),
+            false,
+        ),
+        "mongodb" => ("mongodb:".into(), String::new(), false),
         "mysql" | "clickhouse" => (format!("{kind}:"), String::new(), false),
         "ducklake" => ("ducklake:main.".into(), String::new(), false),
         "iceberg" => (
@@ -1206,23 +1334,6 @@ fn compare_instances(
     Ok(())
 }
 
-fn matrix_combinations(matrix: &IndexMap<String, Vec<Value>>) -> Vec<Map<String, Value>> {
-    matrix
-        .iter()
-        .fold(vec![Map::new()], |combos, (key, values)| {
-            combos
-                .into_iter()
-                .flat_map(|combo| {
-                    values.iter().map(move |v| {
-                        let mut next = combo.clone();
-                        next.insert(key.clone(), v.clone());
-                        next
-                    })
-                })
-                .collect()
-        })
-}
-
 fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -1240,6 +1351,57 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_corpus_shares_one_eventually_limit_and_nothing_else_does() {
+        let eventually = Timing::Eventually(Duration::from_secs(30));
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(40);
+        let mut started = BTreeMap::new();
+        assert_eq!(
+            query::retry_since(eventually, Some(4), &mut started, t0),
+            t0
+        );
+        assert_eq!(
+            query::retry_since(eventually, Some(4), &mut started, later),
+            t0,
+            "a later query of the same corpus counts from the corpus's first"
+        );
+        assert_eq!(
+            query::retry_since(eventually, Some(9), &mut started, later),
+            later
+        );
+        assert_eq!(
+            query::retry_since(eventually, None, &mut started, later),
+            later
+        );
+        assert_eq!(
+            query::retry_since(
+                Timing::Consistently(Duration::from_secs(5)),
+                Some(4),
+                &mut started,
+                later
+            ),
+            later,
+            "`consistently` must hold for its whole length from each query"
+        );
+    }
+
+    #[test]
+    fn busy_counts_overlapping_holds_once_and_no_idle_time() {
+        // One hold, a second overlapping it, the first ends, the second ends,
+        // then idle, each a step apart on a clock the test sets.
+        let busy = Busy::default();
+        let t0 = Instant::now();
+        let step = Duration::from_millis(40);
+        busy.enter_at(t0);
+        busy.enter_at(t0 + step);
+        busy.leave_at(t0 + step * 2);
+        busy.leave_at(t0 + step * 3);
+        // Held for 3 steps (120 ms). Each hold counted on its own would be
+        // 160 ms, and counting the idle time 200 ms.
+        assert_eq!(busy.total_at(t0 + step * 5), step * 3);
+    }
 
     #[test]
     fn matrix_is_the_cartesian_product_in_declaration_order() {
@@ -1280,6 +1442,9 @@ mod table_from_tests {
             (format!("{prefix}t{suffix}"), files)
         };
         assert_eq!(named("postgres"), ("postgres:public.t".into(), false));
+        assert_eq!(named("kafka"), ("kafka:i0_x_t".into(), false));
+        assert_eq!(named("mongodb"), ("mongodb:t".into(), false));
+        assert_eq!(named("dynamodb"), ("dynamodb:i0_x_t".into(), false));
         assert_eq!(named("mysql"), ("mysql:t".into(), false));
         assert_eq!(named("clickhouse"), ("clickhouse:t".into(), false));
         assert_eq!(named("ducklake"), ("ducklake:main.t".into(), false));

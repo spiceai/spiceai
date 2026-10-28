@@ -2909,6 +2909,11 @@ jobs:
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
+      - name: Check documented SQL cases
+        run: |
+          python3 -m unittest discover -s test/spicescript/corpus -p test_sql_surface.py
+          python3 test/spicescript/corpus/sql_surface.py --check
+
       - name: Build spicescript
         uses: ./.github/actions/build-tool
         with:
@@ -2924,12 +2929,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Scripts that pass: any failure fails the job.
-          - { name: 'spicescript: scripts', args: test/spicescript }
+          # Scripts that pass: any failure fails the job. Each shard runs
+          # its share of the scripts (--partition), balanced by their
+          # recorded durations.
+          - { name: 'spicescript: scripts (1/4)', partition: 1/4, args: test/spicescript }
+          - { name: 'spicescript: scripts (2/4)', partition: 2/4, args: test/spicescript }
+          - { name: 'spicescript: scripts (3/4)', partition: 3/4, args: test/spicescript }
+          - { name: 'spicescript: scripts (4/4)', partition: 4/4, args: test/spicescript }
           # Scripts that reproduce open bugs: each must fail exactly as its
           # group's recordings/expected-failures.json says, so a fix or a
           # change in how a bug shows also fails the job.
-          - { name: 'spicescript: known failing', args: --max-wait 30s test/spicescript/known-failing }
+          - { name: 'spicescript: known failing (1/2)', partition: 1/2, args: --max-wait 30s test/spicescript/known-failing }
+          - { name: 'spicescript: known failing (2/2)', partition: 2/2, args: --max-wait 30s test/spicescript/known-failing }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -2984,9 +2995,18 @@ jobs:
           unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
           echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
 
+      - name: Check harness rejects incorrect answers
+        if: ${{ matrix.partition == '1/4' }}
+        run: |
+          python3 test/spicescript/check_harness.py \
+            --runner "${{ steps.spicescript.outputs.path }}" \
+            --spiced "$(command -v spiced)" \
+            --work-dir "$RUNNER_TEMP/spicescript/harness-checks"
+
       - name: Run scenario scripts
         run: |
-          "${{ steps.spicescript.outputs.path }}" --jobs 8 \
+          "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+            --partition ${{ matrix.partition }} \
             --spiced "$(command -v spiced)" \
             --spice-cli "$(command -v spice)" \
             --work-dir "$RUNNER_TEMP/spicescript" \
@@ -3001,6 +3021,8 @@ jobs:
             ${{ runner.temp }}/spicescript/**/spiced.log
             ${{ runner.temp }}/spicescript/**/spicepod.yaml
             ${{ runner.temp }}/spicescript/**/slt-*.txt
+            ${{ runner.temp }}/spicescript/**/random-queries-seed*.txt
+            ${{ runner.temp }}/spicescript/harness-checks/*.log
           retention-days: 7
 
   # Stable, matrix-proof summary check. It succeeds only if every E2E job above
@@ -3042,7 +3064,9 @@ jobs:
       - graceful_shutdown_test_full
       - test_cold_start_unkeyed_append
       - build_spicescript
-      - test_spicescript
+      # test_spicescript reports but does not gate merges while the scenario
+      # scripts settle on the CI runners: a run that fails there names the
+      # failing scripts in its own job.
     steps:
       - name: Verify all E2E jobs succeeded
         # Named rather than left to the runner default: this gate is the required

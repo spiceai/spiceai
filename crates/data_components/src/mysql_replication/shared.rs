@@ -122,8 +122,9 @@ use super::config::{BinlogPosition, ReplicationParams};
 use super::metrics::MetricsCollector;
 use super::rows::{ChangeBatchSchemas, build_change_batch, truncate_change};
 use super::{
-    CursorType, Error, GtidSet, PersistedPosition, PositionStore, ReplicationStreamInput, Result,
-    check_resume_compatibility, encode_checkpoint_schema_json, stream_error,
+    ColumnTypeChanges, CursorType, Error, GtidSet, PersistedPosition, PositionStore,
+    ReplicationStreamInput, Result, RetypeRefusal, check_resume_compatibility,
+    encode_checkpoint_schema_json, stream_error,
 };
 use crate::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
 use crate::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
@@ -610,10 +611,9 @@ fn snapshot_boundary_envelope(
 
 struct MemberHandle {
     dataset_name: String,
-    /// The dataset's schema and its derived change-batch schemas, shared by every
-    /// [`MysqlChangeRows`] this member hands downstream.
-    change_schemas: Arc<ChangeBatchSchemas>,
     primary_keys: Vec<String>,
+    /// What an adopted `ALTER` does to a column whose source type widened.
+    column_type_changes: ColumnTypeChanges,
     /// Immutable decode layout behind an `Arc` swapped on a compatible ALTER
     /// (see [`adopt_current_layout`]). The pump clones the current `Arc` into a
     /// route at `TableMapEvent` time, so a snapshot handed downstream to
@@ -631,6 +631,10 @@ struct MemberHandle {
     /// GTID-positioning, else `File`), decided at attach. Written into every
     /// checkpoint so a resume reloads the correct positioning mode.
     cursor_type: CursorType,
+    /// The dataset's own `mysql_replication_initial_snapshot`, which decides
+    /// whether a re-load reads the table's existing rows. The shared source's
+    /// params are the first subscriber's, so they do not say it.
+    snapshot_mode: InitialSnapshotMode,
 }
 
 /// One shared dump source: registry entry + pump state.
@@ -652,6 +656,25 @@ struct SharedSource {
     /// Tables whose member detached during this pump's lifetime; a rejoin is
     /// resumed from the held floor instead of a fresh snapshot.
     detached: Mutex<HashSet<MemberKey>>,
+}
+
+impl MemberHandle {
+    /// The schema this member's change batches are built with now.
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(lock(&self.layout).change_schemas.dataset())
+    }
+}
+
+/// The change-batch schemas for a widened schema, or `current` when the ALTER
+/// widened nothing.
+fn changed_schemas(
+    current: &Arc<ChangeBatchSchemas>,
+    widened: Option<&SchemaRef>,
+) -> Arc<ChangeBatchSchemas> {
+    widened.map_or_else(
+        || Arc::clone(current),
+        |schema| Arc::new(ChangeBatchSchemas::new(schema)),
+    )
 }
 
 impl SharedSource {
@@ -798,6 +821,7 @@ async fn attach_member(
         position_store,
         schema_json,
         metrics,
+        column_type_changes,
     } = input;
     let member_key: MemberKey = (database.clone(), table.clone());
     let connection = source.key.label();
@@ -908,12 +932,13 @@ async fn attach_member(
         member_key.clone(),
         Arc::new(MemberHandle {
             dataset_name: dataset_name.clone(),
-            change_schemas: Arc::new(ChangeBatchSchemas::new(&schema)),
             primary_keys: primary_keys.clone(),
+            column_type_changes,
             layout: Mutex::new(Arc::new(MemberLayout {
                 layout: layout.clone(),
                 column_map: column_map.clone(),
                 pk_source_indexes,
+                change_schemas: Arc::new(ChangeBatchSchemas::new(&schema)),
             })),
             sender,
             metrics: Arc::clone(&metrics),
@@ -921,6 +946,7 @@ async fn attach_member(
             position_store: Arc::clone(&position_store),
             checkpoint_schema_json: checkpoint_schema_json.clone(),
             cursor_type,
+            snapshot_mode: params.snapshot_mode,
         }),
     );
     metrics.mark_member_attached();
@@ -1800,15 +1826,15 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                         tme.columns_count() != g.layout.columns.len() as u64
                     };
                     if needs_adopt {
-                        let old_layout = { lock(&member.layout).layout.clone() };
+                        let old = Arc::clone(&lock(&member.layout));
                         match adopt_current_layout(
                             &params,
                             &mkey.0,
                             &mkey.1,
-                            member.change_schemas.dataset(),
-                            &old_layout,
+                            &old,
                             &member.primary_keys,
                             &member.dataset_name,
+                            member.column_type_changes,
                         )
                         .await
                         {
@@ -1816,24 +1842,44 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                                 layout,
                                 column_map,
                                 pk_source_indexes,
+                                widened_schema,
                             }) if layout.columns.len() as u64 == tme.columns_count() => {
                                 *lock(&member.layout) = Arc::new(MemberLayout {
                                     layout,
                                     column_map,
                                     pk_source_indexes,
+                                    change_schemas: changed_schemas(
+                                        &old.change_schemas,
+                                        widened_schema.as_ref(),
+                                    ),
                                 });
                             }
                             outcome => {
                                 member.metrics.inc_schema_mismatch_error();
                                 routes.remove(&table_id);
-                                let detail = match outcome {
-                                    Ok(_) => "the current source layout column count still disagrees with the event".to_string(),
-                                    Err(e) => e.to_string(),
+                                let message = match outcome {
+                                    Err(Error::RetypeNotFollowed { refusal }) => {
+                                        retype_stop_message(
+                                            &member.dataset_name,
+                                            &mkey.0,
+                                            &mkey.1,
+                                            None,
+                                            &refusal,
+                                            member.snapshot_mode,
+                                        )
+                                    }
+                                    outcome => {
+                                        let detail = match outcome {
+                                            Ok(_) => "the current source layout column count still disagrees with the event".to_string(),
+                                            Err(e) => e.to_string(),
+                                        };
+                                        format!(
+                                            "source table {}.{} changed shape and the new layout cannot be adopted: {detail}. Re-bootstrap by setting `mysql_replication_invalid_checkpoint_behavior: restart`.",
+                                            mkey.0, mkey.1
+                                        )
+                                    }
                                 };
-                                member_fatal(&source, &mkey, format!(
-                                    "source table {}.{} changed shape and the new layout cannot be adopted: {detail}. Re-bootstrap by setting `mysql_replication_invalid_checkpoint_behavior: restart`.",
-                                    mkey.0, mkey.1
-                                )).await;
+                                member_fatal(&source, &mkey, message).await;
                                 continue 'recv;
                             }
                         }
@@ -2095,7 +2141,6 @@ async fn deliver_commit(
         // the decode + build runs on the consumer, and a decode failure surfaces
         // as a `StreamError` on this one dataset's stream.
         let rows = MysqlChangeRows::new(
-            Arc::clone(&member.change_schemas),
             member.primary_keys.clone(),
             Arc::clone(layout),
             Arc::clone(tme),
@@ -2174,7 +2219,7 @@ async fn handle_statement(
                 let batch = {
                     let g = lock(&member.layout);
                     build_change_batch(
-                        member.change_schemas.dataset(),
+                        g.change_schemas.dataset(),
                         &member.primary_keys,
                         &g.column_map,
                         &[truncate_change()],
@@ -2227,19 +2272,22 @@ async fn handle_statement(
                 // re-fetching the source layout and reconciling it against the
                 // dataset schema — the same behavior as the per-dataset path.
                 // Columns the source gained but the dataset does not declare are
-                // ignored; an ALTER that drops or retypes a *dataset* column
-                // cannot be adopted and is member-fatal. Adopting on the
-                // statement (not only on the next TableMap's column-count change)
-                // also catches type-only ALTERs that keep the column count.
-                let old_layout = { lock(&member.layout).layout.clone() };
+                // ignored; an ALTER that drops a *dataset* column cannot be
+                // adopted and is member-fatal. A column whose type widens
+                // losslessly is retyped in the member's schema, so its later
+                // values decode as the new type and reach `on_schema_change`; any
+                // other retype keeps the column's type. Adopting on the statement
+                // (not only on the next TableMap's column-count change) also
+                // catches type-only ALTERs that keep the column count.
+                let old = Arc::clone(&lock(&member.layout));
                 match adopt_current_layout(
                     &source.params,
                     &mkey.0,
                     &mkey.1,
-                    member.change_schemas.dataset(),
-                    &old_layout,
+                    &old,
                     &member.primary_keys,
                     &member.dataset_name,
+                    member.column_type_changes,
                 )
                 .await
                 {
@@ -2247,19 +2295,35 @@ async fn handle_statement(
                         layout,
                         column_map,
                         pk_source_indexes,
+                        widened_schema,
                     }) => {
                         *lock(&member.layout) = Arc::new(MemberLayout {
                             layout,
                             column_map,
                             pk_source_indexes,
+                            change_schemas: changed_schemas(
+                                &old.change_schemas,
+                                widened_schema.as_ref(),
+                            ),
                         });
                     }
                     Err(e) => {
                         member.metrics.inc_schema_mismatch_error();
-                        member_fatal(source, &mkey, format!(
-                            "ALTER TABLE on source table {}.{} (statement: {statement}) cannot be adopted mid-stream: {e}. Update the dataset schema to match the new table definition, or re-bootstrap by setting `mysql_replication_invalid_checkpoint_behavior: restart`.",
-                            mkey.0, mkey.1
-                        )).await;
+                        let message = match &e {
+                            Error::RetypeNotFollowed { refusal } => retype_stop_message(
+                                &member.dataset_name,
+                                &mkey.0,
+                                &mkey.1,
+                                Some(statement),
+                                refusal,
+                                member.snapshot_mode,
+                            ),
+                            _ => format!(
+                                "ALTER TABLE on source table {}.{} (statement: {statement}) cannot be adopted mid-stream: {e}. Update the dataset schema to match the new table definition, or re-bootstrap by setting `mysql_replication_invalid_checkpoint_behavior: restart`.",
+                                mkey.0, mkey.1
+                            ),
+                        };
+                        member_fatal(source, &mkey, message).await;
                     }
                 }
             }
@@ -2316,6 +2380,42 @@ async fn deliver_to_member(
             }
         }
     }
+}
+
+/// The error a dataset's stream stops with when the source `ALTER` it ran
+/// (`statement`, when the binlog carried it) retyped a replicated column in a
+/// way the stream does not follow. Re-loading without the acceleration data is the one fix: the
+/// dataset then registers the column's new type and snapshots the table into
+/// it. Re-loading into the existing acceleration keeps its old column type.
+fn retype_stop_message(
+    dataset: &str,
+    database: &str,
+    table: &str,
+    statement: Option<&str>,
+    refusal: &RetypeRefusal,
+    snapshot_mode: InitialSnapshotMode,
+) -> String {
+    let before = match statement {
+        Some(statement) => format!(
+            "the source ran '{}'",
+            statement.split_whitespace().collect::<Vec<_>>().join(" ")
+        ),
+        None => "the source table's columns changed".to_string(),
+    };
+    // With no saved position left, `disabled` streams changes only, and the
+    // re-load would skip the table's existing rows.
+    let snapshot = if snapshot_mode == InitialSnapshotMode::Disabled {
+        " with `mysql_replication_initial_snapshot: auto`, so the re-load reads the table's \
+         existing rows"
+    } else {
+        ""
+    };
+    format!(
+        "Dataset '{dataset}' stopped applying changes from MySQL table '{database}.{table}', so \
+         it keeps serving the rows it held before {before}. Cause: {refusal}. To re-load the \
+         dataset with the new column type, remove the dataset's acceleration data and restart \
+         Spice{snapshot}. See: https://spiceai.org/docs/components/data-connectors/mysql"
+    )
 }
 
 /// Build a member's [`PersistedPosition`] from its ack slot — capturing the
@@ -2472,7 +2572,7 @@ async fn rebootstrap_member(
     let signal = snapshot_boundary_envelope(
         source,
         key,
-        member.change_schemas.dataset(),
+        &member.schema(),
         member.dataset_name.clone(),
         true,
     )?;
@@ -2571,7 +2671,7 @@ async fn poll_head_and_heartbeat(
             continue;
         }
         match readiness_heartbeat(
-            member.change_schemas.dataset(),
+            &member.schema(),
             source_now_ms,
             member.ready_lag,
             &member.dataset_name,
@@ -2606,6 +2706,93 @@ mod tests {
 
     fn gtids(raw: &str) -> GtidSet {
         GtidSet::parse(raw).expect("parse gtid set")
+    }
+
+    /// The error names the dataset, the `ALTER` and what it did to the column,
+    /// and the one fix, on one line.
+    #[test]
+    fn a_retype_stop_message_names_the_dataset_the_cause_and_the_fix() {
+        use crate::mysql_replication::RetypeRefusalReason;
+
+        let refusal = |from: &str, to: &str, reason| RetypeRefusal::new("k", from, to, reason);
+        let message = |statement: Option<&str>, refusal: &RetypeRefusal| {
+            retype_stop_message(
+                "orders",
+                "shop",
+                "orders",
+                statement,
+                refusal,
+                InitialSnapshotMode::Auto,
+            )
+        };
+        let rewrote = refusal("bigint", "double", RetypeRefusalReason::SourceRewroteValues);
+        assert_eq!(
+            message(Some("ALTER TABLE orders\n  MODIFY k DOUBLE"), &rewrote),
+            "Dataset 'orders' stopped applying changes from MySQL table 'shop.orders', so it \
+             keeps serving the rows it held before the source ran 'ALTER TABLE orders MODIFY k \
+             DOUBLE'. Cause: column 'k' changed from `bigint` to `double`, which does not hold \
+             every `bigint` value, and MySQL rewrites such values in place without sending row \
+             changes, so the dataset may hold values the source no longer has. To re-load the \
+             dataset with the new column type, remove the dataset's acceleration data and \
+             restart Spice. See: https://spiceai.org/docs/components/data-connectors/mysql"
+        );
+        // A layout change the binlog carried no statement for.
+        assert_eq!(
+            message(None, &rewrote),
+            "Dataset 'orders' stopped applying changes from MySQL table 'shop.orders', so it \
+             keeps serving the rows it held before the source table's columns changed. Cause: \
+             column 'k' changed from `bigint` to `double`, which does not hold every `bigint` \
+             value, and MySQL rewrites such values in place without sending row changes, so the \
+             dataset may hold values the source no longer has. To re-load the dataset with the \
+             new column type, remove the dataset's acceleration data and restart Spice. See: \
+             https://spiceai.org/docs/components/data-connectors/mysql"
+        );
+        assert_eq!(
+            refusal(
+                "int",
+                "decimal(12,2)",
+                RetypeRefusalReason::FractionIntoInteger
+            )
+            .to_string(),
+            "column 'k' changed from `int` to `decimal(12,2)`, and the dataset keeps the \
+             column's integer type, which cannot store a fractional value"
+        );
+        assert_eq!(
+            refusal("float", "double", RetypeRefusalReason::StaysFloat32).to_string(),
+            "column 'k' changed from `float` to `double`, and the dataset keeps the column's \
+             `Float32` type, which would round the new values"
+        );
+        assert_eq!(
+            refusal(
+                "int unsigned",
+                "decimal(10,0)",
+                RetypeRefusalReason::DecimalIntoUnsignedInteger
+            )
+            .to_string(),
+            "column 'k' changed from `int unsigned` to `decimal(10,0)`, and the dataset keeps \
+             the column's unsigned integer type, which the change stream cannot read a decimal \
+             value into"
+        );
+        // With no saved position, `disabled` would stream changes only.
+        assert_eq!(
+            retype_stop_message(
+                "orders",
+                "shop",
+                "orders",
+                Some("ALTER TABLE orders MODIFY k DOUBLE"),
+                &rewrote,
+                InitialSnapshotMode::Disabled,
+            ),
+            "Dataset 'orders' stopped applying changes from MySQL table 'shop.orders', so it \
+             keeps serving the rows it held before the source ran 'ALTER TABLE orders MODIFY k \
+             DOUBLE'. Cause: column 'k' changed from `bigint` to `double`, which does not hold \
+             every `bigint` value, and MySQL rewrites such values in place without sending row \
+             changes, so the dataset may hold values the source no longer has. To re-load the \
+             dataset with the new column type, remove the dataset's acceleration data and \
+             restart Spice with `mysql_replication_initial_snapshot: auto`, so the re-load reads \
+             the table's existing rows. See: \
+             https://spiceai.org/docs/components/data-connectors/mysql"
+        );
     }
 
     fn test_params() -> ReplicationParams {
@@ -2689,8 +2876,8 @@ mod tests {
         let position_store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
         let member = Arc::new(MemberHandle {
             dataset_name: "orders".to_string(),
-            change_schemas: Arc::new(ChangeBatchSchemas::new(&test_schema())),
             primary_keys: vec!["id".to_string()],
+            column_type_changes: ColumnTypeChanges::Keep,
             layout: Mutex::new(Arc::new(MemberLayout {
                 // Covers every column of `test_schema`, so anything the member
                 // builds from the layout (a truncate row included) is buildable
@@ -2716,6 +2903,7 @@ mod tests {
                 },
                 column_map: vec![0, 1],
                 pk_source_indexes: vec![0],
+                change_schemas: Arc::new(ChangeBatchSchemas::new(&test_schema())),
             })),
             sender,
             metrics: MetricsCollector::new(),
@@ -2723,6 +2911,7 @@ mod tests {
             position_store: Arc::clone(&position_store) as Arc<dyn PositionStore>,
             checkpoint_schema_json: None,
             cursor_type: CursorType::File,
+            snapshot_mode: params.snapshot_mode,
         });
         lock(&source.members).insert(member_key.clone(), Arc::clone(&member));
         // A streaming member: the rebuild is what puts it back into SNAPSHOTTING.
@@ -2827,7 +3016,7 @@ mod tests {
             let envelope = snapshot_boundary_envelope(
                 &source,
                 &member_key,
-                member.change_schemas.dataset(),
+                &member.schema(),
                 member.dataset_name.clone(),
                 history_unavailable,
             )

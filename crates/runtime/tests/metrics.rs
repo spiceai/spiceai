@@ -911,20 +911,21 @@ async fn a_mid_stream_pool_refusal_is_counted_as_resources_exhausted() {
     );
 }
 
-/// Whether a series was recorded for a request whose user agent carries `token`.
+/// Whether a series was recorded for a request with user agent `token`.
 ///
-/// Each test that counts a delta on this binary's shared registry sends its own
-/// user agent and reads only its own series, so a sibling running in the same
-/// process cannot move its count.
+/// Each test that counts a delta on this binary's shared registry sends a user
+/// agent of a different known Spice client and reads only that `client` label's
+/// series, so a sibling running in the same process cannot move its count.
 fn sent_by(metric: &prometheus::proto::Metric, token: &str) -> bool {
+    let client = token.split('/').next().unwrap_or(token);
     metric
         .get_label()
         .iter()
-        .any(|label| label.name() == "user_agent" && label.value().contains(token))
+        .any(|label| label.name() == "client" && label.value() == client)
 }
 
 /// The user agent `each_flight_rpc_records_exactly_one_request` sends.
-const FLIGHT_RPC_COUNT_USER_AGENT: &str = "flight-rpc-count-test/1.0";
+const FLIGHT_RPC_COUNT_USER_AGENT: &str = "spice-rs/1.0";
 
 /// Every `flight_requests` increment the client with user agent `token` caused,
 /// summed across label sets.
@@ -1848,9 +1849,9 @@ const SERVER_TIMING_ROUNDING_MS: f64 = 0.0005 + 1e-9;
 /// siblings on this binary's shared registry cannot move the counts.
 #[tokio::test]
 async fn server_timing_reports_the_recorded_duration_samples() -> Result<(), anyhow::Error> {
-    const BUFFERED: &str = "server-timing-buffered/1.0";
-    const STREAMED: &str = "server-timing-streamed/1.0";
-    const FLIGHT: &str = "server-timing-flight/1.0";
+    const BUFFERED: &str = "spicepy/1.0";
+    const STREAMED: &str = "gospice/1.0";
+    const FLIGHT: &str = "spice-java/1.0";
 
     let registry = &*PROMETHEUS;
     let (http_port, channel) = start_servers(FLIGHT).await?;
@@ -1968,6 +1969,58 @@ async fn server_timing_reports_the_recorded_duration_samples() -> Result<(), any
     assert!(
         reported > do_get,
         "the trailer must include the GetFlightInfo time, not only DoGet's {do_get} ms"
+    );
+
+    Ok(())
+}
+
+/// Requests that differ only in their `User-Agent` and `baggage` headers share
+/// one series: header values a caller chooses never become metric labels, so
+/// the series count cannot grow with them.
+#[tokio::test]
+async fn request_header_values_do_not_add_metric_series() -> Result<(), anyhow::Error> {
+    const REQUESTS: u32 = 20;
+
+    let registry = &*PROMETHEUS;
+    let (http_port, _channel) = start_servers("spice-dotnet/1.0").await?;
+    let client = reqwest::Client::new();
+    for i in 0..REQUESTS {
+        client
+            .get(format!("http://127.0.0.1:{http_port}/health"))
+            .header("user-agent", format!("probe-{i}/{i} (system-{i})"))
+            .header("baggage", format!("request-{i}={i}"))
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+
+    let series: Vec<_> = registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == "http_requests")
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .filter(|metric| {
+            metric
+                .get_label()
+                .iter()
+                .any(|label| label.name() == "path" && label.value() == "/health")
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        series.len(),
+        1,
+        "{REQUESTS} requests with distinct header values must share one series, got {series:?}"
+    );
+    let labels: HashMap<&str, &str> = series[0]
+        .get_label()
+        .iter()
+        .map(|label| (label.name(), label.value()))
+        .collect();
+    assert_eq!(labels.get("client"), Some(&"other"));
+    assert!(
+        (series[0].get_counter().value() - f64::from(REQUESTS)).abs() < f64::EPSILON,
+        "every request must still be counted"
     );
 
     Ok(())

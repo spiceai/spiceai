@@ -1,0 +1,170 @@
+name: mysql-cdc-parity
+description: >
+  MySQL binlog CDC converges to the source after inserts, updates, deletes, key
+  changes and large transactions, across a clean stop and a kill: Cayenne under
+  every metastore and deletion mode, and DuckDB.
+
+sources:
+  src: { kind: mysql }
+
+variants:
+  sqlite-key:
+    datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: key } } } }
+  sqlite-position:
+    datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: position } } } }
+  turso-key:
+    datasets: { '*': { acceleration: { params: { cayenne_metastore: turso, cayenne_deletion_mode: key } } } }
+  turso-position:
+    datasets: { '*': { acceleration: { params: { cayenne_metastore: turso, cayenne_deletion_mode: position } } } }
+  duckdb:
+    datasets:
+      orders: { acceleration: { engine: duckdb, mode: memory, on_conflict: { o_id: upsert } } }
+      customers: { acceleration: { engine: duckdb, mode: memory, on_conflict: { c_id: upsert } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mysql-cdc-parity
+  datasets:
+    - from: mysql:orders
+      name: orders
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: o_id
+    - from: mysql:customers
+      name: customers
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: c_id
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        SET SESSION cte_max_recursion_depth = 1000000;
+        CREATE TABLE customers (
+          c_id      INT PRIMARY KEY,
+          c_name    VARCHAR(64) NOT NULL,
+          c_segment VARCHAR(16),
+          c_balance DECIMAL(15, 2),
+          c_active  TINYINT(1),
+          c_since   DATE
+        );
+        CREATE TABLE orders (
+          o_id      BIGINT PRIMARY KEY,
+          o_custkey INT,
+          o_status  CHAR(1),
+          o_total   DECIMAL(15, 2),
+          o_qty     SMALLINT,
+          o_weight  DOUBLE,
+          o_note    TEXT,
+          o_placed  DATETIME(6),
+          o_updated TIMESTAMP(6) NULL,
+          o_payload VARBINARY(16)
+        );
+        INSERT INTO customers
+          WITH RECURSIVE seq (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 500)
+          SELECT i, CONCAT('Customer#', i), ELT(1 + i % 4, 'AUTO', 'BUILDING', 'FURNITURE', NULL),
+                 (i * 37 % 10000) / 7.0, i % 3 <> 0, DATE '2020-01-01' + INTERVAL i DAY
+          FROM seq;
+        INSERT INTO orders
+          WITH RECURSIVE seq (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 20000)
+          SELECT i, 1 + i % 500, ELT(1 + i % 3, 'O', 'F', 'P'), (i * 7919 % 1000000) / 100.0,
+                 i % 50, i * 0.125, CASE WHEN i % 10 = 0 THEN NULL ELSE CONCAT('note ', i) END,
+                 TIMESTAMP '2024-01-01 00:00:00' + INTERVAL (i * 37) MINUTE,
+                 TIMESTAMP '2024-01-01 00:00:00.123456' + INTERVAL (i * 41) SECOND,
+                 UNHEX(LPAD(HEX(i), 8, '0'))
+          FROM seq;
+
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+  - query: SELECT * FROM customers
+    eventually: 30s
+
+  - source-exec:
+      src:
+        - INSERT INTO customers VALUES (501, 'Customer#501', 'AUTO', 12.50, 1, DATE '2024-02-29')
+        - UPDATE customers SET c_balance = -c_balance, c_segment = NULL WHERE c_id % 50 = 0
+        - UPDATE orders SET o_note = NULL, o_total = o_total + 0.01 WHERE o_id % 101 = 0
+        - DELETE FROM orders WHERE o_id % 97 = 0
+        - UPDATE orders SET o_id = o_id + 1000000 WHERE o_id BETWEEN 100 AND 120
+        - |
+          START TRANSACTION;
+          DELETE FROM orders WHERE o_id BETWEEN 200 AND 260;
+          INSERT INTO orders (o_id, o_custkey, o_status, o_note)
+            WITH RECURSIVE seq (i) AS (SELECT 200 UNION ALL SELECT i + 1 FROM seq WHERE i < 260)
+            SELECT i, 1, 'X', 'reinserted' FROM seq;
+          COMMIT;
+  - query: SELECT * FROM orders
+    eventually: 60s
+  - query: SELECT * FROM customers
+    eventually: 30s
+
+  - source-exec:
+      src: UPDATE orders SET o_qty = (o_qty + 1) % 50, o_updated = o_updated + INTERVAL 1 DAY WHERE o_id % 3 = 0
+  - query: SELECT * FROM orders
+    eventually: 90s
+
+  - stop: {}
+  - source-exec:
+      src:
+        - DELETE FROM customers WHERE c_id BETWEEN 10 AND 30
+        - |
+          SET SESSION cte_max_recursion_depth = 10000;
+          INSERT INTO orders (o_id, o_custkey, o_status)
+            WITH RECURSIVE seq (i) AS (SELECT 2000000 UNION ALL SELECT i + 1 FROM seq WHERE i < 2000500)
+            SELECT i, 7, 'N' FROM seq;
+        - UPDATE orders SET o_status = 'S' WHERE o_custkey = 7
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+  - query: SELECT * FROM customers
+    eventually: 30s
+
+  - source-exec:
+      src: UPDATE orders SET o_weight = o_weight * 2 WHERE o_id % 5 = 0
+  - kill-spiced: {}
+  - source-exec:
+      src:
+        - DELETE FROM orders WHERE o_id % 11 = 0
+        - UPDATE customers SET c_active = NOT c_active
+  - start: {}
+  - query: SELECT * FROM orders
+    eventually: 90s
+  - query: SELECT * FROM customers
+    eventually: 30s
+  - query: SELECT o_status, count(*), sum(o_total), min(o_placed), max(o_updated) FROM orders GROUP BY o_status ORDER BY o_status
+    oracle-sql: SELECT o_status, count(*), sum(o_total), min(o_placed), max(o_updated) FROM orders GROUP BY o_status ORDER BY o_status IS NULL, o_status
+    eventually: 30s
+  # Both tables replicated to the same point.
+  - query: SELECT c.c_segment, count(*), sum(o.o_total) FROM orders o JOIN customers c ON o.o_custkey = c.c_id GROUP BY c.c_segment
+    eventually: 30s
+
+  # A compatible ALTER on the source: replication carries on with the new
+  # layout, and the new column (not in the dataset's schema) is not replicated.
+  - source-exec:
+      src:
+        - ALTER TABLE customers ADD COLUMN c_extra TEXT
+        - "INSERT INTO customers (c_id, c_name, c_segment, c_balance, c_active, c_since, c_extra) VALUES (502, 'Customer#502', 'AUTO', 1.00, 1, DATE '2024-03-01', 'not replicated')"
+        - UPDATE customers SET c_balance = c_balance + 1 WHERE c_id = 501
+  - query: SELECT * FROM customers
+    oracle-sql: SELECT c_id, c_name, c_segment, c_balance, c_active, c_since FROM customers
+    eventually: 30s
+
+  # TRUNCATE propagates, and leaves the other dataset alone.
+  - source-exec: { src: TRUNCATE TABLE orders }
+  - query: SELECT count(*) FROM orders
+    eventually: 30s
+  - query: SELECT * FROM customers
+    oracle-sql: SELECT c_id, c_name, c_segment, c_balance, c_active, c_since FROM customers

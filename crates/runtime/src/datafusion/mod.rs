@@ -160,6 +160,7 @@ use change_generations::{
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub(crate) mod component_planner;
+pub(crate) mod output_reservation;
 pub(crate) mod query_memory_pool;
 pub use runtime_datafusion::composed_catalog;
 // `error` and `refresh_sql` below are named throughout the runtime through these
@@ -184,7 +185,9 @@ pub use runtime_table::table_provider_with_spicepod_metadata;
 pub mod secrets_context_extension;
 pub mod table;
 pub use runtime_datafusion::sort_columns;
-pub(crate) mod sql_depth_guard;
+pub(crate) use runtime_query_engine::sql_depth_guard;
+#[cfg(test)]
+mod sql_depth_guard_tests;
 pub(crate) mod sql_validator;
 pub mod tool_udf;
 pub mod udf;
@@ -3612,10 +3615,7 @@ impl DataFusion {
             .map_err(|_| Error::UnableToLockDdlEnabledCatalogs {})?
             .remove(name);
         if registered || deferred {
-            self.clear_cached_plans().await;
-            if let Some(results) = self.results_cache_provider() {
-                results.invalidate_all().await;
-            }
+            self.clear_cached_plans_and_results().await;
         }
         Ok(registered || deferred)
     }
@@ -6627,12 +6627,33 @@ impl DataFusion {
 
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
-            // the tables are created. To handle this, wait until all tables are created.
+            // the tables are created. To handle this, wait until all tables are created,
+            // including tables only a subquery reads: a Spicepod change that replaces a
+            // dataset registers the views reading it again before the dataset is.
+            // A table function and `information_schema` are not catalog tables, and never
+            // exist.
+            let tables_read = {
+                let state = ctx.state();
+                let mut tables_read = dependent_table_names.clone();
+                for table in state
+                    .resolve_table_references(&statements[0])
+                    .unwrap_or_default()
+                {
+                    let is_table_function = table.schema().is_none()
+                        && state.table_functions().contains_key(table.table());
+                    let is_information_schema = table.schema() == Some("information_schema");
+                    if !is_table_function && !is_information_schema && !tables_read.contains(&table)
+                    {
+                        tables_read.push(table);
+                    }
+                }
+                tables_read
+            };
 
             let deadline = Instant::now() + Duration::from_mins(1);
             let mut unresolved_dependent_table: Option<TableReference> = None;
 
-            for dependent_table_name in &dependent_table_names {
+            for dependent_table_name in &tables_read {
                 let mut attempts = 0;
                 if unresolved_dependent_table.is_some() {
                     break;
@@ -7253,6 +7274,15 @@ impl DataFusion {
         tracing::trace!("clearing cached logical plans");
         if let Some(cache_provider) = self.plans_cache_provider() {
             cache_provider.invalidate_all().await;
+        }
+    }
+
+    /// Discards every cached plan and result, for a reload that replaces a definition a
+    /// query reads through (a view, a catalog or a user function) rather than a table.
+    pub(crate) async fn clear_cached_plans_and_results(&self) {
+        self.clear_cached_plans().await;
+        if let Some(results) = self.results_cache_provider() {
+            results.invalidate_all().await;
         }
     }
 
@@ -8050,8 +8080,9 @@ async fn build_snapshot_refresh_state(
     let swappable_provider = SwappableTableProvider::new(initial_provider);
     let current_snapshot_id = std::sync::Arc::new(std::sync::Mutex::new(bootstrap_loaded_id));
     let source: Arc<dyn crate::dataaccelerator::AccelerationSource> = Arc::new(dataset.clone());
-    // The initial provider serves the restored snapshot; the engine may reclaim
-    // what an earlier process left that this snapshot no longer references.
+    // The initial provider serves the local snapshot, which may be older than the
+    // one the first refresh restores; the engine may reclaim what an earlier
+    // process left that this snapshot no longer references.
     accelerator
         .maintain_after_snapshot_restore(source.as_ref(), &swappable_provider.current())
         .await;

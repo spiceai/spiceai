@@ -1275,33 +1275,52 @@ impl Kafka {
         let consumer = self.consumer;
         let metrics = Arc::clone(self.consumer.metrics());
         let offset_commit_hook = self.offset_commit_hook.clone();
-        let inner = self
+        let to_envelope = move |messages: &[BorrowedMessage<'static>]| {
+            let change_batch = messages_to_change_batch(messages, flatten_json.as_ref(), &schema)?;
+
+            let committer = MessageBatchCommitter::from_borrowed_messages(consumer, messages)
+                .with_offset_commit_hook(offset_commit_hook.clone());
+
+            Ok(ChangeEnvelope::new(Box::new(committer), change_batch, true))
+        };
+        let chunks = self
             .consumer
             .consumer
             .stream()
-            .chunks_timeout(self.batching.0, self.batching.1)
-            .map(move |msgs| {
-                let schema = Arc::clone(&schema);
+            .chunks_timeout(self.batching.0, self.batching.1);
+        // A batch can hold a consumption error between messages: a broker
+        // reconnect reports one while the fetches after it already return
+        // messages. The consumer's fetch position has moved past every message
+        // in the batch, so each one is delivered here or never again; the error
+        // goes out between the envelopes on either side of it, in order.
+        let inner = futures::StreamExt::flat_map(chunks, move |msgs| {
+            if msgs.is_empty() {
+                return futures::stream::iter(vec![Err(cdc::StreamError::Kafka(
+                    Error::EmptyBatch,
+                ))]);
+            }
 
-                // Collect all successful messages, fail on first error
-                let messages: Vec<_> = msgs
-                    .into_iter()
-                    .map(|msg| msg.context(UnableToReceiveMessageSnafu))
-                    .collect::<Result<Vec<_>>>()
-                    .map_err(cdc::StreamError::Kafka)?;
-
-                if messages.is_empty() {
-                    return Err(cdc::StreamError::Kafka(Error::EmptyBatch));
+            let mut items = Vec::new();
+            let mut messages = Vec::new();
+            for msg in msgs {
+                match msg {
+                    Ok(msg) => messages.push(msg),
+                    Err(source) => {
+                        if !messages.is_empty() {
+                            items.push(to_envelope(&messages));
+                            messages.clear();
+                        }
+                        items.push(Err(cdc::StreamError::Kafka(
+                            Error::UnableToReceiveMessage { source },
+                        )));
+                    }
                 }
-
-                let change_batch =
-                    messages_to_change_batch(&messages, flatten_json.as_ref(), &schema)?;
-
-                let committer = MessageBatchCommitter::from_borrowed_messages(consumer, &messages)
-                    .with_offset_commit_hook(offset_commit_hook.clone());
-
-                Ok(ChangeEnvelope::new(Box::new(committer), change_batch, true))
-            });
+            }
+            if !messages.is_empty() {
+                items.push(to_envelope(&messages));
+            }
+            futures::stream::iter(items)
+        });
 
         Box::pin(inject_ready_signal_on_caught_up(
             inner,
@@ -2096,6 +2115,15 @@ mod tests {
         rdkafka::mocking::MockCluster<'static, rdkafka::producer::DefaultProducerContext>,
         KafkaConsumer,
     ) {
+        let cluster = cluster_holding_one_message();
+        cluster.broker_down(-1).expect("take broker down");
+        let consumer = consumer_subscribed_to_t(&cluster);
+        (cluster, consumer)
+    }
+
+    /// A one-broker mock cluster holding one message, `{"id": 1}`, on topic `t`.
+    fn cluster_holding_one_message()
+    -> rdkafka::mocking::MockCluster<'static, rdkafka::producer::DefaultProducerContext> {
         use rdkafka::mocking::MockCluster;
         use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 
@@ -2112,8 +2140,13 @@ mod tests {
         producer
             .flush(Duration::from_secs(10))
             .expect("flush message");
+        cluster
+    }
 
-        cluster.broker_down(-1).expect("take broker down");
+    /// A consumer of topic `t` on `cluster`, subscribed but not yet connected.
+    fn consumer_subscribed_to_t(
+        cluster: &rdkafka::mocking::MockCluster<'static, rdkafka::producer::DefaultProducerContext>,
+    ) -> KafkaConsumer {
         let consumer = KafkaConsumer::create_for_dataset(
             "t",
             None,
@@ -2135,7 +2168,7 @@ mod tests {
         )
         .expect("consumer");
         consumer.subscribe("t").expect("subscribe");
-        (cluster, consumer)
+        consumer
     }
 
     /// A broker that refuses the first connection attempts must not fail the
@@ -2202,6 +2235,69 @@ mod tests {
         assert!(
             elapsed >= BUDGET,
             "returned after {elapsed:?}, before the {BUDGET:?} budget passed"
+        );
+    }
+
+    /// A transient consumption error and a message fetched in the same batching
+    /// window must not cost the message. The consumer's fetch position has
+    /// already moved past it, so a message dropped with the error is never
+    /// delivered again until the consumer is recreated from its committed
+    /// offsets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stream_changes_keeps_the_messages_batched_with_a_transient_error() {
+        use rdkafka::types::{RDKafkaApiKey, RDKafkaRespErr};
+
+        // Long enough that the disconnect's error and the message fetched after
+        // the reconnect land in one batch.
+        const BATCH_WINDOW: Duration = Duration::from_secs(5);
+        let cluster = cluster_holding_one_message();
+        // The broker drops the connection that sends the first fetch, as a
+        // broker restart does mid-stream, and the consumer reconnects and
+        // fetches again. Injecting the disconnect keeps the error's timing
+        // independent of how long a platform takes to report a refused
+        // connection.
+        cluster.request_errors(
+            RDKafkaApiKey::Fetch,
+            &[RDKafkaRespErr::RD_KAFKA_RESP_ERR__TRANSPORT],
+        );
+        let consumer = consumer_subscribed_to_t(&cluster);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let kafka = Kafka::new(schema, consumer).with_batching((10_000, BATCH_WINDOW));
+        let mut stream = kafka.stream_changes();
+
+        let mut errors_at = Vec::new();
+        let deadline = tokio::time::Instant::now() + BATCH_WINDOW * 3;
+        let rows_at = loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Err(_) | Ok(None) => break None,
+                Ok(Some(Err(cdc::StreamError::Kafka(Error::UnableToReceiveMessage {
+                    source,
+                }))))
+                    if is_transient_kafka_consumption_error(&source) =>
+                {
+                    errors_at.push(Instant::now());
+                }
+                Ok(Some(Err(e))) => panic!("unexpected stream error: {e}"),
+                Ok(Some(Ok(envelope))) if envelope.num_rows_hint() > 0 => {
+                    assert_eq!(envelope.num_rows_hint(), 1, "one message was produced");
+                    break Some(Instant::now());
+                }
+                Ok(Some(Ok(_ready_signal))) => {}
+            }
+        };
+
+        let rows_at = rows_at.expect(
+            "the message fetched after the reconnect was never delivered; \
+             it was dropped with the transient error in its batch",
+        );
+        let last_error_at = errors_at
+            .last()
+            .expect("the broker dropped the first fetch, so the stream reports a transient error");
+        assert!(
+            rows_at.duration_since(*last_error_at) < BATCH_WINDOW / 2,
+            "the error and the message arrived {:?} apart, so they were not batched together \
+             and the test did not exercise a mixed batch",
+            rows_at.duration_since(*last_error_at)
         );
     }
 }
