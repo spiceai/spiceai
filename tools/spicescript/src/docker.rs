@@ -217,8 +217,18 @@ impl Container {
             ports,
             network: spec.network,
         };
-        // On failure the container is dropped, which removes it.
-        container.resume().await?;
+        // On failure the container is dropped, which removes it, so what it
+        // printed goes into the error.
+        if let Err(e) = container.resume().await {
+            let tail = container.logs(Some(START_FAILURE_LOG_LINES)).await;
+            return Err(match tail {
+                Ok(tail) if !tail.is_empty() => anyhow::anyhow!(
+                    "{e:#}\nits last {START_FAILURE_LOG_LINES} lines of output:\n{}",
+                    String::from_utf8_lossy(&tail).trim_end()
+                ),
+                _ => e,
+            });
+        }
         Ok(container)
     }
 
@@ -347,6 +357,41 @@ impl Container {
         Ok(stdout)
     }
 
+    /// Writes the container's output so far, standard output and error
+    /// interleaved and timestamped, to `path`: what a failed script's source
+    /// said, kept after the container is removed.
+    pub async fn save_logs(&self, path: &std::path::Path) -> Result<()> {
+        let out = self.logs(None).await?;
+        tokio::fs::write(path, out)
+            .await
+            .with_context(|| format!("Failed to write {}", path.display()))
+    }
+
+    /// The container's output, timestamped: all of it, or its last `tail`
+    /// lines.
+    async fn logs(&self, tail: Option<usize>) -> Result<Vec<u8>> {
+        use bollard::container::LogsOptions;
+        let mut stream = self.docker.logs(
+            &self.id,
+            Some(LogsOptions::<String> {
+                stdout: true,
+                stderr: true,
+                timestamps: true,
+                tail: tail.map_or_else(|| "all".to_string(), |n| n.to_string()),
+                ..Default::default()
+            }),
+        );
+        let mut out = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            out.extend_from_slice(
+                &chunk
+                    .with_context(|| format!("Failed to read the logs of container {}", self.name))?
+                    .into_bytes(),
+            );
+        }
+        Ok(out)
+    }
+
     pub async fn remove(&self) -> Result<()> {
         self.docker
             .remove_container(
@@ -432,6 +477,9 @@ impl Drop for Container {
         crate::cleanup::remove_if_tracked(&self.id);
     }
 }
+
+/// How much of a container's output an error for its failed start carries.
+const START_FAILURE_LOG_LINES: usize = 20;
 
 /// How long a request to Docker may take. bollard's default, 120 s, is
 /// shorter than the stalls a daemon on a busy CI host goes through, and a

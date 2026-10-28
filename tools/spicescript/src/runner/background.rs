@@ -112,7 +112,7 @@ pub(super) fn start_background(
                     stats.iterations += 1;
                     stats.latencies.push(began.elapsed());
                     if let Err(e) = outcome {
-                        stats.errors.push(format!("{e:#}"));
+                        stats.errors.push((chrono::Utc::now(), format!("{e:#}")));
                     }
                 }
                 if let Some(every) = every {
@@ -182,19 +182,26 @@ pub(super) async fn stop_background(
         .get((latencies.len() * 99).div_ceil(100).saturating_sub(1))
         .copied()
         .unwrap_or_default();
-    let unexpected: Vec<&String> = stats
+    let unexpected: Vec<&(chrono::DateTime<chrono::Utc>, String)> = stats
         .errors
         .iter()
-        .filter(|e| !allow.iter().any(|a| a.is_match(e)))
+        .filter(|(_, e)| !allow.iter().any(|a| a.is_match(e)))
         .collect();
+    // When, in the clock `spiced.log` uses, so the failures can be lined up
+    // with what the instance logged then. On a line of its own: a ledger
+    // signature is the first line, and the times differ from run to run.
+    let at =
+        |t: &chrono::DateTime<chrono::Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     ensure!(
         unexpected.is_empty(),
-        "{} of {} iterations failed; first: {}",
+        "{} of {} iterations failed; first: {}\nfailed from {} to {}",
         unexpected.len(),
         stats.iterations,
         unexpected
             .first()
-            .map_or(String::new(), |e| one_line(e, 300))
+            .map_or(String::new(), |(_, e)| one_line(e, 300)),
+        unexpected.first().map_or(String::new(), |(t, _)| at(t)),
+        unexpected.last().map_or(String::new(), |(t, _)| at(t)),
     );
     ensure!(
         stats.iterations > 0,
@@ -203,7 +210,7 @@ pub(super) async fn stop_background(
     // The commonest allowed errors, numbers aside, so that what was allowed
     // is seen rather than only counted.
     let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
-    for e in &stats.errors {
+    for (_, e) in &stats.errors {
         let kind: String = one_line(e, 160)
             .chars()
             .map(|c| if c.is_ascii_digit() { '#' } else { c })
