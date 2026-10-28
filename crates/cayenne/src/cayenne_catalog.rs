@@ -415,8 +415,19 @@ impl CayenneCatalog {
         };
         let _serial = tap.enter().await;
         self.tap_verify_pending().await;
-        let (mut report, states) = tap.shadow_states().await;
-        for (id, state) in states {
+        let (mut report, tables) = tap.shadow_tables().await;
+        // One table at a time: its storage replay and SQL readback are the
+        // only states held, whatever the number of tables.
+        for id in tables {
+            let state = match tap.shadow_replay(&id).await {
+                Ok(state) => state,
+                Err(e) => {
+                    report
+                        .differences
+                        .push(format!("{id}: storage readback: {e}"));
+                    continue;
+                }
+            };
             report.verified_tables += 1;
             let diff = match self.tap_read_table_state(&id, false).await {
                 Ok(sql) => match (sql.as_ref(), state.tables.get(&id)) {

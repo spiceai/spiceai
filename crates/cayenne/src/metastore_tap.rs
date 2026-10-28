@@ -196,10 +196,22 @@ impl MetastoreTap {
         }
     }
 
-    pub(crate) async fn shadow_states(&self) -> (ShadowReport, BTreeMap<String, DatasetState>) {
+    /// Wait for the shadow to commit everything queued, then list its tables.
+    pub(crate) async fn shadow_tables(&self) -> (ShadowReport, Vec<String>) {
         match &self.shadow {
             Some(s) => s.verify().await,
-            None => (ShadowReport::default(), BTreeMap::new()),
+            None => (ShadowReport::default(), Vec::new()),
+        }
+    }
+
+    /// One shadowed table rebuilt from storage alone.
+    pub(crate) async fn shadow_replay(
+        &self,
+        table: &str,
+    ) -> std::result::Result<DatasetState, String> {
+        match &self.shadow {
+            Some(s) => s.replay(table).await,
+            None => Err("no shadow is configured".into()),
         }
     }
 

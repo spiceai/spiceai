@@ -53,7 +53,13 @@ pub(super) struct Payload {
 enum Command {
     Blob(Bytes),
     Payload(Box<Payload>),
-    Verify(oneshot::Sender<(ShadowReport, BTreeMap<String, DatasetState>)>),
+    /// A barrier: every earlier payload is committed, then the tables are listed.
+    Verify(oneshot::Sender<(ShadowReport, Vec<String>)>),
+    /// Rebuild one table from storage alone.
+    Replay(
+        String,
+        oneshot::Sender<std::result::Result<DatasetState, String>>,
+    ),
 }
 
 pub(super) struct Shadow {
@@ -121,13 +127,16 @@ impl Shadow {
             failure(&self.failures, "channel", "worker stopped");
         }
     }
-    pub async fn verify(&self) -> (ShadowReport, BTreeMap<String, DatasetState>) {
+    /// Wait for every queued payload, then list the shadowed tables. Replay
+    /// them one at a time with [`Self::replay`], so verification holds one
+    /// table's state at once.
+    pub async fn verify(&self) -> (ShadowReport, Vec<String>) {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(Command::Verify(tx)).is_ok()
-            && let Ok((mut report, states)) = rx.await
+            && let Ok((mut report, tables)) = rx.await
         {
             report.failures = self.failures.lock().clone();
-            return (report, states);
+            return (report, tables);
         }
         failure(&self.failures, "channel", "verification worker stopped");
         (
@@ -135,8 +144,21 @@ impl Shadow {
                 failures: self.failures.lock().clone(),
                 ..Default::default()
             },
-            BTreeMap::new(),
+            Vec::new(),
         )
+    }
+    /// One table's state rebuilt from storage alone.
+    pub async fn replay(&self, table: &str) -> std::result::Result<DatasetState, String> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(Command::Replay(table.to_string(), tx))
+            .is_err()
+        {
+            return Err("verification worker stopped".into());
+        }
+        rx.await
+            .unwrap_or_else(|_| Err("verification worker stopped".into()))
     }
 }
 #[derive(prost::Message)]
@@ -222,6 +244,7 @@ async fn run(
         }
         let mut queued: BTreeMap<String, Vec<Payload>> = BTreeMap::new();
         let mut barrier = None;
+        let mut replays = Vec::new();
         for command in commands {
             match command {
                 Command::Blob(bytes) => {
@@ -238,6 +261,7 @@ async fn run(
                 }
                 Command::Payload(p) => queued.entry(p.table.clone()).or_default().push(*p),
                 Command::Verify(tx) => barrier = Some(tx),
+                Command::Replay(id, tx) => replays.push((id, tx)),
             }
         }
         for (id, payloads) in queued {
@@ -306,22 +330,18 @@ async fn run(
                 failure(&failures, "output", e);
             }
         }
+        for (id, tx) in replays {
+            let result = replay(Arc::clone(&store), table_prefix(&prefix, &id))
+                .await
+                .map_err(|e| {
+                    failure(&failures, "readback", &e);
+                    e.to_string()
+                });
+            let _ = tx.send(result);
+        }
         if let Some(tx) = barrier {
-            let mut states = BTreeMap::new();
-            for id in tables.keys().chain(failed_tables.iter()) {
-                match replay(Arc::clone(&store), table_prefix(&prefix, id)).await {
-                    Ok(state) => {
-                        states.insert(id.clone(), state);
-                    }
-                    Err(e) => {
-                        failure(&failures, "readback", &e);
-                        report
-                            .differences
-                            .push(format!("{id}: storage readback: {e}"));
-                    }
-                }
-            }
-            let _ = tx.send((report.clone(), states));
+            let ids = tables.keys().chain(failed_tables.iter()).cloned().collect();
+            let _ = tx.send((report.clone(), ids));
         }
     }
 }
