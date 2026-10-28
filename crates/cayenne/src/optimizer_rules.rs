@@ -5576,9 +5576,16 @@ mod tests {
 
     /// TPC-DS Q51 shape: `FULL JOIN` of two aggregates over Cayenne,
     /// hash-partitioned 8 ways.
-    fn q51_full_join(left_leaf: Arc<dyn ExecutionPlan>, right_leaf: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    fn q51_full_join(
+        left_leaf: Arc<dyn ExecutionPlan>,
+        right_leaf: Arc<dyn ExecutionPlan>,
+    ) -> Arc<dyn ExecutionPlan> {
         let left = hash_repartition(grouped_count_over(left_leaf, "ws_item_sk"), "ws_item_sk", 8);
-        let right = hash_repartition(grouped_count_over(right_leaf, "ss_item_sk"), "ss_item_sk", 8);
+        let right = hash_repartition(
+            grouped_count_over(right_leaf, "ss_item_sk"),
+            "ss_item_sk",
+            8,
+        );
         Arc::new(hash_join_with_join_type(
             left,
             right,
