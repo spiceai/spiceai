@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `c216c62616ce67e1cbc7b4f0c5293e62fae79f18` | `lukim/eager-agg-ungrouped-count-zero-on-3a75c40` (temporary; spiceai/datafusion#276 targets `spiceai-55`) |
+| [datafusion](#datafusion) | `bd3d95cc17680cccf976a0c442dc389122752b20` | `lukim/eager-agg-ungrouped-count-zero-on-3a75c40` (temporary; spiceai/datafusion#276 targets `spiceai-55`) |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `4a2920746865562e604150fbee49eea6241c0b85` | `spiceai-55` |
