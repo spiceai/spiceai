@@ -1,0 +1,47 @@
+   Compiling object_store_occ v0.1.0 (/Users/ben/orca/workspaces/spiceai/metastore1/crates/object_store_occ)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.54s
+     Running tests/fault.rs (/tmp/object-store-replay-target/debug/deps/fault-4681db8befb3c8e4)
+
+running 2 tests
+test canceled_call_still_delivers_and_forwarded_operations_are_logged ... InMemory: canceled caller retains delivery; hook/put/get/list/copy/delete/multipart log order holds
+LocalConditionalPut(/var/folders/vq/h3b18yld7356tgpw9zdffjb40000gn/T/.tmpKWwAjA, durable): canceled caller retains delivery; hook/put/get/list/copy/delete/multipart log order holds
+ok
+test faults_memory_and_durable_local ... InMemory: hold, delayed response, duplicate condition, before-hook, ambiguous landing, failed put/get, dropped held response
+LocalConditionalPut(/var/folders/vq/h3b18yld7356tgpw9zdffjb40000gn/T/.tmpYOQkAf, durable): hold, delayed response, duplicate condition, before-hook, ambiguous landing, failed put/get, dropped held response
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/headlog_replay.rs (/tmp/object-store-replay-target/debug/deps/headlog_replay-cba6f1bda5916fca)
+
+running 8 tests
+test commits_restart_turnover ... commits-restart-turnover: witnesses=4 walks=20 backends=memory,durable-local skipped={}
+ok
+test control_ack_before_acceptance ... CONTROL backend=memory safe=holds removed=caught trace=source-ack-before-acceptance "I2 source acknowledgement covered" step=3 action=Acknowledge expected invariants hold; actual=I2 expected acknowledgement <= 0; actual 1 actions=["Receive", "Issue", "Acknowledge"]
+CONTROL backend=durable-local safe=holds removed=caught trace=source-ack-before-acceptance "I2 source acknowledgement covered" step=3 action=Acknowledge expected invariants hold; actual=I2 expected acknowledgement <= 0; actual 1 actions=["Receive", "Issue", "Acknowledge"]
+ok
+test control_batch_exists ... CONTROL backend=memory safe=holds removed=caught trace=window-storage-no-exists-5-exhaust "I4 reader inline payload replay equality" step=3 action=Append(1) expected invariants hold; actual=I4 expected readable committed prefix; actual Head log storage error: Object at location replay/wal/00000000000000000001 not found: No data in memory found. Location: replay/wal/00000000000000000001 actions=["Append(1)", "Append(1)", "Append(1)"]
+CONTROL backend=durable-local safe=holds removed=caught trace=window-storage-no-exists-5-exhaust "I4 reader inline payload replay equality" step=3 action=Append(1) expected invariants hold; actual=I4 expected readable committed prefix; actual Head log storage error: Object at location /private/var/folders/vq/h3b18yld7356tgpw9zdffjb40000gn/T/.tmp6KxHRQ/replay/wal/00000000000000000001 not found: No such file or directory (os error 2) actions=["Append(1)", "Append(1)", "Append(1)"]
+ok
+test control_persist_before_send ... CONTROL backend=memory safe=holds removed=caught trace=commits-restart-no-persist-before-send "I2 acknowledged logical write exactly once" step=12 action=Deliver(0, 1, 1) expected invariants hold; actual=I2 expected logical-write-0 count <= 1 (exactly 1 after acknowledgement); actual 2 actions=["Buffer(0)", "Copy(0)", "Issue(0)", "Send(0)", "Resolve(0)", "Deliver(0, 0, 1)", "Restart", "Buffer(0)", "Issue(0)", "Send(0)", "Resolve(0)", "Deliver(0, 1, 1)", "Response(0)", "Ack(0)"]
+CONTROL backend=durable-local safe=holds removed=caught trace=commits-restart-no-persist-before-send "I2 acknowledged logical write exactly once" step=12 action=Deliver(0, 1, 1) expected invariants hold; actual=I2 expected logical-write-0 count <= 1 (exactly 1 after acknowledgement); actual 2 actions=["Buffer(0)", "Copy(0)", "Issue(0)", "Send(0)", "Resolve(0)", "Deliver(0, 0, 1)", "Restart", "Buffer(0)", "Issue(0)", "Send(0)", "Resolve(0)", "Deliver(0, 1, 1)", "Response(0)", "Ack(0)"]
+ok
+test control_redelivery_skip ... CONTROL backend=memory safe=holds removed=caught trace=source-no-redelivery-skip "I10 source append prefix exactly once" step=12 action=Deliver(2, 0) expected invariants hold; actual=I10 expected rows [1] at position 1; actual [1, 1] actions=["Receive", "Issue", "Takeover", "Receive", "Issue", "Resolve", "Deliver(1, 1)", "Crash", "Acquire", "Receive", "Issue", "Deliver(2, 0)"]
+CONTROL backend=memory safe=holds removed=caught trace=source-no-redelivery-skip "I10 logged source position has its rows" step=12 action=Deliver(2, 1) expected invariants hold; actual=I10 expected rows [1] at position 1; actual [1, 1] actions=["Receive", "Issue", "Deliver(0, 0)", "Takeover", "Receive", "Issue", "Crash", "Acquire", "Receive", "Issue", "Resolve", "Deliver(2, 1)", "Resolve", "Acknowledge", "Receive", "Issue", "Deliver(3, 0)"]
+CONTROL backend=memory safe=holds removed=caught trace=source-no-redelivery-skip "I10 complete source state matches logged prefix" step=12 action=Deliver(2, 0) expected invariants hold; actual=I10 expected rows [1] at position 1; actual [1, 1] actions=["Receive", "Issue", "Takeover", "Receive", "Issue", "Resolve", "Deliver(1, 1)", "Crash", "Acquire", "Receive", "Issue", "Deliver(2, 0)"]
+CONTROL backend=durable-local safe=holds removed=caught trace=source-no-redelivery-skip "I10 source append prefix exactly once" step=12 action=Deliver(2, 0) expected invariants hold; actual=I10 expected rows [1] at position 1; actual [1, 1] actions=["Receive", "Issue", "Takeover", "Receive", "Issue", "Resolve", "Deliver(1, 1)", "Crash", "Acquire", "Receive", "Issue", "Deliver(2, 0)"]
+CONTROL backend=durable-local safe=holds removed=caught trace=source-no-redelivery-skip "I10 logged source position has its rows" step=12 action=Deliver(2, 1) expected invariants hold; actual=I10 expected rows [1] at position 1; actual [1, 1] actions=["Receive", "Issue", "Deliver(0, 0)", "Takeover", "Receive", "Issue", "Crash", "Acquire", "Receive", "Issue", "Resolve", "Deliver(2, 1)", "Resolve", "Acknowledge", "Receive", "Issue", "Deliver(3, 0)"]
+CONTROL backend=durable-local safe=holds removed=caught trace=source-no-redelivery-skip "I10 complete source state matches logged prefix" step=12 action=Deliver(2, 0) expected invariants hold; actual=I10 expected rows [1] at position 1; actual [1, 1] actions=["Receive", "Issue", "Takeover", "Receive", "Issue", "Resolve", "Deliver(1, 1)", "Crash", "Acquire", "Receive", "Issue", "Deliver(2, 0)"]
+ok
+test listed_missing_batch_is_error ... I4 backend=memory open=Head log storage error: Object at location replay/wal/00000000000000000001 not found: No data in memory found. Location: replay/wal/00000000000000000001; poll=Head log storage error: Object at location replay/wal/00000000000000000001 not found: No data in memory found. Location: replay/wal/00000000000000000001; cursor=0
+I4 backend=durable-local open=Head log storage error: Object at location /private/var/folders/vq/h3b18yld7356tgpw9zdffjb40000gn/T/.tmpMv2Ked/replay/wal/00000000000000000001 not found: No such file or directory (os error 2); poll=Head log storage error: Object at location /private/var/folders/vq/h3b18yld7356tgpw9zdffjb40000gn/T/.tmpMv2Ked/replay/wal/00000000000000000001 not found: No such file or directory (os error 2); cursor=0
+ok
+test source_positions ... source-positions: witnesses=3 walks=20 backends=memory,durable-local skipped={}
+ok
+test window_storage ... CUTS backend=memory batch_ends=[3, 4] window_record_bytes=[20000, 20000] head_encoded_bytes=40044
+CUTS backend=durable-local batch_ends=[3, 4] window_record_bytes=[20000, 20000] head_encoded_bytes=40044
+window-storage-6-exhaust: witnesses=3 walks=20 backends=memory,durable-local skipped={"Append refused: batch not yet created": 64, "Checkpoint partially mapped: published batch prefix staged; model publishes full window immediately": 2, "Checkpoint refused: no published batch boundary": 40, "Create: checkpoint-model pending copy has no head-log equivalent": 4, "Gc": 42, "Pin": 40}
+ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.62s
+

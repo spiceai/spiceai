@@ -18,6 +18,7 @@ limitations under the License.
 //! a sibling module) injected faults. Results measured through [`LatencyStore`] are
 //! simulated latency, never an object store's own numbers.
 
+pub mod fault;
 pub mod latency;
 
 pub use latency::{LatencyProfile, LatencyStore, Op};

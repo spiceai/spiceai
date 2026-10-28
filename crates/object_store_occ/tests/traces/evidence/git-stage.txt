@@ -1,0 +1,4 @@
+$ git add crates/object_store_occ/src/headlog/mod.rs
+fatal: Unable to create '/Users/ben/Code/spiceai/.git/worktrees/56594-26fcf00c-d12c-4ec7-aecb-3ae72c921784/index.lock': Operation not permitted
+
+$ git diff --cached --stat

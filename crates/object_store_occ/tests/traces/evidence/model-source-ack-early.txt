@@ -1,0 +1,31 @@
+    Finished `release` profile [optimized] target(s) in 0.70s
+     Running `target/release/cayenne-metastore-model run source-ack-before-acceptance`
+START source-ack-before-acceptance
+CONFIG source-ack-before-acceptance mode=EXHAUSTIVE bound=2 seed=0 states=1136117 unique_or_sampled_visits=300278 depth=29
+PROPERTY HOLDS at most one live row per source key
+PROPERTY FAIL I10 source append prefix exactly once
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=13 [Receive, Issue, Takeover, Receive, Issue, Crash, Acquire, Receive, Issue, Acknowledge, Receive, Issue, Deliver(3, 0)]
+WITNESS Some(State { head: Head { pos: 1, lease: 2, floor: 0 }, rows: [2], position: 2, acknowledged: 1, buffer: [2], cursor: 3, attempts: [Attempt { base: Head { pos: 0, lease: 0, floor: 0 }, rows: [1], position: 1, delivered: 0, retry: false }, Attempt { base: Head { pos: 0, lease: 1, floor: 0 }, rows: [1], position: 1, delivered: 0, retry: false }, Attempt { base: Head { pos: 0, lease: 2, floor: 0 }, rows: [1], position: 1, delivered: 0, retry: false }, Attempt { base: Head { pos: 0, lease: 2, floor: 0 }, rows: [2], position: 2, delivered: 1, retry: false }], active: Some(3), accepted: [3], answer: 0, crashed: true, skipped: false, unknown: false, half: false, needs_lease: false })
+PROPERTY FAIL I10 logged source position has its rows
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=13 [Receive, Issue, Takeover, Receive, Issue, Crash, Acquire, Receive, Issue, Acknowledge, Receive, Issue, Deliver(3, 0)]
+WITNESS Some(State { head: Head { pos: 1, lease: 2, floor: 0 }, rows: [2], position: 2, acknowledged: 1, buffer: [2], cursor: 3, attempts: [Attempt { base: Head { pos: 0, lease: 0, floor: 0 }, rows: [1], position: 1, delivered: 0, retry: false }, Attempt { base: Head { pos: 0, lease: 1, floor: 0 }, rows: [1], position: 1, delivered: 0, retry: false }, Attempt { base: Head { pos: 0, lease: 2, floor: 0 }, rows: [1], position: 1, delivered: 0, retry: false }, Attempt { base: Head { pos: 0, lease: 2, floor: 0 }, rows: [2], position: 2, delivered: 1, retry: false }], active: Some(3), accepted: [3], answer: 0, crashed: true, skipped: false, unknown: false, half: false, needs_lease: false })
+PROPERTY FAIL I10 complete source state matches logged prefix
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=13 [Receive, Issue, Takeover, Receive, Issue, Crash, Acquire, Receive, Issue, Acknowledge, Receive, Issue, Deliver(3, 0)]
+WITNESS Some(State { head: Head { pos: 1, lease: 2, floor: 0 }, rows: [2], position: 2, acknowledged: 1, buffer: [2], cursor: 3, attempts: [Attempt { base: Head { pos: 0, lease: 0, floor: 0 }, rows: [1], position: 1, delivered: 0, retry: false }, Attempt { base: Head { pos: 0, lease: 1, floor: 0 }, rows: [1], position: 1, delivered: 0, retry: false }, Attempt { base: Head { pos: 0, lease: 2, floor: 0 }, rows: [1], position: 1, delivered: 0, retry: false }, Attempt { base: Head { pos: 0, lease: 2, floor: 0 }, rows: [2], position: 2, delivered: 1, retry: false }], active: Some(3), accepted: [3], answer: 0, crashed: true, skipped: false, unknown: false, half: false, needs_lease: false })
+PROPERTY FAIL I2 source acknowledgement covered
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=3 [Receive, Issue, Acknowledge]
+WITNESS Some(State { head: Head { pos: 0, lease: 0, floor: 0 }, rows: [], position: 0, acknowledged: 1, buffer: [], cursor: 2, attempts: [Attempt { base: Head { pos: 0, lease: 0, floor: 0 }, rows: [1], position: 1, delivered: 0, retry: false }], active: None, accepted: [], answer: 0, crashed: false, skipped: false, unknown: false, half: false, needs_lease: false })
+PROPERTY REACHED source redelivery skipped after turnover
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=16 [Receive, Issue, Takeover, Receive, Issue, Acknowledge, Receive, Issue, Deliver(1, 0), Resolve, Issue, Resolve, Deliver(3, 1), Crash, Acquire, Receive]
+PROPERTY REACHED source ambiguous accepted outcome
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=14 [Receive, Issue, Unknown, Takeover, Receive, Issue, Crash, Acquire, Receive, Issue, Acknowledge, Receive, Issue, Deliver(3, 0)]
+PROPERTY REACHED source grouped two changes
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=11 [Receive, Issue, Takeover, Receive, Issue, Crash, Acquire, Receive, Receive, Issue, Deliver(2, 0)]
+RESULT source-ack-before-acceptance expected=I2 source acknowledgement covered matched=true seconds=0.614

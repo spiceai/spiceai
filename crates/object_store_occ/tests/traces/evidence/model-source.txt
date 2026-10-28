@@ -1,0 +1,19 @@
+    Finished `release` profile [optimized] target(s) in 0.73s
+     Running `target/release/cayenne-metastore-model run source-positions`
+START source-positions
+CONFIG source-positions mode=EXHAUSTIVE bound=2 seed=0 states=206617 unique_or_sampled_visits=63798 depth=31
+PROPERTY HOLDS at most one live row per source key
+PROPERTY HOLDS I10 source append prefix exactly once
+PROPERTY HOLDS I10 logged source position has its rows
+PROPERTY HOLDS I10 complete source state matches logged prefix
+PROPERTY HOLDS I2 source acknowledgement covered
+PROPERTY REACHED source redelivery skipped after turnover
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=5 [Receive, Issue, Deliver(0, 0), Takeover, Receive]
+PROPERTY REACHED source ambiguous accepted outcome
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=4 [Receive, Issue, Unknown, Deliver(0, 0)]
+PROPERTY REACHED source grouped two changes
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=4 [Receive, Receive, Issue, Deliver(0, 0)]
+RESULT source-positions expected=holds matched=true seconds=0.088

@@ -1,0 +1,18 @@
+    Finished `release` profile [optimized] target(s) in 0.72s
+     Running `target/release/cayenne-metastore-model run window-storage-6-exhaust`
+START window-storage-6-exhaust
+CONFIG window-storage-6-exhaust mode=EXHAUSTIVE bound=6 seed=0 states=133232 unique_or_sampled_visits=76014 depth=25
+PROPERTY HOLDS I4 reader inline payload replay equality
+PROPERTY HOLDS I8 recovery replay equality including payload bytes
+PROPERTY HOLDS I7 pinned snapshot equals serial
+PROPERTY REACHED byte and count cuts
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=10 [Append(0), Append(0), Append(0), Observe, Create(0), Append(1), Append(1), Observe, Create(1), Append(1)]
+PROPERTY REACHED head byte and count budgets both force drops
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=10 [Append(0), Append(0), Append(0), Observe, Create(0), Append(1), Append(1), Observe, Create(1), Append(1)]
+PROPERTY REACHED delayed seal after GC
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=8 [Append(0), Append(0), Append(0), Observe, Create(0), Checkpoint, Gc, Create(0)]
+PROPERTY NOT_REACHED conflicting seal bytes
+RESULT window-storage-6-exhaust expected=holds matched=true seconds=0.209

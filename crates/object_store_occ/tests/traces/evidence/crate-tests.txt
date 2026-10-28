@@ -1,0 +1,279 @@
+   Compiling object_store_occ v0.1.0 (/Users/ben/orca/workspaces/spiceai/metastore1/crates/object_store_occ)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.76s
+     Running unittests src/lib.rs (/tmp/object-store-replay-target/debug/deps/object_store_occ-46e8d330c49bf4c6)
+
+running 67 tests
+test conditional::tests::a_read_without_etag_or_version_cannot_be_updated_conditionally ... ok
+test capabilities::tests::a_partial_refusal_is_cacheable_even_when_inconclusive ... ok
+test lease::tests::a_lease_claiming_more_than_the_maximum_duration_lapses_at_the_maximum ... ok
+test lease::tests::a_live_lease_of_another_instance_is_left_to_it ... ok
+test lease::tests::a_lease_held_under_our_identity_is_renewed_even_after_a_restart ... ok
+test lease::tests::a_lease_unchanged_for_its_duration_is_taken_over ... ok
+test lease::tests::an_absent_lease_is_created ... ok
+test lease::tests::an_unreadable_lease_lapses_after_our_own_duration ... ok
+test lease::tests::a_record_of_another_format_version_is_unreadable ... ok
+test lease::tests::each_renewal_is_later_than_the_previous_even_when_the_clock_is_not ... ok
+test conditional::tests::stale_version_conflicts_and_current_version_lands ... ok
+test lease::tests::a_former_holder_is_refused_at_its_next_fenced_write ... ok
+test conditional::tests::absent_creates_once_then_conflicts ... ok
+test lease::tests::a_new_observer_judges_no_holder_gone_before_watching_it_for_the_duration ... ok
+test capabilities::tests::a_store_that_ignores_conditions_is_caught ... ok
+test conditional::tests::update_of_a_deleted_object_conflicts ... ok
+test lease::tests::create_then_renew_keeps_the_generation_and_changes_the_version ... ok
+test capabilities::tests::in_memory_enforces_both ... ok
+test lease::tests::the_holders_own_duration_decides_when_its_lease_lapses ... ok
+test lease::tests::a_released_lease_is_taken_over_at_once ... ok
+test lease::tests::the_callers_generation_lookup_decides_a_new_leases_generation ... ok
+test lease::tests::another_holder_takes_over_only_after_the_lease_stays_unchanged_for_its_duration ... ok
+test lease::tests::a_renewing_holder_is_never_taken_over ... ok
+test lease::tests::a_holder_whose_clock_is_far_ahead_or_behind_is_judged_by_the_observers_clock ... ok
+test cleanup::tests::deleting_an_object_that_is_already_gone_counts_as_done ... ok
+test lease::tests::a_write_checked_before_a_takeover_does_not_overwrite_the_new_holder ... ok
+test conditional::tests::local_filesystem_update_is_unsupported_not_overwritten ... ok
+test lease::tests::racing_holders_elect_exactly_one ... ok
+test retry::tests::delays_grow_and_stay_within_the_window ... ok
+test local_conditional_put::tests::test_conditional_update_not_found ... ok
+test retry::tests::stops_at_the_first_non_conflict_error ... ok
+test retry::tests::zero_attempts_still_tries_once ... ok
+test capabilities::tests::plain_local_filesystem_cannot_update ... ok
+test local_conditional_put::tests::test_basic_put_and_get ... ok
+test state::tests::modify_creates_an_absent_object_then_changes_it ... ok
+test state::tests::modify_keep_and_rejected_do_not_write ... ok
+test state::tests::test_delete ... ok
+test state::tests::test_get_cached ... ok
+test state::tests::test_get_missing_removes_cached_entry ... ok
+test state::tests::test_insert_already_exists ... ok
+test state::tests::test_insert_new_object ... ok
+test state::tests::test_list_keys ... ok
+test local_conditional_put::tests::an_update_at_a_directory_path_finds_no_object ... ok
+test state::tests::test_list_keys_scopes_prefix_and_json_suffix ... ok
+test capabilities::tests::local_conditional_put_enforces_both ... ok
+test local_conditional_put::tests::test_conditional_update_compares_etag_without_version ... ok
+test state::tests::test_refresh ... ok
+test state::tests::test_refresh_populates_valid_entries_and_skips_invalid_json ... ok
+test state::tests::test_refresh_removes_deleted_cached_entries ... ok
+test state::tests::test_update_existing ... ok
+test state::tests::update_with_version_conflicts_when_read_etag_is_stale ... ok
+test local_conditional_put::tests::publication_lock_is_hidden_and_cannot_be_replaced ... ok
+test local_conditional_put::tests::test_conditional_update_success ... ok
+test state::tests::update_with_version_refuses_a_version_without_an_etag ... ok
+test state::tests::update_with_version_of_a_deleted_object_is_not_found ... ok
+test local_conditional_put::tests::test_concurrent_conditional_updates_across_instances_one_wins ... ok
+test local_conditional_put::tests::test_create_mode ... ok
+test local_conditional_put::tests::test_concurrent_conditional_updates_one_wins ... ok
+test local_conditional_put::tests::put_returns_the_etag_head_reports ... ok
+test local_conditional_put::tests::test_conditional_update_stale_etag ... ok
+test local_conditional_put::tests::test_sequential_conditional_updates ... ok
+test retry::tests::returns_the_value_once_an_attempt_lands ... ok
+test state::tests::modify_gives_up_after_the_policy_and_keeps_the_winners_value ... ok
+test retry::tests::gives_up_after_max_attempts_of_conflicts ... ok
+test state::tests::concurrent_modify_on_a_local_directory_loses_no_update ... ok
+test local_conditional_put::tests::a_superseded_etag_never_matches_a_later_version ... ok
+test local_conditional_put::tests::a_coarse_timestamp_waits_for_the_clock_instead_of_running_ahead ... ok
+
+test result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.90s
+
+     Running tests/fault.rs (/tmp/object-store-replay-target/debug/deps/fault-4681db8befb3c8e4)
+
+running 1 test
+InMemory: hold, delayed response, duplicate condition, before-hook, ambiguous landing, failed put/get, dropped held response
+LocalConditionalPut(/var/folders/vq/h3b18yld7356tgpw9zdffjb40000gn/T/.tmpJaYnva, durable): hold, delayed response, duplicate condition, before-hook, ambiguous landing, failed put/get, dropped held response
+test faults_memory_and_durable_local ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/headlog.rs (/tmp/object-store-replay-target/debug/deps/headlog-39d5c3a7e3d87014)
+
+running 11 tests
+memory: H=300 B=200 R=100; observed=232 planned=336; Invalid head log: head budget exhausted without a final batch; checkpoint or increase budgets
+memory: 500 ordered records, cold open and lagging polls agree
+local: H=300 B=200 R=100; observed=232 planned=336; Invalid head log: head budget exhausted without a final batch; checkpoint or increase budgets
+test headlog_invalid_config_record_limit_and_unknown_features_fail_closed ... ok
+test headlog_minimum_budget_reports_envelope_overhead_instead_of_unsafe_copy ... ok
+test headlog_byte_cut_waits_for_published_successor_and_exact_record_limit ... ok
+test headlog_group_persists_before_send_and_upload_is_immutable ... ok
+test headlog_takeover_fences_stale_owner_and_preserves_accepted_evidence ... ok
+test headlog_uncertain_responses_identical_retry_and_restart ... ok
+test headlog_missing_listed_batch_is_an_error_for_open_and_poll ... ok
+test headlog_copy_preserves_original_unknown_fields_and_checks_duplicates ... ok
+test headlog_resolution_rejected_and_below_floor_without_evidence_unresolved ... ok
+test headlog_checkpoint_publishes_on_next_commit_and_requires_reopen ... ok
+local: 500 ordered records, cold open and lagging polls agree
+test headlog_500_records_cold_open_and_lagging_poll ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.66s
+
+     Running tests/headlog_replay.rs (/tmp/object-store-replay-target/debug/deps/headlog_replay-cba6f1bda5916fca)
+
+running 8 tests
+I4 backend=memory open=Head log storage error: Object at location replay/wal/00000000000000000001 not found: No data in memory found. Location: replay/wal/00000000000000000001; poll=Head log storage error: Object at location replay/wal/00000000000000000001 not found: No data in memory found. Location: replay/wal/00000000000000000001; cursor=0
+CONTROL backend=memory safe=holds removed=caught trace=source-ack-before-acceptance "I2 source acknowledgement covered" step=3 action=Acknowledge expected invariants hold; actual=I2 expected acknowledgement <= 0; actual 1 actions=["Receive", "Issue", "Acknowledge"]
+CONTROL backend=memory safe=holds removed=caught trace=source-no-redelivery-skip "I10 source append prefix exactly once" step=12 action=Deliver(2, 0) expected invariants hold; actual=I10 expected rows [1] at position 1; actual [1, 1] actions=["Receive", "Issue", "Takeover", "Receive", "Issue", "Resolve", "Deliver(1, 1)", "Crash", "Acquire", "Receive", "Issue", "Deliver(2, 0)"]
+CONTROL backend=memory safe=holds removed=caught trace=commits-restart-no-persist-before-send "I2 acknowledged logical write exactly once" step=12 action=Deliver(0, 1, 1) expected invariants hold; actual=I2 expected logical-write-0 count <= 1 (exactly 1 after acknowledgement); actual 2 actions=["Buffer(0)", "Copy(0)", "Issue(0)", "Send(0)", "Resolve(0)", "Deliver(0, 0, 1)", "Restart", "Buffer(0)", "Issue(0)", "Send(0)", "Resolve(0)", "Deliver(0, 1, 1)", "Response(0)", "Ack(0)"]
+CONTROL backend=memory safe=holds removed=caught trace=source-no-redelivery-skip "I10 logged source position has its rows" step=12 action=Deliver(2, 1) expected invariants hold; actual=I10 expected rows [1] at position 1; actual [1, 1] actions=["Receive", "Issue", "Deliver(0, 0)", "Takeover", "Receive", "Issue", "Crash", "Acquire", "Receive", "Issue", "Resolve", "Deliver(2, 1)", "Resolve", "Acknowledge", "Receive", "Issue", "Deliver(3, 0)"]
+CONTROL backend=memory safe=holds removed=caught trace=source-no-redelivery-skip "I10 complete source state matches logged prefix" step=12 action=Deliver(2, 0) expected invariants hold; actual=I10 expected rows [1] at position 1; actual [1, 1] actions=["Receive", "Issue", "Takeover", "Receive", "Issue", "Resolve", "Deliver(1, 1)", "Crash", "Acquire", "Receive", "Issue", "Deliver(2, 0)"]
+CONTROL backend=memory safe=holds removed=caught trace=window-storage-no-exists-5-exhaust "I4 reader inline payload replay equality" step=3 action=Append(1) expected invariants hold; actual=I4 expected readable committed prefix; actual Head log storage error: Object at location replay/wal/00000000000000000001 not found: No data in memory found. Location: replay/wal/00000000000000000001 actions=["Append(1)", "Append(1)", "Append(1)"]
+CONTROL backend=durable-local safe=holds removed=caught trace=source-ack-before-acceptance "I2 source acknowledgement covered" step=3 action=Acknowledge expected invariants hold; actual=I2 expected acknowledgement <= 0; actual 1 actions=["Receive", "Issue", "Acknowledge"]
+test control_ack_before_acceptance ... ok
+I4 backend=durable-local open=Head log storage error: Object at location /private/var/folders/vq/h3b18yld7356tgpw9zdffjb40000gn/T/.tmpYQ0MRM/replay/wal/00000000000000000001 not found: No such file or directory (os error 2); poll=Head log storage error: Object at location /private/var/folders/vq/h3b18yld7356tgpw9zdffjb40000gn/T/.tmpYQ0MRM/replay/wal/00000000000000000001 not found: No such file or directory (os error 2); cursor=0
+test listed_missing_batch_is_error ... ok
+CONTROL backend=durable-local safe=holds removed=caught trace=window-storage-no-exists-5-exhaust "I4 reader inline payload replay equality" step=3 action=Append(1) expected invariants hold; actual=I4 expected readable committed prefix; actual Head log storage error: Object at location /private/var/folders/vq/h3b18yld7356tgpw9zdffjb40000gn/T/.tmpZQQRjj/replay/wal/00000000000000000001 not found: No such file or directory (os error 2) actions=["Append(1)", "Append(1)", "Append(1)"]
+test control_batch_exists ... ok
+CONTROL backend=durable-local safe=holds removed=caught trace=source-no-redelivery-skip "I10 source append prefix exactly once" step=12 action=Deliver(2, 0) expected invariants hold; actual=I10 expected rows [1] at position 1; actual [1, 1] actions=["Receive", "Issue", "Takeover", "Receive", "Issue", "Resolve", "Deliver(1, 1)", "Crash", "Acquire", "Receive", "Issue", "Deliver(2, 0)"]
+CONTROL backend=durable-local safe=holds removed=caught trace=commits-restart-no-persist-before-send "I2 acknowledged logical write exactly once" step=12 action=Deliver(0, 1, 1) expected invariants hold; actual=I2 expected logical-write-0 count <= 1 (exactly 1 after acknowledgement); actual 2 actions=["Buffer(0)", "Copy(0)", "Issue(0)", "Send(0)", "Resolve(0)", "Deliver(0, 0, 1)", "Restart", "Buffer(0)", "Issue(0)", "Send(0)", "Resolve(0)", "Deliver(0, 1, 1)", "Response(0)", "Ack(0)"]
+test control_persist_before_send ... ok
+CONTROL backend=durable-local safe=holds removed=caught trace=source-no-redelivery-skip "I10 logged source position has its rows" step=12 action=Deliver(2, 1) expected invariants hold; actual=I10 expected rows [1] at position 1; actual [1, 1] actions=["Receive", "Issue", "Deliver(0, 0)", "Takeover", "Receive", "Issue", "Crash", "Acquire", "Receive", "Issue", "Resolve", "Deliver(2, 1)", "Resolve", "Acknowledge", "Receive", "Issue", "Deliver(3, 0)"]
+CONTROL backend=durable-local safe=holds removed=caught trace=source-no-redelivery-skip "I10 complete source state matches logged prefix" step=12 action=Deliver(2, 0) expected invariants hold; actual=I10 expected rows [1] at position 1; actual [1, 1] actions=["Receive", "Issue", "Takeover", "Receive", "Issue", "Resolve", "Deliver(1, 1)", "Crash", "Acquire", "Receive", "Issue", "Deliver(2, 0)"]
+test control_redelivery_skip ... ok
+source-positions: witnesses=3 walks=20 backends=memory,durable-local skipped={}
+test source_positions ... ok
+commits-restart-turnover: witnesses=4 walks=20 backends=memory,durable-local skipped={}
+test commits_restart_turnover ... ok
+window-storage-6-exhaust: witnesses=3 walks=20 backends=memory,durable-local skipped={"Append refused: batch not yet created": 64, "Checkpoint partially mapped: published batch prefix staged; model publishes full window immediately": 2, "Checkpoint refused: no published batch boundary": 40, "Create: checkpoint-model pending copy has no head-log equivalent": 4, "Gc": 42, "Pin": 40}
+test window_storage ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.04s
+
+     Running tests/local_cancellation.rs (/tmp/object-store-replay-target/debug/deps/local_cancellation-a3ef8f2e9a18d2b5)
+
+running 3 tests
+contender after cancellation: Ok(PutResult { e_tag: Some("a825a50-65ee1833d79d2-c"), version: None })
+contender after cancellation: Ok(PutResult { e_tag: Some("a825a52-65ee1833d7a63-c"), version: None })
+contender after cancellation: Ok(PutResult { e_tag: Some("a825a51-65ee1833d7a9b-c"), version: None })
+final length=12, first byte=Some(97)
+final length=12, first byte=Some(97)
+final length=12, first byte=Some(97)
+test runtime_shutdown_does_not_release_an_active_publication_lock ... ok
+test cancelled_local_write_cannot_overwrite_an_acknowledged_contender ... ok
+test dropping_last_handle_drains_active_and_queued_writes ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
+
+     Running tests/local_root_overlap.rs (/tmp/object-store-replay-target/debug/deps/local_root_overlap-6d20fad1431c0107)
+
+running 1 test
+nested_root=false round=0 winners=1 bytes=8388608 first_byte=Some(65) left=Ok(PutResult { e_tag: Some("a825a5f-65ee1834e29cf-800000"), version: None }) right=Err(Conflict { path: "cluster/state-0.json" })
+nested_root=false round=1 winners=1 bytes=8388608 first_byte=Some(65) left=Ok(PutResult { e_tag: Some("a825a64-65ee1834ea2af-800000"), version: None }) right=Err(Conflict { path: "cluster/state-1.json" })
+nested_root=false round=2 winners=1 bytes=8388608 first_byte=Some(66) left=Err(Conflict { path: "cluster/state-2.json" }) right=Ok(PutResult { e_tag: Some("a825a6a-65ee1834f1560-800000"), version: None })
+nested_root=false round=3 winners=1 bytes=8388608 first_byte=Some(65) left=Ok(PutResult { e_tag: Some("a825a6e-65ee1834fa58d-800000"), version: None }) right=Err(Conflict { path: "cluster/state-3.json" })
+nested_root=false round=4 winners=1 bytes=8388608 first_byte=Some(65) left=Ok(PutResult { e_tag: Some("a825a73-65ee18350142f-800000"), version: None }) right=Err(Conflict { path: "cluster/state-4.json" })
+nested_root=false round=5 winners=1 bytes=8388608 first_byte=Some(65) left=Ok(PutResult { e_tag: Some("a825a78-65ee1835080ba-800000"), version: None }) right=Err(Conflict { path: "cluster/state-5.json" })
+nested_root=false round=6 winners=1 bytes=8388608 first_byte=Some(65) left=Ok(PutResult { e_tag: Some("a825a7d-65ee18350eed2-800000"), version: None }) right=Err(Conflict { path: "cluster/state-6.json" })
+nested_root=false round=7 winners=1 bytes=8388608 first_byte=Some(66) left=Err(Conflict { path: "cluster/state-7.json" }) right=Ok(PutResult { e_tag: Some("a825a82-65ee183515f9c-800000"), version: None })
+nested_root=true round=0 winners=1 bytes=8388608 first_byte=Some(65) left=Ok(PutResult { e_tag: Some("a825a8c-65ee18351d4cc-800000"), version: None }) right=Err(Conflict { path: "state-0.json" })
+nested_root=true round=1 winners=1 bytes=8388608 first_byte=Some(66) left=Err(Conflict { path: "cluster/state-1.json" }) right=Ok(PutResult { e_tag: Some("a825a91-65ee183524437-800000"), version: None })
+nested_root=true round=2 winners=1 bytes=8388608 first_byte=Some(65) left=Ok(PutResult { e_tag: Some("a825a96-65ee18352b5b9-800000"), version: None }) right=Err(Conflict { path: "state-2.json" })
+nested_root=true round=3 winners=1 bytes=8388608 first_byte=Some(66) left=Err(Conflict { path: "cluster/state-3.json" }) right=Ok(PutResult { e_tag: Some("a825a9b-65ee18353282a-800000"), version: None })
+nested_root=true round=4 winners=1 bytes=8388608 first_byte=Some(66) left=Err(Conflict { path: "cluster/state-4.json" }) right=Ok(PutResult { e_tag: Some("a825aa0-65ee183538b10-800000"), version: None })
+nested_root=true round=5 winners=1 bytes=8388608 first_byte=Some(65) left=Ok(PutResult { e_tag: Some("a825aa5-65ee183540c41-800000"), version: None }) right=Err(Conflict { path: "state-5.json" })
+nested_root=true round=6 winners=1 bytes=8388608 first_byte=Some(65) left=Ok(PutResult { e_tag: Some("a825aaa-65ee1835482fe-800000"), version: None }) right=Err(Conflict { path: "state-6.json" })
+nested_root=true round=7 winners=1 bytes=8388608 first_byte=Some(66) left=Err(Conflict { path: "cluster/state-7.json" }) right=Ok(PutResult { e_tag: Some("a825aaf-65ee18354e640-800000"), version: None })
+test conditional_writes_to_the_same_file_have_one_winner ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+
+     Running tests/prefix_listing.rs (/tmp/object-store-replay-target/debug/deps/prefix_listing-64c843a36a7445cc)
+
+running 2 tests
+test a_prefix_without_a_trailing_slash_stays_a_textual_prefix ... ok
+test listed_keys_include_state_written_with_a_leading_slash_prefix ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/s3_integration.rs (/tmp/object-store-replay-target/debug/deps/s3_integration-03fc261010bcec70)
+
+running 13 tests
+AWS_S3_BUCKET is not set; skipping the S3 integration test
+AWS_S3_BUCKET is not set; skipping the S3 integration test
+AWS_S3_BUCKET is not set; skipping the S3 integration test
+AWS_S3_BUCKET is not set; skipping the S3 integration test
+AWS_S3_BUCKET is not set; skipping the S3 integration test
+AWS_S3_BUCKET is not set; skipping the S3 integration test
+test test_update_after_external_modification ... ok
+AWS_S3_BUCKET is not set; skipping the S3 integration test
+test test_concurrent_insert_conflict ... AWS_S3_BUCKET is not set; skipping the S3 integration test
+okAWS_S3_BUCKET is not set; skipping the S3 integration test
+
+AWS_S3_BUCKET is not set; skipping the S3 integration test
+test test_modify_distributed ... ok
+AWS_S3_BUCKET is not set; skipping the S3 integration test
+test test_refresh_sees_external_changes ... ok
+AWS_S3_BUCKET is not set; skipping the S3 integration test
+test test_retry_on_conflict_loses_no_concurrent_increment ... ok
+AWS_S3_BUCKET is not set; skipping the S3 integration test
+test test_concurrent_update_conflict ... ok
+test test_conditional_put_conflicts_on_the_wire ... ok
+test test_concurrent_async_writers ... ok
+test test_list_keys_distributed ... ok
+test test_sequential_updates_same_writer ... ok
+test test_concurrent_async_writers_with_retry ... ok
+test test_update_races_with_external_write ... ok
+test test_probe_reports_conditional_writes_enforced ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/state_store.rs (/tmp/object-store-replay-target/debug/deps/state_store-464704e71540926d)
+
+running 13 tests
+test s3_state_store_conformance ... ignored, requires AWS_S3_BUCKET and AWS credentials; creates a unique temporary prefix
+test revisions_are_scoped_to_key_and_handle_but_allow_handle_clones ... ok
+test malformed_and_unknown_records_are_errors_not_absence ... ok
+test missing_version_tokens_are_rejected ... ok
+test read_enforces_both_advertised_and_streamed_size_limits ... ok
+test cancellation_after_apply_does_not_rollback_the_write ... ok
+test lost_success_and_retried_preconditions_do_not_imply_no_effect ... ok
+test value_limits_allow_the_boundary_and_reject_oversized_writes_before_io ... ok
+test identical_values_with_new_write_ids_invalidate_old_revisions ... ok
+test independent_memory_clients_obey_the_contract ... ok
+test unsupported_conditional_updates_never_fall_back_to_overwrite ... ok
+test concurrent_local_updates_from_the_same_revision_have_one_winner ... ok
+test independent_local_clients_obey_the_contract ... ok
+
+test result: ok. 12 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/transactional_wal.rs (/tmp/object-store-replay-target/debug/deps/transactional_wal-7911f326cf56776f)
+
+running 22 tests
+test corrupted_wal_content_fails_recovery_and_resolution ... ok
+test missing_wal_and_unsupported_head_format_fail_closed ... ok
+test staged_wal_is_not_a_commit_and_unknown_can_be_retried_exactly ... ok
+test foreign_handles_receipts_and_invalid_batches_are_rejected ... ok
+test subprocess_writer ... ignored, subprocess helper invoked by process_restart_at_wal_publication_boundaries
+test cancellation_after_publication_recovers_from_persisted_receipt ... ok
+test predicate_and_absent_reads_conflict_on_any_intervening_commit ... ok
+checkpoint artifact=pages, missing=true: recovery rejected, retained snapshot unchanged
+test checkpoint_fences_prepared_attempt_without_advancing_logical_sequence ... ok
+test delayed_publication_is_fenced_by_checkpoint ... ok
+test unreadable_head_after_apply_returns_unknown_until_resolution ... ok
+test lost_checkpoint_response_preserves_reads_and_receipt_evidence ... ok
+test state_byte_limit_accepts_exact_boundary_and_rejects_overflow ... ok
+test stale_checkpoint_cannot_hide_new_commit ... ok
+test lost_upload_and_publication_responses_resolve_exact_attempts ... ok
+checkpoint artifact=pages, missing=false: recovery rejected, retained snapshot unchanged
+test limits_are_persisted_and_checkpoint_only_resets_replay_budget ... ok
+checkpoint artifact=checkpoints, missing=true: recovery rejected, retained snapshot unchanged
+checkpoint artifact=checkpoints, missing=false: recovery rejected, retained snapshot unchanged
+test missing_and_corrupt_checkpoint_artifacts_fail_closed ... ok
+test memory_clients_atomic_batches_and_mvcc ... ok
+process exit boundary=7: sequence=0, outcome=Pending
+process exit boundary=8: sequence=1, outcome=Committed { sequence: 1 }
+test process_restart_at_wal_publication_boundaries ... ok
+test independent_local_clients_atomic_batches_and_mvcc ... ok
+checkpoint metadata=sequence: recovery rejected
+checkpoint metadata=incarnation: recovery rejected
+checkpoint metadata=commit: recovery rejected
+test deterministic_histories_match_model_across_checkpoints_and_reopen ... ok
+checkpoint metadata=duplicate_page: recovery rejected
+checkpoint metadata=reversed_pages: recovery rejected
+checkpoint metadata=totals: recovery rejected
+test inconsistent_checkpoint_metadata_fails_even_with_valid_content_digest ... ok
+test checkpoints_span_pages_and_preserve_boundary_values ... ok
+
+test result: ok. 21 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.56s
+
+   Doc-tests object_store_occ
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

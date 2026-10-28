@@ -1,0 +1,29 @@
+    Finished `release` profile [optimized] target(s) in 0.43s
+     Running `target/release/cayenne-metastore-model run source-no-redelivery-skip`
+START source-no-redelivery-skip
+CONFIG source-no-redelivery-skip mode=EXHAUSTIVE bound=2 seed=0 states=445129 unique_or_sampled_visits=140950 depth=31
+PROPERTY FAIL at most one live row per source key
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=12 [Receive, Issue, Takeover, Receive, Issue, Resolve, Deliver(1, 1), Crash, Acquire, Receive, Issue, Deliver(2, 0)]
+WITNESS Some(State { head: Head { pos: 2, lease: 2, floor: 0 }, rows: [1, 1], position: 1, acknowledged: 0, buffer: [1], cursor: 2, attempts: [Attempt { base: Head { pos: 0, lease: 0, floor: 0 }, rows: [1], position: 1, delivered: 0, retry: false }, Attempt { base: Head { pos: 0, lease: 1, floor: 0 }, rows: [1], position: 1, delivered: 2, retry: true }, Attempt { base: Head { pos: 1, lease: 2, floor: 0 }, rows: [1], position: 1, delivered: 1, retry: false }], active: Some(2), accepted: [1, 2], answer: 0, crashed: true, skipped: false, unknown: false, half: false, needs_lease: false })
+PROPERTY FAIL I10 source append prefix exactly once
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=12 [Receive, Issue, Takeover, Receive, Issue, Resolve, Deliver(1, 1), Crash, Acquire, Receive, Issue, Deliver(2, 0)]
+WITNESS Some(State { head: Head { pos: 2, lease: 2, floor: 0 }, rows: [1, 1], position: 1, acknowledged: 0, buffer: [1], cursor: 2, attempts: [Attempt { base: Head { pos: 0, lease: 0, floor: 0 }, rows: [1], position: 1, delivered: 0, retry: false }, Attempt { base: Head { pos: 0, lease: 1, floor: 0 }, rows: [1], position: 1, delivered: 2, retry: true }, Attempt { base: Head { pos: 1, lease: 2, floor: 0 }, rows: [1], position: 1, delivered: 1, retry: false }], active: Some(2), accepted: [1, 2], answer: 0, crashed: true, skipped: false, unknown: false, half: false, needs_lease: false })
+PROPERTY FAIL I10 logged source position has its rows
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=17 [Receive, Issue, Deliver(0, 0), Takeover, Receive, Issue, Crash, Acquire, Receive, Issue, Resolve, Deliver(2, 1), Resolve, Acknowledge, Receive, Issue, Deliver(3, 0)]
+WITNESS Some(State { head: Head { pos: 3, lease: 2, floor: 0 }, rows: [1, 1, 2], position: 2, acknowledged: 1, buffer: [2], cursor: 3, attempts: [Attempt { base: Head { pos: 0, lease: 0, floor: 0 }, rows: [1], position: 1, delivered: 1, retry: false }, Attempt { base: Head { pos: 1, lease: 1, floor: 0 }, rows: [1], position: 1, delivered: 0, retry: false }, Attempt { base: Head { pos: 1, lease: 2, floor: 0 }, rows: [1], position: 1, delivered: 2, retry: true }, Attempt { base: Head { pos: 2, lease: 2, floor: 0 }, rows: [2], position: 2, delivered: 1, retry: false }], active: Some(3), accepted: [0, 2, 3], answer: 0, crashed: true, skipped: false, unknown: false, half: false, needs_lease: false })
+PROPERTY FAIL I10 complete source state matches logged prefix
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=12 [Receive, Issue, Takeover, Receive, Issue, Resolve, Deliver(1, 1), Crash, Acquire, Receive, Issue, Deliver(2, 0)]
+WITNESS Some(State { head: Head { pos: 2, lease: 2, floor: 0 }, rows: [1, 1], position: 1, acknowledged: 0, buffer: [1], cursor: 2, attempts: [Attempt { base: Head { pos: 0, lease: 0, floor: 0 }, rows: [1], position: 1, delivered: 0, retry: false }, Attempt { base: Head { pos: 0, lease: 1, floor: 0 }, rows: [1], position: 1, delivered: 2, retry: true }, Attempt { base: Head { pos: 1, lease: 2, floor: 0 }, rows: [1], position: 1, delivered: 1, retry: false }], active: Some(2), accepted: [1, 2], answer: 0, crashed: true, skipped: false, unknown: false, half: false, needs_lease: false })
+PROPERTY HOLDS I2 source acknowledgement covered
+PROPERTY NOT_REACHED source redelivery skipped after turnover
+PROPERTY REACHED source ambiguous accepted outcome
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=11 [Receive, Issue, Unknown, Takeover, Receive, Issue, Crash, Acquire, Receive, Issue, Deliver(2, 0)]
+PROPERTY REACHED source grouped two changes
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=7 [Receive, Issue, Takeover, Receive, Receive, Issue, Deliver(1, 0)]
+RESULT source-no-redelivery-skip expected=I10 source append prefix exactly once matched=true seconds=0.265

@@ -349,11 +349,10 @@ impl Writer {
                 return Ok(Outcome::Accepted {
                     commit: attempt.base_commit + 1,
                 });
-            } else {
-                let state = read_head(self.store.as_ref(), &self.prefix).await?;
-                if let Some(outcome) = self.classify(attempt, state).await? {
-                    return Ok(outcome);
-                }
+            }
+            let state = read_head(self.store.as_ref(), &self.prefix).await?;
+            if let Some(outcome) = self.classify(attempt, state).await? {
+                return Ok(outcome);
             }
         }
         Err(Error::RetryExhausted)

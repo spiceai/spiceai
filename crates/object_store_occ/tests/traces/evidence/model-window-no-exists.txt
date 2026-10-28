@@ -1,0 +1,22 @@
+    Finished `release` profile [optimized] target(s) in 0.72s
+     Running `target/release/cayenne-metastore-model run window-storage-no-exists-5-exhaust`
+START window-storage-no-exists-5-exhaust
+CONFIG window-storage-no-exists-5-exhaust mode=EXHAUSTIVE bound=5 seed=0 states=64829 unique_or_sampled_visits=34031 depth=21
+PROPERTY FAIL I4 reader inline payload replay equality
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=3 [Append(1), Append(1), Append(1)]
+PROPERTY FAIL I8 recovery replay equality including payload bytes
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=3 [Append(1), Append(1), Append(1)]
+PROPERTY FAIL I7 pinned snapshot equals serial
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=4 [Append(1), Append(1), Append(1), Pin]
+PROPERTY NOT_REACHED byte and count cuts
+PROPERTY REACHED head byte and count budgets both force drops
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=4 [Append(1), Append(1), Append(0), Append(1)]
+PROPERTY REACHED delayed seal after GC
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=16 [Append(1), Append(1), Observe, Append(1), Observe, Append(1), Observe, Append(1), Observe, Create(0), Create(1), Create(2), Create(3), Checkpoint, Gc, Create(3)]
+PROPERTY NOT_REACHED conflicting seal bytes
+RESULT window-storage-no-exists-5-exhaust expected=I8 recovery replay equality including payload bytes matched=true seconds=0.092

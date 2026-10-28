@@ -1,0 +1,37 @@
+    Finished `release` profile [optimized] target(s) in 0.41s
+     Running `target/release/cayenne-metastore-model run commits-restart-no-persist-before-send`
+START commits-restart-no-persist-before-send
+CONFIG commits-restart-no-persist-before-send mode=EXHAUSTIVE bound=2 seed=0 states=162913 unique_or_sampled_visits=46064 depth=25
+PROPERTY HOLDS I1 unique accepted position
+PROPERTY FAIL I2 acknowledged logical write exactly once
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=14 [Buffer(0), Copy(0), Issue(0), Send(0), Resolve(0), Deliver(0, 0, 1), Restart, Buffer(0), Issue(0), Send(0), Resolve(0), Deliver(0, 1, 1), Response(0), Ack(0)]
+WITNESS Some(State { pos: 4, etag: 0, lease: 1, window: [1, 2], batches: [[10, 11], [], [], [], [], [], [], []], pending: [(0, [10, 11]), (1, [1, 2])], history: [10, 11, 1, 2], requests: [[Request { base: Head { pos: 2, lease: 1, floor: 0 }, etag: 0, pos: 3, lease: 1, id: 1, window: [11, 1], floor: 0, sent: 3, done: 2, answer: 0, success: true, unreadable: false }, Request { base: Head { pos: 3, lease: 1, floor: 0 }, etag: 0, pos: 4, lease: 1, id: 2, window: [1, 2], floor: 0, sent: 3, done: 2, answer: 1, success: true, unreadable: false }], []], ack: 1, persisted: [false, false, false, false], memory: [false, true, false, false], restored: [false, false, false, false], buffers: [false, false], restarted: true, floor: 0, parts: [], root: [], stage: 0, gc: false, listed: false, plan: false, deleted: false, gc_lease: 0, pin: 0, pin_base: 0, pin_target: 0, pin_valid: false, snapshot: false, read: false, bad_read: false, bad_replay: false, bad_pin: false, bad_recovery: false, bad_fence: false, bad_i1: false, revived: false, stale: false, window_resolution: false, batch_resolution: false, lagged: false, folded: false, conflict: false })
+PROPERTY FAIL logical write never applied twice
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=11 [Buffer(0), Copy(0), Issue(0), Send(0), Resolve(0), Deliver(0, 0, 1), Restart, Buffer(0), Issue(0), Send(0), Deliver(0, 1, 0)]
+WITNESS Some(State { pos: 4, etag: 0, lease: 1, window: [1, 2], batches: [[10, 11], [], [], [], [], [], [], []], pending: [(0, [10, 11]), (1, [1, 2])], history: [10, 11, 1, 2], requests: [[Request { base: Head { pos: 2, lease: 1, floor: 0 }, etag: 0, pos: 3, lease: 1, id: 1, window: [11, 1], floor: 0, sent: 3, done: 2, answer: 0, success: true, unreadable: false }, Request { base: Head { pos: 3, lease: 1, floor: 0 }, etag: 0, pos: 4, lease: 1, id: 2, window: [1, 2], floor: 0, sent: 1, done: 1, answer: 0, success: true, unreadable: false }], []], ack: 0, persisted: [false, false, false, false], memory: [false, true, false, false], restored: [false, false, false, false], buffers: [false, false], restarted: true, floor: 0, parts: [], root: [], stage: 0, gc: false, listed: false, plan: false, deleted: false, gc_lease: 0, pin: 0, pin_base: 0, pin_target: 0, pin_valid: false, snapshot: false, read: false, bad_read: false, bad_replay: false, bad_pin: false, bad_recovery: false, bad_fence: false, bad_i1: false, revived: false, stale: false, window_resolution: false, batch_resolution: false, lagged: false, folded: false, conflict: false })
+PROPERTY HOLDS I3 CAS fencing
+PROPERTY HOLDS I4 missing is error and retained references live
+PROPERTY HOLDS I5 resolution sound
+PROPERTY HOLDS I6 prefix determinism
+PROPERTY HOLDS I8 replay equality
+PROPERTY HOLDS I7 pinned snapshot equals serial
+PROPERTY HOLDS I8 recovery equals serial reference
+PROPERTY NOT_REACHED folded checkpoint published by commit
+PROPERTY REACHED restart and lease turnover
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=11 [Buffer(0), Copy(0), Issue(0), Buffer(0), Send(0), Fence, Resolve(0), Issue(0), Send(0), Deliver(0, 1, 0), Restart]
+PROPERTY REACHED persisted attempt restored
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=6 [Buffer(0), Copy(0), Issue(0), Persist(0), Restart, Restore]
+PROPERTY REACHED resolution from window
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=11 [Buffer(0), Copy(0), Issue(0), Buffer(0), Send(0), Fence, Resolve(0), Issue(0), Send(0), Deliver(0, 1, 0), Resolve(0)]
+PROPERTY NOT_REACHED resolution from batch
+PROPERTY REACHED delayed identical retry accepted
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=11 [Buffer(0), Copy(0), Issue(0), Buffer(0), Send(0), Fence, Resolve(0), Issue(0), Send(0), Resolve(0), Deliver(0, 1, 1)]
+PROPERTY NOT_REACHED two writers each two attempts
+PROPERTY NOT_REACHED conflicting batch bytes raced
+RESULT commits-restart-no-persist-before-send expected=I2 acknowledged logical write exactly once matched=true seconds=0.210

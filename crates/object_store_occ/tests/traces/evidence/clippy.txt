@@ -1,0 +1,2 @@
+    Checking object_store_occ v0.1.0 (/Users/ben/orca/workspaces/spiceai/metastore1/crates/object_store_occ)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.89s
