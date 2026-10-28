@@ -241,3 +241,62 @@ and 68,719,476,736 bytes of memory. Runtime sizing is explicitly two cores per
 instance; this is not an OS CPU quota on macOS. Provenance records the CPU model,
 host CPU count, memory and starting load average. The integer-millisecond load
 table cannot establish submillisecond differences.
+
+## Standalone uplink measurements
+
+Source `944b5f351ef64c8713bfefd9d9cb8ce4cc134606`, 2026-10-28 UTC, on the
+host described above. The command was:
+
+```bash
+python3 test/scripts/sidecar.py \
+  --spiced /tmp/spice-sidecar-artifacts/candidate-944b5f3/spiced \
+  --source-commit 944b5f351ef64c8713bfefd9d9cb8ce4cc134606 \
+  --testoperator /tmp/spice-sidecar-artifacts/candidate-944b5f3/testoperator \
+  --rows 100000 --concurrency 2 8 32 128 --duration 30 --cache-states miss \
+  --out /tmp/spice-sidecar-artifacts/bench-944b5f3-miss
+python3 test/scripts/sidecar_report.py \
+  /tmp/spice-sidecar-artifacts/bench-944b5f3-miss \
+  --output /tmp/spice-sidecar-artifacts/bench-944b5f3-miss-summary.json
+```
+
+Both commands exited 0. The report recorded `complete: true`, 16 of 16 arms,
+and zero resource-observer errors. Each arm's five measured query statuses were
+`passed`. The [summary and raw artifacts](evidence/bench-944b5f3-miss) retain
+every repetition. Raw testoperator logs, resource traces and metric snapshots
+are gzip-compressed without changing their contents; `manifest.json` records
+their uncompressed SHA-256 values. Decompress with `gzip -dc FILE.gz`.
+
+| Clients | Protocol | Repetition | Queries/s | P99 ms: aggregate / join / nulls / point / topk | Upstream peak RSS MiB |
+| --- | --- | --- | ---: | --- | ---: |
+| 2 | SQL | 0 | 650.0 | 5 / 5 / 5 / 4 / 5 | 180.6 |
+| 2 | Substrait | 1 | 630.4 | 6 / 8 / 5 / 6 / 8 | 831.2 |
+| 2 | Substrait | 2 | 632.1 | 6 / 6 / 5 / 5 / 10 | 827.2 |
+| 2 | SQL | 3 | 641.1 | 5 / 5 / 4 / 5 / 5 | 180.5 |
+| 8 | SQL | 0 | 836.6 | 22 / 22 / 21 / 21 / 26 | 191.4 |
+| 8 | Substrait | 1 | 829.5 | 23 / 22 / 22 / 21 / 25 | 379.3 |
+| 8 | Substrait | 2 | 831.3 | 22 / 22 / 21 / 21 / 25 | 378.1 |
+| 8 | SQL | 3 | 835.8 | 22 / 21 / 21 / 21 / 25 | 190.7 |
+| 32 | SQL | 0 | 849.4 | 64 / 65 / 63 / 64 / 67 | 193.9 |
+| 32 | Substrait | 1 | 851.6 | 63 / 64 / 62 / 62 / 66 | 318.5 |
+| 32 | Substrait | 2 | 845.2 | 63 / 65 / 62 / 63 / 66 | 318.1 |
+| 32 | SQL | 3 | 851.2 | 63 / 64 / 63 / 63 / 66 | 194.4 |
+| 128 | SQL | 0 | 852.0 | 186 / 188 / 184 / 187 / 188 | 193.7 |
+| 128 | Substrait | 1 | 848.1 | 198 / 197 / 198 / 200 / 201 | 312.6 |
+| 128 | Substrait | 2 | 857.5 | 186 / 190 / 187 / 187 / 190 | 309.6 |
+| 128 | SQL | 3 | 853.1 | 193 / 193 / 192 / 190 / 193 | 195.2 |
+
+These runs establish no consistent loopback throughput or P99 improvement.
+At concurrency two, Substrait had lower throughput and higher tails; at higher
+concurrency, the throughput ranges mostly overlap. Upstream counters recorded
+one `do_get/statement_substrait_plan` per Substrait fragment versus one
+`get_flight_info/sql_query` plus one `do_get/sql_query` for SQL. This removes an
+uplink round trip, but the local measurements do not quantify its benefit at a
+remote network RTT.
+
+The Substrait arms also had higher upstream peak RSS, especially at concurrency
+two. Sidecar RSS stayed similar between protocols. These are whole-arm process
+peaks, not live query-pool reservations: the upstream query-pool gauge was zero
+at the final scrape. The cause of the RSS difference remains under investigation;
+it is not classified as a leak or dismissed as allocator behavior without a
+discriminating run. Cache-hit qualification and full workspace sign-off are
+still pending.

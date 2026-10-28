@@ -1,0 +1,1044 @@
+{
+  "provenance": {
+    "date": "2026-10-28T07:53:52Z",
+    "commit": "944b5f351ef64c8713bfefd9d9cb8ce4cc134606",
+    "harness_commit": "d277f9d1dc14fb396214cfdee70b0b2923c51e74",
+    "harness_sha256": "7519c39de38c39cad3eb124e20f108e6ccdb85a95183783a3df787bfdf92c922",
+    "common_harness_sha256": "7519c39de38c39cad3eb124e20f108e6ccdb85a95183783a3df787bfdf92c922",
+    "binary_sha256": "823f19ba1718df146e8ec7e67627c0c48a65cca0c3e4b6fc6cb68d9ae71cbed9",
+    "legacy_binary_sha256": null,
+    "testoperator_sha256": "a4d9cb537958deea6fe42b7afb081fb4bb02869f61e2eabcf86c685cf124d570",
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "host_logical_cpus": 14,
+    "cpu_model": "Apple M4 Pro",
+    "host_memory_bytes": 68719476736,
+    "load_average_at_start": [
+      1.4501953125,
+      1.83447265625,
+      3.4296875
+    ],
+    "cpu_entitlement_per_instance": 2,
+    "topology": "standalone",
+    "upstream_storage": "cayenne-memory",
+    "arguments": {
+      "spiced": "/private/tmp/spice-sidecar-artifacts/candidate-944b5f3/spiced",
+      "out": "/private/tmp/spice-sidecar-artifacts/bench-944b5f3-miss",
+      "source_commit": "944b5f351ef64c8713bfefd9d9cb8ce4cc134606",
+      "testoperator": "/tmp/spice-sidecar-artifacts/candidate-944b5f3/testoperator",
+      "legacy_spiced": "None",
+      "legacy_source_commit": "None",
+      "modes": "['server', 'sidecar']",
+      "rows": "100000",
+      "duration": "30",
+      "concurrency": "[2, 8, 32, 128]",
+      "cache_states": "['miss']",
+      "executors": "0"
+    }
+  },
+  "expected_arms": 16,
+  "complete": true,
+  "incomplete_arms": [],
+  "arms": [
+    {
+      "cache_hit": false,
+      "concurrency": 2,
+      "arm": 0,
+      "mode": "server",
+      "directory": "/tmp/spice-sidecar-artifacts/bench-944b5f3-miss/bench-cacheFalse-c2-0-server",
+      "iterations": 19501,
+      "elapsed_ms": 30001,
+      "queries_per_second": 650.0116662777907,
+      "queries": [
+        {
+          "name": "aggregate",
+          "iterations": 3900,
+          "p99_ms": 5,
+          "p95_ms": 5,
+          "min_ms": 1,
+          "max_ms": 30
+        },
+        {
+          "name": "join",
+          "iterations": 3900,
+          "p99_ms": 5,
+          "p95_ms": 5,
+          "min_ms": 1,
+          "max_ms": 5
+        },
+        {
+          "name": "nulls",
+          "iterations": 3901,
+          "p99_ms": 5,
+          "p95_ms": 4,
+          "min_ms": 0,
+          "max_ms": 8
+        },
+        {
+          "name": "point",
+          "iterations": 3900,
+          "p99_ms": 4,
+          "p95_ms": 4,
+          "min_ms": 0,
+          "max_ms": 30
+        },
+        {
+          "name": "topk",
+          "iterations": 3900,
+          "p99_ms": 5,
+          "p95_ms": 5,
+          "min_ms": 4,
+          "max_ms": 9
+        }
+      ],
+      "peak_rss_bytes": 142311424,
+      "upstream_peak_rss_bytes": 189333504,
+      "health_samples": 348,
+      "health_p99_ms": 0.816875,
+      "resource_errors": [],
+      "uplink_rpcs_whole_arm": {
+        "do_get/sql_query": 58910,
+        "get_flight_info/sql_query": 58910,
+        "get_schema/": 0
+      },
+      "testoperator_log_sha256": "a6c8ab891e2322f9228b704e5cf15f503ee43d3923dcbf91d4ed120a8443e0ed"
+    },
+    {
+      "cache_hit": false,
+      "concurrency": 2,
+      "arm": 1,
+      "mode": "sidecar",
+      "directory": "/tmp/spice-sidecar-artifacts/bench-944b5f3-miss/bench-cacheFalse-c2-1-sidecar",
+      "iterations": 18915,
+      "elapsed_ms": 30006,
+      "queries_per_second": 630.373925214957,
+      "queries": [
+        {
+          "name": "aggregate",
+          "iterations": 3783,
+          "p99_ms": 6,
+          "p95_ms": 5,
+          "min_ms": 1,
+          "max_ms": 8
+        },
+        {
+          "name": "join",
+          "iterations": 3783,
+          "p99_ms": 8,
+          "p95_ms": 5,
+          "min_ms": 1,
+          "max_ms": 11
+        },
+        {
+          "name": "nulls",
+          "iterations": 3782,
+          "p99_ms": 5,
+          "p95_ms": 4,
+          "min_ms": 0,
+          "max_ms": 8
+        },
+        {
+          "name": "point",
+          "iterations": 3784,
+          "p99_ms": 6,
+          "p95_ms": 4,
+          "min_ms": 0,
+          "max_ms": 8
+        },
+        {
+          "name": "topk",
+          "iterations": 3783,
+          "p99_ms": 8,
+          "p95_ms": 8,
+          "min_ms": 4,
+          "max_ms": 12
+        }
+      ],
+      "peak_rss_bytes": 141950976,
+      "upstream_peak_rss_bytes": 871628800,
+      "health_samples": 344,
+      "health_p99_ms": 0.848125,
+      "resource_errors": [],
+      "uplink_rpcs_whole_arm": {
+        "do_get/statement_substrait_plan": 57325,
+        "get_schema/": 0
+      },
+      "testoperator_log_sha256": "c15e92e214fcb31dcfdee3d50bf0262e69c0d940359f4e22ea0424c28a86f832"
+    },
+    {
+      "cache_hit": false,
+      "concurrency": 2,
+      "arm": 2,
+      "mode": "sidecar",
+      "directory": "/tmp/spice-sidecar-artifacts/bench-944b5f3-miss/bench-cacheFalse-c2-2-sidecar",
+      "iterations": 18966,
+      "elapsed_ms": 30005,
+      "queries_per_second": 632.0946508915181,
+      "queries": [
+        {
+          "name": "aggregate",
+          "iterations": 3794,
+          "p99_ms": 6,
+          "p95_ms": 5,
+          "min_ms": 1,
+          "max_ms": 8
+        },
+        {
+          "name": "join",
+          "iterations": 3794,
+          "p99_ms": 6,
+          "p95_ms": 5,
+          "min_ms": 1,
+          "max_ms": 9
+        },
+        {
+          "name": "nulls",
+          "iterations": 3793,
+          "p99_ms": 5,
+          "p95_ms": 4,
+          "min_ms": 0,
+          "max_ms": 8
+        },
+        {
+          "name": "point",
+          "iterations": 3792,
+          "p99_ms": 5,
+          "p95_ms": 4,
+          "min_ms": 0,
+          "max_ms": 8
+        },
+        {
+          "name": "topk",
+          "iterations": 3793,
+          "p99_ms": 10,
+          "p95_ms": 8,
+          "min_ms": 4,
+          "max_ms": 12
+        }
+      ],
+      "peak_rss_bytes": 142262272,
+      "upstream_peak_rss_bytes": 867401728,
+      "health_samples": 345,
+      "health_p99_ms": 0.797542,
+      "resource_errors": [],
+      "uplink_rpcs_whole_arm": {
+        "do_get/statement_substrait_plan": 57552,
+        "get_schema/": 0
+      },
+      "testoperator_log_sha256": "01e6d385dc203e2a2293ca53cf1a546d7933f0b1ad7bc87f0070954aa72c44df"
+    },
+    {
+      "cache_hit": false,
+      "concurrency": 2,
+      "arm": 3,
+      "mode": "server",
+      "directory": "/tmp/spice-sidecar-artifacts/bench-944b5f3-miss/bench-cacheFalse-c2-3-server",
+      "iterations": 19235,
+      "elapsed_ms": 30001,
+      "queries_per_second": 641.1452951568281,
+      "queries": [
+        {
+          "name": "aggregate",
+          "iterations": 3847,
+          "p99_ms": 5,
+          "p95_ms": 5,
+          "min_ms": 1,
+          "max_ms": 28
+        },
+        {
+          "name": "join",
+          "iterations": 3848,
+          "p99_ms": 5,
+          "p95_ms": 5,
+          "min_ms": 1,
+          "max_ms": 6
+        },
+        {
+          "name": "nulls",
+          "iterations": 3847,
+          "p99_ms": 4,
+          "p95_ms": 4,
+          "min_ms": 0,
+          "max_ms": 5
+        },
+        {
+          "name": "point",
+          "iterations": 3847,
+          "p99_ms": 5,
+          "p95_ms": 4,
+          "min_ms": 0,
+          "max_ms": 30
+        },
+        {
+          "name": "topk",
+          "iterations": 3846,
+          "p99_ms": 5,
+          "p95_ms": 5,
+          "min_ms": 4,
+          "max_ms": 7
+        }
+      ],
+      "peak_rss_bytes": 142819328,
+      "upstream_peak_rss_bytes": 189284352,
+      "health_samples": 343,
+      "health_p99_ms": 0.788292,
+      "resource_errors": [],
+      "uplink_rpcs_whole_arm": {
+        "do_get/sql_query": 57692,
+        "get_flight_info/sql_query": 57692,
+        "get_schema/": 0
+      },
+      "testoperator_log_sha256": "5f0d003e9d25747e73425ec60977a68f2a2a9c79cac57d12be74774af7177b6a"
+    },
+    {
+      "cache_hit": false,
+      "concurrency": 8,
+      "arm": 0,
+      "mode": "server",
+      "directory": "/tmp/spice-sidecar-artifacts/bench-944b5f3-miss/bench-cacheFalse-c8-0-server",
+      "iterations": 25102,
+      "elapsed_ms": 30005,
+      "queries_per_second": 836.5939010164973,
+      "queries": [
+        {
+          "name": "aggregate",
+          "iterations": 5020,
+          "p99_ms": 22,
+          "p95_ms": 18,
+          "min_ms": 1,
+          "max_ms": 32
+        },
+        {
+          "name": "join",
+          "iterations": 5020,
+          "p99_ms": 22,
+          "p95_ms": 18,
+          "min_ms": 1,
+          "max_ms": 32
+        },
+        {
+          "name": "nulls",
+          "iterations": 5020,
+          "p99_ms": 21,
+          "p95_ms": 17,
+          "min_ms": 1,
+          "max_ms": 30
+        },
+        {
+          "name": "point",
+          "iterations": 5021,
+          "p99_ms": 21,
+          "p95_ms": 17,
+          "min_ms": 1,
+          "max_ms": 32
+        },
+        {
+          "name": "topk",
+          "iterations": 5021,
+          "p99_ms": 26,
+          "p95_ms": 21,
+          "min_ms": 4,
+          "max_ms": 32
+        }
+      ],
+      "peak_rss_bytes": 148930560,
+      "upstream_peak_rss_bytes": 200654848,
+      "health_samples": 343,
+      "health_p99_ms": 0.811959,
+      "resource_errors": [],
+      "uplink_rpcs_whole_arm": {
+        "do_get/sql_query": 75325,
+        "get_flight_info/sql_query": 75325,
+        "get_schema/": 0
+      },
+      "testoperator_log_sha256": "cf063de4a29394fd028ab5e24961f4120388c21d8ffb2ed37714eae7911261f8"
+    },
+    {
+      "cache_hit": false,
+      "concurrency": 8,
+      "arm": 1,
+      "mode": "sidecar",
+      "directory": "/tmp/spice-sidecar-artifacts/bench-944b5f3-miss/bench-cacheFalse-c8-1-sidecar",
+      "iterations": 24890,
+      "elapsed_ms": 30006,
+      "queries_per_second": 829.5007665133639,
+      "queries": [
+        {
+          "name": "aggregate",
+          "iterations": 4980,
+          "p99_ms": 23,
+          "p95_ms": 18,
+          "min_ms": 1,
+          "max_ms": 31
+        },
+        {
+          "name": "join",
+          "iterations": 4977,
+          "p99_ms": 22,
+          "p95_ms": 18,
+          "min_ms": 1,
+          "max_ms": 28
+        },
+        {
+          "name": "nulls",
+          "iterations": 4977,
+          "p99_ms": 22,
+          "p95_ms": 17,
+          "min_ms": 0,
+          "max_ms": 27
+        },
+        {
+          "name": "point",
+          "iterations": 4977,
+          "p99_ms": 21,
+          "p95_ms": 18,
+          "min_ms": 0,
+          "max_ms": 29
+        },
+        {
+          "name": "topk",
+          "iterations": 4979,
+          "p99_ms": 25,
+          "p95_ms": 21,
+          "min_ms": 4,
+          "max_ms": 30
+        }
+      ],
+      "peak_rss_bytes": 148750336,
+      "upstream_peak_rss_bytes": 397721600,
+      "health_samples": 343,
+      "health_p99_ms": 0.825458,
+      "resource_errors": [],
+      "uplink_rpcs_whole_arm": {
+        "do_get/statement_substrait_plan": 74878,
+        "get_schema/": 0
+      },
+      "testoperator_log_sha256": "a906d40de9425bfbc59f405ed6be9656da618dc528fe77bfd884d3be02e2254a"
+    },
+    {
+      "cache_hit": false,
+      "concurrency": 8,
+      "arm": 2,
+      "mode": "sidecar",
+      "directory": "/tmp/spice-sidecar-artifacts/bench-944b5f3-miss/bench-cacheFalse-c8-2-sidecar",
+      "iterations": 24941,
+      "elapsed_ms": 30003,
+      "queries_per_second": 831.2835383128354,
+      "queries": [
+        {
+          "name": "aggregate",
+          "iterations": 4989,
+          "p99_ms": 22,
+          "p95_ms": 18,
+          "min_ms": 1,
+          "max_ms": 29
+        },
+        {
+          "name": "join",
+          "iterations": 4990,
+          "p99_ms": 22,
+          "p95_ms": 18,
+          "min_ms": 1,
+          "max_ms": 28
+        },
+        {
+          "name": "nulls",
+          "iterations": 4987,
+          "p99_ms": 21,
+          "p95_ms": 17,
+          "min_ms": 0,
+          "max_ms": 30
+        },
+        {
+          "name": "point",
+          "iterations": 4987,
+          "p99_ms": 21,
+          "p95_ms": 17,
+          "min_ms": 0,
+          "max_ms": 26
+        },
+        {
+          "name": "topk",
+          "iterations": 4988,
+          "p99_ms": 25,
+          "p95_ms": 21,
+          "min_ms": 4,
+          "max_ms": 29
+        }
+      ],
+      "peak_rss_bytes": 149585920,
+      "upstream_peak_rss_bytes": 396443648,
+      "health_samples": 343,
+      "health_p99_ms": 0.852125,
+      "resource_errors": [],
+      "uplink_rpcs_whole_arm": {
+        "do_get/statement_substrait_plan": 75183,
+        "get_schema/": 0
+      },
+      "testoperator_log_sha256": "54a75a4e1f664a592406b5614ae4ac08c4ca58c12bd71747c833ad685c6980ed"
+    },
+    {
+      "cache_hit": false,
+      "concurrency": 8,
+      "arm": 3,
+      "mode": "server",
+      "directory": "/tmp/spice-sidecar-artifacts/bench-944b5f3-miss/bench-cacheFalse-c8-3-server",
+      "iterations": 25078,
+      "elapsed_ms": 30005,
+      "queries_per_second": 835.794034327612,
+      "queries": [
+        {
+          "name": "aggregate",
+          "iterations": 5015,
+          "p99_ms": 22,
+          "p95_ms": 18,
+          "min_ms": 1,
+          "max_ms": 29
+        },
+        {
+          "name": "join",
+          "iterations": 5016,
+          "p99_ms": 21,
+          "p95_ms": 17,
+          "min_ms": 1,
+          "max_ms": 28
+        },
+        {
+          "name": "nulls",
+          "iterations": 5015,
+          "p99_ms": 21,
+          "p95_ms": 17,
+          "min_ms": 1,
+          "max_ms": 27
+        },
+        {
+          "name": "point",
+          "iterations": 5018,
+          "p99_ms": 21,
+          "p95_ms": 17,
+          "min_ms": 1,
+          "max_ms": 26
+        },
+        {
+          "name": "topk",
+          "iterations": 5014,
+          "p99_ms": 25,
+          "p95_ms": 21,
+          "min_ms": 4,
+          "max_ms": 32
+        }
+      ],
+      "peak_rss_bytes": 149536768,
+      "upstream_peak_rss_bytes": 199950336,
+      "health_samples": 343,
+      "health_p99_ms": 0.853083,
+      "resource_errors": [],
+      "uplink_rpcs_whole_arm": {
+        "do_get/sql_query": 74857,
+        "get_flight_info/sql_query": 74857,
+        "get_schema/": 0
+      },
+      "testoperator_log_sha256": "db757b446427b1821d89e55496c866c68df12fc84a348bc02fdc9d78f17d4b53"
+    },
+    {
+      "cache_hit": false,
+      "concurrency": 32,
+      "arm": 0,
+      "mode": "server",
+      "directory": "/tmp/spice-sidecar-artifacts/bench-944b5f3-miss/bench-cacheFalse-c32-0-server",
+      "iterations": 25511,
+      "elapsed_ms": 30034,
+      "queries_per_second": 849.404008790038,
+      "queries": [
+        {
+          "name": "aggregate",
+          "iterations": 5104,
+          "p99_ms": 64,
+          "p95_ms": 55,
+          "min_ms": 7,
+          "max_ms": 79
+        },
+        {
+          "name": "join",
+          "iterations": 5098,
+          "p99_ms": 65,
+          "p95_ms": 56,
+          "min_ms": 4,
+          "max_ms": 76
+        },
+        {
+          "name": "nulls",
+          "iterations": 5102,
+          "p99_ms": 63,
+          "p95_ms": 55,
+          "min_ms": 4,
+          "max_ms": 76
+        },
+        {
+          "name": "point",
+          "iterations": 5103,
+          "p99_ms": 64,
+          "p95_ms": 56,
+          "min_ms": 4,
+          "max_ms": 75
+        },
+        {
+          "name": "topk",
+          "iterations": 5104,
+          "p99_ms": 67,
+          "p95_ms": 59,
+          "min_ms": 9,
+          "max_ms": 79
+        }
+      ],
+      "peak_rss_bytes": 153255936,
+      "upstream_peak_rss_bytes": 203292672,
+      "health_samples": 345,
+      "health_p99_ms": 0.856958,
+      "resource_errors": [],
+      "uplink_rpcs_whole_arm": {
+        "do_get/sql_query": 76871,
+        "get_flight_info/sql_query": 76871,
+        "get_schema/": 0
+      },
+      "testoperator_log_sha256": "99f54359c39279c44cd4cc683e129786578147d3dc2123e0b42f587ba1ca554f"
+    },
+    {
+      "cache_hit": false,
+      "concurrency": 32,
+      "arm": 1,
+      "mode": "sidecar",
+      "directory": "/tmp/spice-sidecar-artifacts/bench-944b5f3-miss/bench-cacheFalse-c32-1-sidecar",
+      "iterations": 25569,
+      "elapsed_ms": 30024,
+      "queries_per_second": 851.6187050359712,
+      "queries": [
+        {
+          "name": "aggregate",
+          "iterations": 5114,
+          "p99_ms": 63,
+          "p95_ms": 55,
+          "min_ms": 6,
+          "max_ms": 75
+        },
+        {
+          "name": "join",
+          "iterations": 5110,
+          "p99_ms": 64,
+          "p95_ms": 57,
+          "min_ms": 8,
+          "max_ms": 93
+        },
+        {
+          "name": "nulls",
+          "iterations": 5115,
+          "p99_ms": 62,
+          "p95_ms": 55,
+          "min_ms": 7,
+          "max_ms": 79
+        },
+        {
+          "name": "point",
+          "iterations": 5116,
+          "p99_ms": 62,
+          "p95_ms": 54,
+          "min_ms": 7,
+          "max_ms": 78
+        },
+        {
+          "name": "topk",
+          "iterations": 5114,
+          "p99_ms": 66,
+          "p95_ms": 58,
+          "min_ms": 11,
+          "max_ms": 87
+        }
+      ],
+      "peak_rss_bytes": 152911872,
+      "upstream_peak_rss_bytes": 334020608,
+      "health_samples": 344,
+      "health_p99_ms": 0.820083,
+      "resource_errors": [],
+      "uplink_rpcs_whole_arm": {
+        "do_get/statement_substrait_plan": 77006,
+        "get_schema/": 0
+      },
+      "testoperator_log_sha256": "3d54d380b6a09d1603969e0fd7f4b7b284025dac03e657a3f3f468aff22041eb"
+    },
+    {
+      "cache_hit": false,
+      "concurrency": 32,
+      "arm": 2,
+      "mode": "sidecar",
+      "directory": "/tmp/spice-sidecar-artifacts/bench-944b5f3-miss/bench-cacheFalse-c32-2-sidecar",
+      "iterations": 25391,
+      "elapsed_ms": 30040,
+      "queries_per_second": 845.2396804260985,
+      "queries": [
+        {
+          "name": "aggregate",
+          "iterations": 5080,
+          "p99_ms": 63,
+          "p95_ms": 55,
+          "min_ms": 6,
+          "max_ms": 75
+        },
+        {
+          "name": "join",
+          "iterations": 5078,
+          "p99_ms": 65,
+          "p95_ms": 58,
+          "min_ms": 9,
+          "max_ms": 79
+        },
+        {
+          "name": "nulls",
+          "iterations": 5078,
+          "p99_ms": 62,
+          "p95_ms": 54,
+          "min_ms": 8,
+          "max_ms": 79
+        },
+        {
+          "name": "point",
+          "iterations": 5078,
+          "p99_ms": 63,
+          "p95_ms": 55,
+          "min_ms": 6,
+          "max_ms": 74
+        },
+        {
+          "name": "topk",
+          "iterations": 5077,
+          "p99_ms": 66,
+          "p95_ms": 58,
+          "min_ms": 10,
+          "max_ms": 82
+        }
+      ],
+      "peak_rss_bytes": 153092096,
+      "upstream_peak_rss_bytes": 333545472,
+      "health_samples": 344,
+      "health_p99_ms": 0.841834,
+      "resource_errors": [],
+      "uplink_rpcs_whole_arm": {
+        "do_get/statement_substrait_plan": 76597,
+        "get_schema/": 0
+      },
+      "testoperator_log_sha256": "50be1e692bc3f325bb1093b2f5656c99ecde73ba66268ad4b22c9cd464c4ac03"
+    },
+    {
+      "cache_hit": false,
+      "concurrency": 32,
+      "arm": 3,
+      "mode": "server",
+      "directory": "/tmp/spice-sidecar-artifacts/bench-944b5f3-miss/bench-cacheFalse-c32-3-server",
+      "iterations": 25561,
+      "elapsed_ms": 30028,
+      "queries_per_second": 851.2388437458372,
+      "queries": [
+        {
+          "name": "aggregate",
+          "iterations": 5116,
+          "p99_ms": 63,
+          "p95_ms": 55,
+          "min_ms": 7,
+          "max_ms": 75
+        },
+        {
+          "name": "join",
+          "iterations": 5113,
+          "p99_ms": 64,
+          "p95_ms": 56,
+          "min_ms": 7,
+          "max_ms": 77
+        },
+        {
+          "name": "nulls",
+          "iterations": 5105,
+          "p99_ms": 63,
+          "p95_ms": 54,
+          "min_ms": 5,
+          "max_ms": 78
+        },
+        {
+          "name": "point",
+          "iterations": 5112,
+          "p99_ms": 63,
+          "p95_ms": 55,
+          "min_ms": 6,
+          "max_ms": 77
+        },
+        {
+          "name": "topk",
+          "iterations": 5115,
+          "p99_ms": 66,
+          "p95_ms": 58,
+          "min_ms": 11,
+          "max_ms": 79
+        }
+      ],
+      "peak_rss_bytes": 152485888,
+      "upstream_peak_rss_bytes": 203882496,
+      "health_samples": 345,
+      "health_p99_ms": 0.942583,
+      "resource_errors": [],
+      "uplink_rpcs_whole_arm": {
+        "do_get/sql_query": 76998,
+        "get_flight_info/sql_query": 76998,
+        "get_schema/": 0
+      },
+      "testoperator_log_sha256": "8b166ae41c1101ac81f0455c2ca3a9730e0bf6fc334d09e5e9fc26474ad2855e"
+    },
+    {
+      "cache_hit": false,
+      "concurrency": 128,
+      "arm": 0,
+      "mode": "server",
+      "directory": "/tmp/spice-sidecar-artifacts/bench-944b5f3-miss/bench-cacheFalse-c128-0-server",
+      "iterations": 25688,
+      "elapsed_ms": 30150,
+      "queries_per_second": 852.0066334991708,
+      "queries": [
+        {
+          "name": "aggregate",
+          "iterations": 5143,
+          "p99_ms": 186,
+          "p95_ms": 177,
+          "min_ms": 28,
+          "max_ms": 201
+        },
+        {
+          "name": "join",
+          "iterations": 5134,
+          "p99_ms": 188,
+          "p95_ms": 178,
+          "min_ms": 28,
+          "max_ms": 202
+        },
+        {
+          "name": "nulls",
+          "iterations": 5133,
+          "p99_ms": 184,
+          "p95_ms": 173,
+          "min_ms": 9,
+          "max_ms": 200
+        },
+        {
+          "name": "point",
+          "iterations": 5138,
+          "p99_ms": 187,
+          "p95_ms": 177,
+          "min_ms": 35,
+          "max_ms": 198
+        },
+        {
+          "name": "topk",
+          "iterations": 5140,
+          "p99_ms": 188,
+          "p95_ms": 178,
+          "min_ms": 22,
+          "max_ms": 199
+        }
+      ],
+      "peak_rss_bytes": 163971072,
+      "upstream_peak_rss_bytes": 203079680,
+      "health_samples": 350,
+      "health_p99_ms": 0.973834,
+      "resource_errors": [],
+      "uplink_rpcs_whole_arm": {
+        "do_get/sql_query": 78326,
+        "get_flight_info/sql_query": 78326,
+        "get_schema/": 0
+      },
+      "testoperator_log_sha256": "3c7def15f3f0eab9c886e82bafa7cacb40291faf453e53a5449f73da66b3347e"
+    },
+    {
+      "cache_hit": false,
+      "concurrency": 128,
+      "arm": 1,
+      "mode": "sidecar",
+      "directory": "/tmp/spice-sidecar-artifacts/bench-944b5f3-miss/bench-cacheFalse-c128-1-sidecar",
+      "iterations": 25551,
+      "elapsed_ms": 30126,
+      "queries_per_second": 848.1378211511651,
+      "queries": [
+        {
+          "name": "aggregate",
+          "iterations": 5110,
+          "p99_ms": 198,
+          "p95_ms": 186,
+          "min_ms": 15,
+          "max_ms": 215
+        },
+        {
+          "name": "join",
+          "iterations": 5115,
+          "p99_ms": 197,
+          "p95_ms": 184,
+          "min_ms": 27,
+          "max_ms": 214
+        },
+        {
+          "name": "nulls",
+          "iterations": 5100,
+          "p99_ms": 198,
+          "p95_ms": 187,
+          "min_ms": 30,
+          "max_ms": 219
+        },
+        {
+          "name": "point",
+          "iterations": 5116,
+          "p99_ms": 200,
+          "p95_ms": 187,
+          "min_ms": 28,
+          "max_ms": 220
+        },
+        {
+          "name": "topk",
+          "iterations": 5110,
+          "p99_ms": 201,
+          "p95_ms": 190,
+          "min_ms": 19,
+          "max_ms": 217
+        }
+      ],
+      "peak_rss_bytes": 163905536,
+      "upstream_peak_rss_bytes": 327794688,
+      "health_samples": 349,
+      "health_p99_ms": 0.779083,
+      "resource_errors": [],
+      "uplink_rpcs_whole_arm": {
+        "do_get/statement_substrait_plan": 77973,
+        "get_schema/": 0
+      },
+      "testoperator_log_sha256": "bc369aecec97dab87937da0c3a493873cae85ce346efcaf2361565893f11136c"
+    },
+    {
+      "cache_hit": false,
+      "concurrency": 128,
+      "arm": 2,
+      "mode": "sidecar",
+      "directory": "/tmp/spice-sidecar-artifacts/bench-944b5f3-miss/bench-cacheFalse-c128-2-sidecar",
+      "iterations": 25849,
+      "elapsed_ms": 30145,
+      "queries_per_second": 857.4888041134517,
+      "queries": [
+        {
+          "name": "aggregate",
+          "iterations": 5173,
+          "p99_ms": 186,
+          "p95_ms": 175,
+          "min_ms": 11,
+          "max_ms": 198
+        },
+        {
+          "name": "join",
+          "iterations": 5165,
+          "p99_ms": 190,
+          "p95_ms": 179,
+          "min_ms": 55,
+          "max_ms": 201
+        },
+        {
+          "name": "nulls",
+          "iterations": 5166,
+          "p99_ms": 187,
+          "p95_ms": 178,
+          "min_ms": 8,
+          "max_ms": 208
+        },
+        {
+          "name": "point",
+          "iterations": 5175,
+          "p99_ms": 187,
+          "p95_ms": 176,
+          "min_ms": 13,
+          "max_ms": 199
+        },
+        {
+          "name": "topk",
+          "iterations": 5170,
+          "p99_ms": 190,
+          "p95_ms": 180,
+          "min_ms": 12,
+          "max_ms": 211
+        }
+      ],
+      "peak_rss_bytes": 163233792,
+      "upstream_peak_rss_bytes": 324665344,
+      "health_samples": 349,
+      "health_p99_ms": 0.859625,
+      "resource_errors": [],
+      "uplink_rpcs_whole_arm": {
+        "do_get/statement_substrait_plan": 78069,
+        "get_schema/": 0
+      },
+      "testoperator_log_sha256": "d70d93a816763fa8e3e23c9c19e1b088149d3122de60c08b3236cc86e075ac18"
+    },
+    {
+      "cache_hit": false,
+      "concurrency": 128,
+      "arm": 3,
+      "mode": "server",
+      "directory": "/tmp/spice-sidecar-artifacts/bench-944b5f3-miss/bench-cacheFalse-c128-3-server",
+      "iterations": 25718,
+      "elapsed_ms": 30148,
+      "queries_per_second": 853.0582459864668,
+      "queries": [
+        {
+          "name": "aggregate",
+          "iterations": 5146,
+          "p99_ms": 193,
+          "p95_ms": 183,
+          "min_ms": 30,
+          "max_ms": 203
+        },
+        {
+          "name": "join",
+          "iterations": 5142,
+          "p99_ms": 193,
+          "p95_ms": 183,
+          "min_ms": 31,
+          "max_ms": 204
+        },
+        {
+          "name": "nulls",
+          "iterations": 5139,
+          "p99_ms": 192,
+          "p95_ms": 181,
+          "min_ms": 19,
+          "max_ms": 205
+        },
+        {
+          "name": "point",
+          "iterations": 5149,
+          "p99_ms": 190,
+          "p95_ms": 177,
+          "min_ms": 20,
+          "max_ms": 206
+        },
+        {
+          "name": "topk",
+          "iterations": 5142,
+          "p99_ms": 193,
+          "p95_ms": 183,
+          "min_ms": 19,
+          "max_ms": 203
+        }
+      ],
+      "peak_rss_bytes": 163315712,
+      "upstream_peak_rss_bytes": 204734464,
+      "health_samples": 350,
+      "health_p99_ms": 0.948833,
+      "resource_errors": [],
+      "uplink_rpcs_whole_arm": {
+        "do_get/sql_query": 78242,
+        "get_flight_info/sql_query": 78242,
+        "get_schema/": 0
+      },
+      "testoperator_log_sha256": "eca7205b67b7f1260970e4005087e9217a4af9bd65ad784060ba91701ccb80e7"
+    }
+  ]
+}
