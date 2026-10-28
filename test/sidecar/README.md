@@ -76,7 +76,7 @@ python3 test/scripts/sidecar.py \
 
 ## Candidate qualification
 
-The final native binary was built from
+The initial qualification binary was built from
 `944b5f351ef64c8713bfefd9d9cb8ce4cc134606` on 2026-10-28 UTC with:
 
 ```bash
@@ -90,8 +90,8 @@ The build exited 0 after 14m51s. `spiced --version` reported
 `v2.5.0-unstable`; its SHA-256 is
 `823f19ba1718df146e8ec7e67627c0c48a65cca0c3e4b6fc6cb68d9ae71cbed9`.
 This uses the core release feature set; the complete workspace sign-off remains
-a separate requirement. Later qualification commits change only harnesses,
-documentation and evidence, not the production Rust tree.
+a separate requirement. The trace correction described below changes the
+production Rust tree and needs a new binary and qualification run.
 
 The [candidate artifacts](evidence/candidate-944b5f3) retain returned rows,
 schemas, plans, responses, source identities and commands. The native commands
@@ -350,3 +350,13 @@ remained correlated. All four cases failed the zero-reconciliation guard;
 the [actual failure and observations](evidence/trace-before-944b5f3) are retained.
 The corrected binary, repeated memory probe and new uplink measurements remain
 to be run.
+
+The real-SDK nested-span guard also caught a root-claim ordering error in
+candidate `00971c2`: a root with no incoming propagated ID could publish its ID
+without consuming the root claim, letting its child reparent itself. The
+[failure](evidence/trace-sdk-00971c2) retains all four unsuccessful attempts.
+Candidate `f4f0d5d` consumes that claim after resolution. The exact same focused
+command then reported [16 passed, 3625 skipped](evidence/trace-sdk-f4f0d5d) in
+0.383s, including matching pins, conflicting IDs, missing propagation, generated
+IDs and nested parent checks. These SDK tests supplement the pending native
+after-run; they do not replace it.
