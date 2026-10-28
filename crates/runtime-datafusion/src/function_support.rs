@@ -2178,4 +2178,250 @@ mod tests {
             &batches
         );
     }
+
+    /// The backend policies every test of a universal refusal runs over: the
+    /// plain one every catalog connector takes and each backend's own.
+    fn every_backend_policy() -> Vec<(&'static str, FunctionSupport)> {
+        vec![
+            ("plain", function_support()),
+            ("DuckDB", deny_spice_functions_for_duckdb_table_providers()),
+            (
+                "DuckLake",
+                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+            ),
+            (
+                "BigQuery",
+                deny_spice_functions_for_bigquery_table_providers(),
+            ),
+            (
+                "PostgreSQL",
+                deny_spice_functions_for_postgres_table_providers(),
+            ),
+            ("SQLite", deny_spice_functions_for_sqlite_table_providers()),
+            ("MySQL", deny_spice_functions_for_mysql_table_providers()),
+        ]
+    }
+
+    fn similar_to(pattern: &str, negated: bool, escape_char: Option<char>) -> Expr {
+        Expr::SimilarTo(datafusion::logical_expr::expr::Like::new(
+            negated,
+            Box::new(col("s")),
+            Box::new(lit(pattern)),
+            escape_char,
+            false,
+        ))
+    }
+
+    /// Regression: the unparser renders `SIMILAR TO` as `LIKE` with the
+    /// pattern unchanged, so `s SIMILAR TO 'cust_[0-9]+'` reached `DuckDB` as
+    /// `s LIKE 'cust_[0-9]+'` and counted 0 rows where `DataFusion` counts every
+    /// `cust_<digits>`. It stays local on every backend, negated, escaped, as a
+    /// filter and as a projection; a plain `LIKE` keeps its pushdown.
+    #[test]
+    fn similar_to_stays_local_on_every_backend() {
+        let refused = [
+            similar_to("cust_[0-9]+", false, None),
+            similar_to("cust_[0-9]+", true, None),
+            similar_to("a!%c", false, Some('!')),
+        ];
+        for (policy, support) in every_backend_policy() {
+            for expr in &refused {
+                for plan in [plan_filtering(expr.clone()), plan_projecting(expr.clone())] {
+                    assert!(
+                        !pushes(&plan, &support),
+                        "the {policy} policy must evaluate {expr} locally:\n{plan}"
+                    );
+                }
+            }
+            let like = plan_filtering(col("s").like(lit("cust_%")));
+            assert!(
+                pushes(&like, &support),
+                "the {policy} policy must still federate a plain LIKE"
+            );
+        }
+    }
+
+    /// Regression: `DuckDB` answers `x / 0` and `x % 0` with `NULL`, where
+    /// `DataFusion` fails an integer one and answers a float `/` with an
+    /// infinity, so a `/` or `%` federates only over a literal divisor that is
+    /// neither zero nor `-1`.
+    #[test]
+    fn duckdb_keeps_a_possibly_zero_divisor_local() {
+        for (route, support) in [
+            ("duckdb", deny_spice_functions_for_duckdb_table_providers()),
+            (
+                "ducklake",
+                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+            ),
+        ] {
+            for refused in [
+                col("i") / lit(0_i64),
+                col("i") % lit(0_i64),
+                col("f") / lit(0.0_f64),
+                col("f") / lit(-0.0_f64),
+                col("f") / lit(f64::NAN),
+                col("i") / lit(ScalarValue::Int64(None)),
+                col("i") / cast(lit(0_i64), DataType::Int32),
+                col("i") / Expr::Negative(Box::new(lit(1_i64))),
+                col("i") / lit(-1_i64),
+                col("i") / col("g"),
+                col("i") % col("g"),
+                col("i") / (col("g") - lit(3_i32)),
+                (col("i") / col("g")).gt(lit(0_i64)),
+            ] {
+                assert!(
+                    !pushes(&plan_dividing(refused.clone()), &support),
+                    "{refused} must stay local on {route}"
+                );
+            }
+            for allowed in [
+                col("i") / lit(2_i64),
+                col("i") % lit(2_i64),
+                col("i") / Expr::Negative(Box::new(lit(2_i64))),
+                col("i") / cast(lit(2_i64), DataType::Int32),
+                col("f") / lit(2.0_f64),
+                col("f") % lit(0.5_f64),
+                col("f") / cast(lit(2_i64), DataType::Float64),
+                col("i") * col("g"),
+            ] {
+                assert!(
+                    pushes(&plan_dividing(allowed.clone()), &support),
+                    "{allowed} must keep its {route} pushdown"
+                );
+            }
+        }
+    }
+
+    /// Regression: with no `ESCAPE`, `DataFusion` reads a backslash in a `LIKE`
+    /// pattern as an escape and `DuckDB` reads it literally, so `'a%c' LIKE
+    /// 'a\%c'` was `false` federated and `true` locally.
+    #[test]
+    fn duckdb_keeps_a_backslash_like_pattern_local() {
+        let with_escape = |pattern: &str, escape_char| {
+            Expr::Like(datafusion::logical_expr::expr::Like::new(
+                false,
+                Box::new(col("s")),
+                Box::new(lit(pattern)),
+                escape_char,
+                false,
+            ))
+        };
+        for (route, support) in [
+            ("duckdb", deny_spice_functions_for_duckdb_table_providers()),
+            (
+                "ducklake",
+                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+            ),
+        ] {
+            for refused in [
+                col("s").like(lit("a\\%c")),
+                col("s").not_like(lit("a\\_c")),
+                col("s").ilike(lit("A\\%C")),
+                col("s").like(col("s")),
+                col("s").like(lit(ScalarValue::Utf8(None))),
+            ] {
+                assert!(
+                    !pushes(&plan_filtering(refused.clone()), &support),
+                    "{refused} must stay local on {route}"
+                );
+            }
+            for allowed in [
+                col("s").like(lit("a%c")),
+                col("s").ilike(lit("A_C")),
+                with_escape("a\\%c", Some('\\')),
+                with_escape("a!%c", Some('!')),
+            ] {
+                assert!(
+                    pushes(&plan_filtering(allowed.clone()), &support),
+                    "{allowed} must keep its {route} pushdown"
+                );
+            }
+        }
+    }
+
+    /// Regression: `DuckDB` counts a negative `substr` start from the end of the
+    /// string, so `substr('abcd', -2, 4)` was `'cd'` federated and `'a'` locally.
+    /// Only literal positions both engines read alike federate.
+    #[test]
+    fn duckdb_keeps_a_substr_outside_the_shared_positions_local() {
+        use datafusion::functions::unicode::substr;
+        let call = |args: Vec<Expr>| substr().call(args);
+        for (route, support) in [
+            ("duckdb", deny_spice_functions_for_duckdb_table_providers()),
+            (
+                "ducklake",
+                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+            ),
+        ] {
+            for refused in [
+                call(vec![col("s"), lit(-2_i64), lit(4_i64)]),
+                call(vec![col("s"), Expr::Negative(Box::new(lit(2_i64)))]),
+                call(vec![col("s"), lit(0_i64), lit(2_i64)]),
+                call(vec![col("s"), col("start")]),
+                call(vec![col("s"), lit(1_i64), col("start")]),
+                call(vec![col("s"), lit(1_i64), lit(-1_i64)]),
+                call(vec![col("s"), lit(5_000_000_000_i64)]),
+                call(vec![col("s"), lit(1_i64), lit(5_000_000_000_i64)]),
+                call(vec![col("s"), lit(ScalarValue::Int64(None))]),
+            ] {
+                assert!(
+                    !pushes(&plan_projecting(refused.clone()), &support),
+                    "{refused} must stay local on {route}"
+                );
+            }
+            for allowed in [
+                call(vec![col("s"), lit(2_i64), lit(2_i64)]),
+                call(vec![col("s"), lit(1_i64)]),
+                call(vec![col("s"), lit(3_i64), lit(0_i64)]),
+            ] {
+                assert!(
+                    pushes(&plan_projecting(allowed.clone()), &support),
+                    "{allowed} must keep its {route} pushdown"
+                );
+            }
+        }
+    }
+
+    /// Regression: `DuckDB` has no `to_char` or `to_unixtime`, and its
+    /// `cardinality` takes a map, so each failed the query on `DuckDB` where
+    /// `DataFusion` answers it; they stay local there. `PostgreSQL`, whose
+    /// `cardinality` matches, keeps that pushdown.
+    #[test]
+    fn duckdb_keeps_functions_it_lacks_local() {
+        use datafusion::functions::datetime::{to_char, to_unixtime};
+        use datafusion::functions_nested::cardinality::cardinality_udf;
+        let fields = || {
+            vec![
+                Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+                Field::new(
+                    "arr",
+                    DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true))),
+                    true,
+                ),
+            ]
+        };
+        let calls = [
+            to_char().call(vec![col("ts"), lit("%Y")]),
+            to_unixtime().call(vec![col("ts")]),
+            cardinality_udf().call(vec![col("arr")]),
+        ];
+        for (route, support) in [
+            ("duckdb", deny_spice_functions_for_duckdb_table_providers()),
+            (
+                "ducklake",
+                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+            ),
+        ] {
+            for call in &calls {
+                assert!(
+                    !pushes(&plan_over(fields(), None, call.clone()), &support),
+                    "{call} must stay local on {route}"
+                );
+            }
+        }
+        assert!(pushes(
+            &plan_over(fields(), None, cardinality_udf().call(vec![col("arr")])),
+            &deny_spice_functions_for_postgres_table_providers()
+        ));
+    }
 }
