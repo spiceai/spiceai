@@ -1,0 +1,16 @@
+[package]
+name = "cayenne-metastore-actions"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "Prototype: Cayenne metastore commit records as typed actions, the dataset state, and a deterministic apply"
+publish = false
+
+[dependencies]
+blake3.workspace = true
+prost.workspace = true
+snafu.workspace = true
+
+[lints]
+workspace = true

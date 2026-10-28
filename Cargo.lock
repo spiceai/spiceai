@@ -3742,6 +3742,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
+ "cayenne-metastore-actions",
  "chdb-rust",
  "chrono",
  "cpu-budget",
@@ -3834,6 +3835,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "util",
+]
+
+[[package]]
+name = "cayenne-metastore-actions"
+version = "2.5.0-unstable"
+dependencies = [
+ "blake3",
+ "prost 0.14.3",
+ "snafu",
 ]
 
 [[package]]

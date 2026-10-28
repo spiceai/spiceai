@@ -866,6 +866,13 @@ pub trait MetastoreTransaction: Send + Sync {
     ///
     /// Returns an error if the transaction cannot be rolled back.
     async fn rollback(self: Box<Self>) -> CatalogResult<()>;
+
+    /// The metastore tap recording this transaction's actions, when the
+    /// catalog has one. Only the tap's own wrapper returns one; a backend's
+    /// transaction never does.
+    fn tap(&self) -> Option<&crate::metastore_tap::TxnTap> {
+        None
+    }
 }
 
 /// Trait for metastore backend implementations.

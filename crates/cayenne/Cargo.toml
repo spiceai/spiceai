@@ -9,6 +9,7 @@ version.workspace = true
 autotests = false
 
 [dependencies]
+cayenne-metastore-actions = { path = "../cayenne-metastore-actions" }
 cpu-budget = { path = "../cpu-budget" }
 arc-swap = { workspace = true }
 arrow = { workspace = true }

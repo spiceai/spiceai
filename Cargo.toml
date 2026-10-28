@@ -57,6 +57,7 @@ members = [
     "crates/otel-arrow",
     "crates/podswatcher",
     "crates/cayenne",
+    "crates/cayenne-metastore-actions",
     "crates/cayenne-metastore-model",
     "crates/runtime-object-store",
     "crates/runtime-otel-push",
