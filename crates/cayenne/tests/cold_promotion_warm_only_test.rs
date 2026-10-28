@@ -849,6 +849,12 @@ async fn test_delete_all_counts_live_rows_impl(fixture: common::TestFixture) -> 
     oracle.remove(&150);
     flush_warm(&table).await;
     assert!(table.promote_warm_to_cold().await?, "promotion 2 fires");
+    // Precondition: the datalake still physically holds the superseded copies of
+    // 100..110 and the deleted row of 150 (generation 1, 100 rows) beside the
+    // ten new copies (generation 2), so the delete-all below reads them.
+    let files = manifest(&fixture.catalog, &table).await?;
+    assert_eq!(generation_count(&files), 2, "two datalake generations");
+    assert_eq!(files.iter().map(|f| f.row_count).sum::<i64>(), 110, "datalake rows");
     let rows: Vec<(i64, i64)> = (120..125).map(|id| (id, id + 2000)).collect();
     upsert(&table, &mut oracle, &rows).await?;
     assert_matches_oracle(&ctx, &oracle, &[100, 120, 150], "before the delete-all").await?;
