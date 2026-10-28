@@ -653,7 +653,8 @@ it is built. This is the proposal that Enhancement would review.
 default, so nothing changes for users until they opt in. Once the new path is
 proven, it becomes the default, and the flag is removed together with the
 surface it makes obsolete: the metastore backend choice, the separate metadata
-directory and the small-write inlining settings. The flag's name and shape, and
+directory, the small-write inlining settings and, for Cayenne, snapshots (a
+reader opens the destination directly). The flag's name and shape, and
 each deprecation and its timing, are defined and reviewed in the Enhancement,
 not here.
 
@@ -848,8 +849,9 @@ as discrete changes, each shipping on its own, and each with an exit proof:
    flag. Its records can reference data files still on local disk until step
    4's placement lands, so the metadata work does not wait on the data work;
    until then, recovery is limited to that disk.
-6. Existing datasets re-bootstrap from their sources; metastore contents are
-   not migrated.
+6. Existing datasets keep the metastore they are on; moving one means deleting
+   its acceleration so it re-bootstraps from its source. Metastore contents are
+   not migrated, and nothing switches automatically.
 7. On by default, once a second instance on the same destination can no
    longer race the writer: either read-only support or detection that
    refuses it.

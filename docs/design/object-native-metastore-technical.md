@@ -1585,9 +1585,10 @@ replacement is measured (direction document, decision 1.5).
 
 ## Existing datasets
 
-An existing dataset is not migrated. Once the flag is enabled, it is
-re-bootstrapped: loaded again from its source into a new object-native
-dataset, as [roadmap step 6](#step-6-existing-datasets-re-bootstrap)
+An existing dataset is neither migrated nor switched automatically. It keeps
+the metastore it is on, and a setting that names a different one is an error;
+moving it means deleting its acceleration so it loads from its source as a new
+dataset does, as [roadmap step 6](#step-6-existing-datasets-keep-their-metastore)
 describes. Migrating metastore contents, if it is ever needed, is separate
 work.
 
@@ -2013,7 +2014,7 @@ flowchart LR
     S2 --> S3["3 · shadow log"]
     S3 --> S4["4 · readers from<br/>the shadow"]
     S4 --> S5["5 · authority for<br/>new datasets (flag)"]
-    S5 --> S6["6 · existing datasets<br/>re-bootstrap"]
+    S5 --> S6["6 · existing datasets<br/>keep their metastore"]
     S6 --> S7["7 · default on"]
     S7 --> S8["8 · remove the<br/>SQL metastore"]
 ```
@@ -2177,20 +2178,23 @@ A library change, with no Cayenne or runtime change.
   tier is measured against it, including the rc.3 caching workload (direction
   document, decision 1.5).
 
-### Step 6: existing datasets re-bootstrap
+### Step 6: existing datasets keep their metastore
 
-- **Change:** with the flag enabled, a dataset still on the SQL metastore is
-  re-bootstrapped: loaded again from its source into a new object-native
-  dataset, as a full refresh or a CDC snapshot does today. Its SQL metastore
-  and files stay untouched, and keep serving queries, until the new dataset is
-  ready; then they are removed. Metastore contents are not migrated.
+- **Change:** no automatic switch, and no one-time upgrade path to build and
+  test. A dataset keeps the metastore its acceleration is already on, detected
+  from what is on disk, and the flag decides only for datasets that have no
+  acceleration yet. A flag that names a different metastore from the one an
+  existing acceleration uses is an error naming the dataset and the fix:
+  delete the acceleration, and it re-bootstraps from its source as a new
+  dataset does today. Metastore contents are not migrated.
 - **Datasets that cannot re-bootstrap** (an acceleration holding data its
   source no longer has) are out of scope here: what their users do is a
   separate decision, and this work does not keep supporting the old
   metastore for them.
-- **Exit proof:** every test Spicepod's datasets re-bootstrapped with
-  `--validate` before and after, and a recovery from the destination alone on
-  a fresh instance without the original data directory.
+- **Exit proof:** the mismatch error in both directions; every test
+  Spicepod's datasets deleted and re-bootstrapped with `--validate` before and
+  after; and, once data is in the destination, a recovery from the destination
+  alone on a fresh instance without the original data directory.
 
 ### Step 7: on by default
 
