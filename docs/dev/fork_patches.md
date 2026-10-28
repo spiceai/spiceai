@@ -297,7 +297,7 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Placeholder type inference stays linear in the depth of an expression: an expression without a placeholder is returned before the walk, and an operand's field is looked up only beside an untyped placeholder (spiceai/datafusion#259) | Planning a wide disjunction, such as a batched primary-key lookup, becomes quadratic in its width again, with or without a placeholder. A lookup of 100 four-column keys spent ~147 ms in logical planning without the patch and ~2 ms with it | silent (perf) | `crates/runtime/src/datafusion/query.rs::a_wide_disjunction_plans_in_time_linear_in_its_width` (400 branches must plan in under 8× the time of 100) |
 | `unwrap_cast` keeps a cast that drops decimal digits — a decimal with fractional digits cast to an integer, or a decimal cast to a smaller scale — on the column instead of moving it onto the literal, in the logical and physical simplifiers (`is_decimal_scale_narrowing_cast`; spiceai/datafusion#262; upstream tracks the class as apache/datafusion#23095) | `CAST(price AS BIGINT) = 173665` over a `DECIMAL(15, 2)` column is rewritten to `price = 173665.00`, which holds for one value where every price in [173665, 173666) should match, and a range on the same cast returns a row outside it; on TPC-H SF1, `orders WHERE CAST(o_totalprice AS BIGINT) = 173665` returned 0 rows instead of 4 ([#14969](https://github.com/spiceai/spiceai/issues/14969)) | silent (wrong data) | **GAP** — the guard, `crates/runtime-datafusion/src/fork_backport_guards.rs::a_filter_on_a_decimal_cast_that_drops_digits_keeps_the_cast`, lands with [#15207](https://github.com/spiceai/spiceai/pull/15207); see [Open gaps](#open-gaps) |
 | Type coercion turns an implicit cast of a scalar function's literal argument into a literal of the coerced type, so `return_field_from_args` sees the literal (`coerce_scalar_function_arguments_for_signature` in `analyzer/type_coercion.rs`, `scalar_arguments_for_fields` in `expr_schema.rs`; spiceai/datafusion#273, upstream apache/datafusion#23232) | `round(decimal, 2)` plans `decimal(p+1, s)` after analysis, where the literal hides behind `CAST(Int64(2) AS Int32)`, and `decimal(p, 2)` after the simplifier folds the cast; the optimizer's schema check ignores decimal precision and scale, so nothing fails. Flight SQL `GetFlightInfo` announces the analyzed schema and the stream sends the other, so ADBC clients fail every `round` over a decimal with "endpoint 0 returned inconsistent schema" ([#15652](https://github.com/spiceai/spiceai/issues/15652)) | silent (query failure) | `crates/runtime/src/datafusion/query.rs::get_schema_matches_streamed_schema_for_decimal_round` (announced against streamed type for a literal, a column and `avg`); in the fork, `expr_schema::tests::scalar_arguments_*` and `test_return_field_args_scalar_argument_types_match_arg_fields` |
-| Join output streams consume Tokio's cooperative budget: `HashJoinExec`, `SortMergeJoinExec`, `NestedLoopJoinExec` and `CrossJoinExec` wrap their `execute()` stream in `coop::cooperative` (spiceai/datafusion#278, upstream apache/datafusion#19358) | `EnsureCooperative` wraps only leaves and exchanges, and a fan-out join emits many batches per input batch without yielding, so the task driving it never returns `Pending`. Aborting the query (client disconnect, cancel, timeout) waits for the join to finish, and its CPU keeps running for the rest of the join ([#15677](https://github.com/spiceai/spiceai/issues/15677)) | silent (CPU after cancel) | in the fork, `joins::cancellation_tests::*` (each fails on the unwrapped stream); no guard in this repo yet |
+| Join output streams consume Tokio's cooperative budget: `HashJoinExec`, `SortMergeJoinExec`, `NestedLoopJoinExec` and `CrossJoinExec` wrap their `execute()` stream in `coop::cooperative` (spiceai/datafusion#278, upstream apache/datafusion#19358) | `EnsureCooperative` wraps only leaves and exchanges, and a fan-out join emits many batches per input batch without yielding, so the task driving it never returns `Pending`. Aborting the query (client disconnect, cancel, timeout) waits for the join to finish, and its CPU keeps running for the rest of the join ([#15677](https://github.com/spiceai/spiceai/issues/15677)) | silent (CPU after cancel) | **GAP** — no guard here yet; in the fork, `joins::cancellation_tests::*` (each fails on the unwrapped stream); see [Open gaps](#open-gaps) |
 | BigQuery dialect: temporal typing and naming — a tz-naive timestamp cast is `DATETIME` not `TIMESTAMP`, a timestamp literal's cast target follows the offset it renders with, sub-second digits are truncated to six, a comparison BigQuery has no supertype for is brought to one, `date - date` is `DATE_DIFF`, `CAST(date AS INT64)` is `UNIX_DATE`, `btrim`/`now`/`to_unixtime`/`unix_seconds`/`to_timestamp` are renamed or type-directed, `median`/`approx_percentile_cont` are rendered by ordering the group, a constant `GROUP BY` key is cast to its own type, and `array_element` subscripts with `SAFE_ORDINAL` (fork PR #212) | BigQuery puts no timezone qualifier on a timestamp type, so a tz-naive value typed `TIMESTAMP` becomes an instant with no supertype against a `DATETIME` column and the statement is refused; the name and cast rows are refused outright too. Two are quieter: `array_element` is 1-based where a bare BigQuery subscript is 0-based, so the neighbouring element is read with no error, and dropping a constant grouping key turns a grouped aggregate into a global one, returning one row of zeros where the grouped form returns none | silent (query failure; wrong data for the subscript and the dropped grouping key) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the four `#212` arms: `DATE_DIFF`, `UNIX_DATE`, `DATETIME`, cast `GROUP BY`) and `::array_element_federates_only_for_a_non_negative_integer_index`; in the fork, the per-rendering tests in `plan_to_sql.rs` and, restored by fork PR #214 after #212 deleted them, `rewrite.rs`'s own; real-engine guard: `test/scripts/bigquery-pushdown.sh` |
 | Spark concat coerces an untyped NULL argument to a string type (fork PR #217). Upstream adopted the behaviour in DataFusion 55 (`ConcatFunc` coercion, apache/datafusion#22244), so the merge took upstream's `coerce_types`; the fork keeps its tests | A string array concatenated with an untyped NULL reaches an unsupported kernel branch | silent (panic) | `crates/runtime/src/datafusion/builder.rs::tests::the_built_session_concatenates_an_untyped_null` |
 | Substrait VarChar literals decode as UTF-8 strings (fork PR #215) | Plans containing VarChar literals fail to decode | silent (query failure) | `crates/runtime/src/flight/flightsql/statement_substrait_plan.rs::tests::decode_plan_executes_a_varchar_literal`; `tools/substrait-compliance/src/mode_a.rs::varchar_literal_lowers_to_utf8` (Isthmus TPC-H plans emit `VarChar` literals such as `EUROPE`, length 25; the Mode A harness `spice-substrait-compliance` exercises them on q02/q03/q05/q11/q12/q16/q17/q19–q22) |
@@ -811,7 +811,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**41 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**42 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -876,22 +876,29 @@ They are not equal in consequence; this is the order to close them in.
 9. `orc-rust` in-codec decode allowance — losing it lets one compressed metadata
    chunk decode in full before the stream is rejected. A guard needs a memory
    measurement around one ORC open; the rejection itself is guarded.
+10. `datafusion` join output streams consuming Tokio's cooperative budget
+   (spiceai/datafusion#278) — losing it lets an aborted query's hash, sort-merge,
+   nested-loop or cross join keep its CPU until the join finishes
+   ([#15677](https://github.com/spiceai/spiceai/issues/15677)). The fork's
+   `joins::cancellation_tests` guard it there. A guard here needs a fan-out join
+   query whose task is aborted mid-stream, asserting it ends within a bounded number
+   of batches rather than a wall-clock timing.
 
 **Blocked, not merely undone.** These have been looked at and cannot be closed by
 writing a test; each says what would unblock it:
 
-10. `snowflake-rs` (five rows) — no host override, private response types. Needs a
+11. `snowflake-rs` (five rows) — no host override, private response types. Needs a
    live account, or an upstream change letting the base URL be set.
-11. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
+12. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
    race, so any test of it is a timing test. Upstream has since removed the code
    path and the lock (vortex-data/vortex#8919); if a run confirms that, drop the row
    rather than guard it.
-12. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
+13. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
    there is no behaviour of ours to assert on.
 
 **Reported late rather than wrongly.** The right answer, after an avoidable wait:
 
-13. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
+14. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
    `endpoint` is retried through the whole backoff budget before reporting, so a
    configuration error looks like a slow provider. What changes is *when* the
    error arrives, and asserting that is a timing test.
@@ -899,7 +906,7 @@ writing a test; each says what would unblock it:
 **Diagnostics only.** The query is unaffected; what is lost is the ability to see
 how it ran:
 
-14. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
+15. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
    upstream's; `EXPLAIN FORMAT TREE` is not carried) — plain `EXPLAIN` is guarded
    through the cluster harness, and `ANALYZE` is not issued through it by anything. Closing this needs the
    harness to submit the statement rather than build its text as a label.
@@ -910,7 +917,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-15. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+16. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `mistral.rs`/`candle` i-quant MoE kernels; `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `mistral.rs` `deepseek41` and `glm5-next` decode kernels (spiceai/mistral.rs#49), which
     no suite here trends yet — their evidence is the DGX Spark decode A/B in that PR;
@@ -923,7 +930,7 @@ without becoming a flaky timing test:
 **Unoptimised builds only.** No query answers anything differently; what is lost
 is stack headroom in a debug build (release builds were not measured):
 
-16. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
+17. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
     it keeps the unparser's opt-level-0 frame from growing with #233 and #234, which
     without it push the fork's `roundtrip_statement` past the 2 MiB default test
     thread (it needs 2,112 KiB without the refactor, 1,984 KiB with it). This repo's
