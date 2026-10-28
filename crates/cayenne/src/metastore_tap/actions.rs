@@ -16,7 +16,6 @@ limitations under the License.
 
 //! Builds the metastore tap's actions from the catalog's own types.
 
-use cayenne_metastore_actions::ObjRef;
 use cayenne_metastore_actions::proto::{
     self, Action, ColdEntry, DvEntry, FileEntry, FileStat, Select, TableRef, action::Kind,
 };
@@ -79,7 +78,10 @@ pub(crate) fn remove_file_stats(table_id: &str, select: Select, snapshot_ids: &[
     }))
 }
 
-pub(crate) fn set_file_stats(stats: &SnapshotFileStatistics) -> Action {
+pub(crate) fn set_file_stats(
+    catalog: &crate::CayenneCatalog,
+    stats: &SnapshotFileStatistics,
+) -> Action {
     Action::new(Kind::SetFileStats(proto::SetFileStats {
         table_id: stats.table_id.clone(),
         stat: Some(FileStat {
@@ -87,7 +89,7 @@ pub(crate) fn set_file_stats(stats: &SnapshotFileStatistics) -> Action {
             path: stats.file_path.clone(),
             size: stats.file_size_bytes,
             rows: stats.num_rows,
-            blob: Some(ObjRef::of(&stats.statistics_blob)),
+            blob: Some(catalog.tap_blob(&stats.statistics_blob)),
         }),
     }))
 }
@@ -172,7 +174,11 @@ pub(crate) fn clear_table_stats(table_id: &str) -> Action {
     Action::new(Kind::ClearTableStats(table(table_id)))
 }
 
-pub(crate) fn add_cold(table_id: &str, files: &[ColdTierFile]) -> Action {
+pub(crate) fn add_cold(
+    catalog: &crate::CayenneCatalog,
+    table_id: &str,
+    files: &[ColdTierFile],
+) -> Action {
     Action::new(Kind::AddColdFiles(proto::AddColdFiles {
         table_id: table_id.to_string(),
         files: files
@@ -183,8 +189,8 @@ pub(crate) fn add_cold(table_id: &str, files: &[ColdTierFile]) -> Action {
                 size: f.file_size_bytes,
                 min_seq: f.min_sequence,
                 max_seq: f.max_sequence,
-                stats: Some(ObjRef::of(&f.statistics_blob)),
-                bloom: f.pk_bloom.as_deref().map(ObjRef::of),
+                stats: Some(catalog.tap_blob(&f.statistics_blob)),
+                bloom: f.pk_bloom.as_deref().map(|bytes| catalog.tap_blob(bytes)),
             })
             .collect(),
     }))
@@ -198,6 +204,7 @@ pub(crate) fn add_inlined(table_id: &str, data: &InlinedData, id: &str, seq: i64
         payload: data.data_ipc.clone(),
         count: data.record_count,
         seq,
+        created_at: String::new(),
     }))
 }
 
@@ -256,6 +263,7 @@ pub(crate) fn inlined_delete(
     idempotent: bool,
 ) -> Action {
     Action::new(Kind::AddInlinedDelete(proto::InlinedDelete {
+        created_at: String::new(),
         table_id: delete.table_id.clone(),
         id: id.to_string(),
         payload: delete.delete_ipc.clone(),

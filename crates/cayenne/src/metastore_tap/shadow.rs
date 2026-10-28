@@ -51,6 +51,7 @@ pub(super) struct Payload {
     pub enqueued: Instant,
 }
 enum Command {
+    Blob(Bytes),
     Payload(Box<Payload>),
     Verify(oneshot::Sender<(ShadowReport, BTreeMap<String, DatasetState>)>),
 }
@@ -105,6 +106,15 @@ impl Shadow {
             failure(&failures, "thread", e);
         }
         Self { tx, failures }
+    }
+    pub fn blob(&self, bytes: &[u8]) {
+        if self
+            .tx
+            .send(Command::Blob(Bytes::copy_from_slice(bytes)))
+            .is_err()
+        {
+            failure(&self.failures, "channel", "worker stopped");
+        }
     }
     pub fn enqueue(&self, payload: Payload) {
         if self.tx.send(Command::Payload(Box::new(payload))).is_err() {
@@ -200,6 +210,7 @@ async fn run(
     let mut tables = BTreeMap::new();
     let mut failed_tables = BTreeSet::new();
     let mut dropped = false;
+    let mut blobs = BTreeSet::new();
     while let Some(first) = rx.recv().await {
         let mut commands = vec![first];
         // A barrier bounds this drain, including when producers keep writing.
@@ -213,6 +224,18 @@ async fn run(
         let mut barrier = None;
         for command in commands {
             match command {
+                Command::Blob(bytes) => {
+                    let digest = blake3::hash(&bytes).to_hex().to_string();
+                    if !blobs.contains(&digest) {
+                        let path = prefix.clone().join("objects/blobs").join(digest.as_str());
+                        match store.put(&path, bytes.into()).await {
+                            Ok(_) => {
+                                blobs.insert(digest);
+                            }
+                            Err(error) => failure(&failures, "blob", error),
+                        }
+                    }
+                }
                 Command::Payload(p) => queued.entry(p.table.clone()).or_default().push(*p),
                 Command::Verify(tx) => barrier = Some(tx),
             }
@@ -551,7 +574,7 @@ async fn decode_payload(store: &Arc<dyn ObjectStore>, payload: &[u8]) -> Result<
     }
 }
 
-async fn replay(store: Arc<dyn ObjectStore>, prefix: Path) -> Result<DatasetState> {
+pub(super) async fn replay(store: Arc<dyn ObjectStore>, prefix: Path) -> Result<DatasetState> {
     let (_, opened) = Reader::open(Arc::clone(&store), prefix).await?;
     let mut state = DatasetState::default();
     if let Some(root) = opened.checkpoint_root {

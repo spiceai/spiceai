@@ -88,6 +88,7 @@ pub fn state_as_record(s: &TableState, table_id: &str) -> Record {
     }
     for (id, row) in &s.inlined_data {
         actions.push(Action::new(Kind::AddInlinedData(p::InlinedData {
+            created_at: row.created_at.clone(),
             table_id: t(),
             id: id.clone(),
             partition_key: row.partition_key.clone(),
@@ -98,6 +99,7 @@ pub fn state_as_record(s: &TableState, table_id: &str) -> Record {
     }
     for (id, row) in &s.inlined_deletes {
         actions.push(Action::new(Kind::AddInlinedDelete(p::InlinedDelete {
+            created_at: row.created_at.clone(),
             table_id: t(),
             id: id.clone(),
             payload: row.raw_payload.clone(),
@@ -210,6 +212,7 @@ mod tests {
         s.inlined_data.insert(
             "inline".into(),
             Inlined {
+                created_at: String::new(),
                 partition_key: Some("p".into()),
                 payload: ObjRef::of(b"data"),
                 raw_payload: b"data".to_vec(),
@@ -220,6 +223,7 @@ mod tests {
         s.inlined_deletes.insert(
             "del".into(),
             InlinedDel {
+                created_at: String::new(),
                 payload: ObjRef::of(b"del"),
                 raw_payload: b"del".to_vec(),
                 count: 1,

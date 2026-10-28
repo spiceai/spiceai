@@ -44,6 +44,15 @@ async fn workload_with_shadow(
     broken: bool,
     shadow: Option<(Arc<dyn object_store::ObjectStore>, bool)>,
 ) -> TestResult<(TapReport, cayenne::metastore_tap::ShadowReport)> {
+    workload_with_reader(broken, shadow, false).await
+}
+
+async fn workload_with_reader(
+    broken: bool,
+    shadow: Option<(Arc<dyn object_store::ObjectStore>, bool)>,
+    reader_check: bool,
+) -> TestResult<(TapReport, cayenne::metastore_tap::ShadowReport)> {
+    let reader_store = shadow.as_ref().map(|(s, _)| Arc::clone(s));
     let shadow_enabled = shadow.is_some();
     let shadow_negative = shadow.as_ref().is_some_and(|(_, negative)| *negative);
     let dir = tempfile::tempdir()?;
@@ -139,16 +148,47 @@ async fn workload_with_shadow(
     datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
     table.checkpoint_mem_tier().await?;
     table.checkpoint_inlined_data().await?;
+    if reader_check {
+        compare_reader(
+            &catalog,
+            reader_store.as_ref().expect("shadow"),
+            &ctx,
+            "deletes",
+            false,
+        )
+        .await?;
+    }
     drop(compaction_guard);
     assert!(
         table.compact_protected_snapshots_subset(usize::MAX).await?,
         "workload must commit a compaction"
     );
     table.drain_in_flight_maintenance().await?;
+    if reader_check {
+        compare_reader(
+            &catalog,
+            reader_store.as_ref().expect("shadow"),
+            &ctx,
+            "compaction",
+            false,
+        )
+        .await?;
+    }
+
     assert!(
         table.promote_warm_to_cold().await?,
         "workload must promote to cold storage"
     );
+    if reader_check {
+        compare_reader(
+            &catalog,
+            reader_store.as_ref().expect("shadow"),
+            &ctx,
+            "cold",
+            false,
+        )
+        .await?;
+    }
     let count = ctx
         .sql("SELECT COUNT(*) FROM tap_rows")
         .await?
@@ -184,6 +224,16 @@ async fn workload_with_shadow(
             .value(0),
         2
     );
+    if reader_check {
+        compare_reader(
+            &catalog,
+            reader_store.as_ref().expect("shadow"),
+            &ctx,
+            "overwrite",
+            false,
+        )
+        .await?;
+    }
     exercise_catalog(&catalog, &dir.path().join("metadata"), &schema).await?;
     let table_id = catalog.get_table("tap_rows").await?.table_id;
     catalog.reserve_sequence_numbers(&table_id, 1).await?;
@@ -587,5 +637,290 @@ async fn metastore_shadow_detects_dropped_payload() -> TestResult<()> {
         }),
         "negative control: {report:#?}"
     );
+    Ok(())
+}
+
+/// Compare the real SQL-backed provider with an independently opened storage-only
+/// provider. Full rows defeat count-only statistics shortcuts.
+async fn compare_reader(
+    catalog: &CayenneCatalog,
+    store: &Arc<dyn object_store::ObjectStore>,
+    writer: &SessionContext,
+    stage: &str,
+    negative: bool,
+) -> TestResult<()> {
+    use arrow::util::pretty::pretty_format_batches;
+    use cayenne::metastore_tap::reader::ShadowCatalog;
+    let report = catalog.shadow_verify().await;
+    if !negative {
+        assert_shadow_readback(&report);
+    }
+    let shadow = Arc::new(ShadowCatalog::open(Arc::clone(store), "shadow".into()).await?);
+    assert_eq!(shadow.list_table_names().await?, vec!["tap_rows"]);
+    let metadata = shadow.get_table("tap_rows").await?;
+    let error = shadow
+        .reserve_sequence_numbers(&metadata.table_id, 1)
+        .await
+        .expect_err("shadow catalog rejects mutations");
+    assert_eq!(
+        error.to_string(),
+        "Invalid operation: the shadow catalog is read-only"
+    );
+    let reader = SessionContext::new();
+    let table = CayenneTableProviderBuilder::new(shadow, reader.runtime_env())
+        .open("tap_rows")
+        .await?;
+    reader.register_table("tap_rows", Arc::new(table))?;
+    for sql in [
+        "SELECT * FROM tap_rows ORDER BY id, value",
+        "SELECT COUNT(*) FROM tap_rows",
+        "SELECT * FROM tap_rows WHERE id >= 2 ORDER BY id, value",
+    ] {
+        let expected_frame = writer.sql(sql).await?;
+        let actual_frame = reader.sql(sql).await?;
+        assert_eq!(expected_frame.schema(), actual_frame.schema());
+        let expected = expected_frame.collect().await?;
+        let actual = actual_frame.collect().await?;
+        let expected_rows = arrow::compute::concat_batches(&expected[0].schema(), &expected)?;
+        let actual_rows = arrow::compute::concat_batches(&expected[0].schema(), &actual)?;
+        assert!(expected_rows.num_rows() > 0);
+        assert!(actual_rows.num_rows() > 0, "reader must read real files");
+        if negative {
+            println!(
+                "negative control ({stage}): {sql}\nwriter:\n{}\nshadow:\n{}",
+                pretty_format_batches(&expected)?,
+                pretty_format_batches(&actual)?
+            );
+            assert_ne!(
+                expected_rows, actual_rows,
+                "negative control: deleted row must reappear"
+            );
+            let ids = actual_rows
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("ids");
+            assert!(ids.values().contains(&2), "deleted id=2 must reappear");
+            break;
+        }
+        assert_eq!(expected_rows, actual_rows, "reader stage {stage}: {sql}");
+        println!("reader {stage}: {sql}\n{}", pretty_format_batches(&actual)?);
+    }
+    Ok(())
+}
+
+fn assert_shadow_readback(report: &cayenne::metastore_tap::ShadowReport) {
+    assert!(report.differences.is_empty(), "{report:#?}");
+    assert!(report.failures.is_empty(), "{report:#?}");
+}
+
+#[tokio::test]
+async fn metastore_shadow_reader_matches_writer() -> TestResult<()> {
+    let dir = tempfile::tempdir()?;
+    let stores: Vec<Arc<dyn object_store::ObjectStore>> = vec![
+        Arc::new(object_store::memory::InMemory::new()),
+        Arc::new(object_store_occ::LocalConditionalPut::new_durable(
+            dir.path(),
+        )?),
+    ];
+    for store in stores {
+        println!("reader store: {store}");
+        let (_, report) = workload_with_reader(false, Some((store, false)), true).await?;
+        assert_shadow(&report);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn metastore_shadow_reader_detects_dropped_delete() -> TestResult<()> {
+    let dir = tempfile::tempdir()?;
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let tap = Arc::new(
+        MetastoreTap::new(None, true)?
+            .breaking_shadow_of("AddDeleteFiles")
+            .with_shadow(
+                Arc::clone(&store),
+                "shadow".into(),
+                object_store_occ::headlog::HeadLogConfig::default(),
+            ),
+    );
+    let catalog = Arc::new(
+        CayenneCatalog::new(format!(
+            "sqlite://{}",
+            dir.path().join("catalog.db").display()
+        ))?
+        .with_tap(tap),
+    );
+    catalog.init().await?;
+    let ctx = SessionContext::new();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let table = Arc::new(
+        CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+        )
+        .create(CreateTableOptions {
+            table_name: "tap_rows".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: dir.path().join("data").to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                deletion_mode: DeletionMode::Key,
+                inline_max_rows: 0,
+                compaction_background_interval_ms: 0,
+                ..VortexConfig::default()
+            },
+        })
+        .await?,
+    );
+    ctx.register_table("tap_rows", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    let guard = table.hold_compaction().await;
+    common::insert_batch(
+        &table,
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+            ],
+        )?,
+    )
+    .await?;
+    let plan = table
+        .delete_from(&ctx.state(), vec![col("id").eq(lit(2_i64))])
+        .await?;
+    datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    compare_reader(&catalog, &store, &ctx, "dropped AddDeleteFiles", true).await?;
+    drop(guard);
+    Ok(())
+}
+
+#[tokio::test]
+async fn metastore_shadow_reader_inline_and_blobs() -> TestResult<()> {
+    use cayenne::metadata::{InlinedDelete, TableStatistics};
+    use cayenne::metastore_tap::reader::ShadowCatalog;
+    let local = tempfile::tempdir()?;
+    let stores: Vec<Arc<dyn object_store::ObjectStore>> = vec![
+        Arc::new(object_store::memory::InMemory::new()),
+        Arc::new(object_store_occ::LocalConditionalPut::new_durable(
+            local.path(),
+        )?),
+    ];
+    for store in stores {
+        let dir = tempfile::tempdir()?;
+        let tap = Arc::new(MetastoreTap::new(None, true)?.with_shadow(
+            Arc::clone(&store),
+            "shadow".into(),
+            object_store_occ::headlog::HeadLogConfig::default(),
+        ));
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!(
+                "sqlite://{}",
+                dir.path().join("catalog.db").display()
+            ))?
+            .with_tap(tap),
+        );
+        catalog.init().await?;
+        let writer = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, true),
+        ]));
+        let table = Arc::new(
+            CayenneTableProviderBuilder::new(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                writer.runtime_env(),
+            )
+            .create(CreateTableOptions {
+                table_name: "tap_rows".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: dir.path().join("data").to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    compaction_background_interval_ms: 0,
+                    ..VortexConfig::default()
+                },
+            })
+            .await?,
+        );
+        writer.register_table("tap_rows", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+        common::insert_batch(
+            &table,
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2, 3])),
+                    Arc::new(Int64Array::from(vec![Some(10), None, Some(30)])),
+                ],
+            )?,
+        )
+        .await?;
+        let id = catalog.get_table("tap_rows").await?.table_id;
+        assert!(
+            catalog.get_inlined_data_count(&id).await? > 0,
+            "exercise durable inline data"
+        );
+        catalog
+            .add_inlined_delete(InlinedDelete {
+                inlined_id: String::new(),
+                table_id: id.clone(),
+                delete_ipc: vec![9, 8, 7],
+                delete_count: 1,
+                sequence_number: 1,
+                published: false,
+                created_at: String::new(),
+            })
+            .await?;
+        compare_reader(&catalog, &store, &writer, "inline with NULL", false).await?;
+        let shadow = ShadowCatalog::open(Arc::clone(&store), "shadow".into()).await?;
+        let expected = catalog.get_inlined_data(&id).await?;
+        let actual = shadow.get_inlined_data(&id).await?;
+        assert_eq!(expected.len(), actual.len());
+        for (e, a) in expected.iter().zip(&actual) {
+            assert_eq!(e.created_at, a.created_at);
+            assert!(!a.created_at.is_empty());
+            assert_eq!(e.data_ipc, a.data_ipc);
+        }
+        let expected = catalog.get_inlined_deletes(&id).await?;
+        let actual = shadow.get_inlined_deletes(&id).await?;
+        assert_eq!(expected[0].created_at, actual[0].created_at);
+        assert!(!actual[0].created_at.is_empty());
+        assert_eq!(expected[0].delete_ipc, actual[0].delete_ipc);
+        assert!(shadow.get_published_inlined_deletes(&id).await?.is_empty());
+        assert_eq!(
+            catalog.table_storage_stats(&id).await?,
+            shadow.table_storage_stats(&id).await?
+        );
+        // Blob round trips use catalog bytes without requiring them to be valid
+        // optimizer/index formats. No query consumes these synthetic payloads.
+        let bytes = vec![1, 2, 3, 4];
+        catalog.upsert_pk_index(&id, "snapshot", &bytes).await?;
+        catalog
+            .upsert_table_statistics(&TableStatistics {
+                table_id: id.clone(),
+                statistics_blob: bytes.clone(),
+                num_rows: 3,
+                num_rows_exact: false,
+                ndv_sketches: Some(vec![]),
+            })
+            .await?;
+        let _ = catalog.shadow_verify().await;
+        let shadow = ShadowCatalog::open(Arc::clone(&store), "shadow".into()).await?;
+        assert_eq!(
+            catalog.get_pk_index(&id).await?,
+            shadow.get_pk_index(&id).await?
+        );
+        let stats = shadow.get_table_statistics(&id).await?.expect("stats");
+        assert_eq!(stats.statistics_blob, bytes);
+        assert_eq!(stats.ndv_sketches, Some(vec![]));
+        println!("reader inline timestamps, NULL rows, PK/statistics/NDV blobs: {store}");
+    }
     Ok(())
 }

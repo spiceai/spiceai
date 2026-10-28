@@ -62,6 +62,7 @@ pub struct Inlined {
     pub raw_payload: Vec<u8>,
     pub count: i64,
     pub seq: i64,
+    pub created_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +72,7 @@ pub struct InlinedDel {
     pub raw_payload: Vec<u8>,
     pub count: i64,
     pub seq: i64,
+    pub created_at: String,
     pub published: bool,
 }
 
@@ -422,6 +424,7 @@ impl DatasetState {
                         partition_key: a.partition_key.clone(),
                         payload: ObjRef::of(&a.payload),
                         raw_payload: a.payload.clone(),
+                        created_at: a.created_at.clone(),
                         count: a.count,
                         seq: a.seq,
                     },
@@ -455,6 +458,7 @@ impl DatasetState {
                 let entry = InlinedDel {
                     payload: ObjRef::of(&a.payload),
                     raw_payload: a.payload.clone(),
+                    created_at: a.created_at.clone(),
                     count: a.count,
                     seq: a.seq,
                     published: a.published,

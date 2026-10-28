@@ -28,9 +28,9 @@ limitations under the License.
 use prost::Message;
 
 use crate::proto::{
-    self, Action, AddDeleteFiles, AddFiles, AddKeys, ColdEntry, DvEntry, FileEntry, ObjRef,
-    PkSeq, Record, RemoveBySnapshot, RemoveDeleteFiles, Select, SetGroup,
-    SetTableStats, TableRef, action::Kind,
+    self, Action, AddDeleteFiles, AddFiles, AddKeys, ColdEntry, DvEntry, FileEntry, ObjRef, PkSeq,
+    Record, RemoveBySnapshot, RemoveDeleteFiles, Select, SetGroup, SetTableStats, TableRef,
+    action::Kind,
 };
 use crate::state::TableState;
 
@@ -42,7 +42,11 @@ fn payload_of(len: u64) -> Vec<u8> {
 /// and after the SQL transaction.
 #[must_use]
 #[expect(clippy::too_many_lines, reason = "one block per collection")]
-pub fn design_record(table_id: &str, before: Option<&TableState>, after: Option<&TableState>) -> Record {
+pub fn design_record(
+    table_id: &str,
+    before: Option<&TableState>,
+    after: Option<&TableState>,
+) -> Record {
     let empty = TableState::default();
     let old = before.unwrap_or(&empty);
     let new = after.unwrap_or(&empty);
@@ -85,7 +89,10 @@ pub fn design_record(table_id: &str, before: Option<&TableState>, after: Option<
         match old_live.get(path) {
             None => added.push((*entry).clone()),
             Some((old_snapshot, old_entry)) => {
-                let old_group = old.groups.contains_key(*old_snapshot).then_some(*old_snapshot);
+                let old_group = old
+                    .groups
+                    .contains_key(*old_snapshot)
+                    .then_some(*old_snapshot);
                 let new_group = new.groups.contains_key(*snapshot).then_some(*snapshot);
                 if old_entry != entry || old_group != new_group {
                     regrouped += 1;
@@ -177,7 +184,9 @@ pub fn design_record(table_id: &str, before: Option<&TableState>, after: Option<
                 ndv: stats.ndv.clone(),
                 exact: stats.exact,
             }))),
-            None => actions.push(Action::new(Kind::ClearTableStats(TableRef { table_id: t() }))),
+            None => actions.push(Action::new(Kind::ClearTableStats(TableRef {
+                table_id: t(),
+            }))),
         }
     }
 
@@ -189,7 +198,9 @@ pub fn design_record(table_id: &str, before: Option<&TableState>, after: Option<
             .map(|(_, entry)| entry.clone())
             .collect();
         if new.cold.len() < old.cold.len() || files.len() == new.cold.len() {
-            actions.push(Action::new(Kind::ClearColdFiles(TableRef { table_id: t() })));
+            actions.push(Action::new(Kind::ClearColdFiles(TableRef {
+                table_id: t(),
+            })));
         }
         actions.push(Action::new(Kind::AddColdFiles(proto::AddColdFiles {
             table_id: t(),
@@ -205,6 +216,7 @@ pub fn design_record(table_id: &str, before: Option<&TableState>, after: Option<
     for (id, row) in &new.inlined_data {
         if old.inlined_data.get(id) != Some(row) {
             actions.push(Action::new(Kind::AddInlinedData(proto::InlinedData {
+                created_at: row.created_at.clone(),
                 table_id: t(),
                 id: id.clone(),
                 partition_key: row.partition_key.clone(),
@@ -230,6 +242,7 @@ pub fn design_record(table_id: &str, before: Option<&TableState>, after: Option<
     for (id, row) in &new.inlined_deletes {
         if old.inlined_deletes.get(id) != Some(row) {
             actions.push(Action::new(Kind::AddInlinedDelete(proto::InlinedDelete {
+                created_at: row.created_at.clone(),
                 table_id: t(),
                 id: id.clone(),
                 payload: payload_of(row.payload.len),
@@ -247,11 +260,13 @@ pub fn design_record(table_id: &str, before: Option<&TableState>, after: Option<
         .cloned()
         .collect();
     if !gone_tombstones.is_empty() {
-        actions.push(Action::new(Kind::RemoveInlinedDeletes(proto::RemoveInlined {
-            table_id: t(),
-            select: Select::Listed as i32,
-            ids: gone_tombstones,
-        })));
+        actions.push(Action::new(Kind::RemoveInlinedDeletes(
+            proto::RemoveInlined {
+                table_id: t(),
+                select: Select::Listed as i32,
+                ids: gone_tombstones,
+            },
+        )));
     }
 
     let keys = |map: &std::collections::BTreeMap<Vec<u8>, i64>,
@@ -286,10 +301,12 @@ pub fn design_record(table_id: &str, before: Option<&TableState>, after: Option<
         })));
     }
     if new.insert_records.len() < old.insert_records.len() {
-        actions.push(Action::new(Kind::ClearInsertRecords(proto::ClearInsertRecords {
-            table_id: t(),
-            seq_le: Some(0),
-        })));
+        actions.push(Action::new(Kind::ClearInsertRecords(
+            proto::ClearInsertRecords {
+                table_id: t(),
+                seq_le: Some(0),
+            },
+        )));
     }
     // The `seq` high-water mark is maintained by `apply` from record ranges in
     // the design; a per-table range costs about this much.
@@ -318,7 +335,11 @@ pub struct CheckpointSize {
 /// their own length (statistics) or apart (the PK index).
 #[must_use]
 pub fn checkpoint_size(table: &TableState) -> CheckpointSize {
-    let files: Vec<FileEntry> = table.live_files().values().map(|(_, e)| (*e).clone()).collect();
+    let files: Vec<FileEntry> = table
+        .live_files()
+        .values()
+        .map(|(_, e)| (*e).clone())
+        .collect();
     let live = AddFiles {
         table_id: String::new(),
         snapshot_id: String::new(),
@@ -356,7 +377,10 @@ pub fn checkpoint_size(table: &TableState) -> CheckpointSize {
     let live_files = live.encoded_len() as u64;
     let delete_files = dvs.encoded_len() as u64;
     let pk_index = table.pk_index.as_ref().map_or(0, |(_, index)| index.len);
-    let stats = table.stats.as_ref().map_or(0, |s| s.blob.len + s.ndv.as_ref().map_or(0, |n| n.len));
+    let stats = table
+        .stats
+        .as_ref()
+        .map_or(0, |s| s.blob.len + s.ndv.as_ref().map_or(0, |n| n.len));
     CheckpointSize {
         without_pk_index: live_files
             + delete_files

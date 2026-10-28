@@ -418,7 +418,7 @@ impl CayenneCatalog {
         let (mut report, states) = tap.shadow_states().await;
         for (id, state) in states {
             report.verified_tables += 1;
-            let diff = match self.tap_read_table_state(&id).await {
+            let diff = match self.tap_read_table_state(&id, false).await {
                 Ok(sql) => match (sql.as_ref(), state.tables.get(&id)) {
                     (Some(sql), Some(shadow)) => {
                         cayenne_metastore_actions::differences(sql, shadow)
@@ -441,8 +441,15 @@ impl CayenneCatalog {
         self.tap.as_ref()
     }
 
-    /// Runs one autocommit statement of a converted operation: in commit
-    /// order with every other tapped write, and recorded once it succeeds.
+    /// Queue immutable bytes before the action that references them.
+    pub(crate) fn tap_blob(&self, bytes: &[u8]) -> cayenne_metastore_actions::ObjRef {
+        if let Some(tap) = &self.tap {
+            tap.blob(bytes);
+        }
+        cayenne_metastore_actions::ObjRef::of(bytes)
+    }
+
+    /// Runs one autocommit statement of a converted operation in commit order.
     async fn tap_autocommit(
         &self,
         params: ExecuteParams<'_>,
@@ -454,8 +461,12 @@ impl CayenneCatalog {
         };
         let _serial = tap.enter().await;
         self.tap_verify_pending().await;
-        self.metastore.execute_helper(params).await?;
-        tap.commit(vec![(op, build())], Vec::new());
+        let txn = self.metastore.begin_transaction().await?;
+        txn.execute(params).await?;
+        let mut pushed = vec![(op, build())];
+        crate::metastore_tap::capture_inline_timestamps(&mut pushed, txn.as_ref()).await?;
+        txn.commit().await?;
+        tap.commit(pushed, Vec::new());
         Ok(())
     }
 
@@ -552,7 +563,7 @@ impl CayenneCatalog {
                 .await
             {
                 for table_id in ids {
-                    if let Ok(Some(table)) = self.tap_read_table_state(&table_id).await {
+                    if let Ok(Some(table)) = self.tap_read_table_state(&table_id, true).await {
                         tables.push((table_id, table));
                     }
                 }
@@ -569,7 +580,7 @@ impl CayenneCatalog {
         if unknown {
             return;
         }
-        let differences = match self.tap_read_table_state(table_id).await {
+        let differences = match self.tap_read_table_state(table_id, false).await {
             Err(err) => vec![format!("readback failed: {err}")],
             Ok(actual) => match (expected, actual) {
                 (None, None) => Vec::new(),
@@ -587,8 +598,8 @@ impl CayenneCatalog {
     async fn tap_read_table_state(
         &self,
         table_id: &str,
+        capture_blobs: bool,
     ) -> CatalogResult<Option<cayenne_metastore_actions::TableState>> {
-        use cayenne_metastore_actions::ObjRef;
         use cayenne_metastore_actions::proto::{ColdEntry, DvEntry, FileEntry, FileStat};
         use cayenne_metastore_actions::state::{Inlined, InlinedDel, Partition, TableStats};
 
@@ -602,12 +613,14 @@ impl CayenneCatalog {
                           current_sequence_number FROM cayenne_table WHERE table_id = ?1",
                     params: text(),
                 },
-                |row| {
+                {
+                    let tap = if capture_blobs { self.tap.clone() } else { None };
+                    move |row| {
                     Ok(cayenne_metastore_actions::TableState {
                         name: row.get_string(0)?,
                         path: row.get_string(1)?,
                         path_is_relative: row.get_bool(2)?,
-                        schema: Some(ObjRef::of(row.get_string(3)?.as_bytes())),
+                        schema: Some(tap_blob_for(tap.as_deref(), row.get_string(3)?.as_bytes())),
                         primary_key_json: row.get_optional_string(4)?,
                         on_conflict_json: row.get_optional_string(5)?,
                         current_snapshot_id: row.get_string(6)?,
@@ -616,6 +629,7 @@ impl CayenneCatalog {
                         seq: row.get_i64(9)?,
                         ..Default::default()
                     })
+                    }
                 },
             )
             .await?;
@@ -658,14 +672,17 @@ impl CayenneCatalog {
                           FROM cayenne_snapshot_file_statistics WHERE table_id = ?1",
                     params: text(),
                 },
-                |row| {
+                {
+                    let tap = if capture_blobs { self.tap.clone() } else { None };
+                    move |row| {
                     Ok(FileStat {
                         snapshot_id: row.get_string(0)?,
                         path: row.get_string(1)?,
                         size: row.get_i64(2)?,
                         rows: row.get_i64(3)?,
-                        blob: Some(ObjRef::of(&row.get_blob(4)?)),
+                        blob: Some(tap_blob_for(tap.as_deref(), &row.get_blob(4)?)),
                     })
+                    }
                 },
             )
             .await?
@@ -724,17 +741,24 @@ impl CayenneCatalog {
                           FROM cayenne_table_statistics WHERE table_id = ?1",
                     params: text(),
                 },
-                |row| {
-                    let ndv = match row.get_value(2)? {
-                        MetastoreValue::Blob(blob) => Some(ObjRef::of(&blob)),
-                        _ => None,
+                {
+                    let tap = if capture_blobs {
+                        self.tap.clone()
+                    } else {
+                        None
                     };
-                    Ok(TableStats {
-                        blob: ObjRef::of(&row.get_blob(0)?),
-                        num_rows: row.get_i64(1)?,
-                        ndv,
-                        exact: row.get_bool(3)?,
-                    })
+                    move |row| {
+                        let ndv = match row.get_value(2)? {
+                            MetastoreValue::Blob(blob) => Some(tap_blob_for(tap.as_deref(), &blob)),
+                            _ => None,
+                        };
+                        Ok(TableStats {
+                            blob: tap_blob_for(tap.as_deref(), &row.get_blob(0)?),
+                            num_rows: row.get_i64(1)?,
+                            ndv,
+                            exact: row.get_bool(3)?,
+                        })
+                    }
                 },
             )
             .await?
@@ -749,9 +773,11 @@ impl CayenneCatalog {
                           statistics_blob, pk_bloom_blob FROM cayenne_cold_tier_file WHERE table_id = ?1",
                     params: text(),
                 },
-                |row| {
+                {
+                    let tap = if capture_blobs { self.tap.clone() } else { None };
+                    move |row| {
                     let bloom = match row.get_value(6)? {
-                        MetastoreValue::Blob(blob) => Some(ObjRef::of(&blob)),
+                        MetastoreValue::Blob(blob) => Some(tap_blob_for(tap.as_deref(), &blob)),
                         _ => None,
                     };
                     Ok(ColdEntry {
@@ -760,9 +786,10 @@ impl CayenneCatalog {
                         size: row.get_i64(2)?,
                         min_seq: row.get_i64(3)?,
                         max_seq: row.get_i64(4)?,
-                        stats: Some(ObjRef::of(&row.get_blob(5)?)),
+                        stats: Some(tap_blob_for(tap.as_deref(), &row.get_blob(5)?)),
                         bloom,
                     })
+                    }
                 },
             )
             .await?
@@ -777,7 +804,19 @@ impl CayenneCatalog {
                     sql: "SELECT snapshot_id, index_blob FROM cayenne_pk_index WHERE table_id = ?1",
                     params: text(),
                 },
-                |row| Ok((row.get_string(0)?, ObjRef::of(&row.get_blob(1)?))),
+                {
+                    let tap = if capture_blobs {
+                        self.tap.clone()
+                    } else {
+                        None
+                    };
+                    move |row| {
+                        Ok((
+                            row.get_string(0)?,
+                            tap_blob_for(tap.as_deref(), &row.get_blob(1)?),
+                        ))
+                    }
+                },
             )
             .await?
             .into_iter()
@@ -808,21 +847,25 @@ impl CayenneCatalog {
             .metastore
             .query_helper(
                 QueryParams {
-                    sql: "SELECT inlined_id, partition_key, data_ipc, record_count, sequence_number \
+                    sql: "SELECT inlined_id, partition_key, data_ipc, record_count, sequence_number, created_at \
                           FROM cayenne_inlined_data WHERE table_id = ?1",
                     params: text(),
                 },
-                |row| {
+                {
+                    let tap = if capture_blobs { self.tap.clone() } else { None };
+                    move |row| {
                     Ok((
                         row.get_string(0)?,
                         Inlined {
+created_at: row.get_string(5)?,
                             partition_key: row.get_optional_string(1)?,
-                            payload: ObjRef::of(&row.get_blob(2)?),
+                            payload: tap_blob_for(tap.as_deref(), &row.get_blob(2)?),
                             raw_payload: row.get_blob(2)?,
                             count: row.get_i64(3)?,
                             seq: row.get_i64(4)?,
                         },
                     ))
+                    }
                 },
             )
             .await?
@@ -833,21 +876,25 @@ impl CayenneCatalog {
             .metastore
             .query_helper(
                 QueryParams {
-                    sql: "SELECT inlined_id, delete_ipc, delete_count, sequence_number, published \
+                    sql: "SELECT inlined_id, delete_ipc, delete_count, sequence_number, published, created_at \
                           FROM cayenne_inlined_delete WHERE table_id = ?1",
                     params: text(),
                 },
-                |row| {
-                    Ok((
-                        row.get_string(0)?,
-                        InlinedDel {
-                            payload: ObjRef::of(&row.get_blob(1)?),
-                            raw_payload: row.get_blob(1)?,
-                            count: row.get_i64(2)?,
-                            seq: row.get_i64(3)?,
-                            published: row.get_bool(4)?,
-                        },
-                    ))
+                {
+                    let tap = if capture_blobs { self.tap.clone() } else { None };
+                    move |row| {
+                        Ok((
+                            row.get_string(0)?,
+                            InlinedDel {
+created_at: row.get_string(5)?,
+                                payload: tap_blob_for(tap.as_deref(), &row.get_blob(1)?),
+                                raw_payload: row.get_blob(1)?,
+                                count: row.get_i64(2)?,
+                                seq: row.get_i64(3)?,
+                                published: row.get_bool(4)?,
+                            },
+                        ))
+                    }
                 },
             )
             .await?
@@ -960,9 +1007,7 @@ impl CayenneCatalog {
             cayenne_metastore_actions::Action::new(cayenne_metastore_actions::Kind::SetSchema(
                 cayenne_metastore_actions::proto::SetSchema {
                     table_id: table_id.to_string(),
-                    schema: Some(cayenne_metastore_actions::ObjRef::of(
-                        schema_json.as_bytes(),
-                    )),
+                    schema: Some(self.tap_blob(schema_json.as_bytes())),
                 },
             ));
         if !drop_statistics {
@@ -1251,6 +1296,7 @@ impl CayenneCatalog {
                 actions.push(cayenne_metastore_actions::Action::new(
                     cayenne_metastore_actions::Kind::AddInlinedDelete(
                         cayenne_metastore_actions::proto::InlinedDelete {
+                            created_at: String::new(),
                             table_id: tombstone.table_id.clone(),
                             id: tombstone.inlined_id.clone(),
                             payload: tombstone.delete_ipc.clone(),
@@ -1959,7 +2005,7 @@ impl CayenneCatalog {
             .await?;
         }
         crate::metastore_tap::push(&*txn, "commit_overwrite_to_cold", || {
-            vec![tap::add_cold(table_id, cold_files)]
+            vec![tap::add_cold(self, table_id, cold_files)]
         });
         Ok(())
     }
@@ -3358,7 +3404,10 @@ impl MetadataCatalog for CayenneCatalog {
                 .join("cayenne-metastore-tap")
                 .join(format!("shadow-verify-{}.txt", std::process::id()));
             if let Err(e) = std::fs::write(&path, format!("{report:#?}\n")) {
-                tracing::warn!("Failed to write the metastore shadow report to '{}': {e}", path.display());
+                tracing::warn!(
+                    "Failed to write the metastore shadow report to '{}': {e}",
+                    path.display()
+                );
             }
         }
         Ok(())
@@ -3516,9 +3565,7 @@ impl MetadataCatalog for CayenneCatalog {
             name: table_name.clone(),
             path: base_path.clone(),
             path_is_relative: false,
-            schema: Some(cayenne_metastore_actions::ObjRef::of(
-                schema_json.as_bytes(),
-            )),
+            schema: Some(self.tap_blob(schema_json.as_bytes())),
             primary_key_json: primary_key_json.clone(),
             on_conflict_json: on_conflict_json.clone(),
             partition_column: partition_column.clone(),
@@ -5051,14 +5098,12 @@ impl MetadataCatalog for CayenneCatalog {
                     cayenne_metastore_actions::Kind::SetTableStats(
                         cayenne_metastore_actions::proto::SetTableStats {
                             table_id: stats.table_id.clone(),
-                            blob: Some(cayenne_metastore_actions::ObjRef::of(
-                                &stats.statistics_blob,
-                            )),
+                            blob: Some(self.tap_blob(&stats.statistics_blob)),
                             num_rows: stats.num_rows,
                             ndv: stats
                                 .ndv_sketches
                                 .as_deref()
-                                .map(cayenne_metastore_actions::ObjRef::of),
+                                .map(|bytes| self.tap_blob(bytes)),
                             exact: stats.num_rows_exact,
                         },
                     ),
@@ -5126,7 +5171,7 @@ impl MetadataCatalog for CayenneCatalog {
                 ],
             },
             "upsert_snapshot_file_statistics",
-            || vec![tap::set_file_stats(stats)],
+            || vec![tap::set_file_stats(self, stats)],
         )
         .await
     }
@@ -5514,7 +5559,7 @@ impl MetadataCatalog for CayenneCatalog {
                         cayenne_metastore_actions::proto::SetPkIndex {
                             table_id: table_id.to_string(),
                             snapshot_id: snapshot_id.to_string(),
-                            index: Some(cayenne_metastore_actions::ObjRef::of(index_blob)),
+                            index: Some(self.tap_blob(index_blob)),
                         },
                     ),
                 )]
@@ -6978,7 +7023,9 @@ fn sql_text_literal(value: &str) -> String {
 ///
 /// It hands back the declaration as it is stored, without the map-layout repair `get_table`
 /// applies on top, so a caller that needs to know what is actually on disk can ask.
-fn deserialize_schema_ipc_base64(schema_json: &str) -> CatalogResult<arrow_schema::Schema> {
+pub(crate) fn deserialize_schema_ipc_base64(
+    schema_json: &str,
+) -> CatalogResult<arrow_schema::Schema> {
     use base64::Engine;
     use bytes::Bytes;
 
@@ -7613,6 +7660,16 @@ fn log_runtime_footer_cache_drift(
             "Cayenne table was registered with a different runtime.params.cayenne_footer_cache_mb than the value stored in the metastore; using the current runtime value"
         );
     }
+}
+
+fn tap_blob_for(
+    tap: Option<&crate::metastore_tap::MetastoreTap>,
+    bytes: &[u8],
+) -> cayenne_metastore_actions::ObjRef {
+    if let Some(tap) = tap {
+        tap.blob(bytes);
+    }
+    cayenne_metastore_actions::ObjRef::of(bytes)
 }
 
 #[cfg(test)]

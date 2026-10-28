@@ -344,6 +344,8 @@ pub struct InlinedData {
     pub count: i64,
     #[prost(int64, tag = "6")]
     pub seq: i64,
+    #[prost(string, tag = "7")]
+    pub created_at: String,
 }
 
 #[derive(Clone, PartialEq, Eq, prost::Message)]
@@ -388,6 +390,8 @@ pub struct InlinedDelete {
     /// An identical existing entry is a no-op; a different one is an error.
     #[prost(bool, tag = "7")]
     pub idempotent: bool,
+    #[prost(string, tag = "8")]
+    pub created_at: String,
 }
 
 #[derive(Clone, PartialEq, Eq, prost::Message)]

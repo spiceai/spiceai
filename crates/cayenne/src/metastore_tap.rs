@@ -41,6 +41,7 @@ use parking_lot::Mutex;
 use prost::Message as _;
 
 mod counting;
+pub mod reader;
 mod shadow;
 pub use shadow::ShadowReport;
 
@@ -187,6 +188,12 @@ impl MetastoreTap {
     pub fn breaking_shadow_of(mut self, kind: &'static str) -> Self {
         self.shadow_drop = Some(kind);
         self
+    }
+
+    pub(crate) fn blob(&self, bytes: &[u8]) {
+        if let Some(shadow) = &self.shadow {
+            shadow.blob(bytes);
+        }
     }
 
     pub(crate) async fn shadow_states(&self) -> (ShadowReport, BTreeMap<String, DatasetState>) {
@@ -463,11 +470,10 @@ impl MetastoreTransaction for TappedTxn {
             txn,
             _serial,
         } = *self;
+        let mut pushed = txn.pushed.into_inner();
+        capture_inline_timestamps(&mut pushed, inner.as_ref()).await?;
         inner.commit().await?;
-        tap.commit(
-            txn.pushed.into_inner(),
-            txn.mutating_statements.into_inner(),
-        );
+        tap.commit(pushed, txn.mutating_statements.into_inner());
         drop(_serial);
         Ok(())
     }
@@ -579,4 +585,46 @@ impl MetastoreTap {
             }
         }
     }
+}
+
+/// Read SQL-generated timestamps while the committing transaction still owns its rows.
+pub(crate) async fn capture_inline_timestamps(
+    pushed: &mut [(&'static str, Vec<Action>)],
+    txn: &dyn MetastoreTransaction,
+) -> CatalogResult<()> {
+    for (_, actions) in pushed {
+        for action in actions {
+            let (table, id, created_at, sql) = match action.kind.as_mut() {
+                Some(cayenne_metastore_actions::Kind::AddInlinedData(a)) => (
+                    &a.table_id,
+                    &a.id,
+                    &mut a.created_at,
+                    "SELECT COALESCE((SELECT created_at FROM cayenne_inlined_data WHERE table_id = ?1 AND inlined_id = ?2), '')",
+                ),
+                Some(cayenne_metastore_actions::Kind::AddInlinedDelete(a)) => (
+                    &a.table_id,
+                    &a.id,
+                    &mut a.created_at,
+                    "SELECT COALESCE((SELECT created_at FROM cayenne_inlined_delete WHERE table_id = ?1 AND inlined_id = ?2), '')",
+                ),
+                _ => continue,
+            };
+            let values = txn
+                .query_row_values(QueryRowParams {
+                    sql,
+                    params: vec![
+                        MetastoreValue::Text(table.clone()),
+                        MetastoreValue::Text(id.clone()),
+                    ],
+                })
+                .await?;
+            let Some(MetastoreValue::Text(timestamp)) = values.into_iter().next() else {
+                return Err(crate::catalog::CatalogError::InvalidOperationNoSource {
+                    message: "inline timestamp is not text".to_string(),
+                });
+            };
+            *created_at = timestamp;
+        }
+    }
+    Ok(())
 }
