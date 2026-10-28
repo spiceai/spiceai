@@ -1428,10 +1428,7 @@ mod tests {
             ],
         )
         .expect("record batch");
-        let digits = [
-            "99999999999999999999999999999999999999",
-            "12345678901234567.89",
-        ];
+        let row = r#"{"d38":99999999999999999999999999999999999999,"d19":12345678901234567.89}"#;
 
         for (format, buffered) in streamed_formats() {
             let buffered = buffered(std::slice::from_ref(&batch)).expect("buffered body");
@@ -1449,11 +1446,17 @@ mod tests {
             let streamed = String::from_utf8(streamed.to_vec()).expect("utf8");
 
             for body in [&buffered, &streamed] {
-                for value in digits {
-                    assert!(
-                        body.contains(value),
-                        "{format:?}: `{value}` must appear exactly in `{body}`"
-                    );
+                match format {
+                    ResponseMimeType::Json => assert_eq!(*body, format!("[{row}]")),
+                    ResponseMimeType::VndSqlJsonV1 => assert!(
+                        body.ends_with(&format!(r#","data":[{row}],"row_count":1}}"#)),
+                        "{format:?}: `{body}` must end with the exact rows and row count"
+                    ),
+                    ResponseMimeType::Csv => assert_eq!(
+                        *body,
+                        "d38,d19\n99999999999999999999999999999999999999,12345678901234567.89\n"
+                    ),
+                    other => panic!("{other:?} is not a streamed format"),
                 }
             }
         }
