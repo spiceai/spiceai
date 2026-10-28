@@ -3,6 +3,9 @@
 
 //! GC-observer monotonic lapse and delayed reads of immutable snapshots.
 use stateright::{Model, Property};
+/// Ticks a pin stays live after it is written or renewed. Two ticks leave room
+/// for a renewal before the deadline that moves the deadline later.
+const LEASE: usize = 2;
 #[derive(Clone, Debug)]
 pub(crate) struct Protocol {
     mode: String,
@@ -21,6 +24,7 @@ pub(crate) struct State {
     result: Option<Result<Vec<usize>, ()>>,
     transaction: Option<usize>,
     pin: Option<usize>,
+    renewed_from: Option<usize>,
     ended: bool,
     read_transaction: Option<usize>,
     paused: bool,
@@ -77,10 +81,10 @@ impl Model for Protocol {
         if s.floor < s.commit {
             a.push(Action::Floor);
         }
-        if !self.has("transaction") && s.clock < 2 {
+        if !self.has("transaction") && s.clock < 3 {
             a.push(Action::Tick);
         }
-        if s.pin.is_some() && s.clock < s.expires && s.expires < 3 {
+        if s.pin.is_some() && s.clock < s.expires && s.renewed_from.is_none() {
             a.push(Action::Renew);
         }
         let keep: Vec<_> = (self.low(s)..=s.commit).flat_map(Self::refs).collect();
@@ -109,7 +113,7 @@ impl Model for Protocol {
         match a {
             Action::Begin => {
                 n.pin = Some(s.commit);
-                n.expires = s.clock + 1;
+                n.expires = s.clock + LEASE;
                 if self.has("transaction") {
                     n.transaction = Some(s.commit);
                 } else {
@@ -128,7 +132,10 @@ impl Model for Protocol {
                 n.clock += 1;
                 n.paused |= s.cursor > 0 && s.result.is_none();
             }
-            Action::Renew => n.expires = s.clock + 1,
+            Action::Renew => {
+                n.renewed_from = Some(s.expires);
+                n.expires = s.clock + LEASE;
+            }
             Action::Collect(id) => n.present[id] = false,
             Action::Read => {
                 if let Some(begin) = s.transaction {
@@ -200,6 +207,16 @@ impl Model for Protocol {
                 Property::sometimes("expired read without head recheck", |_, s: &State| {
                     s.unchecked
                 }),
+                Property::sometimes(
+                    "renewed pin protects its snapshot past the first deadline",
+                    |_, s: &State| {
+                        s.renewed_from.is_some_and(|first| s.clock >= first)
+                            && s.clock < s.expires
+                            && s.query.is_some_and(|v| {
+                                s.floor > v && Self::refs(v).iter().all(|&id| s.present[id])
+                            })
+                    },
+                ),
             ]
         }
     }
