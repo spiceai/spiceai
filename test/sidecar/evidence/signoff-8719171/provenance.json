@@ -1,0 +1,10 @@
+{
+  "date": "2026-10-28",
+  "source_commit": "871917136cd9725e2351f4968a5bb8d7df6c558a",
+  "command": "env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ CARGO_TARGET_DIR=/Users/Code/dev/spiceai/target CARGO_BUILD_JOBS=4 LIBRARY_PATH=/tmp/spice-sidecar-deps/odbc/lib SIGNOFF_SKIP_TARGETED_LINT=1 SIGNOFF_SKIP_TARGETED_TESTS=1 make signoff",
+  "exit_code": 0,
+  "summary": "17878 passed, one after retry, 167 skipped",
+  "suite_seconds": 833.06,
+  "odbc_probe_stdout": "SQLAllocHandle=0\nSQLFreeHandle=0\n",
+  "odbc_probe_exit_code": 0
+}

@@ -1,0 +1,290 @@
+[
+  {
+    "attempt": 0,
+    "exit_code": 101,
+    "wall_seconds": 0.32209095801226795,
+    "registration_assertion": true
+  },
+  {
+    "attempt": 1,
+    "exit_code": 0,
+    "wall_seconds": 0.26498616696335375,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 2,
+    "exit_code": 0,
+    "wall_seconds": 0.2746948329731822,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 3,
+    "exit_code": 0,
+    "wall_seconds": 0.2684402500744909,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 4,
+    "exit_code": 0,
+    "wall_seconds": 0.26858145906589925,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 5,
+    "exit_code": 0,
+    "wall_seconds": 0.2638702909462154,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 6,
+    "exit_code": 0,
+    "wall_seconds": 0.26873816596344113,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 7,
+    "exit_code": 0,
+    "wall_seconds": 0.2685621250420809,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 8,
+    "exit_code": 0,
+    "wall_seconds": 0.24363425001502037,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 9,
+    "exit_code": 0,
+    "wall_seconds": 0.24445145798381418,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 10,
+    "exit_code": 0,
+    "wall_seconds": 0.24700295797083527,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 11,
+    "exit_code": 0,
+    "wall_seconds": 0.2455224160803482,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 12,
+    "exit_code": 0,
+    "wall_seconds": 0.24589949997607619,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 13,
+    "exit_code": 101,
+    "wall_seconds": 0.2977279160404578,
+    "registration_assertion": true
+  },
+  {
+    "attempt": 14,
+    "exit_code": 0,
+    "wall_seconds": 0.24202754104044288,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 15,
+    "exit_code": 0,
+    "wall_seconds": 0.24226995802018791,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 16,
+    "exit_code": 0,
+    "wall_seconds": 0.24279191705863923,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 17,
+    "exit_code": 0,
+    "wall_seconds": 0.24013779207598418,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 18,
+    "exit_code": 0,
+    "wall_seconds": 0.24504270893521607,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 19,
+    "exit_code": 0,
+    "wall_seconds": 0.24731808295473456,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 20,
+    "exit_code": 0,
+    "wall_seconds": 0.24460641597397625,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 21,
+    "exit_code": 0,
+    "wall_seconds": 0.24250741605646908,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 22,
+    "exit_code": 0,
+    "wall_seconds": 0.24240704206749797,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 23,
+    "exit_code": 0,
+    "wall_seconds": 0.2411336669465527,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 24,
+    "exit_code": 0,
+    "wall_seconds": 0.2469056670088321,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 25,
+    "exit_code": 0,
+    "wall_seconds": 0.23880920791998506,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 26,
+    "exit_code": 0,
+    "wall_seconds": 0.24798504204954952,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 27,
+    "exit_code": 0,
+    "wall_seconds": 0.24240195797756314,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 28,
+    "exit_code": 0,
+    "wall_seconds": 0.2431844590464607,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 29,
+    "exit_code": 0,
+    "wall_seconds": 0.24445345893036574,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 30,
+    "exit_code": 0,
+    "wall_seconds": 0.24090387497562915,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 31,
+    "exit_code": 0,
+    "wall_seconds": 0.2375542080262676,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 32,
+    "exit_code": 0,
+    "wall_seconds": 0.2376984580187127,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 33,
+    "exit_code": 0,
+    "wall_seconds": 0.25293695798609406,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 34,
+    "exit_code": 0,
+    "wall_seconds": 0.2412449170369655,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 35,
+    "exit_code": 0,
+    "wall_seconds": 0.25277325010392815,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 36,
+    "exit_code": 0,
+    "wall_seconds": 0.24620995903387666,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 37,
+    "exit_code": 0,
+    "wall_seconds": 0.2465350420679897,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 38,
+    "exit_code": 0,
+    "wall_seconds": 0.24268754094373435,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 39,
+    "exit_code": 0,
+    "wall_seconds": 0.23831266700290143,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 40,
+    "exit_code": 0,
+    "wall_seconds": 0.24395366699900478,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 41,
+    "exit_code": 0,
+    "wall_seconds": 0.2523377500474453,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 42,
+    "exit_code": 101,
+    "wall_seconds": 0.3109782909741625,
+    "registration_assertion": true
+  },
+  {
+    "attempt": 43,
+    "exit_code": 0,
+    "wall_seconds": 0.2403199999826029,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 44,
+    "exit_code": 0,
+    "wall_seconds": 0.25041362503543496,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 45,
+    "exit_code": 101,
+    "wall_seconds": 0.2983211249811575,
+    "registration_assertion": true
+  },
+  {
+    "attempt": 46,
+    "exit_code": 0,
+    "wall_seconds": 0.24517016706522554,
+    "registration_assertion": false
+  },
+  {
+    "attempt": 47,
+    "exit_code": 0,
+    "wall_seconds": 0.24461204197723418,
+    "registration_assertion": false
+  }
+]

@@ -518,3 +518,28 @@ test-only SDK trace exporter. Its [complete output](evidence/signoff-9499820)
 is retained. The exporter now returns `std::future::ready`; the full gate must
 be rerun on the new pushed commit. The native runtime implementation and
 measured binaries are unchanged by this test-fixture correction.
+
+With the local ODBC dependency available, the full gate on
+`871917136cd9725e2351f4968a5bb8d7df6c558a` completed:
+`17878 tests run: 17878 passed (3 slow, 1 flaky), 167 skipped`, in 833.060s.
+The quoted `flaky` label is nextest's retry classification; the executor-idle
+test failed its registration assertion on its first attempt and passed on its
+second. CLI verification reported `spice 2.5.0-unstable`, and the sign-off status
+was read back successfully. The [full output and dependency repair](evidence/signoff-8719171)
+retain both the missing-ODBC link failure and the completed gate. The separate
+Databricks semaphore test passed on its first attempt in this run; that does not
+establish the cause of its earlier failure.
+
+The executor-idle failure was then reproduced with the already-built runtime
+test binary: 48 runs at eight concurrent processes produced 44 passes and four
+failures at `the executor registers`, with no other failure. The
+[probe, commands, binary hash and every output](evidence/idle-before-8719171)
+are retained. The fixture uses real loopback gRPC, but its clock starts paused;
+its five-second registration wait can advance in virtual time while socket
+readiness depends on the operating system. A Spicepod cannot control Tokio's
+test clock, so this reproduction uses the native test binary.
+
+The fixture now observes registration on real time, pauses time for the idle
+timeout and registry removal, then resumes real time for the gRPC stream's EOF.
+Its sender remains open, preserving the idle-connection assertion. The same
+48-run probe and full sign-off are required on the corrected fixture.

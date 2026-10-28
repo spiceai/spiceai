@@ -2551,7 +2551,7 @@ mod tests {
     /// An executor that sends nothing for longer than the idle timeout, while its connection
     /// stays open (its process paused), is unregistered and its control stream ends, so it
     /// reconnects when it resumes.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn the_control_stream_of_an_idle_executor_ends() {
         use runtime_proto::{ExecutorControlMessage, ExecutorHeartbeat};
 
@@ -2578,11 +2578,16 @@ mod tests {
             "the executor registers"
         );
 
+        // Real socket readiness must establish registration before virtual time
+        // advances; otherwise the registration wait can expire ahead of TCP I/O.
+        tokio::time::pause();
         tokio::time::sleep(CONTROL_STREAM_IDLE_TIMEOUT).await;
         assert!(
             eventually(async || registry.connected_executors().await.is_empty()).await,
             "the idle executor is unregistered"
         );
+        // Receiving the end of the gRPC stream also requires real socket I/O.
+        tokio::time::resume();
         let end = tokio::time::timeout(std::time::Duration::from_secs(5), inbound.next()).await;
         assert!(
             matches!(end, Ok(None)),
