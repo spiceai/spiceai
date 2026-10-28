@@ -26,6 +26,8 @@ serde_json.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The compressed-message guard tests encode and decode compressed batches.
+arrow-ipc = { workspace = true, features = ["lz4", "zstd"] }
 insta = {workspace = true, features = ["json"]}
 arrow-json.workspace = true
 criterion = { version = "0.7", features = ["html_reports"] }
