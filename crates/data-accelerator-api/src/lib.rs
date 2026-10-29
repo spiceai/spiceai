@@ -60,6 +60,7 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
 pub mod keep_first;
+pub mod pk_write_guard;
 pub mod snapshots;
 pub mod storage;
 pub mod swappable;

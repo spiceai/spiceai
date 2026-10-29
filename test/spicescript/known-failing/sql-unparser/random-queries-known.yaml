@@ -1,9 +1,6 @@
-# Known failing (#15538): random-queries without steering clear of the known defects
-# (`(NOT x) IS NULL` unparsed without parentheses, groupings unparsed without
-# their aggregation when none of their aggregates is read, DuckDB before 1.5
-# losing rows of nested UNION ALL, MySQL collation and NULLS LAST). Every
-# place except Arrow and Cayenne is expected to fail; the failing queries are
-# written next to each instance's log.
+# Known failures in nested queries (#15538), including DuckDB nested UNION ALL,
+# MySQL collation and NULL ordering, and the remaining DataFusion type and
+# grouping defects. Failing queries are saved beside each instance's log.
 name: random-queries-known
 description: >
   Random queries over nested subqueries (filters, groupings, DISTINCT,

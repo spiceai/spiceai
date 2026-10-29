@@ -447,10 +447,7 @@ pub async fn apply_function_diff(
     new_app: &Arc<app::App>,
 ) {
     if apply_function_diff_inner(runtime, current_app, new_app).await {
-        runtime.df.clear_cached_plans().await;
-        if let Some(results) = runtime.df.results_cache_provider() {
-            results.invalidate_all().await;
-        }
+        runtime.df.clear_cached_plans_and_results().await;
     }
 }
 
@@ -759,6 +756,9 @@ mod deny_list_registration_tests {
             runtime_decide::AI_CLASSIFY_NAME,
             runtime_decide::AI_SCORE_NAME,
             runtime_decide::AI_DECIDE_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_ADD_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUB_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_MUL_UDF_NAME,
         ]
         .iter()
         .map(ToString::to_string)
@@ -1034,6 +1034,21 @@ mod tests {
     /// The no-arg probe, for a name answered by name alone.
     fn make_named_expr(name: &str) -> Expr {
         make_named_call(name, vec![])
+    }
+
+    #[test]
+    fn deny_list_blocks_checked_integer_helpers() {
+        let support = deny_spice_specific_functions();
+        for name in [
+            runtime_datafusion::checked_arithmetic::CHECKED_ADD_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_SUB_UDF_NAME,
+            runtime_datafusion::checked_arithmetic::CHECKED_MUL_UDF_NAME,
+        ] {
+            assert!(
+                !support.supports(&make_named_expr(name), None),
+                "{name} must stay local; remotes do not implement the checked kernels"
+            );
+        }
     }
 
     #[test]
