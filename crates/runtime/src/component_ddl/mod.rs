@@ -723,12 +723,7 @@ impl Runtime {
                 }
                 Ok(()) => {}
                 Err(e) => {
-                    cause.get_or_insert_with(|| {
-                        format!(
-                            "the acceleration data of dataset {} could not be deleted. Cause: {e}",
-                            display_dataset_name(&dataset.name)
-                        )
-                    });
+                    cause.get_or_insert_with(|| deletion_failed(&dataset.name, &e));
                     withheld.push(dataset);
                 }
             }
@@ -844,12 +839,7 @@ impl Runtime {
                     .await
             };
             if let Err(e) = deleted {
-                cause.get_or_insert_with(|| {
-                    format!(
-                        "the acceleration data of dataset {} could not be deleted. Cause: {e}",
-                        display_dataset_name(&dataset.name)
-                    )
-                });
+                cause.get_or_insert_with(|| deletion_failed(&dataset.name, &e));
                 withheld.push(dataset);
             }
         }
@@ -1149,23 +1139,20 @@ impl Runtime {
                 .delete_acceleration_data(dataset, served)
                 .await
             {
-                let failed = format!(
-                    "the acceleration data of dataset {} could not be deleted. Cause: {e}",
-                    display_dataset_name(&dataset.name)
-                );
                 if matches!(on_undeleted, OnUndeleted::ServeEarlier) {
                     Arc::clone(self)
                         .apply_app_diff(Some(&without_app), Arc::clone(served))
                         .await;
+                    let still_served = served
+                        .datasets
+                        .iter()
+                        .any(|now| same_dataset(&now.name, &dataset.name));
                     return Err(ServeFailure {
-                        cause: format!(
-                            "the acceleration data of dataset {} could not be deleted, so it is still served, with that data; run the statement again once the cause is fixed. Cause: {e}",
-                            display_dataset_name(&dataset.name)
-                        ),
+                        cause: undeleted_by_statement(&dataset.name, still_served, &e),
                         unserved: Vec::new(),
                     });
                 }
-                cause.get_or_insert(failed);
+                cause.get_or_insert_with(|| deletion_failed(&dataset.name, &e));
                 if !undeleted
                     .iter()
                     .any(|name| same_dataset(name, &dataset.name))
@@ -1813,10 +1800,38 @@ fn withholds(op: &ComponentDdlOp, failure: &ServeFailure) -> bool {
 /// applied.
 fn withheld_dataset(dataset: &str, cause: &str) -> String {
     format!(
-        "this instance does not serve dataset {} until it deletes the acceleration data an earlier definition of it left, which another instance dropped or replaced; Spice retries every {} seconds, so run the statement again once it has. Cause: {cause}",
+        "this instance does not serve dataset {} until it deletes the acceleration data an earlier definition of it left; Spice retries every {} seconds, so run the statement again once it has. Cause: {cause}",
         display_dataset_name(dataset),
         SQL_DEFINITIONS_CHECK_INTERVAL.as_secs()
     )
+}
+
+/// That the acceleration data of `dataset` could not be deleted, because of
+/// `error`.
+fn deletion_failed(dataset: &str, error: impl std::fmt::Display) -> String {
+    format!(
+        "the acceleration data of dataset {} could not be deleted. Cause: {error}",
+        display_dataset_name(dataset)
+    )
+}
+
+/// Why a statement that retires `dataset` was not applied when its
+/// acceleration data could not be deleted, because of `error`: the dataset is
+/// served as before, with that data, or, when this instance withholds it,
+/// still not served.
+fn undeleted_by_statement(
+    dataset: &str,
+    still_served: bool,
+    error: impl std::fmt::Display,
+) -> String {
+    if still_served {
+        format!(
+            "the acceleration data of dataset {} could not be deleted, so it is still served, with that data; run the statement again once the cause is fixed. Cause: {error}",
+            display_dataset_name(dataset)
+        )
+    } else {
+        withheld_dataset(dataset, &deletion_failed(dataset, error))
+    }
 }
 
 /// `names`, each once, as a message shows a dataset's name.
@@ -2162,9 +2177,9 @@ mod tests {
         assert_eq!(
             withheld_dataset(
                 "orders",
-                "the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
+                &deletion_failed("orders", "Permission denied (os error 13)")
             ),
-            "this instance does not serve dataset 'orders' until it deletes the acceleration data an earlier definition of it left, which another instance dropped or replaced; Spice retries every 10 seconds, so run the statement again once it has. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
+            "this instance does not serve dataset 'orders' until it deletes the acceleration data an earlier definition of it left; Spice retries every 10 seconds, so run the statement again once it has. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
         );
         let orders = Dataset::new("file:orders.csv", "orders");
         assert_eq!(
@@ -2174,6 +2189,21 @@ mod tests {
         assert_eq!(
             withheld_deleted(&[orders, Dataset::new("file:c.csv", "sales.customers")]),
             "Deleted the earlier acceleration data of datasets 'orders', 'sales.customers' and applied the change to them."
+        );
+    }
+
+    /// A statement whose dataset's acceleration data cannot be deleted says
+    /// whether the dataset is still served, with that data, or, withheld, is
+    /// still not served, and when to run the statement again.
+    #[test]
+    fn a_statement_that_cannot_delete_the_data_says_what_is_served() {
+        assert_eq!(
+            undeleted_by_statement("orders", true, "Permission denied (os error 13)"),
+            "the acceleration data of dataset 'orders' could not be deleted, so it is still served, with that data; run the statement again once the cause is fixed. Cause: Permission denied (os error 13)"
+        );
+        assert_eq!(
+            undeleted_by_statement("orders", false, "Permission denied (os error 13)"),
+            "this instance does not serve dataset 'orders' until it deletes the acceleration data an earlier definition of it left; Spice retries every 10 seconds, so run the statement again once it has. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
         );
     }
 }
