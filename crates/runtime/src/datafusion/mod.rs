@@ -3453,7 +3453,9 @@ impl DataFusion {
                     // `.await` between them, so a cancelled caller cannot leave
                     // claimed rows unwritten.
                     match queue.claim(&queued) {
-                        Some(group) => self.spawn_group_insert(group, turn),
+                        Some(group) => {
+                            self.spawn_group_insert(Arc::clone(&queue), group, turn);
+                        }
                         // Another append's group holds these rows; its outcome
                         // follows. Hand the turn to the next group.
                         None => break,
@@ -3494,8 +3496,14 @@ impl DataFusion {
     /// member, rather than in the caller, which may be gone. It runs before any
     /// member is told the outcome, so a caller still sees it done when
     /// `write_data` returns, as for a write of its own.
+    ///
+    /// The task holds `queue` until it hands the turn on. Without that, a queue
+    /// whose members have all gone could be dropped from `append_queues` while
+    /// its group still writes, and a new queue for the dataset would find its
+    /// turn free and write ahead of the group.
     fn spawn_group_insert(
         &self,
+        queue: Arc<append_coalescer::AppendQueue>,
         group: append_coalescer::AppendGroup,
         turn: tokio::sync::OwnedMutexGuard<()>,
     ) {
@@ -3549,6 +3557,7 @@ impl DataFusion {
             );
             completion.complete(&result);
             drop(turn);
+            drop(queue);
         });
     }
 
