@@ -35,7 +35,7 @@ use std::sync::OnceLock;
 
 use snafu::Snafu;
 
-pub use context::{Batch, Context, ContextParams};
+pub use context::{Batch, Context, ContextParams, Truncation};
 pub use model::{Model, ModelParams, Vocab};
 pub use mtp::{DraftKind, Mtp, MtpParams};
 pub use sampler::Sampler;

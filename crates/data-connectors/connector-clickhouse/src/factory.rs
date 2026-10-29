@@ -17,8 +17,6 @@ limitations under the License.
 use async_trait::async_trait;
 use clickhouse_rs::ClientHandle;
 use data_components::Read;
-use data_components::federation::create_spice_federated_table_provider;
-use data_components::function_support::FunctionSupport;
 use datafusion::{common::TableReference, datasource::TableProvider};
 use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool,
@@ -42,7 +40,6 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct ClickhouseTableFactory {
     pool: Arc<ClickhouseConnectionPool>,
-    function_support: Option<FunctionSupport>,
 }
 
 impl std::fmt::Debug for ClickhouseTableFactory {
@@ -55,21 +52,7 @@ impl std::fmt::Debug for ClickhouseTableFactory {
 impl ClickhouseTableFactory {
     #[must_use]
     pub fn new(pool: Arc<ClickhouseConnectionPool>) -> Self {
-        Self {
-            pool,
-            function_support: None,
-        }
-    }
-
-    /// Install the federation function deny-list. Functions on the list (Spice-only
-    /// UDFs such as `json_get_str`) are evaluated locally instead of being pushed
-    /// into the SQL sent to `ClickHouse`. Without this, `ClickHouse`'s `SqlTable`
-    /// inherits the upstream `can_execute_plan` default (always federate) and the
-    /// remote engine rejects the unknown function. See issue #10703.
-    #[must_use]
-    pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
-        self.function_support = Some(function_support);
-        self
+        Self { pool }
     }
 }
 
@@ -82,18 +65,15 @@ impl Read for ClickhouseTableFactory {
         let pool = Arc::clone(&self.pool);
         #[expect(
             clippy::disallowed_methods,
-            reason = "routed through `create_spice_federated_table_provider` with the factory's policy below, which the connector sets to `deny_spice_specific_functions()`"
+            reason = "the ClickHouse federation adaptor installs the same expression policy on its executor and fallback SQL scan"
         )]
         let sql_table = SqlTable::new("clickhouse", &pool, table_reference.clone(), None)
             .await
             .context(UnableToConstructSQLTableSnafu)?;
 
-        let schema = sql_table.schema();
-        let table_provider = Arc::new(create_spice_federated_table_provider(
+        let table_provider = Arc::new(crate::federation::create_federated_provider(
             sql_table,
-            schema,
             table_reference,
-            self.function_support.clone(),
         ));
 
         Ok(table_provider)
