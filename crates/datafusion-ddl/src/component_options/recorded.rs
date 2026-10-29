@@ -27,9 +27,11 @@ limitations under the License.
 use std::borrow::Cow;
 use std::ops::Range;
 
-use datafusion::sql::sqlparser::dialect::Dialect;
+use datafusion::sql::parser::DFParser;
+use datafusion::sql::sqlparser::dialect::{Dialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+use serde_json::Value;
 
 use super::{
     ComponentKind, REDACTED, REDACTED_SQL, byte_offset, is_params_map, is_secret_reference,
@@ -155,6 +157,89 @@ const DEFINING_KEYWORDS: [(Keyword, &[u8]); 3] = [
     (Keyword::ALTER, b"alter"),
     (Keyword::ATTACH, b"attach"),
 ];
+
+/// Whether `text` may hold a statement that defines a component: one of the
+/// [`DEFINING_KEYWORDS`] where it may be a token of its own, or a `\u`
+/// escape, which JSON may spell one with.
+#[must_use]
+pub fn may_define(text: &str) -> bool {
+    text.contains("\\u")
+        || DEFINING_KEYWORDS
+            .iter()
+            .any(|(_, spelling)| mentions(text, spelling))
+}
+
+/// `text` as the `sql` tool records a statement it runs, with every
+/// parameter's value taken out: read as a statement that may define a
+/// component when it parses, and as one that failed to parse otherwise.
+#[must_use]
+pub fn recorded_text(text: &str) -> RecordedStatement<'_> {
+    let dialect = PostgreSqlDialect {};
+    if DFParser::parse_sql_with_dialect(text, &dialect).is_ok() {
+        recorded_statement(text, &dialect, &|_| false)
+    } else {
+        recorded_unparsed_statement(text, &dialect, &|_| false)
+    }
+}
+
+/// `arguments`, a call's arguments to a tool of any name, with each statement
+/// in them that may define a component recorded as the `sql` tool records one
+/// ([`recorded_text`]), and the values that takes out. Each string of JSON
+/// arguments is read on its own, and a string that holds JSON, as the
+/// arguments `tool_invoke` passes on, as JSON; arguments that are not JSON are
+/// read as one statement. `None` when nothing changes.
+#[must_use]
+pub fn recorded_call_arguments(arguments: &str) -> Option<(String, Vec<String>)> {
+    if !may_define(arguments) {
+        return None;
+    }
+    let mut removed = Vec::new();
+    let Ok(mut value) = serde_json::from_str::<Value>(arguments) else {
+        let recorded = recorded_text(arguments);
+        return match recorded.text {
+            Cow::Owned(text) => Some((text, recorded.removed)),
+            Cow::Borrowed(_) => None,
+        };
+    };
+    record_json_statements(&mut value, &mut removed).then(|| (value.to_string(), removed))
+}
+
+/// Record each statement in the strings of `value`, as
+/// [`recorded_call_arguments`] reads them. Returns whether anything changed.
+fn record_json_statements(value: &mut Value, removed: &mut Vec<String>) -> bool {
+    match value {
+        Value::String(text) => {
+            if !may_define(text) {
+                return false;
+            }
+            if let Ok(mut inner) = serde_json::from_str::<Value>(text)
+                && (inner.is_object() || inner.is_array())
+            {
+                let changed = record_json_statements(&mut inner, removed);
+                if changed {
+                    *text = inner.to_string();
+                }
+                return changed;
+            }
+            let recorded = recorded_text(text);
+            match recorded.text {
+                Cow::Owned(recorded_text) => {
+                    removed.extend(recorded.removed);
+                    *text = recorded_text;
+                    true
+                }
+                Cow::Borrowed(_) => false,
+            }
+        }
+        Value::Array(items) => items.iter_mut().fold(false, |changed, item| {
+            record_json_statements(item, removed) | changed
+        }),
+        Value::Object(map) => map.values_mut().fold(false, |changed, item| {
+            record_json_statements(item, removed) | changed
+        }),
+        _ => false,
+    }
+}
 
 /// Whether `token` is one of the [`DEFINING_KEYWORDS`], unquoted.
 fn is_defining_keyword(token: &Token) -> bool {

@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use datafusion_ddl::component_options::redact_values;
+use datafusion_ddl::component_options::{recorded_call_arguments, redact_values};
 use rmcp::{
     model::{CallToolRequestParams, CallToolResponse, CallToolResult, JsonObject, Tool, object},
     service::ServiceError,
@@ -125,13 +125,17 @@ impl SpiceModelTool for McpToolWrapper {
 
     /// A call to another Spice's `sql` tool, such as one this Spice reaches at
     /// its `/v1/mcp`, is recorded as `sql` records it, so a definition's
-    /// credentials stay out of this Spice's task history too. That holds for
-    /// any server's tool named `sql`, which fails closed.
+    /// credentials stay out of this Spice's task history too; that holds for
+    /// any server's tool named `sql`, which fails closed. A tool of another
+    /// name, which may be an `sql` tool its Spicepod renamed, records each
+    /// statement in its arguments that may define a component the same way.
     fn recorded_arguments<'a>(&self, arg: &'a str) -> (Cow<'a, str>, Vec<String>) {
         if is_sql_tool(&self.spec.name) {
-            recorded_input(arg)
-        } else {
-            (Cow::Borrowed(arg), Vec::new())
+            return recorded_input(arg);
+        }
+        match recorded_call_arguments(arg) {
+            Some((recorded, removed)) => (Cow::Owned(recorded), removed),
+            None => (Cow::Borrowed(arg), Vec::new()),
         }
     }
 

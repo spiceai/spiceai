@@ -1759,8 +1759,8 @@ pub fn redact_secret_option_values<'a>(
 
 mod recorded;
 pub use recorded::{
-    RecordedStatement, UNREADABLE_STATEMENT, recorded_statement, recorded_unparsed_statement,
-    redact_values,
+    RecordedStatement, UNREADABLE_STATEMENT, may_define, recorded_call_arguments,
+    recorded_statement, recorded_text, recorded_unparsed_statement, redact_values,
 };
 
 #[cfg(test)]

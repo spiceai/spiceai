@@ -8,8 +8,11 @@ description: >
   its result back to a model with no Spice tools. Through an MCP tool, a
   call reaches another Spice's `sql` tool (a stand-in that quotes the
   statement back in its error): called directly, through Spice's `/v1/mcp`
-  gateway, and by a model. What a read-only key reads in task history holds
-  none of the password.
+  gateway, and by a model. A call reaches it under other names and shapes
+  too: another Spice's `sql` tool its Spicepod renamed (`peer2__query`), an
+  MCP client's own name for Spice's tool (`mcp__spice__sql`), and the legacy
+  Chat Completions `function_call`. What a read-only key reads in task history
+  holds none of the password.
 
 sources:
   model: { kind: mock-http }
@@ -33,6 +36,11 @@ spicepod:
       from: mcp:python3
       params:
         mcp_args: ${script.dir}/mcp/sql_peer.py
+    # Another Spice whose Spicepod names its `sql` tool `query`.
+    - name: peer2
+      from: mcp:python3
+      params:
+        mcp_args: ${script.dir}/mcp/sql_peer.py query
   models:
     - from: anthropic:claude-sonnet-4-6
       name: a
@@ -192,6 +200,43 @@ steps:
       body: SELECT task, input, captured_output FROM runtime.task_history WHERE task IN ('ai_chat', 'ai_completion') AND input LIKE '%peer turn%' ORDER BY task
     expect: { status: 200, body-matches: 'ai_chat[\s\S]*ai_completion[\s\S]*TABLE t5', body-lacks: ['leak-'] }
     eventually: 30s
+  # Other names and shapes: another Spice's `sql` tool its Spicepod renamed,
+  # an MCP client's own name for Spice's `sql` tool in a conversation it sends
+  # to a model with no tools, and the legacy Chat Completions `function_call`.
+  - http:
+      method: POST
+      path: /v1/tools/peer2__query
+      headers: { content-type: application/json }
+      body: '{"query": "CREATE TABLE t6 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-renamed-peer'')"}'
+    expect: { body-contains: t6 }
+  - http:
+      method: POST
+      path: /v1/messages
+      headers: { content-type: application/json, anthropic-version: '2023-06-01' }
+      body: '{"model": "n", "max_tokens": 256, "messages": [{"role": "user", "content": "add the orders table"}, {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_7", "name": "mcp__spice__sql", "input": {"query": "CREATE TABLE t7 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-mcp-client-name'')"}}]}, {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_7", "content": "Cannot connect to the dataset t7"}, {"type": "text", "text": "client name turn two"}]}], "tools": [{"name": "mcp__spice__sql", "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}}}]}'
+    expect: { status: 200, body-contains: done }
+  - http:
+      method: POST
+      path: /v1/chat/completions
+      headers: { content-type: application/json }
+      body: '{"model": "n", "messages": [{"role": "user", "content": "add the orders table"}, {"role": "assistant", "content": null, "function_call": {"name": "sql", "arguments": "{\"query\": \"CREATE TABLE t8 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-function-call'')\"}"}}, {"role": "function", "name": "sql", "content": "Cannot connect to the dataset t8"}, {"role": "user", "content": "function call turn two"}], "functions": [{"name": "sql", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}}]}'
+    expect: { status: 200, body-contains: done }
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SELECT task, input, captured_output, error_message FROM runtime.task_history WHERE task = 'tool_use::peer2__query'
+    expect: { status: 200, body-contains: TABLE t6, body-lacks: ['leak-'] }
+    eventually: 30s
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SELECT task, input FROM runtime.task_history WHERE task IN ('ai_chat', 'ai_completion') AND (input LIKE '%client name turn two%' OR input LIKE '%function call turn two%') ORDER BY task
+    expect: { status: 200, body-matches: 'ai_chat[\s\S]*TABLE t[78][\s\S]*ai_completion', body-lacks: ['leak-'] }
+    eventually: 30s
   # Every row of task history, every column a value can reach.
   - http:
       method: POST
@@ -199,4 +244,4 @@ steps:
       api-key: reader-key
       headers: { content-type: text/plain }
       body: SELECT task, input, captured_output, error_message FROM runtime.task_history ORDER BY start_time
-    expect: { status: 200, body-matches: 'TABLE t1[\s\S]*TABLE t5', body-lacks: ['leak-'] }
+    expect: { status: 200, body-matches: 'TABLE t1[\s\S]*TABLE t8', body-lacks: ['leak-'] }

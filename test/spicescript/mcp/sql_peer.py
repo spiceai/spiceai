@@ -1,16 +1,18 @@
 """An MCP server, over stdio, that stands in for another Spice: it has one tool,
 `sql`, which refuses every statement and quotes it back in its error, as a
-database error can quote what it was sent.
+database error can quote what it was sent. An argument names the tool
+otherwise, as a Spicepod can rename its `sql` tool.
 
 A script starts it as a tool: `from: mcp:python3`, with `mcp_args` set to
-this file's path. It needs nothing beyond the Python standard library.
+this file's path, and the tool's name after it when it is not `sql`. It
+needs nothing beyond the Python standard library.
 """
 
 import json
 import sys
 
 SQL_TOOL = {
-    "name": "sql",
+    "name": sys.argv[1] if len(sys.argv) > 1 else "sql",
     "description": "Run a SQL statement.",
     "inputSchema": {
         "type": "object",

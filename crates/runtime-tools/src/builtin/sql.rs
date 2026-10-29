@@ -15,11 +15,7 @@ limitations under the License.
 */
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use datafusion::sql::parser::DFParser;
-use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion_ddl::component_options::{
-    UNREADABLE_STATEMENT, recorded_statement, recorded_unparsed_statement, redact_values,
-};
+use datafusion_ddl::component_options::{UNREADABLE_STATEMENT, recorded_text, redact_values};
 use std::collections::HashSet;
 use std::{
     borrow::Cow,
@@ -167,23 +163,17 @@ pub fn sql_tool_names() -> Vec<String> {
 }
 
 /// The tool's arguments as task history records them, and the values that
-/// takes out: the statement they carry recorded as the query it runs is, but
-/// with every parameter's value redacted, since the tool cannot tell which are
-/// non-secret. A statement that does not parse is recorded with
-/// [`recorded_unparsed_statement`]. Arguments that are not the tool's JSON run
-/// nothing, and are recorded only as [`UNREADABLE_STATEMENT`].
+/// takes out: the statement they carry recorded as [`recorded_text`] records
+/// it, with every parameter's value redacted, since the tool cannot tell which
+/// are non-secret. Arguments that are not the tool's JSON run nothing, and are
+/// recorded only as [`UNREADABLE_STATEMENT`].
 #[must_use]
 pub fn recorded_input(arg: &str) -> (Cow<'_, str>, Vec<String>) {
     let Ok(SqlToolParams { query }) = serde_json::from_str::<SqlToolParams>(arg) else {
         // Owned, as any changed text is: a caller tells a changed text by it.
         return (Cow::Owned(UNREADABLE_STATEMENT.to_string()), Vec::new());
     };
-    let dialect = PostgreSqlDialect {};
-    let recorded = if DFParser::parse_sql_with_dialect(&query, &dialect).is_ok() {
-        recorded_statement(&query, &dialect, &|_| false)
-    } else {
-        recorded_unparsed_statement(&query, &dialect, &|_| false)
-    };
+    let recorded = recorded_text(&query);
     match recorded.text {
         // Fields beside the query run nothing, and are not recorded.
         Cow::Borrowed(_) if has_only_query(arg) => (Cow::Borrowed(arg), Vec::new()),
