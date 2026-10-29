@@ -20,7 +20,11 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion_ddl::component_options::{
     UNREADABLE_STATEMENT, recorded_statement, recorded_unparsed_statement, redact_values,
 };
-use std::{borrow::Cow, sync::Arc};
+use std::collections::HashSet;
+use std::{
+    borrow::Cow,
+    sync::{Arc, LazyLock},
+};
 
 use crate::builtin::function_tool::current_principal_allows_write;
 use crate::utils::{parameters, write_to_json_string};
@@ -63,9 +67,13 @@ impl SqlTool {
         description: Option<&str>,
         allowed_tables: Option<ResolvedTableAwareAllowlist>,
     ) -> Self {
+        let name = name.unwrap_or(SQL_TOOL);
+        if !is_sql_tool(name) {
+            SQL_TOOL_NAMES.write().insert(name.to_string());
+        }
         Self {
             df,
-            name: name.unwrap_or("sql").to_string(),
+            name: name.to_string(),
             description: description.unwrap_or(DEFAULT_DESCRIPTION).to_string(),
             allowed_tables,
         }
@@ -136,13 +144,35 @@ impl SpiceModelTool for SqlTool {
     }
 }
 
+/// The default name of the tool.
+const SQL_TOOL: &str = "sql";
+
+/// The names of the `sql` tools this process has created: `sql`, and any name
+/// a Spicepod gives one. A recorder that sees a call by name, as task history
+/// does for a conversation a client sends back, reads it as one.
+static SQL_TOOL_NAMES: LazyLock<parking_lot::RwLock<HashSet<String>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(HashSet::from([SQL_TOOL.to_string()])));
+
+/// Whether `name` names an `sql` tool, whose arguments are recorded with
+/// [`recorded_input`].
+#[must_use]
+pub fn is_sql_tool(name: &str) -> bool {
+    SQL_TOOL_NAMES.read().contains(name)
+}
+
+/// The names of the `sql` tools this process has created.
+#[must_use]
+pub fn sql_tool_names() -> Vec<String> {
+    SQL_TOOL_NAMES.read().iter().cloned().collect()
+}
+
 /// The tool's arguments as task history records them, and the values that
 /// takes out: the statement they carry recorded as the query it runs is, but
 /// with every parameter's value redacted, since the tool cannot tell which are
 /// non-secret. A statement that does not parse is recorded with
 /// [`recorded_unparsed_statement`]. Arguments that are not the tool's JSON run
 /// nothing, and are recorded only as [`UNREADABLE_STATEMENT`].
-fn recorded_input(arg: &str) -> (Cow<'_, str>, Vec<String>) {
+pub fn recorded_input(arg: &str) -> (Cow<'_, str>, Vec<String>) {
     let Ok(SqlToolParams { query }) = serde_json::from_str::<SqlToolParams>(arg) else {
         // Owned, as any changed text is: a caller tells a changed text by it.
         return (Cow::Owned(UNREADABLE_STATEMENT.to_string()), Vec::new());

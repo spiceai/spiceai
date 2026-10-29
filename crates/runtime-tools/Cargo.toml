@@ -21,6 +21,7 @@ cache = { path = "../cache" }
 chrono.workspace = true
 datafusion.workspace = true
 datafusion-ddl = { path = "../datafusion-ddl" }
+parking_lot.workspace = true
 fundu.workspace = true
 futures.workspace = true
 itertools.workspace = true

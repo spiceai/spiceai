@@ -28,7 +28,7 @@ pub(crate) mod nsql;
 pub mod params;
 pub(crate) mod provider_models;
 pub(crate) mod rate_limit;
-mod recorded_calls;
+pub(crate) mod recorded_calls;
 pub mod rerank;
 mod responses;
 mod responses_tool_history;

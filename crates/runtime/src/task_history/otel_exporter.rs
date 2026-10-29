@@ -201,9 +201,18 @@ impl TaskHistoryExporter {
 
         match captured_context {
             TaskHistoryCapturedContext::Redacted => Arc::clone(&REDACTED_TASK_HISTORY_VALUE_ARC),
-            TaskHistoryCapturedContext::Truncated => Self::truncate_context_payload(value),
-            TaskHistoryCapturedContext::Full => value,
+            TaskHistoryCapturedContext::Truncated => {
+                Self::truncate_context_payload(Self::with_recorded_calls(value))
+            }
+            TaskHistoryCapturedContext::Full => Self::with_recorded_calls(value),
         }
+    }
+
+    /// `value`, a conversation's payload, with each call to an `sql` tool in it
+    /// recorded as that tool records it, whatever tools the conversation's
+    /// model has: a client sends a whole conversation back on each turn.
+    fn with_recorded_calls(value: Arc<str>) -> Arc<str> {
+        crate::model::recorded_calls::recorded_by_name(&value).map_or(value, Arc::from)
     }
 
     fn truncate_context_payload(value: Arc<str>) -> Arc<str> {
@@ -653,6 +662,44 @@ mod tests {
             ),
             payload
         );
+    }
+
+    /// A conversation a client sends back holds the `sql` calls of its earlier
+    /// turns: task history records each as the tool does, in every mode that
+    /// keeps the payload.
+    #[test]
+    fn process_context_payload_records_sql_calls_as_the_tool_does() {
+        let payload: Arc<str> = serde_json::json!({"messages": [
+            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {
+                "name": "sql",
+                "arguments": "{\"query\":\"CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = 'hunter2')\"}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "password 'hunter2' refused"},
+        ]})
+        .to_string()
+        .into();
+        let recorded = serde_json::json!({"messages": [
+            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {
+                "name": "sql",
+                "arguments": "{\"query\":\"CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = '<redacted>')\"}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "password <redacted> refused"},
+        ]});
+
+        for context in [
+            TaskHistoryCapturedContext::Full,
+            TaskHistoryCapturedContext::Truncated,
+        ] {
+            let value = TaskHistoryExporter::process_context_payload(
+                &context,
+                "ai_chat",
+                Arc::clone(&payload),
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&value)
+                    .expect("the recorded payload is JSON"),
+                recorded,
+                "{context:?}"
+            );
+        }
     }
 
     #[test]

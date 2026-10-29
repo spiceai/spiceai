@@ -18,17 +18,24 @@ limitations under the License.
 //!
 //! A tool says how its arguments are recorded
 //! ([`SpiceModelTool::recorded_arguments`]): the `sql` tool leaves out the
-//! credentials of a definition. A model call carries those arguments too, in
-//! the tool calls a model makes and in the request that sends them back with
-//! each tool's result, so it is recorded with each tool call's arguments as
-//! its tool records them, and each result without the values they took out.
+//! credentials of a definition. A conversation carries those arguments too, in
+//! the tool calls a model makes, in the requests that send them back with each
+//! tool's result, and in what a client sends back on its next turn. So a model
+//! call, and any payload of a conversation task history records, holds each
+//! tool call's arguments as its tool records them, and none of the values that
+//! recording took out, wherever else in the payload they appear.
+//!
+//! The model calls Spice makes in its tool loops know their tools
+//! ([`with_tools`]). Task history also reads every payload it stores by the
+//! names of the tools in it ([`recorded_by_name`]), for a conversation whose
+//! tools Spice did not run, such as one a client sends back.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use datafusion_ddl::component_options::redact_values;
+use datafusion_ddl::component_options::{UNREADABLE_STATEMENT, redact_values};
+use runtime_tools::builtin::sql::{is_sql_tool, recorded_input, sql_tool_names};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tools::SpiceModelTool;
@@ -56,7 +63,12 @@ pub(crate) fn current_tools() -> Option<ConversationTools> {
     TOOLS.try_with(Arc::clone).ok()
 }
 
-/// `value`, a model request or response, as task history records it.
+/// How a call to the named tool records its arguments: the recorded text and
+/// the values taken out, or `None` when they are recorded as sent.
+type Recorder<'r> = dyn Fn(&str, &str) -> Option<(String, Vec<String>)> + 'r;
+
+/// `value`, a model request or response, as task history records it, each
+/// call to one of `tools` recorded as that tool records it.
 pub(crate) fn recorded(
     value: &impl Serialize,
     tools: Option<&ConversationTools>,
@@ -68,39 +80,99 @@ pub(crate) fn recorded(
     let Ok(mut json) = serde_json::from_str::<Value>(&text) else {
         return Ok(text);
     };
-    if record_tool_calls(&mut json, tools) {
+    let record = |name: &str, arguments: &str| {
+        let tool = tools.iter().find(|tool| {
+            let tool_name = tool.name();
+            tool_name == name || encode_tool_name(&tool_name) == name
+        })?;
+        changed(arguments, tool.recorded_arguments(arguments))
+    };
+    if record_tool_calls(&mut json, &record) {
         Ok(json.to_string())
     } else {
         Ok(text)
     }
 }
 
-/// Rewrite in `value` the arguments of each call to one of `tools` as that
-/// tool records them, and each result of such a call without the values the
-/// recording took out. Returns whether anything was rewritten.
-fn record_tool_calls(value: &mut Value, tools: &[Arc<dyn SpiceModelTool>]) -> bool {
-    let mut removed: HashMap<String, Vec<String>> = HashMap::new();
-    let rewritten = rewrite_calls(value, tools, &mut removed);
+/// `text`, a payload of a conversation task history stores, with each call to
+/// an `sql` tool, directly or through `tool_invoke`, recorded as that tool
+/// records it, whatever tools the conversation's model has. `None` when
+/// nothing changes, as for text that is not JSON.
+pub(crate) fn recorded_by_name(text: &str) -> Option<String> {
+    let mut json = serde_json::from_str::<Value>(text).ok()?;
+    let sql_tools = sql_tool_names();
+    let is_sql = |name: &str| {
+        is_sql_tool(name) || sql_tools.iter().any(|tool| encode_tool_name(tool) == name)
+    };
+    let record = |name: &str, arguments: &str| {
+        if is_sql(name) {
+            changed(arguments, recorded_input(arguments))
+        } else if name == "tool_invoke" {
+            recorded_invocation(arguments, &is_sql)
+        } else {
+            None
+        }
+    };
+    record_tool_calls(&mut json, &record).then(|| json.to_string())
+}
+
+/// The recording of `arguments`, when it is not the arguments themselves.
+fn changed(
+    arguments: &str,
+    (recorded, removed): (Cow<'_, str>, Vec<String>),
+) -> Option<(String, Vec<String>)> {
+    (recorded != arguments).then(|| (recorded.into_owned(), removed))
+}
+
+/// The arguments of a `tool_invoke` call, `{"tool_id", "arguments"}`, with
+/// those of a call to an `sql` tool recorded as that tool records them.
+fn recorded_invocation(
+    arguments: &str,
+    is_sql: &dyn Fn(&str) -> bool,
+) -> Option<(String, Vec<String>)> {
+    let Ok(Value::Object(mut invocation)) = serde_json::from_str::<Value>(arguments) else {
+        // Not `tool_invoke`'s JSON: it runs nothing, and keeps nothing.
+        return Some((UNREADABLE_STATEMENT.to_string(), Vec::new()));
+    };
+    // A call that names no tool runs nothing, and keeps nothing either.
+    let Some(tool) = invocation.get("tool_id").and_then(Value::as_str) else {
+        return Some((UNREADABLE_STATEMENT.to_string(), Vec::new()));
+    };
+    if !is_sql(tool) {
+        return None;
+    }
+    let (inner, is_text) = match invocation.get("arguments") {
+        Some(Value::String(text)) => (text.clone(), true),
+        Some(Value::Null) | None => return None,
+        Some(other) => (other.to_string(), false),
+    };
+    let (recorded, removed) = changed(&inner, recorded_input(&inner))?;
+    invocation.insert("arguments".to_string(), as_sent(recorded, is_text));
+    Some((Value::Object(invocation).to_string(), removed))
+}
+
+/// Record in `value` the arguments of each tool call `record` recognizes, and
+/// take every value it removes out of every text in `value`, a tool's result
+/// or a model's own words alike. Returns whether anything changed.
+fn record_tool_calls(value: &mut Value, record: &Recorder<'_>) -> bool {
+    let mut removed = Vec::new();
+    let rewritten = rewrite_calls(value, record, &mut removed);
     if removed.is_empty() {
         rewritten
     } else {
-        redact_results(value, &removed) | rewritten
+        redact_strings(value, &removed) | rewritten
     }
 }
 
-fn rewrite_calls(
-    value: &mut Value,
-    tools: &[Arc<dyn SpiceModelTool>],
-    removed: &mut HashMap<String, Vec<String>>,
-) -> bool {
+fn rewrite_calls(value: &mut Value, record: &Recorder<'_>, removed: &mut Vec<String>) -> bool {
     match value {
         Value::Array(items) => items.iter_mut().fold(false, |rewritten, item| {
-            rewrite_calls(item, tools, removed) | rewritten
+            rewrite_calls(item, record, removed) | rewritten
         }),
         Value::Object(map) => {
-            let rewritten = rewrite_call(map, tools, removed);
+            let rewritten = rewrite_call(map, record, removed);
             map.values_mut().fold(rewritten, |rewritten, item| {
-                rewrite_calls(item, tools, removed) | rewritten
+                rewrite_calls(item, record, removed) | rewritten
             })
         }
         _ => false,
@@ -108,47 +180,34 @@ fn rewrite_calls(
 }
 
 /// Rewrite `map` when it is a tool call, in the shape of any API Spice serves:
-/// Chat Completions' `{"id", "function": {"name", "arguments"}}`, Responses'
-/// `{"type": "function_call", "call_id", "name", "arguments"}`, and Messages'
-/// `{"type": "tool_use" | "mcp_tool_use", "id", "name", "input"}`.
+/// Chat Completions' `{"function": {"name", "arguments"}}`, Responses'
+/// `{"type": "function_call" | "mcp_call", "name", "arguments"}`, and
+/// Messages' `{"type": "tool_use" | "mcp_tool_use", "name", "input"}`.
 fn rewrite_call(
     map: &mut Map<String, Value>,
-    tools: &[Arc<dyn SpiceModelTool>],
-    removed: &mut HashMap<String, Vec<String>>,
+    record: &Recorder<'_>,
+    removed: &mut Vec<String>,
 ) -> bool {
-    // A Responses item has an `id` of its own beside the `call_id` its output
-    // names.
-    let id = ["call_id", "id"]
-        .iter()
-        .find_map(|key| map.get(*key).and_then(Value::as_str))
-        .map(str::to_string);
     if let Some(Value::Object(function)) = map.get_mut("function") {
-        return record_arguments(function, "arguments", id, tools, removed);
+        return record_arguments(function, "arguments", record, removed);
     }
     let key = match map.get("type").and_then(Value::as_str) {
-        Some("function_call") => "arguments",
+        Some("function_call" | "mcp_call") => "arguments",
         Some("tool_use" | "mcp_tool_use") => "input",
         _ => return false,
     };
-    record_arguments(map, key, id, tools, removed)
+    record_arguments(map, key, record, removed)
 }
 
-/// Record the arguments at `key` of `call`, which names its tool, as that
-/// tool records them, and remember under `id` the values taken out.
+/// Record the arguments at `key` of `call`, which names its tool, as `record`
+/// says, and remember the values taken out.
 fn record_arguments(
     call: &mut Map<String, Value>,
     key: &str,
-    id: Option<String>,
-    tools: &[Arc<dyn SpiceModelTool>],
-    removed: &mut HashMap<String, Vec<String>>,
+    record: &Recorder<'_>,
+    removed: &mut Vec<String>,
 ) -> bool {
     let Some(name) = call.get("name").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(tool) = tools.iter().find(|tool| {
-        let tool_name = tool.name();
-        tool_name == name || encode_tool_name(&tool_name) == name
-    }) else {
         return false;
     };
     let (arguments, is_text) = match call.get(key) {
@@ -156,51 +215,21 @@ fn record_arguments(
         Some(other) => (other.to_string(), false),
         None => return false,
     };
-    let (recorded, values) = tool.recorded_arguments(&arguments);
-    if recorded == arguments.as_str() {
+    let Some((recorded, values)) = record(name, &arguments) else {
         return false;
-    }
-    let recorded = recorded.into_owned();
-    let recorded = if is_text {
-        Value::String(recorded)
-    } else {
-        serde_json::from_str(&recorded).unwrap_or(Value::String(recorded))
     };
-    call.insert(key.to_string(), recorded);
-    if let Some(id) = id {
-        removed.entry(id).or_default().extend(values);
-    }
+    call.insert(key.to_string(), as_sent(recorded, is_text));
+    removed.extend(values);
     true
 }
 
-/// Take the values `removed` holds for each tool call out of its result:
-/// Chat Completions' `{"role": "tool", "tool_call_id", "content"}`, Responses'
-/// `{"type": "function_call_output", "call_id", "output"}`, and Messages'
-/// `{"type": "tool_result" | "mcp_tool_result", "tool_use_id", "content"}`.
-fn redact_results(value: &mut Value, removed: &HashMap<String, Vec<String>>) -> bool {
-    match value {
-        Value::Array(items) => items.iter_mut().fold(false, |rewritten, item| {
-            redact_results(item, removed) | rewritten
-        }),
-        Value::Object(map) => {
-            let values = ["tool_call_id", "call_id", "tool_use_id"]
-                .iter()
-                .find_map(|key| map.get(*key).and_then(Value::as_str))
-                .and_then(|id| removed.get(id))
-                .cloned();
-            let mut rewritten = false;
-            if let Some(values) = values {
-                for key in ["content", "output"] {
-                    if let Some(result) = map.get_mut(key) {
-                        rewritten |= redact_strings(result, &values);
-                    }
-                }
-            }
-            map.values_mut().fold(rewritten, |rewritten, item| {
-                redact_results(item, removed) | rewritten
-            })
-        }
-        _ => false,
+/// `recorded` arguments in the shape they were sent in: text, or the JSON the
+/// text holds. A placeholder is text either way.
+fn as_sent(recorded: String, is_text: bool) -> Value {
+    if is_text {
+        Value::String(recorded)
+    } else {
+        serde_json::from_str(&recorded).unwrap_or(Value::String(recorded))
     }
 }
 
@@ -327,6 +356,83 @@ mod tests {
                     "content": [{"type": "text", "text": "password '<redacted>' refused"}]}]},
             ]})
         );
+    }
+
+    /// A payload a client sends back, or one of a model whose tools Spice did
+    /// not run, is recorded with each call to an `sql` tool, directly or
+    /// through `tool_invoke`, recorded as `sql` records it, in every shape;
+    /// what that took out is taken out of the whole payload, a person's words
+    /// included.
+    #[test]
+    fn a_payload_records_calls_to_sql_by_name() {
+        let statement = "CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = 'hunter2')";
+        let recorded_statement =
+            "CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = '<redacted>')";
+        let messages = json!({"messages": [
+            {"role": "user", "content": "define t, its password is hunter2"},
+            {"role": "assistant", "content": [{"type": "mcp_tool_use", "id": "m1", "name": "sql",
+                "server_name": "spice", "input": {"query": statement}}]},
+            {"role": "user", "content": [{"type": "mcp_tool_result", "tool_use_id": "m1",
+                "content": [{"type": "text", "text": "password 'hunter2' refused"}]}]},
+        ]});
+        let recorded: Value = serde_json::from_str(
+            &recorded_by_name(&messages.to_string()).expect("the payload changes"),
+        )
+        .expect("the recorded payload is JSON");
+        assert_eq!(
+            recorded,
+            json!({"messages": [
+                {"role": "user", "content": "define t, its password is <redacted>"},
+                {"role": "assistant", "content": [{"type": "mcp_tool_use", "id": "m1", "name": "sql",
+                    "server_name": "spice", "input": {"query": recorded_statement}}]},
+                {"role": "user", "content": [{"type": "mcp_tool_result", "tool_use_id": "m1",
+                    "content": [{"type": "text", "text": "password <redacted> refused"}]}]},
+            ]})
+        );
+
+        // Responses' `mcp_call`, which holds its own output, and `tool_invoke`,
+        // whose arguments for the tool it calls are JSON or text.
+        let query = json!({"query": statement}).to_string();
+        let responses = json!({"input": [
+            {"type": "mcp_call", "id": "mcp_1", "name": "sql", "server_label": "spice",
+                "arguments": query, "output": "password 'hunter2' refused"},
+            {"type": "function_call", "call_id": "r2", "name": "tool_invoke",
+                "arguments": json!({"tool_id": "sql", "arguments": {"query": statement}}).to_string()},
+            {"type": "function_call", "call_id": "r3", "name": "tool_invoke",
+                "arguments": json!({"tool_id": "sql", "arguments": query}).to_string()},
+        ]});
+        let recorded: Value = serde_json::from_str(
+            &recorded_by_name(&responses.to_string()).expect("the payload changes"),
+        )
+        .expect("the recorded payload is JSON");
+        let recorded_query = json!({"query": recorded_statement}).to_string();
+        assert_eq!(
+            recorded["input"][0],
+            json!({"type": "mcp_call", "id": "mcp_1", "name": "sql", "server_label": "spice",
+                "arguments": recorded_query, "output": "password <redacted> refused"})
+        );
+        let invocation = |index: usize| -> Value {
+            serde_json::from_str(
+                recorded["input"][index]["arguments"]
+                    .as_str()
+                    .expect("the call's arguments are text"),
+            )
+            .expect("the call's arguments are JSON")
+        };
+        assert_eq!(
+            invocation(1),
+            json!({"tool_id": "sql", "arguments": {"query": recorded_statement}})
+        );
+        assert_eq!(
+            invocation(2),
+            json!({"tool_id": "sql", "arguments": recorded_query})
+        );
+
+        // A call to another tool, and text that is not JSON, are kept.
+        let search = json!({"messages": [{"role": "assistant", "tool_calls": [
+            {"id": "c1", "function": {"name": "search", "arguments": "{\"query\":\"hunter2\"}"}}]}]});
+        assert_eq!(recorded_by_name(&search.to_string()), None);
+        assert_eq!(recorded_by_name("define t, its password is hunter2"), None);
     }
 
     /// A call to a tool not in the conversation, and a call whose tool records

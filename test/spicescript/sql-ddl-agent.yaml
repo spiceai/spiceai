@@ -1,0 +1,130 @@
+name: sql-ddl-agent
+description: >
+  An agent defines a dataset with a password, through Spice's `sql` tool, and
+  the conversation goes on. Over the Messages API, Spice runs the call and
+  returns it to the client, which sends the whole conversation back on its
+  next turn, as the Messages API requires. Over Chat Completions, an agent
+  that runs its own tool loop calls `/v1/tools/sql` and sends the call and
+  its result back to a model with no Spice tools. What a read-only key reads
+  in task history holds none of the password.
+
+sources:
+  model: { kind: mock-http }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: sql-ddl-agent
+  runtime:
+    auth:
+      api-key:
+        enabled: true
+        keys: [admin-key:admin, reader-key:ro]
+  models:
+    - from: anthropic:claude-sonnet-4-6
+      name: a
+      params:
+        endpoint: ${sources.model.url}/v1
+        anthropic_api_key: stub-key
+        tools: sql
+    - from: openai:gpt-4o-mini
+      name: n
+      params:
+        endpoint: ${sources.model.url}/v1
+        openai_api_key: stub-key
+
+defaults:
+  api-key: admin-key
+
+steps:
+  # The model's answer once it has a tool's result, or no tool to call.
+  - source-exec:
+      model:
+        - |
+          path: /v1/messages
+          method: POST
+          headers: { content-type: application/json }
+          body: '{"id": "msg_2", "type": "message", "role": "assistant", "model": "claude-sonnet-4-6", "content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn", "stop_sequence": null, "usage": {"input_tokens": 1, "output_tokens": 1}}'
+        - |
+          path: /v1/chat/completions
+          method: POST
+          headers: { content-type: application/json }
+          body: '{"id": "c2", "object": "chat.completion", "created": 1, "model": "gpt-4o-mini", "choices": [{"index": 0, "message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}'
+  - start: {}
+  # The model's first answer: a `sql` call that defines a dataset.
+  - source-exec:
+      model:
+        - |
+          path: /v1/messages
+          method: POST
+          times: 1
+          headers: { content-type: application/json }
+          body: '{"id": "msg_1", "type": "message", "role": "assistant", "model": "claude-sonnet-4-6", "content": [{"type": "tool_use", "id": "toolu_1", "name": "sql", "input": {"query": "CREATE TABLE t1 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-messages-next-turn'')"}}], "stop_reason": "tool_use", "stop_sequence": null, "usage": {"input_tokens": 1, "output_tokens": 1}}'
+
+  # Messages, turn 1: Spice runs the call and returns it to the client.
+  - http:
+      method: POST
+      path: /v1/messages
+      headers: { content-type: application/json, anthropic-version: '2023-06-01' }
+      body: '{"model": "a", "max_tokens": 256, "messages": [{"role": "user", "content": "add the orders table"}]}'
+    expect: { status: 200, body-contains: mcp_tool_use }
+  # Messages, turn 2: the client sends the conversation back.
+  - http:
+      method: POST
+      path: /v1/messages
+      headers: { content-type: application/json, anthropic-version: '2023-06-01' }
+      body: '{"model": "a", "max_tokens": 256, "messages": [{"role": "user", "content": "add the orders table"}, {"role": "assistant", "content": [{"type": "mcp_tool_use", "id": "toolu_1", "name": "sql", "server_name": "spice", "input": {"query": "CREATE TABLE t1 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-messages-next-turn'')"}}, {"type": "mcp_tool_result", "tool_use_id": "toolu_1", "is_error": true, "content": [{"type": "text", "text": "Cannot connect to the dataset t1"}]}, {"type": "text", "text": "done"}]}, {"role": "user", "content": "messages turn two"}]}'
+    expect: { status: 200, body-contains: done }
+
+  # Chat Completions, an agent's own tool loop: it runs the call through
+  # Spice's tool, then sends the call and its result back.
+  - http:
+      method: POST
+      path: /v1/tools/sql
+      headers: { content-type: application/json }
+      body: '{"query": "CREATE TABLE t2 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-agent-loop'')"}'
+    expect: { body-contains: t2 }
+  - http:
+      method: POST
+      path: /v1/chat/completions
+      headers: { content-type: application/json }
+      body: '{"model": "n", "messages": [{"role": "user", "content": "add the orders table"}, {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "sql", "arguments": "{\"query\": \"CREATE TABLE t2 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-agent-loop'')\"}"}}]}, {"role": "tool", "tool_call_id": "call_1", "content": "Cannot connect to the dataset t2"}, {"role": "user", "content": "chat turn two"}], "tools": [{"type": "function", "function": {"name": "sql", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}}}]}'
+    expect: { status: 200, body-contains: done }
+
+  # Task history, as a read-only key reads it. The tool's own rows, and the
+  # model calls Spice made in its tool loop, hold no password.
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SELECT task, input, error_message FROM runtime.task_history WHERE task IN ('tool_use::sql', 'sql_query') AND (input LIKE '%t1%' OR input LIKE '%t2%') ORDER BY start_time
+    expect: { status: 200, body-matches: 'TABLE t1[\s\S]*TABLE t2', body-lacks: ['leak-'] }
+    eventually: 30s
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SELECT task, input FROM runtime.task_history WHERE task = 'ai_completion' AND input LIKE '%messages turn two%'
+    expect: { status: 200, body-contains: messages turn two, body-lacks: ['leak-'] }
+    eventually: 30s
+  # The Messages client's next turn, as task history records the request.
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SELECT task, input FROM runtime.task_history WHERE task = 'ai_chat' AND input LIKE '%messages turn two%'
+    expect: { status: 200, body-contains: messages turn two, body-lacks: ['leak-'] }
+    eventually: 30s
+  # The agent's own tool loop, as task history records the request and the
+  # model call.
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SELECT task, input FROM runtime.task_history WHERE task IN ('ai_chat', 'ai_completion') AND input LIKE '%chat turn two%' ORDER BY task
+    expect: { status: 200, body-matches: 'ai_chat[\s\S]*ai_completion', body-lacks: ['leak-'] }
+    eventually: 30s
