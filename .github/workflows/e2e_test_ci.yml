@@ -1579,10 +1579,18 @@ jobs:
           echo "CI_CLICKHOUSE_DIR=${dir}" >> "$GITHUB_ENV"
           echo "$dir" >> "$GITHUB_PATH"
           ch() { ./clickhouse client --host 127.0.0.1 --port "$CI_CLICKHOUSE_PORT" "$@"; }
+          ready=0
           for attempt in {1..30}; do
-            ch --query="SELECT 1" >/dev/null 2>&1 && break
+            ch --query="SELECT 1" >/dev/null 2>&1 && ready=1 && break
             sleep 1
           done
+          if [ "$ready" -ne 1 ]; then
+            pid="$(cat "${dir}/clickhouse.pid" 2>/dev/null)"
+            echo "::error::ClickHouse is not accepting connections on 127.0.0.1:${CI_CLICKHOUSE_PORT} after 30s (server pid '${pid}': $(ps -p "${pid:-0}" >/dev/null 2>&1 && echo running || echo not running))."
+            tail -n 50 "${dir}/clickhouse.err.log" "${dir}/clickhouse.log" 2>&1 || true
+            memory_pressure 2>/dev/null | tail -n 1 || true
+            exit 1
+          fi
           ch -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
           ch -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
           ch -utest_user --password password --query="CREATE DATABASE IF NOT EXISTS testdb;"
