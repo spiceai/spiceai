@@ -37,6 +37,16 @@ use tokio::sync::Notify;
 /// A serial writer and its last acknowledged state. No database is used.
 pub struct ObjectNativeCatalog {
     inner: StateSlot,
+    opened: OpenSummary,
+}
+
+/// What opening the catalog found, for the startup log.
+#[derive(Clone, Copy, Debug)]
+struct OpenSummary {
+    checkpoint: u64,
+    replayed: usize,
+    tables: usize,
+    lease: u64,
 }
 struct Inner {
     reader: ShadowCatalog,
@@ -167,11 +177,24 @@ impl ObjectNativeCatalog {
             object_store_occ::LocalConditionalPut::new_durable(directory).map_err(invalid)?,
         );
         let prefix = Path::from("catalog");
-        match store.head(&prefix.clone().join("head")).await {
-            Ok(_) => Self::open(store, prefix).await,
-            Err(object_store::Error::NotFound { .. }) => Self::create(store, prefix).await,
-            Err(error) => Err(invalid(error)),
-        }
+        let (catalog, verb) = match store.head(&prefix.clone().join("head")).await {
+            Ok(_) => (Self::open(store, prefix).await?, "Opened"),
+            Err(object_store::Error::NotFound { .. }) => {
+                (Self::create(store, prefix).await?, "Created")
+            }
+            Err(error) => return Err(invalid(error)),
+        };
+        let OpenSummary {
+            checkpoint,
+            replayed,
+            tables,
+            lease,
+        } = catalog.opened;
+        tracing::info!(
+            "{verb} the Cayenne object-native metastore at '{}': {tables} tables from the checkpoint at commit {checkpoint} plus {replayed} later commits, writing as lease {lease}",
+            directory.display()
+        );
+        Ok(catalog)
     }
     /// Replay committed records, then fence the previous writer with the next lease.
     /// # Errors
@@ -221,8 +244,16 @@ impl ObjectNativeCatalog {
             state,
             floor_state,
             since_floor,
+            floor,
         } = replayed;
+        let opened = OpenSummary {
+            checkpoint: floor,
+            replayed: since_floor.len(),
+            tables: state.tables.len(),
+            lease: generation,
+        };
         Ok(Self {
+            opened,
             inner: StateSlot {
                 available: Notify::new(),
                 inner: Mutex::new(Some(Inner {
@@ -242,6 +273,7 @@ struct Replayed {
     state: DatasetState,
     floor_state: DatasetState,
     since_floor: Vec<(u64, Vec<Record>)>,
+    floor: u64,
 }
 fn replay_state(opened: Opened) -> CatalogResult<Replayed> {
     let mut state = DatasetState::default();
@@ -251,6 +283,7 @@ fn replay_state(opened: Opened) -> CatalogResult<Replayed> {
             .map_err(invalid)?;
     }
     let floor_state = state.clone();
+    let floor = opened.floor;
     let mut since_floor = Vec::with_capacity(opened.records.len());
     for entry in opened.records {
         let mut records = Vec::new();
@@ -271,6 +304,7 @@ fn replay_state(opened: Opened) -> CatalogResult<Replayed> {
         state,
         floor_state,
         since_floor,
+        floor,
     })
 }
 
