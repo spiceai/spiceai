@@ -118,7 +118,7 @@ jobs:
                 // the host is shared (#14557), and starves the short macOS test jobs below
                 // that sit on that pool to avoid exactly this neighbour (#13761).
                 builder: "spiceai-macos-large",
-                // Test jobs share each mini with other runner instances, so every one
+                // A self-hosted Mac may run several runner instances, so every test job
                 // binds ports from allocate-spice-ports / allocate-service-ports.
                 runner: "spiceai-macos",
                 target_os: "darwin",
@@ -1078,7 +1078,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Several runner instances share each self-hosted Mac, so this job's database
+      # A self-hosted Mac may run several runner instances, so this job's database
       # servers bind ports allocated to it rather than their stock ones.
       - name: Allocate database service ports
         uses: ./.github/actions/allocate-service-ports
@@ -1277,7 +1277,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Several runner instances share each self-hosted Mac, so this job's database
+      # A self-hosted Mac may run several runner instances, so this job's database
       # servers bind ports allocated to it rather than their stock ones.
       - name: Allocate database service ports
         uses: ./.github/actions/allocate-service-ports
@@ -1520,7 +1520,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Several runner instances share each self-hosted Mac, so this job's database
+      # A self-hosted Mac may run several runner instances, so this job's database
       # servers bind ports allocated to it rather than their stock ones.
       - name: Allocate database service ports
         if: matrix.target.target_os == 'darwin'
@@ -1788,7 +1788,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Several runner instances share each self-hosted Mac, so this job's database
+      # A self-hosted Mac may run several runner instances, so this job's database
       # servers bind ports allocated to it rather than their stock ones.
       - name: Allocate database service ports
         uses: ./.github/actions/allocate-service-ports

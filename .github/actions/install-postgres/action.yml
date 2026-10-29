@@ -79,7 +79,7 @@ runs:
           return 1
         }
         if [ "${{ inputs.isolated }}" = "true" ]; then
-          # Several runner instances share a self-hosted Mac, so the server runs from
+          # A self-hosted Mac may run several runner instances, so the server runs from
           # its own data directory on CI_PG_PORT, as the isolated Linux path does. A
           # GitHub-hosted Mac is a fresh VM, so 5432 is free there without allocation.
           port="${CI_PG_PORT:-5432}"
