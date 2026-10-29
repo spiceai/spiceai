@@ -131,7 +131,7 @@
   "source-down-at-start": 36,
   "sql-ddl": 47,
   "sql-ddl-agent": 21,
-  "sql-ddl-sources": 25,
+  "sql-ddl-sources": 62,
   "sql-explain-protocols": 1,
   "sql-operator-values": 1,
   "sql-predicate-precedence": 17,
