@@ -22,11 +22,12 @@ limitations under the License.
 //! minute rather than when it finally finishes.
 
 use std::collections::VecDeque;
+use std::fmt::Display;
 use std::time::Duration;
 
 use parking_lot::Mutex;
 use runtime_component::dataset::acceleration::RefreshMode;
-use tokio::task::AbortHandle;
+use tokio_util::task::AbortOnDropHandle;
 
 /// How many of a dataset's recent successful refreshes, per mode, make its baseline.
 const HISTORY: usize = 10;
@@ -54,7 +55,8 @@ pub(crate) struct RefreshDurations {
 pub(crate) struct SlowAfter {
     /// How long the refresh may run before it is reported.
     pub elapsed: Duration,
-    /// The median duration of the recent refreshes.
+    /// The median duration of the recent refreshes, the lower of the middle two for an even
+    /// count, so one slow refresh does not raise the baseline.
     pub median: Duration,
     /// How many recent refreshes the median is over.
     pub refreshes: usize,
@@ -92,7 +94,7 @@ impl RefreshDurations {
         }
         let mut sorted: Vec<Duration> = history.iter().copied().collect();
         sorted.sort_unstable();
-        let median = sorted[sorted.len() / 2];
+        let median = sorted[(sorted.len() - 1) / 2];
         Some(SlowAfter {
             elapsed: (median * SLOWDOWN_FACTOR).max(median + MIN_EXCESS),
             median,
@@ -105,7 +107,7 @@ impl RefreshDurations {
 /// `dataset` or `view`.
 pub(crate) fn slow_refresh_warning(
     component_type: &str,
-    name: &str,
+    name: &impl Display,
     mode: RefreshMode,
     slow: SlowAfter,
 ) -> String {
@@ -126,29 +128,26 @@ fn format_duration(duration: Duration) -> String {
     let rounded = if duration >= Duration::from_secs(1) {
         Duration::from_secs(duration.as_secs())
     } else {
-        Duration::from_millis(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        Duration::from_millis(duration.subsec_millis().into())
     };
     humantime::format_duration(rounded).to_string()
 }
 
 /// Logs the warning if the refresh is still running after `slow.elapsed`. Dropping the
-/// watch, when the refresh ends, cancels it.
-pub(crate) struct SlowRefreshWatch(AbortHandle);
-
-impl SlowRefreshWatch {
-    pub(crate) fn start(warning: String, slow: SlowAfter) -> Self {
-        let task = tokio::spawn(async move {
-            tokio::time::sleep(slow.elapsed).await;
-            tracing::warn!("{warning}");
-        });
-        Self(task.abort_handle())
-    }
-}
-
-impl Drop for SlowRefreshWatch {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
+/// handle, when the refresh ends, cancels it. The warning is built only if it fires.
+pub(crate) fn watch(
+    component_type: &'static str,
+    name: impl Display + Send + 'static,
+    mode: RefreshMode,
+    slow: SlowAfter,
+) -> AbortOnDropHandle<()> {
+    AbortOnDropHandle::new(tokio::spawn(async move {
+        tokio::time::sleep(slow.elapsed).await;
+        tracing::warn!(
+            "{}",
+            slow_refresh_warning(component_type, &name, mode, slow)
+        );
+    }))
 }
 
 #[cfg(test)]
@@ -186,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn the_median_ignores_one_outlier_and_keeps_the_last_ten() {
+    fn the_median_ignores_slow_outliers_and_keeps_the_last_ten() {
         let mut seconds = vec![600];
         seconds.extend([20; 10]);
         // The 600s refresh has left the window of the last ten.
@@ -199,6 +198,10 @@ mod tests {
         let slow =
             durations(RefreshMode::Full, &[20, 21, 600, 22, 19]).slow_after(RefreshMode::Full);
         assert_eq!(slow.map(|s| s.median), Some(Duration::from_secs(21)));
+
+        // With an even count, half of them slow, the baseline stays at the usual pace.
+        let slow = durations(RefreshMode::Full, &[20, 600, 20, 600]).slow_after(RefreshMode::Full);
+        assert_eq!(slow.map(|s| s.median), Some(Duration::from_secs(20)));
     }
 
     #[test]
@@ -217,7 +220,7 @@ mod tests {
             .slow_after(RefreshMode::Full)
             .expect("three refreshes");
         assert_eq!(
-            slow_refresh_warning("dataset", "orders", RefreshMode::Full, slow),
+            slow_refresh_warning("dataset", &"orders", RefreshMode::Full, slow),
             "Refresh of dataset 'orders' has run for 1m 3s, more than 3 times the 21s its last 3 full refreshes took at the median, so its accelerated data is falling further behind the source than usual. A slower source or network path is the usual cause: compare the dataset's `dataset_acceleration_refresh_bytes_written` rate with earlier refreshes, and check the load on the server its connections reached. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
         );
     }
@@ -232,8 +235,9 @@ mod tests {
             .slow_after(RefreshMode::Append)
             .expect("three refreshes");
         assert!(
-            slow_refresh_warning("view", "v", RefreshMode::Append, slow)
-                .starts_with("Refresh of view 'v' has run for 30s, more than 3 times the 50ms its last 3 append refreshes took at the median")
+            slow_refresh_warning("view", &"v", RefreshMode::Append, slow).starts_with(
+                "Refresh of view 'v' has run for 30s, more than 3 times the 50ms its last 3 append refreshes took at the median"
+            )
         );
     }
 }

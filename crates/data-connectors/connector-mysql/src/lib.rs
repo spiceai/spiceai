@@ -28,7 +28,7 @@ use datafusion::sql::sqlparser::dialect::MySqlDialect;
 use datafusion_table_providers::mysql::MySQLTableFactory;
 use datafusion_table_providers::sql::arrow_sql_gen::mysql::MysqlZeroDateBehavior;
 use datafusion_table_providers::sql::db_connection_pool::{
-    Error as DbConnectionPoolError, dbconnection,
+    dbconnection,
     mysqlpool::{self, MySQLConnectionPool},
 };
 use mysql_async::{Metrics, prelude::Queryable};
@@ -48,19 +48,10 @@ use std::sync::{Arc, LazyLock};
 
 pub mod replication;
 
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Unable to create MySQL connection pool: {source}"))]
-    UnableToCreateMySQLConnectionPool { source: DbConnectionPoolError },
-}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
 const DEFAULT_POOL_SIZE: PoolSizeDefaults = PoolSizeDefaults { min: 1, max: 5 };
 /// `refresh_mode: changes` datasets use the pool only for schema probes at initialization;
 /// replication runs over its own dedicated connections. Unless the user sized the pool, it
-/// holds no idle connection and opens at most two, which matters at N CDC datasets per
-/// source database. (Same policy as the Postgres connector.)
+/// holds no idle connection, which matters at N CDC datasets per source database.
 const CHANGES_MODE_POOL_SIZE: PoolSizeDefaults = PoolSizeDefaults { min: 0, max: 2 };
 
 pub struct MySQL {
@@ -142,14 +133,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("5")
         .help_link(MYSQL_DOCS),
     ParameterSpec::component("connection_max_lifetime")
-        .description(
-            "How long a pooled connection is used before it is closed and replaced, such as '5m'. \
-             Replacing connections makes the pool resolve the host again, so it spreads across \
-             the servers behind a load-balanced hostname such as a reader endpoint. Each \
-             connection's lifetime is extended by a random amount of up to a fifth of it, so \
-             connections opened together are not replaced together. A connection is not closed \
-             while a query is using it. '0s' keeps connections open indefinitely. Default: 5m.",
-        )
+        .description(pool::CONNECTION_MAX_LIFETIME_DESCRIPTION)
         .default("5m")
         .help_link(MYSQL_DOCS),
     ParameterSpec::component("time_zone")
@@ -277,30 +261,12 @@ impl DataConnectorFactory for MySQLFactory {
             })?;
             let param_map = params.parameters.to_secret_map();
 
-            let pool = match MySQLConnectionPool::new_with_pool_opts(param_map, move |pool_opts| {
-                pool_settings.apply(pool_opts)
-            })
-            .await
-            {
-                Ok(pool) => {
-                    let component = match &params.component {
-                        ConnectorComponent::Dataset(dataset) => {
-                            format!("dataset '{}'", dataset.name)
-                        }
-                        ConnectorComponent::Catalog(catalog) => {
-                            format!("catalog '{}'", catalog.name)
-                        }
-                    };
-                    Arc::new(
-                        pool.with_zero_date_behavior(zero_date_behavior)
-                            .with_new_connection_observer(move |identity| {
-                                tracing::info!(
-                                    "{}",
-                                    pool::new_connection_message(&component, identity)
-                                );
-                            }),
-                    )
-                }
+            let component = match &params.component {
+                ConnectorComponent::Dataset(dataset) => format!("dataset '{}'", dataset.name),
+                ConnectorComponent::Catalog(catalog) => format!("catalog '{}'", catalog.name),
+            };
+            let pool = match pool::connect(param_map, pool_settings, component).await {
+                Ok(pool) => Arc::new(pool.with_zero_date_behavior(zero_date_behavior)),
                 Err(error) => match error {
                     mysqlpool::Error::InvalidUsernameOrPassword => {
                         return Err(
@@ -370,22 +336,7 @@ impl DataConnectorFactory for MySQLFactory {
     }
 }
 
-/// Resolves the pool settings from the parameters the user set. `Parameters` fills in each
-/// spec's default, so whether the user set one is read from the Spicepod's own params (or the
-/// value having been loaded from a secret store), and only then is its value taken.
 fn resolve_pool_settings(params: &ConnectorParams) -> pool::Result<PoolSettings> {
-    let spicepod_params = match &params.component {
-        ConnectorComponent::Dataset(dataset) => &dataset.params,
-        ConnectorComponent::Catalog(catalog) => &catalog.params,
-    };
-    let user_set = |key: &str| {
-        let set = spicepod_params.contains_key(&format!("mysql_{key}"))
-            || spicepod_params.contains_key(key)
-            || params.parameters.is_autoloaded(key);
-        set.then(|| params.parameters.get(key).expose().ok())
-            .flatten()
-    };
-
     let is_changes_mode = matches!(
         &params.component,
         ConnectorComponent::Dataset(dataset) if dataset.acceleration.as_ref().is_some_and(|acceleration| {
@@ -396,9 +347,9 @@ fn resolve_pool_settings(params: &ConnectorParams) -> pool::Result<PoolSettings>
 
     PoolSettings::resolve(
         PoolParams {
-            pool_min: user_set("pool_min"),
-            pool_max: user_set("pool_max"),
-            connection_max_lifetime: user_set("connection_max_lifetime"),
+            pool_min: params.user_set("pool_min"),
+            pool_max: params.user_set("pool_max"),
+            connection_max_lifetime: params.user_set("connection_max_lifetime"),
             connection_string: params.parameters.get("connection_string").expose().ok(),
         },
         Some(if is_changes_mode {

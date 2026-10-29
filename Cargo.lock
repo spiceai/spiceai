@@ -7490,7 +7490,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=dfa9a266a58937f96bd1e03221cba3ba55818b21#dfa9a266a58937f96bd1e03221cba3ba55818b21"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=6ba58db836c62681c3636f55d8ebbb0c457f6ce5#6ba58db836c62681c3636f55d8ebbb0c457f6ce5"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -18945,6 +18945,7 @@ dependencies = [
  "datafusion-table-providers",
  "fundu",
  "futures",
+ "humantime",
  "insta",
  "object_store 0.13.2",
  "opentelemetry 0.32.0",

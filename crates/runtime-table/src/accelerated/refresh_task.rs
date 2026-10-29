@@ -98,7 +98,7 @@ use spicepod::metric::Metrics;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
 use telemetry::timing::MultiTimeMeasurement;
 use tokio::{
@@ -1113,7 +1113,8 @@ impl RefreshTask {
             return Err(e);
         }
 
-        self.refresh_durations.record(refresh.mode, started.elapsed());
+        self.refresh_durations
+            .record(refresh.mode, started.elapsed());
 
         // Only record metrics if a refresh was successful
         self.handle_metrics(
@@ -1138,18 +1139,20 @@ impl RefreshTask {
 
     /// Starts the watch that reports this refresh if it runs far longer than the dataset's
     /// recent refreshes in `mode` did; `None` until there are enough of them.
-    fn watch_for_slow_refresh(&self, mode: RefreshMode) -> Option<slow_refresh::SlowRefreshWatch> {
+    fn watch_for_slow_refresh(
+        &self,
+        mode: RefreshMode,
+    ) -> Option<tokio_util::task::AbortOnDropHandle<()>> {
         if is_spice_internal_dataset(&self.dataset_name) {
             return None;
         }
         let slow = self.refresh_durations.slow_after(mode)?;
-        let warning = slow_refresh::slow_refresh_warning(
+        Some(slow_refresh::watch(
             self.component_type(),
-            &self.dataset_name.to_string(),
+            self.dataset_name.clone(),
             mode,
             slow,
-        );
-        Some(slow_refresh::SlowRefreshWatch::start(warning, slow))
+        ))
     }
 
     /// Ends a refresh that found nothing to fetch: the skip is counted, the dataset is
