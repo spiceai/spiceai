@@ -109,7 +109,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [arrow-adbc](#arrow-adbc) | `6e4119ac2007c6647702a1817505d6849b07e0e0` | `spiceai-24` |
 | [arrow-rs](#arrow-rs) | `2124b9e85c8c4f50fdacfa23d75cbad6a4db9086` | `spiceai-59` |
 | [async-openai](#async-openai) | `307eaf407cbf71afa967f3008250ba96c79626b7` | `spiceai` |
-| [candle](#candle-and-its-kernel-crates) | `3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb` | `spiceai` |
+| [candle](#candle-and-its-kernel-crates) | `829b57522e601ea169b04e2d4a375c3abe3ed58c` | `spiceai` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
 | [candle-index-select-cu](#candle-and-its-kernel-crates) | `75fc0b689b33a327907d36dd479f7d242640ca71` | `master` |
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
@@ -120,14 +120,14 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `4a2920746865562e604150fbee49eea6241c0b85` | `spiceai-55` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
-| [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
+| [docx-rs](#docx-rs) | `81faaf2187185b097710b9ee589bf039efdd74de` | `jeadie/render-zip-upgrade` |
 | [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1f0744b900e69e1b3fafa721aa4283bd4b048a61` | `spiceai-0.11.0-df-55` |
 | [llama.cpp](#llamacpp) | `a337bb5ce3590beb8763494b4381fe830bac0bc8` | `spiceai-b11803` |
-| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `aa8e8d43949970b91fb42a2243b4f60f810d9bbd` | `spiceai` |
+| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
-| [orc-rust](#orc-rust) | `5b35c6d10a8cbd9750d501216ff04e72e23829b6` | `spiceai-0.9` |
+| [orc-rust](#orc-rust) | `d9632e7ae973456c81c660c04e5f55cc86489bcb` | `spiceai-0.9` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
 | [sea-query](#sea-query) | `ae75baef819513fb8d19af014972dcfa324e201a` | `spiceai` |
@@ -679,6 +679,7 @@ branch `spiceai-0.9` cut from upstream `v0.9.0`.
 |---|---|---|---|
 | Metadata streams (file footer, file metadata, stripe footers, row indexes, bloom filters) fail once decoded output exceeds both 64 MiB and 100 times the encoded size; column data streams stay unbounded | A small ORC file with a highly compressible footer makes the runtime allocate until it runs out of memory | silent (memory) | `crates/dataformat-orc/src/file_format.rs::infer_schema_rejects_high_ratio_compressed_footer` |
 | Each codec stops decoding at the remaining allowance, with LZO decoded through `lzo` into a bounded buffer instead of `lzokay-native` | One compressed chunk is decoded in full before the bound rejects it, so a single chunk can still allocate up to its own expansion | silent (memory) | **GAP** — the bound above still rejects the stream after the chunk decodes, so only a memory measurement can tell the two apart |
+| The footer type tree is refused past 100 levels below the root, or when it uses one footer type more than once (`DataType::from_proto`) | A small ORC footer whose subtype indices nest very deep, point back at an ancestor or share a child makes schema building recurse until the stack overflows or build a tree far larger than the file | silent (crash / memory) | `crates/dataformat-orc/src/file_format.rs::infer_schema_bounds_the_footer_type_tree` |
 
 ## text-splitter
 
@@ -698,9 +699,12 @@ patches. They landed on `spiceai` as the merge of spiceai/mistral.rs#47 (`ea48c0
 spiceai/mistral.rs#48, squash-merged as `44507766`, adds the DeepSeek-V4.1 decode fixes
 on top, spiceai/mistral.rs#49, squash-merged as `d99170d2`, the DeepSeek-V4.1 and
 GLM-5.3 decode speedups on top of that, spiceai/mistral.rs#50, squash-merged as
-`dc73261e`, exports the chat-template renderer, and spiceai/mistral.rs#52, squash-merged
-as `aa8e8d43`, the tool-call parser, so `git diff v0.9.4 aa8e8d43` is the whole fork
-delta. #47 built it in 32 commits. The first replays the Spice patches from the
+`dc73261e`, exports the chat-template renderer, spiceai/mistral.rs#52, squash-merged
+as `aa8e8d43`, the tool-call parser, spiceai/mistral.rs#53, squash-merged as `fcd94520`,
+ring collectives over RDMA, spiceai/mistral.rs#54, squash-merged as `2f58f444`, the
+DeepSeek-V4 DSML tool-call parser, and spiceai/mistral.rs#55, squash-merged as
+`e40436e4`, the candle pin at `zip` 9.1, so `git diff v0.9.4 e40436e4` is the whole
+fork delta. #47 built it in 32 commits. The first replays the Spice patches from the
 `v0.9.0` line: `glm-dsa`
 GGUF loading, the i-quant MoE fallback, ring tensor parallelism past two ranks,
 multi-node NCCL on the GGUF path, and the `spiceai/candle` pin. The rest add the GGUF
@@ -733,6 +737,8 @@ rather than by taking them. A re-cut cannot lose what the fork does not carry.
 | `mistral.rs`: `deepseek41` and `glm5-next` decode run fewer, larger kernels: the hyper-connection sinkhorn as one CUDA kernel, the hyper-connection and engram projections oriented once at load with the engram projection kept quantized, the attention heads folded into one matmul over the key they share (DeepSeek-V4.1's MQA, GLM-5.3's MLA latent), and GLM-5.3's KDA causal convolution on the device (spiceai/mistral.rs#49) | DeepSeek-V4.1-Flash decodes at about 5.3 tokens/s on the 3-node ring instead of 10.5, and GLM-5.3-Flash at 5.8 instead of 8.6 on one node | silent (perf) | **GAP** — a perf-only row; the fork guards that each fast path computes what it replaced, and only runs there: `hyper_coeff_takes_the_gguf_out_in_matrix_oriented_at_load`, `an_engram_layer_runs_through_its_quantized_projection`, `folding_the_heads_into_one_matmul_matches_broadcasting_the_keys`, `the_fused_sinkhorn_matches_the_tensor_ops_on_cuda` and `the_device_convolution_matches_the_host_loop` |
 | `mistral.rs`: `apply_chat_template_to` and `ChatTemplateValue` exported from `mistralrs-core` (spiceai/mistral.rs#50), so the llama.cpp engine renders a prompt with the same code as the mistral.rs engine | The llama.cpp engine fails to build | build | compile-guarded |
 | `mistral.rs`: `ToolCallingMatcher` and `ToolCallFormat` exported from `mistralrs-core` (spiceai/mistral.rs#52), so the llama.cpp engine reads tool calls out of generated text with the same parser as the mistral.rs engine | `crates/llms-llamacpp` fails to build | build | compile-guarded |
+| `mistral.rs`: the ring backend's collectives (`SumAllReduce`, `AllGather`) exchange over RDMA (RoCE v2) when every link of the ring has an RDMA device on both ends, and over TCP otherwise (spiceai/mistral.rs#53; the `ring` feature of `mistralrs-quant`) | A ring whose links all have RDMA sends every collective over TCP: each hop is slower, with no error | silent (perf) | **GAP** — a perf-only row; the fork's PR records the measurement |
+| `mistral.rs`: `ToolCallFormat::DeepSeekDsml` and its parser read DeepSeek-V4's DSML tool-call markup (spiceai/mistral.rs#54) | A DeepSeek-V4 reply to a request with tools comes back as DSML markup in `content`, with no tool call, from both the mistral.rs and llama.cpp engines | silent (wrong text) | **GAP** — guarded in the fork, not here: `mistralrs-core/src/tools/parsers/dsml.rs` and the cases in `mistralrs-core/src/tools/testdata/tool_call_parse_oracle.json` |
 | `mistral.rs`: GGUF `eot_token_id` and `eom_token_id` stop generation, as `eos_token_id` does | GLM-5.3-Flash's reply runs past `<|user|>` into an invented next turn until `max_tokens` | silent (wrong text) | **GAP** |
 | `mistral.rs`: a `distributed` build serves a single-node model, and a ring head keeps a second request queued while one runs | A model without `distributed_backend` never finishes loading in a `distributed` build, and a second request to a ring deadlocks every rank at the next all-reduce | load failure / hang | **GAP** |
 | `text-embeddings-inference`: Spice integration + candle re-pointing | Local embedding models fail to load | build | compile-guarded |
@@ -827,7 +833,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**44 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**46 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -861,12 +867,13 @@ They are not equal in consequence; this is the order to close them in.
    re-cut that drops the rotation computes every token from two of three shards
    at world size 3, with no error. A guard needs either a 3-rank ring in a test
    or the collective run over a fake transport from this repo.
-5. `mistral.rs` chat-template defaults, GGUF end-of-turn tokens, and the
-   `deepseek41` decode fixes — three rows. Losing the first renders every template
-   with thinking on, so DeepSeek-V4.1 returns an empty `content`; losing the second
-   lets GLM-5.3-Flash run past the end of its turn; losing the third makes
-   DeepSeek-V4.1 degenerate after a few tokens. The fork's own tests guard the
-   third, and only run there. A guard needs a GGUF-loaded model in a test here; today's
+5. `mistral.rs` chat-template defaults, GGUF end-of-turn tokens, the
+   `deepseek41` decode fixes, and the DSML tool-call parser — four rows. Losing the
+   first renders every template with thinking on, so DeepSeek-V4.1 returns an empty
+   `content`; losing the second lets GLM-5.3-Flash run past the end of its turn;
+   losing the third makes DeepSeek-V4.1 degenerate after a few tokens; losing the
+   fourth returns DeepSeek-V4's tool calls as markup in `content`. The fork's own
+   tests guard the third and fourth, and only run there. A guard needs a GGUF-loaded model in a test here; today's
    evidence is the three models served on the 3-node DGX Spark cluster.
 
 **Hangs, crashes and failures.** These take a query or the process down:
@@ -937,6 +944,8 @@ without becoming a flaky timing test:
     `mistral.rs`/`candle` i-quant MoE kernels; `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `mistral.rs` `deepseek41` and `glm5-next` decode kernels (spiceai/mistral.rs#49), which
     no suite here trends yet — their evidence is the DGX Spark decode A/B in that PR;
+    `mistral.rs` ring collectives over RDMA (spiceai/mistral.rs#53), which no suite
+    here trends either — a ring that loses it falls back to TCP;
     `llama.cpp`'s opt-in decode and prompt levers for a model split across nodes
     (spiceai/llama.cpp#7, #8, #12), measured on the same cluster;
     `snowflake-rs` streaming batches (memory, not latency — but see the

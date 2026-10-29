@@ -132,6 +132,24 @@ pub(crate) fn ensure_text_within_limit(len: u64, format: DocumentType) -> Result
     Ok(())
 }
 
+/// Opens a zip archive, rejecting it when a local file header disagrees with
+/// its central directory entry, two entries share a name, or entries overlap.
+/// Such an archive can show different content to different zip readers ("zip
+/// cloaking", GHSA-m665-v7pm-7grj), so it is refused before any entry is read.
+pub(crate) fn open_consistent_archive(
+    raw: &Bytes,
+    format: DocumentType,
+) -> Result<ZipArchive<Cursor<Bytes>>> {
+    let mut archive = ZipArchive::new(Cursor::new(raw.clone()))
+        .boxed()
+        .context(InternalParsingSnafu { format })?;
+    archive
+        .validate_header_consistency()
+        .boxed()
+        .context(InternalParsingSnafu { format })?;
+    Ok(archive)
+}
+
 /// Magic number of the OLE compound file format, which Office uses for
 /// password-protected OOXML and the legacy binary formats (`.doc`, `.xls`).
 const COMPOUND_FILE_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
@@ -152,9 +170,7 @@ pub(crate) fn rebuild_package(raw: &Bytes, format: DocumentType, limits: Limits)
         .context(InternalParsingSnafu { format });
     }
 
-    let mut archive = ZipArchive::new(Cursor::new(raw.clone()))
-        .boxed()
-        .context(InternalParsingSnafu { format })?;
+    let mut archive = open_consistent_archive(raw, format)?;
     let mut budget = DecompressionBudget::new(format, limits);
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
@@ -167,7 +183,11 @@ pub(crate) fn rebuild_package(raw: &Bytes, format: DocumentType, limits: Limits)
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_owned();
+        let name = entry
+            .name()
+            .boxed()
+            .context(InternalParsingSnafu { format })?
+            .into_owned();
         let data = budget.read_entry(&name, entry)?;
         writer
             .start_file(name, options)
@@ -1458,7 +1478,7 @@ mod tests {
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index).expect("entry");
             assert_eq!(entry.compression(), CompressionMethod::Stored);
-            let name = entry.name().to_owned();
+            let name = entry.name().expect("entry name").into_owned();
             let mut data = Vec::new();
             entry.read_to_end(&mut data).expect("read entry");
             entries.push((name, data));
