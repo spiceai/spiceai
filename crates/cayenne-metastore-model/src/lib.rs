@@ -15,6 +15,7 @@ mod read_programs;
 mod retention;
 mod seq_order;
 mod source_positions;
+mod standby;
 mod state_rules;
 mod transactions;
 mod window;
@@ -155,6 +156,54 @@ pub fn runs() -> Vec<Run> {
             bound: 2,
             seed: None,
             failure: "I10 source append prefix exactly once",
+        },
+        Run {
+            name: "standby",
+            family: "standby",
+            mode: "standby",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "standby-three",
+            family: "standby",
+            mode: "standby-three",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "standby-early-safety",
+            family: "standby",
+            mode: "standby-early-safety",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "standby-no-generation",
+            family: "standby",
+            mode: "standby-no-generation",
+            bound: 0,
+            seed: None,
+            failure: "no stale-generation commit accepted",
+        },
+        Run {
+            name: "standby-early-acquire",
+            family: "standby",
+            mode: "standby-early",
+            bound: 0,
+            seed: None,
+            failure: "lease exclusive until expiry",
+        },
+        Run {
+            name: "standby-no-renew",
+            family: "standby",
+            mode: "standby-no-renew",
+            bound: 0,
+            seed: None,
+            failure: "healthy holder keeps its lease",
         },
         Run {
             name: "commits-restart-turnover",
@@ -507,6 +556,22 @@ pub fn runs() -> Vec<Run> {
             bound: 2,
             seed: None,
             failure: "I2 acknowledged logical write exactly once",
+        },
+        Run {
+            name: "commits-retry-expiry",
+            family: "commits",
+            mode: "commit-retry-expiry",
+            bound: 2,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "commits-retry-expiry-no-horizon",
+            family: "commits",
+            mode: "commit-retry-expiry-no-horizon",
+            bound: 2,
+            seed: None,
+            failure: "logical write never applied twice",
         },
         Run {
             name: "commits-etag",
@@ -2114,6 +2179,8 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
             ) => true,
             _ => false,
         };
+    let standby_required =
+        run.family == "standby" && run.failure.is_empty() && *expectation == Expectation::Sometimes;
     let promotion_required = run.family == "cold-promotion"
         && run.failure.is_empty()
         && *expectation == Expectation::Sometimes;
@@ -2167,6 +2234,7 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
             _ => false,
         };
     added_required
+        || standby_required
         || promotion_required
         || delivery_required
         || widened_required
@@ -2179,6 +2247,7 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
                 | "source-positions"
                 | "retention"
                 | "unknown-action-refusal" => *expectation == Expectation::Sometimes,
+                "commits-retry-expiry" => name == "unresolved past evidence horizon",
                 "commits-restart-turnover" => matches!(
                     name,
                     "restart and lease turnover" | "persisted attempt restored"
@@ -2277,6 +2346,7 @@ where
                 || run.name.starts_with("dataset-lifecycle")
                 || run.name.starts_with("source-")
                 || run.family == "retention"
+                || run.family == "standby"
                 || run.mode.contains("restart")
                 || run.family == "action-compatibility")
                 && p.expectation != Expectation::Sometimes
@@ -2329,6 +2399,7 @@ pub fn run(name: &str) -> Result<(), String> {
         ),
         "dataset-lifecycle" => check(dataset_lifecycle::Protocol::new(r.mode, r.bound), r),
         "source-positions" => check(source_positions::Protocol::new(r.mode, r.bound), r),
+        "standby" => check(standby::Protocol::new(r.mode), r),
         "action-compatibility" => check(action_compatibility::Protocol::new(r.mode), r),
         "retention" => check(retention::Protocol::new(r.mode), r),
         "commits" => check(commits::Protocol::new(r.mode, r.bound), r),

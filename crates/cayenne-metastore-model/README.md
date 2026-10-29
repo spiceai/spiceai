@@ -53,6 +53,9 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `transactions-three-participants` | Three identical participant heads; Prepare/decision/Resolve, ordinary writes, checkpoint/GC and uncertain CAS; full participant values sorted by derived `Ord` for symmetry | Exhaustive symmetry bound 0; original bound-1 samples unchanged |
 | `commits-commit` | Two writers, delayed original/retry deliveries, exact-base CAS, lease takeover, folded checkpoint; I1–I5, I8 | Exhaustive bound 2: K=2, two attempts per writer, up to three leases; samples bound 4: K=3 |
 | `commits-retry` | Unavailable head read, fresh-id retry, delayed deliveries and acknowledgement; exactly-once logical write, I5 | Exhaustive/control 2; one writer, two attempts |
+| `commits-retry-expiry` | The retry graph plus a head store clock that advances with every head write, including takeovers, and checkpoints that drop attempt ids older than the evidence horizon; resolution consults only retained evidence, and an attempt past the horizon resolves unresolved and is reported as commit outcome unknown, never retried; I2/I5, no double apply, unknown never retried | Exhaustive/control 2; one writer, two attempts, horizon 2 store-time units, up to three leases |
+| `standby` / `standby-three` | Two or three instances of one Spicepod on one location: a lease object with an expiry on a discrete clock, renewal by the holder, crash, restart, pause and resume, acquisition only after expiry, and takeover by a head commit that raises the generation; only the generation in the head fences writers; the ingester commits source changes by exact-head CAS and then acknowledges them; standbys serve head reads. No change applied twice or acknowledged without commit, no stale-generation commit accepted, one committing instance per head generation, lease exclusivity, no lease loss by a healthy holder, and an ingester again within the lease duration of a holder failure | Exhaustive: lease duration 3 ticks, 2 source changes, 1 crash, 1 pause, at most 4 lease epochs; a running holder renews and a running standby acquires or takes over before the next tick |
+| `standby-early-safety` | The standby graph with acquisition allowed before expiry; checks only the safety properties, which do not depend on lease timing | Same bounds |
 | `commits-etag` | Explicit store-version CAS and delayed retry across head changes; I1–I3, I5 | Exhaustive/control 1; one writer, one original/retry pair |
 | `commits-storage` | Checkpoint parts/root before head publication, delayed GC, a query kept by retention, lagging reopen, late seal; I4, I7, I8 | Bound 2; samples 4 |
 | `transactions-txn` | Two datasets, one transaction, competing ordinary writes, reservations, commit/abort create race, helper Resolve, uncertain CAS, checkpoint/GC; one participant writes other keys while prepared so the Prepare can reach a checkpoint; I3–I6, I8 | Exhaustive 1 (two lease generations), controls 0 except owner restriction 1; samples 2, 3 (two outstanding handles per dataset) |
@@ -70,6 +73,32 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 `commit-guards` and its three controls use one writer, one attempt, an original/retry
 pair, three lease generations, and no checkpoint/filler actions. They isolate
 CAS, lease and identical-byte obligations at exhaustive bound 1.
+
+`commits-retry-expiry` adds a store clock to the retry graph: every head write,
+including the commit that raises the lease generation at a takeover, advances
+it, and each accepted position keeps the store time it landed at. A checkpoint
+may at any time drop the attempt ids of positions at least the horizon older
+than the head. Resolution looks up the attempt's exact position in retained
+evidence: a retained id decides accepted or rejected, and a dropped one yields
+unresolved even though the head has moved, so the writer reports the commit
+outcome unknown and never retries. The control instead classifies a moved head
+without evidence as rejection, retries a fresh id, and applies the logical write
+twice.
+
+`standby` models instances of one Spicepod on one location with relative
+time: each lease holds a count of ticks left, so the clock needs no bound.
+Ticks wait for urgent steps: a running holder renews before its lease runs
+out, a running instance acquires an expired lease, and a new holder commits its
+takeover. These are the timing assumptions availability rests on; safety needs
+none of them. Acquisition is a conditional write on the lease object; the
+takeover is a CAS on the head that requires a lower generation and raises it;
+ingest commits are exact-head CASs, so a writer whose generation is no longer in
+the head fails and steps down. An in-flight commit survives pause and step-down,
+which is how a resumed writer reaches the head with a stale base. Availability
+counts ticks since the latest holder failure during which some instance runs and
+none ingests; it reaches the lease duration and never exceeds it. Ingest CAS
+responses are never lost here; uncertain outcomes are covered by `commits-*` and
+`source-positions`.
 
 `commits-retry` and `commits-no-resolve-before-retry` extend the commit
 composition with an unavailable head read: safe classification stays unresolved;
@@ -170,6 +199,10 @@ as a separate maintenance process does.
 | `commit-no-lease` | Rebase a stale owner's condition without its lease check: I3 |
 | `commit-no-identical` | Retry different bytes with the original condition: I5 |
 | `commits-no-resolve-before-retry` | Treat an unreadable head as rejection and retry a fresh id: I2 acknowledged logical write exactly once |
+| `commits-retry-expiry-no-horizon` | Treat no retained evidence past the horizon as rejection and retry a fresh id: logical write never applied twice (I5 also fails) |
+| `standby-no-generation` | Takeover acquires the lease object and reads the head without raising its generation: a paused writer resumes and its stale-generation commit is accepted; two instances also commit under one head generation |
+| `standby-early-acquire` | A standby acquires before expiry while the holder renews: two instances hold unexpired leases (and a healthy holder loses its lease). `standby-early-safety` shows the generation in the head still prevents stale commits and double application |
+| `standby-no-renew` | The holder never renews: a healthy holder loses its lease; availability also fails when the standby pauses |
 | `commits-etag-repeat` | Reuse an earlier store tag for a later head: I1 unique accepted position |
 | `seq-order-maintenance-draw` | Maintenance draws ahead of the buffer and publishes first, then permits the lower buffered record: I9 resurrected row after a later compaction |
 | `seq-order-no-shift` | Independent CAS loser retries its unchanged lower sequences: I9 resurrected row after compaction |
@@ -314,12 +347,12 @@ can finish old requests throughout. Full request bytes remain only as network re
 retained acceptance evidence; absence remains unresolved, and it cannot resend
 using a lost condition or payload. This checks identity retention, not a real
 receipt serialization/reconstruction format or eventual completion of unresolved
-operations. New `Issue` actions denote the current owner after a lease change; this
-profile does not model process ownership election. Source restarts explicitly
+operations. New `Issue` actions denote the current owner after a lease change;
+ownership election is modeled separately by `standby`. Source restarts explicitly
 acquire a new generation, reconcile buffered positions with the logged prefix,
 and re-read redelivery from the source acknowledgement. Stream payloads are unique
 append numbers so duplicates and gaps are observable. There is no backfill, multiple
-source partitions, evidence-retention expiry or real connector integration.
+source partitions, evidence-retention expiry (see `commits-retry-expiry`) or real connector integration.
 
 ## Limits
 
@@ -337,8 +370,15 @@ Resolve batch eviction or a second outstanding handle per dataset. The original 
 Existing focused models retain their original bounds and controls. Their narrow
 limits above still apply: in particular only the restart profile clears caller
 state, and the retention graph has one writer and one GC; GC on another node and
-several writers are not modelled. Evidence expiry is not modeled;
-unavailable reads may stay unresolved indefinitely. Results are symbolic protocol
+several writers are not modelled. Evidence expiry is modeled only in the
+single-writer retry graph (`commits-retry-expiry`), with one horizon value and
+symbolic store times; it is not composed with checkpoint bytes, transactions or
+source positions, and an unresolved attempt stays unresolved: the model does not
+check how the caller recovers the logical write. `standby` has one dataset, one
+source partition, at most one crash and one pause, never-lost ingest CAS
+responses, a single global clock (no clock drift between instances or against
+the lease object), and no retention, checkpoints or GC; its availability bound
+holds only under the urgent-step timing assumptions above. Results are symbolic protocol
 evidence, not observations of the Spice engine or a storage provider.
 
 All checkers use a 540-second watchdog. Incomplete budget probes establish no

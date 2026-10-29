@@ -39,6 +39,8 @@ fn main() -> Result<(), String> {
                 "seq-order-2-exhaust",
                 "seq-order-two-writers-2-exhaust",
                 "commits-retry",
+                "commits-retry-expiry",
+                "standby",
                 "commits-etag",
                 "commits-commit-focus-copy-2-exhaust",
                 "commits-storage-2-exhaust",
