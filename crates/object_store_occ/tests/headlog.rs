@@ -1013,8 +1013,7 @@ async fn headlog_spills_large_records_and_verifies_them_on_read() {
             .expect("corrupt spilled object");
         let error = Reader::open(Arc::clone(&backend.store), backend.prefix.clone())
             .await
-            .err()
-            .expect("corrupt payload must fail the open");
+            .expect_err("corrupt payload must fail the open");
         assert_eq!(
             error.to_string(),
             "Invalid head log: spilled payload does not match its reference"
