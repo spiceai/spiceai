@@ -29,6 +29,7 @@ use serde_json::Value;
 use crate::docker::Container;
 
 pub mod clickhouse;
+pub mod document;
 pub mod duckdb_cli;
 pub mod ducklake;
 pub mod files;
@@ -38,6 +39,7 @@ pub mod mock_http;
 pub mod mysql;
 pub mod object_store;
 pub mod postgres;
+pub mod write;
 
 pub struct Namespace {
     pub params: Value,
@@ -64,6 +66,12 @@ pub struct TextResult {
 pub trait Source: Send + Sync {
     /// The source's container; `None` for a source with no server (files).
     fn container(&self) -> Option<&Container>;
+
+    /// Every container the source runs, for saving their logs. A source
+    /// running more than its one `container` lists the rest too.
+    fn containers(&self) -> Vec<&Container> {
+        self.container().into_iter().collect()
+    }
 
     /// Removes everything the source started. A source running more than its
     /// one `container` removes the rest too.
@@ -95,6 +103,17 @@ pub trait Source: Send + Sync {
         columns: &[String],
         rows: &mut (dyn Iterator<Item = Vec<Option<String>>> + Send),
     ) -> Result<u64>;
+
+    /// Applies full row images, preserving the order returned by the mirror.
+    async fn apply(
+        &self,
+        _namespace: &str,
+        _table: &str,
+        _key: &str,
+        _changes: &[write::RowChange],
+    ) -> Result<()> {
+        anyhow::bail!("this source does not support row-image writes")
+    }
 
     /// The objects (or files) under `prefix` in this namespace.
     async fn list(&self, _namespace: &str, prefix: &str) -> Result<Vec<String>> {
@@ -151,6 +170,9 @@ pub async fn start(
 ) -> Result<Box<dyn Source>> {
     let dir = work.join(name);
     let source: Box<dyn Source> = match kind {
+        "kafka" | "mongodb" | "dynamodb" => {
+            Box::new(document::Document::start(name, run_id, kind, version).await?)
+        }
         "docker" => Box::new(generic::Generic::start(name, run_id, spec).await?),
         "postgres" => Box::new(postgres::Postgres::start(name, run_id, version).await?),
         "mysql" => Box::new(mysql::Mysql::start(name, run_id, version).await?),
@@ -161,7 +183,7 @@ pub async fn start(
         "mock-http" => Box::new(mock_http::MockHttp::start().await?),
         "ducklake" => Box::new(ducklake::DuckLake::start(name, run_id, version, dir).await?),
         other => anyhow::bail!(
-            "unknown source kind '{other}'; expected postgres, mysql, clickhouse, files, rustfs, iceberg, ducklake, mock-http or docker"
+            "unknown source kind '{other}'; expected kafka, mongodb, dynamodb, postgres, mysql, clickhouse, files, rustfs, iceberg, ducklake, mock-http or docker"
         ),
     };
     Ok(source)

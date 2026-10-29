@@ -101,11 +101,15 @@ impl MistralLlama {
         options: LocalModelOptions<'_>,
         ring_config_path: Option<tempfile::TempPath>,
     ) -> Result<Self> {
+        // mistral.rs reads the template file from `tokenizer_config` itself.
         let LocalModelOptions {
             chat_template_literal,
+            chat_template_file: _,
             context_length,
             paged_attention,
             reasoning,
+            // mistral.rs reads its ring from `RING_CONFIG`, which the caller wrote.
+            distributed: _,
         } = options;
         for weight in model_weights {
             if !weight.exists() {
@@ -1083,7 +1087,7 @@ const REASONING_LEVELS: [TemplateReasoningEffort; 4] = [
 /// What a model's chat template does with `reasoning_effort`, learned by rendering its
 /// generation prompt once per value when the model loads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ReasoningSupport {
+pub struct ReasoningSupport {
     /// Turning reasoning off can't stop the model reasoning: the prompt rendered with it off
     /// still opens a reasoning block, as GLM-5.3's does, or matches the template's own
     /// reasoning default, as gpt-oss's does by rendering `Reasoning: medium`.
@@ -1098,7 +1102,7 @@ impl ReasoningSupport {
     /// `enable_thinking` and a level, or returns `None` when the template fails. A template
     /// that fails to render with reasoning off or unset, or at every level, is left
     /// unchecked, so requests reach it as they would without this check.
-    fn from_renders(
+    pub fn from_renders(
         render: impl Fn(Option<bool>, Option<TemplateReasoningEffort>) -> Option<String>,
     ) -> Self {
         let (Some(off), Some(unset)) = (render(Some(false), None), render(None, None)) else {
@@ -1162,16 +1166,16 @@ fn names_level(prompt: &str, level: TemplateReasoningEffort) -> bool {
 
 /// The reasoning controls a chat template is rendered with.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ReasoningControls {
-    enable_thinking: Option<bool>,
-    reasoning_effort: Option<TemplateReasoningEffort>,
+pub struct ReasoningControls {
+    pub enable_thinking: Option<bool>,
+    pub reasoning_effort: Option<TemplateReasoningEffort>,
 }
 
 /// The controls for a request's `reasoning_effort`. Unset leaves both to the chat template,
 /// `none` turns reasoning off, and a level turns it on at that level. `minimal` asks for
 /// `low`, the least a template can be asked for. A value the template can't honor is
 /// refused with the message to show the caller.
-fn reasoning_controls(
+pub fn reasoning_controls(
     effort: Option<&ReasoningEffort>,
     support: &ReasoningSupport,
     model: &str,
@@ -1243,7 +1247,7 @@ const TOOL_CHOICE_DOCS: &str = "https://spiceai.org/docs/components/models/huggi
 /// request asks for a constraint that cannot be enforced — including a tool call required of a
 /// request that offers no tools, which `mistral.rs` would otherwise answer in prose, and a tool
 /// the request does not offer, which `mistral.rs` would otherwise fail as an internal error.
-fn request_tool_choice(
+pub fn request_tool_choice(
     req: &CreateChatCompletionRequest,
 ) -> Result<Option<ToolChoice>, OpenAIError> {
     let Some(choice) = req
@@ -1366,7 +1370,8 @@ fn convert_named_tool(x: &ChatCompletionNamedToolChoice) -> Tool {
     }
 }
 
-fn convert_tool(x: &ChatCompletionTools) -> Tool {
+#[must_use]
+pub fn convert_tool(x: &ChatCompletionTools) -> Tool {
     match x {
         ChatCompletionTools::Function(tool) => Tool {
             tp: ToolType::Function,

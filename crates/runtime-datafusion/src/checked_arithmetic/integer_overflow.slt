@@ -1,0 +1,84 @@
+# Integer overflow must error for SUM / + / - / * on Int32 and Int64.
+# Table `t` is registered by the runner: id INT64, big INT64, i INT32
+# rows: (1, i64::MAX, i32::MAX), (2, i64::MAX-1, i32::MAX-1), (3, 1, 1), (4, 2, 2)
+#
+# SQL integer literals are Int64. `i + 1` therefore widens to Int64 and will
+# not overflow Int32. Same-type Int32 overflow uses CAST so both sides stay INT.
+
+statement error overflow
+SELECT SUM(big) FROM t;
+
+statement error overflow
+SELECT SUM(DISTINCT big) FROM t;
+
+statement error overflow
+SELECT big + 1 FROM t WHERE id = 1;
+
+statement error overflow
+SELECT big - -1 FROM t WHERE id = 1;
+
+statement error overflow
+SELECT big * 2 FROM t WHERE id = 1;
+
+statement error overflow
+SELECT i + CAST(1 AS INT) FROM t WHERE id = 1;
+
+statement error overflow
+SELECT i - CAST(-1 AS INT) FROM t WHERE id = 1;
+
+statement error overflow
+SELECT i * CAST(2 AS INT) FROM t WHERE id = 1;
+
+statement error overflow
+SELECT CAST(9223372036854775807 AS BIGINT) + 1;
+
+statement error overflow
+SELECT CAST(2147483647 AS INT) + CAST(1 AS INT);
+
+statement error overflow
+SELECT CAST(-9223372036854775808 AS BIGINT) - 1;
+
+statement error overflow
+SELECT CAST(-2147483648 AS INT) - CAST(1 AS INT);
+
+statement error overflow
+SELECT CAST(4611686018427387904 AS BIGINT) * 2;
+
+statement error overflow
+SELECT CAST(1073741824 AS INT) * CAST(2 AS INT);
+
+query I
+SELECT SUM(i) FROM t WHERE id IN (3, 4);
+----
+3
+
+query I
+SELECT SUM(big) FROM t WHERE id IN (3, 4);
+----
+3
+
+query I
+SELECT SUM(DISTINCT big) FROM t WHERE id IN (3, 4);
+----
+3
+
+# SUM(INT) widens to BIGINT; the four Int32 values fit.
+query I
+SELECT SUM(i) FROM t;
+----
+4294967296
+
+query II
+SELECT big + 1, i + CAST(1 AS INT) FROM t WHERE id = 3;
+----
+2 2
+
+query II
+SELECT big - 1, i - CAST(1 AS INT) FROM t WHERE id = 4;
+----
+1 1
+
+query II
+SELECT big * 2, i * CAST(2 AS INT) FROM t WHERE id = 3;
+----
+2 2

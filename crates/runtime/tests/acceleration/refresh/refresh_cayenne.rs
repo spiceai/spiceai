@@ -220,7 +220,7 @@ async fn test_cayenne_append_mode_with_pk_and_time_column() -> Result<(), anyhow
 
             tracing::info!("✓ Cayenne append mode with both primary_key and time_column works correctly");
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -366,7 +366,7 @@ async fn test_cayenne_partitioned_append_on_conflict_upsert() -> Result<(), anyh
                 "Expected 2 rows total after upsert (not 3)"
             );
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await
@@ -469,7 +469,7 @@ async fn test_cayenne_append_mode_requires_constraint() -> Result<(), anyhow::Er
             rt.shutdown().await;
             load_handle.abort();
 
-            running_container.remove().await?;
+            running_container.cleanup().await;
             Ok(())
         })
         .await

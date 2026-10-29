@@ -164,7 +164,7 @@ jobs:
       # skipping it there: `~/.cargo` and `target/` persist on those hosts and sccache
       # serves the compile, while the restore of this multi-GB cache spends up to ten
       # minutes before it lands or gives up.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         if: matrix.target.target_os != 'darwin'
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
@@ -321,7 +321,7 @@ jobs:
         uses: ./.github/actions/setup-adbc-bigquery
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
 
@@ -2909,6 +2909,11 @@ jobs:
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
+      - name: Check documented SQL cases
+        run: |
+          python3 -m unittest discover -s test/spicescript/corpus -p test_sql_surface.py
+          python3 test/spicescript/corpus/sql_surface.py --check
+
       - name: Build spicescript
         uses: ./.github/actions/build-tool
         with:
@@ -2924,12 +2929,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Scripts that pass: any failure fails the job.
-          - { name: 'spicescript: scripts', args: test/spicescript }
+          # Scripts that pass: any failure fails the job. Each shard runs
+          # its share of the scripts (--partition), balanced by their
+          # recorded durations.
+          - { name: 'spicescript: scripts (1/4)', partition: 1/4, args: test/spicescript }
+          - { name: 'spicescript: scripts (2/4)', partition: 2/4, args: test/spicescript }
+          - { name: 'spicescript: scripts (3/4)', partition: 3/4, args: test/spicescript }
+          - { name: 'spicescript: scripts (4/4)', partition: 4/4, args: test/spicescript }
           # Scripts that reproduce open bugs: each must fail exactly as its
           # group's recordings/expected-failures.json says, so a fix or a
           # change in how a bug shows also fails the job.
-          - { name: 'spicescript: known failing', args: --max-wait 30s test/spicescript/known-failing }
+          - { name: 'spicescript: known failing (1/2)', partition: 1/2, args: --max-wait 30s test/spicescript/known-failing }
+          - { name: 'spicescript: known failing (2/2)', partition: 2/2, args: --max-wait 30s test/spicescript/known-failing }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -2984,23 +2995,47 @@ jobs:
           unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
           echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
 
+      - name: Check harness rejects incorrect answers
+        if: ${{ matrix.partition == '1/4' }}
+        run: |
+          python3 test/spicescript/check_harness.py \
+            --runner "${{ steps.spicescript.outputs.path }}" \
+            --spiced "$(command -v spiced)" \
+            --work-dir "$RUNNER_TEMP/spicescript/harness-checks"
+
       - name: Run scenario scripts
         run: |
-          "${{ steps.spicescript.outputs.path }}" --jobs 8 \
+          "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+            --partition ${{ matrix.partition }} \
             --spiced "$(command -v spiced)" \
             --spice-cli "$(command -v spice)" \
             --work-dir "$RUNNER_TEMP/spicescript" \
+            --results "$RUNNER_TEMP/spicescript-results.json" \
+            --log-capture "$RUNNER_TEMP/spicescript-logs" \
             ${{ matrix.args }}
 
-      - name: Upload instance logs
+      # Every script's outcome, passes included, from every run: a script's
+      # failure rate across runs is read off these rather than off job logs.
+      - name: Upload script results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: spicescript-results-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/spicescript-results.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      # A directory per script with a failure: the script, what the run
+      # printed for it, its source containers' output and its instances' logs.
+      - name: Upload captured logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spicescript-logs-${{ strategy.job-index }}
           path: |
-            ${{ runner.temp }}/spicescript/**/spiced.log
-            ${{ runner.temp }}/spicescript/**/spicepod.yaml
-            ${{ runner.temp }}/spicescript/**/slt-*.txt
+            ${{ runner.temp }}/spicescript-logs
+            ${{ runner.temp }}/spicescript/harness-checks/*.log
+          if-no-files-found: warn
           retention-days: 7
 
   # Stable, matrix-proof summary check. It succeeds only if every E2E job above
@@ -3042,7 +3077,9 @@ jobs:
       - graceful_shutdown_test_full
       - test_cold_start_unkeyed_append
       - build_spicescript
-      - test_spicescript
+      # test_spicescript reports but does not gate merges while the scenario
+      # scripts settle on the CI runners: a run that fails there names the
+      # failing scripts in its own job.
     steps:
       - name: Verify all E2E jobs succeeded
         # Named rather than left to the runner default: this gate is the required

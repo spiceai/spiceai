@@ -1370,6 +1370,9 @@ impl Query {
         }
 
         let inner_span = span.clone();
+        // Finishes the query's record when cancellation drops the planning
+        // future below, which owns the tracker.
+        let tracker_on_cancel = self.tracker.clone();
 
         let query_result =
             async {
@@ -1985,7 +1988,28 @@ impl Query {
         // Keep this large async block out of callers' state machines. This
         // preserves the concrete future type, avoiding dynamic dispatch while
         // still moving the state machine itself to the heap.
-        let query_result = Box::pin(query_result).await;
+        //
+        // Planning can wait on a remote source (catalog lookups, file listings,
+        // table metadata), so race it against cancellation: a stalled source
+        // fails the query at `runtime.query.timeout` or on `/cancel`. A plan
+        // that is ready wins, and its stream observes cancellation itself.
+        let query_result = tokio::select! {
+            biased;
+            result = Box::pin(query_result) => result,
+            () = query_cancel_token.cancelled() => {
+                let error = timeout_state.cancellation_error(&query_id_str);
+                if let Some(tracker) = tracker_on_cancel {
+                    let _trace = trace_span.enter();
+                    let _task = span.enter();
+                    tracker.finish_with_error(
+                        &request_context,
+                        error.to_string(),
+                        ErrorCode::QueryExecutionError,
+                    );
+                }
+                Err(error)
+            }
+        };
 
         match query_result {
             Ok(result) => {
@@ -4043,6 +4067,50 @@ mod tests {
         assert_eq!(field.data_type(), &DataType::Decimal128(22, 2));
     }
 
+    #[tokio::test]
+    async fn get_schema_matches_streamed_schema_for_decimal_round() {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+
+        for sql in [
+            "SELECT round(CAST(2.345 AS DECIMAL(10,3)), 2) AS x",
+            "SELECT round(x, 2) AS x FROM (VALUES (CAST(1.255 AS DECIMAL(10,3)))) t(x)",
+            "SELECT round(avg(x), 2) AS x FROM (VALUES (CAST(1.25 AS DECIMAL(10,2))), (2.50)) t(x)",
+        ] {
+            let (schema, _) = QueryBuilder::new(sql, Arc::clone(&df))
+                .build()
+                .get_schema()
+                .await
+                .expect("schema should be available");
+
+            let mut query = QueryBuilder::new(sql, Arc::clone(&df))
+                .build()
+                .run()
+                .await
+                .expect("query should run");
+            let mut batches = Vec::new();
+            while let Some(batch) = query.data.next().await {
+                batches.push(batch.expect("batch"));
+            }
+
+            let advertised = schema.field(0).data_type();
+            assert_eq!(
+                advertised,
+                query.data.schema().field(0).data_type(),
+                "{sql}"
+            );
+            for batch in &batches {
+                assert_eq!(advertised, batch.schema().field(0).data_type(), "{sql}");
+            }
+        }
+    }
+
     /// A leaked `x-session-id` must not let `GetFlightInfo` resolve
     /// against another principal's session (and then cache that plan
     /// under the caller's namespace).
@@ -4776,6 +4844,80 @@ mod tests {
         .expect_err("query B should fail with a timeout");
 
         match b_err {
+            Error::QueryTimedOut { timeout, .. } => assert_eq!(timeout, "500ms"),
+            other => panic!("expected QueryTimedOut, got: {other:?}"),
+        }
+    }
+
+    /// A table whose `scan` never returns, like a source that stops answering
+    /// while the query is planned.
+    #[derive(Debug)]
+    struct StalledScanTable {
+        schema: arrow::datatypes::SchemaRef,
+    }
+
+    #[async_trait::async_trait]
+    impl datafusion::catalog::TableProvider for StalledScanTable {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            datafusion::datasource::TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn datafusion::catalog::Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[datafusion::prelude::Expr],
+            _limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            std::future::pending().await
+        }
+    }
+
+    /// [query timeout] A query whose planning waits on a stalled source must
+    /// return `QueryTimedOut` when `runtime.query.timeout` elapses.
+    #[tokio::test]
+    async fn query_timeout_while_planning_returns_timed_out() {
+        use std::time::Duration;
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+        df.ctx
+            .register_table(
+                "stalled",
+                Arc::new(StalledScanTable {
+                    schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+                }),
+            )
+            .expect("register the table");
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            Arc::new(
+                RequestContext::builder(Protocol::Http)
+                    .with_query_timeout(Some(Duration::from_millis(500)))
+                    .build(),
+            )
+            .scope(async move {
+                QueryBuilder::new("SELECT id FROM stalled", df)
+                    .build()
+                    .run()
+                    .await
+            }),
+        )
+        .await
+        .expect("the query should stop at its timeout, not wait for planning")
+        .expect_err("the query should fail with a timeout");
+
+        match err {
             Error::QueryTimedOut { timeout, .. } => assert_eq!(timeout, "500ms"),
             other => panic!("expected QueryTimedOut, got: {other:?}"),
         }

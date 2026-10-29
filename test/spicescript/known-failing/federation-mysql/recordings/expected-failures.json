@@ -1,0 +1,94 @@
+{
+  "collation-semantics": [
+    {
+      "run": "collation-semantics[source=postgres]",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM t WHERE s > 'b'",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 80, actual: 60 }",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "collation-semantics[source=mysql]",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM t WHERE s = 'apple'",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 60, actual: 20 }",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "collation-semantics[source=mysql]",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM t WHERE s LIKE 'a%'",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 60, actual: 20 }",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "collation-semantics[source=mysql]",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM t WHERE s IN ('APPLE', 'banana')",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 80, actual: 40 }",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "collation-semantics[source=mysql]",
+      "who": "cayenne",
+      "key": "query: SELECT s, count(*) FROM t WHERE s IS NOT NULL GROUP BY s",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 7, actual: 9 }",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "collation-semantics[source=mysql]",
+      "who": "cayenne",
+      "key": "query: SELECT count(DISTINCT s) FROM t",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"count(DISTINCT t.s)\", row_number: 1, expected: \"\\\"7\\\"\", actual: \"\\\"9\\\"\" }",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "collation-semantics[source=mysql]",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM t WHERE s > 'b'",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 80, actual: 60 }",
+      "group": "federation-mysql"
+    }
+  ],
+  "federated-known-failing": [
+    {
+      "run": "federated-known-failing[source=postgres]",
+      "who": "federated",
+      "key": "query: SELECT t.id, u.id FROM t LEFT JOIN u ON t.id = u.t_id WHERE t.id < 30",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nFailed to build record batch: Invalid argument error: Column 'id' is declared as non-nullable but contains null values\\nReport a bug to r",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "federated-known-failing[source=mysql]",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM t WHERE b = true",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot infer common argument type for comparison operation Int8 = Boolean: Cannot infer common argument type for comparison operation Int8 = Boolean",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "federated-known-failing[source=mysql]",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM t WHERE b = false AND i > 0",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Cannot infer common argument type for comparison operation Int8 = Boolean: Cannot infer common argument type for comparison operation Int8 = Boolean",
+      "group": "federation-mysql"
+    },
+    {
+      "run": "federated-known-failing[source=mysql]",
+      "who": "federated",
+      "key": "query: SELECT t.id, u.id FROM t LEFT JOIN u ON t.id = u.t_id WHERE t.id < 30",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nFailed to build record batch: Invalid argument error: Column 'id' is declared as non-nullable but contains null values.\\nReport a bug to ",
+      "group": "federation-mysql"
+    }
+  ]
+}

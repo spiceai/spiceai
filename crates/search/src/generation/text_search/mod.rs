@@ -40,12 +40,12 @@ use futures::Stream;
 use serde_json::{Number, Value};
 use snafu::{ResultExt, Snafu};
 use tantivy::{
-    DocAddress, Score, Searcher, TantivyError,
+    DocAddress, IndexReader, Score, Searcher, TantivyError,
     collector::TopDocs,
     query::{BooleanQuery, ConstScoreQuery, Occur, Query, QueryParser, QueryParserError},
     query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
     schema::{FieldType, OwnedValue},
-    tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer},
+    tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer, TokenizerManager},
 };
 
 use super::{CandidateGeneration, Result as GenerationResult};
@@ -195,7 +195,7 @@ impl Error {
 impl std::fmt::Debug for FullTextSearchFieldIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FullTextSearchFieldIndex")
-            .field("schema", self.reader.schema())
+            .field("schema", &self.index_schema)
             .field("field", &self.field)
             .field("primary_key", &self.primary_key)
             .field("type_hints", &self.type_hints)
@@ -206,8 +206,13 @@ impl std::fmt::Debug for FullTextSearchFieldIndex {
 /// A [`FullTextSearchFieldIndex`] performs a search on a [`tantivy::Index`]  for a single field of a table.
 #[derive(Clone)]
 pub struct FullTextSearchFieldIndex {
-    // These are components from a [`tantivy::Index`] required to perform a search on a  [`tantivy::Index`] at a given commit.
-    reader: tantivy::Searcher,
+    /// A reader, not a [`Searcher`], so an instance that outlives one query (for example, in a
+    /// cached logical plan) still searches the latest commit. Each search takes its own
+    /// [`Searcher`] when it executes.
+    reader: IndexReader,
+    /// Schema and tokenizers of the underlying [`tantivy::Index`]. These do not change between commits.
+    index_schema: tantivy::schema::Schema,
+    tokenizers: TokenizerManager,
 
     pub field: String,
     pub primary_key: Vec<String>,
@@ -222,20 +227,20 @@ pub struct FullTextSearchFieldIndex {
 }
 
 impl FullTextSearchFieldIndex {
-    pub fn try_new(
-        index_search: Searcher,
-        field: String,
-        primary_key: Vec<String>,
-    ) -> Result<Self> {
-        let stored_columns: HashSet<String> = index_search
-            .schema()
+    pub fn try_new(reader: IndexReader, field: String, primary_key: Vec<String>) -> Result<Self> {
+        let searcher = reader.searcher();
+        let index_schema = searcher.schema().clone();
+        let tokenizers = searcher.index().tokenizers().clone();
+        let stored_columns: HashSet<String> = index_schema
             .fields()
             .filter(|&(_, f)| f.is_stored())
             .map(|(_, f)| f.name().to_string())
             .collect();
 
         let fts = Self {
-            reader: index_search,
+            reader,
+            index_schema,
+            tokenizers,
             field,
             primary_key,
             stored_columns,
@@ -265,7 +270,7 @@ impl FullTextSearchFieldIndex {
     /// Schema is based on the [`tantivy::schema::Schema`] with `self.type_hints` applied.
     /// Field order follows the underlying tantivy schema (not the `HashSet` cache).
     fn schema(&self) -> Arc<Schema> {
-        let search_schema = self.reader.schema();
+        let search_schema = &self.index_schema;
         let fields = search_schema
             .fields()
             .filter_map(|(_, f)| {
@@ -337,15 +342,14 @@ impl FullTextSearchFieldIndex {
 
     fn query_parser(&self) -> QueryParser {
         let default_field = self
-            .reader
-            .schema()
+            .index_schema
             .find_field(self.field.as_str())
             .map(|(f, _)| vec![f])
             .unwrap_or_default();
         QueryParser::new(
-            self.reader.schema().clone(),
+            self.index_schema.clone(),
             default_field,
-            self.reader.index().tokenizers().clone(),
+            self.tokenizers.clone(),
         )
     }
 
@@ -355,7 +359,7 @@ impl FullTextSearchFieldIndex {
     /// classification stays in lockstep with what [`Self::translate_filters`] can actually build.
     #[must_use]
     pub fn classify_filters(&self, filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
-        let schema = self.reader.schema();
+        let schema = &self.index_schema;
         filters
             .iter()
             .map(|f| tantivy_datafusion_filter::classify_filter(schema, f))
@@ -372,7 +376,7 @@ impl FullTextSearchFieldIndex {
         &self,
         filters: &[Expr],
     ) -> Result<Vec<Box<dyn Query>>, DataFusionError> {
-        let schema = self.reader.schema();
+        let schema = &self.index_schema;
         filters
             .iter()
             .map(|f| {
@@ -403,24 +407,12 @@ impl FullTextSearchFieldIndex {
     /// large `limit` doesn't force every matched document's stored fields into memory at once.
     fn search_top_docs(
         &self,
+        searcher: &Searcher,
         literal: &str,
         filters: &[Box<dyn Query>],
         limit: usize,
     ) -> Result<Vec<(Score, DocAddress)>> {
-        // Prefer Tantivy's full QueryParser so operators (AND/OR/NOT), phrases
-        // ("exact match"), field-scoped queries (title:foo) and boosts (term^2)
-        // are honored. Fall back to a bag-of-words OR clause for inputs the
-        // parser rejects (e.g. unbalanced quotes, lone special characters in
-        // conversational queries).
-        let parser = self.query_parser();
-        let text_query = match parser.parse_query(literal) {
-            Ok(parsed) => parsed,
-            Err(_) => parser
-                .build_query_from_user_input_ast(parse_query_literal(literal))
-                .context(InvalidTextSearchQuerySnafu {
-                    query: literal.to_string(),
-                })?,
-        };
+        let text_query = parse_user_query(&self.query_parser(), literal)?;
 
         // `Must`-combine each pushed-down SQL filter with the full-text clause so the top-K is
         // computed over the filtered document set (the filter is applied inside the index, not
@@ -439,22 +431,32 @@ impl FullTextSearchFieldIndex {
             Box::new(BooleanQuery::new(clauses))
         };
 
-        self.reader
+        let limit = top_docs_limit(limit, searcher.num_docs());
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        searcher
             .search(&q, &TopDocs::with_limit(limit).order_by_score())
             .context(TextSearchSnafu)
     }
 
     /// Resolve a slice of scored hits' stored document contents into JSON. Kept separate from
-    /// [`Self::search_top_docs`] so callers can decode `hits` in bounded chunks.
-    fn hits_to_json(&self, hits: &[(Score, DocAddress)]) -> Result<Vec<Value>> {
+    /// [`Self::search_top_docs`] so callers can decode `hits` in bounded chunks. `searcher` must
+    /// be the one that produced `hits`: a [`DocAddress`] is only valid for its segments.
+    fn hits_to_json(
+        &self,
+        searcher: &Searcher,
+        hits: &[(Score, DocAddress)],
+    ) -> Result<Vec<Value>> {
         hits.iter()
             .map(|&(score, addr)| {
                 let doc: HashMap<tantivy::schema::Field, OwnedValue> =
-                    self.reader.doc(addr).context(TextSearchSnafu)?;
+                    searcher.doc(addr).context(TextSearchSnafu)?;
 
                 let mut doc_w_col_names = doc
                     .into_iter()
-                    .map(|(f, v)| (self.reader.schema().get_field_name(f), v))
+                    .map(|(f, v)| (self.index_schema.get_field_name(f), v))
                     // `HashSet<String>::contains` accepts `&str` via `Borrow<str>`.
                     .filter(|(name, _)| self.stored_columns.contains(*name))
                     .collect::<HashMap<_, _>>();
@@ -485,6 +487,29 @@ impl FullTextSearchFieldIndex {
         decoder.serialize(hits)?;
 
         Ok(decoder)
+    }
+}
+
+/// Clamp a requested result count to the number of documents in the index. `TopDocs` allocates
+/// space for `limit` hits up front, and no query can return more hits than the index holds.
+fn top_docs_limit(requested: usize, num_docs: u64) -> usize {
+    usize::try_from(num_docs).map_or(requested, |num_docs| requested.min(num_docs))
+}
+
+/// Parse a user-provided full-text query.
+///
+/// Prefer Tantivy's full `QueryParser` so operators (AND/OR/NOT), phrases ("exact match"),
+/// field-scoped queries (title:foo) and boosts (term^2) are honored. Fall back to a bag-of-words
+/// OR clause for inputs the parser rejects (e.g. unbalanced quotes, lone special characters in
+/// conversational queries).
+fn parse_user_query(parser: &QueryParser, literal: &str) -> Result<Box<dyn Query>> {
+    match parser.parse_query(literal) {
+        Ok(parsed) => Ok(parsed),
+        Err(_) => parser
+            .build_query_from_user_input_ast(parse_query_literal(literal))
+            .context(InvalidTextSearchQuerySnafu {
+                query: literal.to_string(),
+            }),
     }
 }
 
@@ -573,7 +598,11 @@ fn make_stream(
             return;
         }
 
-        // Share the searcher into the blocking tasks that run synchronous tantivy work
+        // Take the searcher when the query runs, not when it is planned, so that a cached plan
+        // sees the latest commit. Scoring and document lookups below all use this one searcher.
+        let searcher = fts.reader.searcher();
+
+        // Share the index into the blocking tasks that run synchronous tantivy work
         // (mmap/disk reads + scoring + stored-field decode) off the async runtime thread
         // (which also serves `/health`, `/v1/search`).
         let fts = std::sync::Arc::new(fts);
@@ -584,9 +613,10 @@ fn make_stream(
         // a single pass avoids that, and these lightweight (score, address) pairs are cheap to
         // hold in full even when `limit` is large, unlike the stored documents they address.
         let blocking_fts = std::sync::Arc::clone(&fts);
+        let blocking_searcher = searcher.clone();
         let query = query.clone();
         let top_docs = match tokio::task::spawn_blocking(move || {
-            blocking_fts.search_top_docs(query.as_str(), filters.as_slice(), limit)
+            blocking_fts.search_top_docs(&blocking_searcher, query.as_str(), filters.as_slice(), limit)
         }).await {
             Ok(Ok(h)) => h,
             Ok(Err(e)) => {
@@ -605,8 +635,9 @@ fn make_stream(
         // time, so memory stays bounded by the batch size rather than by `limit`.
         for chunk in top_docs.chunks(DEFAULT_BATCH_SIZE) {
             let blocking_fts = std::sync::Arc::clone(&fts);
+            let blocking_searcher = searcher.clone();
             let chunk = chunk.to_vec();
-            let hits = match tokio::task::spawn_blocking(move || blocking_fts.hits_to_json(&chunk)).await {
+            let hits = match tokio::task::spawn_blocking(move || blocking_fts.hits_to_json(&blocking_searcher, &chunk)).await {
                 Ok(Ok(h)) => h,
                 Ok(Err(e)) => {
                     yield Err(DataFusionError::Internal(e.to_string()));
@@ -654,7 +685,96 @@ pub fn tantivy_to_arrow_type(t: &FieldType) -> Option<arrow::datatypes::DataType
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::generation::text_search::parse_query_literal;
+    use crate::generation::text_search::{parse_query_literal, parse_user_query, top_docs_limit};
+    use tantivy::{
+        Index,
+        query::QueryParser,
+        schema::{Schema, TEXT},
+    };
+
+    fn text_parser() -> QueryParser {
+        let mut builder = Schema::builder();
+        let text = builder.add_text_field("text", TEXT);
+        QueryParser::for_index(&Index::create_in_ram(builder.build()), vec![text])
+    }
+
+    /// A `*` that Tantivy's grammar read as an exists query with no field panicked inside the
+    /// parser (quickwit-oss/tantivy#3031), failing the whole search request. Regression test for
+    /// the vendored `tantivy-query-grammar` fix.
+    #[test]
+    fn test_fieldless_star_does_not_panic() {
+        let parser = text_parser();
+        let mut queries = vec![
+            "- *".to_string(),
+            "+ *".to_string(),
+            "a - *".to_string(),
+            "/'/ *(".to_string(),
+            "text:[a' TO z] *(".to_string(),
+            "\"it's\" *(".to_string(),
+            "a \"\"**(".to_string(),
+            "(+ *)".to_string(),
+            "-  * b".to_string(),
+        ];
+        for prefix in ["", "a ", "(", "+", "-", "NOT ", "a AND ", "a\t", "\"x\" "] {
+            for end in [
+                '^', '`', ':', '{', '}', '"', '\'', '[', ']', '\\', '(', '\u{a0}', '\u{b}',
+                '\u{c}', '\u{3000}',
+            ] {
+                queries.push(format!("{prefix}*{end}b"));
+            }
+        }
+        for q in &queries {
+            parse_user_query(&parser, q).unwrap_or_else(|e| panic!("{q:?}: {e}"));
+        }
+    }
+
+    /// Every query of up to four characters over the grammar's operator and delimiter characters,
+    /// plus whitespace the grammar's rules disagree on, parses without a panic.
+    #[test]
+    fn test_short_queries_never_panic() {
+        let parser = text_parser();
+        let alphabet: Vec<char> = "a* ()\"[]:^'{}\\+-/\u{a0}".chars().collect();
+        let mut digits = Vec::new();
+        loop {
+            let q: String = digits.iter().map(|&d| alphabet[d]).collect();
+            parse_user_query(&parser, &q).unwrap_or_else(|e| panic!("{q:?}: {e}"));
+            // Advance `digits` as an odometer over `alphabet`, growing to four characters.
+            let mut pos = digits.len();
+            loop {
+                if pos == 0 {
+                    if digits.len() == 4 {
+                        return;
+                    }
+                    digits.fill(0);
+                    digits.push(0);
+                    break;
+                }
+                pos -= 1;
+                digits[pos] += 1;
+                if digits[pos] < alphabet.len() {
+                    break;
+                }
+                digits[pos] = 0;
+            }
+        }
+    }
+
+    #[test]
+    fn test_top_docs_limit_clamps_to_index_size() {
+        assert_eq!(top_docs_limit(10, 1_000), 10);
+        assert_eq!(top_docs_limit(1_000, 1_000), 1_000);
+        assert_eq!(top_docs_limit(1_001, 1_000), 1_000);
+        assert_eq!(top_docs_limit(usize::MAX, 1_000), 1_000);
+        assert_eq!(top_docs_limit(10, 0), 0);
+    }
+
+    /// A query nested deeper than the grammar accepts is searched as its words.
+    #[test]
+    fn test_deeply_nested_query_falls_back_to_words() {
+        let parser = text_parser();
+        let q = format!("{}a{}", "(".repeat(32), ")".repeat(32));
+        parse_user_query(&parser, &q).unwrap_or_else(|e| panic!("{q:?}: {e}"));
+    }
 
     #[test]
     fn test_parse_query_literal() {

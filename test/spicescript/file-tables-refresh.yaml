@@ -1,0 +1,85 @@
+name: file-tables-refresh
+description: >
+  A table of Parquet or CSV part files, on local disk or in an S3-compatible
+  store, answers like the same rows in a database when accelerated by full
+  refresh into Cayenne and DuckDB, after the first load, after a part file is
+  added, and after every file is replaced. The federated form is in
+  known-failing/files-and-lakes/file-tables-federated-stale.yaml.
+
+sources:
+  lake: { kind: '${matrix.src}' }
+  oracle: { kind: postgres }
+
+matrix:
+  src: [files, rustfs]
+  format: [parquet, csv]
+
+variants:
+  cayenne:
+    datasets: { facts: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }
+  duckdb:
+    datasets: { facts: { acceleration: { enabled: true, engine: duckdb, mode: file, refresh_mode: full } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: file-tables-refresh
+  datasets:
+    - from: '${sources.lake.from_prefix}facts${sources.lake.from_suffix}'
+      name: facts
+      params: { $merge: '${sources.lake.table_params}', file_format: '${matrix.format}' }
+
+defaults:
+  expect: { oracle: oracle }
+  query-timeout: 30s
+
+steps:
+  - generate:
+      lake: &facts
+        table: facts
+        rows: 200000
+        seed: 21
+        files: 4
+        format: '${matrix.format}'
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: grp, int: [1, 200] }
+          - { name: ts, timestamp: ['2024-01-01', '2024-12-31'] }
+          - { name: amount, decimal: { range: [0, 1000], scale: 2 } }
+          - { name: label, choice: [alpha, beta, gamma, delta] }
+          - { name: note, text: [3, 20], nulls: 0.2 }
+    mirror: oracle
+  - start: {}
+  - corpus: corpus/layout.sql
+
+  # Another part file.
+  - generate:
+      lake:
+        <<: *facts
+        rows: 20000
+        seed: 22
+        files: 1
+        mode: append
+        columns:
+          - { name: id, sequence: 1000001 }
+          - { name: grp, int: [1, 200] }
+          - { name: ts, timestamp: ['2025-01-01', '2025-01-31'] }
+          - { name: amount, decimal: { range: [0, 1000], scale: 2 } }
+          - { name: label, choice: [alpha, beta, gamma, delta] }
+          - { name: note, text: [3, 20], nulls: 0.2 }
+    mirror: oracle
+  - refresh: facts
+  - corpus: corpus/layout.sql
+    eventually: 30s
+
+  # Every file replaced with different rows.
+  - generate:
+      lake:
+        <<: *facts
+        rows: 150000
+        seed: 23
+        files: 3
+    mirror: oracle
+  - refresh: facts
+  - corpus: corpus/layout.sql
+    eventually: 30s

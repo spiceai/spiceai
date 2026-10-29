@@ -24,8 +24,10 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context as _;
 use bollard::{
     Docker,
+    auth::DockerCredentials,
     container::{
         Config, CreateContainerOptions, LogOutput, RemoveContainerOptions, StartContainerOptions,
     },
@@ -110,6 +112,36 @@ impl RunningContainer {
         remove(&self.docker, &self.id).await?;
         self.removed.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Removes the container once a test is done with it. A removal that fails, such
+    /// as one timing out on a stalled daemon, is reported like a failed removal in
+    /// `Drop` instead of being returned: cleanup must not fail a scenario that
+    /// passed. `Drop` then tries the removal again. A test that removes the
+    /// container to simulate an outage needs the removal to succeed, so it calls
+    /// [`Self::remove`] instead.
+    pub async fn cleanup(&self) {
+        if let Err(e) = self.remove().await {
+            self.report_failed_removal(&e);
+        }
+    }
+
+    /// Removes the container once a test's scenario has finished, and returns the
+    /// scenario's result. A failed removal is reported as in [`Self::cleanup`], so it
+    /// cannot replace the scenario's error.
+    pub async fn remove_after<T>(
+        &self,
+        scenario: Result<T, anyhow::Error>,
+    ) -> Result<T, anyhow::Error> {
+        self.cleanup().await;
+        scenario
+    }
+
+    fn report_failed_removal(&self, e: &anyhow::Error) {
+        eprintln!(
+            "failed to remove test container {} ({}): {e}",
+            self.name, self.id
+        );
     }
 
     pub async fn stop(&self) -> Result<(), anyhow::Error> {
@@ -264,10 +296,7 @@ impl Drop for RunningContainer {
             });
         match removal.map(std::thread::JoinHandle::join) {
             Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(e))) => eprintln!(
-                "failed to remove test container {} ({}): {e}",
-                self.name, self.id
-            ),
+            Ok(Ok(Err(e))) => self.report_failed_removal(&e),
             Ok(Err(_)) => eprintln!(
                 "cleanup thread for test container {} ({}) panicked",
                 self.name, self.id
@@ -491,15 +520,117 @@ impl ContainerRunner {
         {
             return Ok(());
         }
-        let options = Some(CreateImageOptions {
-            from_image: image.as_str(),
-            ..Default::default()
-        });
-        let mut pulling = self.docker.create_image(options, None, None);
-        while let Some(event) = pulling.next().await {
-            tracing::debug!("Pulling image: {:?}", event?);
+        let credentials = match docker_config_path() {
+            Some(path) => tokio::fs::read_to_string(path)
+                .await
+                .ok()
+                .and_then(|config| registry_credentials(&config, image)),
+            None => None,
+        };
+        pull_image(&self.docker, image, credentials).await
+    }
+}
+
+async fn pull_image(
+    docker: &Docker,
+    image: &str,
+    credentials: Option<DockerCredentials>,
+) -> Result<(), anyhow::Error> {
+    let login = match credentials
+        .as_ref()
+        .and_then(|c| c.serveraddress.as_deref())
+    {
+        Some(address) => format!("with the docker login for {address}"),
+        None => "anonymously".to_string(),
+    };
+    tracing::debug!("Pulling image {image} {login}");
+    let options = Some(CreateImageOptions {
+        from_image: image,
+        ..Default::default()
+    });
+    let mut pulling = docker.create_image(options, None, credentials);
+    while let Some(event) = pulling.next().await {
+        let event = event.with_context(|| format!("Failed to pull {image} ({login})"))?;
+        tracing::debug!("Pulling image: {event:?}");
+    }
+    Ok(())
+}
+
+/// The Docker CLI's config file, where `docker login` stores credentials:
+/// `$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`.
+fn docker_config_path() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("DOCKER_CONFIG") {
+        return Some(std::path::PathBuf::from(dir).join("config.json"));
+    }
+    std::env::var_os("HOME").map(|home| {
+        std::path::PathBuf::from(home)
+            .join(".docker")
+            .join("config.json")
+    })
+}
+
+/// The credentials `docker login` stored in `config` (the Docker CLI's config
+/// file) for the registry `image` is pulled from. The Docker CLI sends these
+/// with each pull and the daemon never reads the CLI's config, so a pull made
+/// without them is anonymous, and Docker Hub rate limits anonymous pulls by
+/// address (`429 Too Many Requests`). A login kept in a credential helper
+/// (`credsStore`, `credHelpers`) has no usable entry here, and the pull stays
+/// anonymous.
+fn registry_credentials(config: &str, image: &str) -> Option<DockerCredentials> {
+    use base64::Engine as _;
+
+    let config: serde_json::Value = serde_json::from_str(config).ok()?;
+    let registry = registry_host(image_registry(image));
+    let (address, entry) = config
+        .get("auths")?
+        .as_object()?
+        .iter()
+        .find(|(address, _)| registry_host(address) == registry)?;
+    let field = |name: &str| entry.get(name).and_then(|v| v.as_str()).map(str::to_string);
+    let (username, password) = match field("auth") {
+        Some(auth) => {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(auth.trim())
+                .ok()?;
+            let (username, password) = std::str::from_utf8(&decoded).ok()?.split_once(':')?;
+            (Some(username.to_string()), Some(password.to_string()))
         }
-        Ok(())
+        None => (field("username"), field("password")),
+    };
+    let identitytoken = field("identitytoken");
+    if username.is_none() && identitytoken.is_none() {
+        return None;
+    }
+    Some(DockerCredentials {
+        username,
+        password,
+        identitytoken,
+        serveraddress: Some(address.clone()),
+        ..Default::default()
+    })
+}
+
+/// The registry an image reference names: its first path component when that
+/// is a host (it has a `.` or a port, or is `localhost`), else Docker Hub.
+fn image_registry(image: &str) -> &str {
+    match image.split_once('/') {
+        Some((first, _)) if first.contains(['.', ':']) || first == "localhost" => first,
+        _ => "docker.io",
+    }
+}
+
+/// A registry address reduced to its host, with Docker Hub's several names
+/// (`https://index.docker.io/v1/`, the key `docker login` writes, among them)
+/// reduced to one.
+fn registry_host(address: &str) -> &str {
+    let host = address
+        .strip_prefix("https://")
+        .or_else(|| address.strip_prefix("http://"))
+        .unwrap_or(address);
+    let host = host.split('/').next().unwrap_or(host);
+    match host {
+        "index.docker.io" | "registry-1.docker.io" => "docker.io",
+        host => host,
     }
 }
 

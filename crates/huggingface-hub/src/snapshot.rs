@@ -141,6 +141,36 @@ impl Snapshot {
         repo: RepoId,
         revision: Option<&str>,
     ) -> Result<Self, DownloadError> {
+        Self::open_listing(settings, requester, repo, revision, None).await
+    }
+
+    /// Resolves `revision` as [`Snapshot::open`] does, but looks only at `paths`, rather than
+    /// listing the repository: for a component that reads a few named files of a repository
+    /// that may hold many. The commit comes from the Hub's answer for the first path, and a
+    /// path already in the cache at that commit is used as it is, as `huggingface_hub` does,
+    /// so a warm load costs one request. A path the cache lacks is described, one request
+    /// each. A path the repository does not have is left out, and downloading it names it.
+    ///
+    /// # Errors
+    ///
+    /// See [`Snapshot::open`].
+    pub async fn open_paths(
+        settings: Settings,
+        requester: Requester,
+        repo: RepoId,
+        revision: Option<&str>,
+        paths: &[&str],
+    ) -> Result<Self, DownloadError> {
+        Self::open_listing(settings, requester, repo, revision, Some(paths)).await
+    }
+
+    async fn open_listing(
+        settings: Settings,
+        requester: Requester,
+        repo: RepoId,
+        revision: Option<&str>,
+        paths: Option<&[&str]>,
+    ) -> Result<Self, DownloadError> {
         let revision = revision
             .filter(|revision| !revision.is_empty())
             .unwrap_or(DEFAULT_REVISION)
@@ -149,7 +179,8 @@ impl Snapshot {
         let hub = Hub::new(
             HubConfig {
                 endpoint: settings.endpoint.clone(),
-                token: settings.token.as_ref().map(|token| token.secret().clone()),
+                token: settings.token.clone(),
+                token_scope: settings.token_scope,
             },
             Handle::current(),
         )
@@ -163,7 +194,11 @@ impl Snapshot {
                 .ok_or_else(|| context.error(None, Cause::OfflineNoSnapshot))?;
             (commit, files, Source::OfflineCache)
         } else {
-            match from_hub(&hub, &cache, &repo, &revision).await {
+            let listed = match paths {
+                None => from_hub(&hub, &cache, &repo, &revision).await,
+                Some(paths) => paths_from_hub(&hub, &cache, &repo, &revision, paths).await,
+            };
+            match listed {
                 Ok((commit, files)) => (commit, files, Source::Hub),
                 Err(error) if falls_back(&error) => {
                     let Some((commit, files)) = from_cache(&cache, &repo, &revision).await else {
@@ -228,6 +263,60 @@ impl Snapshot {
     /// See [`Snapshot::download`].
     pub async fn fetch_quietly(&self, paths: &[&str]) -> Result<Vec<PathBuf>, DownloadError> {
         self.fetch(paths, false).await
+    }
+
+    /// The first `len` bytes of `path`, or the whole file when it is shorter: from the cache
+    /// when it holds the file, and otherwise read from the Hub without downloading the rest.
+    /// For a component that decides from a file's header whether it needs the file at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `path` is not in the repository, or the Hub refuses or fails the
+    /// read.
+    pub async fn read_prefix(&self, path: &str, len: u64) -> Result<Vec<u8>, DownloadError> {
+        let context =
+            DownloadContext::new(&self.requester, &self.repo, &self.revision, &self.settings);
+        let missing_file = || {
+            context.error(
+                None,
+                Cause::Missing {
+                    what: format!("'{path}'"),
+                    source: self.source.clone(),
+                },
+            )
+        };
+        let file = self.files.get(path).ok_or_else(missing_file)?;
+        let end = len.min(file.size);
+        if let Some(cached) = self
+            .cache
+            .cached_file(&self.repo, &self.commit, path, Some(file.size))
+            .await
+            && let Ok(bytes) = read_head(&cached, end).await
+        {
+            return Ok(bytes);
+        }
+        // A file only the cache knows of is one whose blob went missing.
+        file.entry.as_ref().ok_or_else(missing_file)?;
+        if end == 0 {
+            return Ok(Vec::new());
+        }
+        let read = self
+            .hub
+            .read(
+                &self.repo,
+                &self.commit,
+                path,
+                Some(object_store::GetRange::Bounded(0..end)),
+            )
+            .await
+            .map_err(|source| context.error(Some(path), Cause::Hub(source)))?;
+        let mut bytes = Vec::with_capacity(usize::try_from(end).unwrap_or(0));
+        let mut stream = read.stream;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|source| context.error(Some(path), Cause::Hub(source)))?;
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
     }
 
     /// Downloads every file in `paths` that is not in the cache yet, at most
@@ -399,7 +488,8 @@ impl Snapshot {
     }
 }
 
-/// Resolves `revision` on the Hub and lists every file at the commit.
+/// Resolves `revision` on the Hub and describes the files at the commit: `paths`, or every
+/// file when `None`.
 async fn from_hub(
     hub: &Arc<Hub>,
     cache: &HubCache,
@@ -428,6 +518,67 @@ async fn from_hub(
             )
         })
         .collect();
+    Ok((commit, files))
+}
+
+/// Resolves `revision` on the Hub and describes `paths` at the commit: a path the cache holds
+/// at the commit from the cache, any other from the Hub.
+async fn paths_from_hub(
+    hub: &Arc<Hub>,
+    cache: &HubCache,
+    repo: &RepoId,
+    revision: &str,
+    paths: &[&str],
+) -> Result<(String, BTreeMap<String, RepoFile>), client::Error> {
+    // A commit names itself; a branch or tag is resolved by the answer for the first path.
+    let resolved = if crate::client::is_commit_sha(revision) {
+        Some(revision.to_string())
+    } else if let Some(first) = paths.first() {
+        match hub.commit_of_file(repo, revision, first).await {
+            Ok(commit) => commit,
+            // The first path does not exist: the revision still has to be resolved.
+            Err(error) if error.is_entry_not_found() => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    let commit = match resolved {
+        Some(commit) => commit,
+        None => hub.commit(repo, revision).await?.sha,
+    };
+    if let Err(error) = cache.write_ref(repo, revision, &commit).await {
+        tracing::debug!(
+            "Failed to record that revision '{revision}' of Hugging Face {} '{repo}' is commit {commit} in the cache: {error}",
+            repo.kind()
+        );
+    }
+    let mut files = BTreeMap::new();
+    for &path in paths {
+        let cached = match relative_path(path) {
+            Some(relative) => tokio::fs::metadata(cache.snapshot_dir(repo, &commit).join(relative))
+                .await
+                .ok()
+                .filter(std::fs::Metadata::is_file),
+            None => None,
+        };
+        let file = match cached {
+            Some(metadata) => RepoFile {
+                path: path.to_string(),
+                size: metadata.len(),
+                entry: None,
+            },
+            None => match hub.entry(repo, &commit, path).await? {
+                Some(entry) if entry.kind == EntryKind::File => RepoFile {
+                    path: entry.path.clone(),
+                    size: entry.size,
+                    entry: Some(entry),
+                },
+                _ => continue,
+            },
+        };
+        files.insert(path.to_string(), file);
+    }
     Ok((commit, files))
 }
 
@@ -467,7 +618,7 @@ fn falls_back(error: &client::Error) -> bool {
             | client::Error::RevisionNotFound { .. }
             | client::Error::EntryNotFound { .. }
             | client::Error::InvalidEndpoint { .. }
-            | client::Error::InvalidToken
+            | client::Error::InvalidToken { .. }
     )
 }
 
@@ -492,6 +643,18 @@ fn report_progress(
             );
         }
     })
+}
+
+/// The first `len` bytes of the file at `path`, or all of it when it is shorter.
+async fn read_head(path: &std::path::Path, len: u64) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    tokio::fs::File::open(path)
+        .await?
+        .take(len)
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok(bytes)
 }
 
 /// The first seven digits of a commit, as the Hub shows it.

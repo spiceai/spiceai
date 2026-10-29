@@ -109,6 +109,19 @@ pub struct RuntimeStatus {
     /// another status. [`Self::release_dataset_ready`] applies those and
     /// returns to `None`.
     dataset_ready_hold: Arc<RwLock<Option<HashSet<TableReference>>>>,
+    /// Outbound Spice Cloud management connection. Kept out of the component
+    /// readiness map so a failed Cloud export cannot flip `/v1/ready`.
+    management: Arc<RwLock<Option<ManagementConnectionStatus>>>,
+}
+
+/// Status of the outbound Spice Cloud management connection.
+///
+/// Recorded for diagnostics and tests. Not part of [`RuntimeStatus::is_ready`]:
+/// query serving must stay up if Cloud export fails.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagementConnectionStatus {
+    pub status: ComponentStatus,
+    pub endpoint: String,
 }
 
 impl Default for RuntimeStatus {
@@ -122,6 +135,7 @@ impl Default for RuntimeStatus {
             ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
             shutdown_token: CancellationToken::new(),
             dataset_ready_hold: Arc::new(RwLock::new(None)),
+            management: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -179,6 +193,30 @@ impl RuntimeStatus {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(component_name.to_string());
         }
+    }
+
+    /// Records the outbound Spice Cloud management connection.
+    ///
+    /// Does not register a readiness component. A failed export must not take
+    /// `/v1/ready` down.
+    pub fn update_management(&self, status: ComponentStatus, endpoint: impl Into<String>) {
+        *self
+            .management
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(ManagementConnectionStatus {
+                status,
+                endpoint: endpoint.into(),
+            });
+    }
+
+    /// Returns the Spice Cloud management connection when one has been recorded.
+    #[must_use]
+    pub fn management_connection(&self) -> Option<ManagementConnectionStatus> {
+        self.management
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn update_catalog(&self, catalog_name: impl Into<String>, status: ComponentStatus) {
@@ -470,10 +508,12 @@ impl RuntimeStatus {
                 };
 
                 // OnLoad readiness: a component counts as ready if it has been ready at least once.
-                // All registered components must appear in the ever-ready set before we report ready.
+                // All registered components must appear in the ever-ready set before we report ready,
+                // except disabled ones: a component removed from the Spicepod never loads.
                 statuses
-                    .keys()
-                    .all(|component| ever_ready.contains(component))
+                    .iter()
+                    .filter(|(_, state)| !matches!(state.status, ComponentStatus::Disabled))
+                    .all(|(component, _)| ever_ready.contains(component))
             }
             // OnRegistration readiness: treat Error/Disabled/Initializing as ready-enough.
             // Only components in ShuttingDown state block overall readiness.
@@ -750,6 +790,15 @@ impl RuntimeStatus {
         self.wait_for_component_ready(&component_name).await
     }
 
+    /// Waits for a dataset's load to end, whether it became `Ready` or failed.
+    pub async fn wait_for_dataset_loaded_or_failed(&self, dataset: &TableReference) -> WaitOutcome {
+        let component_name = format!("dataset:{dataset}");
+        self.wait_for_component_status(&component_name, |status| {
+            matches!(status, ComponentStatus::Ready | ComponentStatus::Error(_))
+        })
+        .await
+    }
+
     /// Waits for a dataset to be registered (any status other than
     /// `Initializing`). Useful when the caller only needs the table
     /// provider to exist, not for the dataset to be fully loaded — e.g.
@@ -908,6 +957,34 @@ mod tests {
     }
 
     #[test]
+    fn management_error_does_not_block_readiness() {
+        let status = RuntimeStatus::new();
+        status.update_dataset(&TableReference::bare("orders"), ComponentStatus::Ready);
+        assert!(status.is_ready());
+
+        status.update_management(
+            ComponentStatus::error_with_message(
+                "Missing required secret: api_key. Specify a value.",
+            ),
+            "N/A",
+        );
+
+        assert!(
+            status.is_ready(),
+            "a failed Spice Cloud management connection must not flip /v1/ready"
+        );
+        let management = status
+            .management_connection()
+            .expect("management status is recorded");
+        assert!(management.status.is_error());
+        assert_eq!(management.endpoint, "N/A");
+        assert_eq!(
+            management.status.error_message(),
+            Some("Missing required secret: api_key. Specify a value.")
+        );
+    }
+
+    #[test]
     fn test_is_ready_false_while_dataset_ready_hold_is_active_on_registration() {
         let status = RuntimeStatus::new();
         status.set_ready_state(RuntimeReadyState::OnRegistration);
@@ -1023,6 +1100,23 @@ mod tests {
 
         // Once ever-ready is achieved, transient non-ready states still satisfy OnLoad mode.
         status.update_dataset(&dataset, ComponentStatus::Refreshing);
+        assert!(status.is_ready());
+    }
+
+    #[test]
+    fn test_is_ready_on_load_ignores_a_removed_component_that_never_loaded() {
+        let status = RuntimeStatus::new();
+        let good = TableReference::bare("good");
+        let bad = TableReference::bare("bad");
+
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+
+        status.update_dataset(&good, ComponentStatus::Ready);
+        status.update_dataset(&bad, ComponentStatus::error_with_message("file not found"));
+        assert!(!status.is_ready());
+
+        // Removing `bad` from the Spicepod disables it.
+        status.update_dataset(&bad, ComponentStatus::Disabled);
         assert!(status.is_ready());
     }
 

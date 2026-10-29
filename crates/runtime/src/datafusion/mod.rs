@@ -159,6 +159,7 @@ use change_generations::{
 };
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
+pub(crate) mod output_reservation;
 pub(crate) mod query_memory_pool;
 pub use runtime_datafusion::composed_catalog;
 // `error` and `refresh_sql` below are named throughout the runtime through these
@@ -183,7 +184,9 @@ pub use runtime_table::table_provider_with_spicepod_metadata;
 pub mod secrets_context_extension;
 pub mod table;
 pub use runtime_datafusion::sort_columns;
-pub(crate) mod sql_depth_guard;
+pub(crate) use runtime_query_engine::sql_depth_guard;
+#[cfg(test)]
+mod sql_depth_guard_tests;
 pub(crate) mod sql_validator;
 pub mod tool_udf;
 pub mod udf;
@@ -510,7 +513,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use 'arrow' (optionally with 'partition_by') or 'cayenne' instead."
+        "Failed to create an accelerated table for dataset {dataset_name}: the '{engine}' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
     ))]
     UnsupportedDistributedAccelerationEngine {
         dataset_name: String,
@@ -1390,6 +1393,7 @@ pub trait DatasetPlacement: std::fmt::Debug + Send + Sync {
 /// The verdict is point-in-time and does not survive into the side effect the
 /// caller then commits; closing that remaining window needs the side effect
 /// itself to carry a generation (#13746).
+#[derive(Clone)]
 pub struct TableInstance {
     table: TableReference,
     /// Held weakly on purpose. A `Weak` keeps the allocation open, so a dropped
@@ -1433,6 +1437,10 @@ pub enum DeferredRefreshOutcome {
     TableChanged,
 }
 
+/// The plan-cache clear count when a session was copied from `DataFusion::ctx`.
+#[derive(Debug)]
+struct PlansGeneration(u64);
+
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     pub(crate) runtime_status: Arc<status::RuntimeStatus>,
@@ -1455,6 +1463,12 @@ pub struct DataFusion {
     /// default catalog, keyed by dataset name (see [`DatasetPlacement`]).
     dataset_placements: dashmap::DashMap<String, Arc<dyn DatasetPlacement>>,
     caching: Arc<Caching>,
+    /// Counts plan-cache clears; `ctx` carries the count as a [`PlansGeneration`]
+    /// extension. A plan is cached only if its session was copied after the last clear,
+    /// because a copied session keeps the functions it was copied with and a plan that
+    /// resolved a definition the clear retired would outlive it. A write holds the read
+    /// guard across its check and insert, so a clear cannot count in between.
+    plans_generation: TokioRwLock<u64>,
     /// First 10 distinct SQL results-cache plan shapes, replayed after the
     /// first full/append refresh until the cache is full. No-op unless
     /// `runtime.caching.sql_results.warmup` is `on_first_refresh`.
@@ -1924,7 +1938,7 @@ impl DataFusion {
     /// action captured against the old one is about a table that is no longer
     /// there.
     #[must_use]
-    async fn table_instance_is_current(&self, instance: &TableInstance) -> bool {
+    pub(crate) async fn table_instance_is_current(&self, instance: &TableInstance) -> bool {
         let Some(captured) = instance.provider.as_ref() else {
             // Nothing resolved under the name when the instance was captured, so
             // there is no identity to compare against; the most the registry can
@@ -4163,6 +4177,7 @@ impl DataFusion {
         let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching)
             || (source.as_any().is::<SinkConnector>()
                 && !matches!(refresh_mode, RefreshMode::Snapshot));
+        let mut initial_status = None;
         if !initial_load_complete
             && let Ok(checkpoint) = dataset_checkpointer(
                 dataset,
@@ -4173,18 +4188,12 @@ impl DataFusion {
             .await
             && checkpoint.exists().await
         {
-            // For append refreshes that rely on a time column (i.e. file-based appends) that have
-            // snapshotting enabled, we delay readiness until the first refresh completes so that
-            // the append window is initialized with newly ingested data rather than pre-existing checkpoint files.
-            // Additionally, for CDC we let connector/stream to decide when dataset is ready.
+            // For CDC we let connector/stream to decide when dataset is ready.
             //
             // A dataset that reads snapshots (`file_format: snapshot`) is ready only once it
             // has restored a snapshot in this process: a copy left from an earlier run can be
             // arbitrarily old, or from a location the dataset no longer reads.
-            let delay_initial_ready = matches!(refresh_mode, RefreshMode::Append)
-                && dataset.time_column.is_some()
-                && acceleration_settings.snapshot_behavior.bootstrap_enabled()
-                || matches!(refresh_mode, RefreshMode::Changes)
+            let delay_initial_ready = matches!(refresh_mode, RefreshMode::Changes)
                 || (dataset.is_snapshot_source()
                     && bootstrap_status.loaded_snapshot_id().is_none());
 
@@ -4200,13 +4209,16 @@ impl DataFusion {
                 // `Refreshing` itself when it starts.
                 let awaits_source = effective_ready_state == ReadyState::OnSchemaResolved
                     && source_table_provider.awaits_source();
-                let initial_status = if awaits_source {
+                //
+                // Reported when the refresher starts rather than here: the dataset's search
+                // indexes are rebuilt from the acceleration first, and it is not registered
+                // until they are, so reporting it ready now would let `/v1/ready` answer while
+                // queries against it still fail.
+                initial_status = Some(if awaits_source {
                     status::ComponentStatus::Initializing
                 } else {
                     status::ComponentStatus::Ready
-                };
-                self.runtime_status
-                    .update_dataset(&dataset.name, initial_status);
+                });
                 initial_load_complete = true;
             }
         }
@@ -4610,6 +4622,9 @@ impl DataFusion {
         }
 
         accelerated_table_builder.initial_load_complete(initial_load_complete);
+        if let Some(initial_status) = initial_status {
+            accelerated_table_builder.initial_status(initial_status);
+        }
 
         // Caching mode requires federation to be disabled so that queries go through
         // AcceleratedTable::scan to trigger the cache miss/hit logic
@@ -6495,12 +6510,33 @@ impl DataFusion {
 
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
-            // the tables are created. To handle this, wait until all tables are created.
+            // the tables are created. To handle this, wait until all tables are created,
+            // including tables only a subquery reads: a Spicepod change that replaces a
+            // dataset registers the views reading it again before the dataset is.
+            // A table function and `information_schema` are not catalog tables, and never
+            // exist.
+            let tables_read = {
+                let state = ctx.state();
+                let mut tables_read = dependent_table_names.clone();
+                for table in state
+                    .resolve_table_references(&statements[0])
+                    .unwrap_or_default()
+                {
+                    let is_table_function = table.schema().is_none()
+                        && state.table_functions().contains_key(table.table());
+                    let is_information_schema = table.schema() == Some("information_schema");
+                    if !is_table_function && !is_information_schema && !tables_read.contains(&table)
+                    {
+                        tables_read.push(table);
+                    }
+                }
+                tables_read
+            };
 
             let deadline = Instant::now() + Duration::from_mins(1);
             let mut unresolved_dependent_table: Option<TableReference> = None;
 
-            for dependent_table_name in &dependent_table_names {
+            for dependent_table_name in &tables_read {
                 let mut attempts = 0;
                 if unresolved_dependent_table.is_some() {
                     break;
@@ -6666,7 +6702,11 @@ impl DataFusion {
                 secrets,
             )
             .await?;
-        source.mark_registered();
+        let instance = match &registration {
+            Some((instance, _)) => instance.clone(),
+            None => self.capture_table_instance(&view.name).await,
+        };
+        source.mark_registered(instance);
         Ok(registration)
     }
 
@@ -6987,6 +7027,10 @@ impl DataFusion {
             None
         };
 
+        let generation = session
+            .config()
+            .get_extension::<PlansGeneration>()
+            .map(|generation| generation.0);
         let (plan, placeholders) = self.create_logical_plan(session, sql, parameters).await?;
 
         // A plan is not cached when it holds substituted table-function parameters,
@@ -6999,7 +7043,10 @@ impl DataFusion {
             && !matches!(plan, LogicalPlan::Ddl(_))
         {
             tracing::trace!("caching plan for {sql}");
-            cache.put_raw_key(&cache_key.as_u64(), plan.clone()).await;
+            let current = self.plans_generation.read().await;
+            if generation == Some(*current) {
+                cache.put_raw_key(&cache_key.as_u64(), plan.clone()).await;
+            }
         }
 
         Ok(plan)
@@ -7084,8 +7131,26 @@ impl DataFusion {
 
     pub(crate) async fn clear_cached_plans(&self) {
         tracing::trace!("clearing cached logical plans");
+        {
+            let mut generation = self.plans_generation.write().await;
+            *generation += 1;
+            self.ctx
+                .state_ref()
+                .write()
+                .config_mut()
+                .set_extension(Arc::new(PlansGeneration(*generation)));
+        }
         if let Some(cache_provider) = self.plans_cache_provider() {
             cache_provider.invalidate_all().await;
+        }
+    }
+
+    /// Discards every cached plan and result, for a reload that replaces a definition a
+    /// query reads through (a view, a catalog or a user function) rather than a table.
+    pub(crate) async fn clear_cached_plans_and_results(&self) {
+        self.clear_cached_plans().await;
+        if let Some(results) = self.results_cache_provider() {
+            results.invalidate_all().await;
         }
     }
 
@@ -7883,8 +7948,9 @@ async fn build_snapshot_refresh_state(
     let swappable_provider = SwappableTableProvider::new(initial_provider);
     let current_snapshot_id = std::sync::Arc::new(std::sync::Mutex::new(bootstrap_loaded_id));
     let source: Arc<dyn crate::dataaccelerator::AccelerationSource> = Arc::new(dataset.clone());
-    // The initial provider serves the restored snapshot; the engine may reclaim
-    // what an earlier process left that this snapshot no longer references.
+    // The initial provider serves the local snapshot, which may be older than the
+    // one the first refresh restores; the engine may reclaim what an earlier
+    // process left that this snapshot no longer references.
     accelerator
         .maintain_after_snapshot_restore(source.as_ref(), &swappable_provider.current())
         .await;
@@ -7902,6 +7968,8 @@ async fn build_snapshot_refresh_state(
 
 #[cfg(test)]
 mod installation_tests;
+#[cfg(test)]
+mod integer_overflow;
 
 #[cfg(test)]
 mod tests {
@@ -8472,6 +8540,61 @@ mod tests {
         assert!(df.has_table_function_placeholders(SQL));
         assert!(
             !df.has_table_function_placeholders("SELECT value FROM echo('fox') WHERE value <> $1")
+        );
+    }
+
+    /// A session copied before a reload clears the plan cache keeps the functions the
+    /// reload retired, so a plan built from it must not be cached.
+    #[tokio::test]
+    async fn a_plan_from_a_session_copied_before_a_plan_cache_clear_is_not_cached() {
+        static SQL: &str = "SELECT value FROM echo('fox')";
+        let raw_cache_key =
+            CacheKey::Query(SQL, None).as_raw_key(Box::new(std::hash::DefaultHasher::new()));
+
+        let runtime = RuntimeBuilder::new().build().await;
+        let plan_cache_provider = Arc::new(SimpleCache::new(
+            512,
+            Duration::from_hours(1),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
+        ));
+        let df = Arc::new(
+            DataFusion::builder(
+                status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+                Handle::current(),
+            )
+            .with_caching(Arc::new(
+                Caching::new().with_plans_cache(plan_cache_provider),
+            ))
+            .build(),
+        );
+        df.ctx.register_udtf("echo", Arc::new(EchoTableFunc));
+
+        let session = df.ctx.state();
+        df.clear_cached_plans().await;
+        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL, None)
+            .await
+            .expect("plan from the copied session");
+
+        let Some(cache_provider) = df.plans_cache_provider() else {
+            unreachable!("Cache provider should be available");
+        };
+        cache_provider.checkpoint().await;
+        assert_eq!(
+            cache_provider.item_count().await,
+            0,
+            "a plan from a session copied before a clear must not be cached"
+        );
+
+        let session = df.ctx.state();
+        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL, None)
+            .await
+            .expect("plan from a session copied after the clear");
+        cache_provider.checkpoint().await;
+        assert_eq!(
+            cache_provider.item_count().await,
+            1,
+            "a plan from a session copied after a clear is cached"
         );
     }
 
@@ -9080,6 +9203,12 @@ mod tests {
                     Err(Error::UnsupportedDistributedAccelerationEngine { .. })
                 ),
                 "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
+            );
+            // The fix it names is the engine that stays: `arrow` is deprecated, and
+            // Cayenne partitions only in file mode.
+            assert_eq!(
+                result.expect_err("duckdb is rejected").to_string(),
+                "Failed to create an accelerated table for dataset my_dataset: the 'duckdb' engine is not supported for distributed acceleration. Use `engine: cayenne` instead, with `mode: file` to partition it with `partition_by`."
             );
         }
 

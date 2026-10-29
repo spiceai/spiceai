@@ -27,7 +27,8 @@ use spicepod::{
 
 use crate::{
     ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
-    run_query_and_check_results_with_plan_checks, utils::test_request_context,
+    run_query_and_check_results_with_plan_checks,
+    utils::{require_process_per_test, test_request_context},
 };
 
 /// Lay out a hive-partitioned Parquet dataset on disk with three partitions
@@ -298,7 +299,8 @@ async fn file_connector_partition_only_scan_reads_a_computed_partition_alias()
                 ),
                 (
                     "SELECT p FROM (SELECT CAST(p AS BIGINT) - 1 AS p FROM hivepart) s GROUP BY p ORDER BY p",
-                    "CAST(p@2 AS Int64) - 1 as p",
+                    // Integer `-` runs as the checked kernel (overflow errors).
+                    "__spice_checked_sub(CAST(p@2 AS Int64), 1) as p",
                     ["0", "1", "2"],
                 ),
             ] {
@@ -832,6 +834,429 @@ async fn file_connector_projection_pushdown() -> Result<(), anyhow::Error> {
                 run_query_and_check_results_with_plan_checks(&mut rt, query, vec![plan_check], validate_result).await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
+
+            Ok(())
+        })
+        .await
+}
+
+fn write_orders_csv(path: &std::path::Path) -> Result<(), anyhow::Error> {
+    std::fs::write(path, "id,name\n1,alpha\n2,bravo\n")?;
+    Ok(())
+}
+
+/// Unknown `file_format: cvs` must fail dataset setup with a did-you-mean
+/// error instead of silently becoming a 1-row document table.
+#[tokio::test]
+async fn file_connector_unknown_file_format_is_a_configuration_error() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::TempDir::new()?;
+            let csv = dir.path().join("orders.csv");
+            write_orders_csv(&csv)?;
+
+            let mut dataset = Dataset::new(format!("file:{}", csv.display()), "typo_cvs");
+            dataset.params = Some(Params {
+                data: HashMap::from([(
+                    "file_format".to_string(),
+                    ParamValue::String("cvs".to_string()),
+                )]),
+            });
+
+            let app = AppBuilder::new("file_format_typo")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            let status = rt
+                .status()
+                .get_dataset_status(&datafusion::common::TableReference::bare("typo_cvs"))
+                .expect("dataset status");
+            assert!(
+                status.is_error(),
+                "unknown file_format must not go Ready, got {status:?}"
+            );
+            let message = status
+                .error_message()
+                .expect("configuration error must be recorded");
+            assert!(
+                message.contains("Unknown `file_format` 'cvs'"),
+                "status error_message must name the invalid format: {message}"
+            );
+            assert!(
+                message.contains("Did you mean `csv`?"),
+                "status error_message must suggest csv: {message}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Unknown `file_format: log` is not a near-miss of a known format, so it
+/// keeps trunk's plain-text table path and the dataset goes Ready.
+#[tokio::test]
+async fn file_connector_unknown_file_format_log_stays_ready() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::TempDir::new()?;
+            let csv = dir.path().join("orders.csv");
+            write_orders_csv(&csv)?;
+
+            let mut dataset = Dataset::new(format!("file:{}", csv.display()), "fmt_log");
+            dataset.params = Some(Params {
+                data: HashMap::from([(
+                    "file_format".to_string(),
+                    ParamValue::String("log".to_string()),
+                )]),
+            });
+
+            let app = AppBuilder::new("file_format_log")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            let status = rt
+                .status()
+                .get_dataset_status(&datafusion::common::TableReference::bare("fmt_log"))
+                .expect("dataset status");
+            assert!(
+                !status.is_error(),
+                "file_format log must not be a configuration error, got {status:?}"
+            );
+            assert_eq!(
+                status.to_string(),
+                "Ready",
+                "file_format log must stay Ready (plain-text table), got {status:?}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Common real text extensions stay Ready. A structured-format near-miss is
+/// a configuration error only when listing confirms it (no `.{claimed}`
+/// objects, and at least one suggested-format object). `file_format: text`
+/// plus `file_extension: .tex` lists only `*.tex` files.
+#[tokio::test]
+async fn file_connector_text_extensions_ready_structured_typos_error() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::TempDir::new()?;
+            for ext in [
+                "tex", "org", "json5", "jsonc", "mdx", "css", "ts", "psv", "md", "cs", "csx", "rc",
+                "jsonld",
+            ] {
+                std::fs::write(
+                    dir.path().join(format!("notes.{ext}")),
+                    format!("hello {ext}\n"),
+                )?;
+            }
+            let csv = dir.path().join("orders.csv");
+            write_orders_csv(&csv)?;
+            std::fs::write(dir.path().join("data.parquet"), b"PAR1")?;
+            std::fs::write(dir.path().join("data.json"), "{\"id\":1}\n")?;
+
+            let cvs_only_dir = tempfile::TempDir::new()?;
+            std::fs::write(cvs_only_dir.path().join("notes.cvs"), "hello cvs\n")?;
+
+            let docs = format!("file:{}/", dir.path().display());
+            let mut app = AppBuilder::new("file_format_text_extensions");
+            for format in [
+                "tex", "org", "json5", "jsonc", "mdx", "css", "ts", "psv", "cs", "csx", "rc",
+                "jsonld",
+            ] {
+                let mut dataset = Dataset::new(docs.clone(), format!("fmt_{format}"));
+                dataset.params = Some(Params {
+                    data: HashMap::from([(
+                        "file_format".to_string(),
+                        ParamValue::String(format.to_string()),
+                    )]),
+                });
+                app = app.with_dataset(dataset);
+            }
+
+            let mut text_tex = Dataset::new(docs.clone(), "text_tex");
+            text_tex.params = Some(Params {
+                data: HashMap::from([
+                    (
+                        "file_format".to_string(),
+                        ParamValue::String("text".to_string()),
+                    ),
+                    (
+                        "file_extension".to_string(),
+                        ParamValue::String(".tex".to_string()),
+                    ),
+                ]),
+            });
+            app = app.with_dataset(text_tex);
+
+            let mut cvs_only = Dataset::new(
+                format!("file:{}/", cvs_only_dir.path().display()),
+                "fmt_cvs_only",
+            );
+            cvs_only.params = Some(Params {
+                data: HashMap::from([(
+                    "file_format".to_string(),
+                    ParamValue::String("cvs".to_string()),
+                )]),
+            });
+            app = app.with_dataset(cvs_only);
+
+            for (name, format, file) in [
+                ("typo_cvs", "cvs", csv.display().to_string()),
+                (
+                    "typo_parqet",
+                    "parqet",
+                    dir.path().join("data.parquet").display().to_string(),
+                ),
+                (
+                    "typo_jsno",
+                    "jsno",
+                    dir.path().join("data.json").display().to_string(),
+                ),
+                (
+                    "typo_parquett",
+                    "parquett",
+                    dir.path().join("data.parquet").display().to_string(),
+                ),
+            ] {
+                let mut dataset = Dataset::new(format!("file:{file}"), name);
+                dataset.params = Some(Params {
+                    data: HashMap::from([(
+                        "file_format".to_string(),
+                        ParamValue::String(format.to_string()),
+                    )]),
+                });
+                app = app.with_dataset(dataset);
+            }
+
+            let app = app.build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            for format in [
+                "tex", "org", "json5", "jsonc", "mdx", "css", "ts", "psv", "cs", "csx", "rc",
+                "jsonld",
+            ] {
+                let name = format!("fmt_{format}");
+                let status = rt
+                    .status()
+                    .get_dataset_status(&datafusion::common::TableReference::bare(name.as_str()))
+                    .expect("dataset status");
+                assert_eq!(
+                    status.to_string(),
+                    "Ready",
+                    "file_format {format} must stay Ready, got {status:?}"
+                );
+            }
+
+            let cvs_only_status = rt
+                .status()
+                .get_dataset_status(&datafusion::common::TableReference::bare("fmt_cvs_only"))
+                .expect("dataset status");
+            assert_eq!(
+                cvs_only_status.to_string(),
+                "Ready",
+                "file_format cvs over only .cvs files must stay Ready, got {cvs_only_status:?}"
+            );
+
+            let text_status = rt
+                .status()
+                .get_dataset_status(&datafusion::common::TableReference::bare("text_tex"))
+                .expect("dataset status");
+            assert_eq!(
+                text_status.to_string(),
+                "Ready",
+                "file_format text plus file_extension .tex must stay Ready, got {text_status:?}"
+            );
+
+            let mut result = rt
+                .datafusion()
+                .query_builder("SELECT location FROM text_tex")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("text_tex query failed: {e}"))?;
+            let mut locations = Vec::new();
+            while let Some(batch) = result.data.next().await {
+                let batch = batch.map_err(|e| anyhow::anyhow!("text_tex batch error: {e}"))?;
+                for row in 0..batch.num_rows() {
+                    locations.push(
+                        arrow::util::display::array_value_to_string(batch.column(0), row)
+                            .expect("location renders"),
+                    );
+                }
+            }
+            assert_eq!(
+                locations.len(),
+                1,
+                "text_tex must list exactly one object: {locations:?}"
+            );
+            assert!(
+                locations[0].ends_with("notes.tex"),
+                "text_tex must pick up notes.tex, got {locations:?}"
+            );
+
+            for (name, format, hint) in [
+                ("typo_cvs", "cvs", "csv"),
+                ("typo_parqet", "parqet", "parquet"),
+                ("typo_jsno", "jsno", "json"),
+                ("typo_parquett", "parquett", "parquet"),
+            ] {
+                let status = rt
+                    .status()
+                    .get_dataset_status(&datafusion::common::TableReference::bare(name))
+                    .expect("dataset status");
+                assert!(
+                    status.is_error(),
+                    "{format} must not go Ready, got {status:?}"
+                );
+                let message = status
+                    .error_message()
+                    .expect("configuration error must be recorded");
+                assert!(
+                    message.contains(&format!("Unknown `file_format` '{format}'")),
+                    "status error_message must name {format}: {message}"
+                );
+                assert!(
+                    message.contains(&format!("Did you mean `{hint}`?")),
+                    "status error_message must suggest {hint}: {message}"
+                );
+            }
+
+            Ok(())
+        })
+        .await
+}
+
+/// A secret-derived bool param must not echo the resolved canary in the
+/// dataset status `error_message`.
+#[tokio::test]
+async fn file_connector_secret_param_validation_does_not_echo_canary() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            const CANARY: &str = "CANARYPGPW7731";
+            const KEY: &str = "SEC1_CANARY_PG_PW";
+            const REFERENCE: &str = "${ env:SEC1_CANARY_PG_PW }";
+
+            require_process_per_test("the test sets an environment variable");
+            // SAFETY: the test runs in a process of its own, before the runtime
+            // starts any thread that reads the environment.
+            unsafe {
+                std::env::set_var(KEY, CANARY);
+            }
+
+            let dir = tempfile::TempDir::new()?;
+            let csv = dir.path().join("orders.csv");
+            write_orders_csv(&csv)?;
+
+            let mut dataset = Dataset::new(format!("file:{}", csv.display()), "leak");
+            dataset.params = Some(Params {
+                data: HashMap::from([
+                    (
+                        "file_format".to_string(),
+                        ParamValue::String("csv".to_string()),
+                    ),
+                    (
+                        "csv_has_header".to_string(),
+                        ParamValue::String(REFERENCE.to_string()),
+                    ),
+                ]),
+            });
+
+            let app = AppBuilder::new("secret_echo")
+                .with_secret(spicepod::component::secret::Secret {
+                    from: "env".to_string(),
+                    name: "env".to_string(),
+                    description: None,
+                    params: None,
+                })
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    unsafe {
+                        std::env::remove_var(KEY);
+                    }
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            unsafe {
+                std::env::remove_var(KEY);
+            }
+
+            let status = rt
+                .status()
+                .get_dataset_status(&datafusion::common::TableReference::bare("leak"))
+                .expect("dataset status");
+            assert!(
+                status.is_error(),
+                "an invalid secret-derived bool must fail dataset setup, got {status:?}"
+            );
+            let message = status
+                .error_message()
+                .expect("validation error must be recorded on the dataset");
+            assert!(
+                !message.contains(CANARY),
+                "dataset status error_message must not contain the canary: {message}"
+            );
+            assert!(
+                message.contains("csv_has_header"),
+                "error_message must name the parameter: {message}"
+            );
+            assert!(
+                message.contains(REFERENCE),
+                "error_message must name the secret reference: {message}"
+            );
 
             Ok(())
         })
