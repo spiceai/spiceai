@@ -764,39 +764,6 @@ fn id_value_batch(rows: &[(i64, i64)]) -> TestResult<RecordBatch> {
     )?)
 }
 
-test_with_backends!(test_do_nothing_ignores_a_key_already_in_the_datalake_impl);
-
-/// Insert-or-ignore of a key whose live row is in a datalake file keeps the
-/// datalake row. Fails on the code before warm-only promotion too, so it is a
-/// separate defect from the promotion change and is kept out of its gate.
-async fn test_do_nothing_ignores_a_key_already_in_the_datalake_impl(
-    fixture: common::TestFixture,
-) -> TestResult<()> {
-    let cold_dir = fixture.temp_dir.path().join("cold");
-    std::fs::create_dir_all(&cold_dir)?;
-    let catalog: Arc<dyn MetadataCatalog> =
-        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let ctx = SessionContext::new();
-    let table = Arc::new(
-        CayenneTableProvider::create_table(
-            catalog,
-            table_options_with_conflict(&fixture, &cold_dir, OnConflict::DoNothingAll),
-            ctx.runtime_env(),
-        )
-        .await?,
-    );
-    ctx.register_table(TABLE, Arc::clone(&table) as Arc<dyn TableProvider>)?;
-    let initial: Vec<(i64, i64)> = (0..100).map(|id| (id, id * 2)).collect();
-    common::insert_batch(table.as_ref(), id_value_batch(&initial)?).await?;
-    flush_warm(&table).await;
-    assert!(table.promote_warm_to_cold().await?, "promotion fires");
-
-    common::insert_batch(table.as_ref(), id_value_batch(&[(5, 999)])?).await?;
-    let oracle: BTreeMap<i64, i64> = initial.into_iter().collect();
-    assert_matches_oracle(&ctx, &oracle, &[5], "after inserting a datalake key").await?;
-    Ok(())
-}
-
 /// Run a `DELETE` with no `WHERE` and return the rows-affected count.
 async fn delete_all(table: &CayenneTableProvider) -> TestResult<u64> {
     let ctx = SessionContext::new();

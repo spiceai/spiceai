@@ -47784,7 +47784,7 @@ mod tests {
 
     #[test]
     fn datalake_merge_leaves_the_large_base_generation_alone() {
-        // Measured on the Anise rig: a 300 MiB datalake base and promotion outputs
+        // Measured under OTLP ingest: a 300 MiB datalake base and promotion outputs
         // of about 1.3 MiB. Four promotions merge with each other; the base is
         // not rewritten to absorb them.
         let mib = 1024 * 1024;
