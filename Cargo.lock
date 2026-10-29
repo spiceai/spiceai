@@ -17624,6 +17624,7 @@ dependencies = [
  "evaluate-api",
  "evaluate-chat",
  "event_stream",
+ "flate2",
  "flight_client",
  "fundu",
  "futures",
