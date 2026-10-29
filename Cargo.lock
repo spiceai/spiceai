@@ -6513,6 +6513,7 @@ dependencies = [
  "delta_kernel_default_engine",
  "document_parse",
  "duckdb",
+ "duration-parse",
  "elasticsearch",
  "flate2",
  "flight_client",
@@ -7489,7 +7490,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=4a2920746865562e604150fbee49eea6241c0b85#4a2920746865562e604150fbee49eea6241c0b85"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=ead7631b4663758b6343554807822fd9f313b865#ead7631b4663758b6343554807822fd9f313b865"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",

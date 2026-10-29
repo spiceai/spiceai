@@ -27,6 +27,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
+use data_components::mysql::pool::{PoolParams, PoolSettings};
 use data_components::mysql::provider::MySQLCatalogProvider;
 use datafusion_table_providers::mysql::MySQLTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
@@ -51,6 +52,16 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("db").description("The MySQL database name."),
     ParameterSpec::component("sslmode").description("The SSL mode for the connection."),
     ParameterSpec::component("sslrootcert").description("The path to the SSL root certificate."),
+    ParameterSpec::component("connection_max_lifetime")
+        .description(
+            "How long a pooled connection is used before it is closed and replaced, such as '5m'. \
+             Replacing connections makes the pool resolve the host again, so it spreads across \
+             the servers behind a load-balanced hostname such as a reader endpoint. Each \
+             connection's lifetime is extended by a random amount of up to a fifth of it, so \
+             connections opened together are not replaced together. A connection is not closed \
+             while a query is using it. '0s' keeps connections open indefinitely. Default: 5m.",
+        )
+        .default("5m"),
 ];
 
 /// A catalog connector for `MySQL`, providing access to schemas and tables
@@ -80,7 +91,33 @@ impl CatalogConnector for MySQLCatalog {
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let connector_component = ConnectorComponent::from(catalog);
 
-        let pool = MySQLConnectionPool::new(self.params.parameters.to_secret_map())
+        // The catalog takes no pool size parameters, so its pool keeps the size its connection
+        // parameters give; only the connection lifetime is resolved here. `Parameters` fills in
+        // the spec default, so whether the user set it is read from the catalog's own params.
+        let parameters = &self.params.parameters;
+        let user_set_lifetime = (catalog.params.contains_key("mysql_connection_max_lifetime")
+            || catalog.params.contains_key("connection_max_lifetime")
+            || parameters.is_autoloaded("connection_max_lifetime"))
+        .then(|| parameters.get("connection_max_lifetime").expose().ok())
+        .flatten();
+        let pool_settings = PoolSettings::resolve(
+            PoolParams {
+                connection_max_lifetime: user_set_lifetime,
+                connection_string: parameters.get("connection_string").expose().ok(),
+                ..PoolParams::default()
+            },
+            None,
+        )
+        .map_err(|error| super::Error::InvalidConfigurationNoSource {
+            connector: PREFIX.to_string(),
+            connector_component: connector_component.clone(),
+            message: error.to_string(),
+        })?;
+
+        let pool =
+            MySQLConnectionPool::new_with_pool_opts(parameters.to_secret_map(), move |pool_opts| {
+                pool_settings.apply(pool_opts)
+            })
             .await
             .map_err(|e| super::Error::UnableToGetCatalogProvider {
                 connector: PREFIX.to_string(),
