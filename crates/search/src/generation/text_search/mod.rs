@@ -431,6 +431,11 @@ impl FullTextSearchFieldIndex {
             Box::new(BooleanQuery::new(clauses))
         };
 
+        let limit = top_docs_limit(limit, searcher.num_docs());
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
         searcher
             .search(&q, &TopDocs::with_limit(limit).order_by_score())
             .context(TextSearchSnafu)
@@ -483,6 +488,12 @@ impl FullTextSearchFieldIndex {
 
         Ok(decoder)
     }
+}
+
+/// Clamp a requested result count to the number of documents in the index. `TopDocs` allocates
+/// space for `limit` hits up front, and no query can return more hits than the index holds.
+fn top_docs_limit(requested: usize, num_docs: u64) -> usize {
+    usize::try_from(num_docs).map_or(requested, |num_docs| requested.min(num_docs))
 }
 
 /// Parse a user-provided full-text query.
@@ -674,7 +685,7 @@ pub fn tantivy_to_arrow_type(t: &FieldType) -> Option<arrow::datatypes::DataType
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::generation::text_search::{parse_query_literal, parse_user_query};
+    use crate::generation::text_search::{parse_query_literal, parse_user_query, top_docs_limit};
     use tantivy::{
         Index,
         query::QueryParser,
@@ -746,6 +757,23 @@ pub(crate) mod tests {
                 digits[pos] = 0;
             }
         }
+    }
+
+    #[test]
+    fn test_top_docs_limit_clamps_to_index_size() {
+        assert_eq!(top_docs_limit(10, 1_000), 10);
+        assert_eq!(top_docs_limit(1_000, 1_000), 1_000);
+        assert_eq!(top_docs_limit(1_001, 1_000), 1_000);
+        assert_eq!(top_docs_limit(usize::MAX, 1_000), 1_000);
+        assert_eq!(top_docs_limit(10, 0), 0);
+    }
+
+    /// A query nested deeper than the grammar accepts is searched as its words.
+    #[test]
+    fn test_deeply_nested_query_falls_back_to_words() {
+        let parser = text_parser();
+        let q = format!("{}a{}", "(".repeat(32), ")".repeat(32));
+        parse_user_query(&parser, &q).unwrap_or_else(|e| panic!("{q:?}: {e}"));
     }
 
     #[test]

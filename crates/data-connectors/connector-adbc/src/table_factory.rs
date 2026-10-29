@@ -68,7 +68,7 @@ fn function_support_for_driver(driver_name: &str) -> FunctionSupport {
     }
     let support = deny_spice_functions_for_table_providers();
     match expression_support_for_engine(driver_name) {
-        Some(gate) => support.with_expression_support(gate),
+        Some(gate) => runtime_udfs_api::and_expression_support(support, gate),
         None => support,
     }
 }

@@ -67,6 +67,12 @@ pub trait Source: Send + Sync {
     /// The source's container; `None` for a source with no server (files).
     fn container(&self) -> Option<&Container>;
 
+    /// Every container the source runs, for saving their logs. A source
+    /// running more than its one `container` lists the rest too.
+    fn containers(&self) -> Vec<&Container> {
+        self.container().into_iter().collect()
+    }
+
     /// Removes everything the source started. A source running more than its
     /// one `container` removes the rest too.
     async fn remove(&self) -> Result<()> {
