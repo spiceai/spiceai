@@ -1,0 +1,153 @@
+name: sql-ddl-sources
+description: >
+  A dataset defined with SQL answers from the source its served definition
+  names, never from acceleration data a definition with another source
+  loaded: after an ALTER of a connector parameter; when a Spicepod starts or
+  stops declaring its name, while Spice runs and across a restart; and when
+  another instance that shares the definitions points it at another source
+  while this one is stopped. Each acceleration is Cayenne in a file, which a
+  load finds marked loaded.
+
+sources:
+  lake: { kind: files }
+  ref: { kind: postgres }
+  other: { kind: postgres }
+
+# Two instances that share the definitions; most steps run on `a`.
+variants:
+  a: {}
+  b: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: sql-ddl-sources
+  runtime:
+    state:
+      location: file://${instance.dir}/../shared-state/
+
+defaults:
+  run-variants: side-by-side
+  compare-variants: false
+  spiced-args: [--pods-watcher-enabled]
+
+steps:
+  - generate:
+      lake:
+        table: orders
+        rows: 50
+        seed: 7
+        primary-key: id
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: amount, int: [0, 1000] }
+    mirror: ref
+  - generate:
+      lake:
+        table: orders_next
+        rows: 30
+        seed: 8
+        primary-key: id
+        format: csv
+        columns:
+          - { name: id, sequence: 1000 }
+          - { name: amount, int: [0, 1000] }
+    mirror: ref
+  - source-exec:
+      other: |
+        CREATE TABLE orders (id integer PRIMARY KEY, amount integer NOT NULL);
+        INSERT INTO orders SELECT 5000 + i, i FROM generate_series(1, 20) AS i;
+  - start: {}
+
+  # A new connector parameter can name another database: the acceleration
+  # then loads from it, not from what the earlier one loaded.
+  - spice-exec: "CREATE TABLE pg WITH (from = 'postgres:public.orders', pg_host = '${sources.ref.params.pg_host}', pg_port = '${sources.ref.params.pg_port}', pg_db = '${sources.ref.params.pg_db}', pg_user = '${sources.ref.params.pg_user}', pg_pass = '${sources.ref.params.pg_pass}', pg_sslmode = 'disable', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM pg
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - spice-exec: "ALTER TABLE pg SET (pg_host = '${sources.other.params.pg_host}', pg_port = '${sources.other.params.pg_port}', pg_db = '${sources.other.params.pg_db}', pg_user = '${sources.other.params.pg_user}', pg_pass = '${sources.other.params.pg_pass}')"
+    only: a
+  - query: SELECT id, amount FROM pg
+    only: a
+    eventually: 60s
+    expect: { oracle: other }
+    oracle-sql: SELECT id, amount FROM orders
+
+  # A Spicepod that starts declaring a name SQL defines is served under it,
+  # from its own source; one that stops gives the name back to the SQL
+  # definition, from its source. While Spice runs:
+  - spice-exec: "CREATE TABLE sw WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM sw
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - edit-spicepod:
+      spicepod:
+        datasets:
+          - from: postgres:public.orders
+            name: sw
+            params: ${sources.other.params}
+            acceleration: { enabled: true, engine: cayenne, mode: file }
+    only: a
+  - query: SELECT id, amount FROM sw
+    only: a
+    eventually: 60s
+    expect: { oracle: other }
+    oracle-sql: SELECT id, amount FROM orders
+  - edit-spicepod:
+      spicepod: { datasets: [] }
+    only: a
+  - query: SELECT id, amount FROM sw
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+
+  # The same, across a restart: the Spicepod changes while Spice is stopped.
+  - restart:
+      patch:
+        spicepod:
+          datasets:
+            - from: postgres:public.orders
+              name: sw
+              params: ${sources.other.params}
+              acceleration: { enabled: true, engine: cayenne, mode: file }
+    only: a
+  - query: SELECT id, amount FROM sw
+    only: a
+    eventually: 60s
+    expect: { oracle: other }
+    oracle-sql: SELECT id, amount FROM orders
+  - restart:
+      patch: { spicepod: { datasets: [] } }
+    only: a
+  - query: SELECT id, amount FROM sw
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+
+  # Another instance points the dataset at another source while `a` is
+  # stopped: once restarted, `a` answers from the new source.
+  - query: SELECT id, amount FROM sw
+    only: b
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - stop: {}
+    only: a
+  - spice-exec: "ALTER TABLE sw SET (from = 'file://${sources.lake.path}/orders_next/')"
+    only: b
+  - start: {}
+    only: a
+  - query: SELECT id, amount FROM sw
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
