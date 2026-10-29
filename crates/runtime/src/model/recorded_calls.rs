@@ -101,8 +101,11 @@ pub(crate) fn recorded(
 /// an MCP server, such as another Spice's (`peer__sql`), counts as one. `None`
 /// when nothing changes, as for text that is not JSON.
 pub(crate) fn recorded_by_name(text: &str) -> Option<String> {
-    let mut json = serde_json::from_str::<Value>(text).ok()?;
     let sql_tools = sql_tool_names();
+    if !may_name(text, &sql_tools) {
+        return None;
+    }
+    let mut json = serde_json::from_str::<Value>(text).ok()?;
     let is_sql = |name: &str| {
         is_sql_tool(name)
             || sql_tools.iter().any(|tool| encode_tool_name(tool) == name)
@@ -118,6 +121,22 @@ pub(crate) fn recorded_by_name(text: &str) -> Option<String> {
         }
     };
     record_tool_calls(&mut json, &record).then(|| json.to_string())
+}
+
+/// Whether `text`, JSON, may hold a string that names `tool_invoke` or one of
+/// `sql_tools`. A name of only `[A-Za-z0-9_-]`, as every tool name a model API
+/// takes is, is written in a JSON string as itself or with `\u` escapes, so
+/// text with neither holds none. That check is cheap enough for every payload
+/// task history keeps; only text that passes it is parsed.
+fn may_name(text: &str, sql_tools: &[String]) -> bool {
+    text.contains("\\u")
+        || text.contains("tool_invoke")
+        || sql_tools.iter().any(|name| {
+            !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+                || text.contains(name.as_str())
+        })
 }
 
 /// The recording of `arguments`, when it is not the arguments themselves.
@@ -447,6 +466,20 @@ mod tests {
             recorded,
             json!({"messages": [{"role": "assistant", "tool_calls": [
                 {"id": "c1", "function": {"name": "peer__sql", "arguments": recorded_query}}]}]})
+        );
+
+        // A name written with escapes is still read as the name.
+        let escaped = format!(
+            r#"{{"messages": [{{"role": "assistant", "tool_calls": [{{"id": "c1", "function": {{"name": "s\u0071l", "arguments": {}}}}}]}}]}}"#,
+            Value::String(query)
+        );
+        let recorded: Value =
+            serde_json::from_str(&recorded_by_name(&escaped).expect("the payload changes"))
+                .expect("the recorded payload is JSON");
+        assert_eq!(
+            recorded,
+            json!({"messages": [{"role": "assistant", "tool_calls": [
+                {"id": "c1", "function": {"name": "sql", "arguments": recorded_query}}]}]})
         );
 
         // A call to another tool, and text that is not JSON, are kept.
