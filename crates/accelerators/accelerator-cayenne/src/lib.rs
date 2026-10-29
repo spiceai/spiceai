@@ -2848,10 +2848,11 @@ impl CayenneAccelerator {
         &self,
         metadata_dir: &str,
         metastore_type: &str,
+        source: &dyn AccelerationSource,
     ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
         let connection_string = match metastore_type {
             "object_native" => {
-                return Self::init_object_native_catalog(&self.catalog, metadata_dir).await;
+                return Self::init_object_native_catalog(&self.catalog, metadata_dir, source).await;
             }
             "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
             _ => format!("sqlite://{metadata_dir}/cayenne.db"), // Default to SQLite
@@ -2859,21 +2860,54 @@ impl CayenneAccelerator {
         Self::init_cayenne_catalog(&self.catalog, connection_string).await
     }
 
-    /// Get or create the object-native catalog, kept as a head log in
-    /// `{metadata_dir}/object_native` with no SQL metastore.
+    /// Get or create the object-native catalog, with no SQL metastore. With
+    /// `runtime.state.location` set, its head log is kept in the location's
+    /// `cayenne/v1/` folder; otherwise in `{metadata_dir}/object_native`.
     async fn init_object_native_catalog(
         cell: &OnceCell<Arc<dyn cayenne::MetadataCatalog>>,
         metadata_dir: &str,
+        source: &dyn AccelerationSource,
     ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
         let directory = PathBuf::from(metadata_dir).join("object_native");
+        let state = source.app().runtime.state.clone();
+        let secrets = source.secrets();
         cell.get_or_try_init(move || async move {
+            let native = match state {
+                Some(state) => {
+                    let location = spicepod::component::runtime::StateLocation {
+                        location: state.location.clone(),
+                        params: state.params.clone(),
+                        source: spicepod::component::runtime::StateSource::RuntimeState,
+                    };
+                    let (store, prefix) = runtime_state_location::build_object_store(
+                        secrets,
+                        tokio::runtime::Handle::current(),
+                        &location,
+                        runtime_state_location::StateFeature::CayenneMetastore,
+                    )
+                    .await
+                    .boxed()
+                    .context(AccelerationInitializationFailedSnafu)?;
+                    cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
+                        store,
+                        object_store::path::Path::from(prefix)
+                            .join("v1")
+                            .join("catalog"),
+                        &format!("{}/cayenne/v1", state.location.trim_end_matches('/')),
+                    )
+                    .await
+                }
+                None => {
+                    cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_local(
+                        &directory,
+                    )
+                    .await
+                }
+            };
             let catalog = Arc::new(
-                cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_local(
-                    &directory,
-                )
-                .await
-                .boxed()
-                .context(AccelerationInitializationFailedSnafu)?,
+                native
+                    .boxed()
+                    .context(AccelerationInitializationFailedSnafu)?,
             ) as Arc<dyn cayenne::MetadataCatalog>;
             catalog
                 .init()
@@ -3026,7 +3060,7 @@ impl CayenneAccelerator {
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?;
             // Get or create the shared catalog (lazy initialization)
-            self.get_or_create_catalog(&metadata_dir, &metastore_type)
+            self.get_or_create_catalog(&metadata_dir, &metastore_type, source)
                 .await?
         };
 
@@ -3897,14 +3931,18 @@ impl DataAccelerator for CayenneAccelerator {
                 .is_some_and(|metastore| metastore == "object_native")
             {
                 let head = format!("{metadata_dir}/object_native/catalog/head");
-                if open_option == OpenOption::OpenExisting && !path_exists(&head).await {
+                // A catalog in `runtime.state.location` is checked when it is opened.
+                if open_option == OpenOption::OpenExisting
+                    && source.app().runtime.state.is_none()
+                    && !path_exists(&head).await
+                {
                     return Err(CheckpointError::Store {
                         source: format!("Cayenne object-native catalog does not exist at {head}")
                             .into(),
                     });
                 }
                 let catalog = self
-                    .get_or_create_catalog(&metadata_dir, "object_native")
+                    .get_or_create_catalog(&metadata_dir, "object_native", source)
                     .await
                     .map_err(|source| CheckpointError::Store {
                         source: Box::new(source),
@@ -4188,7 +4226,7 @@ impl DataAccelerator for CayenneAccelerator {
 
             let table_name = source.name().to_string();
             let catalog = self
-                .get_or_create_catalog(&metadata_dir, metastore_type)
+                .get_or_create_catalog(&metadata_dir, metastore_type, source)
                 .await
                 .boxed()
                 .context(AccelerationInitializationFailedSnafu)?;
@@ -4238,7 +4276,7 @@ impl DataAccelerator for CayenneAccelerator {
                 .get("cayenne_metastore")
                 .map_or("sqlite", String::as_str);
             let catalog = self
-                .get_or_create_catalog(&metadata_dir.to_string_lossy(), metastore_type)
+                .get_or_create_catalog(&metadata_dir.to_string_lossy(), metastore_type, source)
                 .await?;
 
             if !snapshot_bootstrap_enabled(acceleration, source, refresh_mode) {
@@ -4716,7 +4754,7 @@ impl DataAccelerator for CayenneAccelerator {
             .map_or("sqlite", String::as_str)
             .to_string();
         let catalog = match self
-            .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
+            .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type, source)
             .await
         {
             Ok(catalog) => catalog,
@@ -4868,7 +4906,7 @@ impl DataAccelerator for CayenneAccelerator {
                 .get("cayenne_metastore")
                 .map_or("sqlite", String::as_str);
             let catalog = self
-                .get_or_create_catalog(&metadata_dir, metastore_type)
+                .get_or_create_catalog(&metadata_dir, metastore_type, source)
                 .await?;
             // A failed lookup must not fall back to the configured directory: that is
             // where the dataset now puts its data, which may already hold files. Only a
@@ -4985,7 +5023,7 @@ impl DataAccelerator for CayenneAccelerator {
             .get("cayenne_metastore")
             .map_or("sqlite", String::as_str);
         let catalog = self
-            .get_or_create_catalog(&metadata_dir, metastore_type)
+            .get_or_create_catalog(&metadata_dir, metastore_type, source)
             .await?;
         let table = catalog.get_table(table_name).await.boxed()?;
 
@@ -6615,8 +6653,9 @@ mod tests {
         let snapshots_dir = temp.path().join("snapshots");
         std::fs::create_dir_all(&snapshots_dir).expect("snapshot directory");
         let accelerator = CayenneAccelerator::new();
+        let probe = TestAccelerationSource::new("orders");
         let catalog = accelerator
-            .get_or_create_catalog(&metadata_dir.to_string_lossy(), "sqlite")
+            .get_or_create_catalog(&metadata_dir.to_string_lossy(), "sqlite", &probe)
             .await
             .expect("shared catalog");
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));

@@ -7,6 +7,8 @@ description: >
 
 sources:
   src: { kind: postgres }
+  # The state location of the object-native-rustfs variant.
+  lake: { kind: rustfs }
 
 variants:
   sqlite-key:
@@ -21,6 +23,22 @@ variants:
     datasets: { '*': { acceleration: { params: { cayenne_metastore: object_native, cayenne_deletion_mode: key, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
   object-native-position:
     datasets: { '*': { acceleration: { params: { cayenne_metastore: object_native, cayenne_deletion_mode: position, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
+  # The object-native metastore in an S3-compatible store: its head log is kept
+  # under `runtime.state.location`, in the location's `cayenne/v1/` folder, while
+  # data files stay on local disk.
+  object-native-rustfs:
+    spicepod:
+      runtime:
+        state:
+          location: s3://${sources.lake.bucket}/state/
+          params:
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
+    datasets: { '*': { acceleration: { params: { cayenne_metastore: object_native, cayenne_deletion_mode: key, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
   # The same flush cadence on SQLite, so the comparison isolates the metastore.
   sqlite-key-flush:
     datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: key, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }

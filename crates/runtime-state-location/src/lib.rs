@@ -184,17 +184,20 @@ pub enum StateFeature {
     RateControl,
     ResultsCacheWarmup,
     Snapshots,
+    /// The Cayenne object-native metastore's head logs.
+    CayenneMetastore,
     /// The startup check of a `runtime.state` location, which keeps
     /// `format.json` and its probe object in the location's `_spice/` folder.
     StartupCheck,
 }
 
 impl StateFeature {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Scheduler,
         Self::RateControl,
         Self::ResultsCacheWarmup,
         Self::Snapshots,
+        Self::CayenneMetastore,
         Self::StartupCheck,
     ];
 
@@ -207,6 +210,7 @@ impl StateFeature {
             Self::RateControl => Some("rate_control"),
             Self::ResultsCacheWarmup => Some("results_cache_warmup"),
             Self::Snapshots => Some("snapshots"),
+            Self::CayenneMetastore => Some("cayenne_metastore"),
             Self::StartupCheck => None,
         }
     }
@@ -218,6 +222,7 @@ impl StateFeature {
             Self::RateControl => "rate-control",
             Self::ResultsCacheWarmup => "results-cache",
             Self::Snapshots => SNAPSHOTS_STATE_FOLDER,
+            Self::CayenneMetastore => "cayenne",
             Self::StartupCheck => "_spice",
         }
     }
@@ -228,6 +233,7 @@ impl StateFeature {
             Self::RateControl => "rate-control state",
             Self::ResultsCacheWarmup => "SQL results cache warmup state",
             Self::Snapshots => "snapshot",
+            Self::CayenneMetastore => "Cayenne metastore",
             Self::StartupCheck => "shared state location check",
         }
     }
@@ -240,6 +246,7 @@ impl StateFeature {
             Self::RateControl => "source rate control",
             Self::ResultsCacheWarmup => "SQL results cache warmup",
             Self::Snapshots => "acceleration snapshots",
+            Self::CayenneMetastore => "the Cayenne metastore",
             Self::StartupCheck => "the startup check",
         }
     }
@@ -251,7 +258,11 @@ impl StateFeature {
         match (self, source) {
             (Self::Snapshots, _) | (_, StateSource::RuntimeState) => &SNAPSHOT_S3_PARAMETERS,
             (
-                Self::Scheduler | Self::RateControl | Self::ResultsCacheWarmup | Self::StartupCheck,
+                Self::Scheduler
+                | Self::RateControl
+                | Self::ResultsCacheWarmup
+                | Self::CayenneMetastore
+                | Self::StartupCheck,
                 _,
             ) => &S3_PARAMETERS,
         }

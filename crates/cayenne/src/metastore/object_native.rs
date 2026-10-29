@@ -176,7 +176,23 @@ impl ObjectNativeCatalog {
         let store: Arc<dyn ObjectStore> = Arc::new(
             object_store_occ::LocalConditionalPut::new_durable(directory).map_err(invalid)?,
         );
-        let prefix = Path::from("catalog");
+        Self::open_or_create_at(
+            store,
+            Path::from("catalog"),
+            &directory.display().to_string(),
+        )
+        .await
+    }
+
+    /// Open the catalog at `prefix` in `store`, creating it on first use.
+    /// `location` names where it is, for the startup log.
+    /// # Errors
+    /// Returns an error when the store cannot be used or the history is invalid.
+    pub async fn open_or_create_at(
+        store: Arc<dyn ObjectStore>,
+        prefix: Path,
+        location: &str,
+    ) -> CatalogResult<Self> {
         let (catalog, verb) = match store.head(&prefix.clone().join("head")).await {
             Ok(_) => (Self::open(store, prefix).await?, "Opened"),
             Err(object_store::Error::NotFound { .. }) => {
@@ -191,8 +207,7 @@ impl ObjectNativeCatalog {
             lease,
         } = catalog.opened;
         tracing::info!(
-            "{verb} the Cayenne object-native metastore at '{}': {tables} tables from the checkpoint at commit {checkpoint} plus {replayed} later commits, writing as lease {lease}",
-            directory.display()
+            "{verb} the Cayenne object-native metastore at '{location}': {tables} tables from the checkpoint at commit {checkpoint} plus {replayed} later commits, writing as lease {lease}"
         );
         Ok(catalog)
     }
@@ -412,7 +427,7 @@ impl Inner {
             .await
             .map_err(invalid)?;
         // Refuse subsequent mutations unless this exact attempt is accepted.
-        match self.writer.commit(&attempt).await.map_err(invalid)? {
+        match self.publish(&attempt).await? {
             Outcome::Accepted { commit } => {
                 self.reader.state = next;
                 self.poisoned = false;
@@ -426,10 +441,42 @@ impl Inner {
                 }
                 Ok(())
             }
-            outcome => Err(invalid(format!(
-                "catalog publication was not accepted: {outcome:?}; reopen before retrying"
-            ))),
+            outcome => {
+                tracing::error!(
+                    "Cayenne object-native metastore stopped accepting changes, so its datasets stop updating until spiced restarts: the commit was {outcome:?}"
+                );
+                Err(invalid(format!(
+                    "catalog publication was not accepted: {outcome:?}; reopen before retrying"
+                )))
+            }
         }
+    }
+
+    /// Publish `attempt`, resolving an uncertain outcome by reading the head back
+    /// and retrying only the same bytes under the same condition, so a transient
+    /// store error neither loses nor duplicates the commit. `Rejected` and
+    /// `Fenced` are final: another writer owns the log.
+    async fn publish(
+        &mut self,
+        attempt: &object_store_occ::headlog::PreparedAttempt,
+    ) -> CatalogResult<Outcome> {
+        const ATTEMPTS: u32 = 8;
+        let mut outcome = self.writer.commit(attempt).await;
+        for retry in 1..=ATTEMPTS {
+            let error = match outcome {
+                Ok(Outcome::Unresolved) => "the outcome was unresolved".to_string(),
+                Ok(final_outcome) => return Ok(final_outcome),
+                Err(error) => error.to_string(),
+            };
+            let delay = std::time::Duration::from_millis(100 * 2_u64.pow(retry.min(6)));
+            tracing::warn!(
+                "Cayenne object-native metastore could not confirm a commit ({error}), so it is checking whether the commit landed and retrying it in {} ms (attempt {retry} of {ATTEMPTS})",
+                delay.as_millis()
+            );
+            tokio::time::sleep(delay).await;
+            outcome = self.writer.resolve(attempt).await;
+        }
+        outcome.map_err(invalid)
     }
 }
 

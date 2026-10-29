@@ -54,6 +54,7 @@ dependencies = [
  "runtime-parameters",
  "runtime-resources",
  "runtime-secrets",
+ "runtime-state-location",
  "runtime-table",
  "runtime-table-partition",
  "rusqlite",
