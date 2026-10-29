@@ -70,17 +70,13 @@ steps:
           - { name: label, choice: [red, blue, green] }
     mirror: ref
   - start: {}
-  # `avoid: [not]` keeps clear of `(NOT x) IS NULL` being unparsed without
-  # its parentheses; known-failing/sql-unparser/tlp-unparse.yaml exercises it.
-  - tlp: { table: t, seed: 1, queries: 300, depth: 3, aggregate: d, oracle: ref, avoid: [not] }
+  - tlp: { table: t, seed: 1, queries: 300, depth: 3, aggregate: d, oracle: ref }
     when: { backend: [postgres, clickhouse] }
     except: federated
-  - tlp: { table: t, seed: 1, queries: 300, depth: 3, aggregate: d, oracle: ref, avoid: [not] }
+  - tlp: { table: t, seed: 1, queries: 300, depth: 3, aggregate: d, oracle: ref }
     when: { backend: postgres }
     only: federated
   # Federated to ClickHouse, see known-failing/sql-unparser/tlp-unparse.yaml.
-  # MySQL's BOOLEAN reaches Spice as Int8, so `b` is left out; federated,
-  # nested IS predicates are a syntax error there (known-failing).
-  - tlp: { table: t, seed: 1, queries: 300, depth: 3, aggregate: d, oracle: ref, avoid: [not], skip-columns: [b] }
+  # MySQL's BOOLEAN reaches Spice as Int8, so `b` is left out.
+  - tlp: { table: t, seed: 1, queries: 300, depth: 3, aggregate: d, oracle: ref, skip-columns: [b] }
     when: { backend: mysql }
-    except: federated
