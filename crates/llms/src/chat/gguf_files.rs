@@ -42,7 +42,8 @@ pub struct Quantization {
     /// The name a model's `files` can give it, unique in the repository: its folder when the
     /// folder holds no other quantization, or else the quantization tag of its file names
     /// (`UD-Q4_K_XL`, `Q8_0`, `BF16`), or its path when another quantization could go by that
-    /// name: has it, has it as its tag or path, or is in a folder of that name. Its tag (its
+    /// name (has it, has it as its tag or path, or is in a folder of that name) or the name ends
+    /// in `.gguf`, which names a file. Its tag (its
     /// file name, untagged) and its path stem name it too, so a name given while the Hub listed
     /// the repository still resolves against the cache's shorter listing.
     pub name: String,
@@ -295,15 +296,17 @@ pub fn quantizations(listing: &[ListedFile]) -> Vec<Quantization> {
         });
     }
     // A name another quantization could go by would resolve to that one in a listing where it
-    // does, as `Q4_K_M` to the only quantization a cached `Q4_K_M/` folder holds: each takes
-    // its next name until no other claims it, which its first file's path guarantees.
+    // does, as `Q4_K_M` to the only quantization a cached `Q4_K_M/` folder holds, and a name
+    // ending in `.gguf`, as a `model.gguf/` folder's, is read as a file's path: each takes its
+    // next name until neither holds, which its first file's path guarantees.
     for (i, (q, names)) in out.iter_mut().zip(&candidates).enumerate() {
         let mut at = 0;
         while at + 1 < names.len()
-            && claims
-                .iter()
-                .enumerate()
-                .any(|(j, claim)| j != i && claim.contains(&q.name.to_ascii_lowercase()))
+            && (is_gguf(&q.name)
+                || claims
+                    .iter()
+                    .enumerate()
+                    .any(|(j, claim)| j != i && claim.contains(&q.name.to_ascii_lowercase())))
         {
             at += 1;
             q.name.clone_from(&names[at]);
@@ -873,6 +876,7 @@ mod tests {
             ("tag_meets_folder", tag_meets_folder()),
             ("folder_named_like_a_tag", folder_named_like_a_tag()),
             ("untagged_in_a_folder", untagged_in_a_folder()),
+            ("folder_named_like_a_file", folder_named_like_a_file()),
             (
                 "two_folders",
                 listing(&[
@@ -938,6 +942,11 @@ mod tests {
         ])
     }
 
+    /// A quantization alone in a folder whose name ends in `.gguf`: Copilot's case on #15590.
+    fn folder_named_like_a_file() -> Vec<ListedFile> {
+        listing(&[("model.gguf/Model-Q4_K_M.gguf", 4 * GB)])
+    }
+
     /// A draft head published as a series of two shards.
     fn sharded_head() -> Vec<ListedFile> {
         listing(&[
@@ -986,6 +995,7 @@ mod tests {
             ("tag_meets_folder", tag_meets_folder()),
             ("folder_named_like_a_tag", folder_named_like_a_tag()),
             ("untagged_in_a_folder", untagged_in_a_folder()),
+            ("folder_named_like_a_file", folder_named_like_a_file()),
             ("sharded_head", sharded_head()),
         ];
         let mut pinned_a_head = false;

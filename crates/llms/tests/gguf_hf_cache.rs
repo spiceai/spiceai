@@ -145,6 +145,40 @@ async fn every_shard_of_a_sharded_draft_head_is_downloaded() {
     }
 }
 
+/// A repository that offers safetensors loads them when `files` names nothing, offline as
+/// online, even when the cache holds one of its GGUFs and the safetensors index without the
+/// shards: loading the GGUF there would serve other weights than the same model serves online.
+#[tokio::test]
+async fn a_model_with_no_files_keeps_its_safetensors_offline() {
+    crate::require_process_per_test(WHY);
+    let cache = tempfile::tempdir().expect("creates a cache directory");
+    let snapshot = offline_snapshot(cache.path());
+    write_file(&snapshot, "Model-Q4_K_M.gguf");
+    std::fs::write(
+        snapshot.join("model.safetensors.index.json"),
+        br#"{"metadata":{},"weight_map":{"embed":"model-00001-of-00001.safetensors"}}"#,
+    )
+    .expect("writes the safetensors index");
+    std::fs::write(snapshot.join("config.json"), b"{}").expect("writes the config");
+    std::fs::write(snapshot.join("tokenizer.json"), b"{}").expect("writes the tokenizer");
+
+    let error = download_model(
+        REPO_ID,
+        &[],
+        Budget::Unmeasured,
+        HubParams::default(),
+        "test",
+    )
+    .await
+    .expect_err("the safetensors shards are not in the cache");
+    assert!(
+        error
+            .to_string()
+            .contains("'model.safetensors.index.json' names 'model-00001-of-00001.safetensors'"),
+        "{error}"
+    );
+}
+
 fn listing(files: &[(&str, u64)]) -> Vec<ListedFile> {
     files
         .iter()
