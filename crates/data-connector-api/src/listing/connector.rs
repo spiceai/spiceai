@@ -8600,6 +8600,70 @@ mod tests {
         );
     }
 
+    /// A Parquet footer whose schema nests deeper than 100 levels is refused, and one
+    /// at exactly 100 levels still opens.
+    ///
+    /// The footer's schema is a flat element list that the reader rebuilds into a tree by
+    /// recursing once per nesting level, so a file of a few KiB can declare enough levels to
+    /// exhaust the stack during schema inference at dataset initialization. A Spice patch to
+    /// the `spiceai/arrow-rs` fork bounds that depth.
+    #[test]
+    fn a_footer_schema_nested_past_the_depth_limit_is_a_parquet_error() {
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::arrow::arrow_writer::ArrowWriterOptions;
+        use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+
+        const MAX_DEPTH: usize = 100;
+
+        // A column whose leaf sits `depth` levels below the schema root.
+        fn file_with_leaf_at(depth: usize) -> bytes::Bytes {
+            let mut field =
+                arrow::datatypes::Field::new("leaf", arrow::datatypes::DataType::Int64, true);
+            for _ in 1..depth {
+                field = arrow::datatypes::Field::new_struct("s", vec![field], true);
+            }
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+            let mut buffer = Vec::new();
+            ArrowWriter::try_new_with_options(
+                &mut buffer,
+                schema,
+                ArrowWriterOptions::new().with_skip_arrow_metadata(true),
+            )
+            .expect("parquet writer")
+            .close()
+            .expect("writes the footer");
+            bytes::Bytes::from(buffer)
+        }
+
+        let reader =
+            SerializedFileReader::new(file_with_leaf_at(MAX_DEPTH)).expect("reads the footer");
+        assert_eq!(
+            reader
+                .metadata()
+                .file_metadata()
+                .schema_descr()
+                .column(0)
+                .path()
+                .parts()
+                .len(),
+            MAX_DEPTH,
+            "the accepted file has to sit exactly at the limit"
+        );
+
+        let Err(error) = SerializedFileReader::new(file_with_leaf_at(MAX_DEPTH + 1)) else {
+            panic!(
+                "a footer schema nested {} levels deep was accepted",
+                MAX_DEPTH + 1
+            );
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("Parquet schema nesting depth exceeds the maximum of 100"),
+            "the footer was refused, but not on the depth limit: {error}"
+        );
+    }
+
     /// A Parquet page whose header declares more uncompressed bytes than its
     /// compressed body can back is a scan error, raised before the reader allocates
     /// the declared size.

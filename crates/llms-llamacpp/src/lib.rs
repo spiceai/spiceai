@@ -22,13 +22,15 @@ limitations under the License.
 //! [`ReasoningSupport`]. llama.cpp only runs the forward passes and samples.
 //!
 //! One thread owns the backend, the model and its context. Requests wait on a channel and
-//! run one at a time from an empty KV cache, and their tokens stream back over a Tokio
-//! channel, so a forward pass never blocks an async worker. Dropping the model stops that
-//! thread and waits for it to free the model.
+//! run one at a time, each decoding only the part of its prompt that the KV cache does not
+//! already hold from the request before it (`PromptCache`), and their tokens stream back
+//! over a Tokio channel, so a forward pass never blocks an async worker. Dropping the model
+//! stops that thread and waits for it to free the model.
 
 use std::{
     collections::{HashMap, VecDeque},
     num::NonZeroU32,
+    ops::Range,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -37,7 +39,7 @@ use std::{
         mpsc as std_mpsc,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_openai::{
@@ -57,7 +59,7 @@ use futures::Stream;
 use indexmap::IndexMap;
 use llama_cpp::{
     Backend, Batch, Context, ContextParams, DraftKind, Model, ModelParams, Mtp, MtpParams, Sampler,
-    Token, Vocab,
+    Token, Truncation, Vocab,
 };
 use mistralrs_core::reasoning_parsers::{
     TagReasoningContext,
@@ -82,6 +84,7 @@ use llms::chat::{
     nsql::SqlGeneration,
 };
 use llms::streaming_utils::generate_stream_id;
+use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
 
 mod distributed;
 
@@ -138,6 +141,19 @@ const PROMPT_BATCH: usize = 512;
 
 /// The context size when the model sets no `context_length`.
 const DEFAULT_CONTEXT: u32 = 8192;
+
+/// How many tokens before a prompt's end a model with a recurrent state saves a checkpoint of
+/// it, as llama.cpp's server does. A chat's next prompt usually differs from this one only from
+/// the generation prompt on, which the template renders differently for an earlier turn, so the
+/// next request restores the checkpoint instead of reading its whole prompt again; when it
+/// differs earlier, an earlier request's checkpoint still saves reading the turns before.
+const CHECKPOINT_BEFORE_END: usize = 4;
+
+/// The most checkpoints a model keeps; a newer one replaces the oldest.
+const MAX_CHECKPOINTS: usize = 4;
+
+/// The weight of the newest measurement in the smoothed checkpoint costs.
+const COST_SMOOTHING: f64 = 0.25;
 
 /// Draft tokens an MTP head proposes per step. Two measured fastest for Qwen3.8-Flash-Next
 /// on a DGX Spark: over eight prompts, 60.7 tok/s against 53.8 with one and 47.5 without a
@@ -199,6 +215,9 @@ pub struct LlamaCpp {
     special: SpecialTokens,
     reasoning_support: ReasoningSupport,
     counter: AtomicUsize,
+    /// How many prompt tokens the last request read from the KV cache, which the decode thread
+    /// sets.
+    reused_prompt_tokens: Arc<AtomicUsize>,
 }
 
 /// A model's chat template: one, or named ones from a `tokenizer_config.json`, which a request
@@ -218,6 +237,8 @@ struct Loaded {
     /// `general.architecture`, as the GGUF names it.
     architecture: Option<String>,
     special: SpecialTokens,
+    /// How many prompt tokens each request reads from the KV cache, as the thread sets it.
+    reused_prompt_tokens: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -238,6 +259,9 @@ struct Sampling {
 
 struct Job {
     prompt: String,
+    /// The caller's cache namespace: a request reuses only what its own caller's requests left
+    /// in the KV cache.
+    namespace: CacheNamespace,
     limit: Option<usize>,
     sampling: Sampling,
     stop: Vec<String>,
@@ -455,7 +479,16 @@ impl LlamaCpp {
             special: loaded.special,
             reasoning_support,
             counter: AtomicUsize::new(0),
+            reused_prompt_tokens: loaded.reused_prompt_tokens,
         })
+    }
+
+    /// How many prompt tokens the last request read from the KV cache the request before it
+    /// left, instead of decoding them again. For tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn reused_prompt_tokens(&self) -> usize {
+        self.reused_prompt_tokens.load(Ordering::Relaxed)
     }
 
     fn prompt(
@@ -482,6 +515,7 @@ impl LlamaCpp {
     fn submit(
         &self,
         req: &CreateChatCompletionRequest,
+        namespace: &CacheNamespace,
     ) -> std::result::Result<Vec<mpsc::Receiver<Event>>, OpenAIError> {
         let choices = choice_count(req)?;
         let reasoning = reasoning_controls(
@@ -542,6 +576,7 @@ impl LlamaCpp {
             let job = Job {
                 reasoning: reasoning_parser(template, &prompt),
                 prompt: prompt.clone(),
+                namespace: namespace.clone(),
                 limit: completion_limit(req),
                 // Each choice samples with its own seed, so choices differ above temperature 0.
                 sampling: Sampling {
@@ -586,7 +621,7 @@ impl Chat for LlamaCpp {
         &self,
         req: CreateChatCompletionRequest,
     ) -> std::result::Result<ChatCompletionResponseStream, OpenAIError> {
-        let choices = self.submit(&req)?.into();
+        let choices = self.submit(&req, &caller().await)?.into();
         let id = self.id();
         let model = req.model;
         let created = now();
@@ -694,7 +729,8 @@ impl Chat for LlamaCpp {
     ) -> std::result::Result<CreateChatCompletionResponse, OpenAIError> {
         let mut choices = Vec::new();
         let (mut prompt_tokens, mut completion_tokens) = (0, 0_u32);
-        for (index, mut rx) in (0..).zip(self.submit(&req)?) {
+        let namespace = caller().await;
+        for (index, mut rx) in (0..).zip(self.submit(&req, &namespace)?) {
             let (mut reasoning, mut content, mut tool_calls) =
                 (String::new(), String::new(), Vec::new());
             let outcome = loop {
@@ -918,10 +954,17 @@ fn serve(
         bos: piece(&model, vocab.bos()),
         eos: piece(&model, vocab.eos()),
     };
+    // How far the target's cache can be cut back decides whether reusing it needs checkpoints.
+    let truncation = match &mut decoder {
+        Decoder::Plain(context) => context.truncation(),
+        Decoder::Mtp(spec) => spec.target_mut().truncation(),
+    };
+    let mut cache = PromptCache::new(name, truncation);
     let loaded = Loaded {
         template: model.chat_template(),
         architecture: model.architecture(),
         special,
+        reused_prompt_tokens: Arc::clone(&cache.reused),
     };
     // Ruled out while a required tool call is outstanding.
     let eog = vocab.eog_tokens();
@@ -937,8 +980,8 @@ fn serve(
         let events = job.events.clone();
         let stopping = Arc::clone(&job.stopping);
         let result = match &mut decoder {
-            Decoder::Plain(context) => generate(&model, context, job, &eog),
-            Decoder::Mtp(spec) => generate_mtp(&model, spec, split, job, &eog),
+            Decoder::Plain(context) => generate(&model, context, &mut cache, job, &eog),
+            Decoder::Mtp(spec) => generate_mtp(&model, spec, split, &mut cache, job, &eog),
         };
         let event = match result {
             Ok(outcome) => Event::Done(outcome),
@@ -1171,6 +1214,11 @@ fn mtp<'m>(
 trait Target<'m> {
     fn context(&self) -> &Context<'m>;
     fn context_mut(&mut self) -> &mut Context<'m>;
+    /// Removes every cache's entries from position `from` on: the target's, and a draft
+    /// model's, which holds the same positions. False when one cannot roll back that far.
+    fn truncate(&mut self, from: i32) -> bool;
+    /// Empties every cache, the target's and a draft model's.
+    fn clear(&mut self);
     /// Called after every target decode; the MTP head reads the batch's hidden states.
     fn decoded(&mut self, batch: &Batch) -> std::result::Result<(), String>;
 }
@@ -1181,6 +1229,12 @@ impl<'m> Target<'m> for Context<'m> {
     }
     fn context_mut(&mut self) -> &mut Context<'m> {
         self
+    }
+    fn truncate(&mut self, from: i32) -> bool {
+        Context::truncate(self, from)
+    }
+    fn clear(&mut self) {
+        Context::clear(self);
     }
     fn decoded(&mut self, _: &Batch) -> std::result::Result<(), String> {
         Ok(())
@@ -1194,20 +1248,249 @@ impl<'m> Target<'m> for Mtp<'m> {
     fn context_mut(&mut self) -> &mut Context<'m> {
         self.target_mut()
     }
+    fn truncate(&mut self, from: i32) -> bool {
+        self.target_mut().truncate(from) && self.draft_mut().truncate(from)
+    }
+    fn clear(&mut self) {
+        self.target_mut().clear();
+        self.draft_mut().clear();
+    }
     fn decoded(&mut self, batch: &Batch) -> std::result::Result<(), String> {
         self.process(batch).map_err(|e| e.to_string())
     }
 }
 
-/// Tokenizes the prompt and decodes it from an empty KV cache, returning the tokens and the
-/// batch whose last logits predict the first generated token.
+/// What the KV cache holds from the last request, so the next one decodes only the part of its
+/// prompt that differs, as llama.cpp's server reuses a slot's cached prompt. A chat's next turn
+/// repeats the conversation so far, so it decodes little more than the reply and the new
+/// message.
+struct PromptCache {
+    /// The model's name, for the log line.
+    model: String,
+    /// The tokens in the KV cache, in order: the last prompt, then the reply tokens decoded
+    /// after it. Empty while a request runs, so one that fails leaves nothing to reuse.
+    tokens: Vec<Token>,
+    /// The cache namespace of the caller whose request left `tokens` and the checkpoints.
+    namespace: Option<CacheNamespace>,
+    /// For a cache that cannot be cut back to any position, as a recurrent state or a
+    /// compressed cache cannot.
+    checkpoints: Option<Checkpoints>,
+    /// How many prompt tokens the last request read from the cache.
+    reused: Arc<AtomicUsize>,
+    /// What saving a checkpoint costs against reading prompt tokens again.
+    cost: CheckpointCost,
+}
+
+impl PromptCache {
+    fn new(name: &str, truncation: Truncation) -> Self {
+        Self {
+            model: name.to_string(),
+            tokens: Vec::new(),
+            namespace: None,
+            checkpoints: (truncation != Truncation::Anywhere).then(Checkpoints::default),
+            reused: Arc::default(),
+            cost: CheckpointCost::default(),
+        }
+    }
+
+    /// Readies `target` to read `tokens`, and returns how many of them its cache already holds:
+    /// the longest prefix they share with the cache, short of the last token, whose logits the
+    /// request samples from. A cache that cannot be cut back to any position is used as it
+    /// stands only when the prompt extends it; otherwise it restores its latest checkpoint within
+    /// that prefix, and failing that, the cache is emptied.
+    ///
+    /// Only a request from the caller in `namespace` whose request filled the cache reuses it:
+    /// how long a request takes must not say what another caller asked. Another caller's
+    /// request starts from an empty cache, its checkpoints dropped.
+    fn reuse<'m>(
+        &mut self,
+        target: &mut impl Target<'m>,
+        tokens: &[Token],
+        namespace: &CacheNamespace,
+    ) -> usize {
+        let mut cached = std::mem::take(&mut self.tokens);
+        if self.namespace.as_ref() != Some(namespace) {
+            cached.clear();
+            if let Some(checkpoints) = &mut self.checkpoints {
+                checkpoints.clear();
+            }
+            self.namespace = Some(namespace.clone());
+        }
+        let common = cached
+            .iter()
+            .zip(tokens)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let shared = common.min(tokens.len().saturating_sub(1));
+        // A checkpoint past the shared prefix holds the state of tokens this prompt lacks.
+        if let Some(checkpoints) = &mut self.checkpoints {
+            checkpoints.truncate(shared);
+        }
+        // A recurrent state is never rolled back to a prompt prefix, as llama.cpp's server never
+        // rolls one back: its rollback snapshots serve rejected drafts, and a decode refreshes only
+        // as many of them as it has tokens, so after a shorter decode a rollback can restore a
+        // snapshot that predates it.
+        let truncates = self.checkpoints.is_none() || shared == cached.len();
+        let reused = if shared > 0 && truncates && truncate_to(target, shared) {
+            shared
+        } else if let Some(at) = self
+            .checkpoints
+            .as_ref()
+            .and_then(|checkpoints| checkpoints.restore(target.context_mut()))
+            && truncate_to(target, at)
+        {
+            at
+        } else {
+            target.clear();
+            if let Some(checkpoints) = &mut self.checkpoints {
+                checkpoints.clear();
+            }
+            0
+        };
+        tracing::debug!(
+            "Model '{}' reused {reused} of its {} prompt tokens from the previous request's cache.",
+            self.model,
+            tokens.len()
+        );
+        self.reused.store(reused, Ordering::Relaxed);
+        reused
+    }
+
+    /// Where reading a prompt of `len` tokens from `start` on saves a checkpoint, if anywhere:
+    /// only where reading the tokens it covers again would cost the next request more than
+    /// saving it costs this one.
+    fn checkpoint_at(&self, start: usize, len: usize) -> Option<usize> {
+        let at = len.checked_sub(CHECKPOINT_BEFORE_END)?;
+        (self.checkpoints.is_some() && at > start && self.cost.pays(at - start)).then_some(at)
+    }
+
+    fn save_checkpoint(&mut self, context: &Context<'_>, n_tokens: usize) {
+        if let Some(checkpoints) = &mut self.checkpoints {
+            let started = Instant::now();
+            if let Some(bytes) = checkpoints.save(context, n_tokens) {
+                let took = started.elapsed();
+                self.cost.saved(took);
+                tracing::debug!(
+                    "Model '{}' saved a {bytes}-byte checkpoint after {n_tokens} prompt tokens in {:.1} ms.",
+                    self.model,
+                    took.as_secs_f64() * 1000.0
+                );
+            }
+        }
+    }
+
+    /// Records that reading `tokens` prompt tokens took `took`, checkpoint saves aside.
+    fn read(&mut self, tokens: usize, took: Duration) {
+        self.cost.read(tokens, took);
+    }
+
+    /// Records `tokens` as what the caches hold for the next request, after truncating them to
+    /// `tokens`, which drops any drafts verified after them. A cache that cannot roll back that
+    /// far leaves nothing to reuse.
+    fn keep<'m>(&mut self, target: &mut impl Target<'m>, tokens: Vec<Token>) {
+        if truncate_to(target, tokens.len()) {
+            self.tokens = tokens;
+        }
+    }
+}
+
+/// A model's recurrent state saved after a prompt's first tokens, oldest first, as llama.cpp's
+/// server keeps context checkpoints: the attention cache truncates to any position, but the
+/// recurrent state rolls back only to one of these.
+#[derive(Default)]
+struct Checkpoints(Vec<Checkpoint>);
+
+struct Checkpoint {
+    /// How many tokens the state follows.
+    n_tokens: usize,
+    state: Vec<u8>,
+}
+
+impl Checkpoints {
+    /// Saves `context`'s state after its first `n_tokens` tokens, which follow every earlier
+    /// checkpoint's, and returns its size in bytes; `None` when llama.cpp saves nothing.
+    fn save(&mut self, context: &Context<'_>, n_tokens: usize) -> Option<usize> {
+        let state = context.partial_state()?;
+        if self.0.len() == MAX_CHECKPOINTS {
+            self.0.remove(0);
+        }
+        let bytes = state.len();
+        self.0.push(Checkpoint { n_tokens, state });
+        Some(bytes)
+    }
+
+    /// Forgets every checkpoint after the first `n_tokens` tokens.
+    fn truncate(&mut self, n_tokens: usize) {
+        self.0.retain(|checkpoint| checkpoint.n_tokens <= n_tokens);
+    }
+
+    /// Restores the latest checkpoint into `context`, and returns how many tokens it follows.
+    /// `None` when there is none, or llama.cpp could not restore it, which leaves `context`'s
+    /// cache empty.
+    fn restore(&self, context: &mut Context<'_>) -> Option<usize> {
+        let latest = self.0.last()?;
+        context
+            .restore_partial_state(&latest.state)
+            .then_some(latest.n_tokens)
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// What saving a checkpoint costs against reading prompt tokens again, smoothed over requests.
+/// On one machine a save copies the state in about a millisecond and always pays; split across
+/// machines it reads every recurrent tensor back from each of them, which can cost more than
+/// reading a short prompt again.
+#[derive(Debug, Default)]
+struct CheckpointCost {
+    /// Seconds a save takes.
+    save_s: Option<f64>,
+    /// Seconds a prompt token takes to read.
+    token_s: Option<f64>,
+}
+
+impl CheckpointCost {
+    /// Whether a checkpoint covering `tokens` more prompt tokens costs less to save than they
+    /// cost to read again. Until both have been measured, a checkpoint is saved.
+    fn pays(&self, tokens: usize) -> bool {
+        match (self.save_s, self.token_s) {
+            (Some(save), Some(per_token)) => count(tokens) * per_token >= save,
+            _ => true,
+        }
+    }
+
+    fn saved(&mut self, took: Duration) {
+        self.save_s = Some(smoothed(self.save_s, took.as_secs_f64()));
+    }
+
+    fn read(&mut self, tokens: usize, took: Duration) {
+        if tokens > 0 {
+            let per_token = took.as_secs_f64() / count(tokens);
+            self.token_s = Some(smoothed(self.token_s, per_token));
+        }
+    }
+}
+
+fn smoothed(old: Option<f64>, new: f64) -> f64 {
+    old.map_or(new, |old| old + COST_SMOOTHING * (new - old))
+}
+
+/// A token count as a float; counts past `u32::MAX` saturate, which no context reaches.
+fn count(tokens: usize) -> f64 {
+    f64::from(u32::try_from(tokens).unwrap_or(u32::MAX))
+}
+
+/// Tokenizes the prompt and decodes the part of it the cache does not already hold, returning
+/// the tokens and the batch whose last logits predict the first generated token.
 fn read_prompt<'m>(
     model: &Model,
     target: &mut impl Target<'m>,
-    prompt: &str,
+    cache: &mut PromptCache,
+    (prompt, namespace): (&str, &CacheNamespace),
     stopping: &AtomicBool,
 ) -> std::result::Result<(Vec<Token>, Batch), String> {
-    target.context_mut().clear();
     let tokens = model
         .vocab()
         .tokenize(prompt, false, true)
@@ -1222,26 +1505,56 @@ fn read_prompt<'m>(
             tokens.len()
         ));
     }
+    let start = cache.reuse(target, &tokens, namespace);
     let mut batch = Batch::new(PROMPT_BATCH);
-    let mut pos: i32 = 0;
-    let chunks = tokens.chunks(PROMPT_BATCH).count();
-    for (i, chunk) in tokens.chunks(PROMPT_BATCH).enumerate() {
+    // The prompt is read in two spans split at the checkpoint, so the state saved there
+    // follows exactly the tokens before it; without one, the first span is empty.
+    let checkpoint = cache.checkpoint_at(start, tokens.len());
+    let split = checkpoint.unwrap_or(start);
+    // Each span is timed to its computation's end, so the reading's cost and the save's stay
+    // apart; sampling, and the save itself, wait for that computation anyway.
+    let started = Instant::now();
+    decode_span(target, &mut batch, &tokens, start..split, stopping)?;
+    target.context_mut().synchronize();
+    let mut read = started.elapsed();
+    if let Some(at) = checkpoint {
+        cache.save_checkpoint(target.context(), at);
+    }
+    let resumed = Instant::now();
+    decode_span(target, &mut batch, &tokens, split..tokens.len(), stopping)?;
+    target.context_mut().synchronize();
+    read += resumed.elapsed();
+    cache.read(tokens.len() - start, read);
+    Ok((tokens, batch))
+}
+
+/// Decodes `tokens[span]` at their positions, in batches of at most `PROMPT_BATCH`, asking for
+/// logits only at the prompt's last token.
+fn decode_span<'m>(
+    target: &mut impl Target<'m>,
+    batch: &mut Batch,
+    tokens: &[Token],
+    span: Range<usize>,
+    stopping: &AtomicBool,
+) -> std::result::Result<(), String> {
+    for from in span.clone().step_by(PROMPT_BATCH) {
         if stopping.load(Ordering::Relaxed) {
             return Err(DECODE_STOPPED.to_string());
         }
+        let to = (from + PROMPT_BATCH).min(span.end);
         batch.clear();
-        for (j, &token) in chunk.iter().enumerate() {
-            let last = i + 1 == chunks && j + 1 == chunk.len();
+        for (pos, &token) in (from..to).zip(&tokens[from..to]) {
+            let last = pos + 1 == tokens.len();
+            let pos = i32::try_from(pos).map_err(|e| e.to_string())?;
             batch.add(token, pos, last).map_err(|e| e.to_string())?;
-            pos += 1;
         }
         target
             .context_mut()
-            .decode(&batch)
+            .decode(batch)
             .map_err(|e| e.to_string())?;
-        target.decoded(&batch)?;
+        target.decoded(batch)?;
     }
-    Ok((tokens, batch))
+    Ok(())
 }
 
 /// Sends what generation produces to the client, in order: reasoning, content, and tool
@@ -1614,29 +1927,35 @@ fn draw<'v>(sampling: &Sampling) -> Vec<Sampler<'v>> {
 fn generate(
     model: &Model,
     context: &mut Context<'_>,
+    cache: &mut PromptCache,
     job: Job,
     eog: &[Token],
 ) -> std::result::Result<Outcome, String> {
+    let namespace = job.namespace.clone();
     let (prompt, sampling, mut out) = Output::new(job);
     let vocab = model.vocab();
     let mut picker = Picker::new(vocab, &sampling, eog, context.n_ctx())?;
-    let (tokens, mut batch) = read_prompt(model, context, &prompt, &out.stopping)?;
+    // `tokens` grows by every reply token decoded, so it is always what the cache holds.
+    let (mut tokens, mut batch) =
+        read_prompt(model, context, cache, (&prompt, &namespace), &out.stopping)?;
+    let prompt_tokens = tokens.len();
     let n_ctx = usize::try_from(context.n_ctx()).unwrap_or(usize::MAX);
-    let mut pos = i32::try_from(tokens.len()).map_err(|e| e.to_string())?;
     let finish = loop {
         let token = picker.sample(context, batch.n_tokens() - 1, out.in_content());
         if let Some(finish) = out.token(model, token) {
             break finish;
         }
-        if usize::try_from(pos).unwrap_or(usize::MAX) + 1 >= n_ctx {
+        if tokens.len() + 1 >= n_ctx {
             break FinishReason::Length;
         }
         batch.clear();
+        let pos = i32::try_from(tokens.len()).map_err(|e| e.to_string())?;
         batch.add(token, pos, true).map_err(|e| e.to_string())?;
-        pos += 1;
         context.decode(&batch).map_err(|e| e.to_string())?;
+        tokens.push(token);
     };
-    out.finish(finish, tokens.len())
+    cache.keep(context, tokens);
+    out.finish(finish, prompt_tokens)
 }
 
 /// Runs one request with MTP drafting: each forward pass verifies the last token plus up
@@ -1650,20 +1969,23 @@ fn generate_mtp(
     model: &Model,
     spec: &mut Mtp<'_>,
     split: bool,
+    cache: &mut PromptCache,
     job: Job,
     eog: &[Token],
 ) -> std::result::Result<Outcome, String> {
+    let namespace = job.namespace.clone();
     let (prompt, sampling, mut out) = Output::new(job);
     let vocab = model.vocab();
     let mut picker = Picker::new(vocab, &sampling, eog, spec.target().n_ctx())?;
-    spec.draft_mut().clear();
     // `read_prompt` hands every decoded prompt batch to the head, which needs the target's
-    // hidden state at each prompt position before `begin`.
-    let (tokens, mut batch) = read_prompt(model, spec, &prompt, &out.stopping)?;
-    spec.begin(&tokens).map_err(|e| e.to_string())?;
+    // hidden state at each prompt position before `begin`; its cache keeps the positions the
+    // target's reuses.
+    let (mut history, mut batch) =
+        read_prompt(model, spec, cache, (&prompt, &namespace), &out.stopping)?;
+    spec.begin(&history).map_err(|e| e.to_string())?;
     let n_ctx = usize::try_from(spec.target().n_ctx()).unwrap_or(usize::MAX);
-    let mut history = tokens.clone();
-    let mut n_past = i32::try_from(tokens.len()).map_err(|e| e.to_string())?;
+    let prompt_tokens = history.len();
+    let mut n_past = i32::try_from(prompt_tokens).map_err(|e| e.to_string())?;
     let mut id = picker.sample(spec.target(), batch.n_tokens() - 1, out.in_content());
     let full_draft = split;
     let finish = 'generate: loop {
@@ -1716,10 +2038,12 @@ fn generate_mtp(
             let token = picker.sample(spec.target(), index, out.in_content());
             if accepted < real && token == draft[accepted] {
                 accepted += 1;
+                // An accepted draft was decoded in the verify batch, so the cache holds it
+                // whether or not it ends the reply, and the next request may reuse it.
+                history.push(token);
                 if let Some(finish) = out.token(model, token) {
                     break 'generate finish;
                 }
-                history.push(token);
             } else {
                 break token;
             }
@@ -1730,24 +2054,31 @@ fn generate_mtp(
                 .map_err(|e| e.to_string())?;
         }
         // The rejected drafts leave both caches.
-        truncate_cache(spec.target_mut(), n_past)?;
-        truncate_cache(spec.draft_mut(), n_past)?;
+        truncate_cache(spec, n_past)?;
         id = next;
     };
-    out.finish(finish, tokens.len())
+    // The prompt and the reply tokens before the one that finished it.
+    cache.keep(spec, history);
+    out.finish(finish, prompt_tokens)
 }
 
 /// Removes sequence 0's cache entries from position `from` on. A context that cannot roll
 /// back that far, such as a recurrent layer with too few state snapshots, fails the request
 /// instead of decoding on from a state that still holds the removed tokens.
-fn truncate_cache(context: &mut Context<'_>, from: i32) -> std::result::Result<(), String> {
-    if context.truncate(from) {
+fn truncate_cache<'m>(target: &mut impl Target<'m>, from: i32) -> std::result::Result<(), String> {
+    if target.truncate(from) {
         Ok(())
     } else {
         Err(format!(
             "llama.cpp could not roll its cache back to position {from}"
         ))
     }
+}
+
+/// Truncates every cache `target` keeps to its first `n` tokens; false when one cannot roll
+/// back that far.
+fn truncate_to<'m>(target: &mut impl Target<'m>, n: usize) -> bool {
+    i32::try_from(n).is_ok_and(|from| target.truncate(from))
 }
 
 /// Whether a file is an MTP draft head, by the `mtp-` name the GGUF publishers give them.
@@ -2178,6 +2509,12 @@ fn now() -> u32 {
         .unwrap_or_default()
 }
 
+/// The cache namespace of the caller this request runs for: its authenticated principal's, or
+/// the shared one of an unauthenticated or internal request, as the runtime scopes each request.
+async fn caller() -> CacheNamespace {
+    RequestContext::current(AsyncMarker::new().await).cache_namespace()
+}
+
 fn api_error(message: &str) -> OpenAIError {
     OpenAIError::ApiError(ApiError {
         message: message.to_string(),
@@ -2190,6 +2527,32 @@ fn api_error(message: &str) -> OpenAIError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Measured on three DGX Sparks (GLM-5.3, the PR build): a 29-token prompt read in 270 ms,
+    /// and a checkpoint saved in 300 ms. A checkpoint is worth saving only over a prefix that
+    /// would take longer to read again than the save takes.
+    #[test]
+    fn a_checkpoint_is_saved_only_where_reading_its_tokens_again_costs_more() {
+        let mut cost = CheckpointCost::default();
+        assert!(cost.pays(1), "unmeasured, a checkpoint is saved");
+        cost.saved(Duration::from_millis(300));
+        assert!(
+            cost.pays(1),
+            "with the read cost unmeasured, a checkpoint is saved"
+        );
+        cost.read(29, Duration::from_millis(270));
+        assert!(
+            !cost.pays(25),
+            "25 tokens read again in 233 ms, under the 300 ms save"
+        );
+        assert!(cost.pays(33), "33 tokens read again in 307 ms, over it");
+        // A newer measurement moves the estimate a quarter of the way.
+        cost.saved(Duration::from_millis(100));
+        let save_s = cost.save_s.expect("a save was measured");
+        assert!((save_s - 0.25).abs() < 1e-9, "smoothed save {save_s} s");
+        assert!(cost.pays(27), "27 tokens in 251 ms, over the 250 ms save");
+        assert!(!cost.pays(26), "26 tokens in 242 ms, under it");
+    }
 
     fn weather_tool() -> Tool {
         let parameters = serde_json::from_value(serde_json::json!({
@@ -2220,6 +2583,7 @@ mod tests {
             .expect("a matcher for one tool");
         let job = Job {
             prompt: String::new(),
+            namespace: CacheNamespace::Public,
             limit: None,
             sampling: Sampling::default(),
             stop: Vec::new(),
@@ -2543,6 +2907,7 @@ mod tests {
         let (events, rx) = mpsc::channel(STREAM_BUFFER);
         let job = Job {
             prompt: String::new(),
+            namespace: CacheNamespace::Public,
             limit: None,
             sampling: Sampling::default(),
             stop: Vec::new(),
@@ -2747,6 +3112,7 @@ mod tests {
         let (events, rx) = mpsc::channel(STREAM_BUFFER);
         let job = Job {
             prompt: String::new(),
+            namespace: CacheNamespace::Public,
             limit: None,
             sampling: Sampling::default(),
             stop: vec!["STOP".to_string()],

@@ -3861,6 +3861,59 @@ mod tests {
         }
     }
 
+    /// Regression guard for #15538: postfix predicates must keep the value
+    /// produced by their operand, including prefix NOT and another predicate.
+    #[tokio::test]
+    async fn is_predicate_unparsing_preserves_boolean_partitions() {
+        let ctx = SessionContext::new();
+        ctx.sql("CREATE TABLE flags AS VALUES (1, true), (2, false), (3, NULL::BOOLEAN)")
+            .await
+            .expect("create boolean values")
+            .collect()
+            .await
+            .expect("populate boolean values");
+        let flag = col("column2");
+        for expr in [
+            Expr::IsNull(Box::new(!flag.clone())),
+            Expr::IsNotNull(Box::new(!flag.clone())),
+            Expr::IsTrue(Box::new(!flag.clone())),
+            Expr::IsNotTrue(Box::new(!flag.clone())),
+            Expr::IsFalse(Box::new(!flag.clone())),
+            Expr::IsNotFalse(Box::new(!flag.clone())),
+            Expr::IsUnknown(Box::new(!flag.clone())),
+            Expr::IsNotUnknown(Box::new(!flag.clone())),
+            Expr::IsNull(Box::new(Expr::IsTrue(Box::new(flag.clone())))),
+            !Expr::IsNull(Box::new(Expr::IsNotNull(Box::new(flag.clone())))),
+            !Expr::IsNull(Box::new(Expr::IsNull(Box::new(flag)))),
+        ] {
+            let original = ctx
+                .table("flags")
+                .await
+                .expect("read flags")
+                .filter(expr.clone())
+                .expect("filter original expression")
+                .select_columns(&["column1"])
+                .expect("select identifier")
+                .sort(vec![col("column1").sort(true, false)])
+                .expect("order original rows")
+                .collect()
+                .await
+                .expect("evaluate original expression");
+            let emitted = Unparser::new(&PostgreSqlDialect {})
+                .expr_to_sql(&expr)
+                .expect("unparse predicate");
+            let sql = format!("SELECT column1 FROM flags WHERE {emitted} ORDER BY column1");
+            let reparsed = ctx
+                .sql(&sql)
+                .await
+                .unwrap_or_else(|error| panic!("reparse {sql}: {error}"))
+                .collect()
+                .await
+                .unwrap_or_else(|error| panic!("execute {sql}: {error}"));
+            assert_eq!(original, reparsed, "predicate changed meaning: {sql}");
+        }
+    }
+
     /// Regression test for #14941: `INTERSECT` and `EXCEPT` are planned as semi
     /// and anti joins whose keys match NULLs, because a set operation treats two
     /// NULLs as the same value. `=` is never true on NULL, so the federated

@@ -74,6 +74,7 @@
   "mysql-cdc-shared-binlog": 41,
   "mysql-cdc-upgrade": 12,
   "mysql-literals": 12,
+  "mysql-string-length": 8,
   "mysql-types-acceleration": 10,
   "newest-by-time": 12,
   "on-zero-results": 20,
@@ -115,7 +116,9 @@
   "search-hybrid": 6,
   "served-while-source-down": 48,
   "settings-evolution": 54,
+  "slt-strings": 8,
   "source-down-at-start": 36,
+  "sql-predicate-precedence": 17,
   "sql-explain-protocols": 1,
   "sql-operator-values": 1,
   "sql-schema-protocols": 1,
@@ -128,5 +131,8 @@
   "tls": 3,
   "tpch-coverage": 25,
   "tpch-oracles": 26,
-  "views": 11
+  "unparse-pruned-aggregate": 11,
+  "unparse-set-operations": 6,
+  "views": 11,
+  "unparse-aggregate-scopes": 4
 }
