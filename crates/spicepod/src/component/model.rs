@@ -334,10 +334,7 @@ impl Model {
     pub fn gguf_selectors(&self) -> Vec<String> {
         self.files
             .iter()
-            .filter(|f| {
-                matches!(f.file_type(), Some(ModelFileType::Weights) | None)
-                    && !is_other_weights_format(&f.path)
-            })
+            .filter(|f| f.is_gguf_selector())
             .map(|f| f.path.clone())
             .collect()
     }
@@ -441,6 +438,14 @@ impl ModelFile {
             r#type: None,
             params: None,
         }
+    }
+
+    /// Whether [`Model::gguf_selectors`] keeps this entry: typed `weights` or untyped, and not
+    /// weights of another format by its extension.
+    #[must_use]
+    pub fn is_gguf_selector(&self) -> bool {
+        matches!(self.file_type(), Some(ModelFileType::Weights) | None)
+            && !is_other_weights_format(&self.path)
     }
 
     /// Returns the [`ModelFileType`] if explicitly set, otherwise attempts to determine the file

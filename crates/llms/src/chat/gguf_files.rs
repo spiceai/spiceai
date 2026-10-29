@@ -24,10 +24,12 @@ limitations under the License.
 //! [`choose`] picks a quantization when none is named.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::LazyLock;
 
 use regex::Regex;
 use snafu::Snafu;
+use spicepod::component::model::ModelFile;
 
 /// A file of the repository: its path in the repository and its size in bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,13 +298,15 @@ pub fn quantizations(listing: &[ListedFile]) -> Vec<Quantization> {
         });
     }
     // A name another quantization could go by would resolve to that one in a listing where it
-    // does, as `Q4_K_M` to the only quantization a cached `Q4_K_M/` folder holds, and a name
-    // ending in `.gguf`, as a `model.gguf/` folder's, is read as a file's path: each takes its
-    // next name until neither holds, which its first file's path guarantees.
+    // does, as `Q4_K_M` to the only quantization a cached `Q4_K_M/` folder holds; a name ending
+    // in `.gguf`, as a `model.gguf/` folder's, is read as a file's path; and a name a Spicepod's
+    // `files` drop, as a `Q4_K_M.bin/` folder's, never reaches resolution: each takes its next
+    // name until none holds, which its first file's path guarantees.
     for (i, (q, names)) in out.iter_mut().zip(&candidates).enumerate() {
         let mut at = 0;
         while at + 1 < names.len()
             && (is_gguf(&q.name)
+                || !ModelFile::from_path(Path::new(&q.name)).is_gguf_selector()
                 || claims
                     .iter()
                     .enumerate()
@@ -947,6 +951,15 @@ mod tests {
         listing(&[("model.gguf/Model-Q4_K_M.gguf", 4 * GB)])
     }
 
+    /// A quantization alone in a folder whose name ends like weights of another format: Copilot's
+    /// case on #15590, whose folder name the Spicepod's `files` filter drops.
+    fn folder_named_like_other_weights() -> Vec<ListedFile> {
+        listing(&[
+            ("Q4_K_M.bin/Model-Q4_K_M.gguf", 4 * GB),
+            ("Model-Q8_0.gguf", 8 * GB),
+        ])
+    }
+
     /// A draft head published as a series of two shards.
     fn sharded_head() -> Vec<ListedFile> {
         listing(&[
@@ -996,6 +1009,10 @@ mod tests {
             ("folder_named_like_a_tag", folder_named_like_a_tag()),
             ("untagged_in_a_folder", untagged_in_a_folder()),
             ("folder_named_like_a_file", folder_named_like_a_file()),
+            (
+                "folder_named_like_other_weights",
+                folder_named_like_other_weights(),
+            ),
             ("sharded_head", sharded_head()),
         ];
         let mut pinned_a_head = false;
@@ -1006,6 +1023,20 @@ mod tests {
                 pinned_a_head |= !head.is_empty();
                 pinned_a_sharded_head |= head.len() > 1;
                 let pin = pin(&files, q);
+                // the pin as a Spicepod's `files` carries it to resolution
+                let mut model = spicepod::component::model::Model::new(
+                    "huggingface:huggingface.co/org/Model-GGUF",
+                    "model",
+                );
+                model.files = pin
+                    .iter()
+                    .map(|p| ModelFile::from_path(Path::new(p)))
+                    .collect();
+                assert_eq!(
+                    model.gguf_selectors(),
+                    pin,
+                    "{fixture}: the Spicepod's `files` keep all of {pin:?}"
+                );
                 let entries: Vec<&str> = pin.iter().map(String::as_str).collect();
                 let resolved = resolve(&files, &entries)
                     .unwrap_or_else(|e| panic!("{fixture}: {pin:?} does not resolve: {e}"))
