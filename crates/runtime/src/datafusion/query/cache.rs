@@ -4425,6 +4425,7 @@ body: SELECT CAST(random() * 1000000000000 AS BIGINT) AS v
                 Some("no-cache-writeback".to_string()),
             ),
         ] {
+            const SQL: &str = "SELECT scan FROM no_cache_writeback";
             let df = prepare_runtime(Some(SQLResultsCacheConfig {
                 item_ttl: Some("10m".to_string()),
                 cache_key_type: configured,
@@ -4432,7 +4433,6 @@ body: SELECT CAST(random() * 1000000000000 AS BIGINT) AS v
             }))
             .await;
             let scans = register_counted_table(&df, "no_cache_writeback");
-            const SQL: &str = "SELECT scan FROM no_cache_writeback";
             let cached =
                 create_test_request_context(CacheControl::Cache(key_type), client_key.clone());
             let no_cache =
@@ -4487,9 +4487,9 @@ body: SELECT CAST(random() * 1000000000000 AS BIGINT) AS v
     /// for reads, so a background revalidation never serves itself a hit.
     #[tokio::test]
     async fn the_runtime_no_cache_control_never_serves_a_cached_result() {
+        const SQL: &str = "SELECT scan FROM runtime_no_cache";
         let df = prepare_runtime(None).await;
         let scans = register_counted_table(&df, "runtime_no_cache");
-        const SQL: &str = "SELECT scan FROM runtime_no_cache";
         let cached = create_test_request_context(CacheControl::Cache(CacheKeyType::Default), None);
         let bypass = create_test_request_context(CacheControl::NoCache, None);
 
