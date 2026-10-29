@@ -146,9 +146,6 @@ pub(crate) struct DefinitionsStore {
     state: ObjectState<SqlDefinitions>,
     /// Where the document is kept, for messages.
     location: String,
-    /// Whether the document is in `runtime.state`, which other instances may
-    /// share.
-    shared: bool,
     /// Serializes this process's writes, so a write never races another of its
     /// own and conflicts only with a different writer.
     write_lock: Mutex<()>,
@@ -203,7 +200,6 @@ impl DefinitionsStore {
         Ok(Self {
             state: ObjectState::new(store).with_prefix(format!("{prefix}/")),
             location,
-            shared: guarded,
             write_lock: Mutex::new(()),
         })
     }
@@ -211,12 +207,6 @@ impl DefinitionsStore {
     /// Where the document is kept.
     pub fn location(&self) -> &str {
         &self.location
-    }
-
-    /// Whether the document is in `runtime.state`, where another instance that
-    /// shares the location may change it.
-    pub fn is_shared(&self) -> bool {
-        self.shared
     }
 
     /// The stored definitions, or none when nothing was ever defined.
