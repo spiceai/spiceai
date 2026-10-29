@@ -191,10 +191,12 @@ be shown. Retiring the settings is a user-facing change, so it goes through the
 same Enhancement review as the rest of the
 [user-facing surface](#user-facing-surface-proposal-for-the-enhancement).
 
-**One gap this closes.** The tier's GC has no reader pins, so a query still
-reading cold files when GC sweeps them fails. A Cayenne integration test that
-forces that interleaving reproduces it, and reader pins (decision 1.10) remove
-it.
+**One gap this narrows.** The tier's GC deletes an object a short grace period
+(5 minutes by default) after it becomes unreferenced, so a query still reading
+cold files then fails. A Cayenne integration test that forces that
+interleaving reproduces it. Under decision 1.10 the same failure needs a query
+to outlive the retention, about an hour, and it is always an error, never rows
+from part of a snapshot.
 
 ## Milestones
 
@@ -580,7 +582,7 @@ from, and the GC design does.
 **1.8 Two numbers: commit numbers name states, `seq`s order mutations.** Every
 accepted record gets the next commit number, data commits and maintenance
 alike, and a commit number names the dataset state after it: snapshot tokens,
-checkpoints and reader pins use it. Cayenne's sequence numbers stay as they
+checkpoints and the floor use it. Cayenne's sequence numbers stay as they
 are, drawn per write operation per table and stamped while buffering. Within
 each table, every `seq` in a record is above every `seq` in earlier records,
 so `seq` order is commit order, every existing `seq` comparison keeps its
@@ -610,39 +612,58 @@ running alongside live CDC needs one more rule: a live change after the
 backfill's snapshot position wins over backfilled data.
 *Details in:* [Source positions and backfill](object-native-metastore-technical.md#source-positions-and-backfill).
 
-**1.10 GC deletes from the log, and reader pins are low-water marks.** GC is
-one protocol with fencing, staging and reader pins, and correctness never
-depends on a grace period.
+**1.10 GC keeps removed files for a fixed retention, collects uploads by age,
+and readers never write.** Every read returns the object it references or fails
+the query, so GC's timing decides only which long queries can fail, never which
+rows a query returns.
 
 - *Files that were once live* are deleted from what the records say left: a
-  file leaves the state at the record that removes it, and GC deletes it once
-  the floor and every reader pin are past that record. No LIST is needed, as
-  Delta Lake deletes from its `remove` actions and Iceberg from expired
-  snapshots.
-- *Uploads that never committed* are found by listing generations: each
-  upload goes into its writer's generation, which in Milestone 1 is the writer's
-  lease generation, and after a takeover the new owner sweeps its
-  predecessor's. A fenced writer's late upload can leak until a later sweep,
-  which costs space, never correctness.
-- *Each reading node keeps one pin,* a lease it renews, holding for each
-  dataset the oldest commit its queries and open transactions still read. A
-  new query needs no write, and a node that dies releases its pin by letting
-  it lapse; SlateDB's readers keep their checkpoints alive the same way. A
-  long query keeps everything removed since it started, like PostgreSQL's
-  xmin horizon. Pins never block maintenance; they only delay deleting its
-  inputs.
-- *Milestone 2* adds explicit generation closes, because GC on one node cannot see
-  another node's uploads in flight.
+  file leaves the state at the record that removes it, and GC deletes it a
+  fixed retention T (about an hour) after it observes that record. No LIST is
+  needed, as Delta Lake deletes from its `remove` actions and Iceberg from
+  expired snapshots.
+- *Readers write nothing.* A query starts from a state confirmed current within
+  the staleness bound S, so every file it needs survives at least T − S. A
+  query that outlives that may fail, with an error saying to rerun it; it never
+  gets other rows. A read-only node needs only read access to the location.
+- *Uploads that never committed* are collected by age. Every object has a fresh
+  name. A writer references only objects live in its commit's base and its own
+  uploads younger than an age limit (about a day). GC deletes an unreferenced
+  upload once it is older than that by the store's clock, after the head has
+  moved and been re-read: a commit sent before the upload was old then cannot
+  land, and one sent after fails the writer's check. On an idle dataset, GC
+  moves the head with an empty commit.
+- *No clock is compared across machines.* GC times uploads on the store's
+  clock and removals on its own; the writer measures a duration on its own
+  monotonic clock; a takeover restarts the removal timers.
+- *Long uploads* that cannot commit within the age limit are split across
+  several commits. If that ever binds, a `PREPARE_UPLOAD` record can protect a
+  long upload's objects by reference until it commits or a `RELEASE_UPLOAD`
+  drops them.
+
+The protocol model checks this as one graph: with any rule removed, a committed
+state references a deleted file, or a query within the retention fails.
 
 *Details in:* [Checkpoints and garbage collection](object-native-metastore-technical.md#checkpoints-and-garbage-collection).
 
-- *Alternative: retention by age,* as Delta Lake's `VACUUM` and Iceberg's
-  orphan cleanup use. Correctness would rest on a time bound, and the datalake
-  tier's GC shows it failing. Rejected.
-- *Alternative: a pin per query, or one anchored at the oldest query.* A pin
-  per query costs a write each time a query starts on a new commit, and a pin
-  anchored at the oldest query alone does not protect files a newer query
-  reads; the model finds the loss. Rejected.
+- *Alternative: leased reader pins,* a low-water commit each reading node
+  writes and renews, as SlateDB's readers keep their checkpoints alive.
+  Rejected: a pin only moves the time bound, since a reader paused past its
+  lease fails anyway, and it buys only queries longer than the retention. In
+  exchange every reader needs write access to the location, a lease with
+  renewal writes, and a write-then-recheck before its first read, and GC must
+  list pins. Delta Lake (`VACUUM`, 7 days by default), Iceberg (snapshot expiry
+  and orphan cleanup by age) and Hudi (the cleaner keeps the last N commits)
+  all protect readers with a retention bound, and none has readers register.
+- *Alternative: object generations,* where each upload goes into its writer's
+  generation and GC lists only generations no live writer uses. Rejected: it
+  avoids listing the whole prefix, but needs explicit generation closes once
+  writers run on several nodes, an interlock and an admission guard for reused
+  content addresses, and repeated sweeps to catch late uploads. The age rule,
+  the head move and fresh names need none of them.
+- *Alternative: an age limit without the head move.* Rejected: the writer
+  checks age when it sends a commit, but a store can apply the request much
+  later, so a late commit could reference an upload GC already deleted.
 
 ## User-facing surface (proposal for the Enhancement)
 
@@ -697,10 +718,10 @@ not a per-dataset choice. Deprecating `mode` can be decided and scheduled
 separately from the metastore work.
 - **The layout of data files.** Data files live in the destination (see
 [What we are building](#what-we-are-building)), under each dataset's
-`data/<generation>/` folder with their current file names
-([layout](object-native-metastore-technical.md#layout)). A file keeps the
-generation it was written in for life: ending a generation never copies or
-moves a file, and GC only deletes files no protected state references.
+`data/` folder with their current file names
+([layout](object-native-metastore-technical.md#layout)). A file never moves or
+is renamed, and GC deletes a removed file only after the retention (decision
+1.10).
 - **Data locations separate from the catalog.** By default the catalog and the
 data share one location. The format lets the catalog reference data in other
 locations, each with its own permissions, storage class or region (see
