@@ -6,9 +6,10 @@
 #   allowed" on a `*` it reads as an exists query with no field (`a *(b)`,
 #   `- *`), instead of returning a parse error
 #   (https://github.com/quickwit-oss/tantivy/issues/3031). This fork changes
-#   only `literal` in `src/query_grammar.rs` so the exists rule is tried only
+#   `literal` in `src/query_grammar.rs` so the exists rule is tried only
 #   after a field name. Every query 0.26.0 parses without panicking parses to
-#   the same AST.
+#   the same AST. It also limits query nesting depth (`MAX_NESTING_DEPTH`),
+#   so a deeply nested query is a parse error instead of a stack overflow.
 #
 # Wired in via `[patch.crates-io]` in the workspace root Cargo.toml.
 [package]
@@ -17,7 +18,7 @@ version = "0.26.0"
 authors = ["Paul Masurel <paul.masurel@gmail.com>"]
 license = "MIT"
 categories = ["database-implementations", "data-structures"]
-description = """Search engine library (spiceai vendored fork; fieldless exists query is a parse error, not a panic)"""
+description = """Search engine library (spiceai vendored fork; fieldless exists query is a parse error, not a panic; bounded nesting depth)"""
 homepage = "https://github.com/quickwit-oss/tantivy"
 repository = "https://github.com/quickwit-oss/tantivy"
 keywords = ["search", "information", "retrieval"]
