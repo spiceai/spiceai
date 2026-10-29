@@ -407,7 +407,7 @@ fn pdf_streams(raw: &[u8]) -> Vec<PdfStream> {
         let pos = from + rel;
         from = pos + KEYWORD.len();
         if !is_stream_keyword(raw, pos)
-            || in_comment_at(raw, pos)
+            || in_comment_at(raw, pos, lex_from)
             || in_literal_string_at(raw, pos, lex_from)
         {
             continue;
@@ -513,7 +513,7 @@ struct StreamInfo {
 /// filters are a single [`PdfFilter::Unbounded`] stage so the document fails
 /// closed.
 fn stream_before(raw: &[u8], keyword_pos: usize, lex_from: usize) -> Option<StreamInfo> {
-    let close = dict_closer_before(raw, keyword_pos)?;
+    let close = dict_closer_before(raw, keyword_pos, lex_from)?;
     let parsed = filters_of_dict(raw, close, lex_from).unwrap_or(ParsedDict {
         consumed: 0,
         filters: vec![PdfFilter::Unbounded],
@@ -599,7 +599,9 @@ fn parse_u64(data: &[u8]) -> Option<u64> {
 /// Index just past the `>>` that closes the dictionary before `keyword_pos`,
 /// after PDF whitespace and comments. `None` when no dictionary closer sits
 /// there, which is what distinguishes a real stream from the word `stream`.
-fn dict_closer_before(raw: &[u8], keyword_pos: usize) -> Option<usize> {
+/// `lex_from` is where comment spans are decided from (see
+/// [`comment_open_before`]).
+fn dict_closer_before(raw: &[u8], keyword_pos: usize, lex_from: usize) -> Option<usize> {
     let mut i = keyword_pos;
     loop {
         while i > 0 && is_pdf_whitespace(raw[i - 1]) {
@@ -608,7 +610,7 @@ fn dict_closer_before(raw: &[u8], keyword_pos: usize) -> Option<usize> {
         // A `%` comment runs to the end of its line. Consume one only when it
         // sits in the gap before `stream`: a `%` earlier on the dictionary's
         // own line has the closing `>>` after it, and is not this gap.
-        if let Some(comment) = comment_open_before(raw, i) {
+        if let Some(comment) = comment_open_before(raw, i, lex_from) {
             i = comment;
             continue;
         }
@@ -617,29 +619,37 @@ fn dict_closer_before(raw: &[u8], keyword_pos: usize) -> Option<usize> {
     (i >= 2 && &raw[i - 2..i] == b">>").then_some(i)
 }
 
-/// Start index of a `%` comment on the same line whose body covers `pos`.
+/// Start index of the `%` comment whose body covers `pos`.
 ///
-/// Comment spans are decided from the start of the line forward with
+/// Comment spans are decided by a forward scan from `scan_from` with
 /// string-aware tokenization: literal strings (including a `%` inside
 /// `(100 % pure)` or `(% harmless)`) are skipped, and the first `%` outside a
-/// string owns the rest of the line. Bytes inside that span — including `>>`
+/// string owns the rest of its line. Bytes inside that span — including `>>`
 /// or a second `%` — are comment text, not dictionary syntax.
-fn comment_open_before(raw: &[u8], pos: usize) -> Option<usize> {
-    if pos == 0 {
-        return None;
-    }
-    let line_start = raw[..pos]
-        .iter()
-        .rposition(|&b| b == b'\n' || b == b'\r')
-        .map_or(0, |newline| newline + 1);
-    let mut i = line_start;
+///
+/// `scan_from` is the end of the previous validated stream payload, which sits
+/// outside any string or comment. Scanning from the start of `pos`'s line
+/// instead would miss a literal string opened on an earlier line, and read a
+/// `%` inside it as a comment that swallows the dictionary's `>>`.
+fn comment_open_before(raw: &[u8], pos: usize, scan_from: usize) -> Option<usize> {
+    let mut i = scan_from.min(pos);
     while i < pos {
         match raw[i] {
-            b'(' => {
-                let len = skip_literal_string(&raw[i..])?;
-                i += len;
+            b'(' => match skip_literal_string(&raw[i..]) {
+                Some(len) if i + len <= pos => i += len,
+                // `pos` is inside a string that has not closed: string text.
+                Some(_) | None => return None,
+            },
+            b'%' => {
+                let line_end = raw[i..]
+                    .iter()
+                    .position(|&b| b == b'\n' || b == b'\r')
+                    .map_or(raw.len(), |offset| i + offset);
+                if pos <= line_end {
+                    return Some(i);
+                }
+                i = line_end;
             }
-            b'%' => return Some(i),
             _ => i += 1,
         }
     }
@@ -673,9 +683,10 @@ fn in_literal_string_at(raw: &[u8], at: usize, scan_from: usize) -> bool {
     false
 }
 
-/// Whether `at` sits inside a `%` comment on its line.
-fn in_comment_at(raw: &[u8], at: usize) -> bool {
-    comment_open_before(raw, at).is_some()
+/// Whether `at` sits inside a `%` comment, decided from `scan_from` (see
+/// [`comment_open_before`]).
+fn in_comment_at(raw: &[u8], at: usize, scan_from: usize) -> bool {
+    comment_open_before(raw, at, scan_from).is_some()
 }
 
 /// How far back from a dictionary closer its opening `<<` is looked for.
@@ -706,7 +717,7 @@ fn filters_of_dict(raw: &[u8], close: usize, lex_from: usize) -> Option<ParsedDi
             let start = j - 1;
             // A `<<` inside a `%` comment or a literal string is not a
             // dictionary opener.
-            if comment_open_before(raw, start).is_some()
+            if comment_open_before(raw, start, lex_from).is_some()
                 || in_literal_string_at(raw, start, lex_from)
             {
                 continue;
@@ -1734,6 +1745,21 @@ mod tests {
     #[test]
     fn rejects_a_bomb_behind_an_escaped_filter_name() {
         let pdf = pdf_with_dict("/Filter /Fl#61teDecode", &flate_bomb());
+        assert_eq!(
+            pdf_too_large_reason(&pdf),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
+    }
+
+    /// A literal string that opens on one line and holds a `%` on the next is
+    /// string text, not a comment, so the dictionary's `>>` after it still
+    /// closes the dictionary and the Flate bomb behind it is budgeted.
+    #[test]
+    fn rejects_a_bomb_behind_a_multiline_literal_holding_a_percent() {
+        let pdf = pdf_with_dict(
+            "/Filter /FlateDecode /Note (harmless\n% literal)",
+            &flate_bomb(),
+        );
         assert_eq!(
             pdf_too_large_reason(&pdf),
             "its compressed streams decompress to more than 256 MiB, the per-document limit"
