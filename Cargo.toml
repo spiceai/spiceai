@@ -291,7 +291,7 @@ datafusion-proto-common = "55.2.0"
 datafusion-pruning = "55.2.0"
 datafusion-spark = "55.2.0"
 datafusion-substrait = "55.2.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "2890f5ce7710ea23a86b5ed279391b5bbb9b5f93" } # branch: spiceai-55-release-2.4
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "f0af9b628dc48f0227ce6daf3d323b2ead3cc8a5" } # branch: spiceai-55-release-2.4
 delta_kernel = { version = "0.27.1", features = ["arrow-59", "internal-api"] }
 delta_kernel_default_engine = { version = "0.27.1", default-features = false, features = [
     "arrow-59",
