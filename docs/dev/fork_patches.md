@@ -125,7 +125,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1f0744b900e69e1b3fafa721aa4283bd4b048a61` | `spiceai-0.11.0-df-55` |
 | [llama.cpp](#llamacpp) | `a337bb5ce3590beb8763494b4381fe830bac0bc8` | `spiceai-b11803` |
-| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `1404d00e3a46acc640c345de826ccd8962db5710` | `lukim/mistral-think-tags` |
+| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `1404d00e3a46acc640c345de826ccd8962db5710` | `lukim/mistral-think-tags` (TEMPORARY: spiceai/mistral.rs#58) |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [orc-rust](#orc-rust) | `d9632e7ae973456c81c660c04e5f55cc86489bcb` | `spiceai-0.9` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
