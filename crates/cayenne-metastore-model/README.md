@@ -62,6 +62,8 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `intent-roll-forward*` | Proposed single-writer alternative to two-phase commit: one writer holding both datasets' leases commits A's actions, the source position and a pending intent for B in one A record, applies the intent to B under the transaction id, optionally marks it done in A; the next lease holder rolls pending intents forward. Maintenance on either head, delayed/duplicate CAS, lost responses resolved by attempt id, crash, pause and fencing; atomicity, at-most-once B apply, acknowledged/positioned transactions in both datasets at quiescence, I2, no retraction, B values in commit-point order, I5 | 1 or 2 source transactions on one key; one maintenance commit per dataset; one turnover and one crash (`two-takeovers`: two each); 2 copies per request; `disjoint-writer` adds one keyed write to another key of B |
 | `window-storage` | Canonical inline bytes, byte/count pressure, copy rule, cold replay, a running query, checkpoint/GC; I4, I7, I8 | Exhaustive 6 records; controls 5; samples 7, 9 |
 | `retention` / `retention-readers` | Readers never write and GC has no generations: removed objects deleted a fixed retention after GC observes the removal, which stays in durable state until the delete (timers restarted at takeover); never-committed uploads deleted once the head's store time is T_O past theirs; GC's empty commit on an idle head; fresh object names; a writer references only base-live objects or its own never-published uploads, while its base's store time is less than T_O minus a margin past the upload's; object timestamps that lag the writer's lower bound; deletes and commits that land arbitrarily late. `retention-readers` adds one query whose head GET responds late, and stops once the query settles. No dangling reference, rows or an error, and a query within the retention never fails | Exhaustive: 2 object names, 9 clock ticks, 6 head versions, retention 3, staleness 1, upload age 4, timestamp error 1, two sweeps, one takeover; the writer graph adds timestamp skew, the reader graph one query |
+| `retention-remote-gc` / `retention-readers-remote-gc` | GC on another node under its own lease: its empty commit is a CAS on the head version it read that can lose to the writer's commits (and they to it) and is retried; a second GC node takes the lease over, rebuilds the pending removals and restarts every timer, while the first node's issued deletes (removal deletes and selected orphan deletes) land later; the writer's takeover leaves GC's timers alone. Same properties as `retention` / `retention-readers` | As `retention` / `retention-readers`, with one GC lease takeover in place of the writer takeover; the reader graph stops at clock 7 |
+| `retention-readers-checkpoint` / `retention-readers-remote-gc-checkpoint` | Removals durable only as records after the floor and as the checkpoint root's pending-removals list: one checkpoint moves the floor, writes every removal not yet deleted into the root and drops the records below the floor; a takeover (the writer's with GC in process, or the GC lease takeover) rebuilds the pending set from the root with the later records applied and restarts every timer. Same properties as `retention-readers` | As `retention-readers` with one checkpoint; clock 7, or 6 with remote GC |
 | `replicas` / `replicas-readers` | Regional read-only replicas: writers and the source GC use only the source location; one-way replication copies objects and head versions to the replica one at a time in any order, with no delete replication and nothing committed to the replica; the replica head key holds whichever version arrived last. A replica reader adopts only a newer replicated head whose newly referenced objects are present in the replica, confirms it with a conditional GET on the source head timed from the request, starts a query from a head confirmed within S and reads only the replica. The source GC deletes a removed object T after its removal and an aged never-committed upload, after which the writer cannot commit it. The replica GC deletes a copy T after it reads the removal in the replica head, and a copy no replicated head mentions once the source returns 404. Checks that a head confirmed current references only replica objects, no lower head is adopted, a query within T - S never fails, rows or an error, and the replica GC never deletes an object the source head references | Exhaustive: 5 head versions, 8 clock ticks, retention 3, staleness 1, upload age 4; the GC graph has 2 objects and no reader, the reader graph 1 object and one query and stops once it settles; `replicas-orphan-head-age` keeps 4 versions |
 | `window-txn` | Transaction resolution composed with explicit delayed byte-batch sealing and eviction; I3–I6, I8 | Exhaustive 0; samples 2, 3 |
 | `concurrent-txn-overlap`, `concurrent-txn-disjoint` | Two transaction identities, overlapping/disjoint footprints, ordinary writer, rejected and late Prepare, opposite reservations, cleanup, checkpointed pending ids; I4, I6, I8 | Exhaustive/control 0; samples 1, 2 |
@@ -185,6 +187,10 @@ as a separate maintenance process does.
 | `retention-readers-sweep-removed` | The orphan sweep ignores recorded removals: it deletes a recently removed, old upload a query still reads |
 | `retention-readers-response-time` | A head confirmation is timed from its response instead of its request: a late response admits a query whose objects are already deleted |
 | `retention-readers-missing-as-empty` | A missing object reads as empty: wrong rows instead of an error |
+| `retention-remote-gc-blind-commit` | GC's empty commit is an unconditional write of the head it read: it lands over the writer's removal and resurrects the object, whose removal timer then deletes it under the committed state |
+| `retention-readers-remote-gc-keep-timestamps` | The new GC node keeps the old node's removal times, read on a clock one tick ahead: a query within the retention fails |
+| `retention-readers-checkpoint-root-omits` / `retention-readers-remote-gc-checkpoint-root-omits` | The checkpoint root omits the pending removals: after the takeover the removal is forgotten and the orphan sweep deletes an object a query still reads |
+| `retention-readers-checkpoint-tail-only` | The takeover rebuilds pending removals from the records after the floor only: the same failure |
 | `replicas-readers-adoption-all-present` | Checks the stronger property that an adopted head references only objects present in the replica: it fails under the incremental frontier check (see below), not a removed safeguard |
 | `replicas-readers-no-frontier` | The reader adopts a replicated head without checking its new objects are in the replica: a head confirmed current references a missing object |
 | `replicas-readers-adopt-lower` | The reader adopts whatever the replica head shows: after an out-of-order arrival it adopts a lower head |
@@ -312,6 +318,24 @@ graph adds one query with a late GET response and stops once that query settles.
 Other graphs abstract this contract: a query is protected from its start until it
 expires, and the orphan sweep takes only an upload that has aged, which the writer
 can no longer reference.
+
+The remote-GC siblings move GC to another node. Its empty commit is a CAS on the
+head version GC read, so it loses to any commit that lands first and is retried
+from the new head; the writer's commits likewise lose to it. A blind empty commit
+overwrites the head GC read and can resurrect an object the writer removed in
+between, whose removal timer then deletes it under the committed state. A second
+GC node takes over the GC lease, rebuilds the pending removals from durable state
+and restarts every timer on its own clock; the first node's issued deletes land
+afterwards and are harmless, because each was already safe when it was decided.
+GC observing a removal is modelled at the commit that records it, the earliest it
+can happen. The checkpoint siblings make removals durable only as records after
+the floor and as each checkpoint root's pending-removals list. A checkpoint writes
+every removal whose object is not yet deleted into the root and drops the records
+below the floor; a takeover rebuilds the pending set from the root with the later
+records applied. A root that omits pending removals, or a rebuild from the records
+after the floor alone, forgets a removal, and the orphan sweep then deletes an
+object a query still reads. The reader graphs of these siblings stop the clock
+earlier (7, or 6 with both) to stay tractable.
 
 `replicas` and `replicas-readers` add a read-only replica location. Nothing commits
 to the replica and source deletes do not replicate, so only the replica GC removes a
@@ -469,8 +493,14 @@ is conservative). Its liveness is quiescence-based, not a fairness proof.
 
 Existing focused models retain their original bounds and controls. Their narrow
 limits above still apply: in particular only the restart profile clears caller
-state, and the retention graph has one writer and one GC; GC on another node and
-several writers are not modelled. Evidence expiry is modeled only in the
+state, and the retention graphs have one writer at a time: several concurrent
+writers are not modelled, and with remote GC the writer takes over only in the
+in-process graph. Remote GC has two GC nodes and one lease takeover; after it the
+old node issues nothing new (deletes it already decided and its pending empty
+commit still land), GC has one empty commit in flight at a time, and two GC
+nodes both sweeping concurrently are not modelled. Only one checkpoint is taken,
+records below the floor are not kept for readers, and the checkpoint writer knows
+which removed objects are already deleted. Evidence expiry is modeled only in the
 single-writer retry graph (`commits-retry-expiry`), with one horizon value and
 symbolic store times; it is not composed with checkpoint bytes, transactions or
 source positions, and an unresolved attempt stays unresolved: the model does not

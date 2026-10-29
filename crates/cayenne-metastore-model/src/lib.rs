@@ -384,6 +384,86 @@ pub fn runs() -> Vec<Run> {
             failure: "rows or an error",
         },
         Run {
+            name: "retention-remote-gc",
+            family: "retention",
+            mode: "retention-remote-gc",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "retention-readers-remote-gc",
+            family: "retention",
+            mode: "retention-readers-remote-gc",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "retention-readers-checkpoint",
+            family: "retention",
+            mode: "retention-readers-checkpoint",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "retention-readers-remote-gc-checkpoint",
+            family: "retention",
+            mode: "retention-readers-remote-gc-checkpoint",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "retention-readers-remote-gc-checkpoint-root-omits",
+            family: "retention",
+            mode: "retention-readers-remote-gc-checkpoint-root-omits",
+            bound: 0,
+            seed: None,
+            failure: "a query within the retention never fails",
+        },
+        Run {
+            name: "retention-remote-gc-blind-commit",
+            family: "retention",
+            mode: "retention-remote-gc-blind-commit",
+            bound: 0,
+            seed: None,
+            failure: "committed state references only present objects",
+        },
+        Run {
+            name: "retention-readers-remote-gc-keep-timestamps",
+            family: "retention",
+            mode: "retention-readers-remote-gc-keep-timestamps",
+            bound: 0,
+            seed: None,
+            failure: "a query within the retention never fails",
+        },
+        Run {
+            name: "retention-readers-checkpoint-root-omits",
+            family: "retention",
+            mode: "retention-readers-checkpoint-root-omits",
+            bound: 0,
+            seed: None,
+            failure: "a query within the retention never fails",
+        },
+        Run {
+            name: "retention-readers-checkpoint-tail-only",
+            family: "retention",
+            mode: "retention-readers-checkpoint-tail-only",
+            bound: 0,
+            seed: None,
+            failure: "a query within the retention never fails",
+        },
+        Run {
+            name: "naming",
+            family: "state-rules",
+            mode: "identity-design",
+            bound: 3,
+            seed: None,
+            failure: "",
+        },
+        Run {
             name: "replicas",
             family: "replicas",
             mode: "replicas",
@@ -2332,6 +2412,12 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
             ) => true,
             _ => false,
         };
+    // The remote-GC and checkpoint retention graphs must reach every witness,
+    // including the lost GC commit, the stale delete and the root rebuild.
+    let remote_retention_required = run.family == "retention"
+        && run.failure.is_empty()
+        && (run.mode.contains("remote-gc") || run.mode.contains("checkpoint"))
+        && *expectation == Expectation::Sometimes;
     let standby_required =
         run.family == "standby" && run.failure.is_empty() && *expectation == Expectation::Sometimes;
     let promotion_required = run.family == "cold-promotion"
@@ -2402,6 +2488,7 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
     intent_required
         || added_required
         || standby_required
+        || remote_retention_required
         || promotion_required
         || delivery_required
         || widened_required

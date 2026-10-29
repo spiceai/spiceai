@@ -12,6 +12,14 @@
 //! difference of two store timestamps; object timestamps may lag that lower
 //! bound by up to `DRIFT`. Every object has a fresh name. A query starts from
 //! a head confirmed within `S` of when its request was sent.
+//!
+//! With `remote-gc`, GC runs on another node under its own lease: its empty
+//! commit is a CAS that races the writer's, a second GC node can take the
+//! lease over, and deletes the first node already issued land afterwards.
+//! With `checkpoint`, removals are durable only as records after the floor
+//! and as the checkpoint root's pending-removals list; a checkpoint moves the
+//! floor and drops the records below it, and a GC restart rebuilds its
+//! pending set from the root and the records after the floor.
 use stateright::{Model, Property};
 
 const N: usize = 2;
@@ -24,6 +32,7 @@ const T_O: u8 = 4;
 /// Store timestamp error between servers.
 const DRIFT: u8 = 1;
 const HORIZON: u8 = 9;
+const SHORT_HORIZON: u8 = 7;
 const VERSIONS: u8 = 6;
 
 #[derive(Clone, Debug)]
@@ -84,6 +93,23 @@ pub(crate) struct State {
     late_error: bool,
     late_response: bool,
     restarted_timers: bool,
+    /// GC's empty commit in flight: whether the head is still the version it
+    /// read (its CAS condition), and the live set it read.
+    gc_inflight: Option<(bool, [bool; N])>,
+    gc_lost: bool,
+    gc_retried: bool,
+    gc_leases: u8,
+    /// A delete issued by a GC node that has since lost its lease.
+    stale: [bool; N],
+    /// The new GC node has listed since it took over.
+    gc_moved: bool,
+    stale_landed: bool,
+    /// A removal recorded in a record after the floor.
+    logged: [bool; N],
+    /// A removal in the checkpoint root's pending-removals list.
+    rooted: [bool; N],
+    checkpoints: u8,
+    rebuilt_from_root: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Action {
@@ -97,6 +123,13 @@ pub(crate) enum Action {
     Land,
     Remove(usize),
     Bump,
+    /// A remote GC node sends its empty commit, conditioned on the head it read.
+    GcDispatch,
+    GcLand,
+    /// Another GC node takes over the GC lease.
+    GcTakeover,
+    /// The writer moves the floor to a new checkpoint root.
+    Checkpoint,
     Takeover,
     Expire(usize),
     Collect(usize),
@@ -130,6 +163,16 @@ impl Protocol {
     }
     fn retention(&self) -> u8 {
         if self.has("no-retention") { 0 } else { T }
+    }
+    /// The reader graphs with remote GC or checkpoints stop the clock earlier
+    /// to stay tractable, and the one with both earlier still; an aged upload,
+    /// a removal, a checkpoint and a takeover still fit before the horizon.
+    fn horizon(&self) -> u8 {
+        match (self.readers(), self.remote_gc(), self.checkpoint()) {
+            (true, true, true) => SHORT_HORIZON - 1,
+            (true, true, false) | (true, false, true) => SHORT_HORIZON,
+            _ => HORIZON,
+        }
     }
     /// The writer may reference its upload only while its base is less than
     /// `T_O - M` past the upload by the store's clock.
@@ -166,6 +209,47 @@ impl Protocol {
     fn head_write(s: &mut State) {
         s.version += 1;
         s.head_time = s.now;
+        if let Some((current, _)) = &mut s.gc_inflight {
+            // GC's pending empty commit is now conditioned on a stale version.
+            *current = false;
+        }
+    }
+    fn remote_gc(&self) -> bool {
+        self.has("remote-gc")
+    }
+    fn checkpoint(&self) -> bool {
+        self.has("checkpoint")
+    }
+    /// Whether durable state still lists a removal as pending: the root's
+    /// list with the records after the floor applied.
+    fn durable_removal(&self, s: &State, o: usize) -> bool {
+        let root = s.rooted[o] && !s.live[o] && !self.has("tail-only");
+        root || s.logged[o]
+    }
+    /// A new GC instance: its pending set comes from durable state, and every
+    /// timer restarts on its own clock.
+    fn restart_gc(&self, s: &State, n: &mut State) {
+        if self.has("volatile-removals") {
+            // The removals lived only in the predecessor's memory.
+            n.removed = [None; N];
+        }
+        if self.checkpoint() {
+            for o in 0..N {
+                let durable = self.durable_removal(s, o);
+                n.rebuilt_from_root |=
+                    durable && s.rooted[o] && !s.logged[o] && s.present[o] && !s.collecting[o];
+                n.removed[o] = durable.then(|| s.removed[o].unwrap_or(s.now));
+            }
+        }
+        for r in n.removed.iter_mut().flatten() {
+            if self.has("keep-timestamps") {
+                // The predecessor's clock read one tick ahead.
+                *r = r.saturating_sub(1);
+            } else {
+                n.restarted_timers |= *r < s.now;
+                *r = s.now;
+            }
+        }
     }
 }
 impl Model for Protocol {
@@ -178,7 +262,7 @@ impl Model for Protocol {
         if self.readers() && self.settled(s) {
             return;
         }
-        if s.now < HORIZON {
+        if s.now < self.horizon() {
             a.push(Action::Tick);
         }
         if self.has("writer-clock") && s.lag == 0 && s.now + T_O <= HORIZON {
@@ -225,7 +309,9 @@ impl Model for Protocol {
         if s.inflight.is_some() {
             a.push(Action::Land);
         }
-        if s.leases == 0 && s.version < VERSIONS {
+        // With remote GC, a writer takeover leaves GC's timers alone and is
+        // otherwise checked in the in-process graph; the GC takeover replaces it.
+        if s.leases == 0 && s.version < VERSIONS && !self.remote_gc() {
             a.push(Action::Takeover);
         }
         match s.sweep {
@@ -234,10 +320,28 @@ impl Model for Protocol {
                 a.push(Action::Select);
                 // GC's empty commit, so an idle head's time advances.
                 if !s.bumped && s.version < VERSIONS {
-                    a.push(Action::Bump);
+                    if !self.remote_gc() {
+                        a.push(Action::Bump);
+                    } else if s.gc_inflight.is_none() {
+                        a.push(Action::GcDispatch);
+                    }
                 }
             }
             _ => {}
+        }
+        if s.gc_inflight.is_some() {
+            a.push(Action::GcLand);
+        }
+        if self.remote_gc() && s.gc_leases == 0 {
+            a.push(Action::GcTakeover);
+        }
+        if self.checkpoint()
+            && s.checkpoints == 0
+            && s.inflight.is_none()
+            && s.version < VERSIONS
+            && s.logged.contains(&true)
+        {
+            a.push(Action::Checkpoint);
         }
         // A head with nothing live cannot start a query.
         if self.readers()
@@ -285,6 +389,7 @@ impl Model for Protocol {
                     Self::head_write(&mut n);
                     n.live[o] = true;
                     n.removed[o] = None;
+                    n.logged[o] = false;
                     if !self.has("reref-published") {
                         // Published: from now on it is referenced only while live.
                         n.started[o] = None;
@@ -295,27 +400,71 @@ impl Model for Protocol {
                 Self::head_write(&mut n);
                 n.live[o] = false;
                 n.removed[o] = Some(s.now);
+                n.logged[o] = self.checkpoint();
             }
             Action::Bump => {
                 Self::head_write(&mut n);
                 n.bumped = true;
             }
+            Action::GcDispatch => {
+                // Only the blind write needs the live set it read.
+                let read = if self.has("blind-commit") {
+                    s.live
+                } else {
+                    [false; N]
+                };
+                n.gc_inflight = Some((true, read));
+            }
+            Action::GcLand => {
+                let (current, read) = s.gc_inflight?;
+                n.gc_inflight = None;
+                if self.has("blind-commit") {
+                    // An unconditional PUT of the head GC read.
+                    Self::head_write(&mut n);
+                    n.live = read;
+                    n.bumped = true;
+                } else if current {
+                    Self::head_write(&mut n);
+                    n.bumped = true;
+                    n.gc_retried |= s.gc_lost;
+                } else {
+                    // Lost to the writer's commit; GC may read the head again.
+                    n.gc_lost = !self.readers();
+                }
+            }
+            Action::GcTakeover => {
+                n.gc_leases += 1;
+                // The old node's selected deletes are already issued and land
+                // whenever the store applies them; its listing is gone.
+                for o in 0..N {
+                    if s.sweep == Sweep::Selected && s.candidates[o] {
+                        n.collecting[o] = true;
+                    }
+                    // Tracked for the witness, in the writer graph only.
+                    n.stale[o] = n.collecting[o] && !self.readers();
+                }
+                n.sweep = Sweep::Idle;
+                n.candidates = [false; N];
+                self.restart_gc(s, &mut n);
+            }
+            Action::Checkpoint => {
+                Self::head_write(&mut n);
+                n.checkpoints += 1;
+                for o in 0..N {
+                    // The root lists every removal not yet deleted, and the
+                    // records below the new floor are dropped.
+                    n.rooted[o] =
+                        !self.has("root-omits") && self.durable_removal(s, o) && s.present[o];
+                }
+                n.logged = [false; N];
+            }
             Action::Takeover => {
                 Self::head_write(&mut n);
                 n.leases += 1;
                 n.started = [None; N];
-                if self.has("volatile-removals") {
-                    // The removals lived only in the predecessor's memory.
-                    n.removed = [None; N];
-                }
-                for r in n.removed.iter_mut().flatten() {
-                    if self.has("keep-timestamps") {
-                        // The predecessor's clock read one tick ahead.
-                        *r = r.saturating_sub(1);
-                    } else {
-                        n.restarted_timers |= *r < s.now;
-                        *r = s.now;
-                    }
+                if !self.remote_gc() {
+                    // GC runs in the writer's process.
+                    self.restart_gc(s, &mut n);
                 }
             }
             Action::Expire(o) => {
@@ -330,7 +479,9 @@ impl Model for Protocol {
             Action::Collect(o) => {
                 n.collecting[o] = false;
                 n.present[o] = false;
-                n.removed_collected = true;
+                n.removed_collected |= s.removed[o].is_some();
+                n.stale[o] = false;
+                n.stale_landed |= s.stale[o] && s.gc_moved;
             }
             Action::List => {
                 n.candidates = s.present;
@@ -340,6 +491,7 @@ impl Model for Protocol {
                 n.sweep = Sweep::Listed;
                 n.sweeps += 1;
                 n.bumped = false;
+                n.gc_moved |= s.gc_leases > 0 && !self.readers();
             }
             Action::Select => {
                 for o in 0..N {
@@ -453,6 +605,24 @@ impl Model for Protocol {
                 ),
                 Property::sometimes("old upload refused at commit", |_, s: &State| s.refused),
             ]);
+        }
+        if self.remote_gc() && !self.readers() {
+            properties.extend([
+                Property::sometimes(
+                    "GC empty commit loses a race and retries",
+                    |_, s: &State| s.gc_retried,
+                ),
+                Property::sometimes(
+                    "stale GC node's delete lands after takeover",
+                    |_, s: &State| s.stale_landed,
+                ),
+            ]);
+        }
+        if self.checkpoint() {
+            properties.push(Property::sometimes(
+                "takeover rebuilds a removal from the checkpoint root",
+                |_, s: &State| s.rebuilt_from_root,
+            ));
         }
         properties
     }
