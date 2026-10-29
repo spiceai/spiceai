@@ -121,10 +121,17 @@ impl ComponentDdlOp {
         }
     }
 
-    /// The statement, for plans and logs.
+    /// The statement, for plans, logs, and errors: as the user wrote it, so
+    /// `CREATE OR REPLACE` is named as such.
     #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
+            Self::CreateDataset {
+                or_replace: true, ..
+            } => "CREATE OR REPLACE TABLE",
+            Self::CreateCatalog {
+                or_replace: true, ..
+            } => "CREATE OR REPLACE CATALOG",
             Self::CreateDataset { .. } => "CREATE TABLE",
             Self::AlterDataset { .. } => "ALTER TABLE",
             Self::DropDataset { .. } => "DROP TABLE",

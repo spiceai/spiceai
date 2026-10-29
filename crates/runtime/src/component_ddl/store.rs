@@ -128,13 +128,15 @@ impl Error {
 }
 
 /// The innermost error of `error`'s chain: what failed, without the layers
-/// that passed it on, such as `Object store operation 'get' failed`.
-fn root_cause(error: &(dyn std::error::Error + 'static)) -> String {
+/// that passed it on, such as `Object store operation 'get' failed`. On one
+/// line, since messages and log lines embed it, and a source's text, such as
+/// `DuckDB`'s, can span several.
+pub(crate) fn root_cause(error: &(dyn std::error::Error + 'static)) -> String {
     let mut cause = error;
     while let Some(source) = cause.source() {
         cause = source;
     }
-    cause.to_string()
+    util::single_line(&cause.to_string()).into_owned()
 }
 
 pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
@@ -396,5 +398,27 @@ mod tests {
             .expect_err("stale writer");
         assert!(matches!(err, Error::Conflict { .. }), "{err}");
         assert_eq!(second.load().await.expect("load"), orders);
+    }
+
+    /// A message embeds the innermost error of a chain, without the layers
+    /// that passed it on, and on one line, as `DuckDB` writes it over two.
+    #[test]
+    fn a_root_cause_is_the_innermost_error_on_one_line() {
+        #[derive(Debug, Snafu)]
+        #[snafu(display(
+            "The load checkpoint of dataset 's1' could not be cleared. Cause: {source}"
+        ))]
+        struct Cleared {
+            source: std::io::Error,
+        }
+        let error = Cleared {
+            source: std::io::Error::other(
+                "IO Error: The file \"s1.db\" exists, but it is not a valid DuckDB database file!\nFor details, refer to the DuckDB manual: https://duckdb.org/docs/",
+            ),
+        };
+        assert_eq!(
+            root_cause(&error),
+            "IO Error: The file \"s1.db\" exists, but it is not a valid DuckDB database file! For details, refer to the DuckDB manual: https://duckdb.org/docs/"
+        );
     }
 }

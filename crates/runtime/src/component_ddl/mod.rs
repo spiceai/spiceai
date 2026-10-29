@@ -234,6 +234,7 @@ impl ComponentDdlHandler for RuntimeComponentDdl {
                         let cause = e.to_string();
                         let cause =
                             datafusion_ddl::component_options::redact_values(&cause, &values);
+                        let cause = util::single_line(&cause);
                         tracing::warn!(
                             "`{statement}` failed after its client disconnected, so it was not applied. Cause: {cause}"
                         );
@@ -1348,25 +1349,26 @@ impl Runtime {
     }
 
     /// Delete the acceleration data of `dataset`, a definition `app` served and
-    /// that no longer serves.
+    /// that no longer serves. A failure is its root cause, such as the
+    /// accelerator's file error, for the message that names the dataset.
     async fn delete_acceleration_data(
         self: Arc<Self>,
         dataset: &Dataset,
         app: &Arc<App>,
-    ) -> DFResult<()> {
+    ) -> Result<(), String> {
         if !dataset.acceleration.as_ref().is_some_and(|a| a.enabled) {
             return Ok(());
         }
         let built = DatasetBuilder::try_from(dataset.clone())
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?
+            .map_err(|e| store::root_cause(&e))?
             .with_app(Arc::clone(app))
             .with_runtime(Arc::clone(&self))
             .build()
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            .map_err(|e| store::root_cause(&e))?;
         self.df
             .delete_acceleration_data(&built)
             .await
-            .map_err(|e| DataFusionError::Execution(e.to_string()))
+            .map_err(|e| store::root_cause(&e))
     }
 
     /// Wait, within [`REGISTRATION_WAIT`], for `dataset` to register, and say

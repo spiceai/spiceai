@@ -394,8 +394,9 @@ impl Runtime {
                     }
                 }
                 Err(e) => tracing::error!(
-                    "Failed to unload catalog '{}', so its tables stay queryable until Spice restarts. Cause: {e}",
-                    catalog.name
+                    "Failed to unload catalog '{}', so its tables stay queryable until Spice restarts. Cause: {}",
+                    catalog.name,
+                    util::single_line(&e.to_string())
                 ),
             }
         }
