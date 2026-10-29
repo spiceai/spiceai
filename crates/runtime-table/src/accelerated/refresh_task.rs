@@ -3711,7 +3711,7 @@ pub fn max_timestamp_df(
     clippy::cast_precision_loss
 )]
 fn whole_units_at_or_below(value: f64) -> Option<u128> {
-    (value.is_finite() && (0.0..=u64::MAX as f64).contains(&value))
+    (value.is_finite() && (0.0..u64::MAX as f64).contains(&value))
         .then(|| u128::from(value.floor() as u64))
 }
 
