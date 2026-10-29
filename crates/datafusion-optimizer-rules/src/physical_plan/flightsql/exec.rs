@@ -24,7 +24,7 @@ use std::sync::{Arc, LazyLock};
 
 use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DECIMAL128_MAX_PRECISION, DataType, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::TableReference;
 use datafusion::common::stats::Precision;
@@ -152,6 +152,9 @@ pub struct PartialAggregationFlightSqlExec {
     ///
     /// Indexed by output column position of the `ProjectionExec`.
     column_substitutions: Vec<Arc<dyn PhysicalExpr>>,
+    /// Scan schema of the source `FlightSqlExec`, used to decide when a
+    /// pushed `SUM` must stay wide (`CAST` to `DECIMAL(38,0)`).
+    input_schema: SchemaRef,
     /// The `FlightSQL` client.
     client: FlightSqlClient,
     /// Cookie store for authentication propagation.
@@ -191,6 +194,7 @@ impl PartialAggregationFlightSqlExec {
             group_by,
             aggr_exprs,
             output_schema,
+            input_schema: source.schema(),
             column_substitutions,
             client: source.client().clone(),
             cookie_store: Arc::clone(source.cookie_store()),
@@ -235,6 +239,7 @@ impl PartialAggregationFlightSqlExec {
             &self.group_by,
             &self.aggr_exprs,
             &self.column_substitutions,
+            self.input_schema.as_ref(),
         )
     }
 }
@@ -407,6 +412,7 @@ fn build_aggregate_sql(
     group_by: &PhysicalGroupBy,
     aggr_exprs: &[Arc<AggregateFunctionExpr>],
     column_substitutions: &[Arc<dyn PhysicalExpr>],
+    input_schema: &Schema,
 ) -> Result<AggregateQuery> {
     // Phase 1: collect all SQL fragments (before dedup) and their dedup keys.
     let mut all_fragments: Vec<SqlFragment> = Vec::new();
@@ -469,11 +475,20 @@ fn build_aggregate_sql(
                         ))
                     })?;
                 let upper = func_name.to_uppercase();
-                all_fragments.push(SqlFragment {
-                    sql: format!("{upper}({arg_sql})"),
-                    dedup_key: format!("{upper}({})", strip_outer_cast(&arg_sql)),
-                    needs_alias: true,
-                });
+                if func_name == "sum" && sum_stores_wide_integer_partial(aggr) {
+                    let sql = wide_integer_sum_sql(&arg_sql);
+                    all_fragments.push(SqlFragment {
+                        sql: sql.clone(),
+                        dedup_key: sql,
+                        needs_alias: true,
+                    });
+                } else {
+                    all_fragments.push(SqlFragment {
+                        sql: format!("{upper}({arg_sql})"),
+                        dedup_key: format!("{upper}({})", strip_outer_cast(&arg_sql)),
+                        needs_alias: true,
+                    });
+                }
             }
         } else if func_name == "avg" {
             if exprs.len() != 1 {
@@ -517,11 +532,21 @@ fn build_aggregate_sql(
                         needs_alias: true,
                     });
                 } else if name_lower.ends_with("[sum]") {
-                    all_fragments.push(SqlFragment {
-                        sql: format!("SUM({arg_sql})"),
-                        dedup_key: format!("SUM({stripped})"),
-                        needs_alias: true,
-                    });
+                    if physical_expr_is_64bit_integer(&exprs[0], input_schema, column_substitutions)
+                    {
+                        let sql = wide_integer_sum_sql(&arg_sql);
+                        all_fragments.push(SqlFragment {
+                            sql: sql.clone(),
+                            dedup_key: sql,
+                            needs_alias: true,
+                        });
+                    } else {
+                        all_fragments.push(SqlFragment {
+                            sql: format!("SUM({arg_sql})"),
+                            dedup_key: format!("SUM({stripped})"),
+                            needs_alias: true,
+                        });
+                    }
                 } else {
                     return Err(DataFusionError::Internal(format!(
                         "Unrecognized AVG state field '{}' — expected name ending with '[count]' or '[sum]'",
@@ -597,6 +622,48 @@ fn build_aggregate_sql(
         sql: stmt.to_sql(),
         column_mapping,
     })
+}
+
+/// Whether this `sum` stores a `Decimal128(38, 0)` partial. Spice's checked
+/// integer `SUM` does that so a partition total that does not fit in `Int64`
+/// can still cancel at the scheduler. The remote SQL must produce the same
+/// wide value; a plain `SUM(col)` would `evaluate()` to `Int64` on each
+/// executor first.
+fn sum_stores_wide_integer_partial(aggr: &AggregateFunctionExpr) -> bool {
+    if !aggr.fun().name().eq_ignore_ascii_case("sum") {
+        return false;
+    }
+    let Ok(fields) = aggr.state_fields() else {
+        return false;
+    };
+    fields.iter().any(|field| {
+        matches!(
+            field.data_type(),
+            DataType::Decimal128(DECIMAL128_MAX_PRECISION, 0)
+        )
+    })
+}
+
+fn physical_expr_is_64bit_integer(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+    column_substitutions: &[Arc<dyn PhysicalExpr>],
+) -> bool {
+    use datafusion::physical_expr::expressions::Column;
+
+    let resolved = expr
+        .as_ref()
+        .downcast_ref::<Column>()
+        .and_then(|col| column_substitutions.get(col.index()))
+        .unwrap_or(expr);
+    matches!(
+        resolved.data_type(schema),
+        Ok(DataType::Int64 | DataType::UInt64)
+    )
+}
+
+fn wide_integer_sum_sql(arg_sql: &str) -> String {
+    format!("SUM(CAST({arg_sql} AS DECIMAL({DECIMAL128_MAX_PRECISION},0)))")
 }
 
 /// Strip an outer `CAST(... AS ...)` wrapper from a SQL fragment, returning the

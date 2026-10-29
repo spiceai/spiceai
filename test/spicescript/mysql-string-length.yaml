@@ -1,0 +1,54 @@
+name: mysql-string-length
+description: >
+  String length counts Unicode characters, including through aliases and
+  filters. Binary length counts bytes. Federated results agree with MySQL's
+  explicit character and byte functions and with Cayenne over the same rows.
+
+sources:
+  src: { kind: mysql }
+
+variants:
+  federated: {}
+  cayenne: cayenne-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mysql-string-length
+  datasets:
+    - from: mysql:lengths
+      name: lengths
+      params: ${sources.src.params}
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE lengths (id INT PRIMARY KEY, s VARCHAR(64), b VARBINARY(64));
+        INSERT INTO lengths VALUES
+          (1, 'naïve', UNHEX('C3A9')),
+          (2, '漢字', UNHEX('FF00')),
+          (3, '😀', UNHEX('F09F9880')),
+          (4, '', UNHEX('')),
+          (5, NULL, NULL),
+          (6, 'é', UNHEX('65CC81'));
+  - start: {}
+  - query: SELECT id, char_length(s), character_length(s), length(s), len(s) FROM lengths ORDER BY id
+    oracle-sql: SELECT id, CHAR_LENGTH(s), CHAR_LENGTH(s), CHAR_LENGTH(s), CHAR_LENGTH(s) FROM lengths ORDER BY id
+  - query: SELECT id, s FROM lengths WHERE char_length(s) > 1 ORDER BY id
+    oracle-sql: SELECT id, s FROM lengths WHERE CHAR_LENGTH(s) > 1 ORDER BY id
+  - query: SELECT id, length(b), char_length(b) FROM lengths ORDER BY id
+    oracle-sql: SELECT id, LENGTH(b), LENGTH(b) FROM lengths ORDER BY id
+  - explain: SELECT id FROM lengths WHERE char_length(s) > 1
+    contains: [VirtualExecutionPlan, character_length]
+    only: federated
+  - query: SELECT id, CASE WHEN id = 1 THEN 0 ELSE length(s) END AS n FROM lengths ORDER BY id
+    oracle-sql: SELECT id, CASE WHEN id = 1 THEN 0 ELSE CHAR_LENGTH(s) END AS n FROM lengths ORDER BY id
+  - query: SELECT id, CASE length(s) WHEN 0 THEN 'empty' WHEN 1 THEN 'one' ELSE 'other' END AS size FROM lengths ORDER BY id
+    oracle-sql: SELECT id, CASE CHAR_LENGTH(s) WHEN 0 THEN 'empty' WHEN 1 THEN 'one' ELSE 'other' END AS size FROM lengths ORDER BY id
+  - query: SELECT id, CASE WHEN id = 1 THEN 0 ELSE length(b) END AS n FROM lengths ORDER BY id
+    oracle-sql: SELECT id, CASE WHEN id = 1 THEN 0 ELSE LENGTH(b) END AS n FROM lengths ORDER BY id
+  - query: SELECT id, CASE WHEN length(s) > 1 THEN length(s) END AS n FROM lengths ORDER BY id
+    oracle-sql: SELECT id, CASE WHEN CHAR_LENGTH(s) > 1 THEN CHAR_LENGTH(s) END AS n FROM lengths ORDER BY id

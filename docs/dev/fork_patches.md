@@ -107,7 +107,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | Fork | Pinned revision | Branch |
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `6e4119ac2007c6647702a1817505d6849b07e0e0` | `spiceai-24` |
-| [arrow-rs](#arrow-rs) | `045a425f71507d1150bfeeeb5834e43429cb5011` | `spiceai-59` |
+| [arrow-rs](#arrow-rs) | `2124b9e85c8c4f50fdacfa23d75cbad6a4db9086` | `spiceai-59` |
 | [async-openai](#async-openai) | `307eaf407cbf71afa967f3008250ba96c79626b7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb` | `spiceai` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `3a75c403e4db3bc2f76f0d8c2cfce610f52f3675` | `spiceai-55` |
+| [datafusion](#datafusion) | `2644c0d5aad82c29c7c02a6617a71c664f55e94c` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `4a2920746865562e604150fbee49eea6241c0b85` | `spiceai-55` |
@@ -124,10 +124,10 @@ own section below — a count here would be one more thing to keep true by hand.
 | [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1f0744b900e69e1b3fafa721aa4283bd4b048a61` | `spiceai-0.11.0-df-55` |
-| [llama.cpp](#llamacpp) | `1082d1983689a13315cdf2a80d9bd0bbdd572da2` | `spiceai-b11803` |
+| [llama.cpp](#llamacpp) | `a337bb5ce3590beb8763494b4381fe830bac0bc8` | `spiceai-b11803` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `aa8e8d43949970b91fb42a2243b4f60f810d9bbd` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
-| [orc-rust](#orc-rust) | `5b35c6d10a8cbd9750d501216ff04e72e23829b6` | `spiceai-0.9` |
+| [orc-rust](#orc-rust) | `d9632e7ae973456c81c660c04e5f55cc86489bcb` | `spiceai-0.9` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
 | [sea-query](#sea-query) | `ae75baef819513fb8d19af014972dcfa324e201a` | `spiceai` |
@@ -218,8 +218,12 @@ fetch through a single-input repartition, #266, which charges each slice of a ba
 sort shares with its producer for the slice's own rows, #261, which keeps a union input's own
 `ORDER BY` and `LIMIT` inside that input, #262, which keeps a cast that drops decimal digits out
 of `unwrap_cast`, the unparser fixes #246, #247 and #264, and #268, which narrows #266's copy to
-batches whose rows are slices of larger buffers, and #273, upstream apache/datafusion#23232
-cherry-picked from `main`; the pin is #273's merge commit. None changes a
+batches whose rows are slices of larger buffers. The pin is merged #270, which
+includes #273's scalar-UDF coercion fix and the SQL semantics fixes for
+[#15538](https://github.com/spiceai/spiceai/issues/15538): parenthesized IS and NOT
+operands, preserved pruned aggregates and correlated projection scopes, scan
+filters before projection, CASE error propagation, and character-counting MySQL
+string length. The existing patches remain in the commit ancestry. None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
 code, and removes no line of it. The branch also carries
@@ -266,6 +270,11 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Unparser: the dangling-qualifier sweep keeps a qualifier that an `UNNEST` or `LATERAL FLATTEN` alias, the last part of a schema-qualified table, or the column a struct field path is rooted at binds (spiceai/datafusion#246) | The sweep strips a qualifier that does bind: two `UNNEST` aliases sharing a column name give `SELECT c1, c1 …`, and a join of two schema-qualified tables gives `SELECT v, v FROM s.a INNER JOIN s.b …`, which `DuckDB` rejects as ambiguous; `test."metadata".product` is cut to `product` ([#13442](https://github.com/spiceai/spiceai/issues/13442)) | silent (query failure) | **GAP** — no guard here yet; in the fork, the `plan_to_sql.rs` cases #246 fixes; see [Open gaps](#open-gaps) |
 | Unparser: a sort key that reads a projection output that cannot be repeated, through a larger expression, puts the projection in a derived table so the `ORDER BY` reads the output by name (spiceai/datafusion#247) | `ORDER BY (r + 1.0)` over `random() AS r` is emitted as `ORDER BY (random() + 1.0)`, a second draw: the rows are ordered by a value the `SELECT` list never showed, and under a `LIMIT` a different row is selected than the one whose `r` comes back ([#14109](https://github.com/spiceai/spiceai/issues/14109)) | silent (wrong data) | **GAP** — no guard here yet; in the fork, the cases #247 adds to `plan_to_sql.rs`; see [Open gaps](#open-gaps) |
 | Unparser: a join input that lists no columns of its own, such as a bare or filtered table scan, contributes `q.*` for each relation it reads; a column-less input contributes nothing beside another relation; an aggregate no projection takes lists its group keys before its aggregates (spiceai/datafusion#264) | The join's `SELECT` list no longer matches the plan's schema: `SELECT FROM t WHERE EXISTS (…)`, which `DuckDB` rejects, and `SELECT u.a, (u.a * 2) AS d FROM t INNER JOIN u …`, which returns two columns where the plan has three, so a consumer reading by position gets one input's columns under another's names ([#14738](https://github.com/spiceai/spiceai/issues/14738)) | silent (wrong data / query failure) | **GAP** — no guard here yet; in the fork, the join-input cases #264 adds to `plan_to_sql.rs`; see [Open gaps](#open-gaps) |
+| Unparser: nested IS and NOT predicates parenthesize their operands (#15538) | `(NOT x) IS NULL` selects different rows when emitted as `NOT x IS NULL`; MySQL rejects chained IS predicates; ClickHouse gives `NOT (x IS NULL) IS NULL` a different meaning from `NOT ((x IS NULL) IS NULL)` | silent (wrong data / query failure) | `crates/data_components/src/federation.rs::tests::is_predicate_unparsing_preserves_boolean_partitions`; real-engine guards: `test/spicescript/sql-predicate-precedence.yaml` and `test/spicescript/tlp.yaml`. In the fork, `test_unparser_preserves_is_predicate_operands` |
+| Unparser: a projection reading no aggregate outputs keeps the aggregation in a derived table (#15538) | A pruned global aggregate returns its input's rows instead of one row, and a pruned grouped aggregate loses its groups | silent (wrong data) | `test/spicescript/unparse-pruned-aggregate.yaml`, including empty inputs, nested aggregates, `HAVING`, and `QUALIFY`; in the fork, `test_unparser_preserves_pruned_aggregate_rows` |
+| Unparser: aggregate scopes retain correlated subquery bindings and require uniquely addressable grouping outputs (fork PR #270) | Correlated projections lose their FROM binding; grouping sets hit internal grouping-id errors; qualified duplicate grouping names collide | query failure | `test/spicescript/unparse-aggregate-scopes.yaml`; fork `test_unparser_preserves_aggregate_projection_scope_guards` |
+| Unparser: scan filters apply before scan projection (#15538) | The SQL for a filtered INTERSECT or EXCEPT reads `right.id` outside a derived table that projects only the compared columns | silent (query failure) | `test/spicescript/unparse-set-operations.yaml`; in the fork, `test_unparser_preserves_filtered_set_operation_scope` |
+| MySQL dialect: Spark's `length` renders as `character_length` for strings and `length` for binary values (#15538) | Non-ASCII strings return byte counts, so `char_length('naïve')` returns 6 instead of 5 and filters select different rows | silent (wrong data) | `test/spicescript/mysql-string-length.yaml` checks Unicode, aliases, NULL, binary bytes, and the pushed SQL; in the fork, `test_unparser_preserves_mysql_length_units` |
 | Unparser: empty `Projection` emits `SELECT 1` | A projection with no expressions unparses to `SELECT FROM …`, which is not valid SQL, so the federated query fails outright | silent (query failure) | `…::an_empty_projection_does_not_unparse_to_an_empty_select_list` |
 | Unparser: `AT TIME ZONE` faithfully unparsed (fork PR #160), and suppressed for fixed-offset timezones on DuckDB (fork PR #195) | The timezone is dropped from the SQL, so the remote engine evaluates the expression in its own session timezone | silent (wrong data) | `…::a_timezone_survives_unparsing_except_where_the_engine_cannot_resolve_it` |
 | BigQuery dialect: `FLOAT64` not `DOUBLE`, timestamp literal format, `date_field_extract_style` / `interval_style` overrides, `date_trunc` support, no column alias inside a table alias (fork PRs #144, #146, #147, #148, #169). The #144 override is no longer on the branch — the upstream `Dialect` default now renders an accepted format, which the guard pins either way | Federated BigQuery queries are rejected by BigQuery, or silently coerce types. Losing the `date_trunc` week mapping is quieter still: DataFusion truncates a week to Monday and BigQuery's bare `WEEK` is Sunday-based, so the week starts on the wrong day — one day out for a Monday-to-Saturday timestamp, six for a Sunday one — and the query returns wrong rows with no error | silent (wrong data / query failure) | `…::bigquery_names_the_float_type_the_way_bigquery_does`, `…::bigquery_attaches_a_timestamp_offset_to_the_time`, `…::bigquery_extracts_date_fields_and_spells_intervals_the_standard_way`, `…::bigquery_inlines_a_derived_tables_column_aliases`, `…::bigquery_truncates_a_timestamp_the_way_bigquery_does` |
@@ -345,7 +354,8 @@ below was re-confirmed present at the pinned revision. Upstream deprecates
 merged cleanly and are kept. The pin lives in the object-store Parquet reader
 (`parquet/src/arrow/async_reader/store.rs`), in the push-decoder short-read
 path (`parquet/src/util/push_buffers.rs` and its callers), in the page decoder
-(`parquet/src/file/serialized_reader.rs`), in the Thrift metadata decoder
+(`parquet/src/file/serialized_reader.rs`), in the footer schema conversion
+(`parquet/src/schema/types.rs`), in the Thrift metadata decoder
 (`parquet/src/parquet_thrift.rs`,
 `parquet/src/file/metadata/thrift/mod.rs`,
 `parquet/src/file/page_index/offset_index.rs`), in
@@ -364,6 +374,7 @@ path (`parquet/src/util/push_buffers.rs` and its callers), in the page decoder
 | `Decimal` → floating-point cast rounds from the exact decimal digits instead of widening the coefficient to `f64` and dividing by `10^scale` ([spiceai/arrow-rs#26](https://github.com/spiceai/arrow-rs/pull/26)) | A coefficient past 2^53 loses precision before the divide, so a decimal read back as a float is off in the low digits. Measured: a pushed-down Postgres `avg` read as `Decimal128(38, 20)` returned `47.50000000000001` instead of `47.5` ([#13978](https://github.com/spiceai/spiceai/issues/13978)) | silent (wrong data) | `crates/arrow_tools/src/record_batch.rs::test::decimal_to_float_cast_is_correctly_rounded` |
 | `FlightSqlServiceClient::do_get_flight_data` — a `DoGet` that returns the raw `FlightData` stream with the client's headers and bearer token applied, as `do_get` applies them | The Flight SQL connector can no longer replace a schema message before arrow decodes it. A server that declares a `MAP`'s `entries` field nullable (which arrow 59 refuses at decode) fails every read of that table with `The nullable should be set to false for the map entries field`, naming no column. Going through `inner_mut()` instead would drop the `traceparent` and bearer token, which are private to the client | build (the method) | `crates/data_components/src/flightsql.rs::tests::query_to_stream_corrects_a_servers_nullable_map_entries_declaration` |
 | Thrift list lengths in Parquet metadata are bounded by the bytes left in the input: `list_capacity` refuses a declared count the remaining bytes cannot encode, and caps the reservation where the input length is unknown ([spiceai/arrow-rs#32](https://github.com/spiceai/arrow-rs/pull/32)) | Every footer list (`schema`, `row_groups`, `key_value_metadata`, `column_orders`) and the offset index's `page_locations` decodes into a `Vec` sized from the element count in its Thrift list header. A file of a few bytes can declare `i32::MAX` elements, so the reader reserves room for all of them before reading one — during schema inference at dataset initialization, and again on every refresh of that dataset | not silent (memory exhaustion takes the runtime down) | `crates/data-connector-api/src/listing/connector.rs::an_oversized_footer_list_length_is_a_parquet_error_and_not_an_allocation` |
+| `schema_from_array_helper` refuses a footer schema nested more than 100 levels below its root ([spiceai/arrow-rs#33](https://github.com/spiceai/arrow-rs/pull/33)) | The footer's flat schema element list is rebuilt into a tree by recursing once per nesting level, with no bound. A Parquet file of a few KiB that declares a few hundred nested levels overflows the stack during schema inference at dataset initialization, and again on every refresh of that dataset | not silent (stack overflow aborts the runtime) | `crates/data-connector-api/src/listing/connector.rs::a_footer_schema_nested_past_the_depth_limit_is_a_parquet_error` |
 
 ## datafusion-ballista
 
@@ -665,6 +676,7 @@ branch `spiceai-0.9` cut from upstream `v0.9.0`.
 |---|---|---|---|
 | Metadata streams (file footer, file metadata, stripe footers, row indexes, bloom filters) fail once decoded output exceeds both 64 MiB and 100 times the encoded size; column data streams stay unbounded | A small ORC file with a highly compressible footer makes the runtime allocate until it runs out of memory | silent (memory) | `crates/dataformat-orc/src/file_format.rs::infer_schema_rejects_high_ratio_compressed_footer` |
 | Each codec stops decoding at the remaining allowance, with LZO decoded through `lzo` into a bounded buffer instead of `lzokay-native` | One compressed chunk is decoded in full before the bound rejects it, so a single chunk can still allocate up to its own expansion | silent (memory) | **GAP** — the bound above still rejects the stream after the chunk decodes, so only a memory measurement can tell the two apart |
+| The footer type tree is refused past 100 levels below the root, or when it uses one footer type more than once (`DataType::from_proto`) | A small ORC footer whose subtype indices nest very deep, point back at an ancestor or share a child makes schema building recurse until the stack overflows or build a tree far larger than the file | silent (crash / memory) | `crates/dataformat-orc/src/file_format.rs::infer_schema_bounds_the_footer_type_tree` |
 
 ## text-splitter
 
@@ -727,8 +739,10 @@ rather than by taking them. A re-cut cannot lose what the fork does not carry.
 ## llama.cpp
 
 Upstream [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). The fork carries
-upstream releases with one source patch: each `spiceai-<release>` branch is the upstream
-release tag plus the Spice commits, and the pin is its tagged tip, `<release>-spiceai.<n>`.
+upstream releases with the Spice patches below: each `spiceai-<release>` branch is the upstream
+release tag plus the Spice commits, and the pin is its tagged tip, `<release>-spiceai.<n>`,
+or a merge commit on it that no tag names yet: today the merge of spiceai/llama.cpp#8, the
+last of #7, #9, #11, #12 and #8 to land on `spiceai-b11803`.
 `crates/llama-cpp` builds the sources
 with CMake and binds the part of the C API Spice's GGUF engine uses. To move to a new
 release, follow `spiceai/README.md` in the fork.
@@ -736,6 +750,11 @@ release, follow `spiceai/README.md` in the fork.
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | Cargo packaging: a root `Cargo.toml` and `spiceai/` make the release the `llama-cpp-src` git dependency, whose build script reports the source directory and release | Cargo cannot fetch the sources, and `crates/llama-cpp`'s build script has no `DEP_LLAMA_CPP_SRC_ROOT` | build | compile-guarded by `crates/llama-cpp` |
+| Tensor split across nodes over RPC: the head drives every rank's GPU as a device, a full mesh of direct links all-reduces each split layer for any rank count, and each rank pair moves to the fastest link it shares; the mesh's setup is bounded by a deadline, and a link that fails or shuts down ends the mesh instead of hanging a rank or raising `SIGPIPE` (spiceai/llama.cpp#8) | A model split across nodes fails to load, or all-reduces through the head over copies, several times slower; a rank whose link drops hangs or takes `spiced` down | build (and silent perf, crash) | `distributed::a_model_split_across_two_ranks_answers_as_on_one` (`crates/llms-llamacpp/tests/distributed.rs`): Qwen3-0.6B split across two local ranks answers as on one |
+| `glm5-next` (GLM-5.3) and gated-delta-net state tensors split along the axis that keeps each state whole (spiceai/llama.cpp#8) | GLM-5.3 and Qwen3.8 fail to load split across nodes, or split a recurrent state mid-row | build / crash | **GAP** — no small `glm5-next` or Qwen3.8 GGUF to split here; the fork's `test-llama-archs --rpc` covers them; see [Open gaps](#open-gaps) |
+| Opt-in decode and prompt levers for a split model: graph slots, backend sampling, sampler reuse, RPC read pipelining and async reads, deferred and stream-queued all-reduce, prompt-sized KV padding (`LLAMA_KV_PROMPT_PAD`) and a BF16 NCCL all-reduce wire (`GGML_NCCL_WIRE_BF16`) (spiceai/llama.cpp#7, #8, #12) | Each is off unless its environment variable is set, so losing one only loses its speed | silent (perf) | **GAP** — perf-only rows; see [Open gaps](#open-gaps) |
+| The meta backend's graph-slot state and its device and buffer-type registries take locks, and a freed compute buffer drops the graph split parked under it (spiceai/llama.cpp#9; the same PR's backend-sampling fix is in `llama-server`, which Spice does not run) | Two models split across nodes that load or compute on threads of their own, as each of Spice's models does, race on the registries; with graph slots on, every recreated scheduler leaves a parked split behind | crash (race) / silent (memory) | **GAP** — races, which the fork's `test-meta-graph-slots` catches under ThreadSanitizer; see [Open gaps](#open-gaps) |
+| CUDA `mul_mat_vec_q` guards its last block of rows by the rows of `dst`, so a one-token `MUL_MAT_ID` whose expert row count is not a multiple of the rows per block is computed once (spiceai/llama.cpp#11; the defect is upstream's) | On CUDA, decoding one token of such a mixture-of-experts model reads past an expert's rows and overwrites the next expert's first rows, racing that expert's own block, so its logits are wrong and differ from run to run. The models served from this fork have expert rows that are multiples of four and never reach it | silent (wrong data, CUDA only) | **GAP** — CUDA only; the fork's `test-backend-ops -o MUL_MAT_ID` case (`n_mats` 8, `n_used` 6, `m` 66, `n` 1, `k` 768) covers it; see [Open gaps](#open-gaps) |
 | A failed check while loading a model throws instead of aborting: libllama defines `GGML_ABORT_THROWS`, under which `GGML_ABORT` throws a `std::runtime_error` inside the `llama_abort_throws_scope` that `llama_model_load` opens in the try block that catches it, and aborts as upstream everywhere else | Without the patch, a GGUF whose metadata fails a `GGML_ASSERT`, such as an unknown `<arch>.classifier.activation`, aborts `spiced` at load instead of failing that model. Without its scope, a failed check outside a load throws out of a C API function that catches nothing, into Rust | crash | `an_unknown_classifier_activation_fails_the_load_instead_of_aborting` and `a_corrupted_gguf_fails_its_load_without_taking_the_process_down` (`crates/llama-cpp/tests`) for the load, and `sampler::tests::a_failed_check_outside_a_model_load_aborts_instead_of_throwing` (`crates/llama-cpp/src/sampler.rs`) for everywhere else |
 
 ## candle and its kernel crates
@@ -806,7 +825,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**41 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**45 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -823,7 +842,10 @@ They are not equal in consequence; this is the order to close them in.
    scalar subquery from its parent; the fork observed the failure via TPC-H, not
    a minimal repro built here.
 2. `text-embeddings-inference` pooling and model-loading fixes — embeddings
-   differ from the reference implementation.
+   differ from the reference implementation. `llama.cpp`'s CUDA `mul_mat_vec_q`
+   tail guard (spiceai/llama.cpp#11) is the same kind of loss: a GGUF model's
+   logits differ from a correct kernel's. A guard needs a CUDA runner and a
+   mixture-of-experts GGUF whose expert rows are not a multiple of four.
 3. `datafusion` fixes the pin to spiceai/datafusion#273 carries ahead of their
    guards, four rows. #262 (a decimal cast that drops digits) has its guard in
    [#15207](https://github.com/spiceai/spiceai/pull/15207), which replaces its
@@ -867,7 +889,12 @@ They are not equal in consequence; this is the order to close them in.
    request queue in a `distributed` build — three rows. Each fails loudly (a load
    error, an HTTP 500, or a hang), never with wrong text. A guard needs a GGUF of
    each architecture small enough for CI; today's evidence is those models served
-   on the 3-node DGX Spark cluster.
+   on the 3-node DGX Spark cluster. The same holds for `llama.cpp`'s `glm5-next`
+   and gated-delta-net state split across nodes (spiceai/llama.cpp#8): a load
+   error if lost, guarded in the fork by `test-llama-archs --rpc`; and for its
+   meta-backend locks (spiceai/llama.cpp#9), races that the fork's
+   `test-meta-graph-slots` catches under ThreadSanitizer, which a test here would
+   need two split models on one host to reach.
 9. `orc-rust` in-codec decode allowance — losing it lets one compressed metadata
    chunk decode in full before the stream is rejected. A guard needs a memory
    measurement around one ORC open; the rejection itself is guarded.
@@ -909,6 +936,8 @@ without becoming a flaky timing test:
     `mistral.rs`/`candle` i-quant MoE kernels; `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `mistral.rs` `deepseek41` and `glm5-next` decode kernels (spiceai/mistral.rs#49), which
     no suite here trends yet — their evidence is the DGX Spark decode A/B in that PR;
+    `llama.cpp`'s opt-in decode and prompt levers for a model split across nodes
+    (spiceai/llama.cpp#7, #8, #12), measured on the same cluster;
     `snowflake-rs` streaming batches (memory, not latency — but see the
     `snowflake-rs` note above: it is blocked with the rest of that fork);
     `async-openai` retry-after handling; `datafusion`'s `IoWaitHook` carry through
