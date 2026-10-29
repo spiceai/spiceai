@@ -5,7 +5,8 @@ description: |
   the job on a shared self-hosted host: PostgreSQL from install-postgres with
   isolated: 'true' (CI_PG_DIR), and servers that record a pid file and directory
   in CI_MYSQL_PID / CI_MYSQL_DIR and CI_CLICKHOUSE_PID / CI_CLICKHOUSE_DIR.
-  Does nothing for a service the job did not start that way.
+  Does nothing for a service the job did not start that way. Then frees the
+  job's port reservations from allocate-service-ports.
 runs:
   using: 'composite'
   steps:
@@ -38,3 +39,7 @@ runs:
         }
         stop "${CI_MYSQL_PID:-}" "${CI_MYSQL_DIR:-}"
         stop "${CI_CLICKHOUSE_PID:-}" "${CI_CLICKHOUSE_DIR:-}"
+
+    - name: Release service port reservations
+      shell: bash
+      run: bash "${GITHUB_ACTION_PATH}/../allocate-service-ports/release_ports.sh"

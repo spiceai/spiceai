@@ -15,6 +15,15 @@
 # ClickHouse's packaged config.xml listens on all five of those, so a second
 # server that only moves the native port still fails to bind 8123, 9004, 9005,
 # or 9009.
+#
+# Each port handed out is reserved with an atomic `mkdir` under LOCK_DIR, which
+# every instance on the machine shares. A listener probe alone is not enough:
+# two instances whose seeds land on the same offset both see the port free
+# while their databases are still installing, and both bind it — and both own
+# the data directory named after it. A reservation already held by this runner
+# instance is a leftover from an earlier job, since an instance runs one job at
+# a time, so it is taken over; so is one older than STALE_MINUTES.
+# release_ports.sh (from stop-services) frees this job's reservations.
 
 set -uo pipefail
 
@@ -27,6 +36,10 @@ CLICKHOUSE_PG_BASE="${CI_CLICKHOUSE_PG_PORT_BASE:-15000}"
 CLICKHOUSE_INTERSERVER_BASE="${CI_CLICKHOUSE_INTERSERVER_PORT_BASE:-16000}"
 SPAN="${CI_SERVICE_PORT_SPAN:-1000}"
 MAX_PROBE="${CI_SERVICE_PORT_MAX_PROBE:-25}"
+LOCK_DIR="${CI_SERVICE_PORT_LOCK_DIR:-/tmp/spice-ci-service-ports}"
+STALE_MINUTES="${CI_SERVICE_PORT_STALE_MINUTES:-1440}"
+owner="${RUNNER_NAME:-pid-$$}"
+mkdir -p "${LOCK_DIR}"
 
 seed_source="${RUNNER_NAME:-}|${GITHUB_RUN_ID:-}|${GITHUB_JOB:-}|${GITHUB_RUN_ATTEMPT:-}"
 
@@ -47,6 +60,18 @@ port_in_use() {
   return 1
 }
 
+reserve_port() {
+  local lock="${LOCK_DIR}/$1"
+  if ! mkdir "${lock}" 2>/dev/null; then
+    if [ "$(cat "${lock}/owner" 2>/dev/null)" != "${owner}" ] &&
+      [ -z "$(find "${lock}" -maxdepth 0 -mmin +"${STALE_MINUTES}" 2>/dev/null)" ]; then
+      return 1
+    fi
+    touch "${lock}"
+  fi
+  printf '%s\n' "${owner}" >"${lock}/owner"
+}
+
 pick_port() {
   local base="$1"
   local offset="$2"
@@ -54,7 +79,7 @@ pick_port() {
   local port
   while :; do
     port=$((base + (offset + probe) % SPAN))
-    if ! port_in_use "${port}"; then
+    if ! port_in_use "${port}" && reserve_port "${port}"; then
       printf '%s' "${port}"
       return 0
     fi
@@ -89,7 +114,8 @@ CI_CLICKHOUSE_PORT=${clickhouse_port}
 CI_CLICKHOUSE_HTTP_PORT=${clickhouse_http_port}
 CI_CLICKHOUSE_MYSQL_PORT=${clickhouse_mysql_port}
 CI_CLICKHOUSE_PG_PORT=${clickhouse_pg_port}
-CI_CLICKHOUSE_INTERSERVER_PORT=${clickhouse_interserver_port}"
+CI_CLICKHOUSE_INTERSERVER_PORT=${clickhouse_interserver_port}
+CI_SERVICE_PORT_LOCKS=${pg_port} ${mysql_port} ${clickhouse_port} ${clickhouse_http_port} ${clickhouse_mysql_port} ${clickhouse_pg_port} ${clickhouse_interserver_port}"
 printf '%s\n' "${assignments}"
 if [ -n "${GITHUB_ENV:-}" ]; then
   printf '%s\n' "${assignments}" >>"${GITHUB_ENV}"

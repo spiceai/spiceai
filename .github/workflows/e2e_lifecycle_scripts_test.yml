@@ -15,11 +15,13 @@ on:
       - release/*
       - feature-*
     paths:
+      - '.github/actions/allocate-service-ports/**'
       - '.github/actions/allocate-spice-ports/**'
       - '.github/actions/check-spice-log/**'
       - '.github/actions/stop-spice/**'
       - '.github/actions/wait-for-spice-ready/**'
       - 'scripts/test_e2e_spice_lifecycle.sh'
+      - 'scripts/test_e2e_service_ports.sh'
       - 'scripts/test_e2e_spice_ports.sh'
       - 'test/models/**'
       - '.github/workflows/e2e_lifecycle_scripts_test.yml'
@@ -27,11 +29,13 @@ on:
     branches:
       - trunk
     paths:
+      - '.github/actions/allocate-service-ports/**'
       - '.github/actions/allocate-spice-ports/**'
       - '.github/actions/check-spice-log/**'
       - '.github/actions/stop-spice/**'
       - '.github/actions/wait-for-spice-ready/**'
       - 'scripts/test_e2e_spice_lifecycle.sh'
+      - 'scripts/test_e2e_service_ports.sh'
       - 'scripts/test_e2e_spice_ports.sh'
       - 'test/models/**'
       - '.github/workflows/e2e_lifecycle_scripts_test.yml'
@@ -73,6 +77,9 @@ jobs:
 
       - name: Run port allocation tests
         run: bash scripts/test_e2e_spice_ports.sh
+
+      - name: Run service port allocation tests
+        run: bash scripts/test_e2e_service_ports.sh
 
       # The REPL scripts and their tests only ran inside the model E2E jobs,
       # which are skipped on pull requests — so a change to them reached the
