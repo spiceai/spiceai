@@ -1,5 +1,3 @@
-    Finished `release` profile [optimized] target(s) in 0.70s
-     Running `target/release/cayenne-metastore-model run source-ack-before-acceptance`
 START source-ack-before-acceptance
 CONFIG source-ack-before-acceptance mode=EXHAUSTIVE bound=2 seed=0 states=1136117 unique_or_sampled_visits=300278 depth=29
 PROPERTY HOLDS at most one live row per source key
@@ -28,4 +26,22 @@ MINIMIZED enabled=true steps=14 [Receive, Issue, Unknown, Takeover, Receive, Iss
 PROPERTY REACHED source grouped two changes
 TRACE_INITIAL index=Some(0)
 MINIMIZED enabled=true steps=11 [Receive, Issue, Takeover, Receive, Issue, Crash, Acquire, Receive, Receive, Issue, Deliver(2, 0)]
-RESULT source-ack-before-acceptance expected=I2 source acknowledgement covered matched=true seconds=0.614
+RESULT source-ack-before-acceptance expected=I2 source acknowledgement covered matched=true seconds=0.555
+        0.55 real         0.54 user         0.00 sys
+            94797824  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                6120  page reclaims
+                   4  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+                  69  involuntary context switches
+         12437640399  instructions retired
+          2458876062  cycles elapsed
+            76300768  peak memory footprint

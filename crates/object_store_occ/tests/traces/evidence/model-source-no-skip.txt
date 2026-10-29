@@ -1,5 +1,3 @@
-    Finished `release` profile [optimized] target(s) in 0.43s
-     Running `target/release/cayenne-metastore-model run source-no-redelivery-skip`
 START source-no-redelivery-skip
 CONFIG source-no-redelivery-skip mode=EXHAUSTIVE bound=2 seed=0 states=445129 unique_or_sampled_visits=140950 depth=31
 PROPERTY FAIL at most one live row per source key
@@ -26,4 +24,22 @@ MINIMIZED enabled=true steps=11 [Receive, Issue, Unknown, Takeover, Receive, Iss
 PROPERTY REACHED source grouped two changes
 TRACE_INITIAL index=Some(0)
 MINIMIZED enabled=true steps=7 [Receive, Issue, Takeover, Receive, Receive, Issue, Deliver(1, 0)]
-RESULT source-no-redelivery-skip expected=I10 source append prefix exactly once matched=true seconds=0.265
+RESULT source-no-redelivery-skip expected=I10 source append prefix exactly once matched=true seconds=0.244
+        0.24 real         0.24 user         0.00 sys
+            46120960  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                3154  page reclaims
+                   1  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+                  36  involuntary context switches
+          5498919629  instructions retired
+          1077471433  cycles elapsed
+            42844616  peak memory footprint

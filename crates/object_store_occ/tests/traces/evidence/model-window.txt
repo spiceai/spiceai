@@ -1,10 +1,8 @@
-    Finished `release` profile [optimized] target(s) in 0.72s
-     Running `target/release/cayenne-metastore-model run window-storage-6-exhaust`
 START window-storage-6-exhaust
-CONFIG window-storage-6-exhaust mode=EXHAUSTIVE bound=6 seed=0 states=133232 unique_or_sampled_visits=76014 depth=25
+CONFIG window-storage-6-exhaust mode=EXHAUSTIVE bound=6 seed=0 states=27155 unique_or_sampled_visits=16841 depth=23
 PROPERTY HOLDS I4 reader inline payload replay equality
 PROPERTY HOLDS I8 recovery replay equality including payload bytes
-PROPERTY HOLDS I7 pinned snapshot equals serial
+PROPERTY HOLDS I7 query snapshot equals serial
 PROPERTY REACHED byte and count cuts
 TRACE_INITIAL index=Some(0)
 MINIMIZED enabled=true steps=10 [Append(0), Append(0), Append(0), Observe, Create(0), Append(1), Append(1), Observe, Create(1), Append(1)]
@@ -13,6 +11,25 @@ TRACE_INITIAL index=Some(0)
 MINIMIZED enabled=true steps=10 [Append(0), Append(0), Append(0), Observe, Create(0), Append(1), Append(1), Observe, Create(1), Append(1)]
 PROPERTY REACHED delayed seal after GC
 TRACE_INITIAL index=Some(0)
-MINIMIZED enabled=true steps=8 [Append(0), Append(0), Append(0), Observe, Create(0), Checkpoint, Gc, Create(0)]
+MINIMIZED enabled=true steps=10 [Append(0), Append(0), Append(0), Observe, Create(0), Append(0), Checkpoint(3), Append(0), Gc, Create(0)]
 PROPERTY NOT_REACHED conflicting seal bytes
-RESULT window-storage-6-exhaust expected=holds matched=true seconds=0.209
+RESULT window-storage-6-exhaust expected=holds matched=true seconds=0.049
+        0.05 real         0.04 user         0.00 sys
+             4915200  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                 631  page reclaims
+                   8  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+                  22  involuntary context switches
+          1150517435  instructions retired
+           227929547  cycles elapsed
+             2933144  peak memory footprint
+WALKS window-storage-6-exhaust seed=42 count=20 max_steps=40 good=true

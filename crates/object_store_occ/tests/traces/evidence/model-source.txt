@@ -1,5 +1,3 @@
-    Finished `release` profile [optimized] target(s) in 0.73s
-     Running `target/release/cayenne-metastore-model run source-positions`
 START source-positions
 CONFIG source-positions mode=EXHAUSTIVE bound=2 seed=0 states=206617 unique_or_sampled_visits=63798 depth=31
 PROPERTY HOLDS at most one live row per source key
@@ -16,4 +14,23 @@ MINIMIZED enabled=true steps=4 [Receive, Issue, Unknown, Deliver(0, 0)]
 PROPERTY REACHED source grouped two changes
 TRACE_INITIAL index=Some(0)
 MINIMIZED enabled=true steps=4 [Receive, Receive, Issue, Deliver(0, 0)]
-RESULT source-positions expected=holds matched=true seconds=0.088
+RESULT source-positions expected=holds matched=true seconds=0.081
+        0.08 real         0.08 user         0.00 sys
+             6881280  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                 740  page reclaims
+                  17  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+                  24  involuntary context switches
+          1872034786  instructions retired
+           363217412  cycles elapsed
+             4817304  peak memory footprint
+WALKS source-positions seed=42 count=20 max_steps=40 good=true

@@ -89,7 +89,6 @@ struct Replay {
     store: Arc<FaultStore>,
     config: HeadLogConfig,
     staged_writer: Option<Writer>,
-    checkpoint_gap: bool,
     strict_window: bool,
     reader: Reader,
     incremental: Vec<Bytes>,
@@ -153,7 +152,6 @@ impl Replay {
             store,
             config,
             staged_writer: None,
-            checkpoint_gap: false,
             strict_window: true,
             reader,
             incremental: vec![],
@@ -751,10 +749,8 @@ impl Replay {
                     Err(error) => {
                         // A control trace may request an unsafe append. The real
                         // writer refuses it; no publication is invented.
-                        require(!self.strict_window || self.checkpoint_gap, || {
-                            format!(
-                                "positive model append refused before any unsupported checkpoint: {error}"
-                            )
+                        require(!self.strict_window, || {
+                            format!("positive model append refused: {error}")
                         })?;
                         require(
                             error.contains("storage")
@@ -776,29 +772,23 @@ impl Replay {
                 }
             }
             "Checkpoint" => {
-                let (_, lease) = self.serial()?;
-                let mut writer = self.writer(lease).await?;
-                let head = &writer.state().head;
-                if let Some(&boundary) = head.batches.last() {
-                    let serial = self.serial()?.0;
-                    let root = Bytes::from(result(serde_json::to_vec(
-                        &serial[..usize::try_from(boundary).expect("small boundary")],
-                    ))?);
-                    result(writer.publish_checkpoint(boundary, root).await)?;
-                    self.staged_writer = Some(writer);
-                    self.checkpoint_gap = true;
-                    self.skip("Checkpoint partially mapped: published batch prefix staged; model publishes full window immediately");
-                } else {
-                    let at = head.commit;
-                    require(
-                        writer.publish_checkpoint(at, Bytes::new()).await.is_err(),
-                        || "checkpoint unexpectedly accepted inline boundary".into(),
-                    )?;
-                    self.checkpoint_gap = true;
-                    self.skip("Checkpoint refused: no published batch boundary");
-                }
+                // The model writes the root at batch end `c` (commit `c`, since
+                // commits number from 1), and the next accepted commit publishes
+                // the floor; the staged writer carries it to that commit.
+                let c = u64::try_from(args[0]).expect("small boundary");
+                let (serial, lease) = self.serial()?;
+                let mut writer = match self.staged_writer.take() {
+                    Some(writer) => writer,
+                    None => self.writer(lease).await?,
+                };
+                let root = Bytes::from(result(serde_json::to_vec(
+                    &serial[..usize::try_from(c).expect("small boundary")],
+                ))?);
+                result(writer.publish_checkpoint(c, root).await)
+                    .map_err(|e| format!("model checkpoint at {c} refused: {e}"))?;
+                self.staged_writer = Some(writer);
             }
-            "Gc" | "Pin" => self.skip(action),
+            "Gc" | "Query" => self.skip(action),
             other => return Err(format!("unmapped window action {other}")),
         }
         Ok(())
