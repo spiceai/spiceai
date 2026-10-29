@@ -17,6 +17,7 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::inferred_schema::InferredSchema;
+use data_components::mysql::pool::{self, PoolParams, PoolSettings, PoolSizeDefaults};
 use data_components::mysql_replication::{ReplicationMetrics, ReplicationMetricsCollector};
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -27,7 +28,7 @@ use datafusion::sql::sqlparser::dialect::MySqlDialect;
 use datafusion_table_providers::mysql::MySQLTableFactory;
 use datafusion_table_providers::sql::arrow_sql_gen::mysql::MysqlZeroDateBehavior;
 use datafusion_table_providers::sql::db_connection_pool::{
-    Error as DbConnectionPoolError, dbconnection,
+    dbconnection,
     mysqlpool::{self, MySQLConnectionPool},
 };
 use mysql_async::{Metrics, prelude::Queryable};
@@ -37,7 +38,7 @@ use runtime_component::dataset::DatasetSpec;
 use runtime_datafusion::function_support::deny_spice_functions_for_mysql_table_providers;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ParameterSpec, Parameters};
-use secrecy::{ExposeSecret, SecretBox};
+use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -47,21 +48,11 @@ use std::sync::{Arc, LazyLock};
 
 pub mod replication;
 
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Unable to create MySQL connection pool: {source}"))]
-    UnableToCreateMySQLConnectionPool { source: DbConnectionPoolError },
-
-    #[snafu(display(
-        "Invalid connection pool configuration: pool_min ({pool_min}) cannot be greater than pool_max ({pool_max})"
-    ))]
-    InvalidConnectionPoolConfiguration { pool_min: usize, pool_max: usize },
-}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-const DEFAULT_CONNECTION_POOL_MIN: usize = 1;
-const DEFAULT_CONNECTION_POOL_MAX: usize = 5;
+const DEFAULT_POOL_SIZE: PoolSizeDefaults = PoolSizeDefaults { min: 1, max: 5 };
+/// `refresh_mode: changes` datasets use the pool only for schema probes at initialization;
+/// replication runs over its own dedicated connections. Unless the user sized the pool, it
+/// holds no idle connection, which matters at N CDC datasets per source database.
+const CHANGES_MODE_POOL_SIZE: PoolSizeDefaults = PoolSizeDefaults { min: 0, max: 2 };
 
 pub struct MySQL {
     mysql_factory: MySQLTableFactory,
@@ -97,7 +88,11 @@ const MYSQL_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/my
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")
-        .description("Full MySQL DSN. Overrides other connection params if set.")
+        .description(
+            "Full MySQL DSN. Overrides `host`, `tcp_port`, `user`, `pass` and `db` if set. \
+             Its `pool_min`, `pool_max` and `abs_conn_ttl` query settings are used unless the \
+             matching Spicepod parameter is set; setting both to different values is an error.",
+        )
         .examples(&["mysql://app:secret@db.internal:3306/analytics"])
         .help_link(MYSQL_DOCS)
         .secret(),
@@ -136,6 +131,10 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("pool_max")
         .description("The maximum number of connections created in the connection pool.")
         .default("5")
+        .help_link(MYSQL_DOCS),
+    ParameterSpec::component("connection_max_lifetime")
+        .description(pool::CONNECTION_MAX_LIFETIME_DESCRIPTION)
+        .default("5m")
         .help_link(MYSQL_DOCS),
     ParameterSpec::component("time_zone")
         .description("The time zone to use for the connection. Default is '+00:00' (UTC).")
@@ -219,43 +218,6 @@ impl DataConnectorFactory for MySQLFactory {
         _context: &'a dyn ConnectorContext,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
-            let pool_min = params
-                .parameters
-                .get("pool_min")
-                .ok()
-                .and_then(|s| {
-                    let pool_min_str = s.expose_secret();
-                    let parsed_pool_min = pool_min_str.parse::<usize>();
-                    if parsed_pool_min.is_err() {
-                        tracing::warn!(
-                            "Invalid pool_min value: {pool_min_str}, using default of {DEFAULT_CONNECTION_POOL_MIN}"
-                        );
-                    }
-                    parsed_pool_min.ok()
-                })
-                .unwrap_or(DEFAULT_CONNECTION_POOL_MIN);
-            let pool_max = params
-                .parameters
-                .get("pool_max")
-                .ok()
-                .and_then(|s| {
-                    let pool_max_str = s.expose_secret();
-                    let parsed_pool_max = pool_max_str.parse::<usize>();
-                    if parsed_pool_max.is_err() {
-                        tracing::warn!(
-                            "Invalid pool_max value: {pool_max_str}, using default of {DEFAULT_CONNECTION_POOL_MAX}"
-                        );
-                    }
-                    parsed_pool_max.ok()
-                })
-                .unwrap_or(DEFAULT_CONNECTION_POOL_MAX);
-
-            if pool_min > pool_max {
-                return Err(
-                    Error::InvalidConnectionPoolConfiguration { pool_min, pool_max }.into(),
-                );
-            }
-
             let zero_date_behavior = match params
                 .parameters
                 .get("zero_date_behavior")
@@ -290,38 +252,20 @@ impl DataConnectorFactory for MySQLFactory {
 
             let params_for_replication = params.parameters.clone();
 
-            let mut param_map = params.parameters.to_secret_map();
-
-            // `refresh_mode: changes` datasets use this pool only for schema
-            // probes at initialization — replication runs over its own
-            // dedicated connections. Unless the user sized the pool
-            // explicitly, keep it minimal: no idle connections held for the
-            // lifetime of the dataset, and a small max. This matters at N
-            // CDC datasets per source database. (Same policy as the Postgres
-            // connector.)
-            if let ConnectorComponent::Dataset(dataset) = &params.component {
-                let is_changes_mode = dataset.acceleration.as_ref().is_some_and(|acceleration| {
-                    acceleration.refresh_mode
-                        == Some(runtime_component::dataset::acceleration::RefreshMode::Changes)
-                });
-                if is_changes_mode {
-                    // The injected spec defaults are indistinguishable from
-                    // user-set values here, so consult the raw spicepod
-                    // params for whether the user chose a size.
-                    let user_set = |key: &str| {
-                        dataset.params.contains_key(&format!("mysql_{key}"))
-                            || dataset.params.contains_key(key)
-                    };
-                    if !user_set("pool_min") {
-                        param_map.insert("pool_min".to_string(), SecretBox::from("0"));
-                    }
-                    if !user_set("pool_max") {
-                        param_map.insert("pool_max".to_string(), SecretBox::from("2"));
-                    }
+            let pool_settings = resolve_pool_settings(&params).map_err(|error| {
+                DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "mysql".to_string(),
+                    connector_component: params.component.clone(),
+                    message: error.to_string(),
                 }
-            }
+            })?;
+            let param_map = params.parameters.to_secret_map();
 
-            let pool = match MySQLConnectionPool::new(param_map).await {
+            let component = match &params.component {
+                ConnectorComponent::Dataset(dataset) => format!("dataset '{}'", dataset.name),
+                ConnectorComponent::Catalog(catalog) => format!("catalog '{}'", catalog.name),
+            };
+            let pool = match pool::connect(param_map, pool_settings, component).await {
                 Ok(pool) => Arc::new(pool.with_zero_date_behavior(zero_date_behavior)),
                 Err(error) => match error {
                     mysqlpool::Error::InvalidUsernameOrPassword => {
@@ -390,6 +334,30 @@ impl DataConnectorFactory for MySQLFactory {
     fn reserved_keywords(&self) -> &'static [&'static str] {
         RESERVED_KEYWORDS
     }
+}
+
+fn resolve_pool_settings(params: &ConnectorParams) -> pool::Result<PoolSettings> {
+    let is_changes_mode = matches!(
+        &params.component,
+        ConnectorComponent::Dataset(dataset) if dataset.acceleration.as_ref().is_some_and(|acceleration| {
+            acceleration.refresh_mode
+                == Some(runtime_component::dataset::acceleration::RefreshMode::Changes)
+        })
+    );
+
+    PoolSettings::resolve(
+        PoolParams {
+            pool_min: params.user_set("pool_min"),
+            pool_max: params.user_set("pool_max"),
+            connection_max_lifetime: params.user_set("connection_max_lifetime"),
+            connection_string: params.parameters.get("connection_string").expose().ok(),
+        },
+        Some(if is_changes_mode {
+            CHANGES_MODE_POOL_SIZE
+        } else {
+            DEFAULT_POOL_SIZE
+        }),
+    )
 }
 
 async fn mysql_comment_metadata(
