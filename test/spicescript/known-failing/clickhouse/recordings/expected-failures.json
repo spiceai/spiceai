@@ -89,6 +89,14 @@
     {
       "run": "clickhouse-federation[backend=clickhouse]",
       "who": "default",
+      "key": "query: SELECT id, char_length(s) FROM t WHERE char_length(s) > 4",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"char_length(t.s)\", row_number: 1, expected: \"\\\"5\\\"\", actual: \"\\\"6\\\"\" }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-federation[backend=clickhouse]",
+      "who": "default",
       "key": "query: SELECT id, EXTRACT(YEAR FROM dt), EXTRACT(MONTH FROM dt) FROM t WHERE id < 20",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (46): DB::Exception: Function with name 'date_part' does not exist. In scope SELECT t.id, date_part('YEAR', ",

@@ -32,6 +32,7 @@ mod generate;
 mod ledger;
 mod pki;
 mod reap;
+mod results;
 mod rqg;
 mod runner;
 mod script;
@@ -133,6 +134,24 @@ struct Cli {
     /// Scripts with none of them are skipped.
     #[arg(long = "variant", value_name = "NAME", value_parser = parse_variant_name)]
     variants: Vec<String>,
+
+    /// Write every script's outcome, passes included, to this JSON file,
+    /// rewritten as each script finishes.
+    #[arg(long, value_name = "PATH")]
+    results: Option<PathBuf>,
+
+    /// Leave the logs of each script with a failure, expected or not, in a
+    /// directory of its own under this one: the script and what the run
+    /// printed for it, each source container's output, and each instance's
+    /// `spiced.log` and spicepod, a directory per matrix combination.
+    #[arg(long = "log-capture", value_name = "DIR")]
+    log_capture: Option<PathBuf>,
+
+    /// The widest a value is drawn in a failure report's table, in
+    /// characters; a longer one keeps its start and end. 0 draws every value
+    /// whole.
+    #[arg(long = "cell-width", value_name = "CHARS", default_value_t = compare::DEFAULT_CELL_WIDTH)]
+    cell_width: usize,
 }
 
 #[tokio::main]
@@ -151,6 +170,7 @@ async fn run(cli: Cli) -> Result<bool> {
     // Retried comparisons would print every intermediate mismatch; the runner
     // reports the last one with both answers.
     result_compare::set_print_diagnostics(false);
+    compare::set_cell_width(cli.cell_width);
     let targets = targets(&cli.spiced)?;
     let mut paths = script_paths(&cli.scripts)?;
     // Parse everything first, so a typo in the last script fails before the
@@ -232,6 +252,11 @@ async fn run(cli: Cli) -> Result<bool> {
         keep: cli.keep,
         spice_cli: cli.spice,
         pki,
+        log_capture: cli
+            .log_capture
+            .as_deref()
+            .map(std::path::absolute)
+            .transpose()?,
     };
     let mut ledger = ledger::Ledger::load(&scripts)?;
     let mut passed = 0;
@@ -246,21 +271,42 @@ async fn run(cli: Cli) -> Result<bool> {
     // Longest first, by recorded duration (a script without one counts as
     // long): each asks for slots in this order, and slots are granted in the
     // order asked.
-    let mut order: Vec<&script::Script> = scripts.iter().collect();
-    order.sort_by_key(|s| std::cmp::Reverse(s.duration.unwrap_or(std::time::Duration::MAX)));
+    let mut order: Vec<(&PathBuf, &script::Script)> = paths.iter().zip(&scripts).collect();
+    order.sort_by_key(|(_, s)| std::cmp::Reverse(s.duration.unwrap_or(std::time::Duration::MAX)));
     let slots = runner::Slots::new(cli.jobs);
     let mut running = futures::stream::FuturesUnordered::new();
-    for script in order {
+    for (path, script) in order {
         let (options, slots) = (&options, &slots);
         running.push(async move {
             let started = std::time::Instant::now();
             let (report, out) = runner::run_script_buffered(script, options, slots).await;
-            (script, report, out, started.elapsed())
+            (path, script, report, out, started.elapsed())
         });
     }
-    while let Some((script, report, out, waited)) = futures::StreamExt::next(&mut running).await {
+    let mut results = results::Results {
+        partition: cli.partition.map(|(i, n)| format!("{i}/{n}")),
+        complete: false,
+        seconds: 0.0,
+        scripts: Vec::new(),
+    };
+    while let Some((path, script, report, out, waited)) =
+        futures::StreamExt::next(&mut running).await
+    {
         print!("{out}");
         let report = report?;
+        // A log that cannot be saved is a warning, as in the runner: the
+        // script's own outcome still counts, and the other scripts still run.
+        if let Some(root) = &options.log_capture
+            && !report.failures.is_empty()
+            && let Err(e) = capture_script(
+                &runner::capture_dir(root, script),
+                path,
+                &out,
+                &report.failures,
+            )
+        {
+            println!("warning: {e:#}");
+        }
         // The time it held slots, not the time it waited for them.
         let took = if report.ran.is_zero() {
             waited
@@ -268,15 +314,30 @@ async fn run(cli: Cli) -> Result<bool> {
             report.ran
         };
         done += 1;
-        let problems = if cli.record_failures {
+        let (problems, verdict): (Vec<String>, _) = if cli.record_failures {
             ledger.record(script, &report.failures);
-            report.failures.iter().map(ToString::to_string).collect()
+            (
+                report.failures.iter().map(ToString::to_string).collect(),
+                None,
+            )
         } else {
             let verdict = ledger.judge(script, &report.failures);
             expected += verdict.expected;
             notes.extend(verdict.notes.iter().cloned());
-            verdict.problems()
+            (verdict.problems(), Some(verdict))
         };
+        if let Some(file) = &cli.results {
+            results.scripts.push(results::ScriptResult::new(
+                script,
+                path,
+                &report,
+                took,
+                verdict.as_ref(),
+                &problems,
+            ));
+            results.seconds = run_started.elapsed().as_secs_f64();
+            results.write(file)?;
+        }
         let shown_expected = if cli.record_failures {
             0
         } else {
@@ -338,6 +399,12 @@ async fn run(cli: Cli) -> Result<bool> {
         }
         println!();
     }
+    if let Some(file) = &cli.results {
+        results.complete = true;
+        results.seconds = run_started.elapsed().as_secs_f64();
+        results.write(file)?;
+        println!("results: {}", file.display());
+    }
     println!(
         "{} scripts: {passed} checks passed, {} failed{}, in {:.1}s",
         scripts.len(),
@@ -346,6 +413,29 @@ async fn run(cli: Cli) -> Result<bool> {
         run_started.elapsed().as_secs_f64()
     );
     Ok(failures.is_empty() || cli.record_failures)
+}
+
+/// `--log-capture`'s files for a whole script, beside its combinations'
+/// logs: the script as run, and what the run printed for it, with each
+/// failure in full.
+fn capture_script(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    out: &str,
+    failures: &[runner::Failure],
+) -> Result<()> {
+    use std::fmt::Write as _;
+    std::fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
+    std::fs::copy(path, dir.join("script.yaml"))
+        .with_context(|| format!("Failed to copy {} into {}", path.display(), dir.display()))?;
+    // The progress lines name each failure; what went wrong is printed with
+    // the run's summary, so it is added here as the summary prints it.
+    let mut text = out.to_string();
+    for failure in failures {
+        let _ = write!(text, "\nFAILED {failure}\n");
+    }
+    std::fs::write(dir.join("output.txt"), text)
+        .with_context(|| format!("Failed to write {}", dir.join("output.txt").display()))
 }
 
 /// The scripts named on the command line, directories expanded.

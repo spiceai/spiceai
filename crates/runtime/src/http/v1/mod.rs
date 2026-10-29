@@ -49,7 +49,6 @@ use crate::{
             Error as QueryError, QueryBuilder, TransactionError, error_code::ErrorCode,
             is_cancellation_error, is_timeout_error, json_array_writer, run_transaction,
             schema_has_union_columns, single_line, transaction_statements, write_to_json_string,
-            write_to_json_value,
         },
     },
     egress::EgressAccount,
@@ -57,6 +56,7 @@ use crate::{
     status::ComponentStatus,
 };
 use arrow::{array::RecordBatch, datatypes::SchemaRef, util::pretty::pretty_format_batches};
+use arrow_json::writer::JsonArray;
 use async_stream::try_stream;
 use axum::{
     body::Body,
@@ -270,11 +270,9 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
 
 // Runs a query and converts the results to an HTTP response.
 //
-// The default JSON format is streamed batch-by-batch via a chunked body, so the
-// full result set is never materialized in memory (previously it was buffered
-// twice — once as `Vec<RecordBatch>`, then again as the rendered `String`). The
-// other formats — csv, plain, the vnd.* envelopes, and JSON containing union
-// columns — still buffer via `to_http_response`.
+// JSON, CSV and the vnd.* JSON envelopes stream batch-by-batch via a chunked
+// body, so the full result set is never materialized in memory. `text/plain`
+// and results containing union columns buffer via `to_http_response`.
 pub async fn sql_to_http_response(
     df: Arc<DataFusion>,
     sql: Arc<str>,
@@ -331,23 +329,18 @@ async fn query_result_to_http_response(
 
 /// Converts a query stream to the requested HTTP response format.
 ///
-/// Default JSON responses stream batch-by-batch. Formats that require complete
-/// result metadata, and JSON schemas containing union columns, use the buffered
-/// response path.
+/// JSON, CSV and vnd JSON responses stream batch-by-batch; see
+/// [`streamed_encoder`] for the responses that buffer.
 async fn query_stream_to_http_response(
     mut data_stream: SendableRecordBatchStream,
     cache_status: CacheStatus,
     format: ResponseMimeType,
     memory_pool: Arc<dyn MemoryPool>,
 ) -> Response {
-    // Stream only the default JSON format with non-union columns; csv/plain/vnd
-    // buffer via `to_http_response`, and union columns (which the arrow-json array
-    // writer can't render) fall back to the buffered JSON path. Streamability is a
-    // schema property, so decide it before pulling any batch.
-    if !matches!(format, ResponseMimeType::Json) || schema_has_union_columns(&data_stream.schema())
-    {
+    // Streamability is a schema property, so decide it before pulling any batch.
+    let Some(encoder) = streamed_encoder(format, &data_stream.schema()) else {
         return buffered_sql_response(data_stream, cache_status, format).await;
-    }
+    };
 
     // Pull the first batch eagerly so the common immediate-execution error still
     // yields a clean status code instead of a truncated 200 response.
@@ -361,7 +354,7 @@ async fn query_stream_to_http_response(
 
     let headers = response_headers(format, cache_status).await;
     let account = EgressAccount::register(&memory_pool, "http_egress");
-    let body = Body::from_stream(json_array_body_stream(first, data_stream, account));
+    let body = Body::from_stream(sql_body_from_batches(first, data_stream, encoder, account));
     streamed_response(headers, body)
 }
 
@@ -520,7 +513,7 @@ async fn query_raw_stream_to_http_response(
     format: ResponseMimeType,
     memory_pool: Arc<dyn MemoryPool>,
 ) -> Response {
-    if !matches!(format, ResponseMimeType::Json) || schema_has_union_columns(&schema) {
+    let Some(encoder) = streamed_encoder(format, &schema) else {
         let data = match data_stream.try_collect::<Vec<_>>().await {
             Ok(batches) => batches
                 .iter()
@@ -533,7 +526,7 @@ async fn query_raw_stream_to_http_response(
         return to_http_response(data, cache_status, format, ResponseMetadata::empty())
             .await
             .into_response();
-    }
+    };
 
     let first = match data_stream.next().await {
         Some(Ok(batch)) => Some(batch),
@@ -545,7 +538,7 @@ async fn query_raw_stream_to_http_response(
 
     let headers = response_headers(format, cache_status).await;
     let account = EgressAccount::register(&memory_pool, "http_egress");
-    let body = Body::from_stream(json_array_body_from_batches(first, data_stream, account));
+    let body = Body::from_stream(sql_body_from_batches(first, data_stream, encoder, account));
     streamed_response(headers, body)
 }
 
@@ -557,56 +550,145 @@ fn streamed_response(headers: HeaderMap, body: Body) -> Response {
     response
 }
 
-trait SqlJsonBatch: Send + 'static {
+trait SqlBodyBatch: Send + 'static {
     fn as_record_batch(&self) -> &RecordBatch;
 }
 
-impl SqlJsonBatch for RecordBatch {
+impl SqlBodyBatch for RecordBatch {
     fn as_record_batch(&self) -> &RecordBatch {
         self
     }
 }
 
-impl SqlJsonBatch for Arc<RecordBatch> {
+impl SqlBodyBatch for Arc<RecordBatch> {
     fn as_record_batch(&self) -> &RecordBatch {
         self.as_ref()
     }
 }
 
-/// Streams the query result as a single JSON array, one input batch at a time,
-/// charging each serialized chunk against the query memory pool via `account`.
-/// The bytes emitted are identical to the non-streamed `arrow_to_json` output.
-fn json_array_body_stream(
-    first: Option<RecordBatch>,
-    rest: SendableRecordBatchStream,
-    account: Arc<EgressAccount>,
-) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send {
-    json_array_body_from_batches(first, rest, account)
+/// Encodes a `/v1/sql` body one record batch at a time. The concatenated
+/// chunks are identical to the buffered `to_http_response` body.
+enum BodyEncoder {
+    /// One JSON-array writer drives the whole response: it emits the opening
+    /// `[`, the inter-row/inter-batch commas, and the closing `]`.
+    Json(arrow_json::Writer<Vec<u8>, JsonArray>),
+    /// The `data` array of the vnd JSON envelope. The envelope head is written
+    /// with the first batch, because its schema is that batch's schema.
+    VndJson {
+        rows: arrow_json::Writer<Vec<u8>, JsonArray>,
+        row_count: usize,
+        started: bool,
+    },
+    /// The header row is written with the first batch only.
+    Csv { header: bool },
 }
 
-fn json_array_body_from_batches<S, B>(
+/// The encoder that streams `format` over `schema`, or `None` when the
+/// response buffers: `text/plain` sizes its columns from the whole result, the
+/// Arrow JSON and CSV writers cannot render union columns, and the CSV writer
+/// rejects nested columns, an error that must reach the client as a status.
+fn streamed_encoder(
+    format: ResponseMimeType,
+    schema: &arrow::datatypes::Schema,
+) -> Option<BodyEncoder> {
+    if schema_has_union_columns(schema) {
+        return None;
+    }
+    match format {
+        ResponseMimeType::Json => Some(BodyEncoder::Json(json_array_writer())),
+        ResponseMimeType::VndSqlJsonV1 | ResponseMimeType::VndNsqlJsonV1 => {
+            Some(BodyEncoder::VndJson {
+                rows: json_array_writer(),
+                row_count: 0,
+                started: false,
+            })
+        }
+        ResponseMimeType::Csv if schema.fields().iter().any(|f| f.data_type().is_nested()) => None,
+        ResponseMimeType::Csv => Some(BodyEncoder::Csv { header: true }),
+        ResponseMimeType::Plain => None,
+    }
+}
+
+impl BodyEncoder {
+    /// Encodes `batch`, returning the bytes it adds to the body.
+    fn write(&mut self, batch: &RecordBatch) -> Result<Vec<u8>, BoxedError> {
+        match self {
+            Self::Json(writer) => {
+                writer.write(batch)?;
+                Ok(std::mem::take(writer.get_mut()))
+            }
+            Self::VndJson {
+                rows,
+                row_count,
+                started,
+            } => {
+                if !*started {
+                    write_vnd_json_head(rows.get_mut(), Some(&batch.schema()))?;
+                    *started = true;
+                }
+                *row_count += batch.num_rows();
+                rows.write(batch)?;
+                Ok(std::mem::take(rows.get_mut()))
+            }
+            Self::Csv { header } => {
+                let mut writer = arrow_csv::WriterBuilder::new()
+                    .with_header(*header)
+                    .build(Vec::new());
+                writer.write(batch)?;
+                *header = false;
+                Ok(writer.into_inner())
+            }
+        }
+    }
+
+    /// Returns the bytes that end the body.
+    fn finish(self) -> Result<Vec<u8>, BoxedError> {
+        match self {
+            Self::Json(mut writer) => {
+                // Closes the array (`]`), or emits `[]` for an empty result.
+                writer.finish()?;
+                Ok(writer.into_inner())
+            }
+            Self::VndJson {
+                mut rows,
+                row_count,
+                started,
+            } => {
+                if !started {
+                    write_vnd_json_head(rows.get_mut(), None)?;
+                }
+                rows.finish()?;
+                let mut tail = rows.into_inner();
+                write_vnd_json_tail(&mut tail, row_count, None)?;
+                Ok(tail)
+            }
+            Self::Csv { .. } => Ok(Vec::new()),
+        }
+    }
+}
+
+type BoxedError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Streams the query result one input batch at a time, charging each encoded
+/// chunk against the query memory pool via `account`.
+fn sql_body_from_batches<S, B>(
     first: Option<B>,
     rest: S,
+    mut encoder: BodyEncoder,
     account: Arc<EgressAccount>,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send
 where
     S: Stream<Item = Result<B, datafusion::error::DataFusionError>> + Send + Unpin + 'static,
-    B: SqlJsonBatch,
+    B: SqlBodyBatch,
 {
     let mut batches =
         futures::stream::iter(first.map(Ok::<_, datafusion::error::DataFusionError>)).chain(rest);
     try_stream! {
-        // One JSON-array writer drives the whole response: it emits the opening
-        // `[`, the inter-row/inter-batch commas, and the closing `]`, so the
-        // streamed bytes match `arrow_to_json` exactly. Drain its buffer after
-        // each write to yield a chunk (zero-copy — `mem::take` moves the `Vec`).
-        let mut writer = json_array_writer();
         while let Some(item) = batches.next().await {
             let batch = item.map_err(|e| std::io::Error::other(e.to_string()))?;
-            writer
+            let chunk = encoder
                 .write(batch.as_record_batch())
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
-            let chunk = std::mem::take(writer.get_mut());
             if !chunk.is_empty() {
                 let size = chunk.len();
                 account.reserve(size).await;
@@ -614,11 +696,9 @@ where
                 account.release(size);
             }
         }
-        // Closes the array (`]`), or emits `[]` for an empty result.
-        writer
+        let tail = encoder
             .finish()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let tail = std::mem::take(writer.get_mut());
         if !tail.is_empty() {
             let size = tail.len();
             account.reserve(size).await;
@@ -667,7 +747,7 @@ pub async fn to_http_response(
         ResponseMimeType::Csv => arrow_to_csv(&data),
         ResponseMimeType::Plain => arrow_to_plain(&data),
         ResponseMimeType::VndSqlJsonV1 | ResponseMimeType::VndNsqlJsonV1 => {
-            arrow_to_vnd_sql_json_v1(&data, meta)
+            arrow_to_vnd_sql_json_v1(&data, &meta)
         }
     };
 
@@ -842,29 +922,47 @@ fn arrow_to_plain(
 /// Converts a vector of `RecordBatch` to an application/vnd.spiceai.sql.v1+json / application/vnd.spiceai.nsql.v1+json format
 fn arrow_to_vnd_sql_json_v1(
     data: &[RecordBatch],
-    meta: ResponseMetadata,
+    meta: &ResponseMetadata,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    // Calculate total row count across all batches
     let row_count = data.iter().map(RecordBatch::num_rows).sum::<usize>();
 
-    let schema_json = if let Some(batch) = data.first() {
-        // Use built-in Arrow JSON schema representation: https://github.com/apache/arrow/blob/main/docs/source/format/Integration.rst#json-test-data-format
-        serde_json::to_value(batch.schema())?
-    } else {
-        serde_json::json!({})
-    };
+    let mut body = Vec::new();
+    write_vnd_json_head(&mut body, data.first().map(RecordBatch::schema).as_ref())?;
+    body.extend_from_slice(write_to_json_string(data)?.as_bytes());
+    write_vnd_json_tail(&mut body, row_count, meta.sql.as_deref())?;
 
-    let mut result = json!({
-        "row_count": row_count,
-        "schema": schema_json,
-        "data": write_to_json_value(data)?,
-    });
+    String::from_utf8(body).boxed()
+}
 
-    if let Some(sql) = meta.sql {
-        result["sql"] = serde_json::Value::String(sql);
+/// Writes the vnd JSON envelope up to its `data` array: `{"schema":…,"data":`.
+/// The schema uses the Arrow JSON schema representation
+/// (<https://github.com/apache/arrow/blob/main/docs/source/format/Integration.rst#json-test-data-format>);
+/// an empty result has the schema `{}`.
+fn write_vnd_json_head(out: &mut Vec<u8>, schema: Option<&SchemaRef>) -> Result<(), BoxedError> {
+    out.extend_from_slice(br#"{"schema":"#);
+    match schema {
+        Some(schema) => serde_json::to_writer(&mut *out, schema.as_ref())?,
+        None => out.extend_from_slice(b"{}"),
     }
+    out.extend_from_slice(br#","data":"#);
+    Ok(())
+}
 
-    serde_json::to_string(&result).boxed()
+/// Writes the vnd JSON envelope after its `data` array. `row_count` follows
+/// the rows so that the rows can stream before the count is known.
+fn write_vnd_json_tail(
+    out: &mut Vec<u8>,
+    row_count: usize,
+    sql: Option<&str>,
+) -> Result<(), BoxedError> {
+    out.extend_from_slice(br#","row_count":"#);
+    out.extend_from_slice(row_count.to_string().as_bytes());
+    if let Some(sql) = sql {
+        out.extend_from_slice(br#","sql":"#);
+        serde_json::to_writer(&mut *out, sql)?;
+    }
+    out.push(b'}');
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1183,7 +1281,7 @@ mod tests {
 
         // Test conversion without SQL
         let result_without_sql =
-            arrow_to_vnd_sql_json_v1(std::slice::from_ref(&batch), ResponseMetadata::empty())
+            arrow_to_vnd_sql_json_v1(std::slice::from_ref(&batch), &ResponseMetadata::empty())
                 .expect("to convert");
         insta::assert_json_snapshot!(
             "vnd_json_v1_without_sql",
@@ -1193,17 +1291,32 @@ mod tests {
         // Test conversion with SQL
         let metadata = ResponseMetadata::empty()
             .with_sql("SELECT customer_id, total_sales FROM sales_summary LIMIT 2;");
-        let result_with_sql = arrow_to_vnd_sql_json_v1(&[batch], metadata).expect("to convert");
+        let result_with_sql = arrow_to_vnd_sql_json_v1(&[batch], &metadata).expect("to convert");
         insta::assert_json_snapshot!(
             "vnd_json_v1_with_sql",
             serde_json::from_str::<serde_json::Value>(&result_with_sql).expect("to parse")
         );
     }
 
-    /// The chunked `/v1/sql` JSON body must be byte-identical to the buffered
-    /// `arrow_to_json` output across multi-batch, empty, and NULL cases.
+    /// Encodes a whole result the way the buffered `to_http_response` does.
+    type BufferedEncoding = fn(&[RecordBatch]) -> Result<String, BoxedError>;
+
+    /// The formats `/v1/sql` streams, with the buffered encoding each streamed
+    /// body must match byte for byte.
+    fn streamed_formats() -> [(ResponseMimeType, BufferedEncoding); 3] {
+        [
+            (ResponseMimeType::Json, arrow_to_json),
+            (ResponseMimeType::VndSqlJsonV1, |data| {
+                arrow_to_vnd_sql_json_v1(data, &ResponseMetadata::empty())
+            }),
+            (ResponseMimeType::Csv, arrow_to_csv),
+        ]
+    }
+
+    /// Each chunked `/v1/sql` body must be byte-identical to the buffered
+    /// encoding of its format across multi-batch, empty, and NULL cases.
     #[tokio::test]
-    async fn json_array_body_stream_matches_buffered_output() {
+    async fn streamed_body_matches_buffered_output() {
         use arrow::array::ArrayRef;
         use datafusion::error::DataFusionError;
         use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
@@ -1238,57 +1351,165 @@ mod tests {
             vec![make(vec![], vec![])],
         ];
 
-        for batches in cases {
-            let expected = write_to_json_string(&batches).expect("buffered json");
+        for (format, buffered) in streamed_formats() {
+            for batches in &cases {
+                let expected = buffered(batches).expect("buffered body");
+                if matches!(format, ResponseMimeType::VndSqlJsonV1) && batches.is_empty() {
+                    assert_eq!(expected, r#"{"schema":{},"data":[],"row_count":0}"#);
+                }
 
-            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
-            let account = EgressAccount::register(&pool, "test_egress");
+                let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+                let account = EgressAccount::register(&pool, "test_egress");
 
-            let mut batches = batches.into_iter();
-            let first = batches.next();
-            let rest: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-                Arc::clone(&schema),
-                futures::stream::iter(batches.map(Ok::<_, DataFusionError>)),
-            ));
+                let mut batches = batches.clone().into_iter();
+                let first = batches.next();
+                let rest: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&schema),
+                    futures::stream::iter(batches.map(Ok::<_, DataFusionError>)),
+                ));
+                let encoder = streamed_encoder(format, &schema).expect("a streamed format");
 
-            let mut body = std::pin::pin!(json_array_body_stream(first, rest, account));
-            let mut streamed = Vec::new();
-            while let Some(chunk) = body.next().await {
-                streamed.extend_from_slice(&chunk.expect("chunk"));
+                let mut body = std::pin::pin!(sql_body_from_batches(first, rest, encoder, account));
+                let mut streamed = Vec::new();
+                while let Some(chunk) = body.next().await {
+                    streamed.extend_from_slice(&chunk.expect("chunk"));
+                }
+
+                assert_eq!(
+                    String::from_utf8(streamed).expect("utf8"),
+                    expected,
+                    "{format:?}: streamed body must match the buffered encoding"
+                );
             }
 
-            assert_eq!(
-                String::from_utf8(streamed).expect("utf8"),
-                expected,
-                "streamed JSON must match buffered arrow_to_json output"
+            // A complete small result is still a chunked body. Sending it whole with
+            // `Content-Length` is an HTTP framing change and needs an Enhancement.
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let data: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter(std::iter::once(Ok::<_, DataFusionError>(make(
+                    vec![Some(1)],
+                    vec![Some("a")],
+                )))),
+            ));
+            let response =
+                query_stream_to_http_response(data, CacheStatus::CacheMiss, format, pool).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response.body().size_hint().exact().is_none(),
+                "{format:?} responses must stream; an exact size hint is a Content-Length body"
             );
         }
+    }
 
-        // A complete small result is still a chunked body. Sending it whole with
-        // `Content-Length` is an HTTP framing change and needs an Enhancement.
+    /// DECIMAL values keep every digit in each `/v1/sql` format, streamed and
+    /// buffered: a 38-digit value does not become a float.
+    #[tokio::test]
+    async fn decimal_values_keep_every_digit() {
+        use arrow::array::{ArrayRef, Decimal128Array};
+        use datafusion::error::DataFusionError;
+        use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d38", DataType::Decimal128(38, 0), false),
+            Field::new("d19", DataType::Decimal128(19, 2), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(
+                    Decimal128Array::from(vec![
+                        99_999_999_999_999_999_999_999_999_999_999_999_999_i128,
+                    ])
+                    .with_precision_and_scale(38, 0)
+                    .expect("decimal(38, 0)"),
+                ) as ArrayRef,
+                Arc::new(
+                    Decimal128Array::from(vec![1_234_567_890_123_456_789_i128])
+                        .with_precision_and_scale(19, 2)
+                        .expect("decimal(19, 2)"),
+                ) as ArrayRef,
+            ],
+        )
+        .expect("record batch");
+        let row = r#"{"d38":99999999999999999999999999999999999999,"d19":12345678901234567.89}"#;
+
+        for (format, buffered) in streamed_formats() {
+            let buffered = buffered(std::slice::from_ref(&batch)).expect("buffered body");
+
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let data: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter(std::iter::once(Ok::<_, DataFusionError>(batch.clone()))),
+            ));
+            let response =
+                query_stream_to_http_response(data, CacheStatus::CacheMiss, format, pool).await;
+            let streamed = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("streamed body");
+            let streamed = String::from_utf8(streamed.to_vec()).expect("utf8");
+
+            for body in [&buffered, &streamed] {
+                match format {
+                    ResponseMimeType::Json => assert_eq!(*body, format!("[{row}]")),
+                    ResponseMimeType::VndSqlJsonV1 => assert!(
+                        body.ends_with(&format!(r#","data":[{row}],"row_count":1}}"#)),
+                        "{format:?}: `{body}` must end with the exact rows and row count"
+                    ),
+                    ResponseMimeType::Csv => assert_eq!(
+                        *body,
+                        "d38,d19\n99999999999999999999999999999999999999,12345678901234567.89\n"
+                    ),
+                    other => panic!("{other:?} is not a streamed format"),
+                }
+            }
+        }
+    }
+
+    /// CSV cannot encode a nested column, so the request fails with an error
+    /// status rather than a `200` head over an empty body.
+    #[tokio::test]
+    async fn csv_with_a_nested_column_is_an_error_response() {
+        use arrow::array::{Array, ArrayRef, ListArray};
+        use arrow::datatypes::Int64Type;
+        use datafusion::error::DataFusionError;
+        use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let list = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![Some(1)])]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "l",
+            list.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(list) as ArrayRef])
+            .expect("record batch");
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         let data: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            futures::stream::iter(std::iter::once(Ok::<_, DataFusionError>(make(
-                vec![Some(1)],
-                vec![Some("a")],
-            )))),
+            schema,
+            futures::stream::iter(std::iter::once(Ok::<_, DataFusionError>(batch))),
         ));
+
         let response = query_stream_to_http_response(
             data,
             CacheStatus::CacheMiss,
-            ResponseMimeType::Json,
+            ResponseMimeType::Csv,
             pool,
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("error body");
         assert!(
-            response.body().size_hint().exact().is_none(),
-            "JSON responses must stream; an exact size hint is a Content-Length body"
+            String::from_utf8_lossy(&body).contains("not supported in CSV"),
+            "the error names the cause: `{}`",
+            String::from_utf8_lossy(&body)
         );
     }
 
-    /// HTTP JSON and buffered CSV from `QueryResult::from_cached_raw` must
+    /// HTTP JSON, vnd JSON and CSV from `QueryResult::from_cached_raw` must
     /// match the owned-stream path: same status, cache header, and body bytes.
     #[tokio::test]
     async fn cached_raw_http_response_matches_owned_stream() {
@@ -1324,7 +1545,11 @@ mod tests {
         ];
 
         for batches in cases {
-            for format in [ResponseMimeType::Json, ResponseMimeType::Csv] {
+            for format in [
+                ResponseMimeType::Json,
+                ResponseMimeType::VndSqlJsonV1,
+                ResponseMimeType::Csv,
+            ] {
                 let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
                 let owned = QueryResult::new(
                     Box::pin(RecordBatchStreamAdapter::new(
