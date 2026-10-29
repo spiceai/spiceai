@@ -145,7 +145,11 @@ impl CacheResponse {
 /// text, or the key its client supplied — chosen by its cache key type.
 enum KeyUse {
     LookUp,
-    /// `no-cache`: the request does not use the results cache at all.
+    /// A client `no-cache` on the request's kind of key: nothing is looked up,
+    /// but the fresh result is stored under this key for later requests.
+    Revalidate,
+    /// The runtime's own [`CacheControl::NoCache`]: the request does not use
+    /// the results cache at all.
     Bypass,
     /// The request's cache key type is looked up under another kind of key.
     WrongKeyType,
@@ -175,6 +179,12 @@ impl KeyUse {
                 | CacheControl::OnlyIfCached(CacheKeyType::ClientSupplied),
                 CacheKey::ClientSupplied(_),
             ) => Self::LookUp,
+            (CacheControl::Revalidate(CacheKeyType::Default), CacheKey::LogicalPlan(_))
+            | (CacheControl::Revalidate(CacheKeyType::Raw), CacheKey::Query(_, _))
+            | (
+                CacheControl::Revalidate(CacheKeyType::ClientSupplied),
+                CacheKey::ClientSupplied(_),
+            ) => Self::Revalidate,
             (CacheControl::NoCache, _) => Self::Bypass,
             _ => Self::WrongKeyType,
         }
@@ -574,11 +584,18 @@ impl Query {
             CacheControl::Cache(CacheKeyType::Default)
             | CacheControl::MaxStale(CacheKeyType::Default, _)
             | CacheControl::MinFresh(CacheKeyType::Default, _)
-            | CacheControl::OnlyIfCached(CacheKeyType::Default) => plan_raw_cache_key,
+            | CacheControl::OnlyIfCached(CacheKeyType::Default)
+            | CacheControl::Revalidate(CacheKeyType::Default) => plan_raw_cache_key,
             _ => sql_or_client_raw_key,
         }
         .unwrap_or(sql_raw_cache_key);
 
+        // A `no-cache` request reports `BYPASS` whichever of its two lookups
+        // matched its key type; the other reports a wrong-key-type miss.
+        let status = match cache_control {
+            CacheControl::Revalidate(_) => CacheStatus::CacheBypass,
+            _ => status,
+        };
         let cache_status = Self::should_cache_results(df, &plan, status);
         tracker = tracker.map(|t| t.results_cache_hit(false));
 
@@ -737,9 +754,26 @@ impl Query {
 
         let cache_control = request_context.cache_control();
 
+        let raw_key = |provider: &QueryResultsCacheProvider| {
+            let ns = request_context.cache_namespace();
+            let (ns_tag, ns_id) = ns.hash_inputs();
+            key.as_raw_key_in_namespace(provider.hasher(), ns_tag, ns_id)
+        };
+
         // Validate that the provided cache key is the correct type for this request
         match KeyUse::of(cache_control, key) {
             KeyUse::LookUp => {}
+            // Skip the read, but hand back the key: the query's fresh result is
+            // stored under it, replacing whatever entry was there, so the next
+            // request without `no-cache` reads what this one returned.
+            KeyUse::Revalidate => {
+                return Ok(CacheResponse::from(
+                    CacheResult::MissOrSkipped,
+                    CacheStatus::CacheBypass,
+                )
+                .with_query_tracker(tracker)
+                .with_raw_key(Some(raw_key(cache_provider.as_ref()))));
+            }
             KeyUse::Bypass => {
                 return Ok(CacheResponse::from(
                     CacheResult::MissOrSkipped,
@@ -756,11 +790,7 @@ impl Query {
             }
         }
 
-        let raw_key = {
-            let ns = request_context.cache_namespace();
-            let (ns_tag, ns_id) = ns.hash_inputs();
-            key.as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id)
-        };
+        let raw_key = raw_key(cache_provider.as_ref());
 
         // Looked up before planning, and nothing servable was there.
         if already_looked_up == Some(raw_key) {
@@ -827,6 +857,10 @@ impl Query {
             return CacheProbe::Skipped;
         };
         let cache_control = request_context.cache_control();
+        // A `no-cache` request is never answered from the cache.
+        if matches!(cache_control, CacheControl::Revalidate(_)) {
+            return CacheProbe::Skipped;
+        }
         let Some(cache_key_type) = cache_control.cache_key_type() else {
             return CacheProbe::Skipped;
         };
@@ -4372,6 +4406,106 @@ body: SELECT CAST(random() * 1000000000000 AS BIGINT) AS v
             )
             .expect("should register table");
         scans
+    }
+
+    /// A client's `Cache-Control: no-cache` skips the cached lookup, runs the
+    /// query, and stores the fresh result, so the next request without the
+    /// header reads it rather than the entry the revalidation replaced. Holds
+    /// under every cache key type: plan, SQL text, and a client-supplied key.
+    #[tokio::test]
+    async fn a_no_cache_request_stores_its_fresh_result_for_later_reads() {
+        use spicepod::component::caching::CacheKeyType as ConfiguredCacheKeyType;
+
+        for (configured, key_type, client_key) in [
+            (ConfiguredCacheKeyType::Plan, CacheKeyType::Default, None),
+            (ConfiguredCacheKeyType::Sql, CacheKeyType::Raw, None),
+            (
+                ConfiguredCacheKeyType::Plan,
+                CacheKeyType::ClientSupplied,
+                Some("no-cache-writeback".to_string()),
+            ),
+        ] {
+            let df = prepare_runtime(Some(SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                cache_key_type: configured,
+                ..Default::default()
+            }))
+            .await;
+            let scans = register_counted_table(&df, "no_cache_writeback");
+            const SQL: &str = "SELECT scan FROM no_cache_writeback";
+            let cached =
+                create_test_request_context(CacheControl::Cache(key_type), client_key.clone());
+            let no_cache =
+                create_test_request_context(CacheControl::Revalidate(key_type), client_key.clone());
+            let run = |context: &Arc<RequestContext>| {
+                Arc::clone(context).scope(run_i64_query(&df, SQL, ResultsCacheMode::Default))
+            };
+
+            assert_eq!(
+                run(&cached).await,
+                (CacheStatus::CacheMiss, 1),
+                "{key_type:?}"
+            );
+            assert_eq!(
+                run(&cached).await,
+                (CacheStatus::CacheHit, 1),
+                "{key_type:?}"
+            );
+
+            // `no-cache` never serves the cached entry: it runs the query.
+            assert_eq!(
+                run(&no_cache).await,
+                (CacheStatus::CacheBypass, 2),
+                "{key_type:?}"
+            );
+            // ...and the next plain read is served what it returned.
+            assert_eq!(
+                run(&cached).await,
+                (CacheStatus::CacheHit, 2),
+                "{key_type:?}: the read after no-cache must see the fresh result"
+            );
+
+            assert_eq!(
+                run(&no_cache).await,
+                (CacheStatus::CacheBypass, 3),
+                "{key_type:?}"
+            );
+            assert_eq!(
+                run(&cached).await,
+                (CacheStatus::CacheHit, 3),
+                "{key_type:?}"
+            );
+            assert_eq!(
+                scans.load(std::sync::atomic::Ordering::SeqCst),
+                3,
+                "{key_type:?}"
+            );
+        }
+    }
+
+    /// The runtime's own [`CacheControl::NoCache`] keeps bypassing the cache
+    /// for reads, so a background revalidation never serves itself a hit.
+    #[tokio::test]
+    async fn the_runtime_no_cache_control_never_serves_a_cached_result() {
+        let df = prepare_runtime(None).await;
+        let scans = register_counted_table(&df, "runtime_no_cache");
+        const SQL: &str = "SELECT scan FROM runtime_no_cache";
+        let cached = create_test_request_context(CacheControl::Cache(CacheKeyType::Default), None);
+        let bypass = create_test_request_context(CacheControl::NoCache, None);
+
+        assert_eq!(
+            Arc::clone(&cached)
+                .scope(run_i64_query(&df, SQL, ResultsCacheMode::Default))
+                .await,
+            (CacheStatus::CacheMiss, 1)
+        );
+        assert_eq!(
+            Arc::clone(&bypass)
+                .scope(run_i64_query(&df, SQL, ResultsCacheMode::Default))
+                .await,
+            (CacheStatus::CacheBypass, 2)
+        );
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// A hit is served where the request arrived: it has nothing to plan or execute, so it
