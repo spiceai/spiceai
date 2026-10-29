@@ -41,7 +41,8 @@ pub struct ListedFile {
 pub struct Quantization {
     /// The name a model's `files` can give it, unique in the repository: its folder when the
     /// folder holds no other quantization, or else the quantization tag of its file names
-    /// (`UD-Q4_K_XL`, `Q8_0`, `BF16`), or its path when two would share a tag. Its tag and its
+    /// (`UD-Q4_K_XL`, `Q8_0`, `BF16`), or its path when another quantization could go by that
+    /// name: has it, has it as its tag or path, or is in a folder of that name. Its tag and its
     /// path stem name it too when no other quantization has them, so a name given while the
     /// Hub listed the repository still resolves against the cache's shorter listing.
     pub name: String,
@@ -85,9 +86,10 @@ pub enum ResolveError {
         missing.join(", ")
     ))]
     IncompleteShards { path: String, missing: Vec<String> },
-    /// A folder that holds several quantizations, which would each be its name.
+    /// A name several quantizations answer to: a folder that holds several, or a tag one has
+    /// and another's folder bears.
     #[snafu(display(
-        "'{name}' holds {} quantizations of the repository, {}; name one of them",
+        "'{name}' matches {} quantizations of the repository, {}; name one of them",
         quantizations.len(),
         quantizations.join(", ")
     ))]
@@ -254,47 +256,51 @@ pub fn quantizations(listing: &[ListedFile]) -> Vec<Quantization> {
     // Each quantization's names, most preferred first; the last, its first file's path, is
     // unique in the repository.
     let mut candidates = Vec::new();
+    // Every name each quantization could go by in this listing or a shorter one, as the cache's
+    // with the Hub out of reach, and so every name `resolve` could match it by there.
+    let mut claims = Vec::new();
     for (dir, stem, files) in complete {
+        let leaf = dir.rsplit('/').next().unwrap_or(&dir).to_string();
+        let own = tag(files[0])
+            .unwrap_or_else(|| file_name(files[0]).trim_end_matches(".gguf").to_string());
+        let stem = stem.trim_end_matches(".gguf").to_string();
         // A folder names the one quantization it holds; several in one folder go by their tags.
         let name = if !dir.is_empty() && in_folder.get(&dir) == Some(&1) {
-            dir.rsplit('/').next().unwrap_or(&dir).to_string()
+            leaf.clone()
         } else {
-            tag(files[0])
-                .unwrap_or_else(|| file_name(files[0]).trim_end_matches(".gguf").to_string())
+            own.clone()
         };
         let bytes = files
             .iter()
             .map(|f| size.get(f).copied().unwrap_or(0))
             .sum();
-        candidates.push([
-            name.clone(),
-            stem.trim_end_matches(".gguf").to_string(),
-            files[0].to_string(),
-        ]);
+        claims.push(
+            [leaf, dir.clone(), own, stem.clone(), files[0].to_string()]
+                .into_iter()
+                .filter(|claim| !claim.is_empty())
+                .map(|claim| claim.to_ascii_lowercase())
+                .collect::<BTreeSet<_>>(),
+        );
+        candidates.push([name.clone(), stem, files[0].to_string()]);
         out.push(Quantization {
             name,
             files: files.into_iter().map(ToString::to_string).collect(),
             bytes,
         });
     }
-    // Quantizations that would share a name, as one tag in two folders, go by their paths: each
-    // takes its next name until none is shared, which its first file's path guarantees.
-    let mut level = vec![0; out.len()];
-    loop {
-        let mut uses: BTreeMap<String, usize> = BTreeMap::new();
-        for q in &out {
-            *uses.entry(q.name.to_ascii_lowercase()).or_default() += 1;
-        }
-        let mut renamed = false;
-        for ((q, names), at) in out.iter_mut().zip(&candidates).zip(&mut level) {
-            if *at + 1 < names.len() && uses.get(&q.name.to_ascii_lowercase()) > Some(&1) {
-                *at += 1;
-                q.name.clone_from(&names[*at]);
-                renamed = true;
-            }
-        }
-        if !renamed {
-            break;
+    // A name another quantization could go by would resolve to that one in a listing where it
+    // does, as `Q4_K_M` to the only quantization a cached `Q4_K_M/` folder holds: each takes
+    // its next name until no other claims it, which its first file's path guarantees.
+    for (i, (q, names)) in out.iter_mut().zip(&candidates).enumerate() {
+        let mut at = 0;
+        while at + 1 < names.len()
+            && claims
+                .iter()
+                .enumerate()
+                .any(|(j, claim)| j != i && claim.contains(&q.name.to_ascii_lowercase()))
+        {
+            at += 1;
+            q.name.clone_from(&names[at]);
         }
     }
     // Largest first; a stable tie-break by name keeps the order reproducible.
@@ -347,15 +353,14 @@ pub fn pin(listing: &[ListedFile], quantization: &Quantization) -> Vec<String> {
 
 /// Resolves a model's `files` against the repository listing. An exact `.gguf` path is
 /// honoured, with the sibling shards of a shard, a draft head's included; any other entry names
-/// a quantization, by its name, the folder that holds only it, or its tag or path stem when no
-/// other quantization has them, which brings all its shards and, unless a draft head is named,
-/// the repository's draft head. Another file the repository has is left to the
-/// engine, and so is every entry of a repository that offers no GGUF quantization. `Ok(None)`
-/// when `files` names no GGUF weights.
+/// a quantization, by its name, the folder that holds only it, or its tag or path stem, which
+/// brings all its shards and, unless a draft head is named, the repository's draft head.
+/// Another file the repository has is left to the engine, and so is every entry of a
+/// repository that offers no GGUF quantization. `Ok(None)` when `files` names no GGUF weights.
 ///
 /// # Errors
 ///
-/// Returns an error when a named file is missing, a shard series is incomplete, a folder holds
+/// Returns an error when a named file is missing, a shard series is incomplete, a name matches
 /// several quantizations, or a name is neither a file nor a quantization of the repository.
 pub fn resolve(
     listing: &[ListedFile],
@@ -385,42 +390,29 @@ pub fn resolve(
             }
         } else {
             let name = entry.trim_end_matches('/');
-            // `name/` is a folder, never a quantization's name.
-            let named = (!entry.ends_with('/'))
-                .then(|| {
-                    quantizations
-                        .iter()
-                        .find(|q| q.name.eq_ignore_ascii_case(name))
-                })
-                .flatten();
-            let in_folder: Vec<&Quantization> = quantizations
+            // Every quantization the entry could name: the folder that holds it, or, unless
+            // `name/` makes it a folder, its name, its tag or its path stem. A listing of fewer
+            // files, as the cache's with the Hub out of reach, names by its folder what the
+            // whole listing named by its tag, so a name more than one answers to names none.
+            let matched: Vec<&Quantization> = quantizations
                 .iter()
-                .filter(|q| q.files.iter().all(|f| folder(f).eq_ignore_ascii_case(name)))
+                .filter(|q| {
+                    q.files.iter().all(|f| folder(f).eq_ignore_ascii_case(name))
+                        || (!entry.ends_with('/')
+                            && (q.name.eq_ignore_ascii_case(name)
+                                || aliases(q).any(|alias| alias.eq_ignore_ascii_case(name))))
+                })
                 .collect();
-            // Its tag or path stem names a quantization too: a listing of fewer files, as the
-            // cache's with the Hub out of reach, names by its folder what the whole listing
-            // named by its tag.
-            let aliased: Vec<&Quantization> = if named.is_none() && !entry.ends_with('/') {
-                quantizations
-                    .iter()
-                    .filter(|q| aliases(q).any(|alias| alias.eq_ignore_ascii_case(name)))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let q = match (named, in_folder.as_slice(), aliased.as_slice()) {
-                (Some(q), _, _) => q,
-                (None, [q], _) | (None, [], [q]) => *q,
-                (None, [], []) if present.contains(entry) || quantizations.is_empty() => {
-                    continue;
-                }
-                (None, [], []) => {
+            let q = match matched.as_slice() {
+                [q] => *q,
+                [] if present.contains(entry) || quantizations.is_empty() => continue,
+                [] => {
                     return Err(ResolveError::UnknownQuantization {
                         name: name.to_string(),
                         available: quantizations.iter().map(|q| q.name.clone()).collect(),
                     });
                 }
-                (None, [], several) | (None, several, _) => {
+                several => {
                     return Err(ResolveError::AmbiguousQuantization {
                         name: name.to_string(),
                         quantizations: several.iter().map(|q| q.name.clone()).collect(),
@@ -772,7 +764,7 @@ mod tests {
         let err = resolve(&one_folder(), &["gguf/"]).expect_err("the folder holds two");
         assert_eq!(
             err.to_string(),
-            "'gguf' holds 2 quantizations of the repository, Q8_0, Q4_K_M; name one of them"
+            "'gguf' matches 2 quantizations of the repository, Q8_0, Q4_K_M; name one of them"
         );
         // The quantization a budget chooses is pinned by the name it is advertised under.
         let chosen = choose(&qs, 5 * GB).expect("Q4_K_M fits");
@@ -872,6 +864,8 @@ mod tests {
             ("one_folder", one_folder()),
             ("merged_and_split", merged_and_split()),
             ("fallback_meets_folder", fallback_meets_folder()),
+            ("tag_meets_folder", tag_meets_folder()),
+            ("folder_named_like_a_tag", folder_named_like_a_tag()),
             (
                 "two_folders",
                 listing(&[
@@ -917,6 +911,17 @@ mod tests {
         ])
     }
 
+    /// Two quantizations in a folder, beside a folder named like one of their tags that holds
+    /// two others: Copilot's case on #15590.
+    fn tag_meets_folder() -> Vec<ListedFile> {
+        listing(&[
+            ("gguf/Model-Q4_K_M.gguf", 4 * GB),
+            ("gguf/Model-Q8_0.gguf", 8 * GB),
+            ("Q4_K_M/Other-Q2_K.gguf", 2 * GB),
+            ("Q4_K_M/Other-Q8_0.gguf", 8 * GB),
+        ])
+    }
+
     /// A draft head published as a series of two shards.
     fn sharded_head() -> Vec<ListedFile> {
         listing(&[
@@ -950,8 +955,8 @@ mod tests {
 
     /// The `files` a load log advertises load exactly what choosing that quantization with no
     /// `files` loads, its draft head included, whatever its name is, and load it again from a
-    /// cache holding only those files, which is what the repository lists with the Hub out of
-    /// reach.
+    /// cache holding those files and any part of the rest of the repository, which is what the
+    /// repository lists with the Hub out of reach.
     #[test]
     fn every_pin_loads_what_choosing_its_quantization_loads() {
         let mut path_named = fallback_meets_folder();
@@ -962,6 +967,8 @@ mod tests {
             ("folder_and_own_head", folder_and_own_head()),
             ("fallback_meets_folder_with_a_head", path_named),
             ("tags_in_one_folder", tags_in_one_folder()),
+            ("tag_meets_folder", tag_meets_folder()),
+            ("folder_named_like_a_tag", folder_named_like_a_tag()),
             ("sharded_head", sharded_head()),
         ];
         let mut pinned_a_head = false;
@@ -978,21 +985,36 @@ mod tests {
                     .unwrap_or_else(|| panic!("{fixture}: {pin:?} names no weights"));
                 assert_eq!(resolved.weights, q.files, "{fixture}: {pin:?}");
                 assert_eq!(resolved.draft, head, "{fixture}: {pin:?}");
-                let cached: Vec<ListedFile> = files
+                // every subset of the files the pin did not download, beside those it did
+                let rest: Vec<&ListedFile> = files
                     .iter()
-                    .filter(|f| resolved.files().contains(&f.path.as_str()))
-                    .cloned()
+                    .filter(|f| !resolved.files().contains(&f.path.as_str()))
                     .collect();
-                let again = resolve(&cached, &entries)
-                    .unwrap_or_else(|e| {
-                        panic!("{fixture}: {pin:?} does not resolve from the cache: {e}")
-                    })
-                    .unwrap_or_else(|| panic!("{fixture}: {pin:?} names no cached weights"));
-                assert_eq!(
-                    (again.weights, again.draft),
-                    (resolved.weights, resolved.draft),
-                    "{fixture}: {pin:?} from the cache"
-                );
+                assert!(rest.len() <= 10, "{fixture}: {} subsets", 1 << rest.len());
+                for subset in 0..1_u32 << rest.len() {
+                    let cached: Vec<ListedFile> = files
+                        .iter()
+                        .filter(|f| {
+                            resolved.files().contains(&f.path.as_str())
+                                || rest
+                                    .iter()
+                                    .position(|r| r.path == f.path)
+                                    .is_some_and(|i| subset & (1 << i) != 0)
+                        })
+                        .cloned()
+                        .collect();
+                    let paths: Vec<&str> = cached.iter().map(|f| f.path.as_str()).collect();
+                    let again = resolve(&cached, &entries)
+                        .unwrap_or_else(|e| {
+                            panic!("{fixture}: {pin:?} does not resolve from {paths:?}: {e}")
+                        })
+                        .unwrap_or_else(|| panic!("{fixture}: {pin:?} names nothing in {paths:?}"));
+                    assert_eq!(
+                        (&again.weights, &again.draft),
+                        (&resolved.weights, &resolved.draft),
+                        "{fixture}: {pin:?} from {paths:?}"
+                    );
+                }
             }
         }
         assert!(pinned_a_head, "a fixture's quantization drafts with a head");
@@ -1013,14 +1035,37 @@ mod tests {
         );
     }
 
-    /// A folder named like a quantization, holding two others: Copilot's case on #15590.
-    #[test]
-    fn a_trailing_slash_names_only_a_folder() {
-        let files = listing(&[
+    /// A folder named like a quantization's tag, holding two others: Copilot's case on #15590.
+    fn folder_named_like_a_tag() -> Vec<ListedFile> {
+        listing(&[
             ("Model-Q4_K_M.gguf", 4 * GB),
             ("Q4_K_M/A-Q8_0.gguf", 8 * GB),
             ("Q4_K_M/B-Q5_K_M.gguf", 5 * GB),
-        ]);
+        ])
+    }
+
+    /// A tag a folder bears names neither the quantization with that tag nor any in the folder,
+    /// which a cache holding only that one would name by it.
+    #[test]
+    fn a_tag_another_quantizations_folder_bears_is_not_a_name() {
+        assert_eq!(
+            names(&quantizations(&tag_meets_folder())),
+            [
+                "Q4_K_M/Other-Q8_0",
+                "gguf/Model-Q8_0",
+                "gguf/Model-Q4_K_M",
+                "Q2_K"
+            ]
+        );
+        assert_eq!(
+            names(&quantizations(&folder_named_like_a_tag())),
+            ["Q8_0", "Q5_K_M", "Model-Q4_K_M"]
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_names_only_a_folder() {
+        let files = folder_named_like_a_tag();
         assert_eq!(
             resolve(&files, &["Q4_K_M/"]),
             Err(ResolveError::AmbiguousQuantization {
@@ -1028,9 +1073,22 @@ mod tests {
                 quantizations: vec!["Q8_0".to_string(), "Q5_K_M".to_string()],
             })
         );
-        // without the slash the name is the quantization's
+        // Without the slash the tag matches too, and a cache holding one of the folder's two
+        // would take it for the folder's, so the name is refused and the tagged quantization
+        // goes by its path.
         assert_eq!(
-            resolve(&files, &["Q4_K_M"])
+            resolve(&files, &["Q4_K_M"]),
+            Err(ResolveError::AmbiguousQuantization {
+                name: "Q4_K_M".to_string(),
+                quantizations: vec![
+                    "Q8_0".to_string(),
+                    "Q5_K_M".to_string(),
+                    "Model-Q4_K_M".to_string()
+                ],
+            })
+        );
+        assert_eq!(
+            resolve(&files, &["Model-Q4_K_M"])
                 .expect("resolves")
                 .expect("names files")
                 .weights,

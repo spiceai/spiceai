@@ -63,6 +63,49 @@ async fn a_quantization_pinned_online_loads_from_a_cache_holding_only_it() {
     assert_eq!(downloaded.gguf, ["gguf/Model-Q4_K_M.gguf"]);
 }
 
+/// A quantization pinned while the Hub listed the whole repository loads again from a cache
+/// that also holds part of another folder, one named like the quantization's tag.
+///
+/// Online, `Q4_K_M/` holds two quantizations, so the folder names neither; in a cache holding
+/// only one of them it would name that one, and a pin of the tag `Q4_K_M` would load it
+/// instead of the file the pin downloaded.
+#[tokio::test]
+async fn a_pin_is_not_taken_by_a_folder_another_quantization_has_alone_in_the_cache() {
+    crate::require_process_per_test(WHY);
+    let repository = listing(&[
+        ("gguf/Model-Q4_K_M.gguf", 4),
+        ("gguf/Model-Q8_0.gguf", 8),
+        ("Q4_K_M/Other-Q2_K.gguf", 2),
+        ("Q4_K_M/Other-Q8_0.gguf", 8),
+    ]);
+    let q4 = gguf_files::quantizations(&repository)
+        .into_iter()
+        .find(|q| q.files == ["gguf/Model-Q4_K_M.gguf"])
+        .expect("the repository offers gguf/Model-Q4_K_M.gguf");
+    let pinned = gguf_files::pin(&repository, &q4);
+
+    let cache = tempfile::tempdir().expect("creates a cache directory");
+    let snapshot = offline_snapshot(cache.path());
+    write_file(&snapshot, "gguf/Model-Q4_K_M.gguf");
+    write_file(&snapshot, "Q4_K_M/Other-Q2_K.gguf");
+
+    let files: Vec<&str> = pinned.iter().map(String::as_str).collect();
+    let downloaded = download_model(
+        REPO_ID,
+        &files,
+        Budget::Unmeasured,
+        HubParams::default(),
+        "test",
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the pin {pinned:?} must load from the cache: {e}"));
+    assert_eq!(
+        downloaded.gguf,
+        ["gguf/Model-Q4_K_M.gguf"],
+        "pin {pinned:?}"
+    );
+}
+
 /// Every shard of a draft head published as a series is downloaded, shard 1 first, which the
 /// engine opens: whether `files` names every shard, one shard, or a quantization that brings
 /// the head.
