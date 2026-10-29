@@ -407,27 +407,39 @@ async fn upsert(
 
 /// Delete a single key. File uses the durable `DELETE`; memory uses the in-RAM
 /// CDC delete path (`write_cdc_delete_keys_in_memory`).
+/// Delete one key; returns the rows-affected count a file-durability DELETE
+/// reports (`None` for the in-memory CDC path, which reports none).
 async fn delete_key(
     table: &Arc<CayenneTableProvider>,
     key: i64,
     durability: Durability,
-) -> TestResult<()> {
+) -> TestResult<Option<u64>> {
     match durability {
-        Durability::File => delete_filter(table, col("id").eq(lit(key))).await?,
+        Durability::File => Ok(Some(delete_filter(table, col("id").eq(lit(key))).await?)),
         Durability::Memory => {
             table
                 .write_cdc_delete_keys_in_memory(&id_batch(&[key]))
                 .await?;
+            Ok(None)
         }
     }
-    Ok(())
 }
 
-async fn delete_filter(table: &Arc<CayenneTableProvider>, filter: Expr) -> TestResult<()> {
+/// Run `DELETE ... WHERE filter`; returns the rows-affected count it reports.
+async fn delete_filter(table: &Arc<CayenneTableProvider>, filter: Expr) -> TestResult<u64> {
     let ctx = SessionContext::new();
     let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
-    datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
-    Ok(())
+    let batches = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
+    batches
+        .first()
+        .and_then(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+        })
+        .and_then(|a| a.values().first())
+        .copied()
+        .ok_or_else(|| "DELETE returned no rows-affected count".into())
 }
 
 /// Delete every live key. File uses `DELETE WHERE true`; memory deletes the
@@ -438,7 +450,9 @@ async fn delete_all(
     durability: Durability,
 ) -> TestResult<()> {
     match durability {
-        Durability::File => delete_filter(table, lit(true)).await?,
+        Durability::File => {
+            delete_filter(table, lit(true)).await?;
+        }
         Durability::Memory => {
             if !live_keys.is_empty() {
                 table
@@ -469,12 +483,30 @@ async fn overwrite(table: &Arc<CayenneTableProvider>, rows: &[(i64, i64)]) -> Te
 /// away and every memory workload fails with rows the model deleted still served
 /// (regression coverage for spiceai/spiceai#12008 under `cdc_durability: memory`;
 /// `mode: memory`, which never checkpoints, is still uncovered).
-async fn delete_predicate(table: &Arc<CayenneTableProvider>, lo: i64, hi: i64) -> TestResult<()> {
+async fn delete_predicate(
+    table: &Arc<CayenneTableProvider>,
+    lo: i64,
+    hi: i64,
+) -> TestResult<u64> {
     delete_filter(
         table,
         col("value").gt_eq(lit(lo)).and(col("value").lt(lit(hi))),
     )
     .await
+}
+
+/// The rows-affected count a DELETE op must report against `model` (the state
+/// before it), or `None` for an op that is not a filtered DELETE.
+fn expected_delete_count(model: &Model, op: &Op) -> Option<u64> {
+    let rows = match op {
+        Op::Delete { key } => usize::from(model.contains_key(key)),
+        Op::DeletePredicate { lo, hi } => model
+            .values()
+            .filter(|v| **v >= *lo && **v < *hi)
+            .count(),
+        _ => return None,
+    };
+    u64::try_from(rows).ok()
 }
 
 /// One "settle" pass. File compacts small files; memory additionally checkpoints
@@ -855,15 +887,28 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
         let live_value = sample_live_value(&model, &mut rng);
         let op = gen_op(&mut rng, &w.weights, w.population, w.batch_size, live_value);
         history.push(op.clone());
+        // The datalake walks also check every DELETE's rows-affected count
+        // against the model: a key whose datalake copy is superseded or retained
+        // behind tombstones must count once if live and never if not.
+        let expected_deleted = if w.cold && w.durability == Durability::File {
+            expected_delete_count(&model, &op)
+        } else {
+            None
+        };
+        let mut reported_deleted = None;
         match &op {
             Op::Upsert { rows } => upsert(&table, rows, w.durability).await?,
-            Op::Delete { key } => delete_key(&table, *key, w.durability).await?,
+            Op::Delete { key } => {
+                reported_deleted = delete_key(&table, *key, w.durability).await?;
+            }
             Op::DeleteAll => {
                 // Pre-op live keys (memory deletes them by key; file uses WHERE true).
                 let live_keys: Vec<i64> = model.keys().copied().collect();
                 delete_all(&table, &live_keys, w.durability).await?;
             }
-            Op::DeletePredicate { lo, hi } => delete_predicate(&table, *lo, *hi).await?,
+            Op::DeletePredicate { lo, hi } => {
+                reported_deleted = Some(delete_predicate(&table, *lo, *hi).await?);
+            }
             Op::Overwrite { rows } => overwrite(&table, rows).await?,
             Op::Compact => {
                 settle(&table, w.durability).await?;
@@ -895,8 +940,10 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                 materialize_warm_files_for_cold_promotion(&table, w.durability).await?;
                 // `Ok(false)` (warm tier below threshold) is fine.
                 let _ = table.promote_warm_to_cold().await?;
-                // GC serialized after promote, same task — the production
-                // promotion-tick order (out-of-band GC is unsupported).
+                // Then the datalake merge and GC, serialized in the same task —
+                // the production promotion-tick order (out-of-band GC is
+                // unsupported). `Ok(false)` (no tier qualifies) is fine.
+                let _ = table.compact_cold_tier().await?;
                 table.run_cold_tier_gc_tick().await;
             }
         }
@@ -909,6 +956,13 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
             w.mode, w.durability,
         );
         assert_converged(&live, &model, &step_msg);
+        if let Some(expected) = expected_deleted {
+            assert_eq!(
+                reported_deleted,
+                Some(expected),
+                "DELETE rows-affected count; {step_msg}"
+            );
+        }
 
         // Retiring rows is when a maintained count drifts and when deletion
         // vectors leave holes for a stale min/max to prune around. The
@@ -1069,6 +1123,7 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                 let t = handle.read().await;
                 materialize_warm_files_for_cold_promotion(&t, w.durability).await?;
                 let _ = t.promote_warm_to_cold().await?;
+                let _ = t.compact_cold_tier().await?;
                 t.run_cold_tier_gc_tick().await;
             }
             Op::Compact => continue,
@@ -1351,6 +1406,34 @@ fn sequential_cold() -> Workload {
         batch_size: 1,
         ops: scaled_ops(60),
         seeds: scaled_seeds(16),
+        pk_keyset_cache_mb: None,
+        cold: true,
+    }
+}
+// Sequential cold upsert replay: upserts that keep re-inserting keys already in
+// the datalake (often several generations deep), deletes of datalake-resident
+// keys, and promotions and restarts in between, model-checked after every op.
+// Each promotion leaves every earlier datalake file in place, so superseded
+// copies accumulate across generations and only the tombstones hide them.
+fn sequential_cold_upsert_replay() -> Workload {
+    Workload {
+        mode: Mode::Key,
+        durability: Durability::File,
+        concurrency: Concurrency::Sequential,
+        weights: OpWeights {
+            upsert: 55,
+            delete: 10,
+            delete_all: 0,
+            delete_predicate: 5,
+            overwrite: 0,
+            compact: 5,
+            restart: 5,
+            move_to_cold_tier: 20,
+        },
+        population: 24,
+        batch_size: 3,
+        ops: scaled_ops(80),
+        seeds: scaled_seeds(12),
         pk_keyset_cache_mb: None,
         cold: true,
     }
@@ -1638,6 +1721,11 @@ async fn prop_sequential_cold_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential_cold()).await
 }
 test_with_backends!(prop_sequential_cold_impl);
+
+async fn prop_sequential_cold_upsert_replay_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(f, sequential_cold_upsert_replay()).await
+}
+test_with_backends!(prop_sequential_cold_upsert_replay_impl);
 
 // Foreground promotions + restarts with a background compactor/bake loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
