@@ -791,14 +791,14 @@ impl Runtime {
         store: &DefinitionsStore,
         known: SqlDefinitions,
         stored: SqlDefinitions,
-    ) {
-        if let Err(cause) = self.serve_definitions(store, known, stored).await {
-            tracing::warn!(
-                "Failed to apply a change another instance made to the datasets and catalogs defined with SQL in {}, so this instance keeps serving its earlier definitions and retries every {} seconds. Cause: {cause}",
-                store.location(),
-                SQL_DEFINITIONS_CHECK_INTERVAL.as_secs()
-            );
-        }
+    ) -> Option<String> {
+        let cause = self.serve_definitions(store, known, stored).await.err()?;
+        tracing::warn!(
+            "Failed to apply a change another instance made to the datasets and catalogs defined with SQL in {}, so this instance keeps serving its earlier definitions and retries every {} seconds. Cause: {cause}",
+            store.location(),
+            SQL_DEFINITIONS_CHECK_INTERVAL.as_secs()
+        );
+        Some(cause)
     }
 
     /// Serve `stored`, the definitions `store` holds, when they differ from
@@ -1031,8 +1031,8 @@ impl Runtime {
                 let stored = store.load().await.map_err(|e| not_applied(&e))?;
                 if stored != defined {
                     if plan::changes_component(&op, &defined, &stored) {
-                        self.serve_change_by_another(&store, defined, stored).await;
-                        return Err(not_applied(&changed_by_another(&op)));
+                        let unserved = self.serve_change_by_another(&store, defined, stored).await;
+                        return Err(not_applied(&changed_by_another(&op, unserved.as_deref())));
                     }
                     if attempt < CONFLICT_ATTEMPTS {
                         continue;
@@ -1068,8 +1068,9 @@ impl Runtime {
                         && let Ok(stored) = store.load().await
                     {
                         if plan::changes_component(&op, &defined, &stored) {
-                            self.serve_change_by_another(&store, defined, stored).await;
-                            cause = changed_by_another(&op);
+                            let unserved =
+                                self.serve_change_by_another(&store, defined, stored).await;
+                            cause = changed_by_another(&op, unserved.as_deref());
                         } else if attempt < CONFLICT_ATTEMPTS {
                             continue;
                         }
@@ -1410,16 +1411,24 @@ fn unreadable(location: &str, cause: &str) -> String {
 }
 
 /// Why a statement was not applied when another instance changed its own
-/// dataset or catalog while it ran, and how to see that change.
-fn changed_by_another(op: &ComponentDdlOp) -> String {
+/// dataset or catalog while it ran, and how to see that change. `unserved` is
+/// why this instance could not serve the change yet, when it could not: `SHOW
+/// CREATE` then shows the earlier definition until a retry serves it.
+fn changed_by_another(op: &ComponentDdlOp, unserved: Option<&str>) -> String {
     let name = op.component_name();
     let (noun, object) = match op.kind() {
         ComponentKind::Dataset => ("dataset", "TABLE"),
         ComponentKind::Catalog => ("catalog", "CATALOG"),
     };
-    format!(
-        "another instance changed {noun} '{name}' while this statement ran. Run `SHOW CREATE {object} {name}` to see the change, then run the statement again if it still applies."
-    )
+    match unserved {
+        None => format!(
+            "another instance changed {noun} '{name}' while this statement ran. Run `SHOW CREATE {object} {name}` to see the change, then run the statement again if it still applies."
+        ),
+        Some(cause) => format!(
+            "another instance changed {noun} '{name}' while this statement ran, and this instance failed to apply that change, so `SHOW CREATE {object} {name}` shows the earlier definition until a retry applies it; Spice retries every {} seconds. Then run the statement again if it still applies. Cause: {cause}",
+            SQL_DEFINITIONS_CHECK_INTERVAL.as_secs()
+        ),
+    }
 }
 
 /// The values of `op`'s definition that a record any API key reads leaves out
@@ -1605,5 +1614,24 @@ mod tests {
                 "{value:?}"
             );
         }
+    }
+
+    /// A statement that loses a race to a change to its own component sends
+    /// the user to `SHOW CREATE`, and says when that still shows the earlier
+    /// definition because this instance could not apply the change.
+    #[test]
+    fn a_lost_race_says_where_to_see_the_change() {
+        let op = ComponentDdlOp::DropDataset {
+            name: "orders".to_string(),
+            if_exists: false,
+        };
+        assert_eq!(
+            changed_by_another(&op, None),
+            "another instance changed dataset 'orders' while this statement ran. Run `SHOW CREATE TABLE orders` to see the change, then run the statement again if it still applies."
+        );
+        assert_eq!(
+            changed_by_another(&op, Some("Permission denied (os error 13)")),
+            "another instance changed dataset 'orders' while this statement ran, and this instance failed to apply that change, so `SHOW CREATE TABLE orders` shows the earlier definition until a retry applies it; Spice retries every 10 seconds. Then run the statement again if it still applies. Cause: Permission denied (os error 13)"
+        );
     }
 }
