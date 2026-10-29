@@ -1364,7 +1364,12 @@ fn read_sql_files(step: &mut Value, base: &Path) -> Result<()> {
 fn step_key(name: &str, arg: &Value) -> String {
     let text = match arg {
         Value::String(s) => s.clone(),
-        other => other.to_string(),
+        other => {
+            // Ledger identities must not depend on serde_json's preserve_order feature.
+            let mut canonical = other.clone();
+            canonical.sort_all_objects();
+            canonical.to_string()
+        }
     };
     format!(
         "{name}: {}",
@@ -2318,6 +2323,17 @@ fn read_durations(dir: &Path) -> Result<std::collections::BTreeMap<String, u64>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ledger_keys_sort_nested_objects() {
+        let arg: Value =
+            serde_json::from_str(r#"{"table":"t","seed":1,"options":{"z":2,"a":1},"queries":200}"#)
+                .expect("parse generator arguments");
+        assert_eq!(
+            step_key("tlp", &arg),
+            r#"tlp: {"options":{"a":1,"z":2},"queries":200,"seed":1,"table":"t"}"#,
+        );
+    }
 
     #[test]
     fn query_protocols_keep_prepared_statements_on_flightsql() {

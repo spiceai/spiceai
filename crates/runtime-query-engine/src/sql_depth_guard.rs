@@ -114,9 +114,22 @@ pub const MAX_QUERY_NESTING_DEPTH: usize = 64;
 /// before the parser runs. 32 is far above any real nested type.
 pub const MAX_SQL_DATA_TYPE_DEPTH: usize = 32;
 
+/// Maximum number of table references one query may read through common table
+/// expressions, counted after each CTE reference is expanded to the full body
+/// of that CTE.
+///
+/// The planner inlines a separate copy of a CTE's plan for every reference to
+/// it, so CTEs that each read an earlier one several times multiply in size:
+/// ten CTEs that each read the one before twice expand to 1024 copies of the
+/// first. Each CTE reference counts the table references in its expanded body,
+/// or one if the body reads no table. Table references written directly in the
+/// query, outside any CTE, do not count.
+pub const MAX_CTE_EXPANDED_REFERENCES: usize = 4096;
+
 /// Reject `statement` if its queries, any of its expression trees, or any
 /// `arrow_cast` type string it carries, is nested more deeply than the fixed
-/// limits above.
+/// limits above, or if its CTE references expand past
+/// [`MAX_CTE_EXPANDED_REFERENCES`].
 ///
 /// Handles the `sqlparser` statement, the `EXPLAIN` wrapper, and a query
 /// nested in `COPY (query) TO`. `COPY <table> TO`, `CREATE EXTERNAL TABLE`,
@@ -299,11 +312,21 @@ impl Default for DepthCollector {
 }
 
 struct QueryFrame {
-    /// The CTEs this query's `WITH` defines, with each one's depth once its
+    /// The CTEs this query's `WITH` defines, with each one's size once its
     /// body has been visited. The pointer only identifies the body query.
-    ctes: Vec<(String, *const Query, Option<usize>)>,
+    ctes: Vec<(String, *const Query, Option<CteSize>)>,
     /// Depth of the deepest subquery or CTE this query reads.
     deepest_read: usize,
+    /// Table references this query reads with every CTE reference expanded.
+    expanded_references: usize,
+    /// The part of `expanded_references` read through CTE references.
+    cte_references: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CteSize {
+    depth: usize,
+    expanded_references: usize,
 }
 
 impl DepthCollector {
@@ -334,6 +357,8 @@ impl Visitor for DepthCollector {
         self.queries.push(QueryFrame {
             ctes,
             deepest_read: 0,
+            expanded_references: 0,
+            cte_references: 0,
         });
         ControlFlow::Continue(())
     }
@@ -346,39 +371,63 @@ impl Visitor for DepthCollector {
         if depth > MAX_QUERY_NESTING_DEPTH {
             return self.reject(too_deep_query_error());
         }
-        if let Some(parent) = self.queries.last_mut() {
-            let body: *const Query = query;
-            match parent
-                .ctes
-                .iter_mut()
-                .find(|(_, b, _)| std::ptr::eq(*b, body))
-            {
-                Some((_, _, cte_depth)) => *cte_depth = Some(depth),
-                None => parent.deepest_read = parent.deepest_read.max(depth),
-            }
+        let Some(parent) = self.queries.last_mut() else {
+            return ControlFlow::Continue(());
+        };
+        let body: *const Query = query;
+        if let Some((_, _, size)) = parent
+            .ctes
+            .iter_mut()
+            .find(|(_, b, _)| std::ptr::eq(*b, body))
+        {
+            *size = Some(CteSize {
+                depth,
+                expanded_references: frame.expanded_references,
+            });
+            return ControlFlow::Continue(());
+        }
+        parent.deepest_read = parent.deepest_read.max(depth);
+        parent.expanded_references = parent
+            .expanded_references
+            .saturating_add(frame.expanded_references);
+        parent.cte_references = parent.cte_references.saturating_add(frame.cte_references);
+        if parent.cte_references > MAX_CTE_EXPANDED_REFERENCES {
+            return self.reject(too_many_cte_references_error());
         }
         ControlFlow::Continue(())
     }
 
-    // A single-part name reads the deepest CTE in scope it could resolve to.
+    // A single-part name reads the largest CTE in scope it could resolve to.
     // Names match case-insensitively in every enclosing query, which can only
-    // overstate the depth.
+    // overstate the depth and size.
     fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<()> {
-        let [part] = relation.0.as_slice() else {
+        let cte_size = match relation.0.as_slice() {
+            [part] => part.as_ident().and_then(|ident| {
+                self.queries
+                    .iter()
+                    .flat_map(|frame| &frame.ctes)
+                    .filter(|(cte, _, _)| cte.eq_ignore_ascii_case(&ident.value))
+                    .filter_map(|(_, _, size)| *size)
+                    .reduce(|a, b| CteSize {
+                        depth: a.depth.max(b.depth),
+                        expanded_references: a.expanded_references.max(b.expanded_references),
+                    })
+            }),
+            _ => None,
+        };
+        let Some(frame) = self.queries.last_mut() else {
             return ControlFlow::Continue(());
         };
-        let Some(name) = part.as_ident().map(|ident| ident.value.as_str()) else {
+        let Some(size) = cte_size else {
+            frame.expanded_references = frame.expanded_references.saturating_add(1);
             return ControlFlow::Continue(());
         };
-        let cte_depth = self
-            .queries
-            .iter()
-            .flat_map(|frame| &frame.ctes)
-            .filter(|(cte, _, _)| cte.eq_ignore_ascii_case(name))
-            .filter_map(|(_, _, depth)| *depth)
-            .max();
-        if let (Some(depth), Some(frame)) = (cte_depth, self.queries.last_mut()) {
-            frame.deepest_read = frame.deepest_read.max(depth);
+        let references = size.expanded_references.max(1);
+        frame.deepest_read = frame.deepest_read.max(size.depth);
+        frame.expanded_references = frame.expanded_references.saturating_add(references);
+        frame.cte_references = frame.cte_references.saturating_add(references);
+        if frame.cte_references > MAX_CTE_EXPANDED_REFERENCES {
+            return self.reject(too_many_cte_references_error());
         }
         ControlFlow::Continue(())
     }
@@ -487,6 +536,15 @@ fn too_deep_query_error() -> DataFusionError {
         "Query rejected: queries are nested more than {MAX_QUERY_NESTING_DEPTH} levels deep, \
          counting subqueries and common table expressions that read one another. Simplify the \
          query (for example, combine steps of a long WITH chain)."
+    ))
+}
+
+fn too_many_cte_references_error() -> DataFusionError {
+    DataFusionError::Plan(format!(
+        "Query rejected: common table expressions expand to more than \
+         {MAX_CTE_EXPANDED_REFERENCES} table references, because each reference to a WITH query \
+         plans its own copy of that query. Simplify the query (for example, read each WITH query \
+         fewer times from later WITH queries)."
     ))
 }
 
@@ -1346,6 +1404,58 @@ mod tests {
              SELECT * FROM a JOIN b USING (n)",
         )
         .expect("ordinary CTEs pass");
+    }
+
+    /// One CTE read `n` times from a single `FROM` list.
+    fn cte_read_times(n: usize) -> String {
+        let reads: Vec<String> = (0..n).map(|i| format!("c a{i}")).collect();
+        format!(
+            "WITH c AS (SELECT 1 AS x) SELECT 1 FROM {}",
+            reads.join(", ")
+        )
+    }
+
+    #[test]
+    fn cte_references_are_bounded_at_the_expansion_cap() {
+        depth_check(&cte_read_times(MAX_CTE_EXPANDED_REFERENCES)).expect("reads at the cap pass");
+        let err = depth_check(&cte_read_times(MAX_CTE_EXPANDED_REFERENCES + 1))
+            .expect_err("one read over the cap is rejected");
+        assert_eq!(err.to_string(), too_many_cte_references_error().to_string());
+    }
+
+    /// CTEs that each read the one before twice double in expanded size, and
+    /// a CTE reference counts the tables its body reads.
+    #[test]
+    fn cte_references_count_their_expanded_body() {
+        let doubling = |levels: usize, table: &str| {
+            let mut ctes = vec![format!("c0 AS (SELECT x FROM {table})")];
+            ctes.extend(
+                (1..=levels).map(|i| format!("c{i} AS (SELECT a.x FROM c{0} a, c{0} b)", i - 1)),
+            );
+            format!("WITH {} SELECT x FROM c{levels}", ctes.join(", "))
+        };
+        let levels = MAX_CTE_EXPANDED_REFERENCES.ilog2() as usize;
+        depth_check(&doubling(levels, "(SELECT 1 AS x) t"))
+            .expect("an expansion at the cap passes");
+        let err = depth_check(&doubling(levels, "t, t"))
+            .expect_err("two tables in the first CTE double the expansion");
+        assert_eq!(err.to_string(), too_many_cte_references_error().to_string());
+        let err = depth_check(&doubling(levels + 1, "(SELECT 1 AS x) t"))
+            .expect_err("one more level is over the cap");
+        assert_eq!(err.to_string(), too_many_cte_references_error().to_string());
+    }
+
+    /// Table references outside CTE expansion do not count.
+    #[test]
+    fn allows_many_plain_table_references() {
+        let reads: Vec<String> = (0..2 * MAX_CTE_EXPANDED_REFERENCES)
+            .map(|i| format!("t{i}"))
+            .collect();
+        depth_check(&format!(
+            "WITH c AS (SELECT 1 AS x) SELECT 1 FROM c, {}",
+            reads.join(", ")
+        ))
+        .expect("plain tables pass");
     }
 
     #[test]

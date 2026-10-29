@@ -85,27 +85,9 @@
     {
       "run": "federated-known-failing[source=mysql]",
       "who": "federated",
-      "key": "query: SELECT id, char_length(s) FROM t WHERE char_length(s) > 4",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"char_length(t.s)\", row_number: 8, expected: \"\\\"5\\\"\", actual: \"\\\"6\\\"\" }",
-      "group": "federation-mysql"
-    },
-    {
-      "run": "federated-known-failing[source=mysql]",
-      "who": "federated",
       "key": "query: SELECT t.id, u.id FROM t LEFT JOIN u ON t.id = u.t_id WHERE t.id < 30",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow.\\nFailed to build record batch: Invalid argument error: Column 'id' is declared as non-nullable but contains null values.\\nReport a bug to ",
-      "group": "federation-mysql"
-    }
-  ],
-  "slt-strings": [
-    {
-      "run": "slt-strings[source=mysql]",
-      "who": "federated",
-      "key": "slt: {\"file\":\"../../slt/strings.slt\",\"source\":\"src\"}",
-      "kind": "error",
-      "signature": "1 pass, 1 spice-wrong, 0 spice-error, 0 known-error, 0 dialect, 0 accepted-invalid, 0 skipped; report: <path>",
       "group": "federation-mysql"
     }
   ]

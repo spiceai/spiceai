@@ -1,0 +1,36 @@
+# Known failure (#15538): federated MySQL rejects the computed grouping key in HAVING.
+name: unparse-nullable-having
+description: >
+  A HAVING predicate on a nullable computed grouping key returns the same
+  count through every execution engine as PostgreSQL over the source rows.
+
+sources:
+  pg: { kind: postgres }
+  my: { kind: mysql }
+
+variants:
+  postgres: {}
+  mysql: { datasets: { e: { from: 'mysql:e', params: '${sources.my.params}' } } }
+  duckdb: { datasets: { e: { acceleration: { enabled: true, engine: duckdb, mode: file } } } }
+  cayenne: { datasets: { e: { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: unparse-nullable-having
+  datasets:
+    - from: postgres:public.e
+      name: e
+      params: ${sources.pg.params}
+
+defaults:
+  expect: { oracle: pg }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      pg: CREATE TABLE e (id int PRIMARY KEY, v int); INSERT INTO e SELECT i, i % 3 FROM generate_series(1, 11) i;
+  - source-exec:
+      my: CREATE TABLE e (id int PRIMARY KEY, v int); INSERT INTO e VALUES (1,1),(2,2),(3,0),(4,1),(5,2),(6,0),(7,1),(8,2),(9,0),(10,1),(11,2);
+  - start: {}
+  - query: SELECT count(*) AS n FROM (SELECT CASE WHEN v = 0 THEN NULL ELSE v END AS k, max(id) AS m FROM e GROUP BY CASE WHEN v = 0 THEN NULL ELSE v END HAVING CASE WHEN v = 0 THEN NULL ELSE v END IS NULL) x

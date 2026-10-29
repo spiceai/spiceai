@@ -107,7 +107,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | Fork | Pinned revision | Branch |
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `6e4119ac2007c6647702a1817505d6849b07e0e0` | `spiceai-24` |
-| [arrow-rs](#arrow-rs) | `045a425f71507d1150bfeeeb5834e43429cb5011` | `spiceai-59` |
+| [arrow-rs](#arrow-rs) | `2124b9e85c8c4f50fdacfa23d75cbad6a4db9086` | `spiceai-59` |
 | [async-openai](#async-openai) | `307eaf407cbf71afa967f3008250ba96c79626b7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb` | `spiceai` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `3a75c403e4db3bc2f76f0d8c2cfce610f52f3675` | `spiceai-55` |
+| [datafusion](#datafusion) | `2644c0d5aad82c29c7c02a6617a71c664f55e94c` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `4a2920746865562e604150fbee49eea6241c0b85` | `spiceai-55` |
@@ -127,7 +127,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [llama.cpp](#llamacpp) | `a337bb5ce3590beb8763494b4381fe830bac0bc8` | `spiceai-b11803` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `aa8e8d43949970b91fb42a2243b4f60f810d9bbd` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
-| [orc-rust](#orc-rust) | `5b35c6d10a8cbd9750d501216ff04e72e23829b6` | `spiceai-0.9` |
+| [orc-rust](#orc-rust) | `d9632e7ae973456c81c660c04e5f55cc86489bcb` | `spiceai-0.9` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
 | [sea-query](#sea-query) | `ae75baef819513fb8d19af014972dcfa324e201a` | `spiceai` |
@@ -218,8 +218,12 @@ fetch through a single-input repartition, #266, which charges each slice of a ba
 sort shares with its producer for the slice's own rows, #261, which keeps a union input's own
 `ORDER BY` and `LIMIT` inside that input, #262, which keeps a cast that drops decimal digits out
 of `unwrap_cast`, the unparser fixes #246, #247 and #264, and #268, which narrows #266's copy to
-batches whose rows are slices of larger buffers, and #273, upstream apache/datafusion#23232
-cherry-picked from `main`; the pin is #273's merge commit. None changes a
+batches whose rows are slices of larger buffers. The pin is merged #270, which
+includes #273's scalar-UDF coercion fix and the SQL semantics fixes for
+[#15538](https://github.com/spiceai/spiceai/issues/15538): parenthesized IS and NOT
+operands, preserved pruned aggregates and correlated projection scopes, scan
+filters before projection, CASE error propagation, and character-counting MySQL
+string length. The existing patches remain in the commit ancestry. None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
 code, and removes no line of it. The branch also carries
@@ -266,6 +270,11 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Unparser: the dangling-qualifier sweep keeps a qualifier that an `UNNEST` or `LATERAL FLATTEN` alias, the last part of a schema-qualified table, or the column a struct field path is rooted at binds (spiceai/datafusion#246) | The sweep strips a qualifier that does bind: two `UNNEST` aliases sharing a column name give `SELECT c1, c1 …`, and a join of two schema-qualified tables gives `SELECT v, v FROM s.a INNER JOIN s.b …`, which `DuckDB` rejects as ambiguous; `test."metadata".product` is cut to `product` ([#13442](https://github.com/spiceai/spiceai/issues/13442)) | silent (query failure) | **GAP** — no guard here yet; in the fork, the `plan_to_sql.rs` cases #246 fixes; see [Open gaps](#open-gaps) |
 | Unparser: a sort key that reads a projection output that cannot be repeated, through a larger expression, puts the projection in a derived table so the `ORDER BY` reads the output by name (spiceai/datafusion#247) | `ORDER BY (r + 1.0)` over `random() AS r` is emitted as `ORDER BY (random() + 1.0)`, a second draw: the rows are ordered by a value the `SELECT` list never showed, and under a `LIMIT` a different row is selected than the one whose `r` comes back ([#14109](https://github.com/spiceai/spiceai/issues/14109)) | silent (wrong data) | **GAP** — no guard here yet; in the fork, the cases #247 adds to `plan_to_sql.rs`; see [Open gaps](#open-gaps) |
 | Unparser: a join input that lists no columns of its own, such as a bare or filtered table scan, contributes `q.*` for each relation it reads; a column-less input contributes nothing beside another relation; an aggregate no projection takes lists its group keys before its aggregates (spiceai/datafusion#264) | The join's `SELECT` list no longer matches the plan's schema: `SELECT FROM t WHERE EXISTS (…)`, which `DuckDB` rejects, and `SELECT u.a, (u.a * 2) AS d FROM t INNER JOIN u …`, which returns two columns where the plan has three, so a consumer reading by position gets one input's columns under another's names ([#14738](https://github.com/spiceai/spiceai/issues/14738)) | silent (wrong data / query failure) | **GAP** — no guard here yet; in the fork, the join-input cases #264 adds to `plan_to_sql.rs`; see [Open gaps](#open-gaps) |
+| Unparser: nested IS and NOT predicates parenthesize their operands (#15538) | `(NOT x) IS NULL` selects different rows when emitted as `NOT x IS NULL`; MySQL rejects chained IS predicates; ClickHouse gives `NOT (x IS NULL) IS NULL` a different meaning from `NOT ((x IS NULL) IS NULL)` | silent (wrong data / query failure) | `crates/data_components/src/federation.rs::tests::is_predicate_unparsing_preserves_boolean_partitions`; real-engine guards: `test/spicescript/sql-predicate-precedence.yaml` and `test/spicescript/tlp.yaml`. In the fork, `test_unparser_preserves_is_predicate_operands` |
+| Unparser: a projection reading no aggregate outputs keeps the aggregation in a derived table (#15538) | A pruned global aggregate returns its input's rows instead of one row, and a pruned grouped aggregate loses its groups | silent (wrong data) | `test/spicescript/unparse-pruned-aggregate.yaml`, including empty inputs, nested aggregates, `HAVING`, and `QUALIFY`; in the fork, `test_unparser_preserves_pruned_aggregate_rows` |
+| Unparser: aggregate scopes retain correlated subquery bindings and require uniquely addressable grouping outputs (fork PR #270) | Correlated projections lose their FROM binding; grouping sets hit internal grouping-id errors; qualified duplicate grouping names collide | query failure | `test/spicescript/unparse-aggregate-scopes.yaml`; fork `test_unparser_preserves_aggregate_projection_scope_guards` |
+| Unparser: scan filters apply before scan projection (#15538) | The SQL for a filtered INTERSECT or EXCEPT reads `right.id` outside a derived table that projects only the compared columns | silent (query failure) | `test/spicescript/unparse-set-operations.yaml`; in the fork, `test_unparser_preserves_filtered_set_operation_scope` |
+| MySQL dialect: Spark's `length` renders as `character_length` for strings and `length` for binary values (#15538) | Non-ASCII strings return byte counts, so `char_length('naïve')` returns 6 instead of 5 and filters select different rows | silent (wrong data) | `test/spicescript/mysql-string-length.yaml` checks Unicode, aliases, NULL, binary bytes, and the pushed SQL; in the fork, `test_unparser_preserves_mysql_length_units` |
 | Unparser: empty `Projection` emits `SELECT 1` | A projection with no expressions unparses to `SELECT FROM …`, which is not valid SQL, so the federated query fails outright | silent (query failure) | `…::an_empty_projection_does_not_unparse_to_an_empty_select_list` |
 | Unparser: `AT TIME ZONE` faithfully unparsed (fork PR #160), and suppressed for fixed-offset timezones on DuckDB (fork PR #195) | The timezone is dropped from the SQL, so the remote engine evaluates the expression in its own session timezone | silent (wrong data) | `…::a_timezone_survives_unparsing_except_where_the_engine_cannot_resolve_it` |
 | BigQuery dialect: `FLOAT64` not `DOUBLE`, timestamp literal format, `date_field_extract_style` / `interval_style` overrides, `date_trunc` support, no column alias inside a table alias (fork PRs #144, #146, #147, #148, #169). The #144 override is no longer on the branch — the upstream `Dialect` default now renders an accepted format, which the guard pins either way | Federated BigQuery queries are rejected by BigQuery, or silently coerce types. Losing the `date_trunc` week mapping is quieter still: DataFusion truncates a week to Monday and BigQuery's bare `WEEK` is Sunday-based, so the week starts on the wrong day — one day out for a Monday-to-Saturday timestamp, six for a Sunday one — and the query returns wrong rows with no error | silent (wrong data / query failure) | `…::bigquery_names_the_float_type_the_way_bigquery_does`, `…::bigquery_attaches_a_timestamp_offset_to_the_time`, `…::bigquery_extracts_date_fields_and_spells_intervals_the_standard_way`, `…::bigquery_inlines_a_derived_tables_column_aliases`, `…::bigquery_truncates_a_timestamp_the_way_bigquery_does` |
@@ -345,7 +354,8 @@ below was re-confirmed present at the pinned revision. Upstream deprecates
 merged cleanly and are kept. The pin lives in the object-store Parquet reader
 (`parquet/src/arrow/async_reader/store.rs`), in the push-decoder short-read
 path (`parquet/src/util/push_buffers.rs` and its callers), in the page decoder
-(`parquet/src/file/serialized_reader.rs`), in the Thrift metadata decoder
+(`parquet/src/file/serialized_reader.rs`), in the footer schema conversion
+(`parquet/src/schema/types.rs`), in the Thrift metadata decoder
 (`parquet/src/parquet_thrift.rs`,
 `parquet/src/file/metadata/thrift/mod.rs`,
 `parquet/src/file/page_index/offset_index.rs`), in
@@ -364,6 +374,7 @@ path (`parquet/src/util/push_buffers.rs` and its callers), in the page decoder
 | `Decimal` → floating-point cast rounds from the exact decimal digits instead of widening the coefficient to `f64` and dividing by `10^scale` ([spiceai/arrow-rs#26](https://github.com/spiceai/arrow-rs/pull/26)) | A coefficient past 2^53 loses precision before the divide, so a decimal read back as a float is off in the low digits. Measured: a pushed-down Postgres `avg` read as `Decimal128(38, 20)` returned `47.50000000000001` instead of `47.5` ([#13978](https://github.com/spiceai/spiceai/issues/13978)) | silent (wrong data) | `crates/arrow_tools/src/record_batch.rs::test::decimal_to_float_cast_is_correctly_rounded` |
 | `FlightSqlServiceClient::do_get_flight_data` — a `DoGet` that returns the raw `FlightData` stream with the client's headers and bearer token applied, as `do_get` applies them | The Flight SQL connector can no longer replace a schema message before arrow decodes it. A server that declares a `MAP`'s `entries` field nullable (which arrow 59 refuses at decode) fails every read of that table with `The nullable should be set to false for the map entries field`, naming no column. Going through `inner_mut()` instead would drop the `traceparent` and bearer token, which are private to the client | build (the method) | `crates/data_components/src/flightsql.rs::tests::query_to_stream_corrects_a_servers_nullable_map_entries_declaration` |
 | Thrift list lengths in Parquet metadata are bounded by the bytes left in the input: `list_capacity` refuses a declared count the remaining bytes cannot encode, and caps the reservation where the input length is unknown ([spiceai/arrow-rs#32](https://github.com/spiceai/arrow-rs/pull/32)) | Every footer list (`schema`, `row_groups`, `key_value_metadata`, `column_orders`) and the offset index's `page_locations` decodes into a `Vec` sized from the element count in its Thrift list header. A file of a few bytes can declare `i32::MAX` elements, so the reader reserves room for all of them before reading one — during schema inference at dataset initialization, and again on every refresh of that dataset | not silent (memory exhaustion takes the runtime down) | `crates/data-connector-api/src/listing/connector.rs::an_oversized_footer_list_length_is_a_parquet_error_and_not_an_allocation` |
+| `schema_from_array_helper` refuses a footer schema nested more than 100 levels below its root ([spiceai/arrow-rs#33](https://github.com/spiceai/arrow-rs/pull/33)) | The footer's flat schema element list is rebuilt into a tree by recursing once per nesting level, with no bound. A Parquet file of a few KiB that declares a few hundred nested levels overflows the stack during schema inference at dataset initialization, and again on every refresh of that dataset | not silent (stack overflow aborts the runtime) | `crates/data-connector-api/src/listing/connector.rs::a_footer_schema_nested_past_the_depth_limit_is_a_parquet_error` |
 
 ## datafusion-ballista
 
@@ -665,6 +676,7 @@ branch `spiceai-0.9` cut from upstream `v0.9.0`.
 |---|---|---|---|
 | Metadata streams (file footer, file metadata, stripe footers, row indexes, bloom filters) fail once decoded output exceeds both 64 MiB and 100 times the encoded size; column data streams stay unbounded | A small ORC file with a highly compressible footer makes the runtime allocate until it runs out of memory | silent (memory) | `crates/dataformat-orc/src/file_format.rs::infer_schema_rejects_high_ratio_compressed_footer` |
 | Each codec stops decoding at the remaining allowance, with LZO decoded through `lzo` into a bounded buffer instead of `lzokay-native` | One compressed chunk is decoded in full before the bound rejects it, so a single chunk can still allocate up to its own expansion | silent (memory) | **GAP** — the bound above still rejects the stream after the chunk decodes, so only a memory measurement can tell the two apart |
+| The footer type tree is refused past 100 levels below the root, or when it uses one footer type more than once (`DataType::from_proto`) | A small ORC footer whose subtype indices nest very deep, point back at an ancestor or share a child makes schema building recurse until the stack overflows or build a tree far larger than the file | silent (crash / memory) | `crates/dataformat-orc/src/file_format.rs::infer_schema_bounds_the_footer_type_tree` |
 
 ## text-splitter
 
