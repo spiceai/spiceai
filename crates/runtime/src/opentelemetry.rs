@@ -3211,12 +3211,12 @@ mod tests {
         context
     }
 
-    /// A read-only API key must not persist an OTLP metrics export. The metrics store table is
-    /// writable, so a missing principal check would store the row and return success.
+    /// A read-only API key must not persist an OTLP metrics export. The fake engine accepts every
+    /// write, so a missing principal check would store the row and return success.
     #[tokio::test]
     async fn otlp_grpc_read_only_api_key_is_denied_and_writes_nothing() {
-        let engine = Arc::new(FakeQueryEngine::unregistered().writable_only(&["otel_metrics"]));
-        let service = store_service(&engine, &["otel_metrics"]);
+        let engine = Arc::new(FakeQueryEngine::unregistered());
+        let service = build_metrics_service(Arc::clone(&engine) as Arc<dyn QueryEngine>, None);
         let request = otlp_request(vec![otlp_metric("checkout_requests", Some(gauge(1.0)))]);
 
         let status = context_with_api_key(ApiKey::ReadOnly {
@@ -3229,14 +3229,14 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::PermissionDenied);
         assert_eq!(status.message(), "API key does not allow write access");
         assert_eq!(engine.rows_written(), 0);
-        assert!(engine.tables_written().is_empty());
+        assert_eq!(engine.write_calls(), 0);
     }
 
     /// A read-write API key still stores the export.
     #[tokio::test]
     async fn otlp_grpc_read_write_api_key_exports_metrics() {
-        let engine = Arc::new(FakeQueryEngine::unregistered().writable_only(&["otel_metrics"]));
-        let service = store_service(&engine, &["otel_metrics"]);
+        let engine = Arc::new(FakeQueryEngine::unregistered());
+        let service = build_metrics_service(Arc::clone(&engine) as Arc<dyn QueryEngine>, None);
         let request = otlp_request(vec![otlp_metric("svc_requests", Some(gauge(1.0)))]);
 
         let response = context_with_api_key(ApiKey::ReadWrite {
@@ -3248,7 +3248,7 @@ mod tests {
         .into_inner();
 
         assert!(response.partial_success.is_none());
-        assert_eq!(engine.tables_written(), vec!["otel_metrics".to_string()]);
+        assert_eq!(engine.write_calls(), 1);
         assert_eq!(engine.rows_written(), 1);
     }
 
