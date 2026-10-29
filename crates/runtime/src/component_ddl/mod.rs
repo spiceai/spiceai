@@ -901,12 +901,18 @@ impl Runtime {
     }
 
     /// The app the Spicepods declare, without the components defined with SQL
-    /// that the runtime serves beside them.
+    /// that the runtime serves beside them, or `None` while the runtime serves
+    /// no app: reading the definitions with none served records an empty one.
     pub async fn read_spicepod_app(&self) -> Option<Arc<App>> {
-        match self.sql_components.spicepod.read().await.clone() {
-            Some(spicepod) => Some(spicepod),
-            None => self.read_app().await,
-        }
+        let served = self.read_app().await?;
+        Some(
+            self.sql_components
+                .spicepod
+                .read()
+                .await
+                .clone()
+                .unwrap_or(served),
+        )
     }
 
     /// The app to serve for `app`, an app the Spicepods declare: it with the
