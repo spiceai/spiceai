@@ -1480,8 +1480,10 @@ pub struct DataFusion {
     /// again once unused, so unknown table names cannot grow the map without bound.
     schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::RwLock<()>>>>,
     /// Per dataset whose appends may be written together, the appends waiting
-    /// for its turn (see [`append_coalescer`]). Keyed by the bare table name, as
-    /// `schema_evolve_locks` is; created on a dataset's first eligible append.
+    /// for its turn (see [`append_coalescer`]). Keyed by the table reference
+    /// `get_table_provider` resolves (see `queue_key`), so every name for one
+    /// dataset shares its queue and datasets of one name in different schemas do
+    /// not; created on a dataset's first eligible append.
     append_queues: ParkingMutex<HashMap<TableReference, Arc<append_coalescer::AppendQueue>>>,
     change_generations: ChangeGenerations,
     bootstrap_owners: ParkingMutex<HashMap<ResolvedTableReference, Weak<BootstrapOwner>>>,
@@ -3577,11 +3579,7 @@ impl DataFusion {
         if queues.len() >= MAX_APPEND_QUEUES {
             queues.retain(|_, queue| Arc::strong_count(queue) > 1);
         }
-        let queue = Arc::clone(
-            queues
-                .entry(TableReference::bare(table_reference.table().to_string()))
-                .or_default(),
-        );
+        let queue = Arc::clone(queues.entry(queue_key(table_reference)).or_default());
         Some((queue, grouping))
     }
 
@@ -3622,7 +3620,7 @@ impl DataFusion {
         let queue = self
             .append_queues
             .lock()
-            .get(&TableReference::bare(table_reference.table().to_string()))
+            .get(&queue_key(table_reference))
             .cloned();
         queue.map_or((0, 0, 0), |queue| {
             let (groups, members) = queue.claimed();
@@ -7816,6 +7814,24 @@ fn insert_error(
             Error::UnableToExecuteTableInsert { table_name, source }
         }
     }
+}
+
+/// The key of `table_reference`'s append queue: the catalog, schema and table
+/// `DataFusion::get_table_provider` resolves it to, defaults filled in as there.
+/// One dataset's appends must share a queue whatever name they use, or one
+/// queue's append could be written ahead of an earlier append queued in another.
+fn queue_key(table_reference: &TableReference) -> TableReference {
+    TableReference::full(
+        table_reference
+            .catalog()
+            .unwrap_or(SPICE_DEFAULT_CATALOG)
+            .to_string(),
+        table_reference
+            .schema()
+            .unwrap_or(SPICE_DEFAULT_SCHEMA)
+            .to_string(),
+        table_reference.table().to_string(),
+    )
 }
 
 /// Who runs a `write_data` call's [`DataFusion::after_write`].
