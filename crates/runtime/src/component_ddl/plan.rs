@@ -737,11 +737,7 @@ mod tests {
         let mut tuned = cayenne.clone();
         if let Some(acceleration) = tuned.acceleration.as_mut() {
             acceleration.params = Some(spicepod::param::Params::from_string_map(
-                [(
-                    "cayenne_file_path".to_string(),
-                    "/data/orders".to_string(),
-                )]
-                .into(),
+                [("cayenne_file_path".to_string(), "/data/orders".to_string())].into(),
             ));
         }
 
