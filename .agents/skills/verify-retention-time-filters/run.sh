@@ -99,7 +99,9 @@ ctl=$(q "select count(*) from w_ctl")
 for e in $ENGINES; do
   n=$(q "select count(*) from w_$e")
   # Loads start a few seconds apart and the boundary has 1 row/s, so allow a small skew.
-  if [ -n "$n" ] && [ -n "$ctl" ] && [ $((n - ctl)) -le 10 ] && [ $((ctl - n)) -le 10 ]; then
+  # Both windows must be non-empty: an empty pair would "match" while hiding a broken filter.
+  if [ -n "$n" ] && [ -n "$ctl" ] && [ "$n" -gt 0 ] && [ "$ctl" -gt 0 ] \
+    && [ $((n - ctl)) -le 10 ] && [ $((ctl - n)) -le 10 ]; then
     pass "w_$e: rows=$n ~ w_ctl=$ctl"
   else
     fail "w_$e: rows=$n, w_ctl=$ctl"
