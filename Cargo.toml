@@ -302,7 +302,7 @@ datafusion-proto-common = "55.2.0"
 datafusion-pruning = "55.2.0"
 datafusion-spark = "55.2.0"
 datafusion-substrait = "55.2.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "4a2920746865562e604150fbee49eea6241c0b85" } # branch: spiceai-55
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "ead7631b4663758b6343554807822fd9f313b865" } # branch: lukim/mysql-pool-opts (TEMPORARY: spiceai/datafusion-table-providers PR, repoint at its spiceai-55 merge commit)
 delta_kernel = { version = "0.27.1", features = ["arrow-59", "internal-api"] }
 delta_kernel_default_engine = { version = "0.27.1", default-features = false, features = [
     "arrow-59",

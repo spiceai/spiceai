@@ -1,0 +1,148 @@
+name: mysql-connection-pool
+description: >
+  A MySQL dataset's connection pool takes its size and connection lifetime from
+  the Spicepod whether the server is given as individual parameters or as a
+  connection string: a connection string without pool settings gets the
+  documented defaults (at most 5 connections, 1 kept idle), not 10 and 100.
+  Connections are replaced once `connection_max_lifetime` passes, and kept
+  when it is `0s`. An invalid pool value, or one the connection string sets
+  differently, fails the dataset with an error naming the parameter. Each
+  dataset connects as its own MySQL user, so MySQL's own process list and
+  per-user connection totals are the oracle.
+
+sources:
+  src: { kind: mysql }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mysql-connection-pool
+  datasets:
+    # Connection string, no pool settings: Spice's defaults apply.
+    - from: mysql:slow
+      name: url_default
+      params:
+        mysql_connection_string: 'mysql://ud_${sources.src.namespace}:pw@127.0.0.1:${sources.src.params.mysql_tcp_port}/${sources.src.namespace}'
+        mysql_sslmode: disabled
+    # Connection string, pool sized in the Spicepod.
+    - from: mysql:slow
+      name: url_sized
+      params:
+        mysql_connection_string: 'mysql://us_${sources.src.namespace}:pw@127.0.0.1:${sources.src.params.mysql_tcp_port}/${sources.src.namespace}'
+        mysql_sslmode: disabled
+        mysql_pool_min: 2
+        mysql_pool_max: 3
+    - from: mysql:t
+      name: life_short
+      params: { $merge: '${sources.src.params}', mysql_user: 'ls_${sources.src.namespace}', mysql_pass: pw, mysql_connection_max_lifetime: 2s }
+      metrics:
+        - name: discarded_expired_connection
+    - from: mysql:t
+      name: life_off
+      params: { $merge: '${sources.src.params}', mysql_user: 'lo_${sources.src.namespace}', mysql_pass: pw, mysql_connection_max_lifetime: 0s }
+    - from: mysql:t
+      name: life_default
+      params: { $merge: '${sources.src.params}', mysql_user: 'ld_${sources.src.namespace}', mysql_pass: pw }
+    - from: mysql:t
+      name: bad_pool_max
+      params: { $merge: '${sources.src.params}', mysql_pool_max: five }
+    - from: mysql:t
+      name: bad_lifetime
+      params: { $merge: '${sources.src.params}', mysql_connection_max_lifetime: soon }
+    - from: mysql:t
+      name: conflicting_pool_max
+      params:
+        mysql_connection_string: 'mysql://root:${sources.src.params.mysql_pass}@127.0.0.1:${sources.src.params.mysql_tcp_port}/${sources.src.namespace}?pool_max=20'
+        mysql_sslmode: disabled
+        mysql_pool_max: 5
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id INT PRIMARY KEY, v INT);
+        INSERT INTO t VALUES (1, 10);
+        CREATE VIEW slow AS SELECT id, SLEEP(0.3) AS s FROM t;
+        CREATE USER 'ud_${sources.src.namespace}'@'%' IDENTIFIED BY 'pw';
+        CREATE USER 'us_${sources.src.namespace}'@'%' IDENTIFIED BY 'pw';
+        CREATE USER 'ls_${sources.src.namespace}'@'%' IDENTIFIED BY 'pw';
+        CREATE USER 'lo_${sources.src.namespace}'@'%' IDENTIFIED BY 'pw';
+        CREATE USER 'ld_${sources.src.namespace}'@'%' IDENTIFIED BY 'pw';
+        GRANT SELECT ON `${sources.src.namespace}`.* TO 'ud_${sources.src.namespace}'@'%', 'us_${sources.src.namespace}'@'%', 'ls_${sources.src.namespace}'@'%', 'lo_${sources.src.namespace}'@'%', 'ld_${sources.src.namespace}'@'%';
+  # The invalid datasets below keep the runtime from becoming ready.
+  - start: { ready: false }
+  - query: SELECT id, s FROM url_default
+    expect: { rows: [['1', '0']] }
+    eventually: 60s
+  - query: SELECT id, s FROM url_sized
+    expect: { rows: [['1', '0']] }
+    eventually: 60s
+  - query: SELECT id, v FROM life_short
+    expect: { rows: [['1', '10']] }
+    eventually: 60s
+  - query: SELECT id, v FROM life_off
+    expect: { rows: [['1', '10']] }
+    eventually: 60s
+  - query: SELECT id, v FROM life_default
+    expect: { rows: [['1', '10']] }
+    eventually: 60s
+
+  # Invalid pool settings fail the dataset instead of falling back to other values.
+  - assert-status:
+      dataset: bad_pool_max
+      status: Error
+      message-contains: "Cannot setup the dataset bad_pool_max (mysql) with an invalid configuration. `mysql_pool_max` must be a whole number of connections, such as `5`, but is 'five'."
+    eventually: 30s
+  - assert-status:
+      dataset: bad_lifetime
+      status: Error
+      message-contains: "Cannot setup the dataset bad_lifetime (mysql) with an invalid configuration. `mysql_connection_max_lifetime` must be a duration from 1s to 365d, such as `5m`, or `0s` to keep connections open indefinitely, but is 'soon'."
+    eventually: 30s
+  - assert-status:
+      dataset: conflicting_pool_max
+      status: Error
+      message-contains: "Cannot setup the dataset conflicting_pool_max (mysql) with an invalid configuration. `mysql_pool_max` is '5', but `mysql_connection_string` sets `pool_max=20`. Set it in one place."
+    eventually: 30s
+
+  # Eight concurrent readers of a view that takes 0.3 s per query. Each pool
+  # opens connections up to its maximum and no further.
+  - background: { id: burst_default, concurrency: 8, query: SELECT id, s FROM url_default, expect: { id: '1', s: '0' } }
+  - background: { id: burst_sized, concurrency: 8, query: SELECT id, s FROM url_sized, expect: { id: '1', s: '0' } }
+  - source-query: { src: "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER = 'ud_${sources.src.namespace}'" }
+    expect: { rows: [['5']] }
+    eventually: 30s
+  - source-query: { src: "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER = 'us_${sources.src.namespace}'" }
+    expect: { rows: [['3']] }
+    eventually: 30s
+  - source-query: { src: "SELECT COUNT(*) <= 5 FROM information_schema.PROCESSLIST WHERE USER = 'ud_${sources.src.namespace}'" }
+    expect: { rows: [['1']] }
+    consistently: 3s
+  - source-query: { src: "SELECT COUNT(*) <= 3 FROM information_schema.PROCESSLIST WHERE USER = 'us_${sources.src.namespace}'" }
+    expect: { rows: [['1']] }
+    consistently: 3s
+  - stop-background: { id: burst_default }
+  - stop-background: { id: burst_sized }
+  # Once idle, each pool keeps its minimum: 1 by default, 2 as set.
+  - source-query: { src: "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER = 'ud_${sources.src.namespace}'" }
+    expect: { rows: [['1']] }
+    eventually: 30s
+  - source-query: { src: "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER = 'us_${sources.src.namespace}'" }
+    expect: { rows: [['2']] }
+    eventually: 30s
+
+  # One reader at a time on each lifetime dataset. With a 2s lifetime the
+  # pooled connection keeps being replaced; with `0s`, and within the default
+  # 5m, the one connection the pool opened at startup serves every query.
+  - background: { id: read_short, concurrency: 1, every: 200ms, query: SELECT id, v FROM life_short, expect: { id: '1', v: '10' } }
+  - background: { id: read_off, concurrency: 1, every: 200ms, query: SELECT id, v FROM life_off, expect: { id: '1', v: '10' } }
+  - background: { id: read_default, concurrency: 1, every: 200ms, query: SELECT id, v FROM life_default, expect: { id: '1', v: '10' } }
+  - source-query: { src: "SELECT TOTAL_CONNECTIONS >= 4 FROM performance_schema.users WHERE USER = 'ls_${sources.src.namespace}'" }
+    expect: { rows: [['1']] }
+    eventually: 60s
+  - wait-metric: { name: dataset_mysql_discarded_expired_connection, labels: { name: life_short }, above: 0, timeout: 30s }
+  - stop-background: { id: read_short }
+  - stop-background: { id: read_off }
+  - stop-background: { id: read_default }
+  - source-query: { src: "SELECT TOTAL_CONNECTIONS FROM performance_schema.users WHERE USER = 'lo_${sources.src.namespace}'" }
+    expect: { rows: [['1']] }
+  - source-query: { src: "SELECT TOTAL_CONNECTIONS FROM performance_schema.users WHERE USER = 'ld_${sources.src.namespace}'" }
+    expect: { rows: [['1']] }
