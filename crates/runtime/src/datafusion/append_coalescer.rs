@@ -23,8 +23,10 @@ limitations under the License.
 //! the same dataset being written queues its rows here instead of waiting with
 //! them. The queued append that next takes the dataset's turn writes a group of
 //! queued appends, in queue order, as one append, and tells each member the
-//! outcome. An append that finds no other being written is written at once,
-//! exactly as it would be without the queue.
+//! outcome. An append that finds none being written or queued is written at
+//! once, exactly as it would be without the queue. Every other append to the
+//! dataset queues, even one that cannot share a write (it is written in a group
+//! of its own), so no append is written ahead of one queued before it.
 //!
 //! A group never holds two appends that share a value of the dataset's key
 //! (`AcceleratedTable::append_group_key`): the first queued append that shares
@@ -48,12 +50,12 @@ use datafusion::error::DataFusionError;
 use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::{OwnedRwLockReadGuard, oneshot};
 
-/// The most rows one append may bring to a group. A larger append is written on
-/// its own, as it would be without the queue.
-pub(crate) const MEMBER_MAX_ROWS: usize = 8_192;
+/// The most rows one append may bring to a group. A larger append is written in
+/// a group of its own, in queue order.
+const MEMBER_MAX_ROWS: usize = 8_192;
 
 /// The most in-memory bytes one append may bring to a group.
-pub(crate) const MEMBER_MAX_BYTES: usize = 8 * 1024 * 1024;
+const MEMBER_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// The most rows one group writes. A group always takes the append at the head
 /// of the queue, so no append waits on this bound behind more than the groups
@@ -102,8 +104,23 @@ pub(crate) type MemberOutcome = std::result::Result<(), InsertFailure>;
 pub(crate) enum RowKeys {
     /// The dataset has no key: any appends may share a group.
     Unkeyed,
+    /// The append is written in a group of its own, still in queue order: it is
+    /// too large to share a write, or holds rows the accelerator refuses (see
+    /// [`row_keys`]), which in a group would fail every member.
+    Alone,
     /// The encoded key of each row.
     Keyed(HashSet<Box<[u8]>>),
+}
+
+/// A dataset's turn to write, taken without waiting.
+pub(crate) enum FreeTurn {
+    /// No append is queued: the append that took the turn is written at once,
+    /// on its own.
+    Idle(tokio::sync::OwnedMutexGuard<()>),
+    /// Appends are queued, and were queued first: the append that took the turn
+    /// queues behind them and, holding the turn, writes the groups ahead of it
+    /// before its own, so it cannot overtake an earlier append of a key.
+    Behind(tokio::sync::OwnedMutexGuard<()>),
 }
 
 /// The appends waiting for one dataset's turn to write.
@@ -216,8 +233,15 @@ impl GroupCompletion {
 impl AppendQueue {
     /// The dataset's turn to write, if no append to it is being written through
     /// this queue now.
-    pub(crate) fn try_take_turn(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        Arc::clone(&self.turn).try_lock_owned().ok()
+    pub(crate) fn try_take_turn(&self) -> Option<FreeTurn> {
+        let turn = Arc::clone(&self.turn).try_lock_owned().ok()?;
+        // Read while holding the turn. Only a turn holder claims appends, so an
+        // append queued before this read is still queued and is seen here.
+        if self.pending.lock().appends.is_empty() {
+            Some(FreeTurn::Idle(turn))
+        } else {
+            Some(FreeTurn::Behind(turn))
+        }
     }
 
     /// The dataset's turn to write, once the append holding it is written.
@@ -296,7 +320,8 @@ impl AppendQueue {
                         keys.iter().all(|key| !group.contains(key))
                     }
                     (RowKeys::Unkeyed, RowKeys::Unkeyed) => true,
-                    // One table's appends are all keyed or all not.
+                    // An append written alone shares a group with none, and one
+                    // table's other appends are all keyed or all not.
                     _ => false,
                 };
                 if !fits || !same_table || !disjoint {
@@ -368,15 +393,22 @@ fn same_provider(a: &Arc<dyn TableProvider>, b: &Arc<dyn TableProvider>) -> bool
     std::ptr::eq(Arc::as_ptr(a).cast::<()>(), Arc::as_ptr(b).cast::<()>())
 }
 
+/// The key values `data` brings to a group: [`RowKeys::Alone`] when it is too
+/// large to share a write or [`member_keys`] finds rows it cannot group.
+pub(crate) fn row_keys(key: &[String], schema: &SchemaRef, data: &[RecordBatch]) -> RowKeys {
+    let rows: usize = data.iter().map(RecordBatch::num_rows).sum();
+    let bytes: usize = data.iter().map(RecordBatch::get_array_memory_size).sum();
+    if rows > MEMBER_MAX_ROWS || bytes > MEMBER_MAX_BYTES {
+        return RowKeys::Alone;
+    }
+    member_keys(key, schema, data).unwrap_or(RowKeys::Alone)
+}
+
 /// The encoded value of `key` in each row of `data`, to keep appends that share
 /// one out of a group, or `None` when the append cannot join a group and is
 /// written alone: a key column is missing or holds a null, which the accelerator
 /// refuses, and in a group that one append's row would fail every member.
-pub(crate) fn member_keys(
-    key: &[String],
-    schema: &SchemaRef,
-    data: &[RecordBatch],
-) -> Option<RowKeys> {
+fn member_keys(key: &[String], schema: &SchemaRef, data: &[RecordBatch]) -> Option<RowKeys> {
     if key.is_empty() {
         return Some(RowKeys::Unkeyed);
     }
@@ -416,7 +448,9 @@ mod tests {
     use datafusion::datasource::MemTable;
     use datafusion::error::DataFusionError;
 
-    use super::{AppendQueue, InsertFailure, InsertStage, QueuedAppend, RowKeys, member_keys};
+    use super::{
+        AppendQueue, FreeTurn, InsertFailure, InsertStage, QueuedAppend, RowKeys, row_keys,
+    };
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -465,7 +499,7 @@ mod tests {
         rows: &[(Option<i64>, i64)],
     ) -> QueuedAppend {
         let data = vec![batch(rows)];
-        let keys = member_keys(&["id".to_string()], &schema(), &data).expect("keyed rows");
+        let keys = row_keys(&["id".to_string()], &schema(), &data);
         let guard = Arc::new(tokio::sync::RwLock::new(())).read_owned().await;
         queue.enqueue(Arc::clone(provider), schema(), Arc::new(data), keys, guard)
     }
@@ -538,17 +572,77 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rows_with_a_null_key_never_join_a_group() {
-        let data = vec![batch(&[(Some(1), 10), (None, 20)])];
-        assert!(member_keys(&["id".to_string()], &schema(), &data).is_none());
+    #[tokio::test]
+    async fn a_turn_free_while_appends_wait_puts_the_newcomer_behind_them() {
+        let queue = Arc::new(AppendQueue::default());
+        let table = provider();
         assert!(
-            member_keys(&["missing".to_string()], &schema(), &data).is_none(),
-            "a key column the rows lack keeps them out too"
+            matches!(queue.try_take_turn(), Some(FreeTurn::Idle(_))),
+            "with nothing queued the newcomer is written at once"
+        );
+
+        // Queued, and not yet waiting for the turn when the turn comes free.
+        let older = enqueue(&queue, &table, &[(Some(1), 10)]).await;
+        let Some(FreeTurn::Behind(turn)) = queue.try_take_turn() else {
+            panic!("a newcomer must not be written ahead of an append queued before it");
+        };
+        let newer = enqueue(&queue, &table, &[(Some(1), 20)]).await;
+        let group = queue.claim(&newer).expect("the newcomer is queued");
+        assert_eq!(
+            values(&group.batches),
+            vec![10],
+            "the older append is written first"
+        );
+        let group = queue.claim(&newer).expect("the newcomer is still queued");
+        assert_eq!(
+            values(&group.batches),
+            vec![20],
+            "then the newer copy of key 1"
+        );
+        assert!(queue.claim(&older).is_none());
+        drop(turn);
+    }
+
+    #[tokio::test]
+    async fn an_append_written_alone_keeps_its_place_and_shares_no_group() {
+        let queue = Arc::new(AppendQueue::default());
+        let table = provider();
+        let first = enqueue(&queue, &table, &[(Some(1), 10)]).await;
+        let data = vec![batch(&[(None, 20)])];
+        let alone = queue.enqueue(
+            Arc::clone(&table),
+            schema(),
+            Arc::new(data),
+            RowKeys::Alone,
+            Arc::new(tokio::sync::RwLock::new(())).read_owned().await,
+        );
+        let third = enqueue(&queue, &table, &[(Some(3), 30)]).await;
+
+        let group = queue.claim(&third).expect("third is queued");
+        assert_eq!(values(&group.batches), vec![10]);
+        assert!(queue.claim(&first).is_none());
+        let group = queue.claim(&third).expect("third is still queued");
+        assert_eq!(values(&group.batches), vec![20], "written by itself");
+        assert!(queue.claim(&alone).is_none());
+        let group = queue.claim(&third).expect("third is still queued");
+        assert_eq!(values(&group.batches), vec![30]);
+    }
+
+    #[test]
+    fn rows_with_a_null_key_are_written_alone() {
+        let data = vec![batch(&[(Some(1), 10), (None, 20)])];
+        assert_eq!(
+            row_keys(&["id".to_string()], &schema(), &data),
+            RowKeys::Alone
         );
         assert_eq!(
-            member_keys(&[], &schema(), &data),
-            Some(RowKeys::Unkeyed),
+            row_keys(&["missing".to_string()], &schema(), &data),
+            RowKeys::Alone,
+            "a key column the rows lack keeps them out of groups too"
+        );
+        assert_eq!(
+            row_keys(&[], &schema(), &data),
+            RowKeys::Unkeyed,
             "a dataset without a key groups any rows"
         );
     }

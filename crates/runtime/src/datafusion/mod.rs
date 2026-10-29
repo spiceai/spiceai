@@ -3348,11 +3348,12 @@ impl DataFusion {
     /// `rebind_guard`.
     ///
     /// An append to a dataset whose appends may be written together (see
-    /// [`append_coalescer`]) that finds another append to it being written queues
-    /// to share one write with the appends queued beside it. It returns once that
-    /// write has returned, with that write's outcome: never success before the
-    /// accelerator has stored its rows. Every other insert, and an append with no
-    /// other being written, runs at once on its own.
+    /// [`append_coalescer`]) that finds another append to it being written, or
+    /// queued, queues behind them, to share one write with the appends queued
+    /// beside it. It returns once that write has returned, with that write's
+    /// outcome: never success before the accelerator has stored its rows. Every
+    /// other insert, and an append that finds none being written or queued, runs
+    /// at once on its own.
     async fn insert_update(
         &self,
         table_reference: &TableReference,
@@ -3375,31 +3376,27 @@ impl DataFusion {
             return result.map_err(|failure| insert_error(table_reference, failure));
         };
 
-        if let Some(turn) = queue.try_take_turn() {
-            let result = self
-                .insert_alone(table_provider, schema, data, overwrite)
-                .await;
-            drop(turn);
-            drop(rebind_guard);
-            return result.map_err(|failure| insert_error(table_reference, failure));
-        }
-
-        let rows: usize = data.iter().map(RecordBatch::num_rows).sum();
-        let bytes: usize = data.iter().map(RecordBatch::get_array_memory_size).sum();
-        let keys = (rows <= append_coalescer::MEMBER_MAX_ROWS
-            && bytes <= append_coalescer::MEMBER_MAX_BYTES)
-            .then(|| append_coalescer::member_keys(&key, schema, data))
-            .flatten();
-        let Some(keys) = keys else {
-            // Too large to share a write, or rows the accelerator would refuse:
-            // written alone, waiting for the dataset's own write lock as before.
-            let result = self
-                .insert_alone(table_provider, schema, data, overwrite)
-                .await;
-            drop(rebind_guard);
-            return result.map_err(|failure| insert_error(table_reference, failure));
+        // The turn is taken at once only when it is free and no append is
+        // queued. An append that finds it free with appends queued goes behind
+        // them, and writes them before its own, so it never overtakes an earlier
+        // append of the same key.
+        let mut turn = match queue.try_take_turn() {
+            Some(append_coalescer::FreeTurn::Idle(turn)) => {
+                let result = self
+                    .insert_alone(table_provider, schema, data, overwrite)
+                    .await;
+                drop(turn);
+                drop(rebind_guard);
+                return result.map_err(|failure| insert_error(table_reference, failure));
+            }
+            Some(append_coalescer::FreeTurn::Behind(turn)) => Some(turn),
+            None => None,
         };
 
+        // An append too large to share a write, or with rows the accelerator
+        // refuses, is still queued, in a group of its own, so that it too keeps
+        // its place behind earlier appends.
+        let keys = append_coalescer::row_keys(&key, schema, data);
         let mut queued = queue.enqueue(
             Arc::clone(table_provider),
             Arc::clone(schema),
@@ -3408,11 +3405,14 @@ impl DataFusion {
             rebind_guard,
         );
         loop {
-            let woken = tokio::select! {
-                biased;
-                outcome = &mut queued.outcome => Woken::Outcome(outcome),
-                _ = &mut queued.claimed => Woken::Claimed,
-                turn = queue.take_turn() => Woken::Turn(turn),
+            let woken = match turn.take() {
+                Some(turn) => Woken::Turn(turn),
+                None => tokio::select! {
+                    biased;
+                    outcome = &mut queued.outcome => Woken::Outcome(outcome),
+                    _ = &mut queued.claimed => Woken::Claimed,
+                    turn = queue.take_turn() => Woken::Turn(turn),
+                },
             };
             match woken {
                 Woken::Outcome(outcome) => {
