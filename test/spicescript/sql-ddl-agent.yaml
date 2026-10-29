@@ -5,8 +5,10 @@ description: >
   returns it to the client, which sends the whole conversation back on its
   next turn, as the Messages API requires. Over Chat Completions, an agent
   that runs its own tool loop calls `/v1/tools/sql` and sends the call and
-  its result back to a model with no Spice tools. What a read-only key reads
-  in task history holds none of the password.
+  its result back to a model with no Spice tools. Through an MCP tool, a
+  call reaches another Spice's `sql` tool (here this Spice's own `/v1/mcp`):
+  called directly, through the `/v1/mcp` gateway, and by a model. What a
+  read-only key reads in task history holds none of the password.
 
 sources:
   model: { kind: mock-http }
@@ -20,13 +22,19 @@ spicepod:
       api-key:
         enabled: true
         keys: [admin-key:admin, reader-key:ro]
+  tools:
+    # Another Spice, reached at its MCP endpoint: this one's own.
+    - name: peer
+      from: mcp:http://127.0.0.1:${instance.http_port}/v1/mcp
+      params:
+        mcp_auth_token: admin-key
   models:
     - from: anthropic:claude-sonnet-4-6
       name: a
       params:
         endpoint: ${sources.model.url}/v1
         anthropic_api_key: stub-key
-        tools: sql
+        tools: sql, peer
     - from: openai:gpt-4o-mini
       name: n
       params:
@@ -128,3 +136,61 @@ steps:
       body: SELECT task, input FROM runtime.task_history WHERE task IN ('ai_chat', 'ai_completion') AND input LIKE '%chat turn two%' ORDER BY task
     expect: { status: 200, body-matches: 'ai_chat[\s\S]*ai_completion', body-lacks: ['leak-'] }
     eventually: 30s
+
+  # Another Spice's `sql` tool, reached through the MCP tool `peer`: called
+  # directly, through this Spice's `/v1/mcp` gateway, and by a model.
+  - http:
+      method: POST
+      path: /v1/tools/peer__sql
+      headers: { content-type: application/json }
+      body: '{"query": "CREATE TABLE t3 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-mcp-tool'')"}'
+    expect: { body-contains: t3 }
+  - http:
+      method: POST
+      path: /v1/mcp
+      headers:
+        content-type: application/json
+        accept: application/json, text/event-stream
+        mcp-protocol-version: '2026-07-28'
+        mcp-method: tools/call
+        mcp-name: peer__sql
+      body: '{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "peer__sql", "arguments": {"query": "CREATE TABLE t4 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-mcp-gateway'')"}, "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": {"name": "spicescript", "version": "1"}, "io.modelcontextprotocol/clientCapabilities": {}}}}'
+    expect: { status: 200, body-contains: t4 }
+  - source-exec:
+      model:
+        - |
+          path: /v1/messages
+          method: POST
+          times: 1
+          headers: { content-type: application/json }
+          body: '{"id": "msg_3", "type": "message", "role": "assistant", "model": "claude-sonnet-4-6", "content": [{"type": "tool_use", "id": "toolu_3", "name": "peer__sql", "input": {"query": "CREATE TABLE t5 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-mcp-model'')"}}], "stop_reason": "tool_use", "stop_sequence": null, "usage": {"input_tokens": 1, "output_tokens": 1}}'
+  - http:
+      method: POST
+      path: /v1/messages
+      headers: { content-type: application/json, anthropic-version: '2023-06-01' }
+      body: '{"model": "a", "max_tokens": 256, "messages": [{"role": "user", "content": "peer turn"}]}'
+    expect: { status: 200, body-contains: mcp_tool_use }
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SELECT task, input, captured_output, error_message FROM runtime.task_history WHERE task = 'tool_use::peer__sql' ORDER BY start_time
+    expect: { status: 200, body-matches: 'TABLE t3[\s\S]*TABLE t4[\s\S]*TABLE t5', body-lacks: ['leak-'] }
+    eventually: 30s
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SELECT task, input, captured_output FROM runtime.task_history WHERE task IN ('ai_chat', 'ai_completion') AND input LIKE '%peer turn%' ORDER BY task
+    expect: { status: 200, body-matches: 'ai_chat[\s\S]*ai_completion[\s\S]*TABLE t5', body-lacks: ['leak-'] }
+    eventually: 30s
+  # Every row of task history, every column a value can reach.
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SELECT task, input, captured_output, error_message FROM runtime.task_history ORDER BY start_time
+    expect: { status: 200, body-matches: 'TABLE t1[\s\S]*TABLE t5', body-lacks: ['leak-'] }

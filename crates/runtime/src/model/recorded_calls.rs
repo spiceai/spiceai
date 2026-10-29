@@ -39,6 +39,7 @@ use runtime_tools::builtin::sql::{is_sql_tool, recorded_input, sql_tool_names};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tools::SpiceModelTool;
+use tools::naming::decode_tool_name;
 
 use crate::model::tool_use::encode_tool_name;
 
@@ -96,13 +97,16 @@ pub(crate) fn recorded(
 
 /// `text`, a payload of a conversation task history stores, with each call to
 /// an `sql` tool, directly or through `tool_invoke`, recorded as that tool
-/// records it, whatever tools the conversation's model has. `None` when
-/// nothing changes, as for text that is not JSON.
+/// records it, whatever tools the conversation's model has. An `sql` tool of
+/// an MCP server, such as another Spice's (`peer__sql`), counts as one. `None`
+/// when nothing changes, as for text that is not JSON.
 pub(crate) fn recorded_by_name(text: &str) -> Option<String> {
     let mut json = serde_json::from_str::<Value>(text).ok()?;
     let sql_tools = sql_tool_names();
     let is_sql = |name: &str| {
-        is_sql_tool(name) || sql_tools.iter().any(|tool| encode_tool_name(tool) == name)
+        is_sql_tool(name)
+            || sql_tools.iter().any(|tool| encode_tool_name(tool) == name)
+            || decode_tool_name(name).is_some_and(|(_, tool)| is_sql_tool(&tool))
     };
     let record = |name: &str, arguments: &str| {
         if is_sql(name) {
@@ -426,6 +430,19 @@ mod tests {
         assert_eq!(
             invocation(2),
             json!({"tool_id": "sql", "arguments": recorded_query})
+        );
+
+        // The `sql` tool of an MCP server, such as another Spice's.
+        let peer = json!({"messages": [{"role": "assistant", "tool_calls": [
+            {"id": "c1", "function": {"name": "peer__sql", "arguments": query}}]}]});
+        let recorded: Value = serde_json::from_str(
+            &recorded_by_name(&peer.to_string()).expect("the payload changes"),
+        )
+        .expect("the recorded payload is JSON");
+        assert_eq!(
+            recorded,
+            json!({"messages": [{"role": "assistant", "tool_calls": [
+                {"id": "c1", "function": {"name": "peer__sql", "arguments": recorded_query}}]}]})
         );
 
         // A call to another tool, and text that is not JSON, are kept.

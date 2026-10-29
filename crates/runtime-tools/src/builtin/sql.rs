@@ -172,6 +172,7 @@ pub fn sql_tool_names() -> Vec<String> {
 /// non-secret. A statement that does not parse is recorded with
 /// [`recorded_unparsed_statement`]. Arguments that are not the tool's JSON run
 /// nothing, and are recorded only as [`UNREADABLE_STATEMENT`].
+#[must_use]
 pub fn recorded_input(arg: &str) -> (Cow<'_, str>, Vec<String>) {
     let Ok(SqlToolParams { query }) = serde_json::from_str::<SqlToolParams>(arg) else {
         // Owned, as any changed text is: a caller tells a changed text by it.
