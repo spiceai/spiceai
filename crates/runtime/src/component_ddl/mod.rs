@@ -910,7 +910,7 @@ impl Runtime {
             );
         }
         if !withheld.is_empty() {
-            tracing::info!("{}", served_again(&withheld));
+            tracing::info!("{}", withheld_deleted(&withheld));
         }
         Ok(stored)
     }
@@ -1662,12 +1662,13 @@ fn unapplied_change(location: &str, failure: &ServeFailure) -> String {
     )
 }
 
-/// The log line of datasets served again once the acceleration data their
-/// earlier definitions left is deleted.
-fn served_again(withheld: &[Dataset]) -> String {
+/// The log line of datasets withheld until the acceleration data their
+/// earlier definitions left was deleted, once it is: the change another
+/// instance made to them, a drop or a new definition, is then applied.
+fn withheld_deleted(withheld: &[Dataset]) -> String {
     let shown = shown_datasets(withheld.iter().map(|dataset| dataset.name.as_str()));
     format!(
-        "Deleted the earlier acceleration data of {}, so this instance serves {} again.",
+        "Deleted the earlier acceleration data of {} and applied the change to {}.",
         dataset_phrase(&shown),
         if shown.len() == 1 { "it" } else { "them" }
     )
@@ -1925,9 +1926,10 @@ mod tests {
     }
 
     /// A statement that names a withheld dataset says why it is refused and
-    /// when to run it again; the log says when the dataset is served again.
+    /// when to run it again; the log says when the data is deleted and the
+    /// change, a drop or a new definition, applied.
     #[test]
-    fn a_withheld_dataset_is_named_in_its_refusal_and_when_served_again() {
+    fn a_withheld_dataset_is_named_in_its_refusal_and_once_deleted() {
         assert_eq!(
             withheld_dataset(
                 "orders",
@@ -1937,12 +1939,12 @@ mod tests {
         );
         let orders = Dataset::new("file:orders.csv", "orders");
         assert_eq!(
-            served_again(&[orders.clone(), orders.clone()]),
-            "Deleted the earlier acceleration data of dataset 'orders', so this instance serves it again."
+            withheld_deleted(&[orders.clone(), orders.clone()]),
+            "Deleted the earlier acceleration data of dataset 'orders' and applied the change to it."
         );
         assert_eq!(
-            served_again(&[orders, Dataset::new("file:c.csv", "sales.customers")]),
-            "Deleted the earlier acceleration data of datasets 'orders', 'sales.customers', so this instance serves them again."
+            withheld_deleted(&[orders, Dataset::new("file:c.csv", "sales.customers")]),
+            "Deleted the earlier acceleration data of datasets 'orders', 'sales.customers' and applied the change to them."
         );
     }
 }

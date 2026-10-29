@@ -17,6 +17,14 @@ variants:
   default:
     env:
       DL_CONN: 'postgres:dbname=x host=127.0.0.1 port=1 user=u password=leak-ducklake-reference'
+  # The same in libpq's URI form, and with the password first, where the part
+  # DuckDB repeats has no `postgres:` prefix.
+  uri:
+    env:
+      DL_CONN: 'postgres:postgresql://u:leak-ducklake-uri@127.0.0.1:1/x'
+  password-first:
+    env:
+      DL_CONN: 'postgres:password=leak-ducklake-first dbname=x host=127.0.0.1 port=1 user=u'
 
 spicepod:
   version: v1
