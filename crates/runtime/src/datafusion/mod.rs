@@ -389,7 +389,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to write to dataset {table_name}: the write that held these rows together with other concurrent writes stopped before reporting whether it stored them. Retry the write."
+        "Failed to write to dataset {table_name}: the shared write holding these rows stopped before reporting its outcome, so they may or may not be stored. Check the dataset before retrying; a retry can store them twice if the dataset has no primary key."
     ))]
     AppendGroupOutcomeUnknown { table_name: String },
 
