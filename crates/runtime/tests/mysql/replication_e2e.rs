@@ -612,10 +612,8 @@ fn arrow_cells(name: &str, array: &ArrayRef) -> Result<(Kind, Vec<Cell>), anyhow
         | DataType::UInt16
         | DataType::UInt32 => (Kind::Int, DataType::Int64),
         DataType::Float64 => (Kind::Float, DataType::Float64),
-        // Decimal text is rendered at the column's own scale below.
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
-            (Kind::Decimal, DataType::Utf8)
-        }
+        // Casting a decimal to text renders it at the column's scale (`19.99`).
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => (Kind::Decimal, DataType::Utf8),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => (Kind::Text, DataType::Utf8),
         DataType::Date32 => (Kind::Date, DataType::Date32),
         // `MySQL` `DATETIME` has no zone; a UTC-zoned column holds the same
@@ -800,14 +798,9 @@ async fn run_replication_e2e(engine: EngineConfig) -> Result<(), anyhow::Error> 
                 4,
                 "TRUNCATE must only affect its own table"
             );
-            let final_answers = assert_matches_source(
-                &rt,
-                &pool,
-                engine.engine,
-                "truncate",
-                ORDERS_ONLY_QUERIES,
-            )
-            .await?;
+            let final_answers =
+                assert_matches_source(&rt, &pool, engine.engine, "truncate", ORDERS_ONLY_QUERIES)
+                    .await?;
             assert_answers_from_acceleration(
                 &rt,
                 &container,
