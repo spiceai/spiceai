@@ -6091,9 +6091,8 @@ mod tests {
         }
 
         let errors = TaskHistoryErrors::default();
-        let _subscriber = tracing::subscriber::set_default(
-            tracing_subscriber::registry().with(errors.clone()),
-        );
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(errors.clone()));
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",

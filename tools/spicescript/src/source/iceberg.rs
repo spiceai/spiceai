@@ -189,6 +189,10 @@ impl Source for Iceberg {
         Some(&self.catalog)
     }
 
+    fn containers(&self) -> Vec<&Container> {
+        vec![&self.catalog, &self.store]
+    }
+
     async fn remove(&self) -> Result<()> {
         let catalog = self.catalog.remove().await;
         let store = self.store.remove().await;

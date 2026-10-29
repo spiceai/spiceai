@@ -36,6 +36,7 @@ use super::prepared_statement_handle;
 use super::prepared_statement_query::{
     PreparedStatement, decode_param_values, encode_single_row_parameters, param_error_to_status,
 };
+use super::within_decompression_bound;
 use crate::flight::is_auth_read_only;
 use crate::{
     datafusion::{query::QueryBuilder, request_context_extension::get_current_datafusion},
@@ -190,6 +191,7 @@ pub(crate) async fn do_put_update(
         move |flight_data| {
             flight_data
                 .map_err(|status| FlightError::Tonic(Box::new(status)))
+                .and_then(within_decompression_bound)
                 .map(|message| decodable.repair(message))
         }
     });

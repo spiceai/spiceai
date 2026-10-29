@@ -550,6 +550,215 @@ async fn a_sort_over_aggregate_output_slices_charges_each_slice_for_its_own_rows
     }
 }
 
+/// spiceai/datafusion#277. An ordered aggregate (here one whose leading group
+/// key is a constant, as TPC-DS Q78's `d_year` is under `d_year = 2000`) must
+/// emit the groups left at end of input with one `EmitTo::All`. Emitting them as
+/// repeated `EmitTo::First(batch_size)` renumbers every group still held, so the
+/// drain costs time quadratic in the group count.
+#[tokio::test]
+async fn an_ordered_aggregate_emits_its_remaining_groups_once() {
+    use std::sync::{Arc, Mutex};
+
+    use arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::{Result, not_impl_err};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::execution::TaskContext;
+    use datafusion::logical_expr::function::AccumulatorArgs;
+    use datafusion::logical_expr::{
+        Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, GroupsAccumulator, Signature,
+        Volatility,
+    };
+    use datafusion::physical_expr::aggregate::AggregateExprBuilder;
+    use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+    use datafusion::physical_plan::{ExecutionPlan, InputOrderMode, collect};
+
+    type Emits = Arc<Mutex<Vec<EmitTo>>>;
+
+    /// `SUM(v)` that records every `EmitTo` it is asked for.
+    #[derive(Debug)]
+    struct EmitProbe {
+        signature: Signature,
+        emits: Emits,
+    }
+    impl PartialEq for EmitProbe {
+        fn eq(&self, other: &Self) -> bool {
+            self.signature == other.signature
+        }
+    }
+    impl Eq for EmitProbe {}
+    impl std::hash::Hash for EmitProbe {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.signature.hash(state);
+        }
+    }
+    impl AggregateUDFImpl for EmitProbe {
+        fn name(&self) -> &'static str {
+            "emit_probe"
+        }
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Int64)
+        }
+        fn accumulator(&self, _args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+            not_impl_err!("emit_probe runs only as a groups accumulator")
+        }
+        fn groups_accumulator_supported(&self, _args: AccumulatorArgs) -> bool {
+            true
+        }
+        fn create_groups_accumulator(
+            &self,
+            _args: AccumulatorArgs,
+        ) -> Result<Box<dyn GroupsAccumulator>> {
+            Ok(Box::new(EmitProbeGroups {
+                sums: Vec::new(),
+                emits: Arc::clone(&self.emits),
+            }))
+        }
+    }
+
+    struct EmitProbeGroups {
+        sums: Vec<i64>,
+        emits: Emits,
+    }
+    impl EmitProbeGroups {
+        fn take(&mut self, emit_to: EmitTo) -> ArrayRef {
+            self.emits
+                .lock()
+                .expect("emit log lock is not poisoned")
+                .push(emit_to);
+            Arc::new(Int64Array::from(emit_to.take_needed(&mut self.sums)))
+        }
+        fn add(&mut self, values: &ArrayRef, group_indices: &[usize], total_num_groups: usize) {
+            self.sums.resize(total_num_groups, 0);
+            let values = values
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("emit_probe takes an Int64 argument");
+            for (&group, value) in group_indices.iter().zip(values.values()) {
+                self.sums[group] += value;
+            }
+        }
+    }
+    impl GroupsAccumulator for EmitProbeGroups {
+        fn update_batch(
+            &mut self,
+            values: &[ArrayRef],
+            group_indices: &[usize],
+            _opt_filter: Option<&BooleanArray>,
+            total_num_groups: usize,
+        ) -> Result<()> {
+            self.add(&values[0], group_indices, total_num_groups);
+            Ok(())
+        }
+        fn merge_batch(
+            &mut self,
+            values: &[ArrayRef],
+            group_indices: &[usize],
+            total_num_groups: usize,
+        ) -> Result<()> {
+            self.add(&values[0], group_indices, total_num_groups);
+            Ok(())
+        }
+        fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+            Ok(self.take(emit_to))
+        }
+        fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+            Ok(vec![self.take(emit_to)])
+        }
+        fn convert_to_state(
+            &self,
+            _values: &[ArrayRef],
+            _opt_filter: Option<&BooleanArray>,
+        ) -> Result<Vec<ArrayRef>> {
+            not_impl_err!("emit_probe does not skip partial aggregation")
+        }
+        fn size(&self) -> usize {
+            self.sums.capacity() * size_of::<i64>()
+        }
+    }
+
+    const BATCH_SIZE: usize = 8;
+    const GROUPS: usize = 10 * BATCH_SIZE;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("g", DataType::Int32, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let groups = i32::try_from(GROUPS).expect("group count fits in i32");
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from(vec![2000; GROUPS])),
+            Arc::new(Int32Array::from_iter_values(0..groups)),
+            Arc::new(Int64Array::from_iter_values((0..groups).map(i64::from))),
+        ],
+    )
+    .expect("batch matches its schema");
+    let ordering = LexOrdering::new([PhysicalSortExpr::new_default(
+        col("k", &schema).expect("k exists"),
+    )])
+    .expect("ordering is not empty");
+    let input = MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&schema), None)
+        .expect("memory source builds")
+        .try_with_sort_information(vec![ordering])
+        .expect("input is sorted on k");
+    let input = DataSourceExec::from_data_source(input);
+
+    let emits = Emits::default();
+    let probe = Arc::new(AggregateUDF::from(EmitProbe {
+        signature: Signature::exact(vec![DataType::Int64], Volatility::Immutable),
+        emits: Arc::clone(&emits),
+    }));
+    let aggregate = AggregateExec::try_new(
+        AggregateMode::Partial,
+        PhysicalGroupBy::new_single(vec![
+            (col("k", &schema).expect("k exists"), "k".to_string()),
+            (col("g", &schema).expect("g exists"), "g".to_string()),
+        ]),
+        vec![Arc::new(
+            AggregateExprBuilder::new(probe, vec![col("v", &schema).expect("v exists")])
+                .schema(Arc::clone(&schema))
+                .alias("probe")
+                .build()
+                .expect("aggregate builds"),
+        )],
+        vec![None],
+        input,
+        Arc::clone(&schema),
+    )
+    .expect("aggregate plans");
+    assert!(
+        matches!(
+            aggregate.input_order_mode(),
+            InputOrderMode::PartiallySorted(_)
+        ),
+        "the guard needs the ordered aggregate path, got {:?}",
+        aggregate.input_order_mode()
+    );
+
+    let config = get_df_default_config().with_batch_size(BATCH_SIZE);
+    let task = Arc::new(TaskContext::default().with_session_config(config));
+    let output = collect(Arc::new(aggregate) as Arc<dyn ExecutionPlan>, task)
+        .await
+        .expect("aggregate runs");
+
+    let rows: Vec<usize> = output.iter().map(RecordBatch::num_rows).collect();
+    assert_eq!(rows, vec![BATCH_SIZE; GROUPS / BATCH_SIZE]);
+    let emits = emits.lock().expect("emit log lock is not poisoned").clone();
+    assert_eq!(
+        emits,
+        vec![EmitTo::All],
+        "the groups left at end of input must be emitted once"
+    );
+}
+
 /// spiceai/datafusion#279 and #280. A join with a high fan-out yields many output
 /// batches per input batch without polling an input, so unless each output batch
 /// spends the cooperative budget, the task running it never yields: a cancelled
@@ -591,6 +800,11 @@ fn every_join_yields_to_the_scheduler() {
             let result = runtime.block_on(async {
                 let ctx = spice_session(|config| {
                     config.options_mut().optimizer.prefer_hash_join = prefer_hash_join;
+                    // One partition keeps repartition exchanges, which yield on their own, out
+                    // of the plan. A sort-merge join is planned only over several partitions.
+                    if prefer_hash_join {
+                        config.options_mut().execution.target_partitions = 1;
+                    }
                 });
                 let plan = ctx
                     .sql(sql)

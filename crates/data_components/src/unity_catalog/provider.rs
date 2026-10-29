@@ -211,10 +211,6 @@ impl UnityCatalogSchemaProvider {
                 continue;
             }
 
-            let Some(table_reference) = table_creator.table_reference(&table) else {
-                continue;
-            };
-
             if !selector.selects_table(&schema.name, &table.name) {
                 tracing::debug!(
                     "Table {}.{} is not selected by the catalog's include/exclude patterns, skipping",
@@ -223,6 +219,10 @@ impl UnityCatalogSchemaProvider {
                 );
                 continue;
             }
+
+            let Some(table_reference) = table_creator.table_reference(&table) else {
+                continue;
+            };
 
             candidates.push((table, table_reference));
         }
@@ -400,7 +400,6 @@ impl UnityCatalogSchemaProvider {
         }
 
         let table_name = table.name.clone();
-        let table_reference = table_creator.table_reference(table)?;
 
         if !selector.selects_table(&schema.name, &table_name) {
             tracing::debug!(
@@ -409,6 +408,8 @@ impl UnityCatalogSchemaProvider {
             );
             return None;
         }
+
+        let table_reference = table_creator.table_reference(table)?;
 
         if table.requires_read_permission_validation() {
             match client.get_effective_permissions(&table.full_name()).await {

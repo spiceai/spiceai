@@ -30,7 +30,7 @@ use tokio::{
     select,
     sync::{
         Semaphore,
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Sender},
     },
     task::JoinHandle,
 };
@@ -324,7 +324,7 @@ pub type RefreshRequest = (RefreshRequestId, Option<RefreshOverrides>);
 pub type RefreshTaskCompletion = (RefreshRequestId, super::Result<RefreshOutcome>);
 
 type RefreshTaskStartSender = Sender<RefreshRequest>;
-type RefreshTaskCompletionReceiver = Receiver<RefreshTaskCompletion>;
+type RefreshTaskCompletionReceiver = mpsc::UnboundedReceiver<RefreshTaskCompletion>;
 
 impl RefreshTaskRunner {
     #[expect(clippy::too_many_arguments)]
@@ -363,8 +363,10 @@ impl RefreshTaskRunner {
 
         let (start_refresh, mut on_start_refresh) = mpsc::channel::<RefreshRequest>(1);
 
+        // Unbounded, so reporting a finished refresh never waits on the refresher: the
+        // refresher can itself be waiting to hand this loop its next request.
         let (notify_refresh_complete, on_refresh_complete) =
-            mpsc::channel::<RefreshTaskCompletion>(1);
+            mpsc::unbounded_channel::<RefreshTaskCompletion>();
 
         let dataset_name = self.dataset_name.clone();
         let notify_refresh_complete = Arc::new(notify_refresh_complete);
@@ -393,13 +395,13 @@ impl RefreshTaskRunner {
                                     if let Some(generation) = running_reload.take() {
                                         base_refresh.write().await.reload_succeeded(generation);
                                     }
-                                    if let Err(err) = notify_refresh_complete.send((running_request, Ok(outcome))).await {
+                                    if let Err(err) = notify_refresh_complete.send((running_request, Ok(outcome))) {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
                                 },
                                 Ok(Err(err)) => {
                                     tracing::debug!("Dataset {dataset_name} failed to refresh with error: {err}");
-                                    if let Err(err) = notify_refresh_complete.send((running_request, Err(err))).await {
+                                    if let Err(err) = notify_refresh_complete.send((running_request, Err(err))) {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
                                 },
@@ -418,7 +420,7 @@ impl RefreshTaskRunner {
                                         message: panic_message.clone(),
                                     };
 
-                                    if let Err(err) = notify_refresh_complete.send((running_request, Err(panic_error))).await {
+                                    if let Err(err) = notify_refresh_complete.send((running_request, Err(panic_error))) {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
                                 }
