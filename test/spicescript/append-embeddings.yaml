@@ -2,14 +2,15 @@ name: append-embeddings
 description: >
   Append refresh on a day-granular time column re-reads the rows on the latest
   stored date and keeps only the ones not already stored. A dataset with column
-  embeddings does the same when the embedding model returns a different vector
-  for the same text in a different batch: refreshing an unchanged source adds
-  no rows, and new rows on the latest date arrive once.
+  embeddings does the same, with or without a primary key, when the embedding
+  model returns a different vector for the same text in a different batch:
+  refreshing an unchanged source adds no rows, and new rows on the latest date
+  arrive once.
 
 sources:
   src: { kind: postgres }
   # An OpenAI-compatible embeddings endpoint whose vectors depend on the batch
-  # size, as hosted models' do. It records each request's batch size.
+  # size, as hosted models' do. It records each request's path and batch size.
   emb:
     kind: docker
     image: docker.io/library/python:3.12-slim
@@ -32,7 +33,7 @@ sources:
                 if isinstance(inputs, str):
                     inputs = [inputs]
                 with open("/tmp/sizes", "a") as sizes:
-                    sizes.write(f"{len(inputs)}\n")
+                    sizes.write(f"{self.path} {len(inputs)}\n")
                 data = [
                     {"object": "embedding", "index": i, "embedding": [float(len(text)), float(len(inputs))]}
                     for i, text in enumerate(inputs)
@@ -55,6 +56,11 @@ sources:
 matrix:
   engine: [cayenne, arrow, duckdb]
 
+variants:
+  no-key: {}
+  key-upsert:
+    datasets: { docs: { acceleration: { primary_key: id, on_conflict: { id: upsert } } } }
+
 spicepod:
   version: v1
   kind: Spicepod
@@ -63,7 +69,7 @@ spicepod:
     - from: openai:batch-dependent
       name: emb
       params:
-        endpoint: http://127.0.0.1:${sources.emb.port.8000}/v1
+        endpoint: http://127.0.0.1:${sources.emb.port.8000}/${variant.name}/v1
         openai_api_key: test
   datasets:
     - from: postgres:public.docs
@@ -83,25 +89,26 @@ defaults:
   expect: { oracle: src }
 
 steps:
-  # 200 rows over four dates; 50 on the latest, 2001-10-27.
+  # 200 rows over four dates, 50 on the latest (2001-10-27), and 5 with no date.
   - source-exec:
       src: |
-        CREATE TABLE docs (id bigint NOT NULL, d date NOT NULL, body text NOT NULL);
+        CREATE TABLE docs (id bigint NOT NULL, d date, body text NOT NULL);
         INSERT INTO docs
           SELECT i, DATE '2001-10-24' + i % 4, 'document ' || repeat('x', i % 17) || i
           FROM generate_series(1, 200) AS i;
+        INSERT INTO docs SELECT i, NULL, 'undated ' || i FROM generate_series(1001, 1005) AS i;
   - start: {}
   - query: SELECT id, d, body FROM docs
   - query: SELECT count(*) AS n FROM docs WHERE body_embedding IS NOT NULL
-    expect: { rows: [['200']] }
+    expect: { rows: [['205']] }
   # The initial load embeds no batch of 50.
-  - source-query: { emb: grep -cx 50 /tmp/sizes || true }
+  - source-query: { emb: "grep -cx '/${variant.name}/v1/embeddings 50' /tmp/sizes || true" }
     expect: { rows: [['0']] }
 
   # A refresh re-embeds the 50 rows on the latest date in a batch of their own,
   # so their vectors differ from the stored ones, and adds nothing.
   - refresh: docs
-  - source-query: { emb: grep -cx 50 /tmp/sizes }
+  - source-query: { emb: "grep -cx '/${variant.name}/v1/embeddings 50' /tmp/sizes" }
     expect: { rows: [['1']] }
   - query: SELECT id, d, body FROM docs
 
@@ -116,4 +123,4 @@ steps:
   - refresh: docs
   - query: SELECT id, d, body FROM docs
   - query: SELECT count(*) AS n FROM docs WHERE body_embedding IS NOT NULL
-    expect: { rows: [['215']] }
+    expect: { rows: [['220']] }
