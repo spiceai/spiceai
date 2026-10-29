@@ -426,6 +426,54 @@ async fn a_failed_shared_write_fails_every_append_in_it_and_stores_none() {
     rt.shutdown().await;
 }
 
+/// An append too large to share a write still waits behind the appends queued
+/// before it, so its copy of a key they share is the one kept, as when the two
+/// are written one after another.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn an_append_too_large_to_share_a_write_keeps_its_place_in_the_queue() {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let dir = tempfile::tempdir().expect("temp dir");
+    register_test_connectors().await;
+    let rt = start_runtime(vec![make_dataset("large", dir.path(), true, &[])]).await;
+    let table = TableReference::bare("large");
+    let seed = rows_of(100_000..=100_001, 0);
+    append(&rt, &table, &seed).await.expect("seed");
+
+    let earlier = rows_of(1..=10, 1);
+    // More rows than one append may bring to a shared write, and key 5 again.
+    let later = rows_of(1..=9_000, 2);
+    let turn = rt
+        .datafusion()
+        .hold_append_turn(&table)
+        .await
+        .expect("appends to a file-mode Cayenne sink dataset are written together");
+    let first = spawn_append(&rt, &table, earlier.clone());
+    wait_for_queued(&rt, &table, 1).await;
+    let second = spawn_append(&rt, &table, later.clone());
+    // Queued behind the first rather than written ahead of it.
+    wait_for_queued(&rt, &table, 2).await;
+    assert!(
+        !second.is_finished(),
+        "the large append waits for the one queued before it"
+    );
+    drop(turn);
+
+    first.await.expect("append task").expect("earlier append");
+    second.await.expect("append task").expect("later append");
+    let (_, groups, members) = rt.datafusion().append_queue_counts(&table);
+    assert_eq!(
+        (groups, members),
+        (2, 2),
+        "each written from the queue, in its own write"
+    );
+    let expected = last_copy_of_each_key([&seed, &earlier, &later]);
+    assert_eq!(expected.iter().find(|row| row.0 == 5), Some(&(5, 2)));
+    assert_eq!(stored_rows(&rt, "large").await, expected);
+
+    rt.shutdown().await;
+}
+
 /// An append whose caller goes away while it is queued is never written.
 #[cfg(not(windows))]
 #[tokio::test]
