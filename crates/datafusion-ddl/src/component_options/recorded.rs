@@ -29,7 +29,7 @@ use std::ops::Range;
 
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::{Dialect, PostgreSqlDialect};
-use datafusion::sql::sqlparser::keywords::Keyword;
+use datafusion::sql::sqlparser::keywords::{ALL_KEYWORDS, Keyword};
 use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 use serde_json::Value;
 
@@ -46,7 +46,7 @@ pub const UNREADABLE_STATEMENT: &str = "<redacted: the statement could not be pa
 /// A value shorter than this is taken out of an error message only as it is
 /// written in the statement, quotes included: bare, it would match unrelated
 /// text such as a line number.
-const SHORTEST_BARE_VALUE: usize = 4;
+const SHORTEST_BARE_VALUE: usize = util::redact::SHORTEST_PART;
 
 /// A statement's text as it may be recorded, and the values taken out of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,62 +67,48 @@ impl<'a> RecordedStatement<'a> {
         }
     }
 
-    fn unreadable() -> Self {
+    /// The placeholder for `sql`, which cannot be read into tokens, and the
+    /// parts of it that may be values ([`unreadable_parts`]): a source that
+    /// quotes the statement back repeats them.
+    fn unreadable(sql: &str) -> Self {
         Self {
             // Owned, as any changed text is: a caller tells a changed text by it.
             text: Cow::Owned(UNREADABLE_STATEMENT.to_string()),
-            removed: Vec::new(),
+            removed: unreadable_parts(sql),
         }
     }
 }
 
-/// `message`, an error a statement failed with, without the values the
-/// statement's recorded text took out: a parser error quotes the token it
-/// stopped at, and a connector can repeat a value it could not use.
+/// The parts of `text`, which cannot be read into tokens, that may be values:
+/// each word of at least [`SHORTEST_BARE_VALUE`] characters that is not a
+/// keyword, as written and without the quotes around it. A source that quotes
+/// the text back loses them, which may take out a name too; that fails closed.
 #[must_use]
-pub fn redact_values<'m>(message: &'m str, removed: &[String]) -> Cow<'m, str> {
-    // Each value, and each part of it that a source can repeat on its own, as
-    // a database client repeats a connection string's `password=...` without
-    // the rest of it; and each of those as JSON writes it inside a string, as
-    // a recorded result does, where a quote or backslash is escaped.
-    let mut present: Vec<Cow<'_, str>> = Vec::new();
-    let spellings = removed.iter().flat_map(|value| {
-        std::iter::once(value.as_str()).chain(
-            value
-                .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '?'))
-                .filter(|part| part.chars().count() >= SHORTEST_BARE_VALUE),
-        )
-    });
-    for value in spellings.filter(|value| !value.is_empty()) {
-        if message.contains(value) {
-            present.push(Cow::Borrowed(value));
-        }
-        if let Some(escaped) = json_escaped(value)
-            && message.contains(escaped.as_str())
+pub fn unreadable_parts(text: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    for word in text.split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | '=' | ';'))
+    {
+        let bare = word.trim_matches(|c: char| matches!(c, '\'' | '"' | '`'));
+        if bare.chars().count() < SHORTEST_BARE_VALUE
+            || ALL_KEYWORDS
+                .binary_search(&bare.to_ascii_uppercase().as_str())
+                .is_ok()
         {
-            present.push(Cow::Owned(escaped));
+            continue;
+        }
+        parts.push(word.to_string());
+        if bare != word {
+            parts.push(bare.to_string());
         }
     }
-    if present.is_empty() {
-        return Cow::Borrowed(message);
-    }
-    // The longest first, so a quoted value goes whole rather than leaving its
-    // quotes behind.
-    present.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    present.dedup();
-    let mut message = message.to_string();
-    for value in present {
-        message = message.replace(value.as_ref(), REDACTED);
-    }
-    Cow::Owned(message)
+    parts
 }
 
-/// `value` as JSON writes it inside a string, when that differs from `value`.
-fn json_escaped(value: &str) -> Option<String> {
-    let quoted = serde_json::to_string(value).ok()?;
-    let escaped = quoted.get(1..quoted.len() - 1)?;
-    (escaped != value).then(|| escaped.to_string())
-}
+/// `message`, an error a statement failed with or a result that repeats it,
+/// without the values the statement's recorded text took out: a parser error
+/// quotes the token it stopped at, and a connector can repeat a value it could
+/// not use.
+pub use util::redact::redact_values;
 
 /// The text of `sql` as it may be recorded, read with `dialect`, the dialect
 /// the statement is parsed with. Text that cannot define a component is
@@ -270,7 +256,7 @@ fn record<'a>(
     every_statement: bool,
 ) -> RecordedStatement<'a> {
     let Ok(tokens) = Tokenizer::new(dialect, sql).tokenize_with_location() else {
-        return RecordedStatement::unreadable();
+        return RecordedStatement::unreadable(sql);
     };
     // Text that names a keyword only inside a word, as a `created_at` column
     // does, defines nothing: it is returned before its tokens are placed.
@@ -287,12 +273,12 @@ fn record<'a>(
             byte_offset(sql, &starts, token.span.start),
             byte_offset(sql, &starts, token.span.end),
         ) else {
-            return RecordedStatement::unreadable();
+            return RecordedStatement::unreadable(sql);
         };
         // Each token follows the one before: text that does not read so is
         // not spliced.
         if start > end || toks.last().is_some_and(|last| last.range.end > start) {
-            return RecordedStatement::unreadable();
+            return RecordedStatement::unreadable(sql);
         }
         toks.push(Tok {
             range: start..end,

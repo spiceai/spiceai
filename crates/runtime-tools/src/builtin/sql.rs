@@ -15,7 +15,9 @@ limitations under the License.
 */
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use datafusion_ddl::component_options::{UNREADABLE_STATEMENT, recorded_text, redact_values};
+use datafusion_ddl::component_options::{
+    UNREADABLE_STATEMENT, recorded_text, redact_values, unreadable_parts,
+};
 use std::collections::HashSet;
 use std::{
     borrow::Cow,
@@ -171,7 +173,11 @@ pub fn sql_tool_names() -> Vec<String> {
 pub fn recorded_input(arg: &str) -> (Cow<'_, str>, Vec<String>) {
     let Ok(SqlToolParams { query }) = serde_json::from_str::<SqlToolParams>(arg) else {
         // Owned, as any changed text is: a caller tells a changed text by it.
-        return (Cow::Owned(UNREADABLE_STATEMENT.to_string()), Vec::new());
+        // What a source quotes back of the arguments loses their parts.
+        return (
+            Cow::Owned(UNREADABLE_STATEMENT.to_string()),
+            unreadable_parts(arg),
+        );
     };
     let recorded = recorded_text(&query);
     match recorded.text {
@@ -241,21 +247,31 @@ mod tests {
     }
 
     /// Arguments that are not the tool's JSON run nothing, and are recorded
-    /// only as a placeholder, whatever they carry.
+    /// only as a placeholder, whatever they carry; what quotes them back loses
+    /// the parts that may be values.
     #[test]
     fn arguments_that_are_not_the_tools_json_are_not_recorded() {
         for arg in [
             "CREATE TABLE t WITH (pg_pass = 'hunter2')",
             r#"{"sql": "CRATE TABLE t WITH (pg_pass = 'hunter2')"}"#,
             r#"{"query": "CRATE TABLE t WITH (pg_pass = 'hunter2')""#,
-            "not json",
         ] {
             let (recorded, removed) = recorded_input(arg);
             assert!(
                 matches!(&recorded, Cow::Owned(text) if text == UNREADABLE_STATEMENT),
                 "{arg}: {recorded:?}"
             );
-            assert!(removed.is_empty(), "{arg}: {removed:?}");
+            assert!(
+                removed.iter().any(|value| value == "hunter2"),
+                "{arg}: {removed:?}"
+            );
+            assert!(
+                !redact_values(&format!("refused: {arg}"), &removed).contains("hunter2"),
+                "{arg}"
+            );
         }
+        let (recorded, removed) = recorded_input("not json");
+        assert!(matches!(&recorded, Cow::Owned(text) if text == UNREADABLE_STATEMENT));
+        assert!(removed.is_empty(), "{removed:?}");
     }
 }

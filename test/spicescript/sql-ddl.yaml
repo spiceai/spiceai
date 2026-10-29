@@ -4,11 +4,19 @@ description: >
   CREATE TABLE returns, and is kept across a restart until it is dropped. Only
   an `:admin` key defines one. What a read-only key reads (SHOW CREATE, and the
   task history of every statement, mistyped or cut short ones included) holds
-  none of a definition's secrets.
+  none of a definition's secrets, nor does the error of a source that repeats
+  a secret a definition names by reference.
 
 sources:
   lake: { kind: files }
   ref: { kind: postgres }
+
+variants:
+  # A DuckLake connection string with a password, which a definition names as
+  # a reference, `${env:DL_CONN}`.
+  default:
+    env:
+      DL_CONN: 'postgres:dbname=x host=127.0.0.1 port=1 user=u password=leak-ducklake-reference'
 
 spicepod:
   version: v1
@@ -149,6 +157,20 @@ steps:
       headers: { content-type: application/json }
       body: '{"tool_id": "sql", "arguments": {"sql": "CRATE TABLE p18 WITH (pg_pass = ''leak-tool-invoke-bad-arguments'')"}}'
     expect: { body-contains: 'missing field' }
+  # A DuckLake catalog and dataset whose metadata database cannot be reached:
+  # DuckDB's error repeats the connection string the reference resolves to.
+  - http:
+      method: POST
+      path: /v1/sql
+      headers: { content-type: text/plain }
+      body: "CREATE CATALOG dl WITH (from = 'ducklake', ducklake_connection_string = '${env:DL_CONN}')"
+    expect: { body-contains: Unable to connect to Postgres, body-lacks: ['leak-'] }
+  - http:
+      method: POST
+      path: /v1/sql
+      headers: { content-type: text/plain }
+      body: "CREATE TABLE dl_orders WITH (from = 'ducklake:orders', ducklake_connection_string = '${env:DL_CONN}')"
+    expect: { body-contains: Unable to connect to Postgres, body-lacks: ['leak-'] }
   - spice-exec: "CREATE TABLE p_last WITH (from = 'postgres:public.t', pg_host = '127.0.0.1', pg_port = 1, pg_db = 'd', pg_pass = 'leak-last')"
     expect-error: true
   # Task history, as a read-only key reads it, once the last statement is in it.

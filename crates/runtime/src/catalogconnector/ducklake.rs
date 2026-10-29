@@ -31,7 +31,7 @@ use data_components::RefreshableCatalogProvider;
 use data_components::duckdb::{install_and_load_extension, with_utc_session_timezone};
 use data_components::ducklake::provider::{DuckLakeCatalogProvider, DuckLakeFederation};
 use data_components::ducklake::{
-    DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
+    DuckLakeS3Params, attach_error_message, build_ducklake_attach_sql, configure_duckdb_httpfs,
 };
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
@@ -53,6 +53,11 @@ pub enum Error {
 
     #[snafu(display("Failed to initialize DuckLake: {source}"))]
     UnableToInitializeDuckLake { source: duckdb::Error },
+
+    /// Attaching failed: the message leaves out the connection string, which
+    /// `DuckDB` repeats with its credentials.
+    #[snafu(display("Failed to initialize DuckLake: {message}"))]
+    UnableToAttachDuckLake { message: String },
 }
 
 pub const PARAMETERS: &[ParameterSpec] = &[
@@ -293,7 +298,9 @@ impl CatalogConnector for DuckLakeCatalog {
                 duckdb_wrapper
                     .conn
                     .execute(&attach_sql, [])
-                    .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
+                    .map_err(|e| Error::UnableToAttachDuckLake {
+                        message: attach_error_message(&e, &connection_string_for_pool),
+                    })
                     .map_err(|e| super::Error::UnableToGetCatalogProvider {
                         connector: PREFIX.to_string(),
                         connector_component: connector_component_for_pool,

@@ -40,7 +40,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use datafusion_ddl::component_options::{
-    UNREADABLE_STATEMENT, may_define, recorded_call_arguments, redact_values,
+    UNREADABLE_STATEMENT, may_define, recorded_call_arguments, redact_values, unreadable_parts,
 };
 use runtime_tools::builtin::sql::{is_sql_tool, recorded_input, sql_tool_names};
 use serde::Serialize;
@@ -170,11 +170,17 @@ fn recorded_invocation(
 ) -> Option<(String, Vec<String>)> {
     let Ok(Value::Object(mut invocation)) = serde_json::from_str::<Value>(arguments) else {
         // Not `tool_invoke`'s JSON: it runs nothing, and keeps nothing.
-        return Some((UNREADABLE_STATEMENT.to_string(), Vec::new()));
+        return Some((
+            UNREADABLE_STATEMENT.to_string(),
+            unreadable_parts(arguments),
+        ));
     };
     // A call that names no tool runs nothing, and keeps nothing either.
     let Some(tool) = invocation.get("tool_id").and_then(Value::as_str) else {
-        return Some((UNREADABLE_STATEMENT.to_string(), Vec::new()));
+        return Some((
+            UNREADABLE_STATEMENT.to_string(),
+            unreadable_parts(arguments),
+        ));
     };
     let is_sql_call = is_sql(tool);
     let (inner, is_text) = match invocation.get("arguments") {

@@ -164,11 +164,20 @@ pub fn build_ducklake_attach_sql(
     attach_sql
 }
 
+/// The text of `error`, from attaching the `DuckLake` catalog at
+/// `connection_string`, without the connection string or any part of it:
+/// `DuckDB` repeats the whole string, a password included, in its error, also
+/// when the string came from a secret.
+#[must_use]
+pub fn attach_error_message(error: &impl std::fmt::Display, connection_string: &str) -> String {
+    util::redact::redact_values(&error.to_string(), &[connection_string.to_string()]).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DuckLakeS3Params, build_ducklake_attach_sql, build_ducklake_s3_secret_sql,
-        session_token_is_ignored,
+        DuckLakeS3Params, attach_error_message, build_ducklake_attach_sql,
+        build_ducklake_s3_secret_sql, session_token_is_ignored,
     };
 
     #[test]
@@ -316,6 +325,19 @@ mod tests {
         assert_eq!(
             build_ducklake_attach_sql("s3://b/o'brien.ducklake", "my\"lake", true),
             "ATTACH 'ducklake:s3://b/o''brien.ducklake' AS \"my\"\"lake\" (AUTOMATIC_MIGRATION TRUE)"
+        );
+    }
+
+    /// `DuckDB` names the metadata database by its whole connection string,
+    /// twice; neither it nor any part of it a client repeats alone is kept.
+    #[test]
+    fn an_attach_error_keeps_no_part_of_the_connection_string() {
+        let connection_string =
+            "postgres:dbname=db2 host=127.0.0.1 port=18895 user=u2 password=hunter2";
+        let error = r#"IO Error: Failed to attach DuckLake MetaData "__ducklake_metadata_ducklake" at path + "postgres:dbname=db2 host=127.0.0.1 port=18895 user=u2 password=hunter2"Unable to connect to Postgres at "dbname=db2 host=127.0.0.1 port=18895 user=u2 password=hunter2": connection to server at "127.0.0.1", port 18895 failed: Connection refused"#;
+        assert_eq!(
+            attach_error_message(&error, connection_string),
+            r#"IO Error: Failed to attach DuckLake MetaData "__ducklake_metadata_ducklake" at path + "<redacted>"Unable to connect to Postgres at "dbname=db2 <redacted> <redacted> <redacted> <redacted>": connection to server at "127.0.0.1", port 18895 failed: Connection refused"#
         );
     }
 }

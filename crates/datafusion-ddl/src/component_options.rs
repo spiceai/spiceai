@@ -1761,6 +1761,7 @@ mod recorded;
 pub use recorded::{
     RecordedStatement, UNREADABLE_STATEMENT, may_define, recorded_call_arguments,
     recorded_statement, recorded_text, recorded_unparsed_statement, redact_values,
+    unreadable_parts,
 };
 
 #[cfg(test)]

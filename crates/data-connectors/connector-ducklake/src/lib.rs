@@ -23,7 +23,7 @@ use data_components::Read;
 use data_components::duckdb::{install_and_load_extension, with_utc_session_timezone};
 use data_components::ducklake::writer::DuckDbFederatedTableWriter;
 use data_components::ducklake::{
-    DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
+    DuckLakeS3Params, attach_error_message, build_ducklake_attach_sql, configure_duckdb_httpfs,
 };
 use data_connector_api::ConnectorContext;
 use data_connector_api::{
@@ -57,6 +57,11 @@ pub enum Error {
 
     #[snafu(display("Failed to initialize DuckLake extension: {source}"))]
     UnableToInitializeDuckLake { source: duckdb::Error },
+
+    /// Attaching failed: the message leaves out the connection string, which
+    /// `DuckDB` repeats with its credentials.
+    #[snafu(display("Failed to initialize DuckLake extension: {message}"))]
+    UnableToAttachDuckLake { message: String },
 
     #[snafu(display("Failed to get underlying DuckDB connection"))]
     FailedToGetDuckDbConnection,
@@ -243,7 +248,9 @@ fn create_ducklake_factory(
     duckdb_wrapper
         .conn
         .execute(&attach_sql, [])
-        .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
+        .map_err(|e| Error::UnableToAttachDuckLake {
+            message: attach_error_message(&e, connection_string),
+        })
         .map_err(|e| DataConnectorError::UnableToConnectInternal {
             dataconnector: "ducklake".to_string(),
             connector_component: params.component.clone(),
