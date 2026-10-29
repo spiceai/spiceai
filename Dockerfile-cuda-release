@@ -78,20 +78,8 @@ COPY --from=binary /root/spiced /usr/local/bin/spiced
 # Copy PDFium next to the binary (dlopen'd at runtime for PDF document parsing)
 COPY --from=binary /root/libpdfium.so /usr/local/bin/libpdfium.so
 
-# Run as nobody (65534), like the main release image. spiced writes under the
-# working directory (.spice/ acceleration files), $HOME, the Hugging Face cache
-# and /tmp, so give 65534 its own /app and cache directory.
-RUN mkdir -p /app /.cache/huggingface/hub \
-    && chown -R 65534:65534 /app /.cache \
-    && chmod -R 755 /.cache
-
 ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
 ENV LD_LIBRARY_PATH=/usr/local/cuda/compat:${LD_LIBRARY_PATH}
-ENV HOME=/app
-ENV HF_HOME=/.cache/huggingface
-ENV HF_HUB_CACHE=/.cache/huggingface/hub
-
-USER 65534:65534
 
 WORKDIR /app
 
