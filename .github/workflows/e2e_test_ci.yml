@@ -1556,9 +1556,12 @@ jobs:
           # Runs in place and unprivileged rather than `clickhouse install` into the shared
           # host's system paths. Every listener and every state path moves, as on Linux; the
           # working directory only collects preprocessed configs, so it is $dir as well.
+          # The binary's built-in config requires a TABLE ENGINE grant to create a MergeTree
+          # table, which the packaged config.xml on Linux does not, so it is turned off here.
           cd "$dir"
           ./clickhouse server --pid-file="${dir}/clickhouse.pid" -- \
             --listen_host=127.0.0.1 \
+            --access_control_improvements.table_engines_require_grant=0 \
             --http_port="${CI_CLICKHOUSE_HTTP_PORT}" \
             --tcp_port="${CI_CLICKHOUSE_PORT}" \
             --mysql_port="${CI_CLICKHOUSE_MYSQL_PORT}" \

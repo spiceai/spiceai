@@ -72,10 +72,41 @@ release_for spiceai-macos-runner-008 "$first"
 [ -d "$lock_dir/$first" ] && fail "the holder's release frees its port" || pass "the holder's release frees its port"
 assert_eq "a released port is handed out again" "$first" "$(pg_port spiceai-macos-runner-049)"
 
-# A reservation left by an instance that never released it stops blocking the
-# port once it is older than CI_SERVICE_PORT_STALE_MINUTES (a day by default).
+# Another instance's reservation is never taken over, however old: two jobs
+# that both judged it stale would both claim it.
+release_for spiceai-macos-runner-049 "$first"
+mkdir -p "$lock_dir/$first" && echo spiceai-macos-runner-gone >"$lock_dir/$first/owner"
 touch -t 202001010000 "$lock_dir/$first"
-assert_eq "an abandoned reservation is taken over" "$first" "$(pg_port spiceai-macos-runner-008)"
+assert_ne "an old reservation of another instance is skipped" "$first" "$(pg_port spiceai-macos-runner-008)"
+dupes=0
+for _ in 1 2 3 4 5 6 7 8; do
+  pg_port spiceai-macos-runner-008 >"$work_dir/a" &
+  pg_port spiceai-macos-runner-049 >"$work_dir/b" &
+  wait
+  [ "$(cat "$work_dir/a")" = "$(cat "$work_dir/b")" ] && dupes=$((dupes + 1))
+  release_for spiceai-macos-runner-008 "$(cat "$work_dir/a")"
+  release_for spiceai-macos-runner-049 "$(cat "$work_dir/b")"
+done
+assert_eq "concurrent allocations next to an old reservation never share a port" "0" "$dupes"
+
+# An instance runs one job at a time, so reservations it still owns when a new
+# job starts are leftovers of its previous job, from another run, and are freed.
+leftover=$(env -i PATH="$PATH" CI_SERVICE_PORT_LOCK_DIR="$lock_dir" RUNNER_NAME=spiceai-macos-runner-008 \
+  GITHUB_RUN_ID=1 GITHUB_JOB=other GITHUB_RUN_ATTEMPT=1 bash "$allocate" | sed -n 's/^CI_PG_PORT=//p')
+pg_port spiceai-macos-runner-008 >/dev/null
+[ -d "$lock_dir/$leftover" ] && fail "a previous job's leftover is released" || pass "a previous job's leftover is released"
+
+# With every candidate port taken, allocation fails rather than hand out a port
+# another job holds, exports nothing, and keeps none of what it reserved.
+exhausted="$work_dir/exhausted"
+mkdir -p "$exhausted"
+for p in $(seq 11000 11999); do mkdir "$exhausted/$p" && echo other >"$exhausted/$p/owner"; done
+out=$(env -i PATH="$PATH" CI_SERVICE_PORT_LOCK_DIR="$exhausted" RUNNER_NAME=spiceai-macos-runner-008 \
+  GITHUB_RUN_ID=40802775871 GITHUB_JOB=test_quickstart_data_postgres GITHUB_RUN_ATTEMPT=1 bash "$allocate" 2>&1)
+rc=$?
+assert_eq "exhaustion exits non-zero" "1" "$rc"
+case "$out" in *CI_*=*) fail "exhaustion exports no ports" ;; *) pass "exhaustion exports no ports" ;; esac
+assert_eq "exhaustion releases the ports it had reserved" "0" "$(grep -lx spiceai-macos-runner-008 "$exhausted"/*/owner 2>/dev/null | wc -l | tr -d ' ')"
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures check(s) failed"
