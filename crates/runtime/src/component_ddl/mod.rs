@@ -753,16 +753,12 @@ impl Runtime {
             };
             match runtime.serve_stored_definitions(&shared, known).await {
                 Ok(_) => reported = None,
-                Err(cause) => {
+                Err(failure) => {
                     // Reported once until it changes or the check succeeds.
-                    if reported.as_deref() != Some(cause.as_str()) {
-                        tracing::warn!(
-                            "Failed to apply a change another instance made to the datasets and catalogs defined with SQL in {}, so this instance keeps serving its earlier definitions and retries every {} seconds. Cause: {cause}",
-                            shared.location(),
-                            SQL_DEFINITIONS_CHECK_INTERVAL.as_secs()
-                        );
+                    if reported.as_deref() != Some(failure.cause.as_str()) {
+                        tracing::warn!("{}", unapplied_change(shared.location(), &failure));
                     }
-                    reported = Some(cause);
+                    reported = Some(failure.cause);
                 }
             }
         }
@@ -778,8 +774,11 @@ impl Runtime {
         self: &Arc<Self>,
         store: &DefinitionsStore,
         known: SqlDefinitions,
-    ) -> Result<SqlDefinitions, String> {
-        let stored = store.load().await.map_err(|e| e.to_string())?;
+    ) -> Result<SqlDefinitions, ServeFailure> {
+        let stored = store.load().await.map_err(|e| ServeFailure {
+            cause: e.to_string(),
+            unserved: Vec::new(),
+        })?;
         self.serve_definitions(store, known, stored).await
     }
 
@@ -792,25 +791,26 @@ impl Runtime {
         store: &DefinitionsStore,
         known: SqlDefinitions,
         stored: SqlDefinitions,
-    ) -> Option<String> {
-        let cause = self.serve_definitions(store, known, stored).await.err()?;
-        tracing::warn!(
-            "Failed to apply a change another instance made to the datasets and catalogs defined with SQL in {}, so this instance keeps serving its earlier definitions and retries every {} seconds. Cause: {cause}",
-            store.location(),
-            SQL_DEFINITIONS_CHECK_INTERVAL.as_secs()
-        );
-        Some(cause)
+    ) -> Option<ServeFailure> {
+        let failure = self.serve_definitions(store, known, stored).await.err()?;
+        tracing::warn!("{}", unapplied_change(store.location(), &failure));
+        Some(failure)
     }
 
     /// Serve `stored`, the definitions `store` holds, when they differ from
     /// `known`, the ones this instance serves. The caller holds
-    /// `apply_app_lock`. Returns the definitions now served.
+    /// `apply_app_lock`. Returns the definitions now served. A dataset that
+    /// `stored` drops or points at another source, and whose acceleration data
+    /// cannot be deleted, is not served until a retry deletes it: its earlier
+    /// definition would answer for a dataset that no longer reads that data.
+    /// `known` stays the definitions this instance serves, so the check that
+    /// runs every 10 seconds retries.
     async fn serve_definitions(
         self: &Arc<Self>,
         store: &DefinitionsStore,
         known: SqlDefinitions,
         stored: SqlDefinitions,
-    ) -> Result<SqlDefinitions, String> {
+    ) -> Result<SqlDefinitions, ServeFailure> {
         if stored == known {
             return Ok(known);
         }
@@ -828,7 +828,15 @@ impl Runtime {
             // served holds none of them.
             .unwrap_or_else(|| Arc::clone(&served));
         let retired = plan::retired_datasets(&spicepod, &known, &stored, None);
-        let applied = self.retire(&spicepod, &served, &stored, &retired).await?;
+        let applied = self
+            .retire(
+                &spicepod,
+                &served,
+                &stored,
+                &retired,
+                OnUndeleted::KeepUnserved,
+            )
+            .await?;
         plan::warn_shadowed(&spicepod, &stored);
         let current = Arc::new(plan::serve((*spicepod).clone(), &stored));
         *self.sql_components.defined.write().await = Some(stored.clone());
@@ -846,15 +854,17 @@ impl Runtime {
     /// Stop serving `retired`, the datasets a change to `definitions` retires,
     /// and delete their acceleration data, so no later definition of their
     /// names loads it. Returns the app then served: `served` without them.
-    /// When a deletion fails, `served` is served again and the error names the
-    /// dataset.
+    /// When a dataset cannot be unloaded, `served` is served again; when its
+    /// acceleration data cannot be deleted, `on_undeleted` says what is
+    /// served. The error names the dataset.
     async fn retire(
         self: &Arc<Self>,
         spicepod: &Arc<App>,
         served: &Arc<App>,
         definitions: &SqlDefinitions,
         retired: &[Dataset],
-    ) -> Result<Arc<App>, String> {
+        on_undeleted: OnUndeleted,
+    ) -> Result<Arc<App>, ServeFailure> {
         if retired.is_empty() {
             return Ok(Arc::clone(served));
         }
@@ -879,23 +889,37 @@ impl Runtime {
             Arc::clone(self)
                 .apply_app_diff(Some(&without_app), Arc::clone(served))
                 .await;
-            return Err(format!(
-                "dataset {} could not be unloaded, so it is still served, with its acceleration data. Run the statement again; the Spice log says why the unload failed.",
-                display_dataset_name(&dataset.name)
-            ));
+            return Err(ServeFailure {
+                cause: format!(
+                    "dataset {} could not be unloaded, so it is still served, with its acceleration data. Run the statement again; the Spice log says why the unload failed.",
+                    display_dataset_name(&dataset.name)
+                ),
+                unserved: Vec::new(),
+            });
         }
         for dataset in retired {
             if let Err(e) = Arc::clone(self)
                 .delete_acceleration_data(dataset, served)
                 .await
             {
-                Arc::clone(self)
-                    .apply_app_diff(Some(&without_app), Arc::clone(served))
-                    .await;
-                return Err(format!(
-                    "the acceleration data of dataset {} could not be deleted. Cause: {e}",
-                    display_dataset_name(&dataset.name)
-                ));
+                let unserved = match on_undeleted {
+                    OnUndeleted::ServeEarlier => {
+                        Arc::clone(self)
+                            .apply_app_diff(Some(&without_app), Arc::clone(served))
+                            .await;
+                        Vec::new()
+                    }
+                    OnUndeleted::KeepUnserved => {
+                        retired.iter().map(|dataset| dataset.name.clone()).collect()
+                    }
+                };
+                return Err(ServeFailure {
+                    cause: format!(
+                        "the acceleration data of dataset {} could not be deleted. Cause: {e}",
+                        display_dataset_name(&dataset.name)
+                    ),
+                    unserved,
+                });
             }
         }
         Ok(without_app)
@@ -979,7 +1003,7 @@ impl Runtime {
             let defined = self
                 .serve_definitions(&store, known, stored)
                 .await
-                .map_err(|cause| not_applied(&cause))?;
+                .map_err(|failure| not_applied(&failure.cause))?;
             let served = self
                 .read_app()
                 .await
@@ -1038,8 +1062,8 @@ impl Runtime {
                 let stored = store.load().await.map_err(|e| not_applied(&e))?;
                 if stored != defined {
                     if plan::changes_component(&op, &defined, &stored) {
-                        let unserved = self.serve_change_by_another(&store, defined, stored).await;
-                        return Err(not_applied(&changed_by_another(&op, unserved.as_deref())));
+                        let failure = self.serve_change_by_another(&store, defined, stored).await;
+                        return Err(not_applied(&changed_by_another(&op, failure.as_ref())));
                     }
                     if attempt < CONFLICT_ATTEMPTS {
                         continue;
@@ -1050,9 +1074,15 @@ impl Runtime {
                 }
             }
             let applied = self
-                .retire(&spicepod, &served, &definitions, &retired)
+                .retire(
+                    &spicepod,
+                    &served,
+                    &definitions,
+                    &retired,
+                    OnUndeleted::ServeEarlier,
+                )
                 .await
-                .map_err(|cause| not_applied(&cause))?;
+                .map_err(|failure| not_applied(&failure.cause))?;
 
             match store.replace(&defined, &definitions).await {
                 Ok(()) => {
@@ -1075,9 +1105,9 @@ impl Runtime {
                         && let Ok(stored) = store.load().await
                     {
                         if plan::changes_component(&op, &defined, &stored) {
-                            let unserved =
+                            let failure =
                                 self.serve_change_by_another(&store, defined, stored).await;
-                            cause = changed_by_another(&op, unserved.as_deref());
+                            cause = changed_by_another(&op, failure.as_ref());
                         } else if attempt < CONFLICT_ATTEMPTS {
                             continue;
                         }
@@ -1349,26 +1379,28 @@ impl Runtime {
     }
 
     /// Delete the acceleration data of `dataset`, a definition `app` served and
-    /// that no longer serves. A failure is its root cause, such as the
-    /// accelerator's file error, for the message that names the dataset.
+    /// that no longer serves. A failure is its whole chain on one line: its
+    /// innermost error can be a bare code, such as `DuckDB`'s, whose layer
+    /// above holds the text that names the file.
     async fn delete_acceleration_data(
         self: Arc<Self>,
         dataset: &Dataset,
         app: &Arc<App>,
     ) -> Result<(), String> {
+        let one_line = |e: &dyn std::fmt::Display| util::single_line(&e.to_string()).into_owned();
         if !dataset.acceleration.as_ref().is_some_and(|a| a.enabled) {
             return Ok(());
         }
         let built = DatasetBuilder::try_from(dataset.clone())
-            .map_err(|e| store::root_cause(&e))?
+            .map_err(|e| one_line(&e))?
             .with_app(Arc::clone(app))
             .with_runtime(Arc::clone(&self))
             .build()
-            .map_err(|e| store::root_cause(&e))?;
+            .map_err(|e| one_line(&e))?;
         self.df
             .delete_acceleration_data(&built)
             .await
-            .map_err(|e| store::root_cause(&e))
+            .map_err(|e| one_line(&e))
     }
 
     /// Wait, within [`REGISTRATION_WAIT`], for `dataset` to register, and say
@@ -1418,25 +1450,89 @@ fn unreadable(location: &str, cause: &str) -> String {
     )
 }
 
+/// A change to the definitions that this instance could not serve, and what
+/// it serves meanwhile.
+#[derive(Debug)]
+struct ServeFailure {
+    /// What failed, worded as the cause a message goes on to give.
+    cause: String,
+    /// The datasets the change drops or points at another source that this
+    /// instance stopped serving and could not delete the acceleration data of.
+    /// It serves the rest of the change. Empty when it serves its earlier
+    /// definitions instead.
+    unserved: Vec<String>,
+}
+
+/// What [`Runtime::retire`] serves when it cannot delete a retired dataset's
+/// acceleration data.
+#[derive(Clone, Copy, Debug)]
+enum OnUndeleted {
+    /// The app served before: a statement that fails changes nothing.
+    ServeEarlier,
+    /// The app without the retired datasets: the change is stored already, so
+    /// their earlier definitions would answer for a dataset that is dropped
+    /// or reads another source.
+    KeepUnserved,
+}
+
 /// Why a statement was not applied when another instance changed its own
-/// dataset or catalog while it ran, and how to see that change. `unserved` is
-/// why this instance could not serve the change yet, when it could not: `SHOW
-/// CREATE` then shows the earlier definition until a retry serves it.
-fn changed_by_another(op: &ComponentDdlOp, unserved: Option<&str>) -> String {
+/// dataset or catalog while it ran, and how to see that change. `failure` is
+/// why this instance could not serve the change yet, when it could not.
+fn changed_by_another(op: &ComponentDdlOp, failure: Option<&ServeFailure>) -> String {
     let name = op.component_name();
     let (noun, object) = match op.kind() {
         ComponentKind::Dataset => ("dataset", "TABLE"),
         ComponentKind::Catalog => ("catalog", "CATALOG"),
     };
-    match unserved {
-        None => format!(
+    let unserved = |failure: &ServeFailure| {
+        matches!(op.kind(), ComponentKind::Dataset)
+            && failure
+                .unserved
+                .iter()
+                .any(|dataset| resolved_dataset_name(dataset) == resolved_dataset_name(name))
+    };
+    match failure {
+        Some(failure) if unserved(failure) => format!(
+            "another instance changed {noun} '{name}' while this statement ran, and this instance failed to apply that change, so it does not serve {noun} '{name}' until a retry applies it; Spice retries every {} seconds. Then run the statement again if it still applies. Cause: {}",
+            SQL_DEFINITIONS_CHECK_INTERVAL.as_secs(),
+            failure.cause
+        ),
+        Some(failure) if failure.unserved.is_empty() => format!(
+            "another instance changed {noun} '{name}' while this statement ran, and this instance failed to apply that change, so `SHOW CREATE {object} {name}` shows the earlier definition until a retry applies it; Spice retries every {} seconds. Then run the statement again if it still applies. Cause: {}",
+            SQL_DEFINITIONS_CHECK_INTERVAL.as_secs(),
+            failure.cause
+        ),
+        // Served, or served without only other datasets, whose failure is
+        // logged.
+        _ => format!(
             "another instance changed {noun} '{name}' while this statement ran. Run `SHOW CREATE {object} {name}` to see the change, then run the statement again if it still applies."
         ),
-        Some(cause) => format!(
-            "another instance changed {noun} '{name}' while this statement ran, and this instance failed to apply that change, so `SHOW CREATE {object} {name}` shows the earlier definition until a retry applies it; Spice retries every {} seconds. Then run the statement again if it still applies. Cause: {cause}",
-            SQL_DEFINITIONS_CHECK_INTERVAL.as_secs()
-        ),
     }
+}
+
+/// The log line of a change another instance made to the definitions in
+/// `location` that this instance could not serve, saying what it serves.
+fn unapplied_change(location: &str, failure: &ServeFailure) -> String {
+    let seconds = SQL_DEFINITIONS_CHECK_INTERVAL.as_secs();
+    let serving = match failure.unserved.as_slice() {
+        [] => format!("keeps serving its earlier definitions and retries every {seconds} seconds"),
+        [dataset] => format!(
+            "does not serve dataset {} until a retry, every {seconds} seconds, applies it",
+            display_dataset_name(dataset)
+        ),
+        datasets => format!(
+            "does not serve datasets {} until a retry, every {seconds} seconds, applies it",
+            datasets
+                .iter()
+                .map(|dataset| display_dataset_name(dataset))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    format!(
+        "Failed to apply a change another instance made to the datasets and catalogs defined with SQL in {location}, so this instance {serving}. Cause: {}",
+        failure.cause
+    )
 }
 
 /// The values of `op`'s definition that a record any API key reads leaves out
@@ -1625,21 +1721,68 @@ mod tests {
     }
 
     /// A statement that loses a race to a change to its own component sends
-    /// the user to `SHOW CREATE`, and says when that still shows the earlier
-    /// definition because this instance could not apply the change.
+    /// the user to `SHOW CREATE`, and says what this instance serves when it
+    /// could not apply the change: its earlier definitions, or, when the
+    /// change retires the statement's dataset and its acceleration data could
+    /// not be deleted, no definition of it. A failure that leaves only other
+    /// datasets unserved still served this one's change.
     #[test]
-    fn a_lost_race_says_where_to_see_the_change() {
+    fn a_lost_race_says_what_this_instance_serves() {
         let op = ComponentDdlOp::DropDataset {
             name: "orders".to_string(),
             if_exists: false,
         };
+        let not_deleted = |dataset: &str| ServeFailure {
+            cause: format!(
+                "the acceleration data of dataset '{dataset}' could not be deleted. Cause: Permission denied (os error 13)"
+            ),
+            unserved: vec![dataset.to_string()],
+        };
+        let served = "another instance changed dataset 'orders' while this statement ran. Run `SHOW CREATE TABLE orders` to see the change, then run the statement again if it still applies.";
+        assert_eq!(changed_by_another(&op, None), served);
         assert_eq!(
-            changed_by_another(&op, None),
-            "another instance changed dataset 'orders' while this statement ran. Run `SHOW CREATE TABLE orders` to see the change, then run the statement again if it still applies."
+            changed_by_another(&op, Some(&not_deleted("customers"))),
+            served
         );
         assert_eq!(
-            changed_by_another(&op, Some("Permission denied (os error 13)")),
-            "another instance changed dataset 'orders' while this statement ran, and this instance failed to apply that change, so `SHOW CREATE TABLE orders` shows the earlier definition until a retry applies it; Spice retries every 10 seconds. Then run the statement again if it still applies. Cause: Permission denied (os error 13)"
+            changed_by_another(
+                &op,
+                Some(&ServeFailure {
+                    cause: "dataset 'orders' could not be unloaded".to_string(),
+                    unserved: Vec::new(),
+                })
+            ),
+            "another instance changed dataset 'orders' while this statement ran, and this instance failed to apply that change, so `SHOW CREATE TABLE orders` shows the earlier definition until a retry applies it; Spice retries every 10 seconds. Then run the statement again if it still applies. Cause: dataset 'orders' could not be unloaded"
+        );
+        assert_eq!(
+            changed_by_another(&op, Some(&not_deleted("orders"))),
+            "another instance changed dataset 'orders' while this statement ran, and this instance failed to apply that change, so it does not serve dataset 'orders' until a retry applies it; Spice retries every 10 seconds. Then run the statement again if it still applies. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
+        );
+    }
+
+    /// The log line of a change another instance made that this instance
+    /// could not serve says what it serves meanwhile, naming each dataset it
+    /// does not serve.
+    #[test]
+    fn an_unapplied_change_says_what_this_instance_serves() {
+        let location = "s3://bucket/sql-definitions/definitions.json";
+        let failure = |unserved: &[&str]| {
+            ServeFailure {
+            cause: "the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)".to_string(),
+            unserved: unserved.iter().map(ToString::to_string).collect(),
+        }
+        };
+        assert_eq!(
+            unapplied_change(location, &failure(&[])),
+            "Failed to apply a change another instance made to the datasets and catalogs defined with SQL in s3://bucket/sql-definitions/definitions.json, so this instance keeps serving its earlier definitions and retries every 10 seconds. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
+        );
+        assert_eq!(
+            unapplied_change(location, &failure(&["orders"])),
+            "Failed to apply a change another instance made to the datasets and catalogs defined with SQL in s3://bucket/sql-definitions/definitions.json, so this instance does not serve dataset 'orders' until a retry, every 10 seconds, applies it. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
+        );
+        assert_eq!(
+            unapplied_change(location, &failure(&["orders", "sales.customers"])),
+            "Failed to apply a change another instance made to the datasets and catalogs defined with SQL in s3://bucket/sql-definitions/definitions.json, so this instance does not serve datasets 'orders', 'sales.customers' until a retry, every 10 seconds, applies it. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
         );
     }
 }
