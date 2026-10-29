@@ -240,6 +240,7 @@ impl MetastoreTap {
                         .encode_to_vec()
                         .into(),
                     enqueued: Instant::now(),
+                    seed: true,
                 });
             }
             inner.state.tables.insert(table_id, table);
@@ -378,6 +379,7 @@ impl MetastoreTap {
                     table: table_id.clone(),
                     bytes: table_record.encode_to_vec().into(),
                     enqueued: Instant::now(),
+                    seed: false,
                 });
             }
             let size = after.map(checkpoint_size).unwrap_or_default();

@@ -49,6 +49,9 @@ pub(super) struct Payload {
     pub table: String,
     pub bytes: Bytes,
     pub enqueued: Instant,
+    /// The tap's baseline from SQL for a reopened metastore: a full table state,
+    /// not a commit. A table whose log already exists checks it instead.
+    pub seed: bool,
 }
 enum Command {
     Blob(Bytes),
@@ -185,25 +188,46 @@ struct Table {
     spilled_bytes: u64,
     config: HeadLogConfig,
     prefix: Path,
+    /// The log existed when this session opened it: this session rebuilt its
+    /// state from storage and took the head over from an earlier writer.
+    reopened: bool,
 }
+/// Opens a table's log, creating it if absent. An existing log is rebuilt from
+/// storage alone and taken over with the next generation, which fences every
+/// earlier writer of it.
 async fn table(store: Arc<dyn ObjectStore>, prefix: Path, config: HeadLogConfig) -> Result<Table> {
     let store = Arc::new(CountingStore::new(store));
     let dyn_store: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
-    HeadLog::create(Arc::clone(&dyn_store), prefix.clone(), config).await?;
-    let writer = Writer::take_over(dyn_store, prefix.clone(), config, 1).await?;
+    let existing = match dyn_store.head(&prefix.clone().join("head")).await {
+        Ok(_) => true,
+        Err(object_store::Error::NotFound { .. }) => false,
+        Err(e) => return Err(e.into()),
+    };
+    let (state, generation) = if existing {
+        let (reader, _) = Reader::open(Arc::clone(&dyn_store), prefix.clone()).await?;
+        let lease = reader.state().head.lease;
+        let state = replay(Arc::clone(&dyn_store), prefix.clone()).await?;
+        (state, lease + 1)
+    } else {
+        HeadLog::create(Arc::clone(&dyn_store), prefix.clone(), config).await?;
+        (DatasetState::default(), 1)
+    };
+    let writer = Writer::take_over(dyn_store, prefix.clone(), config, generation).await?;
+    let staged = writer.state().head.floor;
     Ok(Table {
         writer,
         store,
-        state: DatasetState::default(),
-        tap_state: DatasetState::default(),
+        tap_state: state.clone(),
+        state,
         ends: BTreeMap::new(),
-        staged: 0,
+        staged,
         disabled: false,
         metadata_bytes: 0,
         checkpoint_bytes: 0,
         spilled_bytes: 0,
         config,
         prefix,
+        reopened: existing,
     })
 }
 fn table_prefix(prefix: &Path, id: &str) -> Path {
@@ -286,6 +310,23 @@ async fn run(
             };
             if t.disabled {
                 failure(&failures, "disabled", &id);
+                continue;
+            }
+            // A reopened log already holds this table: SQL's baseline must
+            // equal what storage rebuilt, and is not committed again.
+            let payloads = if t.reopened {
+                let (seeds, payloads): (Vec<_>, Vec<_>) =
+                    payloads.into_iter().partition(|p| p.seed);
+                for seed in seeds {
+                    report
+                        .differences
+                        .extend(seed_differences(&t.state, &id, &seed.bytes));
+                }
+                payloads
+            } else {
+                payloads
+            };
+            if payloads.is_empty() {
                 continue;
             }
             let start = Instant::now();
@@ -609,4 +650,26 @@ pub(super) async fn replay(store: Arc<dyn ObjectStore>, prefix: Path) -> Result<
         return Err("storage replay contains unconverted actions".into());
     }
     Ok(state)
+}
+
+/// Differences between SQL's baseline for a table and the state a reopened
+/// shadow rebuilt from storage.
+fn seed_differences(rebuilt: &DatasetState, id: &str, seed: &[u8]) -> Vec<String> {
+    let mut expected = DatasetState::default();
+    let applied = Record::decode(seed)
+        .map_err(|e| e.to_string())
+        .and_then(|record| expected.apply(&record).map_err(|e| e.to_string()));
+    if let Err(e) = applied {
+        return vec![format!("{id}: reopened baseline does not decode: {e}")];
+    }
+    match (expected.tables.get(id), rebuilt.tables.get(id)) {
+        (Some(sql), Some(storage)) => differences(sql, storage)
+            .into_iter()
+            .map(|d| format!("{id}: reopened shadow differs from SQL: {d}"))
+            .collect(),
+        (None, None) => Vec::new(),
+        _ => vec![format!(
+            "{id}: reopened shadow and SQL disagree on table presence"
+        )],
+    }
 }

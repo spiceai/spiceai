@@ -926,3 +926,97 @@ async fn metastore_shadow_reader_inline_and_blobs() -> TestResult<()> {
     }
     Ok(())
 }
+
+fn fencing_config() -> object_store_occ::headlog::HeadLogConfig {
+    object_store_occ::headlog::HeadLogConfig {
+        head_budget_bytes: 1024 * 1024,
+        batch_budget_bytes: 128 * 1024,
+        max_record_bytes: 1024,
+        batch_max_records: 1,
+        max_listed_batches: 1024,
+        spill_above_bytes: 1024,
+    }
+}
+
+fn statistics(table_id: &str, num_rows: i64) -> cayenne::metadata::TableStatistics {
+    cayenne::metadata::TableStatistics {
+        table_id: table_id.to_string(),
+        statistics_blob: vec![1, 2, 3],
+        num_rows,
+        ndv_sketches: None,
+        num_rows_exact: false,
+    }
+}
+
+/// A session superseded by a newer one on the same metastore is fenced by the
+/// head log, while SQL still accepts its late write. The late write is a table
+/// statistics upsert, the write a dropped provider's maintenance loop was seen
+/// to make after another session took the table over.
+#[tokio::test]
+async fn metastore_shadow_fences_a_superseded_session() -> TestResult<()> {
+    let dir = tempfile::tempdir()?;
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let db = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let session = |store: &Arc<dyn object_store::ObjectStore>| -> TestResult<Arc<CayenneCatalog>> {
+        let tap = Arc::new(MetastoreTap::new(None, false)?.with_shadow(
+            Arc::clone(store),
+            object_store::path::Path::from("shadow"),
+            fencing_config(),
+        ));
+        Ok(Arc::new(CayenneCatalog::new(db.clone())?.with_tap(tap)))
+    };
+
+    let first = session(&store)?;
+    first.init().await?;
+    let table_id = first
+        .create_table(CreateTableOptions {
+            table_name: "fenced".to_string(),
+            schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: dir.path().join("data").to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        })
+        .await?;
+    first
+        .upsert_table_statistics(&statistics(&table_id, 1))
+        .await?;
+    let report = first.shadow_verify().await;
+    assert_eq!(
+        report.differences,
+        Vec::<String>::new(),
+        "first session alone"
+    );
+
+    // A second session opens the same metastore and takes the table over.
+    let second = session(&store)?;
+    second.init().await?;
+    second
+        .upsert_table_statistics(&statistics(&table_id, 2))
+        .await?;
+    let report = second.shadow_verify().await;
+    assert_eq!(report.differences, Vec::<String>::new(), "takeover");
+
+    // The superseded session writes late. SQL accepts it...
+    first
+        .upsert_table_statistics(&statistics(&table_id, 3))
+        .await?;
+    assert_eq!(
+        second
+            .get_table_statistics(&table_id)
+            .await?
+            .map(|s| s.num_rows),
+        Some(3),
+        "SQL accepts the superseded session's write"
+    );
+    // ...and the head log refuses it: the old generation is fenced.
+    let report = first.shadow_verify().await;
+    let fenced = format!("{table_id}: shadow commit: shadow outcome: Fenced {{ head_lease: 2 }}");
+    assert!(
+        report.differences.contains(&fenced),
+        "expected {fenced:?} in {:?}",
+        report.differences
+    );
+    Ok(())
+}
