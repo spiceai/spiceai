@@ -1,4 +1,5 @@
 {
+  "append-embeddings": 11,
   "append-kill": 7,
   "append-time-column": 8,
   "append-time-partition": 4,
