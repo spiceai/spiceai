@@ -260,7 +260,7 @@ where
     // as on the engine's own connector (issue #14482).
     let function_support = deny_spice_functions_for_table_providers();
     let function_support = match expression_support_for_engine(driver_name) {
-        Some(gate) => function_support.with_expression_support(gate),
+        Some(gate) => runtime_udfs_api::and_expression_support(function_support, gate),
         None => function_support,
     };
     AdbcTableFactory::new(pool)

@@ -17,7 +17,7 @@ limitations under the License.
 //! Refresh command implementation - triggers a dataset refresh.
 
 use crate::context::RuntimeContext;
-use crate::error::{self, InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
+use crate::error::{self, InvalidResponseSnafu, Result};
 use crate::output::{OutputFormat, write_json};
 use clap::Args;
 use serde::{Deserialize, Serialize};
@@ -110,12 +110,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &RefreshArgs) -> Result<()> {
     } else {
         ctx.post(&url, None).await
     }
-    .map_err(|_| {
-        RuntimeUnavailableSnafu {
-            endpoint: ctx.http_endpoint().to_string(),
-        }
-        .build()
-    })?;
+    .map_err(|e| error::runtime_unreachable(ctx.http_endpoint(), &e))?;
 
     let response = error::check_response(response, ctx.http_endpoint()).await?;
 
@@ -139,4 +134,42 @@ pub async fn execute(ctx: &RuntimeContext, args: &RefreshArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TlsServer;
+
+    /// `refresh` posts rather than gets, so it reaches the runtime through a different
+    /// context helper; it has to report an untrusted certificate the same way.
+    #[tokio::test]
+    async fn refresh_reports_a_certificate_failure_rather_than_an_unavailable_runtime() {
+        let server = TlsServer::answering("{}");
+        let ctx = RuntimeContext::with_args(
+            Some(server.url().to_string()),
+            None,
+            None,
+            Some(server.unrelated_ca_file()),
+        )
+        .expect("context should build");
+        let args = RefreshArgs {
+            dataset: "accounts".to_string(),
+            refresh_sql: None,
+            refresh_mode: None,
+            refresh_jitter_max: None,
+            output: OutputFormat::Table,
+        };
+
+        let message = execute(&ctx, &args)
+            .await
+            .expect_err("refresh should fail when the certificate is not trusted")
+            .to_string();
+
+        assert!(
+            message.contains("TLS certificate verification failed")
+                && message.contains("--tls-root-certificate-file"),
+            "expected a certificate error, got: {message}"
+        );
+    }
 }

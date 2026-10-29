@@ -1466,6 +1466,11 @@ impl DataFusionBuilder {
             ),
         )));
 
+        ctx.state_ref()
+            .write()
+            .config_mut()
+            .set_extension(Arc::new(super::PlansGeneration(0)));
+
         DataFusion {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
@@ -1476,6 +1481,7 @@ impl DataFusionBuilder {
             ddl_extension_store,
             datafusion_ref,
             caching,
+            plans_generation: TokioRwLock::new(0),
             results_cache_warmer: self.results_cache_warmer.unwrap_or_else(|| {
                 super::query::ResultsCacheWarmer::new_unloaded(
                     self.results_cache_warmup_store
