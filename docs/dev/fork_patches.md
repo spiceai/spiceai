@@ -125,7 +125,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1f0744b900e69e1b3fafa721aa4283bd4b048a61` | `spiceai-0.11.0-df-55` |
 | [llama.cpp](#llamacpp) | `a337bb5ce3590beb8763494b4381fe830bac0bc8` | `spiceai-b11803` |
-| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c` | `spiceai` |
+| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `1404d00e3a46acc640c345de826ccd8962db5710` | `lukim/mistral-think-tags` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [orc-rust](#orc-rust) | `d9632e7ae973456c81c660c04e5f55cc86489bcb` | `spiceai-0.9` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
@@ -716,9 +716,10 @@ GLM-5.3 decode speedups on top of that, spiceai/mistral.rs#50, squash-merged as
 `dc73261e`, exports the chat-template renderer, spiceai/mistral.rs#52, squash-merged
 as `aa8e8d43`, the tool-call parser, spiceai/mistral.rs#53, squash-merged as `fcd94520`,
 ring collectives over RDMA, spiceai/mistral.rs#54, squash-merged as `2f58f444`, the
-DeepSeek-V4 DSML tool-call parser, and spiceai/mistral.rs#55, squash-merged as
-`e40436e4`, the candle pin at `zip` 9.1, so `git diff v0.9.4 e40436e4` is the whole
-fork delta. #47 built it in 32 commits. The first replays the Spice patches from the
+DeepSeek-V4 DSML tool-call parser, spiceai/mistral.rs#55, squash-merged as
+`e40436e4`, the candle pin at `zip` 9.1, and spiceai/mistral.rs#58, pinned at its head
+`1404d00e` until it merges, Mistral's `[THINK]` reasoning, so `git diff v0.9.4 1404d00e`
+is the whole fork delta. #47 built it in 32 commits. The first replays the Spice patches from the
 `v0.9.0` line: `glm-dsa`
 GGUF loading, the i-quant MoE fallback, ring tensor parallelism past two ranks,
 multi-node NCCL on the GGUF path, and the `spiceai/candle` pin. The rest add the GGUF
@@ -753,6 +754,7 @@ rather than by taking them. A re-cut cannot lose what the fork does not carry.
 | `mistral.rs`: `ToolCallingMatcher` and `ToolCallFormat` exported from `mistralrs-core` (spiceai/mistral.rs#52), so the llama.cpp engine reads tool calls out of generated text with the same parser as the mistral.rs engine | `crates/llms-llamacpp` fails to build | build | compile-guarded |
 | `mistral.rs`: the ring backend's collectives (`SumAllReduce`, `AllGather`) exchange over RDMA (RoCE v2) when every link of the ring has an RDMA device on both ends, and over TCP otherwise (spiceai/mistral.rs#53; the `ring` feature of `mistralrs-quant`) | A ring whose links all have RDMA sends every collective over TCP: each hop is slower, with no error | silent (perf) | **GAP** — a perf-only row; the fork's PR records the measurement |
 | `mistral.rs`: `ToolCallFormat::DeepSeekDsml` and its parser read DeepSeek-V4's DSML tool-call markup (spiceai/mistral.rs#54) | A DeepSeek-V4 reply to a request with tools comes back as DSML markup in `content`, with no tool call, from both the mistral.rs and llama.cpp engines | silent (wrong text) | **GAP** — guarded in the fork, not here: `mistralrs-core/src/tools/parsers/dsml.rs` and the cases in `mistralrs-core/src/tools/testdata/tool_call_parse_oracle.json` |
+| `mistral.rs`: Mistral's `[THINK]…[/THINK]` reasoning tokens are a reasoning format: `TagReasoningContext::new_mistral_think` and `new_in_mistral_think_block`, `is_mistral_think_template`, and the mistral.rs engine's parser choice (spiceai/mistral.rs#58) | Magistral's and Mistral Large 4's reasoning comes back as content, `[THINK]` tags included, with `reasoning_content` empty; losing the constructors fails the build | silent (wrong text) | `mistral_reasoning_is_split_at_its_think_tokens` (`crates/llms-llamacpp/src/lib.rs`) for the llama.cpp engine; the mistral.rs engine's branch is guarded in the fork by `mistral_think_block_splits_reasoning_from_content` and `mistral_think_block_opened_by_the_prompt` |
 | `mistral.rs`: GGUF `eot_token_id` and `eom_token_id` stop generation, as `eos_token_id` does | GLM-5.3-Flash's reply runs past `<|user|>` into an invented next turn until `max_tokens` | silent (wrong text) | **GAP** |
 | `mistral.rs`: a `distributed` build serves a single-node model, and a ring head keeps a second request queued while one runs | A model without `distributed_backend` never finishes loading in a `distributed` build, and a second request to a ring deadlocks every rank at the next all-reduce | load failure / hang | **GAP** |
 | `text-embeddings-inference`: Spice integration + candle re-pointing | Local embedding models fail to load | build | compile-guarded |

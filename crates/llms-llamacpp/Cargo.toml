@@ -18,7 +18,7 @@ futures.workspace = true
 indexmap.workspace = true
 llama-cpp = { path = "../llama-cpp" }
 llms = { path = "../llms", default-features = false, features = ["local_llm"] }
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c", package = "mistralrs-core" } # branch: spiceai (spiceai/mistral.rs#55: candle zip 9.1; includes #52 tool-call parser, #53, #54)
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "1404d00e3a46acc640c345de826ccd8962db5710", package = "mistralrs-core" } # branch: lukim/mistral-think-tags (spiceai/mistral.rs#58: Mistral [THINK] reasoning; on #55, which includes #52, #53, #54)
 rand.workspace = true
 runtime-request-context = { path = "../runtime-request-context" }
 serde_json.workspace = true

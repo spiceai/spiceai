@@ -2885,7 +2885,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2905,7 +2905,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2925,7 +2925,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -10580,7 +10580,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "system-configuration 0.7.0",
  "tokio",
  "tower-service",
@@ -12911,7 +12911,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=1404d00e3a46acc640c345de826ccd8962db5710#1404d00e3a46acc640c345de826ccd8962db5710"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -12938,7 +12938,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-audio"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=1404d00e3a46acc640c345de826ccd8962db5710#1404d00e3a46acc640c345de826ccd8962db5710"
 dependencies = [
  "anyhow",
  "apodize",
@@ -12949,7 +12949,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-code-exec"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=1404d00e3a46acc640c345de826ccd8962db5710#1404d00e3a46acc640c345de826ccd8962db5710"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -12968,7 +12968,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=1404d00e3a46acc640c345de826ccd8962db5710#1404d00e3a46acc640c345de826ccd8962db5710"
 dependencies = [
  "ahash 0.8.12",
  "akin",
@@ -13075,7 +13075,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-flash-attn"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=1404d00e3a46acc640c345de826ccd8962db5710#1404d00e3a46acc640c345de826ccd8962db5710"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -13086,7 +13086,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-macros"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=1404d00e3a46acc640c345de826ccd8962db5710#1404d00e3a46acc640c345de826ccd8962db5710"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -13097,7 +13097,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-mcp"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=1404d00e3a46acc640c345de826ccd8962db5710#1404d00e3a46acc640c345de826ccd8962db5710"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13118,7 +13118,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-metal-compile"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=1404d00e3a46acc640c345de826ccd8962db5710#1404d00e3a46acc640c345de826ccd8962db5710"
 dependencies = [
  "candle-metal-kernels",
  "objc2-metal 0.3.2",
@@ -13127,7 +13127,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=1404d00e3a46acc640c345de826ccd8962db5710#1404d00e3a46acc640c345de826ccd8962db5710"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -13145,7 +13145,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=1404d00e3a46acc640c345de826ccd8962db5710#1404d00e3a46acc640c345de826ccd8962db5710"
 dependencies = [
  "bytemuck",
  "byteorder",
@@ -13184,7 +13184,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-sandbox"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=1404d00e3a46acc640c345de826ccd8962db5710#1404d00e3a46acc640c345de826ccd8962db5710"
 dependencies = [
  "anyhow",
  "itoa",
@@ -13201,7 +13201,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=1404d00e3a46acc640c345de826ccd8962db5710#1404d00e3a46acc640c345de826ccd8962db5710"
 dependencies = [
  "candle-core",
  "image 0.25.10",
@@ -15711,7 +15711,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6705a26ad89d241a989a5395641931ba37076f5ab5fbd19ee92402414a43af32"
 dependencies = [
  "arrayvec",
- "hashbrown 0.17.1",
+ "hashbrown 0.5.0",
  "parking_lot",
  "rand 0.8.6",
 ]
@@ -16247,8 +16247,8 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.14.0",
+ "heck 0.4.1",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph",
@@ -16269,7 +16269,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -16282,7 +16282,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -16604,7 +16604,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -16643,7 +16643,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -19928,7 +19928,7 @@ checksum = "4db5a4a562bcc0017c34cd0efbabf447be783f00576a2a516947f884e6a7ed57"
 dependencies = [
  "ahash 0.8.12",
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.21.7",
  "encoding_rs_io",
  "nohash-hasher",
  "num-traits",
@@ -20501,7 +20501,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
