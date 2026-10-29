@@ -598,7 +598,8 @@ impl SpiceModelTool for ToolRegistryInvokeTool {
         match result {
             Ok(value) => {
                 let captured_output_json = serde_json::to_string(&value).boxed()?;
-                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+                let captured_output = redact_values(&captured_output_json, &removed);
+                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output);
                 Ok(value)
             }
             Err(e) => {

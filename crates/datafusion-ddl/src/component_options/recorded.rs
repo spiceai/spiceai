@@ -81,18 +81,26 @@ impl<'a> RecordedStatement<'a> {
 pub fn redact_values<'m>(message: &'m str, removed: &[String]) -> Cow<'m, str> {
     // Each value, and each part of it that a source can repeat on its own, as
     // a database client repeats a connection string's `password=...` without
-    // the rest of it.
-    let mut present: Vec<&str> = removed
-        .iter()
-        .flat_map(|value| {
-            std::iter::once(value.as_str()).chain(
-                value
-                    .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '?'))
-                    .filter(|part| part.chars().count() >= SHORTEST_BARE_VALUE),
-            )
-        })
-        .filter(|value| !value.is_empty() && message.contains(value))
-        .collect();
+    // the rest of it; and each of those as JSON writes it inside a string, as
+    // a recorded result does, where a quote or backslash is escaped.
+    let mut present: Vec<Cow<'_, str>> = Vec::new();
+    let spellings = removed.iter().flat_map(|value| {
+        std::iter::once(value.as_str()).chain(
+            value
+                .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '?'))
+                .filter(|part| part.chars().count() >= SHORTEST_BARE_VALUE),
+        )
+    });
+    for value in spellings.filter(|value| !value.is_empty()) {
+        if message.contains(value) {
+            present.push(Cow::Borrowed(value));
+        }
+        if let Some(escaped) = json_escaped(value)
+            && message.contains(escaped.as_str())
+        {
+            present.push(Cow::Owned(escaped));
+        }
+    }
     if present.is_empty() {
         return Cow::Borrowed(message);
     }
@@ -102,9 +110,16 @@ pub fn redact_values<'m>(message: &'m str, removed: &[String]) -> Cow<'m, str> {
     present.dedup();
     let mut message = message.to_string();
     for value in present {
-        message = message.replace(value, REDACTED);
+        message = message.replace(value.as_ref(), REDACTED);
     }
     Cow::Owned(message)
+}
+
+/// `value` as JSON writes it inside a string, when that differs from `value`.
+fn json_escaped(value: &str) -> Option<String> {
+    let quoted = serde_json::to_string(value).ok()?;
+    let escaped = quoted.get(1..quoted.len() - 1)?;
+    (escaped != value).then(|| escaped.to_string())
 }
 
 /// The text of `sql` as it may be recorded, read with `dialect`, the dialect
@@ -849,6 +864,27 @@ mod tests {
         }
         // The sweep reads keywords, not only text that hides them.
         assert!(found > 1_000, "{found}");
+    }
+
+    /// A value is taken out of a recorded result, which is JSON, too: there a
+    /// quote or backslash in it is escaped.
+    #[test]
+    fn a_value_is_taken_out_of_json_that_escapes_it() {
+        let removed = ["'pa\"ss\\word'".to_string(), "pa\"ss\\word".to_string()];
+        let result =
+            serde_json::json!([{"type": "text", "text": "refused: pg_pass = 'pa\"ss\\word'"}])
+                .to_string();
+        assert!(result.contains(r#"pa\"ss\\word"#), "{result}");
+        assert_eq!(
+            redact_values(&result, &removed),
+            serde_json::json!([{"type": "text", "text": "refused: pg_pass = <redacted>"}])
+                .to_string()
+        );
+        // As written, too.
+        assert_eq!(
+            redact_values("refused: pa\"ss\\word", &removed),
+            "refused: <redacted>"
+        );
     }
 
     /// A keyword inside a longer word is not read as one, and the text is

@@ -19,6 +19,9 @@ spicepod:
   kind: Spicepod
   name: sql-ddl-agent
   runtime:
+    # Tool results and model answers are recorded too, so they are checked.
+    task_history:
+      captured_output: truncated
     auth:
       api-key:
         enabled: true
@@ -147,6 +150,7 @@ steps:
       headers: { content-type: application/json }
       body: '{"query": "CREATE TABLE t3 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-mcp-tool'')"}'
     expect: { body-contains: t3 }
+  # Its password holds a double quote, which the recorded result, JSON, escapes.
   - http:
       method: POST
       path: /v1/mcp
@@ -156,7 +160,7 @@ steps:
         mcp-protocol-version: '2026-07-28'
         mcp-method: tools/call
         mcp-name: peer__sql
-      body: '{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "peer__sql", "arguments": {"query": "CREATE TABLE t4 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-mcp-gateway'')"}, "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": {"name": "spicescript", "version": "1"}, "io.modelcontextprotocol/clientCapabilities": {}}}}'
+      body: '{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "peer__sql", "arguments": {"query": "CREATE TABLE t4 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-mcp-\"gateway'')"}, "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": {"name": "spicescript", "version": "1"}, "io.modelcontextprotocol/clientCapabilities": {}}}}'
     expect: { status: 200, body-contains: t4 }
   - source-exec:
       model:
