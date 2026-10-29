@@ -28,6 +28,9 @@ pub struct Run {
     seed: Option<u64>,
     failure: &'static str,
 }
+/// Checker threads unless `MODEL_THREADS` says otherwise. Results do not depend
+/// on it; past about six, the shared state set gains little.
+const DEFAULT_THREADS: usize = 6;
 /// All runs of the design, including safeguard-removal controls.
 #[must_use]
 pub fn runs() -> Vec<Run> {
@@ -1855,7 +1858,12 @@ where
     });
     let builder = model
         .checker()
-        .threads(1)
+        .threads(
+            std::env::var("MODEL_THREADS")
+                .ok()
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(DEFAULT_THREADS),
+        )
         .finish_when(stateright::HasDiscoveries::AnyOf(
             std::collections::BTreeSet::default(),
         ));
