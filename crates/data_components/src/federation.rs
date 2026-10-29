@@ -2757,10 +2757,10 @@ mod tests {
     }
 
     /// Regression test for #14109, fixed by fork PR #247 for a sort directly over
-    /// the projection and by fork PR #281 for one over a `DISTINCT`. `SELECT a,
-    /// random() AS r FROM t ORDER BY r + 1.0 LIMIT 10` was pushed down as `ORDER BY
-    /// (random() + 1.0)`, a second draw, so the rows came back ordered by a value the
-    /// `SELECT` list never showed; through `SELECT DISTINCT` the key was not
+    /// the projection and by fork PR #281 for one over a `DISTINCT`.
+    /// `SELECT a, random() AS r FROM t ORDER BY r + 1.0 LIMIT 10` was pushed down
+    /// as `ORDER BY (random() + 1.0)`, a second draw, so the rows came back ordered
+    /// by a value the `SELECT` list never showed; through `SELECT DISTINCT` the key was not
     /// resolved at all, and `ORDER BY ("r" + 1.0)` made `PostgreSQL` refuse the
     /// whole query (`column "r" does not exist`).
     ///
@@ -2792,10 +2792,10 @@ mod tests {
 
     /// The same unresolved key over a `DISTINCT` whose outputs can be repeated.
     /// The `ORDER BY` of a `SELECT DISTINCT` may name only what its list shows, so
-    /// inlining the output does not help there: `PostgreSQL` refuses `ORDER BY ((a +
-    /// 1) + 1)` ("for SELECT DISTINCT, ORDER BY expressions must appear in select
-    /// list"), and `ORDER BY ("b" + 1)` binds `b` to nothing. Every dialect reads the
-    /// key from a `SELECT` above the `DISTINCT` one instead.
+    /// inlining the output does not help there: `PostgreSQL` refuses
+    /// `ORDER BY ((a + 1) + 1)` ("for SELECT DISTINCT, ORDER BY expressions must
+    /// appear in select list"), and `ORDER BY ("b" + 1)` binds `b` to nothing. Every
+    /// dialect reads the key from a `SELECT` above the `DISTINCT` one instead.
     #[test]
     fn a_computed_sort_key_over_distinct_is_ordered_above_it() {
         let plan = LogicalPlanBuilder::scan("t", two_column_source(), None)
