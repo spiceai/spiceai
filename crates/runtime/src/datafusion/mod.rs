@@ -3405,14 +3405,15 @@ impl DataFusion {
             rebind_guard,
         );
         loop {
-            let woken = match turn.take() {
-                Some(turn) => Woken::Turn(turn),
-                None => tokio::select! {
+            let woken = if let Some(turn) = turn.take() {
+                Woken::Turn(turn)
+            } else {
+                tokio::select! {
                     biased;
                     outcome = &mut queued.outcome => Woken::Outcome(outcome),
                     _ = &mut queued.claimed => Woken::Claimed,
                     turn = queue.take_turn() => Woken::Turn(turn),
-                },
+                }
             };
             match woken {
                 Woken::Outcome(outcome) => {
