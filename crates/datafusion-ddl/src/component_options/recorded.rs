@@ -216,11 +216,22 @@ fn record<'a>(
     recording.finish()
 }
 
-/// Whether `sql` holds `word`, in any ASCII case.
+/// Whether `sql` holds `word`, in any ASCII case, where it may be a token of
+/// its own. Every dialect reads an ASCII letter or `_` before it, or an ASCII
+/// letter, digit, or `_` after it, as part of one longer word (`created_at`),
+/// which is not the keyword; next to anything else, it may be.
 fn mentions(sql: &str, word: &[u8]) -> bool {
-    sql.as_bytes()
-        .windows(word.len())
-        .any(|window| window.eq_ignore_ascii_case(word))
+    let bytes = sql.as_bytes();
+    bytes.windows(word.len()).enumerate().any(|(at, window)| {
+        window.eq_ignore_ascii_case(word)
+            && !at
+                .checked_sub(1)
+                .and_then(|before| bytes.get(before))
+                .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+            && !bytes
+                .get(at + word.len())
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    })
 }
 
 /// A token, and the bytes of the statement it was read from.
@@ -775,6 +786,101 @@ fn remember_json(removed: &mut Vec<String>, value: &serde_json::Value) {
             for item in map.values() {
                 remember_json(removed, item);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::sql::sqlparser::dialect::{GenericDialect, MySqlDialect, PostgreSqlDialect};
+
+    use super::*;
+
+    /// The keyword check only spares the tokenizer: whatever is next to a
+    /// keyword, and in every dialect a statement is recorded with, a statement
+    /// is recorded as it is when every statement is read token by token, and a
+    /// keyword the tokenizer reads is always found.
+    #[test]
+    fn the_keyword_check_never_changes_what_is_recorded() {
+        let dialects: [&dyn Dialect; 3] =
+            [&PostgreSqlDialect {}, &GenericDialect {}, &MySqlDialect {}];
+        let neighbors = [
+            "", " ", "\n", "\t", "a", "Z", "_", "0", "9", "$", "'", "\"", "`", "(", ")", ";", ",",
+            ".", "-", "/", "*", "@", ":", "#", "=", "é", "\u{a0}",
+        ];
+        let shown = |name: &str| name == "pg_host";
+        let mut found = 0;
+        for dialect in dialects {
+            for (_, spelling) in DEFINING_KEYWORDS {
+                let lower = std::str::from_utf8(spelling).expect("ASCII");
+                for keyword in [lower.to_string(), lower.to_ascii_uppercase()] {
+                    for before in neighbors {
+                        for after in neighbors {
+                            let word = format!("{before}{keyword}{after}");
+                            for sql in [
+                                format!(
+                                    "{word} TABLE t WITH (pg_host = 'db', pg_pass = 'hunter2')"
+                                ),
+                                format!("SELECT 1 AS {word}, 'hunter2' AS p"),
+                                format!("SELECT 1; {word} TABLE t WITH (pg_pass = 'hunter2')"),
+                            ] {
+                                let Ok(tokens) = Tokenizer::new(dialect, &sql).tokenize() else {
+                                    continue;
+                                };
+                                if tokens.iter().any(is_defining_keyword) {
+                                    found += 1;
+                                    assert!(
+                                        DEFINING_KEYWORDS
+                                            .iter()
+                                            .any(|(_, spelling)| mentions(&sql, spelling)),
+                                        "{dialect:?}: {sql}"
+                                    );
+                                }
+                                assert_eq!(
+                                    recorded_statement(&sql, dialect, &shown),
+                                    record(&sql, dialect, &shown, false),
+                                    "{dialect:?}: {sql}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The sweep reads keywords, not only text that hides them.
+        assert!(found > 1_000, "{found}");
+    }
+
+    /// A keyword inside a longer word is not read as one, and the text is
+    /// kept without reading its tokens; next to a digit or a sign, it is read.
+    #[test]
+    fn a_keyword_inside_a_word_is_not_a_keyword() {
+        for sql in [
+            "SELECT created_at, altered_by, attachment FROM t",
+            "SELECT createdAt FROM t",
+            "SELECT recreate, _alter, alter1 FROM t",
+        ] {
+            assert!(
+                !DEFINING_KEYWORDS
+                    .iter()
+                    .any(|(_, spelling)| mentions(sql, spelling)),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "CREATE TABLE t",
+            "1CREATE TABLE t",
+            "/*x*/create TABLE t",
+            "SELECT 1;ALTER TABLE t",
+            "$attach x",
+            "\u{e9}create x",
+        ] {
+            assert!(
+                DEFINING_KEYWORDS
+                    .iter()
+                    .any(|(_, spelling)| mentions(sql, spelling)),
+                "{sql}"
+            );
         }
     }
 }
