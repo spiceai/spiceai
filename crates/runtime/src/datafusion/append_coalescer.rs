@@ -46,6 +46,7 @@ use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use arrow_row::{RowConverter, SortField};
 use datafusion::catalog::TableProvider;
+use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::{OwnedRwLockReadGuard, oneshot};
@@ -144,6 +145,8 @@ struct Pending {
 
 struct PendingAppend {
     id: u64,
+    /// The name the append's caller wrote to, for its follow-up work.
+    table_reference: TableReference,
     provider: Arc<dyn TableProvider>,
     schema: SchemaRef,
     data: Arc<Vec<RecordBatch>>,
@@ -194,7 +197,19 @@ pub(crate) struct AppendGroup {
     pub(crate) schema: SchemaRef,
     pub(crate) batches: Vec<RecordBatch>,
     pub(crate) rows: usize,
+    /// Each member's own rows and name, in queue order, for the work that
+    /// follows its committed write.
+    pub(crate) members: Vec<MemberWrite>,
+    /// The members' holds on the dataset's provider, to release once the group's
+    /// write returns, as an append written alone releases its own.
+    pub(crate) rebind_guards: Vec<OwnedRwLockReadGuard<()>>,
     pub(crate) completion: GroupCompletion,
+}
+
+/// One member's own write, as its caller made it.
+pub(crate) struct MemberWrite {
+    pub(crate) table_reference: TableReference,
+    pub(crate) data: Arc<Vec<RecordBatch>>,
 }
 
 /// Delivers a group's outcome to each of its members.
@@ -203,26 +218,14 @@ pub(crate) struct AppendGroup {
 /// is told its outcome is unknown.
 pub(crate) struct GroupCompletion {
     outcomes: Vec<oneshot::Sender<MemberOutcome>>,
-    rebind_guards: Vec<OwnedRwLockReadGuard<()>>,
 }
 
 impl GroupCompletion {
-    /// How many appends the group holds.
-    #[must_use]
-    pub(crate) fn members(&self) -> usize {
-        self.outcomes.len()
-    }
-
-    /// Release the members' holds on the dataset's provider, then tell every
-    /// member the outcome of the group's write: each the same success, or each
-    /// the same failure, so no member of a failed write is told it succeeded.
+    /// Tell every member the outcome of the group's write: each the same
+    /// success, or each the same failure, so no member of a failed write is told
+    /// it succeeded.
     pub(crate) fn complete(self, result: &MemberOutcome) {
-        let Self {
-            outcomes,
-            rebind_guards,
-        } = self;
-        drop(rebind_guards);
-        for outcome in outcomes {
+        for outcome in self.outcomes {
             // A member that stopped waiting has no one to tell; its rows were
             // written with the group's.
             let _ = outcome.send(result.clone());
@@ -253,6 +256,7 @@ impl AppendQueue {
     /// are [`member_keys`]' answer for the rows.
     pub(crate) fn enqueue(
         self: &Arc<Self>,
+        table_reference: TableReference,
         provider: Arc<dyn TableProvider>,
         schema: SchemaRef,
         data: Arc<Vec<RecordBatch>>,
@@ -269,6 +273,7 @@ impl AppendQueue {
             pending.next_id = pending.next_id.wrapping_add(1);
             pending.appends.push_back(PendingAppend {
                 id,
+                table_reference,
                 provider,
                 schema,
                 data,
@@ -350,6 +355,7 @@ impl AppendQueue {
         let schema = Arc::clone(&taken[0].schema);
         let mut rows = 0;
         let mut batches = Vec::with_capacity(taken.iter().map(|append| append.data.len()).sum());
+        let mut members = Vec::with_capacity(taken.len());
         let mut outcomes = Vec::with_capacity(taken.len());
         let mut rebind_guards = Vec::with_capacity(taken.len());
         for append in taken {
@@ -357,6 +363,10 @@ impl AppendQueue {
             let _ = append.claimed.send(());
             rows += append.rows;
             batches.extend(append.data.iter().cloned());
+            members.push(MemberWrite {
+                table_reference: append.table_reference,
+                data: append.data,
+            });
             outcomes.push(append.outcome);
             rebind_guards.push(append.rebind_guard);
         }
@@ -365,10 +375,9 @@ impl AppendQueue {
             schema,
             batches,
             rows,
-            completion: GroupCompletion {
-                outcomes,
-                rebind_guards,
-            },
+            members,
+            rebind_guards,
+            completion: GroupCompletion { outcomes },
         })
     }
 
@@ -445,6 +454,7 @@ mod tests {
     use arrow::array::{Int64Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::catalog::TableProvider;
+    use datafusion::common::TableReference;
     use datafusion::datasource::MemTable;
     use datafusion::error::DataFusionError;
 
@@ -501,7 +511,14 @@ mod tests {
         let data = vec![batch(rows)];
         let keys = row_keys(&["id".to_string()], &schema(), &data);
         let guard = Arc::new(tokio::sync::RwLock::new(())).read_owned().await;
-        queue.enqueue(Arc::clone(provider), schema(), Arc::new(data), keys, guard)
+        queue.enqueue(
+            TableReference::bare("t"),
+            Arc::clone(provider),
+            schema(),
+            Arc::new(data),
+            keys,
+            guard,
+        )
     }
 
     #[tokio::test]
@@ -515,7 +532,7 @@ mod tests {
 
         let group = queue.claim(&second).expect("second is queued");
         assert_eq!(values(&group.batches), vec![10, 20, 30]);
-        assert_eq!(group.completion.members(), 2);
+        assert_eq!(group.members.len(), 2);
         assert!(queue.claim(&first).is_none(), "first was claimed");
 
         let group = queue.claim(&fourth).expect("fourth is queued");
@@ -610,6 +627,7 @@ mod tests {
         let first = enqueue(&queue, &table, &[(Some(1), 10)]).await;
         let data = vec![batch(&[(None, 20)])];
         let alone = queue.enqueue(
+            TableReference::bare("t"),
             Arc::clone(&table),
             schema(),
             Arc::new(data),

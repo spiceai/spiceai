@@ -3277,16 +3277,41 @@ impl DataFusion {
 
         // Releases the hold on the provider once the rows are written, so evolution
         // is free to swap it.
-        self.insert_update(
-            table_reference,
-            &table_provider,
-            &update_schema,
-            &update_data,
-            overwrite,
-            rebind_guard,
-        )
-        .await?;
+        let written = self
+            .insert_update(
+                table_reference,
+                &table_provider,
+                &update_schema,
+                &update_data,
+                overwrite,
+                rebind_guard,
+            )
+            .await?;
+        if written == Written::Alone {
+            self.after_write(
+                table_reference,
+                &table_provider,
+                update_type,
+                update_schema,
+                update_data,
+            )
+            .await;
+        }
 
+        Ok(())
+    }
+
+    /// The work every committed `write_data` call is followed by: forwarding to
+    /// Drasi, invalidating cached query state, marking the dataset ready, and
+    /// broadcasting the rows to subscribers.
+    async fn after_write(
+        &self,
+        table_reference: &TableReference,
+        table_provider: &Arc<dyn TableProvider>,
+        update_type: UpdateType,
+        update_schema: SchemaRef,
+        update_data: Arc<Vec<RecordBatch>>,
+    ) {
         // Queue the committed write for Drasi, when `runtime.drasi` names this
         // table. After the write, so Drasi only sees rows the runtime kept; and
         // a queue rather than an await, so a Drasi outage cannot stall the
@@ -3340,8 +3365,6 @@ impl DataFusion {
                 )
                 .await;
         }
-
-        Ok(())
     }
 
     /// Insert one `write_data` call's rows into `table_provider`, then release
@@ -3362,7 +3385,7 @@ impl DataFusion {
         data: &Arc<Vec<RecordBatch>>,
         overwrite: InsertOp,
         rebind_guard: tokio::sync::OwnedRwLockReadGuard<()>,
-    ) -> Result<()> {
+    ) -> Result<Written> {
         let queue = if overwrite == InsertOp::Append {
             self.append_queue(table_reference, table_provider)
         } else {
@@ -3373,7 +3396,9 @@ impl DataFusion {
                 .insert_alone(table_provider, schema, data, overwrite)
                 .await;
             drop(rebind_guard);
-            return result.map_err(|failure| insert_error(table_reference, failure));
+            return result
+                .map(|()| Written::Alone)
+                .map_err(|failure| insert_error(table_reference, failure));
         };
 
         // The turn is taken at once only when it is free and no append is
@@ -3387,7 +3412,9 @@ impl DataFusion {
                     .await;
                 drop(turn);
                 drop(rebind_guard);
-                return result.map_err(|failure| insert_error(table_reference, failure));
+                return result
+                    .map(|()| Written::Alone)
+                    .map_err(|failure| insert_error(table_reference, failure));
             }
             Some(append_coalescer::FreeTurn::Behind(turn)) => Some(turn),
             None => None,
@@ -3398,6 +3425,7 @@ impl DataFusion {
         // its place behind earlier appends.
         let keys = append_coalescer::row_keys(&key, schema, data);
         let mut queued = queue.enqueue(
+            table_reference.clone(),
             Arc::clone(table_provider),
             Arc::clone(schema),
             Arc::clone(data),
@@ -3417,7 +3445,7 @@ impl DataFusion {
             };
             match woken {
                 Woken::Outcome(outcome) => {
-                    return member_result(table_reference, outcome);
+                    return member_result(table_reference, outcome).map(|()| Written::InGroup);
                 }
                 Woken::Claimed => break,
                 Woken::Turn(turn) => {
@@ -3425,7 +3453,7 @@ impl DataFusion {
                     // `.await` between them, so a cancelled caller cannot leave
                     // claimed rows unwritten.
                     match queue.claim(&queued) {
-                        Some(group) => self.spawn_group_insert(table_reference, group, turn),
+                        Some(group) => self.spawn_group_insert(group, turn),
                         // Another append's group holds these rows; its outcome
                         // follows. Hand the turn to the next group.
                         None => break,
@@ -3434,7 +3462,7 @@ impl DataFusion {
             }
         }
         let outcome = (&mut queued.outcome).await;
-        member_result(table_reference, outcome)
+        member_result(table_reference, outcome).map(|()| Written::InGroup)
     }
 
     /// Insert `data` on its own, as one statement.
@@ -3457,38 +3485,67 @@ impl DataFusion {
     }
 
     /// Write `group` as one append, on a task of its own that owns `turn` until
-    /// the write returns, then tell each member the outcome.
+    /// the write returns, then run each member's [`Self::after_write`] and tell
+    /// each member the outcome.
     ///
-    /// The task does not depend on the append that claimed the group: if that
-    /// append's caller goes away, the other members' rows are still written and
-    /// they still hear the outcome.
+    /// The task does not depend on the appends' callers. Once a group has
+    /// claimed an append's rows they are written whether or not its caller still
+    /// waits, so the work that follows a committed write runs here, for every
+    /// member, rather than in the caller, which may be gone. It runs before any
+    /// member is told the outcome, so a caller still sees it done when
+    /// `write_data` returns, as for a write of its own.
     fn spawn_group_insert(
         &self,
-        table_reference: &TableReference,
         group: append_coalescer::AppendGroup,
         turn: tokio::sync::OwnedMutexGuard<()>,
     ) {
         let state = self.ctx.state();
         let task_ctx = self.ctx.task_ctx();
-        let dataset = table_reference.to_string();
+        let datafusion = self.datafusion_ref.get().cloned();
         let append_coalescer::AppendGroup {
             provider,
             schema,
             batches,
             rows,
+            members,
+            rebind_guards,
             completion,
         } = group;
         tokio::spawn(async move {
             let started = std::time::Instant::now();
-            let result =
-                insert_batches(provider, state, task_ctx, schema, batches, InsertOp::Append).await;
+            let result = insert_batches(
+                Arc::clone(&provider),
+                state,
+                task_ctx,
+                Arc::clone(&schema),
+                batches,
+                InsertOp::Append,
+            )
+            .await;
+            // The rows are written, so evolution is free to swap the provider.
+            drop(rebind_guards);
+            let appends = members.len();
+            if result.is_ok()
+                && let Some(datafusion) = datafusion.as_ref().and_then(Weak::upgrade)
+            {
+                for member in members {
+                    datafusion
+                        .after_write(
+                            &member.table_reference,
+                            &provider,
+                            UpdateType::Append,
+                            Arc::clone(&schema),
+                            member.data,
+                        )
+                        .await;
+                }
+            }
             tracing::debug!(
-                dataset,
-                appends = completion.members(),
+                appends,
                 rows,
                 written = result.is_ok(),
                 duration_ms = started.elapsed().as_millis(),
-                "Wrote concurrent appends to dataset {dataset} as one write"
+                "Wrote {appends} concurrent appends as one write"
             );
             completion.complete(&result);
             drop(turn);
@@ -3503,6 +3560,9 @@ impl DataFusion {
         table_reference: &TableReference,
         table_provider: &Arc<dyn TableProvider>,
     ) -> Option<(Arc<append_coalescer::AppendQueue>, Arc<[String]>)> {
+        // A group runs its members' `after_write` through this; without it,
+        // appends are written alone.
+        self.datafusion_ref.get()?;
         let key = append_group_key_of(table_provider)?;
         let mut queues = self.append_queues.lock();
         if queues.len() >= MAX_APPEND_QUEUES {
@@ -7743,6 +7803,15 @@ fn insert_error(
             Error::UnableToExecuteTableInsert { table_name, source }
         }
     }
+}
+
+/// Who runs a `write_data` call's [`DataFusion::after_write`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Written {
+    /// The call wrote its rows itself and follows the write up itself.
+    Alone,
+    /// A group wrote its rows and followed the write up before telling it.
+    InGroup,
 }
 
 /// What woke an append waiting to be written together with others.
