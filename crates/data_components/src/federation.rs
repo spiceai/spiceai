@@ -2811,6 +2811,54 @@ mod tests {
         for (dialect_name, dialect) in federation_dialects() {
             let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
             assert_order_by_reads_the_derived_table(dialect_name, &sql, "FROM (SELECT DISTINCT ");
+            let order_by = &sql[last_offset_of(&sql, "ORDER BY ")..];
+            assert!(
+                [
+                    "ORDER BY (b + 1)",
+                    "ORDER BY (\"b\" + 1)",
+                    "ORDER BY (`b` + 1)"
+                ]
+                .iter()
+                .any(|key| order_by.starts_with(key)),
+                "{dialect_name}: the key has to read the output `b` by name, not inline the \
+                 expression it computes: {sql}"
+            );
+        }
+    }
+
+    /// An unaliased aggregate output under the `DISTINCT` is a column the unparser
+    /// renders as the call itself, so the derived table has to name it, or the
+    /// `SELECT` above reads `sum(t.b)` from a table that exposes `sum` (spiceai/datafusion#281).
+    #[test]
+    fn a_scoped_distinct_names_its_aggregate_output() {
+        use datafusion::functions_aggregate::expr_fn::sum;
+        let plan = LogicalPlanBuilder::scan("t", two_column_source(), None)
+            .expect("scan t")
+            .aggregate(vec![col("t.a")], vec![sum(col("t.b"))])
+            .expect("aggregate")
+            .project(vec![col("t.a"), col("sum(t.b)")])
+            .expect("project")
+            .distinct()
+            .expect("distinct")
+            .sort_with_limit(vec![(col("t.a") + lit(1)).sort(true, true)], Some(3))
+            .expect("sort")
+            .build()
+            .expect("build");
+        for (dialect_name, dialect) in federation_dialects() {
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+            assert_order_by_reads_the_derived_table(dialect_name, &sql, "FROM (SELECT DISTINCT ");
+            // The outer list reads the aggregate by the identifier the dialect
+            // spells for it; the derived table has to bind exactly that one.
+            let outer_list =
+                &sql["SELECT ".len()..first_offset_of(&sql, " FROM (SELECT DISTINCT ")];
+            let Some((_, reference)) = outer_list.split_once(", ") else {
+                panic!("{dialect_name}: expected two outputs in the outer list: {sql}");
+            };
+            assert!(
+                sql.contains(&format!("AS {reference} FROM ")),
+                "{dialect_name}: the derived table leaves the aggregate output for the engine \
+                 to name, so the SELECT above reads {reference}, which it does not expose: {sql}"
+            );
         }
     }
 
