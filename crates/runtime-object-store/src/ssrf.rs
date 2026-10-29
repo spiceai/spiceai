@@ -19,7 +19,8 @@ limitations under the License.
 //!
 //! One classifier decides which addresses and host names are internal. URL tables apply it to
 //! the URL a query names, to every address that URL's host resolves to, and to every redirect;
-//! the HTTPS data connector applies it to every redirect.
+//! the HTTPS data connector applies it to every redirect and to every address a redirect's new
+//! host resolves to.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -147,6 +148,17 @@ pub fn url_table_destination_guard() -> DestinationGuard {
         format!(
             "URL tables cannot read from private, loopback, or link-local addresses, including a proxy host that resolves to one. If this runtime intentionally queries an internal HTTP endpoint or uses a private proxy, set {ALLOW_PRIVATE_HOSTS_ENV}=true"
         ),
+    )
+}
+
+/// What the HTTPS data connector refuses for a host it reaches only through a redirect: any
+/// internal address that host resolves to.
+#[must_use]
+pub fn redirect_destination_guard() -> DestinationGuard {
+    DestinationGuard::new(
+        is_internal_ip,
+        redirect_target_is_internal,
+        "the HTTPS data connector does not follow a redirect to a private, loopback, or link-local address",
     )
 }
 

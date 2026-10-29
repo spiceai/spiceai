@@ -803,13 +803,12 @@ impl RefreshTask {
     /// Returns an error if the source cannot be queried, the refresh SQL fails to
     /// plan or execute, or the resulting data cannot be written to the accelerator.
     pub async fn run(&self, refresh: Refresh) -> super::Result<RefreshOutcome> {
-        // Wait for a source not reached yet before taking a refresh slot: the wait lasts
-        // as long as the source is down, and an accelerated view's source is the tables
-        // it reads, whose own refreshes need a slot.
-        let _ = self.federated.try_wait_table_provider().await;
-
-        // Limit parallel refreshes via a semaphore
-        let _permit = self.semaphore.acquire().await;
+        // Source-consuming refreshes wait before taking a refresh slot: an accelerated
+        // view's source is the tables it reads, whose refreshes also need a slot.
+        // Snapshot refreshes read their store independently of the federated source.
+        if refresh.mode != RefreshMode::Snapshot {
+            let _ = self.federated.try_wait_table_provider().await;
+        }
 
         let max_retries = if refresh.retry_enabled {
             refresh.retry_max_attempts
@@ -833,6 +832,9 @@ impl RefreshTask {
             .last()
             .unwrap_or_else(|| unreachable!("There is always at least one span"));
         let result = retry(retry_strategy, || async {
+            // Limit parallel refreshes via a semaphore. The permit covers one attempt, so a
+            // refresh waiting out a retry backoff does not hold back other datasets.
+            let _permit = self.semaphore.acquire().await;
             match self.run_once(&refresh).await {
                 Ok(outcome) => Ok(outcome),
                 Err(retry_err) => {
@@ -872,6 +874,14 @@ impl RefreshTask {
         &self,
         refresh: &Refresh,
     ) -> Result<RefreshOutcome, RetryError<super::Error>> {
+        // Snapshot polling owns its status and metrics and reads no source, including
+        // the timestamp queries used to measure a source-consuming refresh's lag.
+        if refresh.mode == RefreshMode::Snapshot {
+            let labels = self.get_dataset_label_sets(&refresh.mode).await;
+            let _timer = MultiTimeMeasurement::new(&metrics::REFRESH_DURATION_MS, &labels);
+            return self.refresh_from_snapshot(refresh, &labels).await;
+        }
+
         // A refresh whose source has not been reached yet waits for it before it runs,
         // and reports `Refreshing` only then: while the source cannot be reached, the
         // dataset is served from its acceleration and reports `Error` with the cause.
@@ -1026,12 +1036,7 @@ impl RefreshTask {
                     .map(|()| RefreshOutcome::Refreshed);
             }
             RefreshMode::Snapshot => {
-                // For snapshot mode, poll the snapshot store for a newer snapshot
-                // and reload the accelerator from it. The federated source is
-                // never queried for refreshes in this mode.
-                return self
-                    .refresh_from_snapshot(refresh, &dataset_metrics_label_sets)
-                    .await;
+                unreachable!("Snapshot refreshes return before reading the source")
             }
         };
 

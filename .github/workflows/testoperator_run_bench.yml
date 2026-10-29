@@ -251,8 +251,7 @@ jobs:
           spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
       # A release tag benchmarks the binary that release published, so releases older than the
-      # MinIO builds (kept only for recent commits) can be measured. GitHub publishes asset digests
-      # only from v1.3.2 on; an earlier release has none to verify against and is refused.
+      # MinIO builds (kept only for recent commits) can be measured.
       - name: Resolve the spiced source
         id: spiced_source
         env:
@@ -277,44 +276,12 @@ jobs:
       - name: Install the released spiced
         if: steps.spiced_source.outputs.release == 'true'
         id: release-spiced
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE: ${{ github.event.inputs.spiced_ref }}
-          SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
-          SPICEPOD_FILE: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
-        run: |
-          set -euo pipefail
-          if [[ "${SPICEPOD_PATH}" == *odbc* ]]; then
-            echo "::error::Release binaries are built without ODBC; benchmark ${RELEASE} with ODBC from a commit or branch build instead"
-            exit 1
-          fi
-          if grep -Eq '^[[:space:]]*engine:[[:space:]]*postgres[[:space:]]*$' "${SPICEPOD_FILE}"; then
-            echo "::error::Release binaries are built without the PostgreSQL accelerator; benchmark ${RELEASE} with it from a commit or branch build instead"
-            exit 1
-          fi
-          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
-          auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
-          asset="spiced_linux_x86_64.tar.gz"
-          release_asset="$(curl -fsSL "${auth[@]}" "${api}/releases/tags/${RELEASE}" \
-            | python3 -c 'import json,sys; a = next((a for a in json.load(sys.stdin)["assets"] if a["name"] == sys.argv[1]), {}); print(a.get("id") or "-", a.get("digest") or "-")' "${asset}")"
-          read -r asset_id digest <<< "${release_asset}"
-          if [ "${asset_id}" = "-" ]; then
-            echo "::error::${RELEASE} has no ${asset}"
-            exit 1
-          fi
-          case "${digest}" in
-            sha256:*) ;;
-            *) echo "::error::${RELEASE} has no published SHA-256 digest for ${asset}, so its binary cannot be verified; benchmark it from a commit or branch build instead"; exit 1 ;;
-          esac
-          curl -fsSL --retry 3 -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" \
-            -o "${asset}" "${api}/releases/assets/${asset_id}"
-          echo "${digest#sha256:}  ${asset}" | sha256sum --check
-          tar -xzf "${asset}" spiced
-          sudo cp ./spiced /usr/local/bin/spiced
-          spiced --version
-          commit="$(curl -fsSL "${auth[@]}" "${api}/commits/${RELEASE}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')"
-          echo "SPICED_COMMIT=${commit}"
-          echo "SPICED_COMMIT=${commit}" >> "${GITHUB_OUTPUT}"
+        uses: ./.github/actions/setup-released-spiced
+        with:
+          release: ${{ github.event.inputs.spiced_ref }}
+          spicepod_file: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+          with_odbc: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Display spiced commit
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT || steps.release-spiced.outputs.SPICED_COMMIT }}"
@@ -644,6 +611,16 @@ jobs:
           done
           echo "cluster ${DATABRICKS_CLUSTER_ID} did not reach RUNNING"
           exit 1
+
+      # The image restores its database once, after a fixed sleep, and never retries;
+      # see .github/scripts/mssql_tpch_restore.sh.
+      - name: Wait for the SQL Server TPC-H database
+        if: ${{ contains(github.event.inputs.spicepod_path, 'mssql') }}
+        # The script gives up after ten minutes; this also bounds a hung docker call.
+        timeout-minutes: 15
+        env:
+          MSSQL_SA_PASSWORD: S3cretP@ssw0rd
+        run: bash .github/scripts/mssql_tpch_restore.sh "${{ job.services.mssql_tpch.id }}" tpch_sf1
 
       # `--disable-caching` sends `Cache-Control: no-cache` on the benchmark's Flight
       # connection. It is load-bearing: `runtime.caching.sql_results` is enabled by

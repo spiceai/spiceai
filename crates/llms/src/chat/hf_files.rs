@@ -50,6 +50,36 @@ pub async fn download_model(
     hub: HubParams<'_>,
     name: &str,
 ) -> Result<PathBuf, DownloadError> {
+    let snapshot = open(model_id, hub, name).await?;
+    download(&snapshot, gguf).await
+}
+
+/// The architecture the GGUF model `model_id` (`org/name[:revision]`) names in the header of
+/// its first shard among `gguf`, read from the Hub without downloading the weights; `None`
+/// when no header names one. A node that holds a share of a model split across nodes decides
+/// from it which engine serves the model, as the node that downloads the weights does.
+///
+/// # Errors
+///
+/// Returns an error if the repository or revision cannot be read, lacks a file `gguf` names,
+/// or a read fails.
+pub async fn model_architecture(
+    model_id: &str,
+    gguf: &[&str],
+    hub: HubParams<'_>,
+    name: &str,
+) -> Result<Option<String>, DownloadError> {
+    let snapshot = open(model_id, hub, name).await?;
+    super::gguf_header::model_architecture(gguf, |file: &&str, len| {
+        let file = (*file).to_string();
+        let snapshot = &snapshot;
+        async move { snapshot.read_prefix(&file, len).await }
+    })
+    .await
+}
+
+/// Opens the model `model_id` (`org/name[:revision]`), named `name` in the Spicepod.
+async fn open(model_id: &str, hub: HubParams<'_>, name: &str) -> Result<Snapshot, DownloadError> {
     let requester = Requester {
         kind: "model",
         name: name.to_string(),
@@ -60,8 +90,7 @@ pub async fn download_model(
         Some((repo, revision)) => (repo, Some(revision).filter(|r| !r.is_empty())),
         None => (model_id, None),
     };
-    let snapshot = crate::hf::open_model(requester, repo, revision, hub).await?;
-    download(&snapshot, gguf).await
+    crate::hf::open_model(requester, repo, revision, hub).await
 }
 
 /// mistral.rs's weight file patterns (`mistralrs-core/src/pipeline/paths.rs`).
