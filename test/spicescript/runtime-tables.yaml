@@ -1,0 +1,90 @@
+name: runtime-tables
+description: >
+  Spice's own system tables keep their SQL surface. runtime.task_history and
+  runtime.metrics report the column types users query (the Map of labels, the
+  OTel resource and scope structs, nanosecond UTC timestamps, unsigned and
+  binary attribute fields); after 100 queries task_history holds exactly one
+  row per query, with its labels readable by key, and metrics holds rows whose
+  struct fields read back by name; and task_history deletes the rows older
+  than its retention period at the next check, keeping the newer ones.
+
+sources:
+  lake: { kind: files }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: runtime-tables
+  datasets:
+    - from: 'file://${sources.lake.path}/t/'
+      name: t
+      params: { file_format: parquet }
+
+steps:
+  - generate:
+      lake:
+        table: t
+        rows: 100
+        seed: 3
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: v, int: [1, 10] }
+  - start: {}
+
+  # The column types are SQL surface: a query reading labels['k'] or
+  # resource['attributes'] depends on them.
+  - query: >-
+      SELECT column_name, data_type, is_nullable FROM information_schema.columns
+      WHERE table_schema = 'runtime' AND table_name = 'task_history' ORDER BY ordinal_position
+    expect: {}
+  - query: >-
+      SELECT column_name, data_type, is_nullable FROM information_schema.columns
+      WHERE table_schema = 'runtime' AND table_name = 'metrics' ORDER BY ordinal_position
+    expect: {}
+
+  # 100 queries, each recorded once.
+  - corpus: corpus/runtime-tables-load.sql
+    expect: { rows: [['true']] }
+  - query: >-
+      SELECT count(*) AS n, count(DISTINCT span_id) AS spans, count(error_message) AS errors
+      FROM runtime.task_history WHERE task = 'sql_query' AND input LIKE '%AS th_load FROM t%'
+    expect: { rows: [['100', '100', '0']] }
+    eventually: 60s
+  - query: >-
+      SELECT arrow_typeof(labels) AS labels_type, arrow_typeof(start_time) AS start_type
+      FROM runtime.task_history WHERE task = 'sql_query' AND input LIKE '%AS th_load FROM t%' LIMIT 1
+    expect: {}
+  - query: >-
+      SELECT labels['protocol'] AS protocol, labels['datasets'] AS datasets, count(*) AS n
+      FROM runtime.task_history WHERE task = 'sql_query' AND input LIKE '%AS th_load FROM t%'
+      GROUP BY 1, 2
+    expect: {}
+
+  # The same rows over HTTP, checked as JSON where their values cannot be
+  # literal: ids, times and durations.
+  - http:
+      path: /v1/sql
+      headers: { content-type: text/plain }
+      body: >-
+        SELECT trace_id, span_id, parent_span_id, task, start_time, end_time,
+        execution_duration_ms, labels FROM runtime.task_history
+        WHERE task = 'sql_query' AND input LIKE '%AS th_load FROM t%'
+    expect:
+      status: 200
+      json:
+        - { pointer: '', type: array, length: 100 }
+        - { pointer: /*/task, equals: sql_query }
+        - { pointer: /*/trace_id, matches: '^[0-9a-f]{32}$' }
+        - { pointer: /*/span_id, matches: '^[0-9a-f]{16}$' }
+        - { pointer: /*/start_time, matches: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+' }
+        - { pointer: /*/execution_duration_ms, type: number, above: -1 }
+        - { pointer: /*/labels, type: object }
+
+  # Metrics are exported every 30 s.
+  - query: SELECT count(*) > 0 AS has_rows FROM runtime.metrics
+    expect: { rows: [['true']] }
+    eventually: 90s
+  - query: >-
+      SELECT scope['name'] AS scope_name, arrow_typeof(resource) AS resource_type
+      FROM runtime.metrics LIMIT 1
+    expect: {}

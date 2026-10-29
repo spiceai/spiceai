@@ -656,6 +656,8 @@ impl BackgroundWork {
 pub struct HttpStep {
     pub method: String,
     pub path: String,
+    /// URL query parameters, encoded and appended to `path`.
+    pub query: Vec<(String, String)>,
     pub headers: Vec<(String, String)>,
     pub body: Option<String>,
     pub status: Option<u16>,
@@ -669,6 +671,8 @@ pub struct HttpStep {
     /// Patterns the body must match, and must not match.
     pub body_matches: Vec<regex::Regex>,
     pub body_lacks: Vec<regex::Regex>,
+    /// Predicates over the body parsed as JSON.
+    pub json: Vec<crate::json_assert::JsonAssertion>,
     pub timing: Timing,
     /// The API key the request presents (`api-key: none` for none).
     pub key: crate::spiced::Key,
@@ -707,7 +711,7 @@ impl LineCount {
         }
     }
 
-    fn parse(value: &Value) -> Result<Self> {
+    pub(crate) fn parse(value: &Value) -> Result<Self> {
         let text = match value {
             Value::Number(n) => n.to_string(),
             Value::String(s) => s.trim().to_string(),
@@ -1857,9 +1861,22 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
                     .collect())
             };
             let headers = pairs(inner.take("headers"), "headers")?;
+            let query: Vec<(String, String)> = match inner.take("query") {
+                None => Vec::new(),
+                Some(Value::Object(m)) => m
+                    .into_iter()
+                    .map(|(k, v)| match v {
+                        Value::String(s) => Ok((k, s)),
+                        Value::Number(_) | Value::Bool(_) => Ok((k, v.to_string())),
+                        _ => bail!("`query` values must be strings, numbers or booleans"),
+                    })
+                    .collect::<Result<_>>()?,
+                Some(_) => bail!("`query` must map parameter names to values"),
+            };
             let key = api_key_choice(inner.string("api-key")?);
             let mut body_matches = Vec::new();
             let mut body_lacks = Vec::new();
+            let mut json = Vec::new();
             let (status, expect_headers, lacks_headers, body_contains) = match opts.take("expect") {
                 None => (None, Vec::new(), Vec::new(), None),
                 Some(Value::Object(e)) => {
@@ -1880,6 +1897,15 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
                         let list = one_or_many(e.take(key), key, "a pattern or a list")?;
                         *into = compile_patterns(key, &list)?;
                     }
+                    json = match e.take("json") {
+                        None => Vec::new(),
+                        Some(Value::Array(list)) => list,
+                        Some(one) => vec![one],
+                    }
+                    .into_iter()
+                    .map(crate::json_assert::JsonAssertion::parse)
+                    .collect::<Result<_>>()
+                    .context("`json`")?;
                     e.finish()?;
                     (
                         status,
@@ -1898,6 +1924,7 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
             Action::Http(HttpStep {
                 method,
                 path,
+                query,
                 headers,
                 body,
                 status,
@@ -1906,6 +1933,7 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
                 body_contains,
                 body_matches,
                 body_lacks,
+                json,
                 timing,
                 key,
             })

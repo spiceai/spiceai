@@ -213,13 +213,14 @@ pub(super) async fn http_step(instance: &Instance, step: &HttpStep) -> Result<St
         .map(|(k, v)| Ok((k.clone(), instance.sql(v)?)))
         .collect::<Result<Vec<_>>>()?;
     let body = step.body.as_deref().map(|b| instance.sql(b)).transpose()?;
+    let path = with_query(&step.path, &step.query);
     loop {
         let result = async {
             let (status, got, text) = instance
                 .spiced
                 .http(
                     &step.method,
-                    &step.path,
+                    &path,
                     &headers,
                     body.as_deref(),
                     &step.key,
@@ -267,6 +268,7 @@ pub(super) async fn http_step(instance: &Instance, step: &HttpStep) -> Result<St
                     ));
                 }
             }
+            problems.extend(crate::json_assert::check_all(&step.json, &text));
             ensure!(problems.is_empty(), "{}", problems.join("; "));
             let shown: Vec<String> = step
                 .expect_headers
@@ -285,6 +287,33 @@ pub(super) async fn http_step(instance: &Instance, step: &HttpStep) -> Result<St
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+/// `path` with `query` encoded and appended, after any query string `path`
+/// already carries.
+fn with_query(path: &str, query: &[(String, String)]) -> String {
+    if query.is_empty() {
+        return path.to_string();
+    }
+    let encoded: Vec<String> = query
+        .iter()
+        .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
+        .collect();
+    let separator = if path.contains('?') { '&' } else { '?' };
+    format!("{path}{separator}{}", encoded.join("&"))
+}
+
+/// Percent-encodes everything but RFC 3986's unreserved characters.
+fn percent_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// Asks a source directly and compares its text answer, row for row in order,
