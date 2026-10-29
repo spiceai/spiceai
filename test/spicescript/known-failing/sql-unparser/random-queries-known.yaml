@@ -1,6 +1,6 @@
-# Known failures in nested queries (#15538), including DuckDB nested UNION ALL,
-# MySQL collation and NULL ordering, and the remaining DataFusion type and
-# grouping defects. Failing queries are saved beside each instance's log.
+# Native MySQL collation remains a mismatch with the PostgreSQL reference.
+# PostgreSQL and accelerated variants guard the shared nested-query paths.
+# Failing queries are saved beside each instance's log.
 name: random-queries-known
 description: >
   Random queries over nested subqueries (filters, groupings, DISTINCT,

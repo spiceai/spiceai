@@ -20,22 +20,32 @@ limitations under the License.
 //! setting in the `connection_string` URL's query, else from its default. A setting given in
 //! both places with different values is a configuration error, so that neither silently wins.
 
-use std::fmt;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
+use datafusion_table_providers::sql::db_connection_pool::mysqlpool::{
+    self, MySQLConnectionPool, MySQLServerIdentity,
+};
 use mysql_async::{PoolConstraints, PoolOpts};
+use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 
 const POOL_DOCS: &str =
     "https://spiceai.org/docs/components/data-connectors/mysql/deployment#connection-pool-sizing";
 
-/// How long a pooled connection is used before it is closed and replaced, unless configured
-/// otherwise. Replacing connections makes the pool resolve the host again, so it spreads across
-/// the servers behind a load-balanced hostname (such as the readers behind a cluster's reader
-/// endpoint) instead of staying on the ones it reached first.
-pub const DEFAULT_CONNECTION_MAX_LIFETIME: Duration = Duration::from_mins(5);
+/// The `connection_max_lifetime` parameter's description, shared by the dataset connector and
+/// the catalog.
+pub const CONNECTION_MAX_LIFETIME_DESCRIPTION: &str = "How long a pooled connection is used before it is closed and replaced, such as '5m'. \
+     Replacing connections makes the pool resolve the host again, so it spreads across \
+     the servers behind a load-balanced hostname such as a reader endpoint. Each \
+     connection's lifetime is extended by a random amount of up to a fifth of it, so \
+     connections opened together are not replaced together. A connection is not closed \
+     while a query is using it. '0s' keeps connections open indefinitely. Default: 5m.";
 
-/// The longest accepted `connection_max_lifetime`. A connection's deadline is computed as an
+/// So that a pool re-resolves its host and spreads across the servers behind it.
+const DEFAULT_CONNECTION_MAX_LIFETIME: Duration = Duration::from_mins(5);
+
+/// The longest accepted lifetime or jitter. A connection's deadline is computed as an
 /// `Instant`, which a value such as `inf` would overflow.
 const MAX_CONNECTION_MAX_LIFETIME: Duration = Duration::from_hours(365 * 24);
 
@@ -44,11 +54,21 @@ const MAX_CONNECTION_MAX_LIFETIME: Duration = Duration::from_hours(365 * 24);
 /// would all reconnect within one DNS cache window and reach the same server again.
 const LIFETIME_JITTER_DIVISOR: u32 = 5;
 
+/// After a pool's connection to a server is logged at INFO, its later connections to that
+/// server are logged at DEBUG for this long.
+const SERVER_LOG_INTERVAL: Duration = Duration::from_mins(10);
+
 /// The `connection_string` query keys `mysql_async` reads for the settings resolved here.
 const URL_POOL_MIN: &str = "pool_min";
 const URL_POOL_MAX: &str = "pool_max";
 const URL_MAX_LIFETIME: &str = "abs_conn_ttl";
 const URL_MAX_LIFETIME_JITTER: &str = "abs_conn_ttl_jitter";
+const URL_POOL_KEYS: [&str; 4] = [
+    URL_POOL_MIN,
+    URL_POOL_MAX,
+    URL_MAX_LIFETIME,
+    URL_MAX_LIFETIME_JITTER,
+];
 
 #[derive(Debug, Snafu, PartialEq, Eq)]
 pub enum Error {
@@ -58,25 +78,21 @@ pub enum Error {
     InvalidPoolSize { key: &'static str, value: String },
 
     #[snafu(display(
-        "`{url_key}` in `mysql_connection_string` must be a whole number, but is '{value}'. See: {POOL_DOCS}"
+        "`{url_key}` in `mysql_connection_string` must be a whole number{bound}, but is '{value}'. See: {POOL_DOCS}"
     ))]
     InvalidConnectionStringValue {
         url_key: &'static str,
+        bound: &'static str,
         value: String,
     },
 
-    #[snafu(display(
-        "The pool maximum ({max}) must be at least 1. Set `mysql_pool_max` to 1 or more. See: {POOL_DOCS}"
-    ))]
-    ZeroPoolMax { max: Setting<usize> },
+    #[snafu(display("The pool maximum ({max}) must be at least 1. See: {POOL_DOCS}"))]
+    ZeroPoolMax { max: String },
 
     #[snafu(display(
         "The pool minimum ({min}) is greater than the pool maximum ({max}). Lower `mysql_pool_min` or raise `mysql_pool_max`. See: {POOL_DOCS}"
     ))]
-    MinGreaterThanMax {
-        min: Setting<usize>,
-        max: Setting<usize>,
-    },
+    MinGreaterThanMax { min: String, max: String },
 
     #[snafu(display(
         "`mysql_connection_max_lifetime` must be a duration from 1s to 365d, such as `5m`, or `0s` to keep connections open indefinitely, but is '{value}'. See: {POOL_DOCS}"
@@ -84,12 +100,11 @@ pub enum Error {
     InvalidMaxLifetime { value: String },
 
     #[snafu(display(
-        "`mysql_{key}` is '{value}', but `mysql_connection_string` sets `{url_key}={url_value}`. Set it in one place. See: {POOL_DOCS}"
+        "`mysql_{key}` is '{value}', but `mysql_connection_string` sets `{url_value}`. Set it in one place. See: {POOL_DOCS}"
     ))]
     Conflict {
         key: &'static str,
         value: String,
-        url_key: &'static str,
         url_value: String,
     },
 }
@@ -113,37 +128,7 @@ pub struct PoolSizeDefaults {
     pub max: usize,
 }
 
-/// Where a resolved setting came from, so an error can say which value to change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Origin {
-    Spicepod(&'static str),
-    ConnectionString(&'static str),
-    Default,
-}
-
-/// A resolved setting and where it came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Setting<T> {
-    pub value: T,
-    pub origin: Origin,
-}
-
-impl<T: fmt::Display> fmt::Display for Setting<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.origin {
-            Origin::Spicepod(key) => write!(f, "{}, from `mysql_{key}`", self.value),
-            Origin::ConnectionString(url_key) => write!(
-                f,
-                "{}, from `{url_key}` in `mysql_connection_string`",
-                self.value
-            ),
-            Origin::Default => write!(f, "{}, the default", self.value),
-        }
-    }
-}
-
-/// The resolved pool settings, applied to the pool options read from the connection
-/// parameters with [`PoolSettings::apply`].
+/// The resolved pool settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolSettings {
     /// The minimum and maximum pool size. `None` keeps the size the connection parameters
@@ -155,6 +140,14 @@ pub struct PoolSettings {
     pub max_lifetime_jitter: Option<Duration>,
 }
 
+/// A resolved pool bound, and where it came from, for an error to name.
+struct Bound {
+    value: usize,
+    /// Set by the user, in the Spicepod or the connection string.
+    explicit: bool,
+    origin: String,
+}
+
 impl PoolSettings {
     /// Resolves the pool settings from the Spicepod parameters, the connection string, and
     /// the defaults. `size_defaults` is `None` for a component that has no pool size
@@ -162,9 +155,9 @@ impl PoolSettings {
     ///
     /// # Errors
     ///
-    /// Returns an error when a value is invalid, when the pool minimum exceeds the maximum,
-    /// or when a setting is given in both the Spicepod and the connection string with
-    /// different values.
+    /// Returns an error when a value is invalid, when the pool minimum exceeds a maximum the
+    /// user set, or when a setting is given in both the Spicepod and the connection string
+    /// with different values.
     pub fn resolve(
         params: PoolParams<'_>,
         size_defaults: Option<PoolSizeDefaults>,
@@ -173,26 +166,21 @@ impl PoolSettings {
 
         let size = match size_defaults {
             Some(defaults) => {
-                let min = resolve_pool_size(
-                    "pool_min",
-                    params.pool_min,
-                    URL_POOL_MIN,
-                    url.pool_min,
-                    defaults.min,
-                )?;
-                let max = resolve_pool_size(
-                    "pool_max",
-                    params.pool_max,
-                    URL_POOL_MAX,
-                    url.pool_max,
-                    defaults.max,
-                )?;
-                ensure!(max.value > 0, ZeroPoolMaxSnafu { max });
-                ensure!(min.value <= max.value, MinGreaterThanMaxSnafu { min, max });
-                Some(
-                    PoolConstraints::new(min.value, max.value)
-                        .context(MinGreaterThanMaxSnafu { min, max })?,
-                )
+                let min = resolve_bound(URL_POOL_MIN, params.pool_min, url.pool_min, defaults.min)?;
+                let mut max =
+                    resolve_bound(URL_POOL_MAX, params.pool_max, url.pool_max, defaults.max)?;
+                // A maximum nobody set makes room for the minimum the user asked for.
+                if !max.explicit && max.value < min.value {
+                    max.value = min.value;
+                    max.origin = format!("{}, the default raised to the minimum", max.value);
+                }
+                ensure!(max.value > 0, ZeroPoolMaxSnafu { max: max.origin });
+                Some(PoolConstraints::new(min.value, max.value).context(
+                    MinGreaterThanMaxSnafu {
+                        min: min.origin,
+                        max: max.origin,
+                    },
+                )?)
             }
             None => None,
         };
@@ -206,24 +194,21 @@ impl PoolSettings {
                     return ConflictSnafu {
                         key: "connection_max_lifetime",
                         value,
-                        url_key: URL_MAX_LIFETIME,
-                        url_value: url_ttl.to_string(),
+                        url_value: format!("{URL_MAX_LIFETIME}={url_ttl}"),
                     }
                     .fail();
                 }
                 (lifetime, jitter_for(lifetime, url.max_lifetime_jitter))
             }
             // A lifetime set in the URL is taken as `mysql_async` reads it, jitter included.
-            None => match url.max_lifetime {
-                Some(url_ttl) => (
-                    Some(Duration::from_secs(url_ttl)),
-                    url.max_lifetime_jitter.map(Duration::from_secs),
-                ),
-                None => {
-                    let lifetime = Some(DEFAULT_CONNECTION_MAX_LIFETIME);
-                    (lifetime, jitter_for(lifetime, url.max_lifetime_jitter))
-                }
-            },
+            None if url.max_lifetime.is_some() => (
+                url.max_lifetime.map(Duration::from_secs),
+                url.max_lifetime_jitter.map(Duration::from_secs),
+            ),
+            None => {
+                let lifetime = Some(DEFAULT_CONNECTION_MAX_LIFETIME);
+                (lifetime, jitter_for(lifetime, url.max_lifetime_jitter))
+            }
         };
 
         Ok(Self {
@@ -233,9 +218,7 @@ impl PoolSettings {
         })
     }
 
-    /// Applies these settings to the pool options read from the connection parameters.
-    #[must_use]
-    pub fn apply(self, pool_opts: PoolOpts) -> PoolOpts {
+    fn apply(self, pool_opts: PoolOpts) -> PoolOpts {
         let pool_opts = match self.size {
             Some(size) => pool_opts.with_constraints(size),
             None => pool_opts,
@@ -244,6 +227,115 @@ impl PoolSettings {
             .with_abs_conn_ttl(self.max_lifetime)
             .with_abs_conn_ttl_jitter(self.max_lifetime_jitter)
     }
+}
+
+/// Opens a pool with these settings, logging the server each new connection reached for
+/// `component` (such as `dataset 'orders'`). The pool settings are removed from a
+/// `connection_string` first: they were resolved into `settings`, and `mysql_async` would
+/// otherwise check the URL's `pool_min` and `pool_max` against its own defaults, rejecting a
+/// `pool_max` below 10 given without a `pool_min`.
+///
+/// # Errors
+///
+/// Returns the pool's error when it cannot connect.
+pub async fn connect(
+    params: impl IntoIterator<Item = (String, SecretString)>,
+    settings: PoolSettings,
+    component: String,
+) -> std::result::Result<MySQLConnectionPool, mysqlpool::Error> {
+    let mut params: HashMap<String, SecretString> = params.into_iter().collect();
+    if settings.size.is_some() {
+        for key in ["connection_string", "mysql_connection_string"] {
+            if let Some(connection_string) = params.get_mut(key) {
+                let without = without_pool_settings(connection_string.expose_secret());
+                *connection_string = SecretString::from(without);
+            }
+        }
+    }
+    let log = ConnectionLog {
+        component,
+        logged_at: parking_lot::Mutex::new(HashMap::new()),
+    };
+    Ok(
+        MySQLConnectionPool::new_with_pool_opts(params, move |pool_opts| settings.apply(pool_opts))
+            .await?
+            .with_new_connection_observer(move |identity| log.log(identity)),
+    )
+}
+
+/// Logs the server each new pooled connection reached: at INFO the first time in
+/// [`SERVER_LOG_INTERVAL`] that the pool reaches that server, at DEBUG otherwise. A pool opens
+/// a connection per query while concurrency is above its minimum, so a line per connection
+/// would be a line per query; a line per server still names every server in use.
+struct ConnectionLog {
+    component: String,
+    logged_at: parking_lot::Mutex<HashMap<String, Instant>>,
+}
+
+impl ConnectionLog {
+    fn log(&self, identity: &MySQLServerIdentity) {
+        let message = new_connection_message(&self.component, identity);
+        let server = format!(
+            "{}:{} {}",
+            identity.hostname,
+            identity.port,
+            identity.aurora_server_id.as_deref().unwrap_or_default()
+        );
+        if self.first_in_interval(&server, Instant::now()) {
+            tracing::info!("{message}");
+        } else {
+            tracing::debug!("{message}");
+        }
+    }
+
+    /// Whether `server` has not been logged at INFO within [`SERVER_LOG_INTERVAL`] before
+    /// `now`, recording it if so.
+    fn first_in_interval(&self, server: &str, now: Instant) -> bool {
+        let mut logged_at = self.logged_at.lock();
+        logged_at.retain(|_, at| now.saturating_duration_since(*at) < SERVER_LOG_INTERVAL);
+        if logged_at.contains_key(server) {
+            return false;
+        }
+        logged_at.insert(server.to_string(), now);
+        true
+    }
+}
+
+/// The log line for a new pooled connection, naming the server it reached. The server's own
+/// strings are escaped, so the line stays one line whatever the server reports.
+fn new_connection_message(component: &str, identity: &MySQLServerIdentity) -> String {
+    let aurora = identity
+        .aurora_server_id
+        .as_deref()
+        .map(|instance| format!(" (Aurora instance '{}')", instance.escape_debug()))
+        .unwrap_or_default();
+    format!(
+        "MySQL {component} opened connection {id} to '{host}:{port}', which reached server '{server}:{server_port}'{aurora}.",
+        id = identity.connection_id,
+        host = identity.configured_host.escape_debug(),
+        port = identity.configured_port,
+        server = identity.hostname.escape_debug(),
+        server_port = identity.port,
+    )
+}
+
+/// The connection string with the pool settings removed from its query. A string that does
+/// not parse is returned as it is, for the pool to report.
+fn without_pool_settings(connection_string: &str) -> String {
+    let Ok(mut url) = url::Url::parse(connection_string) else {
+        return connection_string.to_string();
+    };
+    let kept: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(key, _)| !URL_POOL_KEYS.contains(&key.as_ref()))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    if kept.is_empty() {
+        url.set_query(None);
+    } else {
+        url.query_pairs_mut().clear().extend_pairs(kept);
+    }
+    url.into()
 }
 
 /// The settings resolved here that the connection string's query sets, read the way
@@ -266,14 +358,14 @@ impl UrlPoolSettings {
         };
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
-                URL_POOL_MIN => settings.pool_min = Some(parse_url_value(URL_POOL_MIN, &value)?),
-                URL_POOL_MAX => settings.pool_max = Some(parse_url_value(URL_POOL_MAX, &value)?),
+                URL_POOL_MIN => settings.pool_min = Some(parse_url_size(URL_POOL_MIN, &value)?),
+                URL_POOL_MAX => settings.pool_max = Some(parse_url_size(URL_POOL_MAX, &value)?),
                 URL_MAX_LIFETIME => {
-                    settings.max_lifetime = Some(parse_url_value(URL_MAX_LIFETIME, &value)?);
+                    settings.max_lifetime = Some(parse_url_seconds(URL_MAX_LIFETIME, &value)?);
                 }
                 URL_MAX_LIFETIME_JITTER => {
                     settings.max_lifetime_jitter =
-                        Some(parse_url_value(URL_MAX_LIFETIME_JITTER, &value)?);
+                        Some(parse_url_seconds(URL_MAX_LIFETIME_JITTER, &value)?);
                 }
                 _ => {}
             }
@@ -282,20 +374,36 @@ impl UrlPoolSettings {
     }
 }
 
-fn parse_url_value<T: std::str::FromStr>(url_key: &'static str, value: &str) -> Result<T> {
+fn parse_url_size(url_key: &'static str, value: &str) -> Result<usize> {
     value
         .parse()
         .ok()
-        .context(InvalidConnectionStringValueSnafu { url_key, value })
+        .context(InvalidConnectionStringValueSnafu {
+            url_key,
+            bound: "",
+            value,
+        })
 }
 
-fn resolve_pool_size(
+/// Seconds, at most 365 days, which keeps a connection's deadline from overflowing.
+fn parse_url_seconds(url_key: &'static str, value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds <= MAX_CONNECTION_MAX_LIFETIME.as_secs())
+        .context(InvalidConnectionStringValueSnafu {
+            url_key,
+            bound: " of seconds up to 31536000 (365d)",
+            value,
+        })
+}
+
+fn resolve_bound(
     key: &'static str,
     spicepod: Option<&str>,
-    url_key: &'static str,
     url: Option<usize>,
     default: usize,
-) -> Result<Setting<usize>> {
+) -> Result<Bound> {
     match (spicepod, url) {
         (Some(value), url) => {
             let parsed = value
@@ -309,23 +417,25 @@ fn resolve_pool_size(
                 return ConflictSnafu {
                     key,
                     value,
-                    url_key,
-                    url_value: url_value.to_string(),
+                    url_value: format!("{key}={url_value}"),
                 }
                 .fail();
             }
-            Ok(Setting {
+            Ok(Bound {
                 value: parsed,
-                origin: Origin::Spicepod(key),
+                explicit: true,
+                origin: format!("{parsed}, from `mysql_{key}`"),
             })
         }
-        (None, Some(url_value)) => Ok(Setting {
+        (None, Some(url_value)) => Ok(Bound {
             value: url_value,
-            origin: Origin::ConnectionString(url_key),
+            explicit: true,
+            origin: format!("{url_value}, from `{key}` in `mysql_connection_string`"),
         }),
-        (None, None) => Ok(Setting {
+        (None, None) => Ok(Bound {
             value: default,
-            origin: Origin::Default,
+            explicit: false,
+            origin: format!("{default}, the default"),
         }),
     }
 }
@@ -361,8 +471,8 @@ mod tests {
 
     const DEFAULTS: Option<PoolSizeDefaults> = Some(PoolSizeDefaults { min: 1, max: 5 });
 
-    fn size(min: usize, max: usize) -> Option<PoolConstraints> {
-        Some(PoolConstraints::new(min, max).expect("a valid pool size"))
+    fn sized(min: usize, max: usize) -> PoolConstraints {
+        PoolConstraints::new(min, max).expect("a valid pool size")
     }
 
     fn resolve(params: PoolParams<'_>) -> Result<PoolSettings> {
@@ -372,7 +482,7 @@ mod tests {
     #[test]
     fn nothing_set_takes_the_defaults_for_both_connection_paths() {
         let expected = PoolSettings {
-            size: size(1, 5),
+            size: Some(sized(1, 5)),
             max_lifetime: Some(Duration::from_mins(5)),
             max_lifetime_jitter: Some(Duration::from_mins(1)),
         };
@@ -399,7 +509,7 @@ mod tests {
         assert_eq!(
             settings,
             Ok(PoolSettings {
-                size: size(2, 20),
+                size: Some(sized(2, 20)),
                 max_lifetime: Some(Duration::from_mins(10)),
                 max_lifetime_jitter: Some(Duration::from_mins(2)),
             })
@@ -418,7 +528,7 @@ mod tests {
         assert_eq!(
             settings,
             Ok(PoolSettings {
-                size: size(3, 30),
+                size: Some(sized(3, 30)),
                 max_lifetime: Some(Duration::from_mins(2)),
                 max_lifetime_jitter: None,
             })
@@ -443,7 +553,30 @@ mod tests {
             connection_string: Some("mysql://user:pass@db.internal/app?pool_min=4"),
             ..PoolParams::default()
         });
-        assert_eq!(settings.map(|s| s.size), Ok(size(4, 8)));
+        assert_eq!(settings.map(|s| s.size), Ok(Some(sized(4, 8))));
+        // A maximum below `mysql_async`'s default minimum of 10, given alone.
+        let settings = resolve(PoolParams {
+            connection_string: Some("mysql://user:pass@db.internal/app?pool_max=3"),
+            ..PoolParams::default()
+        });
+        assert_eq!(settings.map(|s| s.size), Ok(Some(sized(1, 3))));
+    }
+
+    #[test]
+    fn an_unset_maximum_makes_room_for_the_minimum() {
+        let settings = resolve(PoolParams {
+            pool_min: Some("8"),
+            ..PoolParams::default()
+        });
+        assert_eq!(settings.map(|s| s.size), Ok(Some(sized(8, 8))));
+        let changes_mode = PoolSettings::resolve(
+            PoolParams {
+                connection_string: Some("mysql://user:pass@db.internal/app?pool_min=3"),
+                ..PoolParams::default()
+            },
+            Some(PoolSizeDefaults { min: 0, max: 2 }),
+        );
+        assert_eq!(changes_mode.map(|s| s.size), Ok(Some(sized(3, 3))));
     }
 
     #[test]
@@ -458,7 +591,7 @@ mod tests {
         });
         assert_eq!(
             settings.map(|s| (s.size, s.max_lifetime)),
-            Ok((size(1, 8), Some(Duration::from_mins(2))))
+            Ok((Some(sized(1, 8)), Some(Duration::from_mins(2))))
         );
     }
 
@@ -484,13 +617,10 @@ mod tests {
         })
         .expect_err("conflicting lifetime");
         assert_eq!(
-            error,
-            Error::Conflict {
-                key: "connection_max_lifetime",
-                value: "5m".to_string(),
-                url_key: "abs_conn_ttl",
-                url_value: "600".to_string(),
-            }
+            error.to_string(),
+            format!(
+                "`mysql_connection_max_lifetime` is '5m', but `mysql_connection_string` sets `abs_conn_ttl=600`. Set it in one place. See: {POOL_DOCS}"
+            )
         );
     }
 
@@ -510,26 +640,27 @@ mod tests {
 
         let error = resolve(PoolParams {
             pool_min: Some("0"),
-            pool_max: Some("0"),
+            connection_string: Some("mysql://user:pass@db.internal/app?pool_max=0"),
             ..PoolParams::default()
         })
         .expect_err("zero pool_max");
         assert_eq!(
             error.to_string(),
             format!(
-                "The pool maximum (0, from `mysql_pool_max`) must be at least 1. Set `mysql_pool_max` to 1 or more. See: {POOL_DOCS}"
+                "The pool maximum (0, from `pool_max` in `mysql_connection_string`) must be at least 1. See: {POOL_DOCS}"
             )
         );
 
         let error = resolve(PoolParams {
+            pool_max: Some("4"),
             connection_string: Some("mysql://user:pass@db.internal/app?pool_min=10"),
             ..PoolParams::default()
         })
-        .expect_err("pool_min from the URL above the default pool_max");
+        .expect_err("pool_min above a pool_max the user set");
         assert_eq!(
             error.to_string(),
             format!(
-                "The pool minimum (10, from `pool_min` in `mysql_connection_string`) is greater than the pool maximum (5, the default). Lower `mysql_pool_min` or raise `mysql_pool_max`. See: {POOL_DOCS}"
+                "The pool minimum (10, from `pool_min` in `mysql_connection_string`) is greater than the pool maximum (4, from `mysql_pool_max`). Lower `mysql_pool_min` or raise `mysql_pool_max`. See: {POOL_DOCS}"
             )
         );
 
@@ -539,11 +670,44 @@ mod tests {
         })
         .expect_err("non-integer pool_max in the URL");
         assert_eq!(
-            error,
-            Error::InvalidConnectionStringValue {
-                url_key: "pool_max",
-                value: "lots".to_string(),
-            }
+            error.to_string(),
+            format!(
+                "`pool_max` in `mysql_connection_string` must be a whole number, but is 'lots'. See: {POOL_DOCS}"
+            )
+        );
+    }
+
+    #[test]
+    fn connection_string_lifetimes_are_bounded() {
+        for (url, key) in [
+            ("abs_conn_ttl=31536001", "abs_conn_ttl"),
+            (
+                "abs_conn_ttl_jitter=18446744073709551615",
+                "abs_conn_ttl_jitter",
+            ),
+        ] {
+            let error = resolve(PoolParams {
+                connection_string: Some(&format!("mysql://user:pass@db.internal/app?{url}")),
+                ..PoolParams::default()
+            })
+            .expect_err(url);
+            assert!(
+                matches!(error, Error::InvalidConnectionStringValue { url_key, .. } if url_key == key),
+                "{url}: {error}"
+            );
+        }
+        let settings = resolve(PoolParams {
+            connection_string: Some(
+                "mysql://user:pass@db.internal/app?abs_conn_ttl=31536000&abs_conn_ttl_jitter=31536000",
+            ),
+            ..PoolParams::default()
+        });
+        assert_eq!(
+            settings.map(|s| (s.max_lifetime, s.max_lifetime_jitter)),
+            Ok((
+                Some(MAX_CONNECTION_MAX_LIFETIME),
+                Some(MAX_CONNECTION_MAX_LIFETIME)
+            ))
         );
     }
 
@@ -625,22 +789,65 @@ mod tests {
         );
     }
 
+    fn identity() -> MySQLServerIdentity {
+        MySQLServerIdentity {
+            configured_host: "reader.example.internal".to_string(),
+            configured_port: 3306,
+            connection_id: 12345,
+            hostname: "ip-10-0-1-23".to_string(),
+            port: 3306,
+            aurora_server_id: Some("app-reader-2".to_string()),
+        }
+    }
+
     #[test]
-    fn apply_sets_the_pool_options() {
-        let settings = resolve(PoolParams {
-            pool_max: Some("9"),
-            ..PoolParams::default()
-        })
-        .expect("valid settings");
-        let pool_opts = settings.apply(PoolOpts::default());
+    fn new_connection_message_names_the_server_reached() {
+        let mut identity = identity();
         assert_eq!(
-            pool_opts.constraints(),
-            PoolConstraints::new(1, 9).expect("valid")
+            new_connection_message("dataset 'orders'", &identity),
+            "MySQL dataset 'orders' opened connection 12345 to 'reader.example.internal:3306', which reached server 'ip-10-0-1-23:3306' (Aurora instance 'app-reader-2')."
         );
-        assert_eq!(pool_opts.abs_conn_ttl(), Some(Duration::from_mins(5)));
+        identity.aurora_server_id = None;
+        identity.hostname = "evil\nWARN forged".to_string();
         assert_eq!(
-            pool_opts.abs_conn_ttl_jitter(),
-            Some(Duration::from_mins(1))
+            new_connection_message("catalog 'app'", &identity),
+            "MySQL catalog 'app' opened connection 12345 to 'reader.example.internal:3306', which reached server 'evil\\nWARN forged:3306'."
         );
+    }
+
+    #[test]
+    fn each_server_is_logged_at_info_once_per_interval() {
+        let log = ConnectionLog {
+            component: "dataset 'orders'".to_string(),
+            logged_at: parking_lot::Mutex::new(HashMap::new()),
+        };
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        assert!(log.first_in_interval("reader-1", at(0)));
+        assert!(!log.first_in_interval("reader-1", at(1)));
+        assert!(log.first_in_interval("reader-2", at(2)));
+        assert!(!log.first_in_interval("reader-1", at(599)));
+        assert!(log.first_in_interval("reader-1", at(600)));
+        assert!(!log.first_in_interval("reader-2", at(601)));
+        assert!(log.first_in_interval("reader-2", at(602)));
+    }
+
+    #[test]
+    fn pool_settings_are_removed_from_the_connection_string_and_nothing_else() {
+        assert_eq!(
+            without_pool_settings(
+                "mysql://user:p%40ss@db.internal:3306/app?pool_min=1&prefer_socket=false&pool_max=3&abs_conn_ttl=60&abs_conn_ttl_jitter=5"
+            ),
+            "mysql://user:p%40ss@db.internal:3306/app?prefer_socket=false"
+        );
+        assert_eq!(
+            without_pool_settings("mysql://user:pass@db.internal/app?pool_max=3"),
+            "mysql://user:pass@db.internal/app"
+        );
+        assert_eq!(
+            without_pool_settings("mysql://user:pass@db.internal/app"),
+            "mysql://user:pass@db.internal/app"
+        );
+        assert_eq!(without_pool_settings("not a url"), "not a url");
     }
 }
