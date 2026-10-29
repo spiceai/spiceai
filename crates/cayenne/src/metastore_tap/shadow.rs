@@ -635,7 +635,7 @@ async fn decode_payload(store: &Arc<dyn ObjectStore>, payload: &[u8]) -> Result<
     }
 }
 
-pub(super) async fn replay(store: Arc<dyn ObjectStore>, prefix: Path) -> Result<DatasetState> {
+pub(crate) async fn replay(store: Arc<dyn ObjectStore>, prefix: Path) -> Result<DatasetState> {
     let (_, opened) = Reader::open(Arc::clone(&store), prefix).await?;
     let mut state = DatasetState::default();
     if let Some(root) = opened.checkpoint_root {

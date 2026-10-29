@@ -31,6 +31,48 @@ use datafusion_common::Result as DFResult;
 use datafusion_expr::dml::InsertOp;
 use tempfile::TempDir;
 
+pub type FixtureCatalog = dyn MetadataCatalog;
+
+/// Select a catalog only inside the integration harness. Reopens use the same
+/// durable object directory; the native branch never constructs a SQL catalog.
+pub async fn fixture_catalog(
+    connection_string: String,
+) -> Result<Arc<FixtureCatalog>, Box<dyn std::error::Error>> {
+    match std::env::var("CAYENNE_TEST_CATALOG").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("sqlite") => {
+            Ok(Arc::new(CayenneCatalog::new(connection_string)?))
+        }
+        Ok("native") => {
+            use cayenne::metastore::object_native::ObjectNativeCatalog;
+            use object_store::{ObjectStore, ObjectStoreExt, path::Path};
+            let database = connection_string
+                .strip_prefix("sqlite://")
+                .ok_or("native harness requires a local SQLite fixture path")?;
+            let directory = std::path::PathBuf::from(format!("{database}.native"));
+            tokio::fs::create_dir_all(&directory).await?;
+            let store: Arc<dyn ObjectStore> = Arc::new(
+                object_store_occ::LocalConditionalPut::new_durable(&directory)?,
+            );
+            let prefix = Path::from("catalog");
+            let catalog = match store.head(&prefix.clone().join("head")).await {
+                Ok(_) => ObjectNativeCatalog::open(Arc::clone(&store), prefix.clone()).await?,
+                Err(object_store::Error::NotFound { .. }) => {
+                    ObjectNativeCatalog::create(Arc::clone(&store), prefix.clone()).await?
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let head = store.head(&prefix.join("head")).await?;
+            assert!(head.size > 0, "native catalog must persist a head object");
+            eprintln!(
+                "CAYENNE_TEST_CATALOG=native: durable head {} ({} bytes)",
+                head.location, head.size
+            );
+            Ok(Arc::new(catalog))
+        }
+        value => Err(format!("invalid CAYENNE_TEST_CATALOG selection: {value:?}").into()),
+    }
+}
+
 /// Backend type for parameterized tests
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendType {
@@ -52,7 +94,7 @@ impl BackendType {
 /// Test fixture that sets up a temporary directory and catalog
 pub struct TestFixture {
     pub temp_dir: TempDir,
-    pub catalog: Arc<CayenneCatalog>,
+    pub catalog: Arc<FixtureCatalog>,
     pub data_path: std::path::PathBuf,
     pub backend_type: BackendType,
 }
@@ -76,7 +118,7 @@ impl TestFixture {
             }
         };
 
-        let catalog = Arc::new(CayenneCatalog::new(connection_string)?);
+        let catalog = fixture_catalog(connection_string).await?;
         catalog.init().await?;
 
         Ok(Self {
@@ -276,10 +318,9 @@ pub async fn write_batches(
 /// against that task. This helper gives the background task a bounded
 /// window to complete before failing the test.
 pub async fn poll_inlined_data_count_zero(
-    catalog: &Arc<CayenneCatalog>,
+    catalog: &Arc<impl MetadataCatalog + ?Sized>,
     table_id: &str,
 ) -> Result<i64, Box<dyn std::error::Error>> {
-    use cayenne::MetadataCatalog;
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
     let started = std::time::Instant::now();
@@ -299,11 +340,10 @@ pub async fn poll_inlined_data_count_zero(
 /// same background task: the reclamation that drains `cayenne_inlined_delete`
 /// runs in a `tokio::spawn` scheduled from the write path.
 pub async fn poll_inlined_delete_count_at_most(
-    catalog: &Arc<CayenneCatalog>,
+    catalog: &Arc<impl MetadataCatalog + ?Sized>,
     table_id: &str,
     limit: i64,
 ) -> Result<i64, Box<dyn std::error::Error>> {
-    use cayenne::MetadataCatalog;
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
     let started = std::time::Instant::now();

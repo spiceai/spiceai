@@ -10911,14 +10911,6 @@ impl CayenneTableProvider {
         Arc::clone(self.context.runtime_env())
     }
 
-    /// Downcast the metadata catalog to the concrete Cayenne catalog — the
-    /// write-back marker CRUD is a Cayenne-specific concern (not on the trait).
-    fn cayenne_catalog(&self) -> Option<&crate::CayenneCatalog> {
-        self.catalog
-            .as_any()
-            .downcast_ref::<crate::CayenneCatalog>()
-    }
-
     /// List up to `limit` undelivered write-back markers in delivery order
     /// (oldest commit first, then key) starting after `after`, or at the oldest
     /// marker when that is `None`, as `(pk_bytes, sequence_number)`.
@@ -10935,9 +10927,7 @@ impl CayenneTableProvider {
         limit: usize,
         after: Option<&(i64, Vec<u8>)>,
     ) -> Result<Vec<(Vec<u8>, i64)>> {
-        let Some(catalog) = self.cayenne_catalog() else {
-            return Ok(Vec::new());
-        };
+        let catalog = self.catalog.as_ref();
         Ok(catalog
             .list_pending_write_back(self.table_id(), limit, after)
             .await?)
@@ -10949,9 +10939,7 @@ impl CayenneTableProvider {
     /// # Errors
     /// Propagates the underlying metastore error.
     pub async fn clear_dirty_keys(&self, keys: &[(Vec<u8>, i64)]) -> Result<()> {
-        let Some(catalog) = self.cayenne_catalog() else {
-            return Ok(());
-        };
+        let catalog = self.catalog.as_ref();
         catalog
             .clear_pending_write_back(self.table_id(), keys)
             .await?;
@@ -10963,9 +10951,7 @@ impl CayenneTableProvider {
     /// # Errors
     /// Propagates the underlying metastore error.
     pub async fn dirty_key_count(&self) -> Result<i64> {
-        let Some(catalog) = self.cayenne_catalog() else {
-            return Ok(0);
-        };
+        let catalog = self.catalog.as_ref();
         Ok(catalog.pending_write_back_count(self.table_id()).await?)
     }
 

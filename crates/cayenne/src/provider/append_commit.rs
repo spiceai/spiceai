@@ -30,7 +30,6 @@ use super::on_conflict::{OnConflictDeletions, PreparedOnConflictDeletionPublish}
 use super::pk_index::PkDigestSet;
 use super::table::{CayenneTableProvider, record_cayenne_write_phase};
 use super::{Error, Result};
-use crate::CayenneCatalog;
 use crate::catalog::{CatalogResult, MetadataCatalog};
 use crate::metastore::MetastoreTransaction;
 
@@ -110,14 +109,7 @@ impl PreparedResolvedAppend {
             super::staged_upsert::cleanup_orphan_snapshot_dir(&self.table, &self.snapshot_id).await;
             return Ok(0);
         }
-        let catalog = self
-            .table
-            .catalog()
-            .as_any()
-            .downcast_ref::<CayenneCatalog>()
-            .ok_or(Failure::discard(Error::Unsupported {
-                operation: "atomic append with a non-Cayenne metadata catalog",
-            }))?;
+        let catalog = self.table.catalog().as_ref();
         self.table
             .sync_local_snapshot_dir(&self.snapshot_id)
             .await
@@ -185,22 +177,12 @@ impl PreparedResolvedAppend {
 }
 
 async fn commit_metadata(
-    catalog: &CayenneCatalog,
+    catalog: &dyn MetadataCatalog,
     prepared: &mut PreparedOnConflictDeletionPublish,
 ) -> std::result::Result<(), Failure> {
     for attempt in 1..=DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS {
-        let mut txn = catalog
-            .begin_transaction()
-            .await
-            .map_err(Failure::discard)?;
-        if let Err(error) = catalog
-            .apply_prepared_on_conflict_in_txn(txn.as_mut(), prepared)
-            .await
-        {
-            let _ = txn.rollback().await;
-            return Err(Failure::discard(error));
-        }
-        match commit_transaction(txn, prepared.table.table_id()).await {
+        let publications: Vec<_> = prepared.catalog_publication().into_iter().collect();
+        match catalog.commit_publications(&publications).await {
             Ok(()) => {
                 prepared.mark_catalog_committed();
                 return Ok(());
@@ -225,7 +207,7 @@ async fn commit_metadata(
 /// never happened; unreadable, the files are kept and the table refuses writes
 /// until it is reloaded.
 async fn resolve_failed_commit(
-    catalog: &CayenneCatalog,
+    catalog: &dyn MetadataCatalog,
     prepared: &mut PreparedOnConflictDeletionPublish,
     error: Error,
 ) -> std::result::Result<(), Failure> {
@@ -265,7 +247,7 @@ async fn resolve_failed_commit(
 }
 
 #[cfg(not(test))]
-pub(super) async fn commit_transaction(
+pub(crate) async fn commit_transaction(
     txn: Box<dyn MetastoreTransaction>,
     _table_id: &str,
 ) -> CatalogResult<()> {
@@ -274,7 +256,7 @@ pub(super) async fn commit_transaction(
 
 #[cfg(not(test))]
 pub(super) async fn snapshot_sequence(
-    catalog: &CayenneCatalog,
+    catalog: &dyn MetadataCatalog,
     table_id: &str,
     snapshot_id: &str,
 ) -> CatalogResult<Option<i64>> {
@@ -282,7 +264,7 @@ pub(super) async fn snapshot_sequence(
 }
 
 #[cfg(test)]
-pub(super) async fn commit_transaction(
+pub(crate) async fn commit_transaction(
     txn: Box<dyn MetastoreTransaction>,
     table_id: &str,
 ) -> CatalogResult<()> {
@@ -303,7 +285,7 @@ pub(super) async fn commit_transaction(
 
 #[cfg(test)]
 pub(super) async fn snapshot_sequence(
-    catalog: &CayenneCatalog,
+    catalog: &dyn MetadataCatalog,
     table_id: &str,
     snapshot_id: &str,
 ) -> CatalogResult<Option<i64>> {

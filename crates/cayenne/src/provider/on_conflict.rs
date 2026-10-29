@@ -112,6 +112,22 @@ pub(crate) struct PreparedOnConflictDurablePayload {
 }
 
 impl PreparedOnConflictDeletionPublish {
+    pub(crate) fn catalog_publication(&self) -> Option<crate::catalog::CatalogPublication> {
+        self.durable_payload
+            .as_ref()
+            .map(|payload| crate::catalog::CatalogPublication {
+                table_id: payload.table_id.clone(),
+                snapshot_id: self.target_snapshot_id.clone(),
+                snapshot_sequence: self.snapshot_sequence,
+                insert_sequence: self.insert_sequence,
+                delete_files: payload.delete_files.clone(),
+                insert_pk_bytes: payload.insert_pk_bytes.clone(),
+                inline_tombstone: payload.inline_tombstone.clone(),
+                pending_durable_flips: payload.pending_durable_flips.clone(),
+                dirty_pk_bytes: Vec::new(),
+            })
+    }
+
     /// The commit sequence this staged upsert publishes under. An on-conflict
     /// append carries no `append_sequence`, so this is the value its validated
     /// primary keys must be stamped with for per-key optimistic concurrency.

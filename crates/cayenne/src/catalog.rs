@@ -281,11 +281,28 @@ pub struct SnapshotSequenceCommit {
     pub sequence_number: i64,
 }
 
-// Transaction support is currently not exposed at the catalog level.
-// Each catalog implementation can use backend-specific transactions internally
-// to ensure atomicity of operations.
-//
-// Future work: Expose catalog-level transactions when needed.
+/// One table's durable append publication. A slice is one atomic transaction.
+#[derive(Clone, Debug)]
+pub struct CatalogPublication {
+    /// Table whose state changes.
+    pub table_id: String,
+    /// Replacement files registered as a protected snapshot.
+    pub snapshot_id: String,
+    /// Visibility sequence of the protected snapshot.
+    pub snapshot_sequence: i64,
+    /// Sequence of replacement primary keys, if present.
+    pub insert_sequence: Option<i64>,
+    /// Durable deletion vectors.
+    pub delete_files: Vec<DeleteFile>,
+    /// Primary keys replaced by the publication.
+    pub insert_pk_bytes: Vec<Vec<u8>>,
+    /// Inline deletion marker committed with the replacement snapshot.
+    pub inline_tombstone: Option<InlinedDelete>,
+    /// Existing inline deletion markers to activate.
+    pub pending_durable_flips: Vec<String>,
+    /// Primary keys requiring federated write-back.
+    pub dirty_pk_bytes: Vec<Vec<u8>>,
+}
 
 /// Trait for metadata catalog operations.
 ///
@@ -293,11 +310,29 @@ pub struct SnapshotSequenceCommit {
 /// including table creation and file tracking.
 #[async_trait]
 pub trait MetadataCatalog: Send + Sync {
-    /// Downcast hook so a caller holding `Arc<dyn MetadataCatalog>` can reach
-    /// concrete methods needed for atomic multi-table transaction commit
-    /// (`begin_transaction`, `apply_prepared_on_conflict_in_txn`), mirroring how the
-    /// overwrite path takes a concrete `&CayenneCatalog`.
+    /// Access backend-specific operations through a concrete catalog reference.
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Commit every table publication together, or leave all tables unchanged.
+    async fn commit_publications(&self, publications: &[CatalogPublication]) -> CatalogResult<()>;
+
+    /// Page undelivered write-back markers by sequence and primary key.
+    async fn list_pending_write_back(
+        &self,
+        table_id: &str,
+        limit: usize,
+        after: Option<&(i64, Vec<u8>)>,
+    ) -> CatalogResult<Vec<(Vec<u8>, i64)>>;
+
+    /// Clear delivered markers only when no newer sequence has replaced them.
+    async fn clear_pending_write_back(
+        &self,
+        table_id: &str,
+        keys: &[(Vec<u8>, i64)],
+    ) -> CatalogResult<()>;
+
+    /// Count undelivered write-back markers.
+    async fn pending_write_back_count(&self, table_id: &str) -> CatalogResult<i64>;
 
     /// Initialize the catalog, creating necessary tables if they don't exist.
     async fn init(&self) -> CatalogResult<()>;

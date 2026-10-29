@@ -30,8 +30,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
 use cayenne::{
-    CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
-    ScanViewReuse, SlotAdvancer,
+    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, ScanViewReuse, SlotAdvancer,
 };
 use datafusion::datasource::TableProvider;
 use datafusion::execution::SendableRecordBatchStream;
@@ -759,7 +758,7 @@ async fn test_cold_tier_restart_reopen_impl(fixture: common::TestFixture) -> Tes
 
     // Session 2: a NEW catalog connection over the same metastore file — the
     // provider must rebuild everything from persisted state.
-    let catalog2 = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog2 = common::fixture_catalog(fixture.connection_string()).await?;
     catalog2.init().await?;
     let ctx2 = SessionContext::new();
     let reopened = Arc::new(
@@ -1655,7 +1654,7 @@ async fn test_cold_tier_promotion_preserves_pending_stage_b_impl(
         "the staged batch is visible after its Stage-B publish"
     );
 
-    let catalog2 = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog2 = common::fixture_catalog(fixture.connection_string()).await?;
     catalog2.init().await?;
     let ctx2 = SessionContext::new();
     let reopened = Arc::new(
@@ -1740,7 +1739,7 @@ async fn test_cold_tier_promotion_racing_stage_b_finalize_impl(
     }
 
     // The loss manifests at restart (the source slot was acked at Stage-A).
-    let catalog2 = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog2 = common::fixture_catalog(fixture.connection_string()).await?;
     catalog2.init().await?;
     let ctx2 = SessionContext::new();
     let reopened = Arc::new(

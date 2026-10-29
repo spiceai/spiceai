@@ -423,9 +423,16 @@ async fn a_waiting_publish_does_not_hold_back_the_other_partitions_impl(
         prepared
             .push(tokio::time::timeout(WAIT_LIMIT, table.begin_overwrite(replacement, 1)).await??);
     }
-    let mut txn = fixture.catalog.begin_transaction().await?;
+    let sql_catalog = fixture
+        .catalog
+        .as_any()
+        .downcast_ref::<cayenne::CayenneCatalog>()
+        .ok_or(cayenne::catalog::CatalogError::NotImplemented {
+            function: "SQL transaction test requires CayenneCatalog".to_string(),
+        })?;
+    let mut txn = sql_catalog.begin_transaction().await?;
     for prep in &prepared {
-        prep.apply_in_txn(&fixture.catalog, &mut *txn).await?;
+        prep.apply_in_txn(sql_catalog, &mut *txn).await?;
     }
     txn.commit().await?;
     let committed = catalog

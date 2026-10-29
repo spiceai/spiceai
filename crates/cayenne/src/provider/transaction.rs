@@ -52,7 +52,6 @@ use super::pk_index::PkDigestSet;
 use super::staged_upsert::{CayenneStagedUpsert, PreparedTxnCommit, TransactionWriteToken};
 use super::table::CayenneTableProvider;
 use super::{Error, Result};
-use crate::CayenneCatalog;
 
 /// One participant table in a transaction (read and/or written): its per-table
 /// begin token, provider, accumulated read footprint, and — once a write stages
@@ -383,14 +382,7 @@ impl CayenneTransaction {
                     .to_string(),
             });
         }
-        let Some(catalog) = shared_catalog.as_any().downcast_ref::<CayenneCatalog>() else {
-            drop(write_guards);
-            rollback_prepared(prepared).await;
-            return Err(Error::Internal {
-                table: "<transaction>".to_string(),
-                message: "transaction participant is not backed by a Cayenne catalog".to_string(),
-            });
-        };
+        let catalog = shared_catalog.as_ref();
 
         // Hold visibility + listing-fence locks (canonical order) across the fused
         // durable commit and the in-memory publish.
@@ -451,32 +443,17 @@ enum FusedFailure {
 /// Bounded retry on a busy backend; an `apply` failure is terminal (the whole
 /// multi-table commit aborts). On success every table is durable together.
 async fn commit_fused(
-    catalog: &CayenneCatalog,
+    catalog: &dyn crate::catalog::MetadataCatalog,
     prepared: &mut [PreparedTxnCommit],
 ) -> std::result::Result<(), FusedFailure> {
     use turso_shared::{DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, retry_backoff_delay};
 
-    let first_table = prepared
-        .first()
-        .map(|pc| pc.table_id().to_string())
-        .unwrap_or_default();
     for attempt in 1..=DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS {
-        let mut txn = catalog
-            .begin_transaction()
-            .await
-            .map_err(|e| FusedFailure::Uncommitted(e.into()))?;
-        let mut apply_err = None;
-        for pc in prepared.iter_mut() {
-            if let Err(e) = pc.apply_in_txn(catalog, txn.as_mut()).await {
-                apply_err = Some(e);
-                break;
-            }
-        }
-        if let Some(e) = apply_err {
-            let _ = txn.rollback().await;
-            return Err(FusedFailure::Uncommitted(Error::from(e)));
-        }
-        match super::append_commit::commit_transaction(txn, &first_table).await {
+        let publications: Vec<_> = prepared
+            .iter()
+            .filter_map(PreparedTxnCommit::catalog_publication)
+            .collect();
+        match catalog.commit_publications(&publications).await {
             Ok(()) => {
                 // Durably committed — disarm each publish's abort cleanup so its
                 // `Drop` does not delete the now-live deletion-vector files.
@@ -509,7 +486,7 @@ async fn commit_fused(
 /// transaction stands; none, it never happened; otherwise the staged files are
 /// kept and each table refuses writes until it is reloaded.
 async fn resolve_failed_fused_commit(
-    catalog: &CayenneCatalog,
+    catalog: &dyn crate::catalog::MetadataCatalog,
     prepared: &mut [PreparedTxnCommit],
     error: Error,
 ) -> std::result::Result<(), FusedFailure> {

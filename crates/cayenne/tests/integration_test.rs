@@ -67,7 +67,7 @@ async fn test_cayenne_basic_workflow_impl(
     // 3. Create Cayenne table provider
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
+        Arc::<common::FixtureCatalog>::clone(catalog),
         table_options,
         ctx.runtime_env(),
     )
@@ -382,7 +382,7 @@ async fn test_cayenne_basic_workflow_impl(
     // Create a fresh table provider by reading from catalog
     // This simulates what happens when spiced restarts or a new client connects
     let catalog_arc: Arc<dyn cayenne::MetadataCatalog> =
-        Arc::<cayenne::CayenneCatalog>::clone(catalog);
+        Arc::<common::FixtureCatalog>::clone(catalog);
     let fresh_ctx = SessionContext::new();
     let fresh_table =
         CayenneTableProvider::new("test_table", catalog_arc, fresh_ctx.runtime_env()).await?;
@@ -594,7 +594,7 @@ async fn test_cayenne_statistics_impl(
 
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(&catalog),
+        Arc::<common::FixtureCatalog>::clone(&catalog),
         table_options,
         ctx.runtime_env(),
     )
@@ -709,7 +709,7 @@ async fn test_cayenne_core_data_types_impl(
 
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(&catalog),
+        Arc::<common::FixtureCatalog>::clone(&catalog),
         table_options,
         ctx.runtime_env(),
     )
@@ -954,7 +954,7 @@ async fn test_cayenne_sorted_insert_impl(
     let ctx = SessionContext::new();
     let table: Arc<dyn TableProvider> = Arc::new(
         CayenneTableProvider::create_table(
-            Arc::<cayenne::CayenneCatalog>::clone(catalog),
+            Arc::<common::FixtureCatalog>::clone(catalog),
             table_options,
             ctx.runtime_env(),
         )
@@ -1049,7 +1049,7 @@ async fn test_cayenne_sorted_insert_impl(
     let verify_ctx = SessionContext::new();
     let reopened_table: Arc<dyn TableProvider> = Arc::new(
         cayenne::CayenneTableProviderBuilder::new(
-            Arc::<cayenne::CayenneCatalog>::clone(catalog),
+            Arc::<common::FixtureCatalog>::clone(catalog),
             verify_ctx.runtime_env(),
         )
         .open("sorted_table")

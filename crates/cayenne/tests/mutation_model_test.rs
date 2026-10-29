@@ -641,3 +641,174 @@ async fn test_exhaustive_composite_single_row_sequences_impl(
 }
 
 test_with_backends!(test_exhaustive_composite_single_row_sequences_impl);
+
+async fn test_sequence_reservation_guard_impl(fixture: TestFixture) -> TestResult<()> {
+    let (table, ctx, schema) = setup_int64_upsert_table(&fixture, "reservation_guard").await?;
+    apply_int64_mutation(
+        &table,
+        &schema,
+        &Int64MutationOp::Upsert { key: 1, value: 10 },
+    )
+    .await?;
+    let before = fixture
+        .catalog
+        .get_sequence_number(table.table_id())
+        .await?;
+    let result = fixture
+        .catalog
+        .reserve_sequence_numbers(table.table_id(), 0)
+        .await;
+    assert!(
+        result.is_err(),
+        "zero-length sequence reservation must fail: {result:?}"
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .get_sequence_number(table.table_id())
+            .await?,
+        before
+    );
+    assert_eq!(
+        read_int64_rows(&ctx, "reservation_guard").await?,
+        vec![(1, 10)]
+    );
+    Ok(())
+}
+test_with_backends!(test_sequence_reservation_guard_impl);
+
+async fn test_publication_tombstone_replay_impl(fixture: TestFixture) -> TestResult<()> {
+    use cayenne::{catalog::CatalogPublication, metadata::InlinedDelete};
+    let (table, _, _) = setup_int64_upsert_table(&fixture, "publication_replay").await?;
+    let publication = CatalogPublication {
+        table_id: table.table_id().to_string(),
+        snapshot_id: uuid::Uuid::now_v7().to_string(),
+        snapshot_sequence: 1,
+        insert_sequence: None,
+        delete_files: vec![],
+        insert_pk_bytes: vec![],
+        inline_tombstone: Some(InlinedDelete {
+            inlined_id: uuid::Uuid::now_v7().to_string(),
+            table_id: table.table_id().to_string(),
+            delete_ipc: vec![1, 2, 3],
+            delete_count: 1,
+            sequence_number: 1,
+            published: false,
+            created_at: String::new(),
+        }),
+        pending_durable_flips: vec![],
+        dirty_pk_bytes: vec![],
+    };
+    fixture
+        .catalog
+        .commit_publications(std::slice::from_ref(&publication))
+        .await?;
+    let before = fixture
+        .catalog
+        .get_inlined_deletes(table.table_id())
+        .await?;
+    // Replay in a later millisecond to test timestamp-independent idempotency.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    fixture
+        .catalog
+        .commit_publications(std::slice::from_ref(&publication))
+        .await?;
+    let after = fixture
+        .catalog
+        .get_inlined_deletes(table.table_id())
+        .await?;
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].created_at, before[0].created_at);
+    assert_eq!(after[0].delete_ipc, vec![1, 2, 3]);
+    Ok(())
+}
+test_with_backends!(test_publication_tombstone_replay_impl);
+
+async fn test_delete_file_replacement_same_path_impl(fixture: TestFixture) -> TestResult<()> {
+    use cayenne::metadata::{DeleteFile, DeletionType};
+    let (table, _, _) = setup_int64_upsert_table(&fixture, "replacement_path").await?;
+    let file = DeleteFile {
+        delete_file_id: String::new(),
+        table_id: table.table_id().to_string(),
+        source_data_file_path: None,
+        path: fixture
+            .data_path
+            .join("delete.arrow")
+            .to_string_lossy()
+            .to_string(),
+        path_is_relative: false,
+        format: "arrow".to_string(),
+        delete_count: 1,
+        file_size_bytes: 64,
+        deletion_type: DeletionType::KeyBased,
+        sequence_number: 1,
+        reinsert_sequence: None,
+    };
+    let id = fixture.catalog.add_delete_file(file.clone()).await?;
+    fixture
+        .catalog
+        .commit_delete_files_with_inlined_rewrite(
+            vec![file],
+            table.table_id(),
+            vec![],
+            vec![],
+            vec![id],
+        )
+        .await?;
+    let stored = fixture
+        .catalog
+        .get_table_delete_files(table.table_id())
+        .await?;
+    assert_eq!(
+        stored.len(),
+        1,
+        "replacement at the same path must stay registered"
+    );
+    assert_eq!(stored[0].delete_count, 1);
+    Ok(())
+}
+test_with_backends!(test_delete_file_replacement_same_path_impl);
+
+async fn test_publication_without_reinsert_sequence_impl(fixture: TestFixture) -> TestResult<()> {
+    use cayenne::{
+        catalog::CatalogPublication,
+        metadata::{DeleteFile, DeletionType},
+    };
+    let (table, _, _) = setup_int64_upsert_table(&fixture, "optional_reinsert").await?;
+    let publication = CatalogPublication {
+        table_id: table.table_id().to_string(),
+        snapshot_id: uuid::Uuid::now_v7().to_string(),
+        snapshot_sequence: 1,
+        insert_sequence: None,
+        delete_files: vec![DeleteFile {
+            delete_file_id: uuid::Uuid::now_v7().to_string(),
+            table_id: table.table_id().to_string(),
+            source_data_file_path: None,
+            path: fixture
+                .data_path
+                .join("delete.arrow")
+                .to_string_lossy()
+                .to_string(),
+            path_is_relative: false,
+            format: "arrow".to_string(),
+            delete_count: 1,
+            file_size_bytes: 64,
+            deletion_type: DeletionType::KeyBased,
+            sequence_number: 1,
+            reinsert_sequence: None,
+        }],
+        insert_pk_bytes: vec![vec![1]],
+        inline_tombstone: None,
+        pending_durable_flips: vec![],
+        dirty_pk_bytes: vec![],
+    };
+    fixture.catalog.commit_publications(&[publication]).await?;
+    let files = fixture
+        .catalog
+        .get_table_delete_files(table.table_id())
+        .await?;
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].reinsert_sequence, None);
+    Ok(())
+}
+test_with_backends!(test_publication_without_reinsert_sequence_impl);

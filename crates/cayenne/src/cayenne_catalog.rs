@@ -2016,7 +2016,11 @@ created_at: row.get_string(5)?,
             .await?;
         }
         crate::metastore_tap::push(&*txn, "commit_overwrite_to_cold", || {
-            vec![tap::add_cold(self, table_id, cold_files)]
+            vec![tap::add_cold(
+                |bytes| self.tap_blob(bytes),
+                table_id,
+                cold_files,
+            )]
         });
         Ok(())
     }
@@ -2173,109 +2177,6 @@ created_at: row.get_string(5)?,
             )]
         });
         Ok(())
-    }
-
-    /// List up to `limit` undelivered write-back markers for `table_id` in
-    /// delivery order — oldest commit sequence first, then key — starting after
-    /// `after`, or at the oldest marker when that is `None`. Returns
-    /// `(pk_bytes, sequence_number)` pairs.
-    ///
-    /// Every key one commit dirties shares that commit's sequence, so the key
-    /// breaks the tie and makes the order total. `after` is then an exact cursor:
-    /// a caller can page past markers it could not deliver without re-claiming or
-    /// skipping one, whatever else commits meanwhile.
-    pub(crate) async fn list_pending_write_back(
-        &self,
-        table_id: &str,
-        limit: usize,
-        after: Option<&(i64, Vec<u8>)>,
-    ) -> CatalogResult<Vec<(Vec<u8>, i64)>> {
-        let table_id_value = blob_keyed_table_id_value(table_id);
-        let limit_value = MetastoreValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX));
-        let params = match after {
-            None => QueryParams {
-                sql: "SELECT pk_bytes, sequence_number FROM cayenne_pending_write_back \
-                      WHERE table_id = ?1 ORDER BY sequence_number ASC, pk_bytes ASC LIMIT ?2",
-                params: vec![table_id_value, limit_value],
-            },
-            Some((sequence_number, pk_bytes)) => QueryParams {
-                sql: "SELECT pk_bytes, sequence_number FROM cayenne_pending_write_back \
-                      WHERE table_id = ?1 \
-                        AND (sequence_number > ?3 OR (sequence_number = ?3 AND pk_bytes > ?4)) \
-                      ORDER BY sequence_number ASC, pk_bytes ASC LIMIT ?2",
-                params: vec![
-                    table_id_value,
-                    limit_value,
-                    MetastoreValue::Integer(*sequence_number),
-                    MetastoreValue::Blob(pk_bytes.clone()),
-                ],
-            },
-        };
-        self.metastore
-            .query_helper(params, |row| Ok((row.get_blob(0)?, row.get_i64(1)?)))
-            .await
-    }
-
-    /// Compare-and-clear delivered markers: for each `(pk_bytes, claimed_seq)`,
-    /// delete the marker only if its stored sequence is still `<= claimed_seq`
-    /// (a newer commit that bumped it above `claimed_seq` during delivery leaves
-    /// it in place, so the stale delivery never clears a fresh mark). Batched in
-    /// one transaction.
-    pub(crate) async fn clear_pending_write_back(
-        &self,
-        table_id: &str,
-        keys: &[(Vec<u8>, i64)],
-    ) -> CatalogResult<()> {
-        if keys.is_empty() {
-            return Ok(());
-        }
-        let txn = self.begin_transaction().await?;
-        let table_id_value = blob_keyed_table_id_value(table_id);
-        for (pk_bytes, claimed_seq) in keys {
-            txn.execute(ExecuteParams {
-                sql: "DELETE FROM cayenne_pending_write_back \
-                      WHERE table_id = ?1 AND pk_bytes = ?2 AND sequence_number <= ?3",
-                params: vec![
-                    table_id_value.clone(),
-                    MetastoreValue::Blob(pk_bytes.clone()),
-                    MetastoreValue::Integer(*claimed_seq),
-                ],
-            })
-            .await?;
-        }
-        crate::metastore_tap::push(&*txn, "clear_pending_write_back", || {
-            vec![cayenne_metastore_actions::Action::new(
-                cayenne_metastore_actions::Kind::ClearDelivered(
-                    cayenne_metastore_actions::proto::AddKeys {
-                        table_id: table_id.to_string(),
-                        keys: keys
-                            .iter()
-                            .map(|(pk, seq)| cayenne_metastore_actions::proto::PkSeq {
-                                pk: pk.clone(),
-                                seq: *seq,
-                            })
-                            .collect(),
-                    },
-                ),
-            )]
-        });
-        txn.commit().await?;
-        Ok(())
-    }
-
-    /// Count undelivered write-back markers for `table_id` (backlog gauge).
-    pub(crate) async fn pending_write_back_count(&self, table_id: &str) -> CatalogResult<i64> {
-        let rows = self
-            .metastore
-            .query_helper(
-                QueryParams {
-                    sql: "SELECT COUNT(*) FROM cayenne_pending_write_back WHERE table_id = ?1",
-                    params: vec![blob_keyed_table_id_value(table_id)],
-                },
-                |row| row.get_i64(0),
-            )
-            .await?;
-        Ok(rows.into_iter().next().unwrap_or(0))
     }
 
     /// Reconcile a reopened table's stored `VortexConfig` with the requested options for
@@ -3332,6 +3233,135 @@ created_at: row.get_string(5)?,
 impl MetadataCatalog for CayenneCatalog {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    async fn list_pending_write_back(
+        &self,
+        table_id: &str,
+        limit: usize,
+        after: Option<&(i64, Vec<u8>)>,
+    ) -> CatalogResult<Vec<(Vec<u8>, i64)>> {
+        let table_id_value = blob_keyed_table_id_value(table_id);
+        let limit_value = MetastoreValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX));
+        let params = match after {
+            None => QueryParams {
+                sql: "SELECT pk_bytes, sequence_number FROM cayenne_pending_write_back \
+                      WHERE table_id = ?1 ORDER BY sequence_number ASC, pk_bytes ASC LIMIT ?2",
+                params: vec![table_id_value, limit_value],
+            },
+            Some((sequence_number, pk_bytes)) => QueryParams {
+                sql: "SELECT pk_bytes, sequence_number FROM cayenne_pending_write_back \
+                      WHERE table_id = ?1 \
+                        AND (sequence_number > ?3 OR (sequence_number = ?3 AND pk_bytes > ?4)) \
+                      ORDER BY sequence_number ASC, pk_bytes ASC LIMIT ?2",
+                params: vec![
+                    table_id_value,
+                    limit_value,
+                    MetastoreValue::Integer(*sequence_number),
+                    MetastoreValue::Blob(pk_bytes.clone()),
+                ],
+            },
+        };
+        self.metastore
+            .query_helper(params, |row| Ok((row.get_blob(0)?, row.get_i64(1)?)))
+            .await
+    }
+    async fn clear_pending_write_back(
+        &self,
+        table_id: &str,
+        keys: &[(Vec<u8>, i64)],
+    ) -> CatalogResult<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let txn = self.begin_transaction().await?;
+        let table_id_value = blob_keyed_table_id_value(table_id);
+        for (pk_bytes, claimed_seq) in keys {
+            txn.execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_pending_write_back \
+                      WHERE table_id = ?1 AND pk_bytes = ?2 AND sequence_number <= ?3",
+                params: vec![
+                    table_id_value.clone(),
+                    MetastoreValue::Blob(pk_bytes.clone()),
+                    MetastoreValue::Integer(*claimed_seq),
+                ],
+            })
+            .await?;
+        }
+        crate::metastore_tap::push(&*txn, "clear_pending_write_back", || {
+            vec![cayenne_metastore_actions::Action::new(
+                cayenne_metastore_actions::Kind::ClearDelivered(
+                    cayenne_metastore_actions::proto::AddKeys {
+                        table_id: table_id.to_string(),
+                        keys: keys
+                            .iter()
+                            .map(|(pk, seq)| cayenne_metastore_actions::proto::PkSeq {
+                                pk: pk.clone(),
+                                seq: *seq,
+                            })
+                            .collect(),
+                    },
+                ),
+            )]
+        });
+        txn.commit().await?;
+        Ok(())
+    }
+    async fn pending_write_back_count(&self, table_id: &str) -> CatalogResult<i64> {
+        let rows = self
+            .metastore
+            .query_helper(
+                QueryParams {
+                    sql: "SELECT COUNT(*) FROM cayenne_pending_write_back WHERE table_id = ?1",
+                    params: vec![blob_keyed_table_id_value(table_id)],
+                },
+                |row| row.get_i64(0),
+            )
+            .await?;
+        Ok(rows.into_iter().next().unwrap_or(0))
+    }
+    async fn commit_publications(
+        &self,
+        publications: &[crate::catalog::CatalogPublication],
+    ) -> CatalogResult<()> {
+        if publications.is_empty() {
+            return Ok(());
+        }
+        let mut txn = self.begin_transaction().await?;
+        for publication in publications {
+            let mut payload = crate::provider::on_conflict::PreparedOnConflictDurablePayload {
+                table_id: publication.table_id.clone(),
+                delete_files: publication.delete_files.clone(),
+                insert_pk_bytes: publication.insert_pk_bytes.clone(),
+                inline_tombstone: publication.inline_tombstone.clone(),
+                pending_durable_flips: publication.pending_durable_flips.clone(),
+            };
+            if let Err(error) = Self::apply_prepared_on_conflict_payload_in_txn(
+                txn.as_mut(),
+                &mut payload,
+                &publication.snapshot_id,
+                publication.snapshot_sequence,
+                publication.insert_sequence,
+            )
+            .await
+            {
+                let _ = txn.rollback().await;
+                return Err(error);
+            }
+            if let Err(error) = self
+                .mark_dirty_keys_in_txn(
+                    txn.as_mut(),
+                    &publication.table_id,
+                    &publication.dirty_pk_bytes,
+                    publication.snapshot_sequence,
+                )
+                .await
+            {
+                let _ = txn.rollback().await;
+                return Err(error);
+            }
+        }
+        crate::provider::append_commit::commit_transaction(txn, &publications[0].table_id).await
     }
 
     async fn init(&self) -> CatalogResult<()> {
@@ -5182,7 +5212,7 @@ impl MetadataCatalog for CayenneCatalog {
                 ],
             },
             "upsert_snapshot_file_statistics",
-            || vec![tap::set_file_stats(self, stats)],
+            || vec![tap::set_file_stats(|bytes| self.tap_blob(bytes), stats)],
         )
         .await
     }
@@ -7058,7 +7088,7 @@ pub(crate) fn deserialize_schema_ipc_base64(
 /// Serialize an Arrow schema to the base64 Arrow-IPC form stored in
 /// `cayenne_table.schema_json`. Shared by `create_table` and
 /// `update_table_schema` so both persist byte-identical encodings.
-fn serialize_schema_ipc_base64(schema: &arrow_schema::Schema) -> CatalogResult<String> {
+pub(crate) fn serialize_schema_ipc_base64(schema: &arrow_schema::Schema) -> CatalogResult<String> {
     use arrow_ipc::writer::IpcWriteOptions;
     let write_options = IpcWriteOptions::default();
     let arrow_flight::IpcMessage(schema_bytes) =
@@ -7321,7 +7351,7 @@ fn configuration_schemas_match(left: &arrow_schema::Schema, right: &arrow_schema
 /// One setting whose stored value differs from the requested one, named the way an
 /// operator configures it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SettingChange {
+pub(crate) struct SettingChange {
     /// The setting, as a backticked Spicepod key or, for a derived setting such as
     /// the data location, a plain description.
     setting: &'static str,
@@ -7358,7 +7388,7 @@ impl std::fmt::Display for SettingChange {
 }
 
 /// `changes` as the comma-separated list the operator-facing messages embed.
-fn describe_setting_changes(changes: &[SettingChange]) -> String {
+pub(crate) fn describe_setting_changes(changes: &[SettingChange]) -> String {
     changes
         .iter()
         .map(ToString::to_string)
@@ -7423,7 +7453,10 @@ fn disables_pk_conflict_detection(stored: &TableMetadata, options: &CreateTableO
 
 /// Whether `options` turns primary-key conflict detection on for a keyed table whose
 /// rows were written with it off, and so may share a key.
-fn enables_pk_conflict_detection(stored: &TableMetadata, options: &CreateTableOptions) -> bool {
+pub(crate) fn enables_pk_conflict_detection(
+    stored: &TableMetadata,
+    options: &CreateTableOptions,
+) -> bool {
     !stored.primary_key.is_empty()
         && stored.vortex_config.pk_conflict_detection == PkConflictDetection::None
         && options.vortex_config.pk_conflict_detection == PkConflictDetection::Auto
@@ -7437,7 +7470,7 @@ fn enables_pk_conflict_detection(stored: &TableMetadata, options: &CreateTableOp
 /// they are.
 ///
 /// The schema is compared separately, under the dataset's `on_schema_change` policy.
-fn identity_setting_changes(
+pub(crate) fn identity_setting_changes(
     stored: &TableMetadata,
     options: &CreateTableOptions,
 ) -> Vec<SettingChange> {
@@ -7604,7 +7637,7 @@ fn schema_kept_warning(table_name: &str) -> String {
     )
 }
 
-fn validate_create_table_options(options: &CreateTableOptions) -> CatalogResult<()> {
+pub(crate) fn validate_create_table_options(options: &CreateTableOptions) -> CatalogResult<()> {
     if matches!(
         options.vortex_config.pk_conflict_detection,
         PkConflictDetection::None

@@ -42,7 +42,7 @@ use prost::Message as _;
 
 mod counting;
 pub mod reader;
-mod shadow;
+pub(crate) mod shadow;
 pub use shadow::ShadowReport;
 
 use crate::catalog::CatalogResult;

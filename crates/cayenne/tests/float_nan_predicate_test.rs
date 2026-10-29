@@ -287,7 +287,6 @@ async fn seed_blobs_without_nan_counts(
     table: &cayenne::CayenneTableProvider,
     nan_free_bounds: (f64, f64),
 ) -> Vec<(String, String)> {
-    use cayenne::MetadataCatalog;
     use datafusion::datasource::TableProvider;
     use vortex::expr::stats::{Precision as VortexPrecision, Stat};
     use vortex::flatbuffers::WriteFlatBufferExt;
@@ -352,7 +351,6 @@ async fn seed_blobs_without_nan_counts(
 /// holds no NaN gets its pruning back rather than losing it for good.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn blobs_written_before_nan_was_accounted_for_are_not_trusted() {
-    use cayenne::MetadataCatalog;
     use vortex::expr::stats::Stat;
 
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)

@@ -27,7 +27,6 @@ limitations under the License.
 use crate::common;
 
 use arrow::datatypes::{DataType, Field, Schema};
-use cayenne::MetadataCatalog;
 use cayenne::metadata::{CreateTableOptions, TableStatistics};
 use std::sync::Arc;
 

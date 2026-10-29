@@ -30,7 +30,7 @@ use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;
 use datafusion_common::stats::Precision;
@@ -366,7 +366,7 @@ async fn test_a_promotion_after_a_reopen_rebaselines_the_count_impl(
 
     // Session 2: a fresh catalog connection over the same metastore, so the
     // provider rebuilds its statistics cache from persisted state.
-    let catalog = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    let catalog = common::fixture_catalog(fixture.connection_string()).await?;
     catalog.init().await?;
     let ctx = SessionContext::new();
     let reopened = Arc::new(

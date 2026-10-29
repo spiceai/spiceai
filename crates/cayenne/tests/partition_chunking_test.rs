@@ -66,7 +66,7 @@ async fn test_partitioned_table_with_chunking_impl(
     // Create Cayenne table provider
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
+        Arc::<common::FixtureCatalog>::clone(catalog),
         table_options,
         ctx.runtime_env(),
     )
@@ -288,7 +288,7 @@ async fn test_partitioned_table_with_large_chunks_impl(
 
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
+        Arc::<common::FixtureCatalog>::clone(catalog),
         table_options,
         ctx.runtime_env(),
     )
@@ -361,7 +361,7 @@ async fn test_timestamp_partition_with_date_part_impl(
 
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
+        Arc::<common::FixtureCatalog>::clone(catalog),
         table_options,
         ctx.runtime_env(),
     )
