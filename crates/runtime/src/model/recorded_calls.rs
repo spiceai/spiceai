@@ -374,8 +374,10 @@ mod tests {
             "CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = '<redacted>')";
         let messages = json!({"messages": [
             {"role": "user", "content": "define t, its password is hunter2"},
-            {"role": "assistant", "content": [{"type": "mcp_tool_use", "id": "m1", "name": "sql",
-                "server_name": "spice", "input": {"query": statement}}]},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "Defining t with the password hunter2."},
+                {"type": "mcp_tool_use", "id": "m1", "name": "sql",
+                    "server_name": "spice", "input": {"query": statement}}]},
             {"role": "user", "content": [{"type": "mcp_tool_result", "tool_use_id": "m1",
                 "content": [{"type": "text", "text": "password 'hunter2' refused"}]}]},
         ]});
@@ -387,8 +389,10 @@ mod tests {
             recorded,
             json!({"messages": [
                 {"role": "user", "content": "define t, its password is <redacted>"},
-                {"role": "assistant", "content": [{"type": "mcp_tool_use", "id": "m1", "name": "sql",
-                    "server_name": "spice", "input": {"query": recorded_statement}}]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Defining t with the password <redacted>."},
+                    {"type": "mcp_tool_use", "id": "m1", "name": "sql",
+                        "server_name": "spice", "input": {"query": recorded_statement}}]},
                 {"role": "user", "content": [{"type": "mcp_tool_result", "tool_use_id": "m1",
                     "content": [{"type": "text", "text": "password <redacted> refused"}]}]},
             ]})

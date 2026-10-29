@@ -21,5 +21,6 @@ target/debug/spicescript --jobs 8 --spiced trunk=target/release/spiced test/spic
 | `external/` | Scripts that need data from outside the repository, such as SQLite's sqllogictest corpus. |
 | `corpus/` | SQL corpora that `corpus` steps run, and the Python scripts that generate the literal matrices. |
 | `seed/` | Source fixtures loaded by `source-exec: { file }`. |
+| `mcp/` | MCP servers that a script starts as a tool (`from: mcp:python3`, `mcp_args: ${script.dir}/mcp/<file>`), standing in for another service. |
 | `slt/`, `slt-sqlite/` | sqllogictest files. |
 | `recordings/` | Run times per script (`durations.json`), in every directory with scripts, and the expected failures (`expected-failures.json`). |

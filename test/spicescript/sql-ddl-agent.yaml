@@ -6,9 +6,10 @@ description: >
   next turn, as the Messages API requires. Over Chat Completions, an agent
   that runs its own tool loop calls `/v1/tools/sql` and sends the call and
   its result back to a model with no Spice tools. Through an MCP tool, a
-  call reaches another Spice's `sql` tool (here this Spice's own `/v1/mcp`):
-  called directly, through the `/v1/mcp` gateway, and by a model. What a
-  read-only key reads in task history holds none of the password.
+  call reaches another Spice's `sql` tool (a stand-in that quotes the
+  statement back in its error): called directly, through Spice's `/v1/mcp`
+  gateway, and by a model. What a read-only key reads in task history holds
+  none of the password.
 
 sources:
   model: { kind: mock-http }
@@ -23,11 +24,12 @@ spicepod:
         enabled: true
         keys: [admin-key:admin, reader-key:ro]
   tools:
-    # Another Spice, reached at its MCP endpoint: this one's own.
+    # Another Spice's `sql` tool, over MCP: a stand-in that refuses each
+    # statement and quotes it back in its error.
     - name: peer
-      from: mcp:http://127.0.0.1:${instance.http_port}/v1/mcp
+      from: mcp:python3
       params:
-        mcp_auth_token: admin-key
+        mcp_args: ${script.dir}/mcp/sql_peer.py
   models:
     - from: anthropic:claude-sonnet-4-6
       name: a

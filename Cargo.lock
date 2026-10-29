@@ -18837,6 +18837,7 @@ dependencies = [
  "http 1.4.1",
  "http-body-util",
  "itertools 0.14.0",
+ "parking_lot",
  "reqwest 0.13.4",
  "rmcp",
  "runtime-auth",
