@@ -40,6 +40,25 @@ SPAN="${SPICE_PORT_SPAN:-4000}"
 # long way would only hide it.
 MAX_PROBE="${SPICE_PORT_MAX_PROBE:-25}"
 
+# The probe alone lets two instances whose seeds land on the same offset both
+# take a pair before either spiced binds it. So each pair is also reserved with
+# an atomic `mkdir` of LOCK_DIR/<http port>, a directory every instance on the
+# host shares. A reservation is not released when the job ends — a job may stop
+# and restart spiced on its pair — but by this instance's next allocation: it
+# runs one job at a time, so the reservations it owns are its previous job's.
+LOCK_DIR="${SPICE_PORT_LOCK_DIR:-/tmp/spice-ci-spice-ports}"
+owner="${RUNNER_NAME:-pid-$$}"
+mkdir -p "${LOCK_DIR}" 2>/dev/null
+for lock in "${LOCK_DIR}"/*; do
+  if [ "$(cat "${lock}/owner" 2>/dev/null)" = "${owner}" ]; then
+    rm -rf "${lock}"
+  fi
+done
+
+reserve() {
+  mkdir "${LOCK_DIR}/$1" 2>/dev/null && printf '%s\n' "${owner}" >"${LOCK_DIR}/$1/owner"
+}
+
 # Seed. RUNNER_NAME is the one that matters — it identifies the runner instance,
 # and therefore the collision domain. The others only spread repeat jobs on one
 # instance apart. All are optional so the script is runnable outside Actions.
@@ -91,7 +110,7 @@ while :; do
   http_port=$((HTTP_BASE + (offset + probe) % SPAN))
   flight_port=$((http_port + FLIGHT_OFFSET))
 
-  if ! port_in_use "${http_port}" && ! port_in_use "${flight_port}"; then
+  if ! port_in_use "${http_port}" && ! port_in_use "${flight_port}" && reserve "${http_port}"; then
     break
   fi
 
@@ -100,7 +119,7 @@ while :; do
     break
   fi
 
-  echo "Port ${http_port}/${flight_port} is already held on this host; trying the next pair."
+  echo "Port ${http_port}/${flight_port} is already held or reserved on this host; trying the next pair."
 done
 
 if [ "${probe}" -ge "${MAX_PROBE}" ]; then

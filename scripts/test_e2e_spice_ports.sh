@@ -70,7 +70,7 @@ run_alloc() {
   local env_file="$work_dir/github_env"
   : >"$env_file"
 
-  alloc_output=$(env RUNNER_NAME="$runner" GITHUB_ENV="$env_file" "$@" bash "$script" 2>&1)
+  alloc_output=$(env RUNNER_NAME="$runner" GITHUB_ENV="$env_file" SPICE_PORT_LOCK_DIR="$work_dir/locks" "$@" bash "$script" 2>&1)
   alloc_env=$(cat "$env_file")
 }
 
@@ -249,13 +249,32 @@ esac
 printf 'case: works with no Actions environment at all\n'
 # Runnable by hand, and by anyone reproducing a CI failure locally.
 bare_output=$(env -u RUNNER_NAME -u GITHUB_ENV -u GITHUB_RUN_ID -u GITHUB_JOB \
-  -u GITHUB_RUN_ATTEMPT bash "$script" 2>&1)
+  -u GITHUB_RUN_ATTEMPT SPICE_PORT_LOCK_DIR="$work_dir/locks" bash "$script" 2>&1)
 bare_status=$?
 assert_eq 'exits 0 with no Actions variables set' '0' "$bare_status"
 case $bare_output in
 *SPICE_HTTP_PORT=*) pass 'prints the assignments when GITHUB_ENV is unset' ;;
 *) fail "no assignments in output: $bare_output" ;;
 esac
+
+printf 'case: instances whose seeds collide get different pairs before either binds\n'
+# These two names land on the same offset for this run and job, and nothing
+# listens on the port yet, so only the reservation can tell them apart.
+ids=(GITHUB_RUN_ID=40835409860 GITHUB_JOB=test_local_acceleration GITHUB_RUN_ATTEMPT=1)
+run_alloc 'spiceai-macos-runner-024' "${ids[@]}"
+first=$(value_of SPICE_HTTP_PORT)
+run_alloc 'spiceai-macos-runner-123' "${ids[@]}"
+second=$(value_of SPICE_HTTP_PORT)
+assert_ne 'the second instance gets another pair' "$first" "$second"
+assert_eq 'the first instance holds its reservation' 'spiceai-macos-runner-024' "$(cat "$work_dir/locks/$first/owner" 2>/dev/null)"
+
+printf "case: an instance's next job frees its previous reservation\n"
+run_alloc 'spiceai-macos-runner-024' GITHUB_RUN_ID=1 GITHUB_JOB=next GITHUB_RUN_ATTEMPT=1
+if [ -d "$work_dir/locks/$first" ]; then
+  fail "the previous reservation $first is still held"
+else
+  pass 'the previous reservation is released'
+fi
 
 if [ "$failures" -ne 0 ]; then
   printf '\n%s check(s) failed\n' "$failures"
