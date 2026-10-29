@@ -1328,10 +1328,15 @@ impl Runtime {
             &checkpoint_schema,
             resolved_refresh_mode,
         );
-        let federated_table = FederatedTable::new_deferred(
-            Arc::new(ds.spec.clone()),
+        let refresh_source =
+            ConnectorRefreshSource::new_arc(Arc::clone(data_connector), Arc::clone(&ds));
+        // Snapshot refreshes report snapshot-store failures. The original source
+        // remains available for federation without changing the reader's status.
+        let refresh_source = if resolved_refresh_mode == RefreshMode::Snapshot {
+            refresh_source
+        } else {
             crate::dataconnector::refresh_source::ReportingRefreshSource::new_arc(
-                ConnectorRefreshSource::new_arc(Arc::clone(data_connector), Arc::clone(&ds)),
+                refresh_source,
                 Arc::clone(&ds),
                 Arc::clone(&self.status),
                 match reason {
@@ -1341,11 +1346,17 @@ impl Runtime {
                     } => Some(*configuration_error),
                     SourceUnavailable::NotContacted => None,
                 },
-            ),
+            )
+        };
+        let federated_table = FederatedTable::new_deferred(
+            Arc::new(ds.spec.clone()),
+            refresh_source,
             checkpoint_schema,
             self.status.shutdown_token(),
         );
-        reason.log_serving_from_acceleration(&ds.name);
+        if resolved_refresh_mode != RefreshMode::Snapshot {
+            reason.log_serving_from_acceleration(&ds.name);
+        }
         (ds, federated_table)
     }
 
@@ -2604,7 +2615,7 @@ impl Runtime {
             })?;
 
         if notifier.is_some() {
-            // spawn a background task to wait for the accelerated table to be ready before creating schedules
+            // spawn a background task to wait for the accelerated table to be ready before acking its partitions
             let runtime = ds.runtime();
             let runtime_status = Arc::clone(&self.status);
             let ds = Arc::clone(&ds);
@@ -2685,6 +2696,21 @@ impl Runtime {
                         "Failed to load the partitions of {dataset_name} assigned during its initial load: {e}"
                     );
                 }
+            });
+
+            // The schedule waits only for the initial load to end, so a scheduled refresh
+            // can still recover a dataset whose initial load failed.
+            let runtime = ds.runtime();
+            let runtime_status = Arc::clone(&self.status);
+            tokio::task::spawn(async move {
+                if runtime_status
+                    .wait_for_dataset_loaded_or_failed(&ds.name)
+                    .await
+                    == runtime_status::WaitOutcome::ShuttingDown
+                {
+                    return;
+                }
+                let dataset_name = ds.name.to_string();
                 if let Err(e) = runtime.create_dataset_or_view_schedule(ds).await {
                     tracing::error!("Failed to create dataset schedule for '{dataset_name}': {e}");
                 }

@@ -3,8 +3,8 @@ description: >
   A reader with refresh_mode: snapshot follows a writer through the snapshot
   store: it bootstraps from the writer's first snapshot and then serves each
   newer one the writer publishes, not its own source's rows (its source keeps
-  the original rows). (A reader whose source table is missing never follows:
-  known-failing/other/snapshots-reader-without-source.yaml.) A cached answer stays
+  the original rows). snapshots-reader-without-source.yaml covers unavailable
+  sources. A cached answer stays
   cached while its polls find no newer snapshot, and once it ages out
   (`item_ttl`; a refresh does not clear the cache) the newer snapshot is
   served.

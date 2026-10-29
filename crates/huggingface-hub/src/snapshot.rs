@@ -265,6 +265,60 @@ impl Snapshot {
         self.fetch(paths, false).await
     }
 
+    /// The first `len` bytes of `path`, or the whole file when it is shorter: from the cache
+    /// when it holds the file, and otherwise read from the Hub without downloading the rest.
+    /// For a component that decides from a file's header whether it needs the file at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `path` is not in the repository, or the Hub refuses or fails the
+    /// read.
+    pub async fn read_prefix(&self, path: &str, len: u64) -> Result<Vec<u8>, DownloadError> {
+        let context =
+            DownloadContext::new(&self.requester, &self.repo, &self.revision, &self.settings);
+        let missing_file = || {
+            context.error(
+                None,
+                Cause::Missing {
+                    what: format!("'{path}'"),
+                    source: self.source.clone(),
+                },
+            )
+        };
+        let file = self.files.get(path).ok_or_else(missing_file)?;
+        let end = len.min(file.size);
+        if let Some(cached) = self
+            .cache
+            .cached_file(&self.repo, &self.commit, path, Some(file.size))
+            .await
+            && let Ok(bytes) = read_head(&cached, end).await
+        {
+            return Ok(bytes);
+        }
+        // A file only the cache knows of is one whose blob went missing.
+        file.entry.as_ref().ok_or_else(missing_file)?;
+        if end == 0 {
+            return Ok(Vec::new());
+        }
+        let read = self
+            .hub
+            .read(
+                &self.repo,
+                &self.commit,
+                path,
+                Some(object_store::GetRange::Bounded(0..end)),
+            )
+            .await
+            .map_err(|source| context.error(Some(path), Cause::Hub(source)))?;
+        let mut bytes = Vec::with_capacity(usize::try_from(end).unwrap_or(0));
+        let mut stream = read.stream;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|source| context.error(Some(path), Cause::Hub(source)))?;
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
+
     /// Downloads every file in `paths` that is not in the cache yet, at most
     /// [`MAX_CONCURRENT_FILES`] at a time, and returns their paths in the snapshot directory,
     /// in the order given.
@@ -589,6 +643,18 @@ fn report_progress(
             );
         }
     })
+}
+
+/// The first `len` bytes of the file at `path`, or all of it when it is shorter.
+async fn read_head(path: &std::path::Path, len: u64) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    tokio::fs::File::open(path)
+        .await?
+        .take(len)
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok(bytes)
 }
 
 /// The first seven digits of a commit, as the Hub shows it.

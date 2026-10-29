@@ -411,6 +411,12 @@ pub enum Action {
         source: String,
         sql: Vec<String>,
     },
+    Write {
+        source: String,
+        sql: Vec<String>,
+        mirror: String,
+        key: String,
+    },
     Refresh {
         dataset: String,
         expect_error: bool,
@@ -585,7 +591,16 @@ pub struct TlpStep {
     pub avoid: crate::tlp::Avoid,
 }
 
-/// Random queries over nested subqueries, each compared with an oracle.
+/// Query transports available to random protocol comparisons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryProtocol {
+    Flight,
+    FlightSql,
+    Http,
+}
+
+/// Random queries compared with an oracle or across protocols.
 #[derive(Debug, Clone)]
 pub struct RandomQueriesStep {
     pub tables: Vec<String>,
@@ -593,7 +608,9 @@ pub struct RandomQueriesStep {
     pub queries: u64,
     /// How many relations deep a query nests.
     pub depth: u32,
-    pub oracle: String,
+    pub oracle: Option<String>,
+    /// Transports that must return the same rows for each generated query.
+    pub protocols: Vec<QueryProtocol>,
     /// Equalities two of the tables may be joined on, `a.x = b.y`.
     pub joins: Vec<String>,
     pub skip_columns: Vec<String>,
@@ -731,6 +748,8 @@ pub enum KillSignal {
 
 #[derive(Debug, Clone)]
 pub struct QueryStep {
+    /// Compare this query over these transports; omitted keeps the existing path.
+    pub protocols: Option<Vec<QueryProtocol>>,
     /// Names the answer, so a later query can expect `same-as` it.
     pub id: Option<String>,
     pub sql: String,
@@ -1297,6 +1316,7 @@ const ACTIONS: &[&str] = &[
     "pause-source",
     "unpause-source",
     "source-exec",
+    "write",
     "refresh",
     "query",
     "spice-exec",
@@ -1344,7 +1364,12 @@ fn read_sql_files(step: &mut Value, base: &Path) -> Result<()> {
 fn step_key(name: &str, arg: &Value) -> String {
     let text = match arg {
         Value::String(s) => s.clone(),
-        other => other.to_string(),
+        other => {
+            // Ledger identities must not depend on serde_json's preserve_order feature.
+            let mut canonical = other.clone();
+            canonical.sort_all_objects();
+            canonical.to_string()
+        }
     };
     format!(
         "{name}: {}",
@@ -1466,6 +1491,26 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
         "stop-source" => Action::StopSource(string_arg(&arg, name)?),
         "pause-source" => Action::PauseSource(string_arg(&arg, name)?),
         "unpause-source" => Action::UnpauseSource(string_arg(&arg, name)?),
+        "write" => {
+            let Value::Object(m) = arg else {
+                bail!("`write` takes a mapping of source name to SQL");
+            };
+            let (source, sql) = single_entry(m, "`write` takes exactly one source")?;
+            let sql = match sql {
+                Value::String(s) => vec![s],
+                v => serde_json::from_value(v).context("SQL must be a string or a list")?,
+            };
+            let mirror = opts
+                .string("mirror")?
+                .context("`write` requires `mirror`: a postgres source")?;
+            ensure!(source != mirror, "a write target cannot be its own mirror");
+            Action::Write {
+                source,
+                sql,
+                mirror,
+                key: opts.string("key")?.unwrap_or_else(|| "id".into()),
+            }
+        }
         "source-exec" => {
             let Value::Object(m) = arg else {
                 bail!("`source-exec` takes a mapping of source name to SQL");
@@ -1511,7 +1556,18 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
             let sql = string_arg(&arg, name)?;
             let timing = opts.timing("a query")?;
             let (expect_error, error_contains) = opts.expected_error("expect-error")?;
+            let protocols = opts.protocols()?;
+            let parameters = opts.parse("parameters", "`parameters` is a list of values")?;
+            let session = opts.string("flight-session")?;
+            ensure!(
+                (parameters.is_none() && session.is_none())
+                    || protocols
+                        .as_deref()
+                        .is_none_or(|p| p == [QueryProtocol::FlightSql]),
+                "prepared queries support only `protocols: [flightsql]`"
+            );
             Action::Query(QueryStep {
+                protocols,
                 id: opts.string("id")?,
                 sql,
                 oracle_sql: opts.string("oracle-sql")?,
@@ -1523,8 +1579,8 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
                 show: opts.bool("show")?,
                 sent: opts.parse("sent", "invalid `sent`")?.unwrap_or_default(),
                 key: api_key_choice(opts.string("api-key")?),
-                parameters: opts.parse("parameters", "`parameters` is a list of values")?,
-                session: opts.string("flight-session")?,
+                parameters,
+                session,
             })
         }
         "spice-exec" => {
@@ -1671,7 +1727,7 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
         "random-queries" => {
             let mut inner = Opts::of_mapping(
                 arg,
-                "`random-queries` takes a mapping with `tables` and an `oracle`",
+                "`random-queries` takes a mapping with `tables` and `oracle` or `protocols`",
             )?;
             let tables = inner.list("tables")?;
             ensure!(!tables.is_empty(), "`random-queries` needs `tables`");
@@ -1679,9 +1735,14 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
             let queries = inner.whole_number("queries", 100)?;
             let depth =
                 u32::try_from(inner.whole_number("depth", 2)?).context("`depth` is too large")?;
-            let oracle = inner
-                .string("oracle")?
-                .context("`random-queries` needs an `oracle`")?;
+            let oracle = inner.string("oracle")?;
+            let protocols = inner
+                .protocols()?
+                .unwrap_or_else(|| vec![QueryProtocol::Flight]);
+            ensure!(
+                oracle.is_some() || protocols.len() >= 2,
+                "`random-queries` needs an `oracle` or at least two `protocols`"
+            );
             let joins = inner.list("joins")?;
             let skip_columns = inner.list("skip-columns")?;
             let avoid = avoid_list(&inner.list("avoid")?)?;
@@ -1692,6 +1753,7 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
                 queries,
                 depth,
                 oracle,
+                protocols,
                 joins,
                 skip_columns,
                 avoid,
@@ -2134,6 +2196,26 @@ impl Opts {
             .with_context(|| error.to_string())
     }
 
+    fn protocols(&mut self) -> Result<Option<Vec<QueryProtocol>>> {
+        let protocols: Option<Vec<QueryProtocol>> = self.parse(
+            "protocols",
+            "`protocols` is a list of flight, flightsql or http",
+        )?;
+        if let Some(protocols) = &protocols {
+            ensure!(
+                protocols.iter().any(|p| *p != QueryProtocol::Http),
+                "`protocols` needs flight or flightsql to supply the result schema"
+            );
+            for (i, protocol) in protocols.iter().enumerate() {
+                ensure!(
+                    !protocols[..i].contains(protocol),
+                    "`protocols` must not repeat {protocol:?}"
+                );
+            }
+        }
+        Ok(protocols)
+    }
+
     /// A pattern or a list of patterns, compiled.
     fn patterns(&mut self, key: &str) -> Result<Vec<regex::Regex>> {
         let patterns = one_or_many(self.take(key), key, "a pattern or a list of patterns")?;
@@ -2241,6 +2323,71 @@ fn read_durations(dir: &Path) -> Result<std::collections::BTreeMap<String, u64>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ledger_keys_sort_nested_objects() {
+        let arg: Value =
+            serde_json::from_str(r#"{"table":"t","seed":1,"options":{"z":2,"a":1},"queries":200}"#)
+                .expect("parse generator arguments");
+        assert_eq!(
+            step_key("tlp", &arg),
+            r#"tlp: {"options":{"a":1,"z":2},"queries":200,"seed":1,"table":"t"}"#,
+        );
+    }
+
+    #[test]
+    fn query_protocols_keep_prepared_statements_on_flightsql() {
+        let script = |options: &str| {
+            Script::parse(&format!(
+                "name: protocols\nspicepod: {{}}\nsteps:\n  - query: SELECT 1\n    {options}"
+            ))
+        };
+        let parsed = script("protocols: [flightsql, http]").expect("query protocols");
+        let Action::Query(query) = &parsed.steps[0].action else {
+            panic!("expected query");
+        };
+        assert_eq!(
+            query.protocols.as_deref(),
+            Some([QueryProtocol::FlightSql, QueryProtocol::Http].as_slice())
+        );
+        script("parameters: []\n    protocols: [flightsql]").expect("prepared Flight SQL");
+        script("parameters: []\n    protocols: [flightsql, http]")
+            .expect_err("prepared statements cannot compare HTTP");
+        script("protocols: [http]").expect_err("HTTP alone supplies no Arrow schema");
+    }
+
+    #[test]
+    fn random_query_protocols() {
+        let script = |options: &str| {
+            Script::parse(&format!(
+                "name: protocols\nspicepod: {{}}\nsteps:\n  - random-queries: {{ tables: [t], {options} }}"
+            ))
+        };
+        let legacy = script("oracle: ref").expect("legacy random query script");
+        let Action::RandomQueries(step) = &legacy.steps[0].action else {
+            panic!("expected random queries");
+        };
+        assert_eq!(step.protocols, [QueryProtocol::Flight]);
+        assert_eq!(step.oracle.as_deref(), Some("ref"));
+        let differential = script("protocols: [flightsql, http]")
+            .expect("protocol comparison needs no external oracle");
+        let Action::RandomQueries(step) = &differential.steps[0].action else {
+            panic!("expected random queries");
+        };
+        assert_eq!(
+            step.protocols,
+            [QueryProtocol::FlightSql, QueryProtocol::Http]
+        );
+        for options in [
+            "protocols: []",
+            "protocols: [http]",
+            "protocols: [flightsql]",
+            "protocols: [flightsql, flightsql]",
+            "protocols: [flightsql, adbc]",
+        ] {
+            assert!(script(options).is_err(), "must reject {options}");
+        }
+    }
 
     #[test]
     fn parses_steps_with_sibling_options() {

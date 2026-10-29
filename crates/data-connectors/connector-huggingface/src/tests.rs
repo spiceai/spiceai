@@ -470,7 +470,13 @@ async fn hub_handler(State(mock): State<Mock>, request: Request<Body>) -> Respon
             let entries: Vec<_> = wanted
                 .iter()
                 .filter_map(|path| files.get(path).map(|file| (path, file)))
-                .map(|(path, file)| serde_json::json!({"type": "file", "oid": blob_id(&file.bytes)[..40].to_string(), "size": file.bytes.len(), "path": path}))
+                .map(|(path, file)| {
+                    let mut entry = serde_json::json!({"type": "file", "oid": blob_id(&file.bytes)[..40].to_string(), "size": file.bytes.len(), "path": path});
+                    if file.lfs {
+                        entry["lfs"] = serde_json::json!({"oid": blob_id(&file.bytes), "size": file.bytes.len(), "pointerSize": 133});
+                    }
+                    entry
+                })
                 .collect();
             response(
                 StatusCode::OK,
@@ -1768,6 +1774,147 @@ mod store_reads {
             store.head(&path("r/ranges", "missing.bin")).await,
             Err(object_store::Error::NotFound { .. })
         ));
+    }
+
+    /// A git-stored file lists its tree oid and downloads with `x-linked-etag`.
+    /// If-Match of the listed generation must still read the file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_accepts_if_match_of_the_listed_content_id() {
+        let mock = Mock::start().await;
+        let bytes = Bytes::from_static(b"id,name\n1,one\n");
+        mock.commit("r/etag", C1, vec![("a.csv", text("id,name\n1,one\n"))]);
+        let (store, _) = registered(&mock, "r/etag");
+        let location = path("r/etag", "a.csv");
+        let listed = store.head(&location).await.expect("the file's description");
+        let listed_etag = listed.e_tag.expect("a listing e_tag");
+
+        let matched = store
+            .get_opts(
+                &location,
+                object_store::GetOptions {
+                    if_match: Some(listed_etag),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("If-Match of the listed generation");
+        assert_eq!(matched.bytes().await.expect("bytes"), bytes);
+
+        let error = store
+            .get_opts(
+                &location,
+                object_store::GetOptions {
+                    if_match: Some("not-the-listed-generation".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a different generation");
+        assert!(
+            matches!(error, object_store::Error::Precondition { .. }),
+            "{error}"
+        );
+    }
+
+    /// The `ETag` of an ordinary read must work as a precondition on the next read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_returns_the_e_tag_its_preconditions_check() {
+        let mock = Mock::start().await;
+        let bytes = Bytes::from_static(b"id,name\n1,one\n");
+        mock.commit("r/get-etag", C1, vec![("a.csv", text("id,name\n1,one\n"))]);
+        let (store, _) = registered(&mock, "r/get-etag");
+        let location = path("r/get-etag", "a.csv");
+        let listed = store.head(&location).await.expect("the file's description");
+        let read = store.get(&location).await.expect("an ordinary read");
+        let read_etag = read.meta.e_tag.clone().expect("a read e_tag");
+        assert_eq!(Some(&read_etag), listed.e_tag.as_ref());
+        assert_eq!(read.bytes().await.expect("bytes"), bytes);
+
+        let matched = store
+            .get_opts(
+                &location,
+                object_store::GetOptions {
+                    if_match: Some(read_etag.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("If-Match of the read's e_tag");
+        assert_eq!(matched.bytes().await.expect("bytes"), bytes);
+
+        let error = store
+            .get_opts(
+                &location,
+                object_store::GetOptions {
+                    if_none_match: Some(read_etag),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("If-None-Match of the read's e_tag");
+        assert!(
+            matches!(error, object_store::Error::NotModified { .. }),
+            "{error}"
+        );
+    }
+
+    /// An LFS file lists its SHA-256, and a read reports the same `ETag`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_of_an_lfs_file_reports_its_listed_e_tag() {
+        let mock = Mock::start().await;
+        let file = File {
+            bytes: Bytes::from_static(b"id,name\n1,one\n"),
+            lfs: true,
+        };
+        mock.commit("r/lfs-etag", C1, vec![("data/a.csv", file)]);
+        let (store, _) = registered(&mock, "r/lfs-etag");
+        let listed = futures::TryStreamExt::try_collect::<Vec<_>>(
+            store.list(Some(&path("r/lfs-etag", "data"))),
+        )
+        .await
+        .expect("the listing");
+        let listed_etag = listed[0].e_tag.clone().expect("a listing e_tag");
+        assert_eq!(listed_etag.len(), 64, "the LFS SHA-256: {listed_etag}");
+
+        let read = store
+            .get(&path("r/lfs-etag", "data/a.csv"))
+            .await
+            .expect("an ordinary read");
+        assert_eq!(read.meta.e_tag, Some(listed_etag));
+    }
+
+    /// A read without a precondition does not depend on the file's description.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_reads_the_file_when_its_description_fails() {
+        let mock = Mock::start().await;
+        let bytes = Bytes::from_static(b"id,name\n1,one\n");
+        mock.commit("r/no-info", C1, vec![("a.csv", text("id,name\n1,one\n"))]);
+        let (store, _) = registered(&mock, "r/no-info");
+        let location = path("r/no-info", "a.csv");
+        mock.0
+            .lock()
+            .faults
+            .api_truncated
+            .insert("paths-info", u32::MAX);
+
+        let read = store.get(&location).await.expect("an ordinary read");
+        assert_eq!(read.meta.e_tag, None);
+        assert_eq!(read.bytes().await.expect("bytes"), bytes);
+
+        let error = store
+            .get_opts(
+                &location,
+                object_store::GetOptions {
+                    if_match: Some("any".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a precondition needs the description");
+        assert!(
+            !matches!(error, object_store::Error::Precondition { .. }),
+            "{error}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
