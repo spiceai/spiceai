@@ -69,7 +69,7 @@ spicepod:
     - from: openai:batch-dependent
       name: emb
       params:
-        endpoint: http://127.0.0.1:${sources.emb.port.8000}/${variant.name}/v1
+        endpoint: http://127.0.0.1:${sources.emb.port.8000}/${sources.emb.namespace}/v1
         openai_api_key: test
   datasets:
     - from: postgres:public.docs
@@ -102,13 +102,13 @@ steps:
   - query: SELECT count(*) AS n FROM docs WHERE body_embedding IS NOT NULL
     expect: { rows: [['205']] }
   # The initial load embeds no batch of 50.
-  - source-query: { emb: "grep -cx '/${variant.name}/v1/embeddings 50' /tmp/sizes || true" }
+  - source-query: { emb: "grep -cx '/${sources.emb.namespace}/v1/embeddings 50' /tmp/sizes || true" }
     expect: { rows: [['0']] }
 
   # A refresh re-embeds the 50 rows on the latest date in a batch of their own,
   # so their vectors differ from the stored ones, and adds nothing.
   - refresh: docs
-  - source-query: { emb: "grep -cx '/${variant.name}/v1/embeddings 50' /tmp/sizes" }
+  - source-query: { emb: "grep -cx '/${sources.emb.namespace}/v1/embeddings 50' /tmp/sizes" }
     expect: { rows: [['1']] }
   - query: SELECT id, d, body FROM docs
 
