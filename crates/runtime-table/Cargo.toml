@@ -33,6 +33,7 @@ datafusion-table-providers.workspace = true
 fundu.workspace = true
 futures.workspace = true
 opentelemetry.workspace = true
+humantime.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 runtime-acceleration = { path = "../runtime-acceleration" }
