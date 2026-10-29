@@ -282,7 +282,25 @@ impl DataConnectorFactory for MySQLFactory {
             })
             .await
             {
-                Ok(pool) => Arc::new(pool.with_zero_date_behavior(zero_date_behavior)),
+                Ok(pool) => {
+                    let component = match &params.component {
+                        ConnectorComponent::Dataset(dataset) => {
+                            format!("dataset '{}'", dataset.name)
+                        }
+                        ConnectorComponent::Catalog(catalog) => {
+                            format!("catalog '{}'", catalog.name)
+                        }
+                    };
+                    Arc::new(
+                        pool.with_zero_date_behavior(zero_date_behavior)
+                            .with_new_connection_observer(move |identity| {
+                                tracing::info!(
+                                    "{}",
+                                    pool::new_connection_message(&component, identity)
+                                );
+                            }),
+                    )
+                }
                 Err(error) => match error {
                     mysqlpool::Error::InvalidUsernameOrPassword => {
                         return Err(

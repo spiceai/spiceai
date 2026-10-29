@@ -98,7 +98,7 @@ use spicepod::metric::Metrics;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
 use telemetry::timing::MultiTimeMeasurement;
 use tokio::{
@@ -117,6 +117,7 @@ pub mod changes;
 #[cfg(test)]
 mod deletion;
 mod latest_by_time;
+mod slow_refresh;
 
 /// The largest UTC offset a time may carry (+14:00), in nanoseconds.
 const MAX_UTC_OFFSET_NANOS: u128 = 14 * 3_600 * 1_000_000_000;
@@ -526,6 +527,7 @@ impl RefreshTaskBuilder {
             runtime_status: self.runtime_status,
             dataset_name: self.dataset_name,
             dataset_metric_labels,
+            refresh_durations: slow_refresh::RefreshDurations::default(),
             federated: self.federated,
             federated_source: self.federated_source,
             accelerator: self.accelerator,
@@ -610,6 +612,9 @@ pub struct RefreshTask {
     /// Prebuilt per-dataset metric labels (see [`DatasetMetricLabels`]), reused
     /// by the hot metric-record sites instead of re-allocating the label.
     dataset_metric_labels: DatasetMetricLabels,
+    /// How long recent successful refreshes took, which a running refresh is compared
+    /// with to report one that is far slower.
+    refresh_durations: slow_refresh::RefreshDurations,
     federated: Arc<FederatedTable>,
     federated_source: Option<String>,
     accelerator: Arc<dyn TableProvider>,
@@ -985,6 +990,10 @@ impl RefreshTask {
         );
 
         let start_time = SystemTime::now();
+        let started = Instant::now();
+        // Warns if this refresh runs far longer than the dataset's recent ones did. Dropped,
+        // and so cancelled, when the refresh returns.
+        let _slow_refresh_watch = self.watch_for_slow_refresh(refresh.mode);
 
         // The source commit an append refresh loads, saved only once its rows are
         // written: a refresh that fails or is cancelled must be read again.
@@ -1104,6 +1113,8 @@ impl RefreshTask {
             return Err(e);
         }
 
+        self.refresh_durations.record(refresh.mode, started.elapsed());
+
         // Only record metrics if a refresh was successful
         self.handle_metrics(
             &dataset_metrics_label_sets,
@@ -1123,6 +1134,22 @@ impl RefreshTask {
         }
 
         Ok(RefreshOutcome::Refreshed)
+    }
+
+    /// Starts the watch that reports this refresh if it runs far longer than the dataset's
+    /// recent refreshes in `mode` did; `None` until there are enough of them.
+    fn watch_for_slow_refresh(&self, mode: RefreshMode) -> Option<slow_refresh::SlowRefreshWatch> {
+        if is_spice_internal_dataset(&self.dataset_name) {
+            return None;
+        }
+        let slow = self.refresh_durations.slow_after(mode)?;
+        let warning = slow_refresh::slow_refresh_warning(
+            self.component_type(),
+            &self.dataset_name.to_string(),
+            mode,
+            slow,
+        );
+        Some(slow_refresh::SlowRefreshWatch::start(warning, slow))
     }
 
     /// Ends a refresh that found nothing to fetch: the skip is counted, the dataset is

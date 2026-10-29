@@ -8,7 +8,8 @@ description: >
   when it is `0s`. An invalid pool value, or one the connection string sets
   differently, fails the dataset with an error naming the parameter. Each
   dataset connects as its own MySQL user, so MySQL's own process list and
-  per-user connection totals are the oracle.
+  per-user connection totals are the oracle. Each new connection logs which
+  server it reached, once.
 
 sources:
   src: { kind: mysql }
@@ -146,3 +147,11 @@ steps:
     expect: { rows: [['1']] }
   - source-query: { src: "SELECT TOTAL_CONNECTIONS FROM performance_schema.users WHERE USER = 'ld_${sources.src.namespace}'" }
     expect: { rows: [['1']] }
+
+  # Each new connection logs the server it reached, once: one line per connection
+  # MySQL counted above.
+  - assert-log:
+      contains: ["INFO .*MySQL dataset 'life_short' opened connection \\d+ to '127\\.0\\.0\\.1:\\d+', which reached server '[^']+:3306'\\."]
+  - assert-log: { count: { "MySQL dataset 'life_short' opened connection": '>=4' } }
+  - assert-log: { count: { "MySQL dataset 'life_off' opened connection": 1 } }
+  - assert-log: { count: { "MySQL dataset 'life_default' opened connection": 1 } }

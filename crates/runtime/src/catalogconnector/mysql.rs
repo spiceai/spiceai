@@ -125,7 +125,13 @@ impl CatalogConnector for MySQLCatalog {
                 source: Box::new(e),
             })?;
 
-        let pool = Arc::new(pool);
+        let component = format!("catalog '{}'", catalog.name);
+        let pool = Arc::new(pool.with_new_connection_observer(move |identity| {
+            tracing::info!(
+                "{}",
+                data_components::mysql::pool::new_connection_message(&component, identity)
+            );
+        }));
         // Install the Spice function deny-list so federation evaluates locally
         // anything MySQL cannot run, instead of unparsing it into the SQL sent to
         // MySQL where it fails as an unknown function. That covers the Spice-only

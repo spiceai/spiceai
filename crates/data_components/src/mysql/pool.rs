@@ -23,6 +23,7 @@ limitations under the License.
 use std::fmt;
 use std::time::Duration;
 
+use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLServerIdentity;
 use mysql_async::{PoolConstraints, PoolOpts};
 use snafu::prelude::*;
 
@@ -355,9 +356,51 @@ fn jitter_for(lifetime: Option<Duration>, url_jitter: Option<u64>) -> Option<Dur
     })
 }
 
+/// The log line for a new pooled connection, naming the server it reached. A hostname that
+/// load-balances, such as a cluster's reader endpoint, can reach a different server on each
+/// connection; this line is what says which. `component` is, for example,
+/// `dataset 'orders'`.
+#[must_use]
+pub fn new_connection_message(component: &str, identity: &MySQLServerIdentity) -> String {
+    let aurora = identity
+        .aurora_server_id
+        .as_deref()
+        .map(|instance| format!(" (Aurora instance '{instance}')"))
+        .unwrap_or_default();
+    format!(
+        "MySQL {component} opened connection {id} to '{host}:{port}', which reached server '{server}:{server_port}'{aurora}.",
+        id = identity.connection_id,
+        host = identity.configured_host,
+        port = identity.configured_port,
+        server = identity.hostname,
+        server_port = identity.port,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_connection_message_names_the_server_reached() {
+        let mut identity = MySQLServerIdentity {
+            configured_host: "reader.example.internal".to_string(),
+            configured_port: 3306,
+            connection_id: 12345,
+            hostname: "ip-10-0-1-23".to_string(),
+            port: 3306,
+            aurora_server_id: Some("app-reader-2".to_string()),
+        };
+        assert_eq!(
+            new_connection_message("dataset 'orders'", &identity),
+            "MySQL dataset 'orders' opened connection 12345 to 'reader.example.internal:3306', which reached server 'ip-10-0-1-23:3306' (Aurora instance 'app-reader-2')."
+        );
+        identity.aurora_server_id = None;
+        assert_eq!(
+            new_connection_message("catalog 'app'", &identity),
+            "MySQL catalog 'app' opened connection 12345 to 'reader.example.internal:3306', which reached server 'ip-10-0-1-23:3306'."
+        );
+    }
 
     const DEFAULTS: Option<PoolSizeDefaults> = Some(PoolSizeDefaults { min: 1, max: 5 });
 
