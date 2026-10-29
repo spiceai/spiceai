@@ -1384,7 +1384,7 @@ pub(crate) mod tests {
 
     /// Every real consumer of this stream (`QueryResult::collect_batches`'s
     /// `try_collect`, the HTTP JSON writer's `?`-propagating loop in
-    /// `json_array_body_from_batches`, and the Flight encoder's `return` on
+    /// `sql_body_from_batches`, and the Flight encoder's `return` on
     /// `Err` in `crates/runtime/src/flight/mod.rs`) stops polling on the
     /// first `Err` item. `stream!` compiles to a generator that only
     /// advances past a `yield` when polled again, so with every caller

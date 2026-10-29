@@ -312,7 +312,40 @@ message SpicePhysicalPlanNode {
         UdtfExecNode udtf = 4;
         IcebergTableScanExecNode iceberg_table_scan = 5;
         HttpExecNode http_exec = 6;
+        HeaderProjectedCsvScanExecNode header_projected_csv_scan = 7;
     }
+}
+
+// Headered CSV/TSV scan that binds columns by header name.
+//
+// A stock `CsvScan` reconstructs `CsvSource` (positional). This node carries
+// the shared `FileScanExecConf` plus CSV options and decodes to
+// `HeaderProjectedCsvSource` so a column reorder still binds by name.
+message HeaderProjectedCsvScanExecNode {
+    // Prost-encoded `datafusion.FileScanExecConf` (same bytes as `CsvScanExecNode.base_conf`).
+    bytes base_conf = 1;
+    bool has_header = 2;
+    string delimiter = 3;
+    string quote = 4;
+    optional string escape = 5;
+    optional string comment = 6;
+    bool newlines_in_values = 7;
+    bool truncate_rows = 8;
+    // `FileScanConfig.file_compression_type`. Stock `CsvScan` does not put this
+    // on the wire and always decodes `UNCOMPRESSED`. An empty value is
+    // uncompressed (proto3 default / older nodes).
+    string file_compression_type = 9;
+    // Listed `ObjectMeta` generation per file. DataFusion's `PartitionedFile`
+    // proto has no `e_tag` or `version`, so without this the executor re-HEADs
+    // and the mid-scan pin is lost. Older nodes omit the field (no pin).
+    repeated FileGeneration file_generations = 10;
+}
+
+// Generation listed at plan time for one headered CSV/TSV file.
+message FileGeneration {
+    string path = 1;
+    optional string e_tag = 2;
+    optional string version = 3;
 }
 
 message SchemaCastScanExecNode {

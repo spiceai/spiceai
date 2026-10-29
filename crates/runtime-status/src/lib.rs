@@ -790,6 +790,15 @@ impl RuntimeStatus {
         self.wait_for_component_ready(&component_name).await
     }
 
+    /// Waits for a dataset's load to end, whether it became `Ready` or failed.
+    pub async fn wait_for_dataset_loaded_or_failed(&self, dataset: &TableReference) -> WaitOutcome {
+        let component_name = format!("dataset:{dataset}");
+        self.wait_for_component_status(&component_name, |status| {
+            matches!(status, ComponentStatus::Ready | ComponentStatus::Error(_))
+        })
+        .await
+    }
+
     /// Waits for a dataset to be registered (any status other than
     /// `Initializing`). Useful when the caller only needs the table
     /// provider to exist, not for the dataset to be fully loaded — e.g.

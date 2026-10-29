@@ -80,7 +80,6 @@ use {
 use crate::cluster::partition::service::PartitionService;
 #[cfg(feature = "duckdb")]
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-#[cfg(feature = "duckdb")]
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
@@ -1185,6 +1184,10 @@ impl DataFusionBuilder {
             self.cluster_config.as_ref().and_then(|cfg| cfg.role()),
             Some(ClusterRole::Scheduler)
         ) {
+            // Pushes partial aggregates into per-executor Flight SQL. Checked
+            // integer `SUM` keeps the registry name `sum` (federation), so the
+            // rule matches it; the emitted SQL is `SUM(CAST(col AS DECIMAL(38,0)))`
+            // so an executor does not narrow to `Int64` before partitions cancel.
             state = state.with_physical_optimizer_rule(FlightSQLPartialAggregatePushdown::new());
 
             // Distribute small-dimension joins onto executors (broadcast the
@@ -1204,6 +1207,19 @@ impl DataFusionBuilder {
                     addresses, /* max_broadcast_dim_rows */ 25_000_000,
                 ));
             }
+        }
+
+        // Checked integer SUM must not be completed as a pre-aggregate: keep
+        // EagerAggregation's name (skip lists) and decline when the plan has a
+        // 64-bit integer SUM / AVG. Must wrap before point-lookup skippable
+        // wrapping so the skippable layer still sees the rule name.
+        {
+            let physical = state
+                .physical_optimizers()
+                .get_or_insert_with(PhysicalOptimizer::new);
+            runtime_datafusion::checked_arithmetic::install_checked_eager_aggregation(
+                &mut physical.rules,
+            );
         }
 
         // Rules a primary-key point lookup cannot trigger are skipped while one is planned.
@@ -1275,6 +1291,11 @@ impl DataFusionBuilder {
             if let Err(e) = state.register_udaf(udaf) {
                 panic!("Unable to register Spark aggregate function `{name}`: {e}");
             }
+        }
+        if let Err(e) =
+            runtime_datafusion::checked_arithmetic::register_checked_arithmetic(&mut state)
+        {
+            panic!("Unable to register checked integer arithmetic: {e}");
         }
         for udwf in datafusion_spark::all_default_window_functions() {
             if kept_out(
@@ -1445,6 +1466,11 @@ impl DataFusionBuilder {
             ),
         )));
 
+        ctx.state_ref()
+            .write()
+            .config_mut()
+            .set_extension(Arc::new(super::PlansGeneration(0)));
+
         DataFusion {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
@@ -1455,6 +1481,7 @@ impl DataFusionBuilder {
             ddl_extension_store,
             datafusion_ref,
             caching,
+            plans_generation: TokioRwLock::new(0),
             results_cache_warmer: self.results_cache_warmer.unwrap_or_else(|| {
                 super::query::ResultsCacheWarmer::new_unloaded(
                     self.results_cache_warmup_store
@@ -1553,6 +1580,7 @@ fn with_spice_logical_optimizers(
         let _ = cayenne_optimizer_rules;
         let _ = cte_materialization;
     }
+    runtime_datafusion::checked_arithmetic::install_checked_single_distinct(&mut optimizer_rules);
     optimizer_rules.extend(trailing_rules);
     // Leaf-expression pushdown would move a model call below the filters that decide
     // which rows it runs on; the decision functions' own rule runs last and places it.
@@ -4195,7 +4223,7 @@ mod tests {
     /// join, the rendered plan, and the query's rows.
     #[cfg(not(windows))]
     async fn plan_an_aggregate_over_a_join(eager_aggregation: bool) -> (bool, String, String) {
-        use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
+        use arrow::array::{Int32Array, RecordBatch, StringArray};
 
         let df = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
@@ -4206,15 +4234,17 @@ mod tests {
         .build();
 
         // 10,000 fact rows over 100 join keys, and one dimension row per key.
+        // Amount is Int32 so this stays a decomposable SUM: checked Int64 SUM
+        // is kept out of EagerAggregation (see integer_overflow.rs).
         let fact_schema = Arc::new(Schema::new(vec![
             Field::new("fk", DataType::Int32, false),
-            Field::new("amount", DataType::Int64, false),
+            Field::new("amount", DataType::Int32, false),
         ]));
         let fact = RecordBatch::try_new(
             Arc::clone(&fact_schema),
             vec![
                 Arc::new(Int32Array::from_iter_values((1..=10_000).map(|i| i % 100))),
-                Arc::new(Int64Array::from_iter_values(1..=10_000)),
+                Arc::new(Int32Array::from_iter_values(1..=10_000)),
             ],
         )
         .expect("build the fact batch");
@@ -4362,6 +4392,7 @@ mod tests {
                 "resolve_grouping_function",
                 "type_coercion",
                 "exact_float_literal_decimal_cast",
+                "checked_integer_overflow",
                 "spice_ddl_rewrite",
             ],
             "Analyzer rule list or ordering has changed"
