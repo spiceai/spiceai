@@ -118,9 +118,9 @@
   "settings-evolution": 54,
   "slt-strings": 8,
   "source-down-at-start": 36,
-  "sql-predicate-precedence": 17,
   "sql-explain-protocols": 1,
   "sql-operator-values": 1,
+  "sql-predicate-precedence": 17,
   "sql-schema-protocols": 1,
   "surface": 6,
   "text-search-cdc-repeated": 21,
@@ -131,8 +131,9 @@
   "tls": 3,
   "tpch-coverage": 25,
   "tpch-oracles": 26,
+  "unparse-aggregate-scopes": 4,
   "unparse-pruned-aggregate": 11,
   "unparse-set-operations": 6,
-  "views": 11,
-  "unparse-aggregate-scopes": 4
+  "unparse-sort-keys": 14,
+  "views": 11
 }
