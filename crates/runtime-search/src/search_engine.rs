@@ -490,9 +490,11 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                 } else {
                     None
                 };
+            // A client key partitions the search key; it never replaces it.
+            let search_cache_key = CacheKey::Search(&search_key);
             let cache_key = match scoped_user_cache_key.as_deref() {
-                Some(cache_key) => CacheKey::ClientSupplied(cache_key),
-                _ => CacheKey::Search(&search_key),
+                Some(cache_key) => CacheKey::ClientSupplied(cache_key, &search_cache_key),
+                _ => search_cache_key,
             };
 
             let raw_cache_key = {
