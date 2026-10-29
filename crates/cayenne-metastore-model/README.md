@@ -23,8 +23,7 @@ Every checker uses one thread. Controls require `EXHAUST=1` and exhaust their gr
 required control failure, invalid witness, or checker timeout makes the command fail.
 A sampled run reports `NOT_FOUND`, which does not establish exhaustive safety.
 New exhaustive safe graphs require their essential reachability witnesses; missing
-one fails the run. Liveness uses an explicit `eventually` property in the finite
-orphan graph, rather than inferring progress from a `sometimes` witness.
+one fails the run.
 
 ## Compositions and bounds
 
@@ -43,34 +42,29 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `read-widened-*` | Full modeled program-family selection per statement, two sequential statements per writer, rule 2 / stamping at commit; program replay, I9 and live-row multiplicity | Exhaustive 2/3 total selected statements, 3 planning attempts per statement, 2 tables, 3 keys and columns 0..=2; six-selection samples |
 | `read-widened-delivery-*` / `read-delivery-*` | Immutable conditional requests, unknown outcomes, head-read resolution and delayed identical retries; program replay, I2/I5/I9 and multiplicity | Widened positives 1/2 selections; unknown-as-loss/exact-base controls 1, unknown-as-win 1/2; fixed single-writer comparisons; 1 explicit unknown event, 2 copies per request |
 | `cold-promotion` | Atomically remove live warm inputs and add cold outputs, checkpoint plus tail recovery, delayed duplicate publication; multiplicity and I8/I9 | 2 valid initial placements, 1 staged record, 2 deliveries, 1 checkpoint; tombstone-free inputs |
-| `dataset-lifecycle` | One dataset (parent and child), buffered per-table upserts/deletes, acknowledgement commits, arbitrary warm subsets, promotion-only cold rewrites, coverage, commit naming, checkpoint PK collection and tail recovery, pin-aware log collection, removal retirement, two low-water queries, takeover and late predecessor upload; I4/I7/I8/I9 | Exhaustive 2 total accepted records, 2 total buffered operations, 2 keys per table, 2 initial files in each of 2 tier placements, one checkpoint, one takeover and one upload; samples 4 records, seeds 7, 42, 20261024 |
+| `dataset-lifecycle` | One dataset (parent and child), buffered per-table upserts/deletes, acknowledgement commits, arbitrary warm subsets, promotion-only cold rewrites, coverage, commit naming, checkpoint PK collection and tail recovery, log collection that keeps running queries' states, removal retirement, two queries within retention, takeover, a fresh-named upload, orphan collection and a late fenced upload; I4/I7/I8/I9 | Exhaustive 2 total accepted records, 2 total buffered operations, 2 keys per table, 2 initial files in each of 2 tier placements, one checkpoint, one takeover and one upload; samples 4 records, seeds 7, 42, 20261024 |
 | `dataset-prepare-*` | Lifecycle file/deletion state and prepared keyed deletes/upserts, external decision and logged Resolve; I4/I6/I8/I9; cutoff cap with ordinary-write reservations | 6 accepted records, 2 buffered operations on parent table, 1 arbitrary warm subset, 1 cold promotion, 1 standalone clear, 1 checkpoint; no lease/staging actions |
-| `dataset-pin-expiry*` | Lifecycle maintenance/checkpoint/log collection with leased query, renewal/recheck, delayed GET and GC selection/deletion; rows or error | 2 accepted records, 2 clock advances, 1 renewal, 1 query, scan in key/file order |
-| `dataset-byte-window-metadata-prefix*` | Lifecycle actions in shared byte-window Store, delayed sealing, aligned floors, checkpoint PK pages and retention of every pinned state | 5 total records including 2 initial metadata records, 2 buffered operations, 2 warm rewrites, 1 promotion, 1 metadata removal, 2 checkpoint pages, 1 storage collection; early-floor controls use 3 total records |
-| `pin-expiry` | GC-observer monotonic clock, leased pins with renewal before the deadline, partial immutable snapshot scan, delayed GET completion, lapse head recheck and missing-object errors; exact snapshot rows or error, and a renewed pin keeping its snapshot past the first deadline | 3 clock advances, a two-tick lease, 1 renewal, 1 head advance, 2 snapshot objects, one query |
-| `transaction-begin-pin` | Begin commit retained until commit/abort, delayed transaction read, floor/GC, renewal low water; I7 | One transaction, one head advance; no expiry in this graph |
+| `dataset-query-expiry*` | Lifecycle maintenance/checkpoint/log collection with a query whose retention expires, delayed GET and GC selection/deletion; rows or error | 2 accepted records, 2 clock advances, 1 query, scan in key/file order |
+| `dataset-byte-window-metadata-prefix*` | Lifecycle actions in shared byte-window Store, delayed sealing, aligned floors, checkpoint PK pages and retention of every running query's state | 5 total records including 2 initial metadata records, 2 buffered operations, 2 warm rewrites, 1 promotion, 1 metadata removal, 2 checkpoint pages, 1 storage collection; early-floor controls use 3 total records |
 | `source-positions` | Numbered append stream, buffered/grouped data and positions, ambiguous CAS, identical retry, acknowledgement, crash reacquisition, takeover, redelivery and skip; I10/I2 | 2 source changes, 4 attempt identities, 1 crash and 1 external takeover, up to 2 generation advances |
 | `commits-restart-turnover` | Existing commit composition plus volatile buffer/handle clearing, persist-before-send receipts, restore, delayed requests and takeover; I1–I5 and existing replay checks | 1 logical writer, 2 attempt identities, original/retry delivery, 1 restart, up to 3 lease generations; no checkpoint/filler actions |
 | `unknown-action-refusal` | Older reader refuses an action the serial append oracle understands; I11 | 2 records, one unsupported action kind |
 | `transactions-three-participants` | Three identical participant heads; Prepare/decision/Resolve, ordinary writes, checkpoint/GC and uncertain CAS; full participant values sorted by derived `Ord` for symmetry | Exhaustive symmetry bound 0; original bound-1 samples unchanged |
-| `orphan-repeated-sweep` | Upload completion, takeover, repeated sweep and delayed deletion under finite fair scheduling; eventual collection | 1 initially in-flight orphan, 1 takeover, at most 2 sweeps |
 | `commits-commit` | Two writers, delayed original/retry deliveries, exact-base CAS, lease takeover, folded checkpoint; I1–I5, I8 | Exhaustive bound 2: K=2, two attempts per writer, up to three leases; samples bound 4: K=3 |
 | `commits-retry` | Unavailable head read, fresh-id retry, delayed deliveries and acknowledgement; exactly-once logical write, I5 | Exhaustive/control 2; one writer, two attempts |
 | `commits-etag` | Explicit store-version CAS and delayed retry across head changes; I1–I3, I5 | Exhaustive/control 1; one writer, one original/retry pair |
-| `commits-storage` | Checkpoint parts/root before head publication, delayed GC, pin registration/recheck, lagging reopen, late seal; I4, I7, I8 | Bound 2; samples 4 |
+| `commits-storage` | Checkpoint parts/root before head publication, delayed GC, a query kept by retention, lagging reopen, late seal; I4, I7, I8 | Bound 2; samples 4 |
 | `transactions-txn` | Two datasets, one transaction, competing ordinary writes, reservations, commit/abort create race, helper Resolve, uncertain CAS, checkpoint/GC; one participant writes other keys while prepared so the Prepare can reach a checkpoint; I3–I6, I8 | Exhaustive 1 (two lease generations), controls 0 except owner restriction 1; samples 2, 3 (two outstanding handles per dataset) |
-| `window-storage` | Canonical inline bytes, byte/count pressure, copy rule, cold replay, pins, checkpoint/GC; I4, I7, I8 | Exhaustive 6 records; controls 5; samples 7, 9 |
+| `window-storage` | Canonical inline bytes, byte/count pressure, copy rule, cold replay, a running query, checkpoint/GC; I4, I7, I8 | Exhaustive 6 records; controls 5; samples 7, 9 |
+| `retention` | Readers never write and GC has no generations: removed objects deleted a fixed retention after GC observes the removal (restarted at takeover); never-committed uploads deleted once old by the store's clock, after a head move and a recheck; fresh object names; a writer references only base-live objects or its own young uploads, with a margin for clock error; commits that land arbitrarily late; one reader query from a recently confirmed state; no dangling reference, rows or an error, and a query within the retention never fails | Exhaustive: 2 object names, 9 clock ticks, 6 head versions, retention 3, staleness 1, upload age 4, writer clock error 1, one takeover, one query |
 | `window-txn` | Transaction resolution composed with explicit delayed byte-batch sealing and eviction; I3–I6, I8 | Exhaustive 0; samples 2, 3 |
 | `concurrent-txn-overlap`, `concurrent-txn-disjoint` | Two transaction identities, overlapping/disjoint footprints, ordinary writer, rejected and late Prepare, opposite reservations, cleanup, checkpointed pending ids; I4, I6, I8 | Exhaustive/control 0; samples 1, 2 |
-| `concurrent-floor-aligned` | Published floor at batch boundaries, reader reopen, pin handshake and delayed deletion; I4, I7, I8 | Exhaustive 6 records; samples 7, 9 |
+| `concurrent-floor-aligned` | Published floor at batch boundaries, reader reopen, a query kept by retention and delayed deletion; I4, I7, I8 | Exhaustive 6 records; samples 7, 9 |
 | `seq-order` | Per-key versions, buffered upserts/deletes, committed-prefix readers, compaction, CAS loser uniform shift and conflict re-plan; I8, I9, inherited file ranges | Two keys; one writer: 2 operations; two writers: 2 each, 2 maintenance commits; samples 3 each, seeds 7, 42, 20261024 |
-| `generations` | Close, collector selection/deletion, delayed writer rebase and exact-base admission; I4 | One object and one generation close |
 | `naming` | Retained state and checkpoint names versus files, tombstones and schema; naming by sequence versus a dense commit number | Exhaustive 3 mutation/maintenance/metadata records; arbitrary checkpoint writes |
 | `table-seq` | Two per-table allocators under one head, upserts/deletes, a two-table record and an atomic partition key move; refusal safety predicate, I9 values versus serial oracle, per-table ranges | Exhaustive 3 accepted records, 2 keys, initial high-water marks [4, 0] |
 | `delete-coverage` | Arbitrary nonempty warm-file subsets, one cold file rewritten only by promotion, fresh upserts, coverage-aware later tombstone clearing; I9 existence versus serial oracle, including a separate cold-file predicate | Exhaustive 4 records, 2 keys, 2 initial files in each of 2 tier placements; samples 6 records, seeds 7, 42, 20261024 |
-| `pins` | One node, two concurrent query versions, transient data file, pin-write/recheck, floor, delayed GC; I7 | Exhaustive 3 version advances, one pin registration and one GC selection/delivery |
 | `pk-index` | PK-existence index, checkpoint collection, record collection and reopen; recovered keys equal full state (I8) | Exhaustive 3 mutations, 2 keys; checkpoint-aligned index |
-| `removal` | Single-owner removal accounting, lease fencing, one predecessor sweep, delayed uploads/deletes, content-addressed reuse, low-water pins; I4/I7 | Exhaustive 3 commits, 2 lease generations, 2 object names per generation; samples 5 commits, seeds 7, 42, 20261024 |
 
 `commit-guards` and its three controls use one writer, one attempt, an original/retry
 pair, three lease generations, and no checkpoint/filler actions. They isolate
@@ -83,10 +77,7 @@ write. Both use one writer, two attempts, bound 2, three lease generations and n
 checkpoint/filler actions. `commits-etag` / `commits-etag-repeat` use the guard
 graph at bound 1 with explicit store tags captured at issue time. CAS compares
 the tag; safe tags increase, while the control lets a later lease-head version
-reuse the initial tag. No new composition is needed. The pin control uses the
-existing `concurrent-floor-aligned-6-exhaust` graph, retaining only the batch
-containing the target instead of every batch needed from the base. It demonstrates
-loss of an immutable replay batch, not deletion of checkpoint pages or data files.
+reuse the initial tag. No new composition is needed.
 
 Positions in the byte model are zero-based and ranges are half-open; the
 specification uses inclusive one-based positions.
@@ -129,30 +120,31 @@ as a separate maintenance process does.
 | `dataset-prepare-no-prepare-roots` | Collect prepared upsert objects: I4 |
 | `dataset-prepare-no-write-reservation` | Admit an ordinary write on a reserved key: I9 |
 | `dataset-prepare-no-reader-record` | Reader applies external decision before logged Resolve: I6 |
-| `dataset-pin-expiry-missing-as-empty` | Missing GET contributes no rows to the lifecycle scan: wrong snapshot result |
-| `dataset-pin-expiry-no-delete-selection` | Selection honors a lapsed pin but deletion recomputes candidates without it; rows or error remains the required outcome |
-| `dataset-pin-expiry-no-log-pin-expiry` | Log retention includes expired pins: safety-preserving excess retention |
-| `dataset-byte-window-metadata-prefix-no-pin-batch` | Drop an old batch needed for a state protected by the live low-water pin: I7 |
+| `dataset-query-expiry-missing-as-empty` | Missing GET contributes no rows to the lifecycle scan: wrong snapshot result |
+| `dataset-query-expiry-no-delete-selection` | Selection honors an expired query but deletion recomputes candidates without it; rows or error remains the required outcome |
+| `dataset-query-expiry-no-log-expiry` | Log retention includes expired queries: safety-preserving excess retention |
+| `dataset-byte-window-metadata-prefix-no-query-batch` | Drop an old batch needed by a running query's state: I7 |
 | `dataset-byte-window-metadata-prefix-no-sealed-floor` | Complete checkpoint and floor cross an unsealed batch: current recovery can succeed while an intermediate protected state is lost; I7 |
 | `dataset-byte-window-metadata-prefix-no-sealed-floor-without-readers` | Same early floor with no query registration: checks the separate complete-checkpoint case |
 | `transactions-two-participants-symmetry-no-create-once` | Decision overwrite still finds participant disagreement with symmetry enabled |
 | `dataset-lifecycle-no-coverage` | Clear without coverage in the composed graph: I9 resurrected row |
-| `dataset-lifecycle-no-retirement-interlock` | Reuse a selected address before delete completes: I4 |
-| `dataset-lifecycle-no-pin-recheck` | Admit an older query after the floor/GC selection: I7 |
+| `dataset-lifecycle-no-upload-age` | The orphan sweep takes an upload before it has aged, while the writer can still stage it: I4 |
 | `dataset-lifecycle-no-table-scope` | Dataset-wide comparison of independent allocators: valid child record refused (accepted rows still satisfy I9) |
 | `dataset-lifecycle-no-commit-number` | Name maintenance states by mutation high water: I8 one name has different physical states |
-| `dataset-lifecycle-no-pin-log-retention` | Reclaim metadata history below the floor despite an older live pin: I7 reconstruction fails even with data files present |
+| `dataset-lifecycle-no-query-log-retention` | Reclaim metadata history below the floor despite an older running query: I7 reconstruction fails even with data files present |
 | `dataset-lifecycle-no-index-checkpoint` | Omit PK collection refresh in checkpoint recovery: I8 |
-| `pin-expiry-missing-as-empty` | Missing delayed GET contributes no rows: partial snapshot returned |
-| `pin-expiry-no-lapse-recheck` | Safety-preserving control: immutable reads still return the snapshot or error; requires an expired unchecked read witness |
-| `transaction-begin-pin-ignore-transactions` | Renewal advances L past the open transaction: I7 |
+| `retention-no-age-check` / `-no-margin` | The writer references an old upload, or checks its age without allowing for clock error: a committed state references a deleted object |
+| `retention-no-head-move` / `-no-recheck` | GC deletes orphans without waiting for the head to move, or without re-reading it: a late commit lands referencing a deleted object |
+| `retention-reuse-found` | The writer reuses an object it finds present instead of a fresh name: a committed state references a deleted object |
+| `retention-no-retention` / `-stale-start` | Retention zero, or a query starts from a state confirmed longer ago than the staleness bound: a query within the retention fails |
+| `retention-keep-timestamps` | A takeover keeps removal times from the predecessor's clock: a query within the retention fails |
+| `retention-missing-as-empty` | A missing object reads as empty: wrong rows instead of an error |
 | `source-ack-before-acceptance` | Acknowledge buffered changes before CAS acceptance: I2 |
 | `source-position-before-data` | Separate offset record lands first: logged prefix lacks rows (I10) |
 | `source-position-after-data` | Separate data record lands first, crash/redelivery appends it again: I10 |
 | `source-no-redelivery-skip` | Reapply changes already covered by logged position: I10 duplicate append |
 | `commits-restart-no-persist-before-send` | Send without persisted attempt identity; restart forgets it and applies the logical write again: I2 |
 | `unknown-action-skip` | Ignore unsupported append: replay differs from serial oracle (I11) |
-| `orphan-single-sweep` | Late upload survives the sole sweep: terminal counterexample to eventual collection |
 | `commit-no-copy` / `storage-no-exists` | Evict before the immutable batch exists: I4 |
 | `commit-no-observed` | Seal a planned head: I8 replay equality |
 | `storage-no-stable-cut` | Head-dependent cut: I4/I8 exact bytes |
@@ -169,20 +161,15 @@ as a separate maintenance process does.
 | `commit-no-lease` | Rebase a stale owner's condition without its lease check: I3 |
 | `commit-no-identical` | Retry different bytes with the original condition: I5 |
 | `commits-no-resolve-before-retry` | Treat an unreadable head as rejection and retry a fresh id: I2 acknowledged logical write exactly once |
-| `concurrent-floor-aligned-no-pin-base-6-exhaust` | Retain only the target batch: I7 validated pinned snapshot loses a required replay batch |
 | `commits-etag-repeat` | Reuse an earlier store tag for a later head: I1 unique accepted position |
 | `seq-order-maintenance-draw` | Maintenance draws ahead of the buffer and publishes first, then permits the lower buffered record: I9 resurrected row after a later compaction |
 | `seq-order-no-shift` | Independent CAS loser retries its unchanged lower sequences: I9 resurrected row after compaction |
 | `seq-order-drawn-cutoff` | Compaction clears deletes through an allocated sequence rather than its captured committed cutoff: I9 resurrected row |
 | `seq-order-non-uniform` | Independent writer wins; loser assigns separate operation blocks in reverse buffer order (upserts keep delete < insert): I9 earlier value wins |
-| `generations-no-admission` | Admit a closed-generation orphan after rebase: I4 |
 | `naming-no-commit-number` | Name distinct retained states/checkpoints by mutation `seq`: state identity and I8 |
 | `table-seq-no-table-scope` | Compare independently allocated table sequences dataset-wide: valid record refused; accepted records still satisfy I9 |
 | `delete-coverage-no-cold` | Omit cold files from coverage: I9 resurrection |
-| `pins-low-water-no-recheck` / `pins-low-water-past-active` | Omit post-pin floor validation / advance L past active queries: I7 |
 | `pk-index-checkpoint-no-refresh` | Retain an older PK-index reference after checkpoint/record GC: I8 recovered keys disagree |
-| `removal-reuse` | Removal deletion races with staging/reuse of the same content address: I4/I7 |
-| `removal-serialized-own-sweep` / `removal-serialized-no-pins` | Sweep owner staging without excluding it / ignore pins when retiring removals: I4/I7 |
 
 `txn-no-owner-resolve` is a safety-preserving restriction: its required outcome is
 no safety failure and no non-owner-after-turnover witness. It checks a lost helper
@@ -242,40 +229,30 @@ never rewrites the cold file. Promotion applies deletes. Clearing checks all
 live files whose minimum sequence is at or below the tombstone. The graph does
 not model stale asynchronous rewrite publication.
 
-The pin composition gives every version its own symbolic complete checkpoint,
-so each query's base equals its target. Fixed L-only pins
-retain every state from `min(floor, L)` onward; a node writes its pin before
-reading, rechecks the floor, and renews without passing an active query. Failed
-registration refuses the read. There is no expiry or query-release transition.
 The PK index refreshes as a checkpoint collection.
 The graph does not model asynchronous index construction or real index bytes.
 
-`removal-reuse` is the control without serialization: it is unsafe even with
-lease fencing and pin-aware deletion. `removal-serialized` additionally serializes retirement with
-staging/reuse through delete completion: selection excludes ready uploads and
-plans, and new staging/reuse cannot acquire a selected address. It is safe only
-within this graph. A file removed at commit v can be selected when the retention
-low water is **at least v**: it is absent from state v, and every earlier state
-is below retention. Historical re-additions are checked for reachability before
-selection. The single owner can discard its own failed uploads only when no
-retained state or plan needs them. Content addresses are generation-scoped;
-a successor creates/reuses in its own lease generation, never admits an
-unreachable predecessor address. Pins here atomically capture the current head;
-the separate pin graph checks the registration race.
-
-The predecessor generation is swept once; a fenced upload can complete afterwards
-and leak. Thus this model does not justify removing repeated cleanup if eventual
-orphan reclamation is required. Removing periodic close records and their
-closed-generation admission checks needs the extra local retirement rule and
-generation-scoped reuse restriction; the unqualified simplification is unsafe.
-Each object name has at most one modeled upload attempt per lease generation;
-recreating a deleted address, multiple concurrent uploads of identical content,
-remote collectors and unresolved Prepare roots are outside the removal graph.
+`retention` is the only reader and garbage-collection protocol. Readers never
+write: a query starts from a state confirmed current within the staleness bound S,
+and every object it needs survives at least T - S, because each was live at that
+confirmation and GC deletes a removed object only T after observing its removal.
+Every read returns the referenced object or fails the query. Uploads that never
+committed are collected by age instead of by generation: GC selects unreferenced
+objects at least T_O old by the store's clock, waits for the head to move (its own
+empty commit when the dataset is idle), re-reads the head and keeps anything a late
+commit referenced. A commit sent before the objects were old was conditioned on an
+older head and fails; one sent after fails the writer's age check, which allows for
+the writer's clock error. Every object has a fresh name, so nothing is reused by
+finding it present. No clock is compared across machines: GC's upload age uses the
+store's clock, removal timers are GC's local durations and restart at takeover, and
+the writer measures a local duration. Other graphs abstract this contract: a query
+is protected from its start until it expires, and the orphan sweep takes only an
+upload that has aged, which the writer can no longer reference.
 
 ## Composition boundaries and liveness
 
 `dataset-lifecycle` is one graph with shared head, committed versions, file/deletion
-collections, object presence, pin low water and retention decisions. Both tables
+collections, object presence, the oldest running query and retention decisions. Both tables
 share acceptance but allocate sequences independently. Buffered values enter the
 serial oracle only at acknowledgement acceptance. Maintenance draws no sequences;
 its one-row outputs inherit sequence metadata and apply the captured committed
@@ -284,16 +261,19 @@ physical collections and a PK-existence collection; recovery uses only a publish
 checkpoint and the contiguous surviving tail. With one new checkpoint, the initial
 checkpoint and its whole tail remain until the protected low water reaches the new
 checkpoint. I4 reconstructs every state at/above the floor; I7 reconstructs every
-state from an admitted pin L onward and compares metadata, keys and object presence
+state from the oldest running query onward and compares metadata, keys and object presence
 with the audit versions. Audit versions are not recovery inputs. Physical replay shares `apply`; the row oracle uses
-logical buffer operations without physical sequence comparisons. A generation-scoped
-content-addressed metadata page exercises reuse, staged references and delayed
-retirement alongside the row files. The predecessor may finish an upload after its
-sweep; its staged publication still uses its old exact head and cannot win.
+logical buffer operations without physical sequence comparisons. A metadata page
+staged from the writer's own fresh-named upload exercises staged references and
+delayed retirement alongside the row files. `Age` marks an upload past the age
+limit, after which the writer cannot stage it and the orphan sweep may take it; the
+retention graph checks that the writer's age check and GC's head move give exactly
+that. A fenced predecessor may finish an upload after the orphan sweep; nothing
+references it, and a later sweep collects it.
 
 The small exhaustive bound reaches warm subset compaction, cold promotion,
 standalone covered clearing, parent/child records, maintenance while buffering,
-two-query pins, log collection/recovery, retirement deletion and late upload.
+two queries, log collection/recovery, retirement deletion and late upload.
 These are separate required witnesses; it does not claim every action happens
 in one two-record history. In particular delete + warm rewrite + cold promotion
 requires three records and is sampled in this composition; the existing focused
@@ -306,16 +286,10 @@ complete metadata objects; their byte/page encoding and asynchronous constructio
 are not modeled.
 
 The expiry graph separates head validation/GET dispatch from GET completion, so
-GC can delete an object while a read is outstanding. Clock steps are the GC
-observer's local monotonic lapse observation, not wall clocks or skew. No expiry
-interval is inferred. Errors discard partial results. With immutable object
-identity and missing-object errors, omitting the post-lapse head recheck does not
-break returned-row safety in these bounds; it loses early failure/diagnostics.
-This is not permission to omit the specified recheck. Re-pinning after a failed
-query, distributed pin visibility, clock implementation and continuous renewal
-are outside this graph. Transaction-begin pins have a separate non-expiring graph;
-they protect the begin state until either terminal outcome, including before a
-later read.
+GC can delete an object while a read is outstanding. Clock steps stand for the
+retention running out; a query cannot extend it. Errors discard partial results.
+With immutable object identity and missing-object errors, a read after expiry
+returns its snapshot's rows or an error.
 
 The restart profile retains network requests separately from volatile handles.
 `Persist` records the symbolic attempt id before `Send`; restart clears buffer and
@@ -331,20 +305,6 @@ and re-read redelivery from the source acknowledgement. Stream payloads are uniq
 append numbers so duplicates and gaps are observable. There is no backfill, multiple
 source partitions, evidence-retention expiry or real connector integration.
 
-`orphan-repeated-sweep` uses Stateright `Property::eventually`. Its fairness
-assumption is that the finite set of upload and takeover operations completes,
-then every required sweep and selected deletion is eventually serviced. Unbounded
-scheduler delays/stuttering are abstracted away: every maximal path drains the
-remaining enabled work. Action history distinguishes DAG joins; the graph is a
-finite tree with no cycles, as Stateright 0.31's eventual checker requires. The
-property is false initially and becomes true only after the completed upload has
-been collected. The control permits the same work scheduling but removes follow-up
-sweeps; a terminal path then leaves the late upload present. The driver validates
-temporal counterexamples as enabled paths ending with no successor and the property
-false; it does not minimize them using a safety predicate. This proves completion
-only in this finite fair abstraction, not scheduler fairness, recurrent unbounded
-uploads, LIST visibility, deletion failures or the real cleanup service.
-
 ## Limits
 
 Not covered: real HTTP/object storage; ETag collision probabilities; canonical
@@ -356,13 +316,12 @@ or unbounded safety and liveness. The three-participant symmetry run exhausts bo
 not three concurrent transactions. Its bound-one samples have one outstanding
 request per dataset and reach all-three commit, all-three abort, helper resolution
 after turnover, and checkpointed pending state at every seed. They do not reach
-Resolve batch eviction or a second outstanding handle per dataset. The original Milestone 1 graph retains its existing bounds. The new lifecycle siblings share its physical apply, rewrite, coverage and recovery helpers, but each composes one additional mechanism; there is no graph combining prepared actions, expiry and bytes simultaneously. The prepared sibling abstracts the other participant and durable decision to a nondeterministic commit/abort; it does not recheck the existing multi-participant decision race. The child table stays unchanged in these siblings; parent/child allocation remains covered by the original graph. Their smaller action alphabets omit lease turnover, staging/reuse and the predecessor upload race. The expiry sibling permits one renewal and terminal errors ignore late GET completions. Byte tokens stand for complete immutable action payloads: metadata-only records cost one symbolic byte and file/delete mutations two; the journal is an encoding dictionary and audit oracle, never a fallback for a missing batch. Store.root is a symbolic prefix descriptor rather than retained physical WAL; old-state recovery uses actual checkpoint pages and tail tokens. Pages include physical state and the checkpoint PK collection; recovery of protected states requires actual retained pages plus contiguous batch/window tokens.
+Resolve batch eviction or a second outstanding handle per dataset. The original Milestone 1 graph retains its existing bounds. The new lifecycle siblings share its physical apply, rewrite, coverage and recovery helpers, but each composes one additional mechanism; there is no graph combining prepared actions, expiry and bytes simultaneously. The prepared sibling abstracts the other participant and durable decision to a nondeterministic commit/abort; it does not recheck the existing multi-participant decision race. The child table stays unchanged in these siblings; parent/child allocation remains covered by the original graph. Their smaller action alphabets omit lease turnover, staging and the predecessor upload race. In the expiry sibling, terminal errors ignore late GET completions. Byte tokens stand for complete immutable action payloads: metadata-only records cost one symbolic byte and file/delete mutations two; the journal is an encoding dictionary and audit oracle, never a fallback for a missing batch. Store.root is a symbolic prefix descriptor rather than retained physical WAL; old-state recovery uses actual checkpoint pages and tail tokens. Pages include physical state and the checkpoint PK collection; recovery of protected states requires actual retained pages plus contiguous batch/window tokens.
 
 Existing focused models retain their original bounds and controls. Their narrow
-limits above still apply: in particular the existing removal graph sweeps each
-predecessor once, existing query pin graphs omit expiry/release, and only the new
-restart profile clears caller state. Generation admission remains a separate
-composition from multi-dataset reservations. Evidence expiry is not modeled;
+limits above still apply: in particular only the restart profile clears caller
+state, and the retention graph has one writer and one GC; GC on another node and
+several writers are not modelled. Evidence expiry is not modeled;
 unavailable reads may stay unresolved indefinitely. Results are symbolic protocol
 evidence, not observations of the Spice engine or a storage provider.
 
@@ -570,7 +529,7 @@ four records, two maintainers, and no checkpoint or lease-turnover transitions.
 The publication-fence necessity pair permits one turnover even at its minimal bound.
 
 I4 checks admission and retained reference presence: this graph has no object GC,
-pins, byte windows, unavailable storage or uncertain outcomes. Checkpoints capture
+readers, byte windows, unavailable storage or uncertain outcomes. Checkpoints capture
 an immutable named state and PK collection; a stale checkpoint recovers via the
 tail and never replaces current state with its older contents.
 

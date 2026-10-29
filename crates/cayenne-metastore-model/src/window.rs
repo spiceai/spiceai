@@ -12,7 +12,8 @@ pub struct Protocol {
 pub struct State {
     store: Store,
     log: Vec<Record>,
-    pin: Option<Store>,
+    /// A running query; retention keeps its state's batches.
+    query: Option<Store>,
     checkpoint: bool,
     gc: bool,
 }
@@ -23,7 +24,7 @@ pub enum Action {
     Create(usize),
     Checkpoint(usize),
     Gc,
-    Pin,
+    Query,
 }
 impl Protocol {
     pub fn new(mode: &str, bound: usize) -> Self {
@@ -40,7 +41,7 @@ impl Model for Protocol {
         vec![State {
             store: Store::default(),
             log: vec![],
-            pin: None,
+            query: None,
             checkpoint: false,
             gc: false,
         }]
@@ -63,8 +64,8 @@ impl Model for Protocol {
         if state.store.floor > 0 && !state.gc {
             action.push(Action::Gc);
         }
-        if state.pin.is_none() {
-            action.push(Action::Pin);
+        if state.query.is_none() {
+            action.push(Action::Query);
         }
         action.retain(|action| self.next_state(state, action.clone()).is_some());
     }
@@ -89,9 +90,9 @@ impl Model for Protocol {
             Action::Gc => {
                 let saved = next.store.batches.clone();
                 next.store.gc();
-                if let Some(pin) = &next.pin {
+                if let Some(query) = &next.query {
                     for (action, v) in saved {
-                        if pin.index.iter().any(|(b, _)| *b == action)
+                        if query.index.iter().any(|(b, _)| *b == action)
                             && !next.store.batches.iter().any(|(b, _)| *b == action)
                         {
                             next.store.batches.push((action, v));
@@ -102,11 +103,11 @@ impl Model for Protocol {
                 }
                 next.gc = true;
             }
-            Action::Pin => {
+            Action::Query => {
                 let mut p = next.store.clone();
                 p.batches.clear();
                 p.pending.clear();
-                next.pin = Some(p);
+                next.query = Some(p);
             }
         }
         if next == *state { None } else { Some(next) }
@@ -127,8 +128,8 @@ impl Model for Protocol {
                         == Some(state.log.iter().copied().map(payload).collect())
                 },
             ),
-            Property::always("I7 pinned snapshot equals serial", |_, state: &State| {
-                state.pin.as_ref().is_none_or(|p| {
+            Property::always("I7 query snapshot equals serial", |_, state: &State| {
+                state.query.as_ref().is_none_or(|p| {
                     let mut p = p.clone();
                     p.batches.clone_from(&state.store.batches);
                     p.decode().is_some_and(|v| state.log.starts_with(&v))

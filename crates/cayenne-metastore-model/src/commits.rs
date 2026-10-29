@@ -54,15 +54,14 @@ pub struct State {
     plan: bool,
     deleted: bool,
     gc_lease: usize,
-    pin: u8,
-    pin_base: usize,
-    pin_target: usize,
-    pin_valid: bool,
+    query: bool,
+    query_base: usize,
+    query_target: usize,
     snapshot: bool,
     read: bool,
     bad_read: bool,
     bad_replay: bool,
-    bad_pin: bool,
+    bad_query: bool,
     bad_recovery: bool,
     bad_fence: bool,
     bad_i1: bool,
@@ -96,9 +95,7 @@ pub enum Action {
     Floor,
     Scan,
     Delete,
-    ChoosePin,
-    Pin,
-    Recheck,
+    Query,
     Snapshot,
     Recover,
     Lagging,
@@ -207,15 +204,14 @@ impl Model for Protocol {
             plan: false,
             deleted: false,
             gc_lease: 0,
-            pin: 0,
-            pin_base: 0,
-            pin_target: 0,
-            pin_valid: false,
+            query: false,
+            query_base: 0,
+            query_target: 0,
             snapshot: false,
             read: false,
             bad_read: false,
             bad_replay: false,
-            bad_pin: false,
+            bad_query: false,
             bad_recovery: false,
             bad_fence: false,
             bad_i1: false,
@@ -236,8 +232,8 @@ impl Model for Protocol {
     }
     fn actions(&self, state: &State, action: &mut Vec<Action>) {
         use Action::{
-            Ack, Advance, ChoosePin, Copy, Delete, Deliver, Fence, Floor, Issue, Lagging, Observe,
-            Parts, Pin, Poll, Recheck, Recover, Resolve, Response, Root, Scan, Snapshot,
+            Ack, Advance, Copy, Delete, Deliver, Fence, Floor, Issue, Lagging, Observe, Parts,
+            Poll, Query, Recover, Resolve, Response, Root, Scan, Snapshot,
         };
         if self.storage() {
             if state.stage == 0 {
@@ -255,16 +251,10 @@ impl Model for Protocol {
             if state.plan && !state.deleted {
                 action.push(Delete);
             }
-            if state.pin == 0 {
-                action.push(ChoosePin);
+            if !state.query {
+                action.push(Query);
             }
-            if state.pin == 1 {
-                action.push(Pin);
-            }
-            if state.pin == 2 {
-                action.push(Recheck);
-            }
-            if state.pin == 3 && !state.snapshot {
+            if state.query && !state.snapshot {
                 action.push(Snapshot);
             }
             if !state.lagged && state.deleted {
@@ -395,8 +385,8 @@ impl Model for Protocol {
     }
     fn next_state(&self, state: &State, action: Action) -> Option<State> {
         use Action::{
-            Ack, Advance, ChoosePin, Copy, Delete, Deliver, Fence, Floor, Issue, Lagging, Observe,
-            Parts, Pin, Poll, Recheck, Recover, Resolve, Response, Root, Scan, Snapshot,
+            Ack, Advance, Copy, Delete, Deliver, Fence, Floor, Issue, Lagging, Observe, Parts,
+            Poll, Query, Recover, Resolve, Response, Root, Scan, Snapshot,
         };
         let mut next = state.clone();
         match action {
@@ -573,10 +563,8 @@ impl Model for Protocol {
                 } else {
                     state.floor
                 };
-                next.plan = floor >= self.k
-                    && !(state.pin >= 2
-                        && (state.pin == 2 || state.pin_valid)
-                        && state.pin_base < self.k);
+                // Retention keeps a running query's state; no reader writes.
+                next.plan = floor >= self.k && !(state.query && state.query_base < self.k);
                 next.gc = true;
             }
             Delete => {
@@ -584,24 +572,17 @@ impl Model for Protocol {
                 next.deleted = true;
                 next.stale |= state.lease > state.gc_lease;
             }
-            ChoosePin => {
-                next.pin = 1;
-                next.pin_base = state.floor;
-                next.pin_target = state.pos;
-            }
-            Pin => next.pin = 2,
-            Recheck => {
-                next.pin = 3;
-                next.pin_valid = crate::core::pin_admitted(state.pin_base, state.floor);
+            Query => {
+                next.query = true;
+                next.query_base = state.floor;
+                next.query_target = state.pos;
             }
             Snapshot => {
                 next.snapshot = true;
-                if state.pin_valid {
-                    next.bad_pin = self
-                        .decode(state, state.pin_base, state.pin_target)
-                        .as_deref()
-                        != Some(&state.history[..state.pin_target]);
-                }
+                next.bad_query = self
+                    .decode(state, state.query_base, state.query_target)
+                    .as_deref()
+                    != Some(&state.history[..state.query_target]);
             }
             Recover => {
                 next.bad_recovery |= self.decode(state, state.floor, state.pos).as_deref()
@@ -670,8 +651,8 @@ impl Model for Protocol {
                 state.history.len() == state.pos
             }),
             Property::always("I8 replay equality", |_, state: &State| !state.bad_replay),
-            Property::always("I7 pinned snapshot equals serial", |_, state: &State| {
-                !state.bad_pin
+            Property::always("I7 query snapshot equals serial", |_, state: &State| {
+                !state.bad_query
             }),
             Property::always("I8 recovery equals serial reference", |_, state: &State| {
                 !state.bad_recovery
@@ -710,8 +691,8 @@ impl Model for Protocol {
                 Property::sometimes("reader more than K behind completed", |_, state: &State| {
                     state.lagged && !state.bad_replay
                 }),
-                Property::sometimes("valid pinned snapshot completed", |_, state: &State| {
-                    state.snapshot && state.pin_valid && !state.bad_pin
+                Property::sometimes("query snapshot completed", |_, state: &State| {
+                    state.snapshot && !state.bad_query
                 }),
             ]);
         } else {

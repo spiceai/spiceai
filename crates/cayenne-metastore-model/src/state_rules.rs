@@ -52,16 +52,8 @@ pub(crate) struct State {
     files: Vec<File>,
     tombstones: Vec<(usize, usize)>,
     expected: [bool; 2],
-    // Version-indexed file sets are symbolic immutable checkpoint collections.
-    versions: Vec<Vec<usize>>,
-    objects: Vec<usize>,
     floor: usize,
-    queries: Vec<usize>,
-    candidate: Option<usize>,
-    pin: Option<usize>,
-    validated: bool,
     moved: bool,
-    scan: Option<Vec<usize>>,
     recovered: Option<[bool; 2]>,
     keys: [bool; 2],
     index: Option<(usize, [bool; 2])>,
@@ -84,14 +76,6 @@ pub(crate) enum Action {
     Compact(usize),
     Promote,
     Clear,
-    Advance,
-    Choose,
-    Pin,
-    Recheck,
-    SecondQuery,
-    Renew,
-    Floor,
-    Scan,
     Collect,
     SetKey(usize, bool),
     Index,
@@ -192,12 +176,6 @@ impl Protocol {
         }
         n.files.sort_by_key(|f| f.id);
     }
-    fn retained(s: &State, low: usize) -> Vec<usize> {
-        let mut keep: Vec<_> = s.versions[low..].iter().flatten().copied().collect();
-        keep.sort_unstable();
-        keep.dedup();
-        keep
-    }
 }
 impl Model for Protocol {
     type State = State;
@@ -241,9 +219,6 @@ impl Model for Protocol {
                     cold: true,
                 },
             ];
-        } else if self.has("pins") {
-            s.versions = vec![vec![0]];
-            s.objects = vec![0];
         }
         if self.has("coverage") {
             let mut warm_key = s.clone();
@@ -296,34 +271,6 @@ impl Model for Protocol {
                 if !s.tombstones.is_empty() {
                     a.push(Action::Clear);
                 }
-            }
-        } else if self.has("pins") {
-            if s.step < self.bound {
-                a.push(Action::Advance);
-            }
-            if s.candidate.is_none() && s.queries.is_empty() {
-                a.push(Action::Choose);
-            }
-            if s.candidate.is_some() && s.pin.is_none() {
-                a.push(Action::Pin);
-            }
-            if s.pin.is_some() && !s.validated {
-                a.push(Action::Recheck);
-            }
-            if s.validated && s.queries.len() == 1 && s.step > s.queries[0] {
-                a.push(Action::SecondQuery);
-            }
-            if s.queries.len() == 2 {
-                a.push(Action::Renew);
-            }
-            if s.floor < s.step {
-                a.push(Action::Floor);
-            }
-            if s.scan.is_none() && s.floor > 0 {
-                a.push(Action::Scan);
-            }
-            if s.scan.is_some() {
-                a.push(Action::Collect);
             }
         } else if self.has("index") {
             if s.step < self.bound {
@@ -416,56 +363,9 @@ impl Model for Protocol {
                 self.clear_covered(&mut next, state.high);
                 next.step += 1;
             }
-            Action::Advance => {
-                next.step += 1;
-                // File 1 exists only at version 1, between the two outer states.
-                let files = if next.step == 1 { vec![0, 1] } else { vec![0] };
-                for f in &files {
-                    if !next.objects.contains(f) {
-                        next.objects.push(*f);
-                    }
-                }
-                next.versions.push(files);
-            }
-            Action::Choose => next.candidate = Some(state.step),
-            Action::Pin => next.pin = state.candidate,
-            Action::Recheck => {
-                next.validated = true;
-                if crate::core::pin_admitted(state.pin?, state.floor) || self.has("no-recheck") {
-                    next.queries.push(state.candidate?);
-                }
-            }
-            Action::SecondQuery => next.queries.push(state.step),
-            Action::Renew => {
-                next.pin = if self.has("no-active-low") {
-                    Some(state.step)
-                } else {
-                    state.queries.iter().min().copied()
-                };
-            }
-            Action::Floor => next.floor = state.step,
-            Action::Scan => {
-                let mut keep = Self::retained(state, state.floor);
-                if let Some(v) = state.pin {
-                    keep = Self::retained(state, v.min(state.floor));
-                }
-                next.scan = Some(
-                    state
-                        .objects
-                        .iter()
-                        .filter(|f| !keep.contains(f))
-                        .copied()
-                        .collect(),
-                );
-            }
             Action::Collect => {
-                if self.has("pins") {
-                    next.objects
-                        .retain(|f| !state.scan.as_ref().is_some_and(|v| v.contains(f)));
-                } else {
-                    next.records.drain(..state.floor - state.collected);
-                    next.collected = state.floor;
-                }
+                next.records.drain(..state.floor - state.collected);
+                next.collected = state.floor;
             }
             Action::SetKey(k, v) => {
                 next.records.push((k, v));
@@ -614,17 +514,6 @@ impl Model for Protocol {
                 }),
                 Property::sometimes("cold promotion completes", |_, s: &State| {
                     !s.files.iter().any(|f| f.cold)
-                }),
-            ]
-        } else if self.has("pins") {
-            vec![
-                Property::always("I7 every active query readable", |_, s: &State| {
-                    s.queries
-                        .iter()
-                        .all(|&v| s.versions[v].iter().all(|f| s.objects.contains(f)))
-                }),
-                Property::sometimes("two queries separated by removed file", |_, s: &State| {
-                    s.queries.len() == 2 && s.queries[0] == 0 && s.queries[1] == 1 && s.floor > 1
                 }),
             ]
         } else {

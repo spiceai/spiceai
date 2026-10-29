@@ -198,13 +198,3 @@ pub(crate) fn resolve_attempt(evidence: Option<bool>, same_base: bool) -> u8 {
         None => 0,
     }
 }
-
-pub(crate) fn pin_admitted(base: usize, floor: usize) -> bool {
-    base >= floor
-}
-
-/// A closed-generation reference can be admitted only from the CAS base's
-/// reachable set, never from the uploader's earlier observation.
-pub(crate) fn admits_reference(closed: bool, reachable: bool) -> bool {
-    !closed || reachable
-}

@@ -9,13 +9,10 @@ mod concurrent;
 mod core;
 mod dataset_lifecycle;
 mod floors;
-mod generations;
-mod orphan_cleanup;
 mod position_deletes;
 mod read_programs;
-mod removal;
+mod retention;
 mod seq_order;
-mod snapshot_leases;
 mod source_positions;
 mod state_rules;
 mod transactions;
@@ -44,9 +41,9 @@ pub fn runs() -> Vec<Run> {
             failure: "",
         },
         Run {
-            name: "dataset-lifecycle-no-pin-log-retention",
+            name: "dataset-lifecycle-no-query-log-retention",
             family: "dataset-lifecycle",
-            mode: "dataset-lifecycle-no-pin-log-retention",
+            mode: "dataset-lifecycle-no-query-log-retention",
             bound: 2,
             seed: None,
             failure: "I7 composed query snapshots",
@@ -68,20 +65,12 @@ pub fn runs() -> Vec<Run> {
             failure: "I9 composed table rows",
         },
         Run {
-            name: "dataset-lifecycle-no-retirement-interlock",
+            name: "dataset-lifecycle-no-upload-age",
             family: "dataset-lifecycle",
-            mode: "dataset-lifecycle-no-retirement-interlock",
+            mode: "dataset-lifecycle-no-upload-age",
             bound: 2,
             seed: None,
             failure: "I4 composed retained objects",
-        },
-        Run {
-            name: "dataset-lifecycle-no-pin-recheck",
-            family: "dataset-lifecycle",
-            mode: "dataset-lifecycle-no-pin-recheck",
-            bound: 2,
-            seed: None,
-            failure: "I7 composed query snapshots",
         },
         Run {
             name: "dataset-lifecycle-no-table-scope",
@@ -122,46 +111,6 @@ pub fn runs() -> Vec<Run> {
             bound: 4,
             seed: Some(20_261_024),
             failure: "",
-        },
-        Run {
-            name: "pin-expiry",
-            family: "snapshot-leases",
-            mode: "expiry",
-            bound: 2,
-            seed: None,
-            failure: "",
-        },
-        Run {
-            name: "pin-expiry-missing-as-empty",
-            family: "snapshot-leases",
-            mode: "expiry-missing-as-empty",
-            bound: 2,
-            seed: None,
-            failure: "snapshot rows or error",
-        },
-        Run {
-            name: "pin-expiry-no-lapse-recheck",
-            family: "snapshot-leases",
-            mode: "expiry-no-lapse-recheck",
-            bound: 2,
-            seed: None,
-            failure: "",
-        },
-        Run {
-            name: "transaction-begin-pin",
-            family: "snapshot-leases",
-            mode: "transaction",
-            bound: 1,
-            seed: None,
-            failure: "",
-        },
-        Run {
-            name: "transaction-begin-pin-ignore-transactions",
-            family: "snapshot-leases",
-            mode: "transaction-ignore-transactions",
-            bound: 1,
-            seed: None,
-            failure: "I7 transaction begin snapshot readable",
         },
         Run {
             name: "source-positions",
@@ -260,76 +209,84 @@ pub fn runs() -> Vec<Run> {
             failure: "",
         },
         Run {
-            name: "orphan-repeated-sweep",
-            family: "orphan-cleanup",
-            mode: "repeated-sweep",
-            bound: 1,
+            name: "retention",
+            family: "retention",
+            mode: "retention",
+            bound: 0,
             seed: None,
             failure: "",
         },
         Run {
-            name: "orphan-single-sweep",
-            family: "orphan-cleanup",
-            mode: "single-sweep",
-            bound: 1,
+            name: "retention-no-age-check",
+            family: "retention",
+            mode: "retention-no-age-check",
+            bound: 0,
             seed: None,
-            failure: "orphan eventually collected",
+            failure: "committed state references only present objects",
         },
         Run {
-            name: "removal-reuse",
-            family: "removal",
-            mode: "reuse",
-            bound: 3,
+            name: "retention-no-margin",
+            family: "retention",
+            mode: "retention-no-margin",
+            bound: 0,
             seed: None,
-            failure: "I4 removal retains accepted objects",
+            failure: "committed state references only present objects",
         },
         Run {
-            name: "removal-serialized",
-            family: "removal",
-            mode: "serialized",
-            bound: 3,
+            name: "retention-no-head-move",
+            family: "retention",
+            mode: "retention-no-head-move",
+            bound: 0,
             seed: None,
-            failure: "",
+            failure: "committed state references only present objects",
         },
         Run {
-            name: "removal-serialized-own-sweep",
-            family: "removal",
-            mode: "serialized-own-sweep",
-            bound: 3,
+            name: "retention-no-recheck",
+            family: "retention",
+            mode: "retention-no-recheck",
+            bound: 0,
             seed: None,
-            failure: "I4 removal retains accepted objects",
+            failure: "committed state references only present objects",
         },
         Run {
-            name: "removal-serialized-no-pins",
-            family: "removal",
-            mode: "serialized-no-pins",
-            bound: 3,
+            name: "retention-reuse-found",
+            family: "retention",
+            mode: "retention-reuse-found",
+            bound: 0,
             seed: None,
-            failure: "I7 removal retains active queries",
+            failure: "committed state references only present objects",
         },
         Run {
-            name: "removal-serialized-5-simulation-7",
-            family: "removal",
-            mode: "serialized",
-            bound: 5,
-            seed: Some(7),
-            failure: "",
+            name: "retention-no-retention",
+            family: "retention",
+            mode: "retention-no-retention",
+            bound: 0,
+            seed: None,
+            failure: "a query within the retention never fails",
         },
         Run {
-            name: "removal-serialized-5-simulation-42",
-            family: "removal",
-            mode: "serialized",
-            bound: 5,
-            seed: Some(42),
-            failure: "",
+            name: "retention-stale-start",
+            family: "retention",
+            mode: "retention-stale-start",
+            bound: 0,
+            seed: None,
+            failure: "a query within the retention never fails",
         },
         Run {
-            name: "removal-serialized-5-simulation-20261024",
-            family: "removal",
-            mode: "serialized",
-            bound: 5,
-            seed: Some(20_261_024),
-            failure: "",
+            name: "retention-keep-timestamps",
+            family: "retention",
+            mode: "retention-keep-timestamps",
+            bound: 0,
+            seed: None,
+            failure: "a query within the retention never fails",
+        },
+        Run {
+            name: "retention-missing-as-empty",
+            family: "retention",
+            mode: "retention-missing-as-empty",
+            bound: 0,
+            seed: None,
+            failure: "rows or an error",
         },
         Run {
             name: "naming",
@@ -378,30 +335,6 @@ pub fn runs() -> Vec<Run> {
             bound: 4,
             seed: None,
             failure: "I9 coverage equals serial oracle",
-        },
-        Run {
-            name: "pins-low-water",
-            family: "state-rules",
-            mode: "pins-design",
-            bound: 3,
-            seed: None,
-            failure: "",
-        },
-        Run {
-            name: "pins-low-water-no-recheck",
-            family: "state-rules",
-            mode: "pins-design-no-recheck",
-            bound: 3,
-            seed: None,
-            failure: "I7 every active query readable",
-        },
-        Run {
-            name: "pins-low-water-past-active",
-            family: "state-rules",
-            mode: "pins-design-no-active-low",
-            bound: 3,
-            seed: None,
-            failure: "I7 every active query readable",
         },
         Run {
             name: "pk-index-checkpoint",
@@ -546,14 +479,6 @@ pub fn runs() -> Vec<Run> {
             bound: 1,
             seed: None,
             failure: "I1 unique accepted position",
-        },
-        Run {
-            name: "concurrent-floor-aligned-no-pin-base-6-exhaust",
-            family: "floors",
-            mode: "floor-aligned-no-pin-base",
-            bound: 6,
-            seed: None,
-            failure: "I7 validated pinned snapshot",
         },
         Run {
             name: "commit-guards",
@@ -1130,22 +1055,6 @@ pub fn runs() -> Vec<Run> {
             bound: 1,
             seed: None,
             failure: "I5 resolution sound",
-        },
-        Run {
-            name: "generations",
-            family: "generations",
-            mode: "generations",
-            bound: 0,
-            seed: None,
-            failure: "",
-        },
-        Run {
-            name: "generations-no-admission",
-            family: "generations",
-            mode: "generations-no-admission",
-            bound: 0,
-            seed: None,
-            failure: "I4 admitted object survives GC",
         },
     ];
     declared.push(Run {
@@ -1780,22 +1689,22 @@ fn additional_runs() -> Vec<Run> {
             6,
             "I9 lifecycle logical rows",
         ),
-        ("dataset-pin-expiry", "expiry", 2, ""),
+        ("dataset-query-expiry", "expiry", 2, ""),
         (
-            "dataset-pin-expiry-missing-as-empty",
+            "dataset-query-expiry-missing-as-empty",
             "expiry-missing-as-empty",
             2,
             "snapshot rows or error",
         ),
         (
-            "dataset-pin-expiry-no-delete-selection",
+            "dataset-query-expiry-no-delete-selection",
             "expiry-no-delete-selection",
             2,
             "",
         ),
         (
-            "dataset-pin-expiry-no-log-pin-expiry",
-            "expiry-no-log-pin-expiry",
+            "dataset-query-expiry-no-log-expiry",
+            "expiry-no-log-expiry",
             2,
             "",
         ),
@@ -1806,16 +1715,16 @@ fn additional_runs() -> Vec<Run> {
             "",
         ),
         (
-            "dataset-byte-window-metadata-prefix-no-pin-batch",
-            "byte-window-metadata-prefix-no-pin-batch",
+            "dataset-byte-window-metadata-prefix-no-query-batch",
+            "byte-window-metadata-prefix-no-query-batch",
             5,
-            "I7 byte lifecycle pinned recovery",
+            "I7 byte lifecycle query recovery",
         ),
         (
             "dataset-byte-window-metadata-prefix-no-sealed-floor",
             "byte-window-metadata-prefix-no-sealed-floor",
             3,
-            "I7 byte lifecycle pinned recovery",
+            "I7 byte lifecycle query recovery",
         ),
     ] {
         runs.push(Run {
@@ -2042,11 +1951,10 @@ where
                 "missing delayed object errors" => {
                     run.mode.contains("expiry") && !run.mode.contains("missing-as-empty")
                 }
-                "expired delayed read completes"
-                | "object deleted during dispatched read"
-                | "renewed snapshot completes"
-                | "renewal head recheck rejects" => run.mode.contains("expiry"),
-                "pinned replay batch retained"
+                "expired delayed read completes" | "object deleted during dispatched read" => {
+                    run.mode.contains("expiry")
+                }
+                "query replay batch retained"
                 | "checkpoint page collected"
                 | "byte budget evicts records"
                 | "count budget evicts records" => run.mode == "byte-window-metadata-prefix",
@@ -2142,23 +2050,14 @@ where
             || composed_required
             || run.seed.is_none()
                 && match run.name {
-                    "dataset-lifecycle" | "source-positions" => {
-                        p.expectation == Expectation::Sometimes
-                    }
+                    "dataset-lifecycle"
+                    | "source-positions"
+                    | "retention"
+                    | "unknown-action-refusal" => p.expectation == Expectation::Sometimes,
                     "commits-restart-turnover" => matches!(
                         p.name,
                         "restart and lease turnover" | "persisted attempt restored"
                     ),
-                    "pin-expiry" => matches!(
-                        p.name,
-                        "lapsed query errors"
-                            | "paused partial scan resumes"
-                            | "renewed pin protects its snapshot past the first deadline"
-                    ),
-                    "pin-expiry-no-lapse-recheck" => p.name == "expired read without head recheck",
-                    "transaction-begin-pin"
-                    | "unknown-action-refusal"
-                    | "orphan-repeated-sweep" => p.expectation == Expectation::Sometimes,
                     _ => false,
                 };
         if required && found.is_none() {
@@ -2222,11 +2121,9 @@ where
                 || run.family == "seq-order"
                 || run.family == "lifecycle-composed"
                 || run.family == "state-rules"
-                || run.family == "removal"
                 || run.name.starts_with("dataset-lifecycle")
                 || run.name.starts_with("source-")
-                || run.family == "orphan-cleanup"
-                || run.family == "snapshot-leases"
+                || run.family == "retention"
                 || run.mode.contains("restart")
                 || run.family == "action-compatibility")
                 && p.expectation != Expectation::Sometimes
@@ -2278,10 +2175,9 @@ pub fn run(name: &str) -> Result<(), String> {
             r,
         ),
         "dataset-lifecycle" => check(dataset_lifecycle::Protocol::new(r.mode, r.bound), r),
-        "snapshot-leases" => check(snapshot_leases::Protocol::new(r.mode), r),
         "source-positions" => check(source_positions::Protocol::new(r.mode, r.bound), r),
         "action-compatibility" => check(action_compatibility::Protocol::new(r.mode), r),
-        "orphan-cleanup" => check(orphan_cleanup::Protocol::new(r.mode), r),
+        "retention" => check(retention::Protocol::new(r.mode), r),
         "commits" => check(commits::Protocol::new(r.mode, r.bound), r),
         "transactions" => check_with_symmetry(
             transactions::Protocol::new(r.mode, r.bound),
@@ -2293,8 +2189,6 @@ pub fn run(name: &str) -> Result<(), String> {
         "window" => check(window::Protocol::new(r.mode, r.bound), r),
         "floors" => check(floors::Protocol::new(r.mode, r.bound), r),
         "concurrent" => check(concurrent::Protocol::new(r.mode, r.bound), r),
-        "generations" => check(generations::Protocol::new(r.mode), r),
-        "removal" => check(removal::Protocol::new(r.mode, r.bound), r),
         "state-rules" => check(state_rules::Protocol::new(r.mode, r.bound), r),
         "seq-order" => check(seq_order::Protocol::new(r.mode, r.bound), r),
         "predicate-progress" => check(read_programs::PredicateProgress::new(r.bound), r),
