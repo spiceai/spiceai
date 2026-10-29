@@ -81,9 +81,10 @@ impl CacheKeyType {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CacheControl {
     Cache(CacheKeyType),
-    /// Neither read nor write the results cache. Used by the runtime's own
-    /// queries (for example a background stale-while-revalidate refresh, which
-    /// stores its result itself); a client's `no-cache` is [`Self::Revalidate`].
+    /// Never serve a cached result. Used by the runtime's own queries (for
+    /// example a background stale-while-revalidate refresh, which stores its
+    /// result under the entry's key itself); a client's `no-cache` is
+    /// [`Self::Revalidate`].
     NoCache,
     /// The client's `no-cache`: never serve a cached result, run the query, and
     /// store the fresh result under the request's key so later requests read it.

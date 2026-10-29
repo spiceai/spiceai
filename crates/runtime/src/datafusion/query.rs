@@ -114,7 +114,7 @@ use opentelemetry::KeyValue;
 use runtime_auth::AuthRequestContext;
 use runtime_datafusion::config::request_context_config::SpiceRequestContextConfig;
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
-use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
+use runtime_request_context::{AsyncMarker, CacheControl, Protocol, RequestContext};
 use tokio::runtime::Handle;
 use util::session_state::builder_from_existing;
 
@@ -1052,7 +1052,14 @@ impl Query {
                 let plan_cacheable =
                     Query::should_cache_results(&self.df, &logical_plan, CacheStatus::CacheMiss)
                         == CacheStatus::CacheMiss;
+                // `no-cache` (the client's, or the runtime's own) is never
+                // answered from the cache.
+                let serves_cached = !matches!(
+                    request_context.cache_control(),
+                    CacheControl::NoCache | CacheControl::Revalidate(_)
+                );
                 if plan_cacheable
+                    && serves_cached
                     && mode != DistributedSubmitMode::Resume
                     && results_cache_mode == ResultsCacheMode::Default
                     && let Some(cache_provider) = self.df.results_cache_provider()
