@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `2644c0d5aad82c29c7c02a6617a71c664f55e94c` | `spiceai-55` |
+| [datafusion](#datafusion) | `b5e682c04535b7acd2a9f8434320d96e3be2b79d` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `4a2920746865562e604150fbee49eea6241c0b85` | `spiceai-55` |
@@ -223,7 +223,9 @@ includes #273's scalar-UDF coercion fix and the SQL semantics fixes for
 [#15538](https://github.com/spiceai/spiceai/issues/15538): parenthesized IS and NOT
 operands, preserved pruned aggregates and correlated projection scopes, scan
 filters before projection, CASE error propagation, and character-counting MySQL
-string length. The existing patches remain in the commit ancestry. None changes a
+string length. On top of #270 the pin carries #281, which reads a sort key over
+a `SELECT DISTINCT` that the list does not show from a `SELECT` above it. The
+existing patches remain in the commit ancestry. None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
 code, and removes no line of it. The branch also carries
@@ -268,7 +270,8 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Unparser: a `FULL JOIN` input that is itself a join keeps each filtered scan's filter in that scan's own derived table (fork PR #231) | The filter is lifted to the enclosing query's `WHERE`, which SQL evaluates after the `FULL JOIN`, so the null-extended rows the join preserves are discarded — 1 row where the plan returns 2 ([#12593](https://github.com/spiceai/spiceai/issues/12593)); a predicate on such an input that no scan applies is refused rather than emitted where it would discard rows | silent (wrong data) | `…::a_full_join_input_that_is_a_join_keeps_its_scan_filters_scoped` |
 | Unparser: an `EXISTS`-style join refuses a build-side key that only the build projection binds (fork PR #232) | `SELECT 1` replaces the build projection, so a key the projection renamed onto the probe's qualifier binds to the probe instead — `WHERE (p.c = p.c)`, always true: a semi join returns every row and an anti join none ([#13493](https://github.com/spiceai/spiceai/issues/13493)) | silent (wrong data) | `…::an_exists_refuses_a_build_key_only_the_build_projection_binds` |
 | Unparser: the dangling-qualifier sweep keeps a qualifier that an `UNNEST` or `LATERAL FLATTEN` alias, the last part of a schema-qualified table, or the column a struct field path is rooted at binds (spiceai/datafusion#246) | The sweep strips a qualifier that does bind: two `UNNEST` aliases sharing a column name give `SELECT c1, c1 …`, and a join of two schema-qualified tables gives `SELECT v, v FROM s.a INNER JOIN s.b …`, which `DuckDB` rejects as ambiguous; `test."metadata".product` is cut to `product` ([#13442](https://github.com/spiceai/spiceai/issues/13442)) | silent (query failure) | **GAP** — no guard here yet; in the fork, the `plan_to_sql.rs` cases #246 fixes; see [Open gaps](#open-gaps) |
-| Unparser: a sort key that reads a projection output that cannot be repeated, through a larger expression, puts the projection in a derived table so the `ORDER BY` reads the output by name (spiceai/datafusion#247) | `ORDER BY (r + 1.0)` over `random() AS r` is emitted as `ORDER BY (random() + 1.0)`, a second draw: the rows are ordered by a value the `SELECT` list never showed, and under a `LIMIT` a different row is selected than the one whose `r` comes back ([#14109](https://github.com/spiceai/spiceai/issues/14109)) | silent (wrong data) | **GAP** — no guard here yet; in the fork, the cases #247 adds to `plan_to_sql.rs`; see [Open gaps](#open-gaps) |
+| Unparser: a sort key that reads a projection output that cannot be repeated, through a larger expression, puts the projection in a derived table so the `ORDER BY` reads the output by name (spiceai/datafusion#247) | `ORDER BY (r + 1.0)` over `random() AS r` is emitted as `ORDER BY (random() + 1.0)`, a second draw: the rows are ordered by a value the `SELECT` list never showed, and under a `LIMIT` a different row is selected than the one whose `r` comes back ([#14109](https://github.com/spiceai/spiceai/issues/14109)) | silent (wrong data) | `crates/data_components/src/federation.rs::tests::a_sort_key_reading_a_volatile_output_orders_by_the_value_the_select_list_shows`, its `projection` arm; real-engine guard: the `random()` checks in `test/spicescript/unparse-sort-keys.yaml`. In the fork, the cases #247 adds to `plan_to_sql.rs` |
+| Unparser: a sort key over a `SELECT DISTINCT` that its list does not show reads the outputs from a `SELECT` above the `DISTINCT` one, with an unaliased aggregate or window output named (spiceai/datafusion#281) | The key is not resolved through the `DISTINCT`: `ORDER BY ("b" + 1)` names an output alias inside an expression and `ORDER BY ("t"."a" + 1)` an expression the list does not show, so PostgreSQL refuses the whole query (`column "b" does not exist`; "for SELECT DISTINCT, ORDER BY expressions must appear in select list"), and an engine that accepts the alias evaluates `random()` again for it ([#14109](https://github.com/spiceai/spiceai/issues/14109)) | query failure; silent (wrong data) where the engine accepts the alias | `crates/data_components/src/federation.rs::tests::a_sort_key_reading_a_volatile_output_orders_by_the_value_the_select_list_shows`, its `distinct` arm, and `::a_computed_sort_key_over_distinct_is_ordered_above_it`; real-engine guard: `test/spicescript/unparse-sort-keys.yaml`. In the fork, `test_sql_sort_keys_over_distinct_unparse_to_sql_postgres_accepts` and the `*_over_distinct_*` cases in `plan_to_sql.rs` |
 | Unparser: a join input that lists no columns of its own, such as a bare or filtered table scan, contributes `q.*` for each relation it reads; a column-less input contributes nothing beside another relation; an aggregate no projection takes lists its group keys before its aggregates (spiceai/datafusion#264) | The join's `SELECT` list no longer matches the plan's schema: `SELECT FROM t WHERE EXISTS (…)`, which `DuckDB` rejects, and `SELECT u.a, (u.a * 2) AS d FROM t INNER JOIN u …`, which returns two columns where the plan has three, so a consumer reading by position gets one input's columns under another's names ([#14738](https://github.com/spiceai/spiceai/issues/14738)) | silent (wrong data / query failure) | **GAP** — no guard here yet; in the fork, the join-input cases #264 adds to `plan_to_sql.rs`; see [Open gaps](#open-gaps) |
 | Unparser: nested IS and NOT predicates parenthesize their operands (#15538) | `(NOT x) IS NULL` selects different rows when emitted as `NOT x IS NULL`; MySQL rejects chained IS predicates; ClickHouse gives `NOT (x IS NULL) IS NULL` a different meaning from `NOT ((x IS NULL) IS NULL)` | silent (wrong data / query failure) | `crates/data_components/src/federation.rs::tests::is_predicate_unparsing_preserves_boolean_partitions`; real-engine guards: `test/spicescript/sql-predicate-precedence.yaml` and `test/spicescript/tlp.yaml`. In the fork, `test_unparser_preserves_is_predicate_operands` |
 | Unparser: a projection reading no aggregate outputs keeps the aggregation in a derived table (#15538) | A pruned global aggregate returns its input's rows instead of one row, and a pruned grouped aggregate loses its groups | silent (wrong data) | `test/spicescript/unparse-pruned-aggregate.yaml`, including empty inputs, nested aggregates, `HAVING`, and `QUALIFY`; in the fork, `test_unparser_preserves_pruned_aggregate_rows` |
@@ -824,7 +827,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**45 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**44 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -846,11 +849,10 @@ They are not equal in consequence; this is the order to close them in.
    logits differ from a correct kernel's. A guard needs a CUDA runner and a
    mixture-of-experts GGUF whose expert rows are not a multiple of four.
 3. `datafusion` fixes the pin to spiceai/datafusion#273 carries ahead of their
-   guards, four rows. #262 (a decimal cast that drops digits) has its guard in
+   guards, three rows. #262 (a decimal cast that drops digits) has its guard in
    [#15207](https://github.com/spiceai/spiceai/pull/15207), which replaces its
-   **GAP** marker when it lands. The unparser fixes #246, #247 and #264
+   **GAP** marker when it lands. The unparser fixes #246 and #264
    ([#13442](https://github.com/spiceai/spiceai/issues/13442),
-   [#14109](https://github.com/spiceai/spiceai/issues/14109),
    [#14738](https://github.com/spiceai/spiceai/issues/14738)) have none: each needs
    a federated query whose pushed SQL a real engine answers differently without
    the patch, as the other unparser guards in `crates/data_components/src/federation.rs` do.
