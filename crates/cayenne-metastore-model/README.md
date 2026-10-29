@@ -57,7 +57,7 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `commits-storage` | Checkpoint parts/root before head publication, delayed GC, a query kept by retention, lagging reopen, late seal; I4, I7, I8 | Bound 2; samples 4 |
 | `transactions-txn` | Two datasets, one transaction, competing ordinary writes, reservations, commit/abort create race, helper Resolve, uncertain CAS, checkpoint/GC; one participant writes other keys while prepared so the Prepare can reach a checkpoint; I3–I6, I8 | Exhaustive 1 (two lease generations), controls 0 except owner restriction 1; samples 2, 3 (two outstanding handles per dataset) |
 | `window-storage` | Canonical inline bytes, byte/count pressure, copy rule, cold replay, a running query, checkpoint/GC; I4, I7, I8 | Exhaustive 6 records; controls 5; samples 7, 9 |
-| `retention` | Readers never write and GC has no generations: removed objects deleted a fixed retention after GC observes the removal (restarted at takeover); never-committed uploads deleted once old by the store's clock, after a head move and a recheck; fresh object names; a writer references only base-live objects or its own young uploads, with a margin for clock error; commits that land arbitrarily late; one reader query from a recently confirmed state; no dangling reference, rows or an error, and a query within the retention never fails | Exhaustive: 2 object names, 9 clock ticks, 6 head versions, retention 3, staleness 1, upload age 4, writer clock error 1, one takeover, one query |
+| `retention` / `retention-readers` | Readers never write and GC has no generations: removed objects deleted a fixed retention after GC observes the removal, which stays in durable state until the delete (timers restarted at takeover); never-committed uploads deleted once the head's store time is T_O past theirs; GC's empty commit on an idle head; fresh object names; a writer references only base-live objects or its own never-published uploads, while its base's store time is less than T_O minus a margin past the upload's; object timestamps that lag the writer's lower bound; deletes and commits that land arbitrarily late. `retention-readers` adds one query whose head GET responds late, and stops once the query settles. No dangling reference, rows or an error, and a query within the retention never fails | Exhaustive: 2 object names, 9 clock ticks, 6 head versions, retention 3, staleness 1, upload age 4, timestamp error 1, two sweeps, one takeover; the writer graph adds timestamp skew, the reader graph one query |
 | `window-txn` | Transaction resolution composed with explicit delayed byte-batch sealing and eviction; I3–I6, I8 | Exhaustive 0; samples 2, 3 |
 | `concurrent-txn-overlap`, `concurrent-txn-disjoint` | Two transaction identities, overlapping/disjoint footprints, ordinary writer, rejected and late Prepare, opposite reservations, cleanup, checkpointed pending ids; I4, I6, I8 | Exhaustive/control 0; samples 1, 2 |
 | `concurrent-floor-aligned` | Published floor at batch boundaries, reader reopen, a query kept by retention and delayed deletion; I4, I7, I8 | Exhaustive 6 records; samples 7, 9 |
@@ -100,11 +100,12 @@ as a separate maintenance process does.
 
 | Control suffix | Removed safeguard and required downstream failure |
 |---|---|
-| `remote-maintenance-minimal-no-publication-fence` | Check lease only before publication: an expired unit still publishes; I3 |
+| `remote-maintenance-minimal-lease-outside-head` | The lease turnover writes only a separate lease object, so the publication CAS cannot see it: an expired unit still publishes; I3 |
+| `remote-maintenance-no-retry-lease-check` | A retry after a lost CAS rebases without checking the unit's generation in the new head: an expired unit publishes; I3 |
 | `remote-maintenance-no-stable-high-water` / minimal pair | Maintenance advances high water over a buffered operation: its original stamps are refused |
 | `remote-maintenance-no-committed-cutoff` / minimal pair | Apply through an allocator value that includes uncommitted deletes: later covered clearing resurrects an old row |
 | `remote-maintenance-no-file-set-lease` / minimal pair | Overlapping plans with input guards retained: holds; leases avoid redundant work, not required for safety in this graph |
-| `remote-maintenance-no-guard-revalidation` / minimal pair | Skip retry guard validation but retain full file-set exclusion and publication fencing: holds in this graph |
+| `remote-maintenance-no-guard-revalidation` / minimal pair | Skip the retry's input, coverage and cap guards but keep its lease check and full file-set exclusion: holds in this graph |
 | `remote-maintenance-no-file-set-lease-no-guard-revalidation` / minimal pair | Remove both exclusions: two replacements of the same input leave duplicate live rows |
 | `read-transaction-*-no-union-footprint` | Validate only s2: stale s1 actions violate whole-transaction program replay |
 | `read-transaction-*-no-overlay-read-keys` | Omit s2 lookup keys already written by s1: holds because the union still includes s1 written keys |
@@ -136,12 +137,17 @@ as a separate maintenance process does.
 | `dataset-lifecycle-no-commit-number` | Name maintenance states by mutation high water: I8 one name has different physical states |
 | `dataset-lifecycle-no-query-log-retention` | Reclaim metadata history below the floor despite an older running query: I7 reconstruction fails even with data files present |
 | `dataset-lifecycle-no-index-checkpoint` | Omit PK collection refresh in checkpoint recovery: I8 |
-| `retention-no-age-check` / `-no-margin` | The writer references an old upload, or checks its age without allowing for clock error: a committed state references a deleted object |
-| `retention-no-head-move` / `-no-recheck` | GC deletes orphans without waiting for the head to move, or without re-reading it: a late commit lands referencing a deleted object |
+| `retention-no-age-check` / `-no-margin` | The writer references an old upload, or checks its age without allowing for timestamp error: a committed state references a deleted object |
+| `retention-writer-clock` | The writer ages its upload on its own clock while the store's clock jumps ahead: GC deletes it after the head move and the commit lands |
+| `retention-list-date` | GC ages uploads by the LIST's time instead of the head's: a commit based on an older head lands after the delete |
+| `retention-reref-published` | A writer references its own upload again after publishing and removing it: GC's delete of the removed object lands under the new commit |
 | `retention-reuse-found` | The writer reuses an object it finds present instead of a fresh name: a committed state references a deleted object |
-| `retention-no-retention` / `-stale-start` | Retention zero, or a query starts from a state confirmed longer ago than the staleness bound: a query within the retention fails |
-| `retention-keep-timestamps` | A takeover keeps removal times from the predecessor's clock: a query within the retention fails |
-| `retention-missing-as-empty` | A missing object reads as empty: wrong rows instead of an error |
+| `retention-readers-no-retention` / `-stale-start` | Retention zero, or a query starts from a state confirmed longer ago than the staleness bound: a query within the retention fails |
+| `retention-readers-keep-timestamps` | A takeover keeps removal times from the predecessor's clock: a query within the retention fails |
+| `retention-readers-volatile-removals` | Removals live only in GC's memory: after a takeover the orphan sweep deletes a recently removed object a query still reads |
+| `retention-readers-sweep-removed` | The orphan sweep ignores recorded removals: it deletes a recently removed, old upload a query still reads |
+| `retention-readers-response-time` | A head confirmation is timed from its response instead of its request: a late response admits a query whose objects are already deleted |
+| `retention-readers-missing-as-empty` | A missing object reads as empty: wrong rows instead of an error |
 | `source-ack-before-acceptance` | Acknowledge buffered changes before CAS acceptance: I2 |
 | `source-position-before-data` | Separate offset record lands first: logged prefix lacks rows (I10) |
 | `source-position-after-data` | Separate data record lands first, crash/redelivery appends it again: I10 |
@@ -235,22 +241,29 @@ not model stale asynchronous rewrite publication.
 The PK index refreshes as a checkpoint collection.
 The graph does not model asynchronous index construction or real index bytes.
 
-`retention` is the only reader and garbage-collection protocol. Readers never
-write: a query starts from a state confirmed current within the staleness bound S,
-and every object it needs survives at least T - S, because each was live at that
-confirmation and GC deletes a removed object only T after observing its removal.
-Every read returns the referenced object or fails the query. Uploads that never
-committed are collected by age instead of by generation: GC selects unreferenced
-objects at least T_O old by the store's clock, waits for the head to move (its own
-empty commit when the dataset is idle), re-reads the head and keeps anything a late
-commit referenced. A commit sent before the objects were old was conditioned on an
-older head and fails; one sent after fails the writer's age check, which allows for
-the writer's clock error. Every object has a fresh name, so nothing is reused by
-finding it present. No clock is compared across machines: GC's upload age uses the
-store's clock, removal timers are GC's local durations and restart at takeover, and
-the writer measures a local duration. Other graphs abstract this contract: a query
-is protected from its start until it expires, and the orphan sweep takes only an
-upload that has aged, which the writer can no longer reference.
+`retention` and `retention-readers` are the only reader and garbage-collection
+protocol. Readers never write: a query starts from a head confirmed within the
+staleness bound S of when its GET was sent, and every object it needs survives at
+least T - S, because each was live at that confirmation and GC deletes a removed
+object only T after observing its removal. The removal stays recorded in durable
+state until the delete, so a new GC after a takeover still knows it, and the
+orphan sweep skips it. Every read returns the referenced object or fails the query.
+Uploads that never committed are collected by age instead of by generation, and
+every age is a difference of two store timestamps: GC deletes an unreferenced
+upload once the head it read is T_O past the upload's `LastModified`, and the
+writer refuses its own upload once its CAS base is T_O minus a margin past a lower
+bound on that upload's time. A commit landing after GC's read is based on that head
+or a newer one, so the writer would have refused it. GC's empty commit lets an idle
+head's time advance; it is needed for progress, not for safety. A writer references
+an upload of its own only until it is published; after that, only while it is live
+in the base. Every object has a fresh name, so nothing is reused by finding it
+present. Removal timers are GC's local durations and restart at takeover; no
+other clock is compared across machines. The graph is split in two to stay
+tractable: the writer graph checks references with timestamp skew, and the reader
+graph adds one query with a late GET response and stops once that query settles.
+Other graphs abstract this contract: a query is protected from its start until it
+expires, and the orphan sweep takes only an upload that has aged, which the writer
+can no longer reference.
 
 ## Composition boundaries and liveness
 
@@ -270,8 +283,8 @@ logical buffer operations without physical sequence comparisons. A metadata page
 staged from the writer's own fresh-named upload exercises staged references and
 delayed retirement alongside the row files. `Age` marks an upload past the age
 limit, after which the writer cannot stage it and the orphan sweep may take it; the
-retention graph checks that the writer's age check and GC's head move give exactly
-that. A fenced predecessor may finish an upload after the orphan sweep; nothing
+retention graphs check that the writer's age check and GC's head-relative age
+give exactly that. A fenced predecessor may finish an upload after the orphan sweep; nothing
 references it, and a later sweep collects it.
 
 The small exhaustive bound reaches warm subset compaction, cold promotion,
@@ -518,11 +531,12 @@ retain every originally drawn stamp. The graph counts physical live rows and
 compares every committed prefix with the logical oracle, replay and checkpoint
 plus tail (including PK keys). Both tables can be acknowledged together.
 
-Leases exclude overlapping file sets until release or turnover. A publication
-atomically enforces its unit generation; this is a fencing assumption, not a
-separate lease GET followed by an unfenced CAS. With live-input guards retained,
-overlapping unleased plans remain safe. With full lease exclusion and fencing,
-skipping retry guard revalidation also remains safe in the finite graph. Removing
+Leases exclude overlapping file sets until release or turnover. A turnover
+records the unit's new generation in the head, so a plan from the old generation
+loses its CAS, and its retry finds the new generation and re-plans. The
+publication itself reads nothing else. With live-input guards retained,
+overlapping unleased plans remain safe. With full lease exclusion and the retry's
+lease check, skipping the other retry guards also remains safe in the finite graph. Removing
 both leaves two output copies. The two-safeguard diagnostic names both removals.
 `remote-maintenance-clear-retry` isolates a delete, cold rewrite, warm rewrite and
 an unrelated child-table commit. It requires the same nonempty covered clear to

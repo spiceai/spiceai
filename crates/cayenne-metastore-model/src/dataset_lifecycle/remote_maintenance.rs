@@ -148,10 +148,12 @@ impl Protocol {
         state.versions.push(state.data.clone());
         state.expected.push(oracle);
     }
-    fn guarded(&self, state: &State, node: usize, p: &Pending) -> bool {
-        if p.generation != state.generation[node] {
-            return false;
-        }
+    /// The retry's lease check: the head the CAS lost to records the unit's
+    /// current generation.
+    fn leased(&self, state: &State, node: usize, p: &Pending) -> bool {
+        self.has("no-retry-lease-check") || p.generation == state.generation[node]
+    }
+    fn guarded(&self, state: &State, p: &Pending) -> bool {
         if !p
             .record
             .remove
@@ -460,7 +462,9 @@ impl Model for Protocol {
             }
             Action::RetryMaintenance(node) => {
                 let p = state.pending[node].as_ref()?;
-                if self.has("no-guard-revalidation") || self.guarded(state, node, p) {
+                if self.leased(state, node, p)
+                    && (self.has("no-guard-revalidation") || self.guarded(state, p))
+                {
                     let p = next.pending[node].as_mut()?;
                     p.base = state.log.len();
                     for t in 0..2 {
@@ -475,13 +479,9 @@ impl Model for Protocol {
             }
             Action::PublishMaintenance(node) => {
                 let p = next.pending[node].take()?;
-                if p.generation != state.generation[node] {
-                    next.fenced = true;
-                    if !self.has("no-publication-fence") {
-                        return Some(next);
-                    }
-                    next.stale_publication = true;
-                }
+                // The CAS conditions only on the head, so it cannot consult the
+                // lease itself; a turnover fences it only by moving the head.
+                next.stale_publication |= p.generation != state.generation[node];
                 next.maintenance_retry |= p.retried;
                 next.clear_retry |= p.retried && !p.record.clear.is_empty();
                 if let Some(checkpoint) = p.checkpoint {
@@ -492,6 +492,10 @@ impl Model for Protocol {
             }
             Action::ExpireLease(node) => {
                 next.generation[node] += 1;
+                if !self.has("lease-outside-head") {
+                    // The new generation is recorded in the head.
+                    Self::accept(&mut next, Self::empty(state));
+                }
             }
         }
         (next != *state).then_some(next)
