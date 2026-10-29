@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use app::AppBuilder;
+use app::{App, AppBuilder};
 use arrow::array::{RecordBatch, StringArray};
 use futures::TryStreamExt;
 use runtime::Runtime;
@@ -74,10 +74,15 @@ fn csv_dataset(path: &Path, name: &str) -> Dataset {
 /// A runtime over `fixture`: its Spicepod declares `pod_orders`, and what SQL
 /// defined is kept in the fixture's instance directory.
 async fn start(fixture: &Fixture) -> Arc<Runtime> {
-    register_test_connectors().await;
     let app = AppBuilder::new("sql_ddl")
         .with_dataset(csv_dataset(&fixture.orders_csv, "pod_orders"))
         .build();
+    start_with(fixture, app).await
+}
+
+/// A runtime over `fixture` whose Spicepod is `app`.
+async fn start_with(fixture: &Fixture, app: App) -> Arc<Runtime> {
+    register_test_connectors().await;
     let rt = Arc::new(
         Runtime::builder()
             .with_app(app)
@@ -446,6 +451,77 @@ async fn a_redefined_dataset_never_serves_the_data_its_name_held_before() {
             eventually(&rt, select, other)
                 .await
                 .unwrap_or_else(|last| panic!("after a restart; served:\n{last}"));
+        })
+        .await;
+}
+
+/// A dataset whose earlier acceleration data cannot be deleted is not served,
+/// whoever declares its name, until a retry deletes that data: the Spicepod
+/// that declares the name once the instance restarts does not bring it back on
+/// the retries in between, which would load and unload it on each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withheld_dataset_stays_unserved_until_its_data_is_deleted() {
+    crate::utils::require_process_per_test(
+        "It shuts a runtime down, which marks change data capture and Cayenne compaction shut down for the whole process",
+    );
+    test_request_context()
+        .scope(async {
+            let fixture = Fixture::new();
+            let rt = start(&fixture).await;
+            let duckdb_file = fixture.instance_dir.with_file_name("s1.duckdb");
+            message(
+                &rt,
+                &format!(
+                    "CREATE TABLE s1 WITH (from = 'file:{}', file_format = 'csv', \
+                     \"acceleration.engine\" = 'duckdb', \"acceleration.mode\" = 'file', \
+                     \"acceleration.params.duckdb_file\" = '{}')",
+                    fixture.orders_csv.display(),
+                    duckdb_file.display()
+                ),
+            )
+            .await;
+            let select = "SELECT id FROM s1 ORDER BY id";
+            eventually(
+                &rt,
+                select,
+                "+----+\n| id |\n+----+\n| 1  |\n| 2  |\n| 3  |\n+----+",
+            )
+            .await
+            .unwrap_or_else(|last| panic!("s1 loads its source; served:\n{last}"));
+            rt.shutdown().await;
+            drop(rt);
+
+            // The file the definition kept its data in is no DuckDB database
+            // any more, so that data cannot be deleted, and the Spicepod now
+            // declares s1 over the other source.
+            std::fs::write(&duckdb_file, b"not a DuckDB database")
+                .expect("overwrite the DuckDB file");
+            let app = AppBuilder::new("sql_ddl")
+                .with_dataset(csv_dataset(&fixture.orders_csv, "pod_orders"))
+                .with_dataset(csv_dataset(&fixture.other_csv, "s1"))
+                .build();
+            let rt = start_with(&fixture, app).await;
+
+            // Withheld across more than one retry, every 10 seconds: the time
+            // the dataset stays unserved is what is under test.
+            let until = tokio::time::Instant::now() + Duration::from_secs(25);
+            while tokio::time::Instant::now() < until {
+                let e = error(&rt, select).await;
+                assert!(
+                    e.contains("table 'spice.public.s1' not found"),
+                    "s1 is withheld; got: {e}"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+
+            // Once the fault is gone, the next retry deletes the data, and the
+            // Spicepod's s1 is served.
+            std::fs::remove_file(&duckdb_file).expect("remove the file");
+            eventually(&rt, select, "+----+\n| id |\n+----+\n| 7  |\n+----+")
+                .await
+                .unwrap_or_else(|last| {
+                    panic!("once its earlier data is deleted, s1 is served; served:\n{last}")
+                });
         })
         .await;
 }
