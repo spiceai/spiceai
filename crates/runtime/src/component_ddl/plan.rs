@@ -423,10 +423,11 @@ fn drop_catalog(
 
 /// The served SQL-defined datasets whose acceleration data the change from
 /// `defined` to `next` retires: the change drops them, points them at another
-/// source, or, made by `op`, replaces them. A dataset defined anew under a name
-/// starts from its source, never from data an earlier definition loaded. A
-/// definition a Spicepod component shadows was never served, so the data under
-/// its name is the Spicepod's.
+/// source (a new `from` or connector parameter, which can name another
+/// database, file, or table), or, made by `op`, replaces them. A dataset
+/// defined anew under a name starts from its source, never from data an earlier
+/// definition loaded. A definition a Spicepod component shadows was never
+/// served, so the data under its name is the Spicepod's.
 ///
 /// `op` is `None` for a change another instance made, which is known only by
 /// its result: a replacement that kept the source reads as a change to the
@@ -452,7 +453,11 @@ pub(crate) fn retired_datasets(
                 .find(|new| same_dataset(&new.name, &old.name))
             {
                 None => true,
-                Some(new) => new.from != old.from || (replaces(&old.name) && new != *old),
+                Some(new) => {
+                    new.from != old.from
+                        || new.params != old.params
+                        || (replaces(&old.name) && new != *old)
+                }
             }
         })
         .cloned()
@@ -860,6 +865,24 @@ mod tests {
         assert_eq!(
             retired_datasets(&spicepod, &defined, &changed.definitions, Some(&moved)),
             vec![dataset("orders")]
+        );
+
+        // A connector parameter can name another database, file, or table.
+        let reconnected = set("file_format", "parquet");
+        let changed_parameter = plan(&spicepod, &defined, &reconnected).expect("new parameter");
+        assert_eq!(
+            retired_datasets(
+                &spicepod,
+                &defined,
+                &changed_parameter.definitions,
+                Some(&reconnected)
+            ),
+            vec![dataset("orders")]
+        );
+        assert_eq!(
+            retired_datasets(&spicepod, &defined, &changed_parameter.definitions, None),
+            vec![dataset("orders")],
+            "a new connector parameter, made by another instance"
         );
 
         let mut replacement = dataset("orders");

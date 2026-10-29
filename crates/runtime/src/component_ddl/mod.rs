@@ -28,6 +28,7 @@ limitations under the License.
 //! defined (see [`plan`]).
 
 mod plan;
+mod served;
 mod store;
 
 use std::collections::{HashMap, HashSet};
@@ -665,6 +666,9 @@ impl Runtime {
         let spicepod = served
             .clone()
             .unwrap_or_else(|| Arc::new(AppBuilder::new("spice").build()));
+        if store.is_shared() {
+            self.retire_while_stopped(&store, &spicepod, &defined).await;
+        }
         if !defined.is_empty() {
             tracing::info!(
                 "Loading {} defined with SQL from {}",
@@ -672,7 +676,7 @@ impl Runtime {
                 store.location()
             );
             plan::warn_shadowed(&spicepod, &defined);
-            let next = Arc::new(plan::serve((*spicepod).clone(), &defined));
+            let next = Arc::new(self.sql_components.serve(&spicepod, &defined));
             if late {
                 Arc::clone(self).apply_app_diff(served.as_ref(), next).await;
             } else {
@@ -681,8 +685,88 @@ impl Runtime {
         }
         *self.sql_components.spicepod.write().await = Some(spicepod);
         *self.sql_components.defined.write().await = Some(defined);
+        self.record_served(&store).await;
         drop(serialized);
         Ok(store)
+    }
+
+    /// When instances share the definitions, another can drop a dataset or
+    /// point it at another source while this one is stopped. Before anything
+    /// loads, delete the acceleration data of each dataset that `defined`
+    /// retires from what this instance recorded it served, and of each it
+    /// withheld; a dataset whose data cannot be deleted is withheld until a
+    /// retry deletes it.
+    async fn retire_while_stopped(
+        self: &Arc<Self>,
+        store: &DefinitionsStore,
+        spicepod: &Arc<App>,
+        defined: &SqlDefinitions,
+    ) {
+        let Some(recorded) = served::read(&self.sql_components.instance_dir).await else {
+            return;
+        };
+        let mut retired = plan::retired_datasets(spicepod, &recorded.definitions, defined, None);
+        retired.extend(recorded.withheld);
+        let mut deleted = Vec::new();
+        let mut withheld = Vec::new();
+        let mut cause = None;
+        for dataset in retired {
+            match Arc::clone(self)
+                .delete_acceleration_data(&dataset, spicepod)
+                .await
+            {
+                Ok(()) if dataset.acceleration.as_ref().is_some_and(|a| a.enabled) => {
+                    deleted.push(dataset);
+                }
+                Ok(()) => {}
+                Err(e) => {
+                    cause.get_or_insert_with(|| {
+                        format!(
+                            "the acceleration data of dataset {} could not be deleted. Cause: {e}",
+                            display_dataset_name(&dataset.name)
+                        )
+                    });
+                    withheld.push(dataset);
+                }
+            }
+        }
+        if !deleted.is_empty() {
+            tracing::info!("{}", withheld_deleted(&deleted));
+        }
+        if let Some(cause) = cause {
+            let unserved = withheld
+                .iter()
+                .map(|dataset| dataset.name.clone())
+                .collect();
+            tracing::warn!(
+                "{}",
+                unapplied_change(store.location(), &ServeFailure { cause, unserved })
+            );
+        }
+        *self.sql_components.withheld.lock() = withheld;
+    }
+
+    /// Record, in the instance directory, what this instance serves of the
+    /// definitions instances share, so that once restarted it can tell what
+    /// another instance changed meanwhile ([`Self::retire_while_stopped`]).
+    async fn record_served(&self, store: &DefinitionsStore) {
+        if !store.is_shared() {
+            return;
+        }
+        let Some(definitions) = self.sql_components.defined().await else {
+            return;
+        };
+        let record = served::Served {
+            definitions,
+            withheld: self.sql_components.withheld(),
+        };
+        if let Err(e) = served::write(&self.sql_components.instance_dir, &record).await {
+            tracing::warn!(
+                "Failed to record which datasets and catalogs defined with SQL this instance serves in '{}', so if another instance changes a dataset while this one is stopped, this one may serve the acceleration data its earlier definition loaded once restarted. Cause: {}",
+                served::path(&self.sql_components.instance_dir).display(),
+                util::single_line(&e.to_string())
+            );
+        }
     }
 
     /// The error a failed read of the SQL definitions logs.
@@ -891,6 +975,7 @@ impl Runtime {
                         })
                         .collect();
                     *self.sql_components.defined.write().await = Some(stored);
+                    self.record_served(store).await;
                 }
                 return Err(failure);
             }
@@ -902,6 +987,7 @@ impl Runtime {
         Arc::clone(self)
             .apply_app_diff(Some(&applied), current)
             .await;
+        self.record_served(store).await;
         if stored != known {
             tracing::info!(
                 "Applied the change another instance made to the datasets and catalogs defined with SQL in {}: {}.",
@@ -1090,7 +1176,7 @@ impl Runtime {
             })?;
             let defined = match self.serve_definitions(&store, known, stored).await {
                 Ok(defined) => defined,
-                Err(failure) if withholds(&op, &failure) => {
+                Err(failure) if defines(&op) && withholds(&op, &failure) => {
                     return Err(not_applied(&withheld_dataset(
                         op.component_name(),
                         &failure.cause,
@@ -1189,6 +1275,7 @@ impl Runtime {
                 Ok(()) => {
                     *self.sql_components.defined.write().await = Some(definitions);
                     Arc::clone(&self).apply_app_diff(Some(&applied), next).await;
+                    self.record_served(&store).await;
                     break (message, validate);
                 }
                 Err(e) => {
@@ -1602,6 +1689,16 @@ fn changed_by_another(op: &ComponentDdlOp, failure: Option<&ServeFailure>) -> St
             "another instance changed {noun} '{name}' while this statement ran. Run `SHOW CREATE {object} {name}` to see the change, then run the statement again if it still applies."
         ),
     }
+}
+
+/// Whether `op` defines or changes its dataset: what a withheld dataset
+/// refuses, since its new definition could load the data the earlier one
+/// left. A `DROP` goes on.
+fn defines(op: &ComponentDdlOp) -> bool {
+    matches!(
+        op,
+        ComponentDdlOp::CreateDataset { .. } | ComponentDdlOp::AlterDataset { .. }
+    )
 }
 
 /// Whether `failure` withholds the dataset `op` names.

@@ -53,46 +53,60 @@ pub struct MetadataConnection {
     pub password: Option<(MetadataDatabase, String)>,
 }
 
+/// Why a `PostgreSQL` or `MySQL` metadata connection string cannot be read:
+/// its password could not be held apart, so it is not attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unreadable {
+    pub database: MetadataDatabase,
+    /// What is wrong with it, worded to follow "it has".
+    pub reason: &'static str,
+}
+
 impl MetadataConnection {
-    /// Split `connection_string`. A `PostgreSQL` string may be `key = value`
-    /// pairs or a URI, which is rewritten as pairs, since the extension reads
-    /// a secret's fields as pairs put in front of the path; a `MySQL` string
-    /// may be pairs. Any other string, one without a password, and one that
-    /// cannot be read, is kept whole.
-    #[must_use]
-    pub fn parse(connection_string: &str) -> Self {
-        let split = if let Some(rest) = connection_string.strip_prefix("postgres:") {
-            if is_postgres_uri(rest) {
-                postgres_uri(rest).and_then(|pairs| without_password(&pairs, &["password"]))
-            } else {
-                libpq_pairs(rest).and_then(|pairs| without_password_in(rest, &pairs, &["password"]))
-            }
-            .map(|(path, password)| {
-                (
-                    format!("postgres:{path}"),
-                    MetadataDatabase::Postgres,
-                    password,
-                )
-            })
-        } else if let Some(rest) = connection_string.strip_prefix("mysql:") {
-            mysql_pairs(rest)
-                .and_then(|pairs| without_password_in(rest, &pairs, &["password", "passwd"]))
-                .map(|(path, password)| {
-                    (format!("mysql:{path}"), MetadataDatabase::Mysql, password)
-                })
-        } else {
-            None
+    /// Split `connection_string`. The prefix that names the database is read
+    /// as `DuckDB` reads it: in any case, by the extension's name or alias. A
+    /// `PostgreSQL` string may be `key = value` pairs or a URI, which is
+    /// rewritten as pairs, since the extension puts a secret's fields in front
+    /// of the path as pairs; a `MySQL` string may be pairs. Any other string,
+    /// and one without a password, is kept whole.
+    ///
+    /// # Errors
+    ///
+    /// Why a `PostgreSQL` or `MySQL` string cannot be read.
+    pub fn parse(connection_string: &str) -> Result<Self, Unreadable> {
+        let whole = || Self {
+            path: connection_string.to_string(),
+            password: None,
         };
-        match split {
-            Some((path, database, password)) => Self {
-                path,
+        let Some((prefix, rest)) = connection_string.split_once(':') else {
+            return Ok(whole());
+        };
+        let database = match prefix.to_ascii_lowercase().as_str() {
+            "postgres" | "postgres_scanner" => MetadataDatabase::Postgres,
+            "mysql" | "mysql_scanner" => MetadataDatabase::Mysql,
+            _ => return Ok(whole()),
+        };
+        let unreadable = |reason| Unreadable { database, reason };
+        let split = match database {
+            MetadataDatabase::Postgres if is_postgres_uri(rest) => {
+                without_password(&postgres_uri(rest).map_err(unreadable)?, &["password"])
+            }
+            MetadataDatabase::Postgres => {
+                without_password_in(rest, &libpq_pairs(rest).map_err(unreadable)?, &["password"])
+            }
+            MetadataDatabase::Mysql => without_password_in(
+                rest,
+                &mysql_pairs(rest).map_err(unreadable)?,
+                &["password", "passwd"],
+            ),
+        };
+        Ok(match split {
+            Some((path, password)) => Self {
+                path: format!("{prefix}:{path}"),
                 password: Some((database, password)),
             },
-            None => Self {
-                path: connection_string.to_string(),
-                password: None,
-            },
-        }
+            None => whole(),
+        })
     }
 }
 
@@ -159,27 +173,29 @@ fn is_postgres_uri(s: &str) -> bool {
         || s.get(..11).map(str::to_ascii_lowercase).as_deref() == Some("postgres://")
 }
 
+const UNTERMINATED_QUOTE: &str = "an unterminated quote";
+const MISSING_EQUALS: &str = "a parameter without `=`";
+const TRAILING_BACKSLASH: &str = "a `\\` at its end";
+
 /// The pairs of a libpq `key = value` string: a value may be quoted with `'`,
-/// and a backslash escapes the next character, quoted or not. `None` when the
-/// string is not one.
-fn libpq_pairs(s: &str) -> Option<Vec<Pair>> {
+/// and a backslash escapes the next character, quoted or not.
+fn libpq_pairs(s: &str) -> Result<Vec<Pair>, &'static str> {
     pairs(s, '\'', true)
 }
 
 /// The pairs of a `MySQL` extension's string: a value may be quoted with `"`,
-/// inside which a backslash escapes `\` or `"`. `None` when the string is not
-/// one.
-fn mysql_pairs(s: &str) -> Option<Vec<Pair>> {
+/// inside which a backslash escapes `\` or `"`.
+fn mysql_pairs(s: &str) -> Result<Vec<Pair>, &'static str> {
     pairs(s, '"', false)
 }
 
-fn pairs(s: &str, quote: char, escape_unquoted: bool) -> Option<Vec<Pair>> {
+fn pairs(s: &str, quote: char, escape_unquoted: bool) -> Result<Vec<Pair>, &'static str> {
     let mut chars = s.char_indices().peekable();
     let mut result = Vec::new();
     loop {
         while chars.next_if(|(_, c)| c.is_whitespace()).is_some() {}
         let Some(&(start, _)) = chars.peek() else {
-            return Some(result);
+            return Ok(result);
         };
         let mut key = String::new();
         while let Some((_, c)) = chars.next_if(|(_, c)| *c != '=' && !c.is_whitespace()) {
@@ -187,14 +203,14 @@ fn pairs(s: &str, quote: char, escape_unquoted: bool) -> Option<Vec<Pair>> {
         }
         while chars.next_if(|(_, c)| c.is_whitespace()).is_some() {}
         if key.is_empty() || chars.next_if(|(_, c)| *c == '=').is_none() {
-            return None;
+            return Err(MISSING_EQUALS);
         }
         while chars.next_if(|(_, c)| c.is_whitespace()).is_some() {}
         let mut value = String::new();
         let end = if chars.next_if(|(_, c)| *c == quote).is_some() {
             loop {
-                match chars.next()? {
-                    (_, '\\') => value.push(chars.next()?.1),
+                match chars.next().ok_or(UNTERMINATED_QUOTE)? {
+                    (_, '\\') => value.push(chars.next().ok_or(UNTERMINATED_QUOTE)?.1),
                     (i, c) if c == quote => break i + c.len_utf8(),
                     (_, c) => value.push(c),
                 }
@@ -208,7 +224,7 @@ fn pairs(s: &str, quote: char, escape_unquoted: bool) -> Option<Vec<Pair>> {
                 }
                 chars.next();
                 if c == '\\' && escape_unquoted {
-                    value.push(chars.next()?.1);
+                    value.push(chars.next().ok_or(TRAILING_BACKSLASH)?.1);
                 } else {
                     value.push(c);
                 }
@@ -223,11 +239,16 @@ fn pairs(s: &str, quote: char, escape_unquoted: bool) -> Option<Vec<Pair>> {
     }
 }
 
+const BAD_PERCENT: &str =
+    "a `%` that is not followed by two hex digits, or that encodes bytes that are not UTF-8";
+const BAD_HOST: &str = "a host in `[` without its `]`, or with text after `]` that is not a port";
+const BAD_QUERY: &str = "a query parameter without `=`";
+
 /// The pairs a libpq URI sets, in libpq's names, from
 /// `postgresql://[user[:password]@][host][:port][,...][/dbname][?param=value&...]`,
-/// with each part percent-decoded. `None` when it is not one.
-fn postgres_uri(s: &str) -> Option<Vec<(String, String)>> {
-    let rest = s.split_once("://")?.1;
+/// with each part percent-decoded.
+fn postgres_uri(s: &str) -> Result<Vec<(String, String)>, &'static str> {
+    let rest = s.split_once("://").map_or(s, |(_, rest)| rest);
     let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
     let (authority, dbname) = rest.split_once('/').unwrap_or((rest, ""));
     let (userinfo, hosts) = match authority.split_once('@') {
@@ -252,10 +273,10 @@ fn postgres_uri(s: &str) -> Option<Vec<(String, String)>> {
     if !hosts.is_empty() {
         for spec in hosts.split(',') {
             let (host, port) = if let Some(bracketed) = spec.strip_prefix('[') {
-                let (host, after) = bracketed.split_once(']')?;
+                let (host, after) = bracketed.split_once(']').ok_or(BAD_HOST)?;
                 let port = match after {
                     "" => "",
-                    port => port.strip_prefix(':')?,
+                    port => port.strip_prefix(':').ok_or(BAD_HOST)?,
                 };
                 (host, port)
             } else {
@@ -275,7 +296,7 @@ fn postgres_uri(s: &str) -> Option<Vec<(String, String)>> {
         pairs.push(("dbname".to_string(), percent_decoded(dbname)?));
     }
     for param in query.split('&').filter(|param| !param.is_empty()) {
-        let (key, value) = param.split_once('=')?;
+        let (key, value) = param.split_once('=').ok_or(BAD_QUERY)?;
         let (key, value) = (percent_decoded(key)?, percent_decoded(value)?);
         // As libpq reads it, for JDBC's sake.
         if key == "ssl" && value == "true" {
@@ -284,21 +305,28 @@ fn postgres_uri(s: &str) -> Option<Vec<(String, String)>> {
             pairs.push((key, value));
         }
     }
-    Some(pairs)
+    Ok(pairs)
 }
 
-fn percent_decoded(s: &str) -> Option<String> {
+fn percent_decoded(s: &str) -> Result<String, &'static str> {
     let mut bytes = Vec::with_capacity(s.len());
     let mut iter = s.bytes();
     while let Some(byte) = iter.next() {
         if byte == b'%' {
-            let hex = [iter.next()?, iter.next()?];
-            bytes.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+            let hex = [
+                iter.next().ok_or(BAD_PERCENT)?,
+                iter.next().ok_or(BAD_PERCENT)?,
+            ];
+            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                return Err(BAD_PERCENT);
+            }
+            let hex = std::str::from_utf8(&hex).map_err(|_| BAD_PERCENT)?;
+            bytes.push(u8::from_str_radix(hex, 16).map_err(|_| BAD_PERCENT)?);
         } else {
             bytes.push(byte);
         }
     }
-    String::from_utf8(bytes).ok()
+    String::from_utf8(bytes).map_err(|_| BAD_PERCENT)
 }
 
 #[cfg(test)]
@@ -306,7 +334,7 @@ mod tests {
     use super::*;
 
     fn split(s: &str) -> (String, Option<String>) {
-        let connection = MetadataConnection::parse(s);
+        let connection = MetadataConnection::parse(s).expect("readable");
         (
             connection.path,
             connection.password.map(|(_, password)| password),
@@ -375,6 +403,85 @@ mod tests {
         );
     }
 
+    /// The prefix is read as `DuckDB` reads it, in any case and by the
+    /// extension's alias, and kept as written.
+    #[test]
+    fn a_prefix_in_any_case_or_by_alias_is_read() {
+        for prefix in ["Postgres", "POSTGRES", "postgres_scanner"] {
+            assert_eq!(
+                split(&format!("{prefix}:dbname=x password=hunter2")),
+                (format!("{prefix}:dbname=x"), Some("hunter2".to_string())),
+                "{prefix}"
+            );
+        }
+        assert_eq!(
+            split("MYSQL_SCANNER:host=localhost password=hunter2"),
+            (
+                "MYSQL_SCANNER:host=localhost".to_string(),
+                Some("hunter2".to_string())
+            )
+        );
+    }
+
+    /// A `PostgreSQL` or `MySQL` string that cannot be read is refused, saying
+    /// why, rather than attached whole, password included.
+    #[test]
+    fn an_unreadable_string_is_refused() {
+        for (s, database, reason) in [
+            (
+                "postgres:dbname=x password='unterminated",
+                MetadataDatabase::Postgres,
+                UNTERMINATED_QUOTE,
+            ),
+            (
+                "postgres:dbname=x password",
+                MetadataDatabase::Postgres,
+                MISSING_EQUALS,
+            ),
+            (
+                "postgres:dbname=x password='it''s'",
+                MetadataDatabase::Postgres,
+                MISSING_EQUALS,
+            ),
+            (
+                "postgres:dbname=x password=a\\",
+                MetadataDatabase::Postgres,
+                TRAILING_BACKSLASH,
+            ),
+            (
+                "postgres:postgresql://u:hunter%zz@127.0.0.1/x",
+                MetadataDatabase::Postgres,
+                BAD_PERCENT,
+            ),
+            (
+                "postgres:postgresql://u:hunter%+5@127.0.0.1/x",
+                MetadataDatabase::Postgres,
+                BAD_PERCENT,
+            ),
+            (
+                "postgres:postgresql://u:hunter2@[::1/x",
+                MetadataDatabase::Postgres,
+                BAD_HOST,
+            ),
+            (
+                "postgres:postgresql://u@h/x?password",
+                MetadataDatabase::Postgres,
+                BAD_QUERY,
+            ),
+            (
+                "mysql:mysql://root:hunter2@localhost/meta",
+                MetadataDatabase::Mysql,
+                MISSING_EQUALS,
+            ),
+        ] {
+            assert_eq!(
+                MetadataConnection::parse(s),
+                Err(Unreadable { database, reason }),
+                "{s}"
+            );
+        }
+    }
+
     /// A `MySQL` string loses its password under either name.
     #[test]
     fn a_mysql_string_loses_its_password() {
@@ -394,16 +501,13 @@ mod tests {
         );
     }
 
-    /// A string without a password, one that cannot be read, and any other
-    /// database's string are kept whole.
+    /// A string without a password, and any other database's string, is
+    /// kept whole.
     #[test]
     fn other_strings_are_kept_whole() {
         for s in [
             "postgres:dbname=x host=127.0.0.1",
             "postgres:postgresql://u@127.0.0.1/x",
-            "postgres:dbname=x password='unterminated",
-            "postgres:dbname=x password",
-            "postgres:dbname=x password='it''s'",
             "postgres:password=",
             "metadata.ducklake",
             "sqlite:metadata.sqlite",

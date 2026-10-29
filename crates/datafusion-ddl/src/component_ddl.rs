@@ -122,21 +122,36 @@ impl ComponentDdlOp {
     }
 
     /// The statement, for plans, logs, and errors: as the user wrote it, so
-    /// `CREATE OR REPLACE` is named as such.
+    /// `CREATE OR REPLACE`, `IF NOT EXISTS`, and `IF EXISTS` are named as
+    /// such.
     #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
             Self::CreateDataset {
                 or_replace: true, ..
             } => "CREATE OR REPLACE TABLE",
+            Self::CreateDataset {
+                if_not_exists: true,
+                ..
+            } => "CREATE TABLE IF NOT EXISTS",
+            Self::CreateDataset { .. } => "CREATE TABLE",
+            Self::AlterDataset { .. } => "ALTER TABLE",
+            Self::DropDataset {
+                if_exists: true, ..
+            } => "DROP TABLE IF EXISTS",
+            Self::DropDataset { .. } => "DROP TABLE",
             Self::CreateCatalog {
                 or_replace: true, ..
             } => "CREATE OR REPLACE CATALOG",
-            Self::CreateDataset { .. } => "CREATE TABLE",
-            Self::AlterDataset { .. } => "ALTER TABLE",
-            Self::DropDataset { .. } => "DROP TABLE",
+            Self::CreateCatalog {
+                if_not_exists: true,
+                ..
+            } => "CREATE CATALOG IF NOT EXISTS",
             Self::CreateCatalog { .. } => "CREATE CATALOG",
             Self::AlterCatalog { .. } => "ALTER CATALOG",
+            Self::DropCatalog {
+                if_exists: true, ..
+            } => "DROP CATALOG IF EXISTS",
             Self::DropCatalog { .. } => "DROP CATALOG",
         }
     }

@@ -21,7 +21,7 @@ limitations under the License.
 //! with the `ducklake` extension.
 
 use crate::duckdb::install_and_load_extension;
-use connection::{MetadataConnection, MetadataDatabase};
+use connection::{MetadataConnection, MetadataDatabase, Unreadable};
 
 pub mod connection;
 pub mod provider;
@@ -220,7 +220,7 @@ pub fn attach_ducklake(
     automatic_migration: bool,
 ) -> Result<(), String> {
     let failed = |e: duckdb::Error| attach_error_message(&e, connection_string);
-    let metadata = MetadataConnection::parse(connection_string);
+    let metadata = MetadataConnection::parse(connection_string).map_err(unreadable_message)?;
     let secret = match &metadata.password {
         Some((database, password)) => {
             install_and_load_extension(conn, database.extension()).map_err(failed)?;
@@ -244,21 +244,52 @@ pub fn attach_ducklake(
     Ok(())
 }
 
+/// Why a metadata connection string is refused: its password could not be
+/// held apart from what `DuckDB` repeats, so nothing is attached.
+fn unreadable_message(unreadable: Unreadable) -> String {
+    let (database, fix) = match unreadable.database {
+        MetadataDatabase::Postgres => (
+            "PostgreSQL",
+            "Write it as `key=value` pairs, or as a `postgresql://` URI with special characters percent-encoded, such as `%` as `%25`.",
+        ),
+        MetadataDatabase::Mysql => (
+            "MySQL",
+            "Write it as `key=value` pairs, with a value that holds a space in double quotes.",
+        ),
+    };
+    format!(
+        "the DuckLake metadata connection string could not be read as a {database} connection string: it has {}. {fix} See https://spiceai.org/docs/components/data-connectors/ducklake",
+        unreadable.reason
+    )
+}
+
 /// The text of `error`, from attaching the `DuckLake` catalog at
-/// `connection_string`, without the connection string or any part of it, as
-/// written or as a metadata database's extension repeats it, without its
-/// `postgres:` prefix, and without its password, which an extension that
-/// cannot read the string it merged with the secret repeats.
+/// `connection_string`, without the connection string or any part of it: as
+/// written, as attached without its password, either one without the prefix
+/// that names the database, which the extension repeats without it, and the
+/// password, which an extension that cannot read the string it merged with
+/// the secret repeats.
 #[must_use]
 pub fn attach_error_message(error: &impl std::fmt::Display, connection_string: &str) -> String {
+    let without_prefix = |s: &str| {
+        s.split_once(':')
+            .filter(|(prefix, path)| {
+                prefix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && path.chars().count() >= util::redact::SHORTEST_PART
+            })
+            .map(|(_, path)| path.to_string())
+    };
     let mut values = vec![connection_string.to_string()];
-    if let Some((scheme, path)) = connection_string.split_once(':')
-        && scheme.chars().all(|c| c.is_ascii_alphanumeric())
-        && path.chars().count() >= util::redact::SHORTEST_PART
+    values.extend(without_prefix(connection_string));
+    if let Ok(MetadataConnection {
+        path,
+        password: Some((_, password)),
+    }) = MetadataConnection::parse(connection_string)
     {
-        values.push(path.to_string());
-    }
-    if let Some((_, password)) = MetadataConnection::parse(connection_string).password {
+        values.extend(without_prefix(&path));
+        values.push(path);
         values.push(password);
     }
     util::redact::redact_values(&error.to_string(), &values).into_owned()
@@ -268,8 +299,9 @@ pub fn attach_error_message(error: &impl std::fmt::Display, connection_string: &
 mod tests {
     use super::{
         DuckLakeS3Params, attach_error_message, build_ducklake_attach_sql,
-        build_ducklake_s3_secret_sql, build_metadata_secret_sql, connection::MetadataDatabase,
-        metadata_secret_name, session_token_is_ignored,
+        build_ducklake_s3_secret_sql, build_metadata_secret_sql,
+        connection::{MetadataConnection, MetadataDatabase},
+        metadata_secret_name, session_token_is_ignored, unreadable_message,
     };
 
     #[test]
@@ -478,5 +510,27 @@ mod tests {
                 "{connection_string}"
             );
         }
+        // A URI is attached as the pairs it was rewritten to, which DuckLake
+        // and the extension repeat, with and without the prefix.
+        let error = r#"IO Error: Failed to attach DuckLake MetaData "__ducklake_metadata_c" at path + "postgres:user='dlkuser' host='127.0.0.1' port='1' dbname='dlkdb'"Unable to connect to Postgres at "user='dlkuser' host='127.0.0.1' port='1' dbname='dlkdb'": connection refused"#;
+        assert_eq!(
+            attach_error_message(
+                &error,
+                "postgres:postgresql://dlkuser:hunter2@127.0.0.1:1/dlkdb"
+            ),
+            r#"IO Error: Failed to attach DuckLake MetaData "__ducklake_metadata_c" at path + "<redacted>"Unable to connect to Postgres at "<redacted>": connection refused"#
+        );
+    }
+
+    /// A string whose password cannot be held apart is refused, saying why
+    /// and what to write instead, and without any part of it.
+    #[test]
+    fn an_unreadable_connection_string_is_refused_with_the_fix() {
+        let unreadable = MetadataConnection::parse("postgres:postgresql://u:hunter%zz@127.0.0.1/x")
+            .expect_err("a bare `%`");
+        assert_eq!(
+            unreadable_message(unreadable),
+            "the DuckLake metadata connection string could not be read as a PostgreSQL connection string: it has a `%` that is not followed by two hex digits, or that encodes bytes that are not UTF-8. Write it as `key=value` pairs, or as a `postgresql://` URI with special characters percent-encoded, such as `%` as `%25`. See https://spiceai.org/docs/components/data-connectors/ducklake"
+        );
     }
 }
