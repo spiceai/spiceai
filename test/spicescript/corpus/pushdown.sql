@@ -25,6 +25,7 @@ SELECT id, coalesce(i, -1) FROM t WHERE coalesce(i, -1) < 0;
 SELECT id, CASE WHEN i > 0 THEN 'pos' WHEN i < 0 THEN 'neg' ELSE 'zero-or-null' END FROM t;
 SELECT id, upper(s), lower(s) FROM t WHERE s IS NOT NULL;
 SELECT id, substring(s, 1, 3) FROM t WHERE s IS NOT NULL;
+SELECT id, char_length(s) FROM t WHERE char_length(s) > 4;
 SELECT id FROM t WHERE s LIKE 'O''%';
 SELECT id, s FROM t WHERE s = 'O''Brien';
 SELECT id FROM t WHERE dt >= DATE '2024-03-01' AND dt < DATE '2024-04-01';

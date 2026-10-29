@@ -7119,6 +7119,15 @@ impl DataFusion {
         }
     }
 
+    /// Discards every cached plan and result, for a reload that replaces a definition a
+    /// query reads through (a view, a catalog or a user function) rather than a table.
+    pub(crate) async fn clear_cached_plans_and_results(&self) {
+        self.clear_cached_plans().await;
+        if let Some(results) = self.results_cache_provider() {
+            results.invalidate_all().await;
+        }
+    }
+
     /// Plans `sql` and caches the result, so a test can then assert what invalidates the entry.
     ///
     /// Lives here rather than in the test module that uses it because the plan cache's own
@@ -7933,6 +7942,8 @@ async fn build_snapshot_refresh_state(
 
 #[cfg(test)]
 mod installation_tests;
+#[cfg(test)]
+mod integer_overflow;
 
 #[cfg(test)]
 mod tests {
