@@ -145,22 +145,28 @@ steps:
     eventually: 30s
 
   # One reader at a time on each lifetime dataset. With a 2s lifetime the
-  # pooled connection keeps being replaced; with `0s` the one connection the
-  # pool opened at startup serves every query.
+  # pooled connection keeps being replaced; with `0s` the pool opens no
+  # connection while it reads. Each dataset's connection total is saved first,
+  # because every pool opens more than one connection at startup.
+  - source-exec:
+      src: |
+        CREATE TABLE connections_before (who VARCHAR(2) PRIMARY KEY, total BIGINT NOT NULL);
+        INSERT INTO connections_before SELECT 'ls', TOTAL_CONNECTIONS FROM performance_schema.users WHERE USER = 'ls_${sources.src.namespace}';
+        INSERT INTO connections_before SELECT 'lo', TOTAL_CONNECTIONS FROM performance_schema.users WHERE USER = 'lo_${sources.src.namespace}';
   - background: { id: read_short, concurrency: 1, every: 200ms, query: 'SELECT id, v FROM life_short', expect: { id: '1', v: '10' } }
   - background: { id: read_off, concurrency: 1, every: 200ms, query: 'SELECT id, v FROM life_off', expect: { id: '1', v: '10' } }
-  - source-query: { src: "SELECT TOTAL_CONNECTIONS >= 4 FROM performance_schema.users WHERE USER = 'ls_${sources.src.namespace}'" }
+  - source-query: { src: "SELECT (SELECT TOTAL_CONNECTIONS FROM performance_schema.users WHERE USER = 'ls_${sources.src.namespace}') - (SELECT total FROM connections_before WHERE who = 'ls') >= 2" }
     expect: { rows: [['1']] }
     eventually: 60s
   - wait-metric: { name: dataset_mysql_discarded_expired_connection, labels: { name: life_short }, above: 0, timeout: 30s }
   - stop-background: { id: read_short }
   - stop-background: { id: read_off }
-  - source-query: { src: "SELECT TOTAL_CONNECTIONS FROM performance_schema.users WHERE USER = 'lo_${sources.src.namespace}'" }
-    expect: { rows: [['1']] }
+  - source-query: { src: "SELECT (SELECT TOTAL_CONNECTIONS FROM performance_schema.users WHERE USER = 'lo_${sources.src.namespace}') - (SELECT total FROM connections_before WHERE who = 'lo')" }
+    expect: { rows: [['0']] }
 
   # The server a dataset's connections reached is logged at INFO once per server
   # per 10 minutes: one line for life_short, whose connections were replaced at
-  # least four times above, and one for life_off.
+  # least twice above, and one for life_off.
   - assert-log:
       contains: ["INFO .*MySQL dataset 'life_short' opened connection \\d+ to '127\\.0\\.0\\.1:\\d+', which reached server '[^']+:3306'\\."]
   - assert-log: { count: { "INFO .*MySQL dataset 'life_short' opened connection": 1 } }
