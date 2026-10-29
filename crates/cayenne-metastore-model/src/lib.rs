@@ -1856,6 +1856,27 @@ where
             std::process::exit(1);
         }
     });
+    // A control is done once its expected failure and every witness it must
+    // reach are found; exhausting the rest of its graph checks nothing more.
+    let targets = if run.failure.is_empty() || run.seed.is_some() {
+        std::collections::BTreeSet::default()
+    } else {
+        model
+            .properties()
+            .iter()
+            .filter(|p| {
+                p.name == run.failure
+                    || p.expectation == Expectation::Sometimes
+                        && required_witness(&run, p.name, &p.expectation)
+            })
+            .map(|p| p.name)
+            .collect()
+    };
+    let finish = if targets.is_empty() {
+        stateright::HasDiscoveries::AnyOf(targets)
+    } else {
+        stateright::HasDiscoveries::AllOf(targets)
+    };
     let builder = model
         .checker()
         .threads(
@@ -1864,9 +1885,7 @@ where
                 .and_then(|t| t.parse().ok())
                 .unwrap_or(DEFAULT_THREADS),
         )
-        .finish_when(stateright::HasDiscoveries::AnyOf(
-            std::collections::BTreeSet::default(),
-        ));
+        .finish_when(finish);
     let builder = if let Some(f) = representative {
         builder.symmetry_fn(f)
     } else {
@@ -1900,6 +1919,146 @@ where
     let joined = watchdog.join().is_ok();
     result && joined
 }
+/// Whether a run must reach the `sometimes` property `name`.
+fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
+    let symmetry_required = run.mode.contains("symmetry")
+        && run.failure.is_empty()
+        && matches!(
+            name,
+            "both participants commit"
+                | "both participants abort"
+                | "all three participants commit"
+                | "all three participants abort"
+                | "checkpoint rebuilds unresolved Prepare"
+                | "identical retry accepted"
+        );
+    let composed_required = run.family == "lifecycle-composed"
+        && match name {
+            "prepared commit visible"
+            | "prepared abort discarded"
+            | "maintenance while prepared"
+            | "ordinary write while prepared"
+            | "prepared delete commits"
+            | "prepared upsert commits"
+            | "two actions prepared together"
+            | "abort after maintenance"
+            | "checkpoint retains prepared actions"
+            | "GC while prepared" => run.mode.contains("prepare"),
+            "higher cutoff while prepared" => run.mode == "prepare-no-cutoff-cap",
+            "warm subset rewrite" | "cold promotion" => true,
+            "row object collected" => {
+                run.failure.is_empty() && !run.mode.contains("no-sealed-floor")
+            }
+            "missing delayed object errors" => {
+                run.mode.contains("expiry") && !run.mode.contains("missing-as-empty")
+            }
+            "expired delayed read completes" | "object deleted during dispatched read" => {
+                run.mode.contains("expiry")
+            }
+            "query replay batch retained"
+            | "checkpoint page collected"
+            | "byte budget evicts records"
+            | "count budget evicts records" => run.mode == "byte-window-metadata-prefix",
+            _ => false,
+        };
+    let read_required = run.failure.is_empty()
+        && match (run.family, name) {
+            (
+                "read-programs",
+                "two read-dependent writers and blind commit"
+                | "conflict replans statement"
+                | "independent loser retries",
+            ) => run.mode.contains("full"),
+            _ => false,
+        };
+    let widened_required = run.failure.is_empty()
+        && run.mode.contains("widened")
+        && match (run.family, name) {
+            ("read-programs", "all three writers commit") => run.bound >= 3,
+            ("read-programs", "writer commits two statements") => {
+                run.bound >= 2 && !run.mode.contains("transaction")
+            }
+            ("read-programs", "conflict replans statement" | "independent loser retries") => {
+                run.bound >= 2
+            }
+            (
+                "read-delivery",
+                "lost response resolved by head read" | "delayed duplicate of accepted request",
+            ) => true,
+            _ => false,
+        };
+    let promotion_required = run.family == "cold-promotion"
+        && run.failure.is_empty()
+        && *expectation == Expectation::Sometimes;
+    let delivery_required = run.family == "read-delivery"
+        && (run.failure.is_empty()
+            && matches!(
+                name,
+                "lost response resolved by head read" | "delayed duplicate of accepted request"
+            )
+            || run.mode.contains("no-resolve-before-replan")
+                && name == "unknown relative update applied twice");
+    let added_required = run.failure.is_empty()
+        && run.seed.is_none()
+        && match (run.family, name) {
+            (
+                "remote-maintenance",
+                "writer retries original stamps then commits" | "maintenance retries guards",
+            )
+            | ("position-deletes", "compaction remaps winning position delete") => true,
+            ("remote-maintenance", "covered clear retries and publishes") => {
+                run.mode.contains("clear-retry")
+            }
+            ("remote-maintenance", "checkpoint published") => !run.mode.contains("clear-retry"),
+            (
+                "remote-maintenance",
+                "two tables acknowledged together"
+                | "maintenance lease fenced"
+                | "cold promotion publishes",
+            ) => !run.mode.contains("minimal") && !run.mode.contains("clear-retry"),
+            (
+                "remote-maintenance",
+                "maintenance while Prepare unresolved" | "Prepare committed" | "Prepare aborted",
+            ) => run.mode.contains("prepare"),
+            (
+                "remote-maintenance",
+                "overlapping maintenance planned" | "maintenance replans invalid guards",
+            ) => run.mode.contains("no-file-set-lease"),
+            ("read-programs", "winner commits between transaction statements") => {
+                run.mode.contains("transaction-widened") && run.bound >= 2
+            }
+            (
+                "read-programs",
+                "transaction reads its own writes" | "transaction commits two nonempty statements",
+            ) => run.mode.contains("transaction-widened"),
+            ("position-deletes", "position delete remapped after compaction") => {
+                !run.mode.contains("already-dropped")
+            }
+            ("position-deletes", "already deleted target consumed") => {
+                run.mode == "already-dropped"
+            }
+            _ => false,
+        };
+    added_required
+        || promotion_required
+        || delivery_required
+        || widened_required
+        || read_required
+        || symmetry_required
+        || composed_required
+        || run.seed.is_none()
+            && match run.name {
+                "dataset-lifecycle"
+                | "source-positions"
+                | "retention"
+                | "unknown-action-refusal" => *expectation == Expectation::Sometimes,
+                "commits-restart-turnover" => matches!(
+                    name,
+                    "restart and lease turnover" | "persisted attempt restored"
+                ),
+                _ => false,
+            }
+}
 fn output<M: Model, C: Checker<M>>(c: &C, run: &Run, start: Instant) -> bool
 where
     M::State: Clone + PartialEq + std::fmt::Debug,
@@ -1928,146 +2087,7 @@ where
     let mut expected_found = run.failure.is_empty();
     for p in c.model().properties() {
         let found = discoveries.get(p.name);
-        let symmetry_required = run.mode.contains("symmetry")
-            && run.failure.is_empty()
-            && matches!(
-                p.name,
-                "both participants commit"
-                    | "both participants abort"
-                    | "all three participants commit"
-                    | "all three participants abort"
-                    | "checkpoint rebuilds unresolved Prepare"
-                    | "identical retry accepted"
-            );
-        let composed_required = run.family == "lifecycle-composed"
-            && match p.name {
-                "prepared commit visible"
-                | "prepared abort discarded"
-                | "maintenance while prepared"
-                | "ordinary write while prepared"
-                | "prepared delete commits"
-                | "prepared upsert commits"
-                | "two actions prepared together"
-                | "abort after maintenance"
-                | "checkpoint retains prepared actions"
-                | "GC while prepared" => run.mode.contains("prepare"),
-                "higher cutoff while prepared" => run.mode == "prepare-no-cutoff-cap",
-                "warm subset rewrite" | "cold promotion" => true,
-                "row object collected" => {
-                    run.failure.is_empty() && !run.mode.contains("no-sealed-floor")
-                }
-                "missing delayed object errors" => {
-                    run.mode.contains("expiry") && !run.mode.contains("missing-as-empty")
-                }
-                "expired delayed read completes" | "object deleted during dispatched read" => {
-                    run.mode.contains("expiry")
-                }
-                "query replay batch retained"
-                | "checkpoint page collected"
-                | "byte budget evicts records"
-                | "count budget evicts records" => run.mode == "byte-window-metadata-prefix",
-                _ => false,
-            };
-        let read_required = run.failure.is_empty()
-            && match (run.family, p.name) {
-                (
-                    "read-programs",
-                    "two read-dependent writers and blind commit"
-                    | "conflict replans statement"
-                    | "independent loser retries",
-                ) => run.mode.contains("full"),
-                _ => false,
-            };
-        let widened_required = run.failure.is_empty()
-            && run.mode.contains("widened")
-            && match (run.family, p.name) {
-                ("read-programs", "all three writers commit") => run.bound >= 3,
-                ("read-programs", "writer commits two statements") => {
-                    run.bound >= 2 && !run.mode.contains("transaction")
-                }
-                ("read-programs", "conflict replans statement" | "independent loser retries") => {
-                    run.bound >= 2
-                }
-                (
-                    "read-delivery",
-                    "lost response resolved by head read" | "delayed duplicate of accepted request",
-                ) => true,
-                _ => false,
-            };
-        let promotion_required = run.family == "cold-promotion"
-            && run.failure.is_empty()
-            && p.expectation == Expectation::Sometimes;
-        let delivery_required = run.family == "read-delivery"
-            && (run.failure.is_empty()
-                && matches!(
-                    p.name,
-                    "lost response resolved by head read" | "delayed duplicate of accepted request"
-                )
-                || run.mode.contains("no-resolve-before-replan")
-                    && p.name == "unknown relative update applied twice");
-        let added_required = run.failure.is_empty()
-            && run.seed.is_none()
-            && match (run.family, p.name) {
-                (
-                    "remote-maintenance",
-                    "writer retries original stamps then commits" | "maintenance retries guards",
-                )
-                | ("position-deletes", "compaction remaps winning position delete") => true,
-                ("remote-maintenance", "covered clear retries and publishes") => {
-                    run.mode.contains("clear-retry")
-                }
-                ("remote-maintenance", "checkpoint published") => !run.mode.contains("clear-retry"),
-                (
-                    "remote-maintenance",
-                    "two tables acknowledged together"
-                    | "maintenance lease fenced"
-                    | "cold promotion publishes",
-                ) => !run.mode.contains("minimal") && !run.mode.contains("clear-retry"),
-                (
-                    "remote-maintenance",
-                    "maintenance while Prepare unresolved"
-                    | "Prepare committed"
-                    | "Prepare aborted",
-                ) => run.mode.contains("prepare"),
-                (
-                    "remote-maintenance",
-                    "overlapping maintenance planned" | "maintenance replans invalid guards",
-                ) => run.mode.contains("no-file-set-lease"),
-                ("read-programs", "winner commits between transaction statements") => {
-                    run.mode.contains("transaction-widened") && run.bound >= 2
-                }
-                (
-                    "read-programs",
-                    "transaction reads its own writes"
-                    | "transaction commits two nonempty statements",
-                ) => run.mode.contains("transaction-widened"),
-                ("position-deletes", "position delete remapped after compaction") => {
-                    !run.mode.contains("already-dropped")
-                }
-                ("position-deletes", "already deleted target consumed") => {
-                    run.mode == "already-dropped"
-                }
-                _ => false,
-            };
-        let required = added_required
-            || promotion_required
-            || delivery_required
-            || widened_required
-            || read_required
-            || symmetry_required
-            || composed_required
-            || run.seed.is_none()
-                && match run.name {
-                    "dataset-lifecycle"
-                    | "source-positions"
-                    | "retention"
-                    | "unknown-action-refusal" => p.expectation == Expectation::Sometimes,
-                    "commits-restart-turnover" => matches!(
-                        p.name,
-                        "restart and lease turnover" | "persisted attempt restored"
-                    ),
-                    _ => false,
-                };
+        let required = required_witness(run, p.name, &p.expectation);
         if required && found.is_none() {
             good = false;
             println!("MISSING_REQUIRED_WITNESS {}", p.name);
@@ -2075,7 +2095,7 @@ where
         let status = match (&p.expectation, found.is_some()) {
             (Expectation::Always | Expectation::Eventually, true) => "FAIL",
             (Expectation::Always | Expectation::Eventually, false)
-                if run.seed.is_none() && complete =>
+                if run.seed.is_none() && complete && run.failure.is_empty() =>
             {
                 "HOLDS"
             }

@@ -19,7 +19,7 @@ nice -n 10 cargo run --release -p cayenne-metastore-model -- run seq-order-two-w
 EXHAUST=1 nice -n 10 cargo run --release -p cayenne-metastore-model -- run seq-order-no-shift
 ```
 
-Checkers use 6 threads by default; set `MODEL_THREADS` to change it. Results do not depend on the thread count, and the binary uses mimalloc, because cloning states dominates checking. Controls require `EXHAUST=1` and exhaust their graph. A wrong outcome, missing
+Checkers use 6 threads by default; set `MODEL_THREADS` to change it. Results do not depend on the thread count, and the binary uses mimalloc, because cloning states dominates checking. Controls require `EXHAUST=1`. A control stops once it has found its expected failure and every witness it must reach; its other safety properties print `NOT_FOUND`, not `HOLDS`, because the rest of its graph is not explored. A wrong outcome, missing
 required control failure, invalid witness, or checker timeout makes the command fail.
 A sampled run reports `NOT_FOUND`, which does not establish exhaustive safety.
 New exhaustive safe graphs require their essential reachability witnesses; missing
