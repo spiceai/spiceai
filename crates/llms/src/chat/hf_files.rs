@@ -171,7 +171,7 @@ fn resolve_gguf(
                 describe(resolved.quantization.as_deref(), resolved.weights.len()),
                 resolved
                     .draft
-                    .as_ref()
+                    .first()
                     .map_or_else(String::new, |draft| format!(", drafting with '{draft}'"))
             );
         }

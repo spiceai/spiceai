@@ -24,6 +24,8 @@ pub mod llms;
 // Credential-free tests that run in `make nextest`; `llms` calls live provider
 // APIs and runs in `integration_llms.yml`.
 mod anthropic_stream_errors;
+#[cfg(feature = "local_llm")]
+mod gguf_hf_cache;
 mod list_models_errors;
 #[cfg(feature = "local_embed")]
 mod model2vec_hf_cache;
