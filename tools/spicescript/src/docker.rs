@@ -24,6 +24,7 @@ use std::{collections::HashMap, time::Duration};
 use anyhow::{Context, Result, bail};
 use bollard::{
     Docker,
+    auth::DockerCredentials,
     container::{
         Config, CreateContainerOptions, InspectContainerOptions, NetworkingConfig,
         RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
@@ -493,22 +494,207 @@ fn patient(docker: Docker) -> Docker {
     docker.with_timeout(DOCKER_REQUEST_TIMEOUT)
 }
 
+/// How many times an image is pulled before the pull counts as failed. A
+/// pull streams the image from its registry through the daemon, and that
+/// stream can break off part way: the response ends mid-message (`bytes
+/// remaining on stream`), or the daemon reports a registry error mid-stream.
+/// Pulling again keeps the layers already fetched. Only the pull is retried;
+/// the image is not what a script tests.
+const PULL_ATTEMPTS: u32 = 3;
+
+/// How long to wait before pulling again after a pull broke off.
+const PULL_RETRY_PAUSE: Duration = Duration::from_secs(5);
+
 async fn pull_if_missing(docker: &Docker, image: &str) -> Result<()> {
     if docker.inspect_image(image).await.is_ok() {
         return Ok(());
     }
+    let credentials = match docker_config_path() {
+        Some(path) => tokio::fs::read_to_string(path)
+            .await
+            .ok()
+            .and_then(|config| registry_credentials(&config, image)),
+        None => None,
+    };
+    let login = match credentials
+        .as_ref()
+        .and_then(|c| c.serveraddress.as_deref())
+    {
+        Some(address) => format!("with the docker login for {address}"),
+        None => "anonymously".to_string(),
+    };
+    crate::runner::emit(&format!("   pulling {image} {login}"));
+    pull_with_retries(PULL_ATTEMPTS, PULL_RETRY_PAUSE, image, || {
+        pull_image(docker, image, credentials.clone())
+    })
+    .await
+    .map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to pull {image} ({login}): {}",
+            pull_error_text(&err)
+        )
+    })
+}
+
+async fn pull_image(
+    docker: &Docker,
+    image: &str,
+    credentials: Option<DockerCredentials>,
+) -> Result<(), bollard::errors::Error> {
     let mut pull = docker.create_image(
         Some(CreateImageOptions {
             from_image: image,
             ..Default::default()
         }),
         None,
-        None,
+        credentials,
     );
     while let Some(event) = pull.next().await {
-        event.with_context(|| format!("Failed to pull {image}"))?;
+        event?;
     }
     Ok(())
+}
+
+/// The Docker CLI's config file, where `docker login` stores credentials:
+/// `$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`.
+fn docker_config_path() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("DOCKER_CONFIG") {
+        return Some(std::path::PathBuf::from(dir).join("config.json"));
+    }
+    std::env::var_os("HOME").map(|home| {
+        std::path::PathBuf::from(home)
+            .join(".docker")
+            .join("config.json")
+    })
+}
+
+/// The credentials `docker login` stored in `config` (the Docker CLI's
+/// config file) for the registry `image` is pulled from. The Docker CLI
+/// sends these with each pull and the daemon never reads the CLI's config,
+/// so a pull made without them is anonymous, and Docker Hub rate limits
+/// anonymous pulls by address (`429 Too Many Requests`). A login kept in a
+/// credential helper (`credsStore`, `credHelpers`) has no usable entry here,
+/// and the pull stays anonymous.
+fn registry_credentials(config: &str, image: &str) -> Option<DockerCredentials> {
+    use base64::Engine as _;
+
+    let config: serde_json::Value = serde_json::from_str(config).ok()?;
+    let registry = registry_host(image_registry(image));
+    let (address, entry) = config
+        .get("auths")?
+        .as_object()?
+        .iter()
+        .find(|(address, _)| registry_host(address) == registry)?;
+    let field = |name: &str| entry.get(name).and_then(|v| v.as_str()).map(str::to_string);
+    let (username, password) = match field("auth") {
+        Some(auth) => {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(auth.trim())
+                .ok()?;
+            let (username, password) = std::str::from_utf8(&decoded).ok()?.split_once(':')?;
+            (Some(username.to_string()), Some(password.to_string()))
+        }
+        None => (field("username"), field("password")),
+    };
+    let identitytoken = field("identitytoken");
+    if username.is_none() && identitytoken.is_none() {
+        return None;
+    }
+    Some(DockerCredentials {
+        username,
+        password,
+        identitytoken,
+        serveraddress: Some(address.clone()),
+        ..Default::default()
+    })
+}
+
+/// The registry an image reference names: its first path component when that
+/// is a host (it has a `.` or a port, or is `localhost`), else Docker Hub.
+fn image_registry(image: &str) -> &str {
+    match image.split_once('/') {
+        Some((first, _)) if first.contains(['.', ':']) || first == "localhost" => first,
+        _ => "docker.io",
+    }
+}
+
+/// A registry address reduced to its host, with Docker Hub's several names
+/// (`https://index.docker.io/v1/`, the key `docker login` writes, among them)
+/// reduced to one.
+fn registry_host(address: &str) -> &str {
+    let host = address
+        .strip_prefix("https://")
+        .or_else(|| address.strip_prefix("http://"))
+        .unwrap_or(address);
+    let host = host.split('/').next().unwrap_or(host);
+    match host {
+        "index.docker.io" | "registry-1.docker.io" => "docker.io",
+        host => host,
+    }
+}
+
+/// Runs `pull` until it succeeds, fails other than by its stream breaking
+/// off, or has been tried `attempts` times, pausing `pause` before each
+/// retry. Each retry is reported in the script's output, naming `image`.
+async fn pull_with_retries<P, PF>(
+    attempts: u32,
+    pause: Duration,
+    image: &str,
+    mut pull: P,
+) -> Result<(), bollard::errors::Error>
+where
+    P: FnMut() -> PF,
+    PF: std::future::Future<Output = Result<(), bollard::errors::Error>>,
+{
+    let mut tried = 1;
+    loop {
+        match pull().await {
+            Ok(()) => return Ok(()),
+            Err(err) if tried < attempts && pull_broke_off(&err) => {
+                crate::runner::emit(&format!(
+                    "   pulling {image} broke off ({}); pulling again ({tried} of {attempts} attempts made)",
+                    pull_error_text(&err)
+                ));
+                tried += 1;
+                tokio::time::sleep(pause).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Whether a pull failed because its stream broke off, which pulling again
+/// can get past, rather than because the image cannot be pulled: Docker
+/// answers a missing image or a refused login before the stream starts, and
+/// reports a missing manifest or platform in the stream.
+fn pull_broke_off(err: &bollard::errors::Error) -> bool {
+    use bollard::errors::Error;
+    const PERMANENT: [&str; 5] = [
+        "manifest unknown",
+        "no matching manifest",
+        "not found",
+        "access denied",
+        "unauthorized",
+    ];
+    match err {
+        Error::IOError { .. } => true,
+        Error::DockerStreamError { error } => {
+            let error = error.to_ascii_lowercase();
+            !PERMANENT.iter().any(|permanent| error.contains(permanent))
+        }
+        _ => false,
+    }
+}
+
+/// The error a pull failed with, including the daemon's own message for an
+/// error reported mid-stream, which bollard's `Display` leaves out.
+fn pull_error_text(err: &bollard::errors::Error) -> String {
+    match err {
+        bollard::errors::Error::DockerStreamError { error } => {
+            format!("Docker stream error: {error}")
+        }
+        other => other.to_string(),
+    }
 }
 
 /// How many times creating a container is tried when Docker does not answer
@@ -901,6 +1087,251 @@ mod create_retry_tests {
                 got,
                 Err(Error::DockerResponseServerError {
                     status_code: 409,
+                    ..
+                })
+            ),
+            "{got:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod pull_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    use base64::Engine as _;
+    use bollard::{API_DEFAULT_VERSION, Docker, auth::DockerCredentials, errors::Error};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    use super::{
+        pull_broke_off, pull_error_text, pull_image, pull_with_retries, registry_credentials,
+    };
+
+    /// `docker login` to Docker Hub as `user` with password `s3cr3t`, as the
+    /// Docker CLI stores it.
+    const HUB_LOGIN: &str =
+        r#"{"auths":{"https://index.docker.io/v1/":{"auth":"dXNlcjpzM2NyM3Q="}}}"#;
+
+    /// A Docker API that answers every request with `body` after the
+    /// headers of a `200 OK`, then closes the connection, and keeps each
+    /// request's `X-Registry-Auth` header.
+    async fn daemon(body: &'static str) -> (Docker, Arc<parking_lot::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local address");
+        let auth = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&auth);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request).into_owned();
+                    if let Some(value) = request.lines().find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("x-registry-auth"))
+                            .map(|(_, value)| value.trim().to_string())
+                    }) {
+                        seen.lock().push(value);
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let docker = Docker::connect_with_http(&format!("http://{addr}"), 5, API_DEFAULT_VERSION)
+            .expect("client");
+        (docker, auth)
+    }
+
+    fn hub_login() -> DockerCredentials {
+        DockerCredentials {
+            username: Some("user".into()),
+            password: Some("s3cr3t".into()),
+            serveraddress: Some("https://index.docker.io/v1/".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reads_the_login_for_the_registry_an_image_is_pulled_from() {
+        for image in [
+            "mongo:8.0",
+            "docker.io/library/mongo:8.0",
+            "clickhouse/clickhouse-server:24.8",
+        ] {
+            assert_eq!(
+                registry_credentials(HUB_LOGIN, image),
+                Some(hub_login()),
+                "{image}"
+            );
+        }
+
+        // A login to another registry is not sent to Docker Hub, and the Hub
+        // login is not sent to another registry.
+        let ghcr = r#"{"auths":{"ghcr.io":{"username":"bot","password":"token"}}}"#;
+        assert_eq!(registry_credentials(ghcr, "mongo:8.0"), None);
+        assert_eq!(
+            registry_credentials(HUB_LOGIN, "ghcr.io/spiceai/image:1"),
+            None
+        );
+        assert_eq!(
+            registry_credentials(HUB_LOGIN, "localhost:5000/image"),
+            None
+        );
+        assert_eq!(
+            registry_credentials(ghcr, "ghcr.io/spiceai/image:1"),
+            Some(DockerCredentials {
+                username: Some("bot".into()),
+                password: Some("token".into()),
+                serveraddress: Some("ghcr.io".into()),
+                ..Default::default()
+            })
+        );
+
+        // A login kept in a credential helper leaves an empty entry: pull
+        // anonymously rather than send an empty login.
+        let helper = r#"{"auths":{"https://index.docker.io/v1/":{}},"credsStore":"desktop"}"#;
+        assert_eq!(registry_credentials(helper, "mongo:8.0"), None);
+        assert_eq!(registry_credentials("not json", "mongo:8.0"), None);
+    }
+
+    #[tokio::test]
+    async fn a_pull_sends_the_stored_login() {
+        let (docker, auth) = daemon("{\"status\":\"Pulling from library/mongo\"}\n").await;
+        pull_image(&docker, "mongo:8.0", Some(hub_login()))
+            .await
+            .expect("the pull succeeds");
+        pull_image(&docker, "mongo:8.0", None)
+            .await
+            .expect("the pull succeeds");
+        let sent = auth.lock().clone();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        let login: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(&sent[0])
+                .expect("base64"),
+        )
+        .expect("JSON");
+        assert_eq!(login["username"], "user");
+        assert_eq!(login["password"], "s3cr3t");
+        assert_eq!(login["serveraddress"], "https://index.docker.io/v1/");
+        // Without a login the header is empty: Docker pulls anonymously.
+        assert!(sent[1].is_empty(), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_cut_off_mid_message_or_failing_mid_stream_is_retried() {
+        // The response ends inside a progress message, as a pull does when
+        // its connection drops.
+        let (docker, _) = daemon("{\"status\":\"Downloading\",\"progressDetail\":{\"curr").await;
+        let err = pull_image(&docker, "mongo:8.0", None)
+            .await
+            .expect_err("a cut-off stream fails the pull");
+        assert_eq!(pull_error_text(&err), "bytes remaining on stream");
+        assert!(pull_broke_off(&err), "{err:?}");
+
+        // The daemon reports a registry error in the stream; its message is
+        // kept, though bollard's `Display` leaves it out.
+        let (docker, _) = daemon(
+            "{\"errorDetail\":{\"message\":\"read tcp: connection reset by peer\"},\"error\":\"read tcp: connection reset by peer\"}\n",
+        )
+        .await;
+        let err = pull_image(&docker, "mongo:8.0", None)
+            .await
+            .expect_err("an error in the stream fails the pull");
+        assert_eq!(
+            pull_error_text(&err),
+            "Docker stream error: read tcp: connection reset by peer"
+        );
+        assert!(pull_broke_off(&err), "{err:?}");
+    }
+
+    #[test]
+    fn an_image_that_cannot_be_pulled_is_not_retried() {
+        for err in [
+            Error::DockerResponseServerError {
+                status_code: 404,
+                message: "pull access denied for nosuch/image, repository does not exist".into(),
+            },
+            Error::DockerResponseServerError {
+                status_code: 500,
+                message: "toomanyrequests: You have reached your unauthenticated pull rate limit"
+                    .into(),
+            },
+            Error::DockerStreamError {
+                error: "no matching manifest for linux/arm64/v8 in the manifest list entries"
+                    .into(),
+            },
+            Error::DockerStreamError {
+                error: "manifest unknown".into(),
+            },
+        ] {
+            assert!(!pull_broke_off(&err), "{err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_a_pull_that_broke_off_up_to_the_allowed_attempts() {
+        let broke_off = || Error::DockerStreamError {
+            error: "unexpected EOF".into(),
+        };
+
+        // Two breaks, then success: three attempts.
+        let calls = AtomicU32::new(0);
+        let got = pull_with_retries(3, Duration::ZERO, "mongo:8.0", || async {
+            match calls.fetch_add(1, Ordering::SeqCst) {
+                0 | 1 => Err(broke_off()),
+                _ => Ok(()),
+            }
+        })
+        .await;
+        assert!(got.is_ok(), "{got:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // Breaks every time: gives up after the allowed attempts with the
+        // last error.
+        let calls = AtomicU32::new(0);
+        let got = pull_with_retries(3, Duration::ZERO, "mongo:8.0", || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(broke_off())
+        })
+        .await;
+        assert!(
+            matches!(got, Err(Error::DockerStreamError { .. })),
+            "{got:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // A missing image fails at once.
+        let calls = AtomicU32::new(0);
+        let got = pull_with_retries(3, Duration::ZERO, "nosuch/image", || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(Error::DockerResponseServerError {
+                status_code: 404,
+                message: "pull access denied".into(),
+            })
+        })
+        .await;
+        assert!(
+            matches!(
+                got,
+                Err(Error::DockerResponseServerError {
+                    status_code: 404,
                     ..
                 })
             ),

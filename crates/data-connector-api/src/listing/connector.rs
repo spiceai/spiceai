@@ -17,6 +17,7 @@ limitations under the License.
 use crate::federated::FederatedTableProvider;
 use crate::parameters::ConnectorContext;
 use data_components::cdc::{AccelerationContents, ChangesStream};
+use data_components::csv_header_projection::HeaderProjectedCsvFormat;
 use data_components::file_schema_drift::{FileSchemaDriftGuard, FileSchemaDriftLayer};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -1894,6 +1895,11 @@ pub trait ListingTableConnector: DataConnector {
             name = dataset.name,
             sanitized_url = schema_infer_url.sanitized_url(),
         );
+
+        // Headered CSV is read by column name. Wrap here, not in
+        // `get_file_format_and_extension`, so Hugging Face can still downcast
+        // the unwrapped `CsvFormat` for its positional commit check.
+        let file_format = HeaderProjectedCsvFormat::wrap(file_format);
 
         // `target_partitions` and `collect_statistics` are read from the scanning
         // session's config at scan time, so they are no longer copied onto the options.
@@ -4385,6 +4391,659 @@ mod tests {
         } else {
             panic!("Unexpected error");
         }
+    }
+
+    #[tokio::test]
+    async fn get_file_format_and_extension_keeps_unwrapped_csv_format() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "csv".to_string());
+        let (connector, dataset) = setup_connector("test:test.csv".to_string(), params);
+        let (Some(file_format), _) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("csv format")
+        else {
+            panic!("expected a CSV file format");
+        };
+        assert!(
+            file_format.as_ref().downcast_ref::<CsvFormat>().is_some(),
+            "Hugging Face downcasts CsvFormat from get_file_format_and_extension"
+        );
+        assert!(
+            file_format
+                .as_ref()
+                .downcast_ref::<HeaderProjectedCsvFormat>()
+                .is_none()
+        );
+    }
+
+    fn write_events_csv(path: &std::path::Path, header: &str, rows: &[&str]) {
+        let mut text = String::from(header);
+        text.push('\n');
+        for row in rows {
+            text.push_str(row);
+            text.push('\n');
+        }
+        std::fs::write(path, text).expect("write csv");
+    }
+
+    async fn csv_listing_sums(
+        provider: Arc<dyn TableProvider>,
+        refresh: bool,
+    ) -> (Option<i64>, Option<i64>) {
+        let mut config = datafusion::prelude::SessionConfig::new();
+        if refresh {
+            data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        }
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let batches = ctx
+            .sql("SELECT sum(amount_cents), sum(user_id) FROM events")
+            .await
+            .expect("sql")
+            .collect()
+            .await
+            .expect("collect");
+        let batch = &batches[0];
+        let amounts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("amount_cents");
+        let users = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("user_id");
+        (
+            (!amounts.is_null(0)).then(|| amounts.value(0)),
+            (!users.is_null(0)).then(|| users.value(0)),
+        )
+    }
+
+    /// `(event_id, "user.name")` for every row of a flattened JSON listing,
+    /// ordered by `event_id`.
+    async fn json_user_names(
+        provider: Arc<dyn TableProvider>,
+        refresh: bool,
+    ) -> Vec<(i64, Option<String>)> {
+        let mut config = datafusion::prelude::SessionConfig::new();
+        if refresh {
+            data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        }
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let batches = ctx
+            .sql(r#"SELECT event_id, "user.name" FROM events ORDER BY event_id"#)
+            .await
+            .expect("sql")
+            .collect()
+            .await
+            .expect("collect");
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let ids = arrow::compute::cast(batch.column(0), &DataType::Int64).expect("event_id");
+            let ids = ids
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("event_id as Int64");
+            let names = arrow::compute::cast(batch.column(1), &DataType::Utf8).expect("user.name");
+            let names = names
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("user.name as Utf8");
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    ids.value(row),
+                    (!names.is_null(row)).then(|| names.value(row).to_string()),
+                ));
+            }
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_binds_csv_columns_by_header_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.csv");
+        write_events_csv(
+            &path,
+            "event_id,user_id,region,amount_cents,ts",
+            &["1,10,us,100,t0", "2,20,eu,200,t1"],
+        );
+
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "csv".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("csv format")
+        else {
+            panic!("expected a CSV file format");
+        };
+
+        let template = connector
+            .listing_table_template(&dataset, &url, &extension, Arc::clone(&file_format))
+            .await
+            .expect("template");
+        assert!(
+            template
+                .options
+                .format
+                .as_ref()
+                .downcast_ref::<HeaderProjectedCsvFormat>()
+                .is_some(),
+            "listing options must wrap a headered CSV so columns bind by name"
+        );
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30))
+        );
+
+        write_events_csv(
+            &path,
+            "event_id,amount_cents,region,user_id,ts",
+            &["1,100,us,10,t0", "2,200,eu,20,t1"],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30)),
+            "values must follow the header names after a column reorder"
+        );
+
+        write_events_csv(
+            &path,
+            "event_id,user_id,region,amt,ts",
+            &["1,10,us,100,t0", "2,20,eu,200,t1"],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (None, Some(30)),
+            "a renamed column is NULL on a federated read"
+        );
+
+        let mut config = datafusion::prelude::SessionConfig::new();
+        data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let message = ctx
+            .sql("SELECT * FROM events")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a refresh scan must not load NULLs for a renamed column")
+            .to_string();
+        assert!(message.contains("'amount_cents'"), "{message}");
+        assert!(message.contains("Dataset 'test'"), "{message}");
+    }
+
+    fn write_events_ndjson(path: &std::path::Path, lines: &[&str]) {
+        let mut text = String::new();
+        for line in lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        std::fs::write(path, text).expect("write ndjson");
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_rejects_json_rename_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"region":"us","amount_cents":100,"ts":"t0"}"#,
+                r#"{"event_id":2,"user_id":20,"region":"eu","amount_cents":200,"ts":"t1"}"#,
+            ],
+        );
+
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("jsonl format")
+        else {
+            panic!("expected a JSONL file format");
+        };
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"amount_cents":100,"region":"us","user_id":10,"ts":"t0"}"#,
+                r#"{"event_id":2,"amount_cents":200,"region":"eu","user_id":20,"ts":"t1"}"#,
+            ],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30)),
+            "JSON object keys bind by name after a reorder"
+        );
+
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"region":"us","amt":100,"ts":"t0"}"#,
+                r#"{"event_id":2,"user_id":20,"region":"eu","amt":200,"ts":"t1"}"#,
+            ],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (None, Some(30)),
+            "a renamed JSON column is NULL on a federated read"
+        );
+
+        let mut config = datafusion::prelude::SessionConfig::new();
+        data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let message = ctx
+            .sql("SELECT * FROM events")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a refresh scan must not overwrite accelerated JSON with NULLs")
+            .to_string();
+        assert!(message.contains("'amount_cents'"), "{message}");
+        assert!(message.contains("Dataset 'test'"), "{message}");
+    }
+
+    const EVENTS_JSON_BASELINE: &[&str] = &[
+        r#"{"event_id":1,"user_id":10,"region":"us","amount_cents":100,"ts":"t0"}"#,
+        r#"{"event_id":2,"user_id":20,"region":"eu","amount_cents":200,"ts":"t1"}"#,
+    ];
+    const EVENTS_JSON_RENAMED: &[&str] = &[
+        r#"{"event_id":1,"user_id":10,"region":"us","amt":100,"ts":"t0"}"#,
+        r#"{"event_id":2,"user_id":20,"region":"eu","amt":200,"ts":"t1"}"#,
+    ];
+
+    fn write_events_json_array(path: &std::path::Path, objects: &[&str]) {
+        std::fs::write(path, format!("[{}]", objects.join(","))).expect("write json array");
+    }
+
+    fn write_events_json_pointer(path: &std::path::Path, objects: &[&str]) {
+        std::fs::write(path, format!(r#"{{"data":[{}]}}"#, objects.join(",")))
+            .expect("write json pointer");
+    }
+
+    async fn assert_listing_json_rename_fails_refresh(
+        label: &str,
+        from: String,
+        params: HashMap<String, String>,
+        file_path: &std::path::Path,
+        write: fn(&std::path::Path, &[&str]),
+    ) {
+        write(file_path, EVENTS_JSON_BASELINE);
+        let (connector, dataset) = setup_connector(from.clone(), params);
+        let url = Url::parse(&from).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: format: {e}"))
+        else {
+            panic!("{label}: expected a JSON file format");
+        };
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: listing table: {e}"));
+
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), true).await,
+            (Some(300), Some(30)),
+            "{label}: last good accelerated read before rename"
+        );
+
+        write(file_path, EVENTS_JSON_RENAMED);
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (None, Some(30)),
+            "{label}: a renamed JSON column is NULL on a federated read"
+        );
+
+        let mut config = datafusion::prelude::SessionConfig::new();
+        data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let message = ctx
+            .sql("SELECT * FROM events")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a refresh scan must not overwrite accelerated JSON with NULLs")
+            .to_string();
+        assert!(message.contains("'amount_cents'"), "{label}: {message}");
+        assert!(message.contains("Dataset 'test'"), "{label}: {message}");
+        let file_name = file_path.file_name().expect("file name").to_string_lossy();
+        assert!(
+            message.contains(&format!(
+                "'{}/{}'",
+                file_path.parent().expect("parent").display(),
+                file_name
+            )) || message.contains(&format!("'{file_name}'")),
+            "{label}: example file path: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_rejects_json_array_rename_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.json");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "json".to_string());
+        assert_listing_json_rename_fails_refresh(
+            "file_format json",
+            format!("file://{}/", dir.path().display()),
+            params,
+            &path,
+            write_events_json_array,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_rejects_auto_json_rename_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.json");
+        assert_listing_json_rename_fails_refresh(
+            "auto-detected json",
+            format!("file://{}", path.display()),
+            HashMap::new(),
+            &path,
+            write_events_json_array,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_rejects_json_pointer_rename_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        params.insert("json_pointer".to_string(), "/data".to_string());
+        assert_listing_json_rename_fails_refresh(
+            "jsonl json_pointer",
+            format!("file://{}/", dir.path().display()),
+            params,
+            &path,
+            write_events_json_pointer,
+        )
+        .await;
+    }
+
+    async fn assert_listing_json_empty_refresh_clears(
+        label: &str,
+        from: String,
+        params: HashMap<String, String>,
+        file_path: &std::path::Path,
+        write: fn(&std::path::Path, &[&str]),
+        write_empty: impl Fn(&std::path::Path),
+    ) {
+        write(file_path, EVENTS_JSON_BASELINE);
+        let (connector, dataset) = setup_connector(from.clone(), params);
+        let url = Url::parse(&from).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: format: {e}"))
+        else {
+            panic!("{label}: expected a JSON file format");
+        };
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: listing table: {e}"));
+
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), true).await,
+            (Some(300), Some(30)),
+            "{label}: last good accelerated read before empty"
+        );
+
+        write_empty(file_path);
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (None, None),
+            "{label}: federated empty source has no values"
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), true).await,
+            (None, None),
+            "{label}: empty source must clear on refresh, not fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_clears_jsonl_on_empty_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        assert_listing_json_empty_refresh_clears(
+            "jsonl empty",
+            format!("file://{}/", dir.path().display()),
+            params,
+            &path,
+            write_events_ndjson,
+            |p| std::fs::write(p, "\n\n").expect("blank jsonl"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_clears_json_array_on_empty_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.json");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "json".to_string());
+        assert_listing_json_empty_refresh_clears(
+            "file_format json empty",
+            format!("file://{}/", dir.path().display()),
+            params,
+            &path,
+            write_events_json_array,
+            |p| write_events_json_array(p, &[]),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_clears_json_pointer_on_empty_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        params.insert("json_pointer".to_string(), "/data".to_string());
+        assert_listing_json_empty_refresh_clears(
+            "jsonl json_pointer empty",
+            format!("file://{}/", dir.path().display()),
+            params,
+            &path,
+            write_events_json_pointer,
+            |p| write_events_json_pointer(p, &[]),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_allows_json_sparse_nullable_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        write_events_ndjson(&path, EVENTS_JSON_BASELINE);
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("jsonl format")
+        else {
+            panic!("expected a JSONL file format");
+        };
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"region":"us","ts":"t0"}"#,
+                r#"{"event_id":2,"user_id":20,"region":"eu","ts":"t1"}"#,
+            ],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (None, Some(30)),
+            "omitted amount_cents is NULL on a federated read"
+        );
+        assert_eq!(
+            csv_listing_sums(provider, true).await,
+            (None, Some(30)),
+            "a sparse nullable key must not fail refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_allows_json_unregistered_field_type_change_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        write_events_ndjson(&path, EVENTS_JSON_BASELINE);
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("jsonl format")
+        else {
+            panic!("expected a JSONL file format");
+        };
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"region":"us","amount_cents":100,"ts":"t0","extra":1}"#,
+                r#"{"event_id":2,"user_id":20,"region":"eu","amount_cents":200,"ts":"t1","extra":{}}"#,
+            ],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30)),
+            "unregistered extra is ignored on a federated read"
+        );
+        assert_eq!(
+            csv_listing_sums(provider, true).await,
+            (Some(300), Some(30)),
+            "an unregistered field that changes type must not fail refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_allows_json_flatten_null_parent_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.json");
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"user":{"name":"a"},"amount_cents":100,"ts":"t0"}"#,
+                r#"{"event_id":2,"user_id":20,"user":{"name":"b"},"amount_cents":200,"ts":"t1"}"#,
+            ],
+        );
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "json".to_string());
+        params.insert("flatten_json".to_string(), "true".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("flattened json format")
+        else {
+            panic!("expected a JSONL file format");
+        };
+        assert!(
+            file_format
+                .as_ref()
+                .downcast_ref::<SpiceJsonFormat>()
+                .is_some_and(|json| json.options().flatten_json.as_deref() == Some(".")),
+            "listing must enable flatten_json so user.name is a registered column"
+        );
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+        assert_eq!(
+            json_user_names(Arc::clone(&provider), false).await,
+            vec![(1, Some("a".to_string())), (2, Some("b".to_string()))],
+            "user.name reads the flattened child while the parent is an object"
+        );
+
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"user":null,"amount_cents":100,"ts":"t0"}"#,
+                r#"{"event_id":2,"user_id":20,"user":null,"amount_cents":200,"ts":"t1"}"#,
+            ],
+        );
+        assert_eq!(
+            json_user_names(Arc::clone(&provider), false).await,
+            vec![(1, None), (2, None)],
+            "a flattened null parent is NULL for user.name on a federated read"
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30)),
+            "registered columns keep their values on a federated read"
+        );
+        assert_eq!(
+            json_user_names(Arc::clone(&provider), true).await,
+            vec![(1, None), (2, None)],
+            "user becoming null in every record is NULL for user.name on refresh"
+        );
+        assert_eq!(
+            csv_listing_sums(provider, true).await,
+            (Some(300), Some(30)),
+            "user becoming null in every record must not fail refresh"
+        );
     }
 
     #[tokio::test]
