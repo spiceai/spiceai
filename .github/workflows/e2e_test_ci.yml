@@ -117,7 +117,9 @@ jobs:
                 // the host is shared (#14557), and starves the short macOS test jobs below
                 // that sit on that pool to avoid exactly this neighbour (#13761).
                 builder: "spiceai-macos-large",
-                runner: "macos-15",
+                // Test jobs share each mini with other runner instances, so every one
+                // binds ports from allocate-spice-ports / allocate-service-ports.
+                runner: "spiceai-macos",
                 target_os: "darwin",
                 target_arch: "aarch64"
               }
@@ -757,12 +759,15 @@ jobs:
         run: |
           spice login dremio -u demo -p demo1234
 
+      - name: Allocate Spice runtime ports
+        uses: ./.github/actions/allocate-spice-ports
+
       - name: Start spice runtime
         working-directory: test_app
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          spice run &> spice.log &
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
           # time to initialize added dataset
           sleep 10
 
@@ -770,7 +775,7 @@ jobs:
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done
+          while [[ "$(curl -s "${SPICE_HTTP_ENDPOINT}/health")" != "ok" ]]; do sleep 1; done
 
       - name: Add spiceai/quickstart
         working-directory: test_app
@@ -834,13 +839,16 @@ jobs:
           spice dataset configure taxi_trips --description "new york taxi trips" --from spice.ai/spiceai/quickstart/datasets/taxi_trips --param spiceai_region=us-east-1
           cat spicepod.yaml
 
+      - name: Allocate Spice runtime ports
+        uses: ./.github/actions/allocate-spice-ports
+
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         working-directory: test_app
         run: |
-          spice run &> spice.log &
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
           # time to initialize added dataset
           sleep 10
 
@@ -928,13 +936,16 @@ jobs:
 
           cat spicepod.yaml
 
+      - name: Allocate Spice runtime ports
+        uses: ./.github/actions/allocate-spice-ports
+
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         working-directory: test_app
         run: |
-          spice run &> spice.log &
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
           # time to initialize added dataset
           sleep 10
 
@@ -1050,7 +1061,7 @@ jobs:
               params:
                 {
                   pg_host: localhost,
-                  pg_port: 5432,
+                  pg_port: '${env:PGPORT}',
                   pg_db: testdb_acc,
                   pg_user: postgres,
                   pg_pass: postgres,
@@ -1062,6 +1073,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Several runner instances share each self-hosted Mac, so this job's database
+      # servers bind ports allocated to it rather than their stock ones.
+      - name: Allocate service ports
+        if: matrix.target.target_os == 'darwin'
+        uses: ./.github/actions/allocate-service-ports
 
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
@@ -1107,7 +1124,7 @@ jobs:
           echo "    from: postgres:test_postgresql_table" >> spicepod.yaml
           echo "    params:" >> spicepod.yaml
           echo "      pg_host: localhost" >> spicepod.yaml
-          echo "      pg_port: 5432" >> spicepod.yaml
+          echo "      pg_port: ${PGPORT}" >> spicepod.yaml
           echo "      pg_db: testdb" >> spicepod.yaml
           echo "      pg_user: postgres" >> spicepod.yaml
           echo "      pg_sslmode: disable" >> spicepod.yaml
@@ -1140,7 +1157,7 @@ jobs:
           echo "    from: postgres:test_postgresql_table" >> spicepod.yaml
           echo "    params:" >> spicepod.yaml
           echo "      pg_host: localhost" >> spicepod.yaml
-          echo "      pg_port: 5432" >> spicepod.yaml
+          echo "      pg_port: ${PGPORT}" >> spicepod.yaml
           echo "      pg_db: testdb" >> spicepod.yaml
           echo "      pg_user: postgres" >> spicepod.yaml
           echo "      pg_sslmode: disable" >> spicepod.yaml
@@ -1173,13 +1190,16 @@ jobs:
 
           cat spicepod.yaml
 
+      - name: Allocate Spice runtime ports
+        uses: ./.github/actions/allocate-spice-ports
+
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_PG_PASS: postgres
         working-directory: test_app
         run: |
-          spice run &> spice.log &
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
           # time to initialize added dataset
           sleep 10
 
@@ -1207,6 +1227,10 @@ jobs:
         with:
           working-directory: test_app
 
+      - name: Stop database services
+        if: always()
+        uses: ./.github/actions/stop-services
+
   test_quickstart_data_mysql:
     name: 'Test MySQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
@@ -1230,7 +1254,7 @@ jobs:
               params:
                 {
                   pg_host: localhost,
-                  pg_port: 5432,
+                  pg_port: '${env:PGPORT}',
                   pg_db: testdb,
                   pg_user: postgres,
                   pg_pass: postgres,
@@ -1242,6 +1266,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Several runner instances share each self-hosted Mac, so this job's database
+      # servers bind ports allocated to it rather than their stock ones.
+      - name: Allocate service ports
+        if: matrix.target.target_os == 'darwin'
+        uses: ./.github/actions/allocate-service-ports
 
       - name: Install PostgreSQL
         if: matrix.acceleration.engine == 'postgres'
@@ -1263,7 +1293,10 @@ jobs:
           mysql -uroot -proot -e "CREATE USER test_user@localhost IDENTIFIED BY 'password';"
           mysql -uroot -proot -e "GRANT ALL PRIVILEGES ON testdb.* TO 'test_user'@'localhost'; FLUSH PRIVILEGES;"
           mysql -e "CREATE DATABASE IF NOT EXISTS testdb;" -utest_user -ppassword
+          echo "MYSQL_TCP_PORT=3306" >> "$GITHUB_ENV"
 
+      # A private server on CI_MYSQL_PORT instead of the shared Homebrew service on 3306.
+      # The mysql clients reach it through MYSQL_UNIX_PORT and MYSQL_TCP_PORT.
       - name: Install MySQL (MacOS)
         if: matrix.target.target_os == 'darwin'
         run: |
@@ -1276,27 +1309,28 @@ jobs:
             done
             return 1
           }
-          # macos-15 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066
-          # A stale index only matters if the install below fails, so don't fail on it here.
-          retry brew update || echo "::warning::brew update failed; installing with the image's formula index"
-          # The macos-15 image points bin/openssl at the deprecated openssl@1.1 with a plain
-          # symlink that Homebrew does not own, so `brew unlink openssl@1.1` leaves it in
-          # place. When a mysql@8.4 bottle needs a newer openssl@3, brew upgrades it but
-          # cannot link bin/openssl over that symlink, and `brew install` exits 1 even
-          # though MySQL installed. Removing the symlink first lets the upgrade link.
-          openssl_link="$(brew --prefix)/bin/openssl"
-          if [[ "$(readlink "$openssl_link")" == */openssl@1.1/* ]]; then
-            rm "$openssl_link"
-          fi
-          retry brew install mysql@8.4
-          brew link mysql@8.4 --force --overwrite
-          brew services start mysql@8.4
+          brew list --versions mysql@8.4 >/dev/null || HOMEBREW_NO_AUTO_UPDATE=1 retry brew install mysql@8.4
+          mysql_bin="$(brew --prefix mysql@8.4)/bin"
+          dir="${RUNNER_TEMP}/mysql"
+          # Under /tmp, named by port, to stay under macOS's 104-byte socket path limit.
+          socket="/tmp/mysql-${CI_MYSQL_PORT}.sock"
+          rm -rf "$dir" && mkdir -p "$dir"
+          "${mysql_bin}/mysqld" --no-defaults --initialize-insecure --datadir="$dir/data" --log-error="$dir/error.log"
+          "${mysql_bin}/mysqld" --no-defaults --datadir="$dir/data" --port="$CI_MYSQL_PORT" --bind-address=127.0.0.1,::1 \
+            --socket="$socket" --mysqlx=OFF --pid-file="$dir/mysqld.pid" --log-error="$dir/error.log" > /dev/null 2>&1 &
+          {
+            echo "CI_MYSQL_PID=$!"
+            echo "MYSQL_TCP_PORT=${CI_MYSQL_PORT}"
+            echo "MYSQL_UNIX_PORT=${socket}"
+          } >> "$GITHUB_ENV"
+          echo "${mysql_bin}" >> "$GITHUB_PATH"
+          export PATH="${mysql_bin}:$PATH" MYSQL_UNIX_PORT="$socket"
           for attempt in {1..30}; do
-            mysqladmin ping --silent && break
+            mysqladmin -uroot ping --silent && break
             sleep 1
           done
-          mysql -e "CREATE USER test_user@localhost IDENTIFIED BY 'password';"
-          mysql -e "GRANT ALL PRIVILEGES ON testdb.* TO 'test_user'@'localhost'; FLUSH PRIVILEGES;"
+          mysql -uroot -e "CREATE USER test_user@localhost IDENTIFIED BY 'password';"
+          mysql -uroot -e "GRANT ALL PRIVILEGES ON testdb.* TO 'test_user'@'localhost'; FLUSH PRIVILEGES;"
           mysql -e "CREATE DATABASE IF NOT EXISTS testdb;" -utest_user -ppassword
 
       - name: Wait for MySQL to start
@@ -1342,7 +1376,7 @@ jobs:
           echo "    from: mysql:test_mysql_table" >> spicepod.yaml
           echo "    params:" >> spicepod.yaml
           echo "      mysql_host: localhost" >> spicepod.yaml
-          echo "      mysql_tcp_port: 3306" >> spicepod.yaml
+          echo "      mysql_tcp_port: ${MYSQL_TCP_PORT}" >> spicepod.yaml
           echo "      mysql_db: testdb" >> spicepod.yaml
           echo "      mysql_user: test_user" >> spicepod.yaml
           echo "      mysql_sslmode: disabled" >> spicepod.yaml
@@ -1381,7 +1415,7 @@ jobs:
           echo "    from: mysql:test_mysql_table" >> spicepod.yaml
           echo "    params:" >> spicepod.yaml
           echo "      mysql_host: localhost" >> spicepod.yaml
-          echo "      mysql_tcp_port: 3306" >> spicepod.yaml
+          echo "      mysql_tcp_port: ${MYSQL_TCP_PORT}" >> spicepod.yaml
           echo "      mysql_db: testdb" >> spicepod.yaml
           echo "      mysql_user: test_user" >> spicepod.yaml
           echo "      mysql_sslmode: disabled" >> spicepod.yaml
@@ -1414,13 +1448,16 @@ jobs:
 
           cat spicepod.yaml
 
+      - name: Allocate Spice runtime ports
+        uses: ./.github/actions/allocate-spice-ports
+
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_MYSQL_PASS: password
         working-directory: test_app
         run: |
-          spice run &> spice.log &
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
           # time to initialize added dataset
           sleep 10
 
@@ -1448,6 +1485,10 @@ jobs:
         with:
           working-directory: test_app
 
+      - name: Stop database services
+        if: always()
+        uses: ./.github/actions/stop-services
+
   test_quickstart_clickhouse:
     name: 'Test Clickhouse quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
@@ -1462,6 +1503,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Several runner instances share each self-hosted Mac, so this job's database
+      # servers bind ports allocated to it rather than their stock ones.
+      - name: Allocate service ports
+        if: matrix.target.target_os == 'darwin'
+        uses: ./.github/actions/allocate-service-ports
 
       - name: Configure apt mirrors (Linux)
         if: matrix.target.target_os == 'linux'
@@ -1483,41 +1530,53 @@ jobs:
           clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
           clickhouse client --port 9001 -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
           clickhouse client --port 9001 -utest_user --password password --query="CREATE DATABASE IF NOT EXISTS testdb;"
+          echo "CI_CLICKHOUSE_PORT=9001" >> "$GITHUB_ENV"
 
       - name: Install Clickhouse
         if: matrix.target.target_os == 'darwin'
         run: |
           CLICKHOUSE_VERSION="26.3.9.8-lts"
           BASE_URL="https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "${BASE_URL}/clickhouse-macos-aarch64" -o clickhouse-macos-aarch64
-          mv clickhouse-macos-aarch64 clickhouse
-          chmod +x clickhouse
-          sudo ./clickhouse install --noninteractive
-          sudo clickhouse server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
+          dir="${RUNNER_TEMP}/clickhouse"
+          rm -rf "$dir" && mkdir -p "$dir"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "${BASE_URL}/clickhouse-macos-aarch64" -o "$dir/clickhouse"
+          chmod +x "$dir/clickhouse"
+          # Runs in place and unprivileged, every listener on this job's ports, rather than
+          # `clickhouse install` into the shared host's system paths and stock ports. The
+          # server keeps users and other state in its working directory, so start it there.
+          cd "$dir"
+          ./clickhouse server -- --path="$dir/data/" --listen_host=127.0.0.1 \
+            --tcp_port="$CI_CLICKHOUSE_PORT" --http_port="$CI_CLICKHOUSE_HTTP_PORT" \
+            --mysql_port="$CI_CLICKHOUSE_MYSQL_PORT" --postgresql_port="$CI_CLICKHOUSE_PG_PORT" \
+            --interserver_http_port="$CI_CLICKHOUSE_INTERSERVER_PORT" --logger.console=0 \
+            --logger.log="$dir/server.log" --logger.errorlog="$dir/server.err.log" > /dev/null 2>&1 &
+          echo "CI_CLICKHOUSE_PID=$!" >> "$GITHUB_ENV"
+          echo "$dir" >> "$GITHUB_PATH"
+          ch() { ./clickhouse client --host 127.0.0.1 --port "$CI_CLICKHOUSE_PORT" "$@"; }
           for attempt in {1..30}; do
-            clickhouse client --port 9001 --query="SELECT 1" >/dev/null 2>&1 && break
+            ch --query="SELECT 1" >/dev/null 2>&1 && break
             sleep 1
           done
-          clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
-          clickhouse client --port 9001 -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
-          clickhouse client --port 9001 -utest_user --password password --query="CREATE DATABASE IF NOT EXISTS testdb;"
+          ch -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
+          ch -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
+          ch -utest_user --password password --query="CREATE DATABASE IF NOT EXISTS testdb;"
 
       - name: Wait for Clickhouse to start
         run: |
           for attempt in {1..30}; do
-            clickhouse client --port 9001 --query="SELECT 1" >/dev/null 2>&1 && exit 0
+            clickhouse client --host 127.0.0.1 --port "$CI_CLICKHOUSE_PORT" --query="SELECT 1" >/dev/null 2>&1 && exit 0
             sleep 1
           done
-          echo "::error::ClickHouse is not accepting connections on port 9001 after 30s"
+          echo "::error::ClickHouse is not accepting connections on port ${CI_CLICKHOUSE_PORT} after 30s"
           exit 1
 
       - name: Check Clickhouse
-        run: clickhouse client --port 9001 -utest_user --password password --query="SELECT version();"
+        run: clickhouse client --host 127.0.0.1 --port "$CI_CLICKHOUSE_PORT" -utest_user --password password --query="SELECT version();"
 
       - name: Prepare Clickhouse dataset
         run: |
-          clickhouse client --port 9001 -m -n -utest_user --password password --database=testdb < test/scripts/setup-data-clickhouse.sql
-          clickhouse client --port 9001 -utest_user --password password --database=testdb --query="SELECT * FROM test_clickhouse_table;"
+          clickhouse client --host 127.0.0.1 --port "$CI_CLICKHOUSE_PORT" -m -n -utest_user --password password --database=testdb < test/scripts/setup-data-clickhouse.sql
+          clickhouse client --host 127.0.0.1 --port "$CI_CLICKHOUSE_PORT" -utest_user --password password --database=testdb --query="SELECT * FROM test_clickhouse_table;"
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -1539,9 +1598,12 @@ jobs:
         run: |
           echo -e "test_clickhouse_table\neth recent blocks\nclickhouse:test_clickhouse_table\ny" | spice dataset configure
           # configure clickhouse credentials
-          echo -e "params:\n  clickhouse_host: localhost\n  clickhouse_tcp_port: 9001\n  clickhouse_db: testdb\n  clickhouse_user: test_user\n  clickhouse_pass: password\n  clickhouse_secure: false\n" >> ./datasets/test_clickhouse_table/dataset.yaml
+          echo -e "params:\n  clickhouse_host: 127.0.0.1\n  clickhouse_tcp_port: ${CI_CLICKHOUSE_PORT}\n  clickhouse_db: testdb\n  clickhouse_user: test_user\n  clickhouse_pass: password\n  clickhouse_secure: false\n" >> ./datasets/test_clickhouse_table/dataset.yaml
           cat spicepod.yaml
           cat ./datasets/test_clickhouse_table/dataset.yaml
+
+      - name: Allocate Spice runtime ports
+        uses: ./.github/actions/allocate-spice-ports
 
       - name: Start spice runtime
         env:
@@ -1549,7 +1611,7 @@ jobs:
           SPICE_CLICKHOUSE_PASS: password
         working-directory: test_app
         run: |
-          spice run &> spice.log &
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
           # time to initialize added dataset
           sleep 10
 
@@ -1569,6 +1631,10 @@ jobs:
         uses: ./.github/actions/stop-spice
         with:
           working-directory: test_app
+
+      - name: Stop database services
+        if: always()
+        uses: ./.github/actions/stop-services
 
   test_quickstart_duckdb:
     env:
@@ -1597,8 +1663,8 @@ jobs:
       - name: Install DuckDB
         if: matrix.target.target_os == 'darwin'
         run: |
-          wget https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-osx-universal.zip
-          unzip duckdb_cli-osx-universal.zip
+          curl -fsSLO --retry 5 --retry-all-errors --retry-delay 5 https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-osx-universal.zip
+          unzip -o duckdb_cli-osx-universal.zip
           chmod +x ./duckdb
 
       - name: Generate TPCH database
@@ -1628,12 +1694,15 @@ jobs:
           cat spicepod.yaml
           cat datasets/tpch_customer/dataset.yaml
 
+      - name: Allocate Spice runtime ports
+        uses: ./.github/actions/allocate-spice-ports
+
       - name: Start Spice runtime
         working-directory: duckdb-app
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          spice run &> spice.log &
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
           # time to initialize added dataset
           sleep 5
 
@@ -1680,6 +1749,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Several runner instances share each self-hosted Mac, so this job's database
+      # servers bind ports allocated to it rather than their stock ones.
+      - name: Allocate service ports
+        if: matrix.target.target_os == 'darwin'
+        uses: ./.github/actions/allocate-service-ports
 
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
@@ -1735,11 +1810,14 @@ jobs:
           echo "      refresh_sql: SELECT * FROM eth.recent_blocks LIMIT 1" >> spicepod.yaml
           echo "    params:" >> spicepod.yaml
           echo "      pg_host: localhost" >> spicepod.yaml
-          echo "      pg_port: '5432'" >> spicepod.yaml
+          echo "      pg_port: '${PGPORT}'" >> spicepod.yaml
           echo "      pg_db: testdb" >> spicepod.yaml
           echo "      pg_user: postgres" >> spicepod.yaml
           echo "      pg_sslmode: disable" >> spicepod.yaml
           cat spicepod.yaml
+
+      - name: Allocate Spice runtime ports
+        uses: ./.github/actions/allocate-spice-ports
 
       - name: Start spice runtime
         env:
@@ -1747,7 +1825,7 @@ jobs:
           SPICE_PG_PASS: postgres
         working-directory: test_app
         run: |
-          spice run &> spice.log &
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
           # time to initialize added dataset
           sleep 10
 
@@ -1760,7 +1838,7 @@ jobs:
       - name: Manually refresh dataset (no params)
         working-directory: test_app
         run: |
-          output=$(spice refresh eth.recent_blocks 2>&1)
+          output=$(spice refresh eth.recent_blocks --http-endpoint "${SPICE_HTTP_ENDPOINT}" 2>&1)
           echo "$output"
           if [[ $output == *"Dataset refresh triggered"* ]]; then
             # time to refresh dataset
@@ -1779,7 +1857,7 @@ jobs:
       - name: Manually refresh dataset (with params)
         working-directory: test_app
         run: |
-          output=$(spice refresh eth.recent_blocks --refresh-jitter-max=1s --refresh-sql='SELECT * FROM eth.recent_blocks LIMIT 2' 2>&1)
+          output=$(spice refresh eth.recent_blocks --http-endpoint "${SPICE_HTTP_ENDPOINT}" --refresh-jitter-max=1s --refresh-sql='SELECT * FROM eth.recent_blocks LIMIT 2' 2>&1)
           echo "$output"
           if [[ $output == *"Dataset refresh triggered"* ]]; then
             # time to refresh dataset
@@ -1800,6 +1878,10 @@ jobs:
         uses: ./.github/actions/stop-spice
         with:
           working-directory: test_app
+
+      - name: Stop database services
+        if: always()
+        uses: ./.github/actions/stop-services
 
   test_results_caching:
     name: 'Test results caching on ${{ matrix.target.name }}'
@@ -1851,12 +1933,15 @@ jobs:
           echo "      refresh_sql: select * from customer limit 1;" >> spicepod.yaml
           cat spicepod.yaml
 
+      - name: Allocate Spice runtime ports
+        uses: ./.github/actions/allocate-spice-ports
+
       - name: Start spice runtime
         working-directory: test_app
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          spice run &> spice.log &
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
           # time to initialize added dataset
           sleep 10
 
@@ -1871,7 +1956,7 @@ jobs:
         run: |
           # The entry's age counts from this query's start; the expiry check below uses it.
           echo "CACHED_AT=$(date +%s)" >> "$GITHUB_ENV"
-          response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+          response=$(curl -i -XPOST "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
           echo "$response"
           if echo "$response" | grep -q "results-cache-status: MISS"; then
             echo "Cache miss detected as expected"
@@ -1883,7 +1968,7 @@ jobs:
       - name: Run SQL query and check Hit cache header
         working-directory: test_app
         run: |
-          response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "select c_name from (select * from customer)")
+          response=$(curl -i -XPOST "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "select c_name from (select * from customer)")
           echo "$response"
           if echo "$response" | grep -q "results-cache-status: HIT"; then
             echo "Cache hit detected as expected"
@@ -1895,7 +1980,7 @@ jobs:
       - name: Manually refresh dataset
         working-directory: test_app
         run: |
-          output=$(spice refresh customer 2>&1)
+          output=$(spice refresh customer --http-endpoint "${SPICE_HTTP_ENDPOINT}" 2>&1)
           echo "$output"
           if [[ $output != *"Dataset refresh triggered"* ]]; then
             echo "Failed to trigger dataset refresh."
@@ -1923,7 +2008,7 @@ jobs:
         run: |
           # A refresh does not invalidate SQL results: they expire by item_ttl, counted from
           # the query that produced them.
-          response=$(curl -sS -i --max-time 5 -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+          response=$(curl -sS -i --max-time 5 -XPOST "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
           echo "$response"
           if echo "$response" | grep -q "results-cache-status: HIT"; then
             echo "Cache hit after refresh detected as expected"
@@ -1939,7 +2024,7 @@ jobs:
           # first query becomes a miss 60s after that query started, and not before.
           deadline=$((CACHED_AT + 90))
           while :; do
-            response=$(curl -sS -i --max-time 5 -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+            response=$(curl -sS -i --max-time 5 -XPOST "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
             age=$(( $(date +%s) - CACHED_AT ))
             if echo "$response" | grep -q "results-cache-status: MISS"; then
               echo "$response"
@@ -1961,7 +2046,7 @@ jobs:
       - name: Run SQL query with custom cache key and check for miss header
         working-directory: test_app
         run: |
-          response=$(curl -i -XPOST -H"Spice-Cache-Key: e2eci" "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+          response=$(curl -i -XPOST -H"Spice-Cache-Key: e2eci" "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
           echo "$response"
           if echo "$response" | grep -q "results-cache-status: MISS"; then
             echo "Cache miss detected as expected"
@@ -1973,7 +2058,7 @@ jobs:
       - name: Run SQL query with custom cache key and check for hit and vary header
         working-directory: test_app
         run: |
-          response=$(curl -i -XPOST -H"Spice-Cache-Key: e2eci" "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+          response=$(curl -i -XPOST -H"Spice-Cache-Key: e2eci" "${SPICE_HTTP_ENDPOINT}/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
           echo "$response"
           if echo "$response" | grep -q "results-cache-status: HIT"; then
             echo "Cache hit detected as expected"
@@ -2463,6 +2548,9 @@ jobs:
 
           cat spicepod.yaml
 
+      - name: Allocate Spice runtime ports
+        uses: ./.github/actions/allocate-spice-ports
+
       - name: Start spice runtime
         working-directory: test_app
         env:
@@ -2472,7 +2560,7 @@ jobs:
           DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
         run: |
-          spice run &> spice.log &
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
           # time to initialize added datasets
           sleep 20
 

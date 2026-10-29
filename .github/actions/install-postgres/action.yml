@@ -26,11 +26,16 @@ runs:
         sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='postgres'" | grep -q 1 || sudo -u postgres createuser -s postgres
         sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
         sudo -u postgres createdb ${{ inputs.pg-db }}
+        echo "PGPORT=5432" >> "$GITHUB_ENV"
 
+    # Several runner instances share each self-hosted Mac, so the server gets a
+    # private data directory and this job's CI_PG_PORT (allocate-service-ports)
+    # rather than the shared Homebrew service on 5432. stop-services stops it.
     - name: Install PostgreSQL (macOS)
       if: runner.os == 'macOS'
       shell: bash
       run: |
+        port="${CI_PG_PORT:?Run ./.github/actions/allocate-service-ports before install-postgres}"
         # Homebrew's API and bottle hosts fail transiently; retry each network step.
         retry() {
           for attempt in 1 2 3; do
@@ -40,21 +45,21 @@ runs:
           done
           return 1
         }
-        # macos-15 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066
-        # A stale index only matters if the install below fails, so don't fail on it here.
-        retry brew update || echo "::warning::brew update failed; installing with the image's formula index"
-        retry brew install postgresql@18
+        brew list --versions postgresql@18 >/dev/null || HOMEBREW_NO_AUTO_UPDATE=1 retry brew install postgresql@18
         pg_bin="$(brew --prefix postgresql@18)/bin"
-        export PATH="${pg_bin}:$PATH"
+        dir="${RUNNER_TEMP}/postgres"
+        rm -rf "$dir"
+        "${pg_bin}/initdb" -D "$dir" --username=postgres --auth=trust --no-instructions >/dev/null
+        # The socket goes to /tmp, named by port, to stay under macOS's 104-byte socket path limit.
+        "${pg_bin}/pg_ctl" -D "$dir" -l "$dir/server.log" -w \
+          -o "-p ${port} -k /tmp -c listen_addresses=localhost" start
+        "${pg_bin}/psql" -h localhost -p "$port" -U postgres -d postgres -c "ALTER USER postgres PASSWORD 'postgres';"
+        "${pg_bin}/createdb" -h localhost -p "$port" -U postgres ${{ inputs.pg-db }}
         echo "${pg_bin}" >> "$GITHUB_PATH"
-        brew services start postgresql@18
-        for attempt in {1..30}; do
-          pg_isready -q && break
-          sleep 1
-        done
-        createuser -s postgres
-        psql -d postgres -c "ALTER USER postgres PASSWORD 'postgres';"
-        createdb ${{ inputs.pg-db }}
+        {
+          echo "PGPORT=${port}"
+          echo "CI_PG_DATA=${dir}"
+        } >> "$GITHUB_ENV"
 
     - name: Wait for PostgreSQL to start
       shell: bash

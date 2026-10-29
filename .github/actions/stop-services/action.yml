@@ -1,0 +1,18 @@
+name: 'Stop database services'
+description: |
+  Stops the PostgreSQL, MySQL, and ClickHouse servers this job started from
+  RUNNER_TEMP on a self-hosted Mac (install-postgres and the macOS service steps
+  in e2e_test_ci.yml), so none outlives the job on the shared host. Does nothing
+  for a service the job did not start that way, such as a Linux system service.
+runs:
+  using: 'composite'
+  steps:
+    - name: Stop database services
+      shell: bash
+      run: |
+        if [ -n "${CI_PG_DATA:-}" ]; then
+          pg_ctl -D "$CI_PG_DATA" stop -m fast || true
+        fi
+        for pid in ${CI_MYSQL_PID:-} ${CI_CLICKHOUSE_PID:-}; do
+          kill "$pid" 2>/dev/null || true
+        done

@@ -9,9 +9,11 @@ inputs:
     required: false
     default: '.'
   url:
-    description: 'Readiness endpoint to poll'
+    description: |
+      Readiness endpoint to poll. Defaults to SPICE_HTTP_ENDPOINT/v1/ready when
+      allocate-spice-ports ran, and http://localhost:8090/v1/ready otherwise.
     required: false
-    default: 'http://localhost:8090/v1/ready'
+    default: ''
   timeout:
     description: 'Seconds to wait before failing'
     required: false

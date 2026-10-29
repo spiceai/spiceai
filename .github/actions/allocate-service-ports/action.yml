@@ -1,0 +1,13 @@
+name: 'Allocate database service ports'
+description: |
+  Exports CI_PG_PORT, CI_MYSQL_PORT, and the ClickHouse listen ports
+  (CI_CLICKHOUSE_PORT, CI_CLICKHOUSE_HTTP_PORT, CI_CLICKHOUSE_MYSQL_PORT,
+  CI_CLICKHOUSE_PG_PORT, CI_CLICKHOUSE_INTERSERVER_PORT) for this runner
+  instance. Instances that share a machine also share a network namespace, so
+  two jobs cannot both bind 5432, 3306, or ClickHouse's packaged listeners.
+runs:
+  using: 'composite'
+  steps:
+    - name: Allocate database service ports
+      shell: bash
+      run: bash "${GITHUB_ACTION_PATH}/allocate_ports.sh"

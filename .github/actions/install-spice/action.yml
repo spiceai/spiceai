@@ -8,24 +8,34 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    # Runner instances on a self-hosted host share $HOME, so a job there installs into
+    # its own RUNNER_TEMP; otherwise concurrent jobs from different runs would replace
+    # each other's binaries. `spice` runs the `spiced` beside it.
     - name: Install Spice binaries
+      id: install
       shell: bash
       if: runner.os != 'Windows'
       run: |
         echo "Installing Spice from local folder: ${{ inputs.build-path }}"
 
+        bin_dir="$HOME/.spice/bin"
+        if [ "${RUNNER_ENVIRONMENT:-}" = "self-hosted" ]; then
+          bin_dir="$RUNNER_TEMP/spice/bin"
+        fi
+
         chmod +x "${{ inputs.build-path }}/spice"
         chmod +x "${{ inputs.build-path }}/spiced"
 
-        mkdir -p "$HOME/.spice/bin"
+        mkdir -p "$bin_dir"
 
-        mv "${{ inputs.build-path }}/spice" "$HOME/.spice/bin"
-        mv "${{ inputs.build-path }}/spiced" "$HOME/.spice/bin"
+        mv "${{ inputs.build-path }}/spice" "$bin_dir"
+        mv "${{ inputs.build-path }}/spiced" "$bin_dir"
 
-        echo "$HOME/.spice/bin" >> $GITHUB_PATH
+        echo "$bin_dir" >> $GITHUB_PATH
+        echo "bin-dir=$bin_dir" >> $GITHUB_OUTPUT
 
-        echo "Spice binaries installed successfully into $HOME/.spice/bin."
-        ls -la "$HOME/.spice/bin"
+        echo "Spice binaries installed successfully into $bin_dir."
+        ls -la "$bin_dir"
 
     - name: Install Spice binaries (Windows)
       shell: pwsh
@@ -57,23 +67,25 @@ runs:
     - name: Verify Spice installation
       shell: bash
       if: runner.os != 'Windows'
+      env:
+        SPICE_BIN_DIR: ${{ steps.install.outputs.bin-dir }}
       run: |
         # Verify binaries exist and are executable
-        if [ ! -x "$HOME/.spice/bin/spice" ]; then
+        if [ ! -x "$SPICE_BIN_DIR/spice" ]; then
           echo "ERROR: spice binary not found or not executable"
           exit 1
         fi
-        if [ ! -x "$HOME/.spice/bin/spiced" ]; then
+        if [ ! -x "$SPICE_BIN_DIR/spiced" ]; then
           echo "ERROR: spiced binary not found or not executable"
           exit 1
         fi
         echo "Spice binaries verified successfully"
         # Test spiced --version directly to debug any issues
         echo "Testing spiced --version:"
-        "$HOME/.spice/bin/spiced" --version 2>&1 || echo "spiced --version failed with exit code $?"
+        "$SPICE_BIN_DIR/spiced" --version 2>&1 || echo "spiced --version failed with exit code $?"
         # Show spice version (which calls spiced --version internally)
         echo "Testing spice version:"
-        "$HOME/.spice/bin/spice" version 2>&1 || echo "spice version failed with exit code $?"
+        "$SPICE_BIN_DIR/spice" version 2>&1 || echo "spice version failed with exit code $?"
 
     - name: Verify Spice installation (Windows)
       if: runner.os == 'Windows'

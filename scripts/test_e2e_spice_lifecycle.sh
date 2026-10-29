@@ -188,11 +188,12 @@ run_subject() {
   local subject="$1"
   shift
   local output rc
-  # `-u RUNNER_WORKSPACE -u SPICE_STOP_SCOPE` first: these are real variables on
-  # a GitHub runner, and inheriting them would silently scope a case that meant
-  # to run unscoped — passing locally and failing only in CI. Each case then
+  # `-u RUNNER_WORKSPACE -u SPICE_STOP_SCOPE -u SPICE_HTTP_ENDPOINT` first: these
+  # are real variables on a GitHub runner, and inheriting them would silently scope
+  # a case that meant to run unscoped, or point it at another port — passing locally
+  # and failing only in CI. Each case then
   # sets whatever it needs through "$@".
-  output="$(cd "$work_dir" && env -u RUNNER_WORKSPACE -u SPICE_STOP_SCOPE \
+  output="$(cd "$work_dir" && env -u RUNNER_WORKSPACE -u SPICE_STOP_SCOPE -u SPICE_HTTP_ENDPOINT \
     "PATH=$stub_dir:$PATH" "STATE_DIR=$stub_dir" "$@" \
     bash -c 'enable -n kill; source "$1"' _ "$subject" 2>&1)"
   rc=$?
@@ -338,6 +339,14 @@ reset_state "101 spiced $OURS"
 result="$(run_subject "$wait_script" STUB_READY_BODY=ready SPICE_READY_TIMEOUT=5)"
 assert_eq "exits 0 once the runtime reports ready" "${result%%|*}" "0"
 assert_contains "reports how long it took" "${result#*|}" "Runtime ready after"
+assert_contains "polls spiced's default port without an allocated one" "${result#*|}" "http://localhost:8090/v1/ready"
+
+# A job that ran allocate-spice-ports and passes no url must poll its own port.
+reset_state "101 spiced $OURS"
+result="$(run_subject "$wait_script" STUB_READY_BODY=ready SPICE_READY_TIMEOUT=5 \
+  SPICE_HTTP_ENDPOINT=http://127.0.0.1:21734)"
+assert_eq "exits 0 on the allocated port" "${result%%|*}" "0"
+assert_contains "polls the allocated port" "${result#*|}" "http://127.0.0.1:21734/v1/ready"
 
 # Not-ready must keep waiting rather than pass — the pre-#12057 expect bug was
 # exactly this shape, where an absent process read as success.

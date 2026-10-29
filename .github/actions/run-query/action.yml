@@ -41,7 +41,8 @@ runs:
       run: |
         query="${{ inputs.query }}"
         echo "Executing query: $query"
-        sql_output=$(spice sql <<EOF
+        # SPICE_FLIGHT_ENDPOINT is set when the job ran allocate-spice-ports.
+        sql_output=$(spice sql ${SPICE_FLIGHT_ENDPOINT:+--endpoint "http://${SPICE_FLIGHT_ENDPOINT}"} <<EOF
         $query
         .error
         EOF
