@@ -20,12 +20,12 @@ use std::sync::{Arc, LazyLock};
 
 use arrow::array::ArrayRef;
 use arrow::compute::kernels::numeric::{add, mul, sub};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field, FieldRef};
 use arrow::error::ArrowError;
 use datafusion::common::{Result, exec_err, plan_err};
 use datafusion::logical_expr::{
-    ColumnarValue, Expr, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    TypeSignature, Volatility,
+    ColumnarValue, Expr, Operator, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+    Signature, TypeSignature, Volatility,
 };
 
 use super::is_integer_arith_type;
@@ -145,6 +145,21 @@ impl ScalarUDFImpl for CheckedIntegerOp {
         } else {
             plan_err!("{} expects two arguments", self.name())
         }
+    }
+
+    /// Nullable only when an operand is, as the `+` / `-` / `*` it replaces:
+    /// overflow is an error, never a NULL. The default reports every result
+    /// nullable, so a plan's schema changed with the rewrite and a client
+    /// that compared it with the operator's schema saw a mismatch.
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        let [left, right] = args.arg_fields else {
+            return plan_err!("{} expects two arguments", self.name());
+        };
+        Ok(Arc::new(Field::new(
+            self.name(),
+            left.data_type().clone(),
+            left.is_nullable() || right.is_nullable(),
+        )))
     }
 
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
