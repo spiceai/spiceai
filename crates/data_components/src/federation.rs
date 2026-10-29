@@ -2562,8 +2562,8 @@ mod tests {
             .err()
             .unwrap_or_else(|| {
                 panic!(
-                    "{context}: a filter on a volatile output read through a derived table \
-                     the engine does not fix must be refused"
+                    "{context}: a volatile output read through a derived table the engine does \
+                     not fix must be refused"
                 )
             });
         assert!(
@@ -2721,6 +2721,96 @@ mod tests {
             ),
         ] {
             assert_volatile_scope_refused(&format!("sqlite, {route}"), &SqliteDialect {}, &plan);
+        }
+    }
+
+    /// Asserts the `ORDER BY` is the enclosing query's, after the derived table that
+    /// `derived` opens, where the derived table's output names bind.
+    fn assert_order_by_reads_the_derived_table(arm: &str, sql: &str, derived: &str) {
+        let derived_at = first_offset_of(sql, derived);
+        let order_at = last_offset_of(sql, "ORDER BY ");
+        assert!(
+            order_at > derived_at && paren_depth_at(sql, order_at) == 0,
+            "{arm}: the ORDER BY has to read the outputs from the SELECT above the derived \
+             table, where their names bind: {sql}"
+        );
+    }
+
+    /// [`volatile_projection`] sorted by `r + 1.0`, directly or through a `DISTINCT`.
+    /// A key that is not the bare output name is what the unparser has to resolve
+    /// against the `SELECT` list; each shape is one way it resolved it wrongly.
+    fn volatile_sort_key_shapes() -> Vec<(&'static str, LogicalPlan)> {
+        let key = || vec![(col("r") + lit(1.0)).sort(true, true)];
+        let sorted = volatile_projection()
+            .sort_with_limit(key(), Some(10))
+            .expect("sort")
+            .build()
+            .expect("build");
+        let distinct = volatile_projection()
+            .distinct()
+            .expect("distinct")
+            .sort_with_limit(key(), Some(10))
+            .expect("sort")
+            .build()
+            .expect("build");
+        vec![("projection", sorted), ("distinct", distinct)]
+    }
+
+    /// Regression test for #14109, fixed by fork PR #247 for a sort directly over
+    /// the projection and by fork PR #281 for one over a `DISTINCT`. `SELECT a,
+    /// random() AS r FROM t ORDER BY r + 1.0 LIMIT 10` was pushed down as `ORDER BY
+    /// (random() + 1.0)`, a second draw, so the rows came back ordered by a value the
+    /// `SELECT` list never showed; through `SELECT DISTINCT` the key was not
+    /// resolved at all, and `ORDER BY ("r" + 1.0)` made `PostgreSQL` refuse the
+    /// whole query (`column "r" does not exist`).
+    ///
+    /// The repair reads the output by name from a `SELECT` above the one computing
+    /// it, so the volatile call is evaluated once and the `ORDER BY` sits outside
+    /// the derived table. A dialect whose engine flattens that table evaluates the
+    /// call again for the key, so the scope is refused there instead.
+    #[test]
+    fn a_sort_key_reading_a_volatile_output_orders_by_the_value_the_select_list_shows() {
+        for (shape, plan) in volatile_sort_key_shapes() {
+            for (dialect_name, dialect) in federation_dialects() {
+                let arm = format!("{dialect_name}/{shape}");
+                if !dialect.derived_table_evaluates_volatile_outputs_once() {
+                    assert_volatile_scope_refused(&arm, dialect.as_ref(), &plan);
+                    continue;
+                }
+                let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+                // The output is named `r`, so every `random()` in the SQL is a call.
+                let evaluations = sql.matches("random()").count();
+                assert_eq!(
+                    evaluations, 1,
+                    "{arm}: the volatile call is evaluated {evaluations} times, so the rows are \
+                     ordered by a value the SELECT list never showed: {sql}"
+                );
+                assert_order_by_reads_the_derived_table(&arm, &sql, "FROM (SELECT ");
+            }
+        }
+    }
+
+    /// The same unresolved key over a `DISTINCT` whose outputs can be repeated.
+    /// The `ORDER BY` of a `SELECT DISTINCT` may name only what its list shows, so
+    /// inlining the output does not help there: `PostgreSQL` refuses `ORDER BY ((a +
+    /// 1) + 1)` ("for SELECT DISTINCT, ORDER BY expressions must appear in select
+    /// list"), and `ORDER BY ("b" + 1)` binds `b` to nothing. Every dialect reads the
+    /// key from a `SELECT` above the `DISTINCT` one instead.
+    #[test]
+    fn a_computed_sort_key_over_distinct_is_ordered_above_it() {
+        let plan = LogicalPlanBuilder::scan("t", two_column_source(), None)
+            .expect("scan t")
+            .project(vec![col("t.a"), (col("t.a") + lit(1)).alias("b")])
+            .expect("project")
+            .distinct()
+            .expect("distinct")
+            .sort_with_limit(vec![(col("b") + lit(1)).sort(true, true)], Some(3))
+            .expect("sort")
+            .build()
+            .expect("build");
+        for (dialect_name, dialect) in federation_dialects() {
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+            assert_order_by_reads_the_derived_table(dialect_name, &sql, "FROM (SELECT DISTINCT ");
         }
     }
 
