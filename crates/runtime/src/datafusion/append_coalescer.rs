@@ -51,6 +51,8 @@ use datafusion::error::DataFusionError;
 use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::{OwnedRwLockReadGuard, oneshot};
 
+use crate::accelerated::AppendGrouping;
+
 /// The most rows one append may bring to a group. A larger append is written in
 /// a group of its own, in queue order.
 const MEMBER_MAX_ROWS: usize = 8_192;
@@ -404,24 +406,46 @@ fn same_provider(a: &Arc<dyn TableProvider>, b: &Arc<dyn TableProvider>) -> bool
 
 /// The key values `data` brings to a group: [`RowKeys::Alone`] when it is too
 /// large to share a write or [`member_keys`] finds rows it cannot group.
-pub(crate) fn row_keys(key: &[String], schema: &SchemaRef, data: &[RecordBatch]) -> RowKeys {
+pub(crate) fn row_keys(
+    grouping: &AppendGrouping,
+    schema: &SchemaRef,
+    data: &[RecordBatch],
+) -> RowKeys {
     let rows: usize = data.iter().map(RecordBatch::num_rows).sum();
     let bytes: usize = data.iter().map(RecordBatch::get_array_memory_size).sum();
     if rows > MEMBER_MAX_ROWS || bytes > MEMBER_MAX_BYTES {
         return RowKeys::Alone;
     }
-    member_keys(key, schema, data).unwrap_or(RowKeys::Alone)
+    member_keys(grouping, schema, data).unwrap_or(RowKeys::Alone)
 }
 
-/// The encoded value of `key` in each row of `data`, to keep appends that share
-/// one out of a group, or `None` when the append cannot join a group and is
-/// written alone: a key column is missing or holds a null, which the accelerator
-/// refuses, and in a group that one append's row would fail every member.
-fn member_keys(key: &[String], schema: &SchemaRef, data: &[RecordBatch]) -> Option<RowKeys> {
-    if key.is_empty() {
+/// The encoded value of `grouping.key` in each row of `data`, to keep appends
+/// that share one out of a group, or `None` when the append cannot join a group
+/// and is written alone: a column of `grouping.non_null` is missing or holds a
+/// null, which the accelerator refuses, and in a group that one append's row
+/// would fail every member.
+fn member_keys(
+    grouping: &AppendGrouping,
+    schema: &SchemaRef,
+    data: &[RecordBatch],
+) -> Option<RowKeys> {
+    let non_null = grouping
+        .non_null
+        .iter()
+        .map(|column| schema.index_of(column).ok())
+        .collect::<Option<Vec<usize>>>()?;
+    if data.iter().any(|batch| {
+        non_null
+            .iter()
+            .any(|&index| batch.column(index).null_count() > 0)
+    }) {
+        return None;
+    }
+    if grouping.key.is_empty() {
         return Some(RowKeys::Unkeyed);
     }
-    let indices = key
+    let indices = grouping
+        .key
         .iter()
         .map(|column| schema.index_of(column).ok())
         .collect::<Option<Vec<usize>>>()?;
@@ -461,6 +485,14 @@ mod tests {
     use super::{
         AppendQueue, FreeTurn, InsertFailure, InsertStage, QueuedAppend, RowKeys, row_keys,
     };
+    use crate::accelerated::AppendGrouping;
+
+    fn grouping(key: &[&str], non_null: &[&str]) -> AppendGrouping {
+        AppendGrouping {
+            key: key.iter().map(ToString::to_string).collect(),
+            non_null: non_null.iter().map(ToString::to_string).collect(),
+        }
+    }
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -509,7 +541,7 @@ mod tests {
         rows: &[(Option<i64>, i64)],
     ) -> QueuedAppend {
         let data = vec![batch(rows)];
-        let keys = row_keys(&["id".to_string()], &schema(), &data);
+        let keys = row_keys(&grouping(&["id"], &["id"]), &schema(), &data);
         let guard = Arc::new(tokio::sync::RwLock::new(())).read_owned().await;
         queue.enqueue(
             TableReference::bare("t"),
@@ -650,18 +682,28 @@ mod tests {
     fn rows_with_a_null_key_are_written_alone() {
         let data = vec![batch(&[(Some(1), 10), (None, 20)])];
         assert_eq!(
-            row_keys(&["id".to_string()], &schema(), &data),
+            row_keys(&grouping(&["id"], &["id"]), &schema(), &data),
             RowKeys::Alone
         );
         assert_eq!(
-            row_keys(&["missing".to_string()], &schema(), &data),
+            row_keys(&grouping(&["missing"], &["missing"]), &schema(), &data),
             RowKeys::Alone,
             "a key column the rows lack keeps them out of groups too"
         );
         assert_eq!(
-            row_keys(&[], &schema(), &data),
+            row_keys(&grouping(&[], &[]), &schema(), &data),
             RowKeys::Unkeyed,
             "a dataset without a key groups any rows"
+        );
+        assert_eq!(
+            row_keys(&grouping(&["value"], &["value", "id"]), &schema(), &data),
+            RowKeys::Alone,
+            "a null in a column another possible key names keeps the rows out too"
+        );
+        assert_eq!(
+            row_keys(&grouping(&[], &["id"]), &schema(), &data),
+            RowKeys::Alone,
+            "even when the grouping key is empty"
         );
     }
 }

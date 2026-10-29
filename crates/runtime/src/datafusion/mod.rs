@@ -28,7 +28,7 @@ use crate::accelerated::{
     self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
 };
 use crate::accelerated::{
-    AcceleratedTable, Retention,
+    AcceleratedTable, AppendGrouping, Retention,
     refresh::{Refresh, VersionsByTime},
 };
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
@@ -3391,7 +3391,7 @@ impl DataFusion {
         } else {
             None
         };
-        let Some((queue, key)) = queue else {
+        let Some((queue, grouping)) = queue else {
             let result = self
                 .insert_alone(table_provider, schema, data, overwrite)
                 .await;
@@ -3423,7 +3423,7 @@ impl DataFusion {
         // An append too large to share a write, or with rows the accelerator
         // refuses, is still queued, in a group of its own, so that it too keeps
         // its place behind earlier appends.
-        let keys = append_coalescer::row_keys(&key, schema, data);
+        let keys = append_coalescer::row_keys(&grouping, schema, data);
         let mut queued = queue.enqueue(
             table_reference.clone(),
             Arc::clone(table_provider),
@@ -3562,17 +3562,17 @@ impl DataFusion {
     }
 
     /// The queue appends to `table_reference` wait in to be written together,
-    /// with the key no two members of a group may share, or `None` when its
-    /// appends are each written alone (see `AcceleratedTable::append_group_key`).
+    /// with how they may be grouped, or `None` when its appends are each written
+    /// alone (see `AcceleratedTable::append_grouping`).
     fn append_queue(
         &self,
         table_reference: &TableReference,
         table_provider: &Arc<dyn TableProvider>,
-    ) -> Option<(Arc<append_coalescer::AppendQueue>, Arc<[String]>)> {
+    ) -> Option<(Arc<append_coalescer::AppendQueue>, Arc<AppendGrouping>)> {
         // A group runs its members' `after_write` through this; without it,
         // appends are written alone.
         self.datafusion_ref.get()?;
-        let key = append_group_key_of(table_provider)?;
+        let grouping = append_grouping_of(table_provider)?;
         let mut queues = self.append_queues.lock();
         if queues.len() >= MAX_APPEND_QUEUES {
             queues.retain(|_, queue| Arc::strong_count(queue) > 1);
@@ -3582,7 +3582,7 @@ impl DataFusion {
                 .entry(TableReference::bare(table_reference.table().to_string()))
                 .or_default(),
         );
-        Some((queue, key))
+        Some((queue, grouping))
     }
 
     /// Take `table_reference`'s turn to append, so the appends that arrive while
@@ -4622,8 +4622,12 @@ impl DataFusion {
         accelerated_table_builder.cdc_apply_runtime(self.cdc_apply_runtime().cloned());
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
         accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
-        if let Some(key) = append_group_key(&acceleration_settings, &source_table_provider) {
-            accelerated_table_builder.groups_appends_by(key);
+        if let Some(grouping) = append_grouping(
+            &acceleration_settings,
+            &source_table_provider,
+            &accelerated_table_provider,
+        ) {
+            accelerated_table_builder.groups_appends_by(grouping);
         }
         accelerated_table_builder.cdc_param_overrides(
             crate::accelerated::refresh_task::changes::extract_cdc_param_overrides(
@@ -7853,11 +7857,11 @@ fn member_result(
     }
 }
 
-/// The key `provider`'s accelerated table groups concurrent appends by, or `None`
-/// when it writes each alone or is not an accelerated table.
-fn append_group_key_of(provider: &Arc<dyn TableProvider>) -> Option<Arc<[String]>> {
+/// How `provider`'s accelerated table groups concurrent appends, or `None` when
+/// it writes each alone or is not an accelerated table.
+fn append_grouping_of(provider: &Arc<dyn TableProvider>) -> Option<Arc<AppendGrouping>> {
     accelerated_table_of(provider, |accelerated| {
-        accelerated.append_group_key().map(Arc::clone)
+        accelerated.append_grouping().map(Arc::clone)
     })
     .flatten()
 }
@@ -7888,36 +7892,70 @@ fn accelerated_table_of<T>(
     }
 }
 
-/// The key concurrent appends to a dataset may be grouped by, or `None` when its
-/// appends must each be written alone (see [`append_coalescer`]).
+/// How concurrent appends to a dataset may be written together, or `None` when
+/// its appends must each be written alone (see [`append_coalescer`]).
 ///
 /// Only an unpartitioned, file-backed Cayenne acceleration: it keeps the last
 /// arrival of a key within one append as across appends, and counts the copies an
 /// append repeats itself as superseded, so a group whose members share no key
-/// stores and counts what the members would one after another. The key is the one
-/// the accelerator is created with: the acceleration's `primary_key`, or else the
-/// source's. A key that differs from the one the table resolves can only make the
-/// superseded count include a key two members share; the rows stored are the same.
-fn append_group_key(acceleration: &Acceleration, source: &FederatedTable) -> Option<Vec<String>> {
+/// stores and counts what the members would one after another.
+///
+/// The key is the one the table resolves: the primary key the opened
+/// acceleration reports, which is its stored one even when it kept that through a
+/// settings change it cannot apply in place. Without one, it is the key Cayenne
+/// creates a table with: the acceleration's `primary_key` when it names columns,
+/// otherwise the source's. A key other than the one the table resolves would only
+/// let a key two members share into the superseded count; the rows stored are the
+/// same. A null, though, fails the whole write, so every column any of these keys
+/// names keeps an append with a null in it out of groups.
+fn append_grouping(
+    acceleration: &Acceleration,
+    source: &FederatedTable,
+    accelerator: &Arc<dyn TableProvider>,
+) -> Option<AppendGrouping> {
     if acceleration.engine != Engine::Cayenne
         || matches!(acceleration.mode, Mode::Memory)
         || !acceleration.partition_by.is_empty()
     {
         return None;
     }
-    let key = match &acceleration.primary_key {
-        Some(primary_key) => primary_key.iter().map(str::to_string).collect(),
-        None => source
-            .constraints()
-            .map(|constraints| {
-                data_accelerator_api::get_primary_keys_from_constraints(
-                    constraints,
-                    &source.schema(),
-                )
-            })
-            .unwrap_or_default(),
+    let stored: Vec<String> = accelerator
+        .constraints()
+        .map(|constraints| {
+            data_accelerator_api::get_primary_keys_from_constraints(
+                constraints,
+                &accelerator.schema(),
+            )
+        })
+        .unwrap_or_default();
+    let requested: Vec<String> = acceleration
+        .primary_key
+        .as_ref()
+        .map(|primary_key| primary_key.iter().map(str::to_string).collect())
+        .unwrap_or_default();
+    let from_source: Vec<String> = source
+        .constraints()
+        .map(|constraints| {
+            data_accelerator_api::get_primary_keys_from_constraints(constraints, &source.schema())
+        })
+        .unwrap_or_default();
+    let key = if !stored.is_empty() {
+        stored.clone()
+    } else if !requested.is_empty() {
+        requested.clone()
+    } else {
+        from_source.clone()
     };
-    Some(key)
+    let mut non_null: Vec<String> = Vec::new();
+    for column in stored.into_iter().chain(requested).chain(from_source) {
+        if !non_null.contains(&column) {
+            non_null.push(column);
+        }
+    }
+    Some(AppendGrouping {
+        key: key.into(),
+        non_null: non_null.into(),
+    })
 }
 
 /// Whether a write failed the schema check the runtime runs before inserting anything.
