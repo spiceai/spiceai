@@ -2795,34 +2795,61 @@ mod tests {
     /// inlining the output does not help there: `PostgreSQL` refuses
     /// `ORDER BY ((a + 1) + 1)` ("for SELECT DISTINCT, ORDER BY expressions must
     /// appear in select list"), and `ORDER BY ("b" + 1)` binds `b` to nothing. Every
-    /// dialect reads the key from a `SELECT` above the `DISTINCT` one instead.
+    /// dialect reads the key from a `SELECT` above the `DISTINCT` one instead,
+    /// including when a filter above the sort is lowered between it and the
+    /// `DISTINCT` (spiceai/datafusion#281).
     #[test]
     fn a_computed_sort_key_over_distinct_is_ordered_above_it() {
-        let plan = LogicalPlanBuilder::scan("t", two_column_source(), None)
-            .expect("scan t")
-            .project(vec![col("t.a"), (col("t.a") + lit(1)).alias("b")])
-            .expect("project")
-            .distinct()
-            .expect("distinct")
-            .sort_with_limit(vec![(col("b") + lit(1)).sort(true, true)], Some(3))
+        let sorted = || {
+            LogicalPlanBuilder::scan("t", two_column_source(), None)
+                .expect("scan t")
+                .project(vec![col("t.a"), (col("t.a") + lit(1)).alias("b")])
+                .expect("project")
+                .distinct()
+                .expect("distinct")
+        };
+        let key = || vec![(col("b") + lit(1)).sort(true, true)];
+        let bounded = sorted()
+            .sort_with_limit(key(), Some(3))
             .expect("sort")
             .build()
             .expect("build");
-        for (dialect_name, dialect) in federation_dialects() {
-            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
-            assert_order_by_reads_the_derived_table(dialect_name, &sql, "FROM (SELECT DISTINCT ");
-            let order_by = &sql[last_offset_of(&sql, "ORDER BY ")..];
-            assert!(
-                [
-                    "ORDER BY (b + 1)",
-                    "ORDER BY (\"b\" + 1)",
-                    "ORDER BY (`b` + 1)"
-                ]
-                .iter()
-                .any(|key| order_by.starts_with(key)),
-                "{dialect_name}: the key has to read the output `b` by name, not inline the \
-                 expression it computes: {sql}"
-            );
+        let filtered = sorted()
+            .sort(key())
+            .expect("sort")
+            .filter(col("b").gt(lit(0)).and(col("t.a").gt(lit(0))))
+            .expect("filter")
+            .build()
+            .expect("build");
+        for (shape, plan) in [("bounded", bounded), ("filtered", filtered)] {
+            for (dialect_name, dialect) in federation_dialects() {
+                let arm = format!("{dialect_name}/{shape}");
+                let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+                assert_order_by_reads_the_derived_table(&arm, &sql, "FROM (SELECT DISTINCT ");
+                let order_at = last_offset_of(&sql, "ORDER BY ");
+                if shape == "filtered" {
+                    // The filter is emitted above the derived table, which hides `t`.
+                    let predicate = &sql[last_offset_of(&sql, "WHERE ")..order_at];
+                    assert!(
+                        !["t.a", "\"t\".", "`t`."]
+                            .iter()
+                            .any(|qualified| predicate.contains(qualified)),
+                        "{arm}: the filter names `t`, which the derived table hides: {sql}"
+                    );
+                }
+                let order_by = &sql[order_at..];
+                assert!(
+                    [
+                        "ORDER BY (b + 1)",
+                        "ORDER BY (\"b\" + 1)",
+                        "ORDER BY (`b` + 1)"
+                    ]
+                    .iter()
+                    .any(|key| order_by.starts_with(key)),
+                    "{arm}: the key has to read the output `b` by name, not inline the \
+                     expression it computes: {sql}"
+                );
+            }
         }
     }
 
@@ -2858,6 +2885,49 @@ mod tests {
                 sql.contains(&format!("AS {reference} FROM ")),
                 "{dialect_name}: the derived table leaves the aggregate output for the engine \
                  to name, so the SELECT above reads {reference}, which it does not expose: {sql}"
+            );
+        }
+    }
+
+    /// The sort over a scoped `DISTINCT` inside an unbounded `EXISTS` body orders
+    /// nothing the `EXISTS` can observe, so it is left out, as a sort directly over
+    /// the projection is (spiceai/datafusion#281). Under the `SELECT 1` the body
+    /// takes, the sort is derived apart from the body and loses that context, and a
+    /// dialect that cannot take the scope refused the whole statement.
+    #[test]
+    fn a_sort_over_a_scoped_distinct_is_left_out_of_an_unbounded_exists_body() {
+        let body = LogicalPlanBuilder::scan("u", two_column_source(), None)
+            .expect("scan u")
+            .project(vec![col("u.a"), random_call().alias("r")])
+            .expect("project")
+            .distinct()
+            .expect("distinct")
+            .sort(vec![(col("r") + lit(1.0)).sort(true, true)])
+            .expect("sort")
+            .project(vec![lit(1)])
+            .expect("exists projection")
+            .build()
+            .expect("build body");
+        let plan = LogicalPlanBuilder::scan("t", two_column_source(), Some(vec![0]))
+            .expect("scan t")
+            .filter(exists(Arc::new(body)))
+            .expect("filter")
+            .build()
+            .expect("build");
+        for (dialect_name, dialect) in federation_dialects() {
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+            assert!(
+                sql.contains("WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT "),
+                "{dialect_name}: expected the body to read the DISTINCT as a derived table: {sql}"
+            );
+            assert!(
+                !sql.contains("ORDER BY"),
+                "{dialect_name}: the EXISTS body keeps a sort whose order nothing observes: {sql}"
+            );
+            assert_eq!(
+                sql.matches("random()").count(),
+                1,
+                "{dialect_name}: the volatile output has to be computed once: {sql}"
             );
         }
     }
