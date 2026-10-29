@@ -20291,6 +20291,7 @@ dependencies = [
  "runtime-api-types",
  "runtime-cloud-connect",
  "runtime-secrets",
+ "rustls",
  "rustyline",
  "secrecy",
  "semver",
