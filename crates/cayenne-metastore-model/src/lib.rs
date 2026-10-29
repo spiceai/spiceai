@@ -1694,6 +1694,31 @@ fn additional_runs() -> Vec<Run> {
             "I9 lifecycle logical rows",
         ),
         ("dataset-query-expiry", "expiry", 2, ""),
+        // Queries during prepared transactions, with and without byte batches.
+        (
+            "dataset-prepare-query-expiry",
+            "prepare-cutoff-cap-expiry",
+            3,
+            "",
+        ),
+        (
+            "dataset-prepare-query-expiry-missing-as-empty",
+            "prepare-cutoff-cap-expiry-missing-as-empty",
+            3,
+            "snapshot rows or error",
+        ),
+        (
+            "dataset-prepare-query-expiry-byte-window",
+            "prepare-cutoff-cap-expiry-byte-window-metadata-prefix",
+            5,
+            "",
+        ),
+        (
+            "dataset-prepare-query-expiry-byte-window-no-query-batch",
+            "prepare-cutoff-cap-expiry-byte-window-metadata-prefix-no-query-batch",
+            5,
+            "I7 byte lifecycle query recovery",
+        ),
         (
             "dataset-query-expiry-missing-as-empty",
             "expiry-missing-as-empty",
@@ -1989,8 +2014,16 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
             | "prepared upsert commits"
             | "two actions prepared together"
             | "abort after maintenance"
-            | "checkpoint retains prepared actions"
             | "GC while prepared" => run.mode.contains("prepare"),
+            "checkpoint retains prepared actions" => {
+                run.mode.contains("prepare") && !run.mode.contains("byte-window")
+            }
+            "byte checkpoint retains prepared actions" => {
+                run.mode.contains("prepare") && run.mode.contains("byte-window")
+            }
+            "query while prepared returns its snapshot" => {
+                run.mode.contains("prepare") && run.mode.contains("expiry")
+            }
             "higher cutoff while prepared" => run.mode == "prepare-no-cutoff-cap",
             "warm subset rewrite" | "cold promotion" => true,
             "row object collected" => {

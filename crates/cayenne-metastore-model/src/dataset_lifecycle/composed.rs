@@ -42,6 +42,7 @@ pub(crate) struct State {
     expired_completion: bool,
     missing_read_error: bool,
     deleted_pending: bool,
+    query_while_prepared: bool,
     collected_pages: usize,
 }
 impl std::fmt::Debug for State {
@@ -311,6 +312,7 @@ impl Model for Protocol {
                     expired_completion: false,
                     missing_read_error: false,
                     deleted_pending: false,
+                    query_while_prepared: false,
                     collected_pages: 0,
                 };
                 if self.has("metadata-prefix") {
@@ -349,7 +351,10 @@ impl Model for Protocol {
                 | LocalAction::Floor
                 | LocalAction::CollectLog
                 | LocalAction::Recover => !self.bytes(),
-                LocalAction::Choose => !self.txn() && !self.has("without-readers"),
+                // Queries meet prepared actions only with expiry on, which bounds the graph.
+                LocalAction::Choose => {
+                    (!self.txn() || self.has("expiry")) && !self.has("without-readers")
+                }
                 LocalAction::RemovePage => self.bytes(),
                 LocalAction::SelectRemoved => !self.has("expiry"),
                 LocalAction::Delete => true,
@@ -554,6 +559,7 @@ impl Model for Protocol {
                     }
                     if matches!(a, LocalAction::Choose) {
                         n.expires = s.clock + 1;
+                        n.query_while_prepared = !s.dataset.data.prepared.is_empty();
                     }
                     if matches!(a, LocalAction::Choose) && self.bytes() {
                         let mut view = s.store.clone();
@@ -804,6 +810,14 @@ impl Model for Protocol {
                         .as_ref()
                         .is_some_and(|(_, d, _)| !d.prepared.is_empty())
             }),
+            Property::sometimes(
+                "byte checkpoint retains prepared actions",
+                |_, s: &State| {
+                    s.window_collected
+                        && !s.dataset.data.prepared.is_empty()
+                        && s.pages.iter().any(|(_, d, _)| !d.prepared.is_empty())
+                },
+            ),
             Property::sometimes("ordinary write while prepared", |_, s: &State| {
                 s.journal.iter().enumerate().any(|(i, r)| {
                     !r.resolve && !r.ops.is_empty() && !s.dataset.versions[i].prepared.is_empty()
@@ -862,6 +876,10 @@ impl Model for Protocol {
             Property::sometimes("maintenance while prepared", |_, s: &State| {
                 s.maintained_pending
             }),
+            Property::sometimes(
+                "query while prepared returns its snapshot",
+                |_, s: &State| s.query_while_prepared && matches!(s.result, Some(Ok(_))),
+            ),
             Property::sometimes("expired delayed read completes", |_, s: &State| {
                 s.expired_completion && s.result.is_some()
             }),
