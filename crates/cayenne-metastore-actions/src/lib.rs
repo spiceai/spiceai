@@ -26,4 +26,4 @@ pub use proto::{Action, ObjRef, Record, action::Kind};
 pub use state::{ApplyError, DatasetState, TableState, differences};
 
 pub mod checkpoint;
-pub use checkpoint::state_as_record;
+pub use checkpoint::{state_as_record, state_as_root};

@@ -6,9 +6,8 @@ use crate::TableState;
 use crate::proto::{self as p, Action, Record, action::Kind};
 
 /// Actions that rebuild every collection of a table from an empty dataset.
-/// Source positions belong to `DatasetState`, not to a table. No catalog path
-/// emits `AdvanceSourcePosition`: CDC positions live in `spice_sys_*` tables
-/// written outside the tap. Per-table roots therefore carry no positions.
+/// Source positions belong to `DatasetState`, not to a table, so a per-table root
+/// carries none; [`state_as_root`] adds them for a whole catalog.
 #[must_use]
 pub fn state_as_record(s: &TableState, table_id: &str) -> Record {
     let t = || table_id.to_string();
@@ -136,6 +135,27 @@ pub fn state_as_record(s: &TableState, table_id: &str) -> Record {
             record_count: part.record_count,
             size: part.size,
         })));
+    }
+    Record { actions }
+}
+
+/// Actions that rebuild a whole catalog, every table and every source position,
+/// from an empty dataset.
+#[must_use]
+pub fn state_as_root(state: &crate::DatasetState) -> Record {
+    let mut actions = Vec::new();
+    for (table_id, table) in &state.tables {
+        actions.extend(state_as_record(table, table_id).actions);
+    }
+    for ((source, partition), position) in &state.positions {
+        actions.push(Action::new(Kind::AdvanceSourcePosition(
+            p::AdvanceSourcePosition {
+                source: source.clone(),
+                partition: partition.clone(),
+                position: position.clone(),
+                clear: false,
+            },
+        )));
     }
     Record { actions }
 }

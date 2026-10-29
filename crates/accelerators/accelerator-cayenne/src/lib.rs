@@ -20,6 +20,7 @@ limitations under the License.
 pub(crate) mod autotune;
 mod change_sink;
 mod imds;
+mod native_sidecar;
 pub mod partitioned_insert_strategy;
 pub mod s3;
 pub mod snapshot_engine;
@@ -3889,6 +3890,30 @@ impl DataAccelerator for CayenneAccelerator {
 
             let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
             let metadata_db_path = format!("{metadata_dir}/cayenne.db");
+
+            if source
+                .acceleration()
+                .and_then(|a| a.params.get("cayenne_metastore"))
+                .is_some_and(|metastore| metastore == "object_native")
+            {
+                let head = format!("{metadata_dir}/object_native/catalog/head");
+                if open_option == OpenOption::OpenExisting && !path_exists(&head).await {
+                    return Err(CheckpointError::Store {
+                        source: format!("Cayenne object-native catalog does not exist at {head}")
+                            .into(),
+                    });
+                }
+                let catalog = self
+                    .get_or_create_catalog(&metadata_dir, "object_native")
+                    .await
+                    .map_err(|source| CheckpointError::Store {
+                        source: Box::new(source),
+                    })?;
+                return Ok(Arc::new(native_sidecar::NativeSidecar::new(
+                    catalog,
+                    source.name().to_string(),
+                )));
+            }
 
             if open_option == OpenOption::OpenExisting && !path_exists(&metadata_db_path).await {
                 return Err(CheckpointError::Store {

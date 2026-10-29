@@ -122,7 +122,7 @@ impl ShadowCatalog {
         let path = self
             .prefix
             .clone()
-            .join("objects/blobs")
+            .join("objects").join("blobs")
             .join(digest.as_str());
         let bytes = self
             .store

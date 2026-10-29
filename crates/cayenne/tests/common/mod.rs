@@ -54,10 +54,27 @@ pub async fn fixture_catalog(
                 object_store_occ::LocalConditionalPut::new_durable(&directory)?,
             );
             let prefix = Path::from("catalog");
+            // Tiny batches and a checkpoint at every sealed batch, so the suites
+            // seal, checkpoint and reopen from checkpoint roots constantly.
+            let config = cayenne::metastore::object_native::NativeCatalogConfig {
+                log: object_store_occ::headlog::HeadLogConfig {
+                    batch_max_records: 2,
+                    ..object_store_occ::headlog::HeadLogConfig::default()
+                },
+                checkpoint_after_batches: 1,
+            };
             let catalog = match store.head(&prefix.clone().join("head")).await {
-                Ok(_) => ObjectNativeCatalog::open(Arc::clone(&store), prefix.clone()).await?,
+                Ok(_) => {
+                    ObjectNativeCatalog::open_with_config(Arc::clone(&store), prefix.clone(), config)
+                        .await?
+                }
                 Err(object_store::Error::NotFound { .. }) => {
-                    ObjectNativeCatalog::create(Arc::clone(&store), prefix.clone()).await?
+                    ObjectNativeCatalog::create_with_config(
+                        Arc::clone(&store),
+                        prefix.clone(),
+                        config,
+                    )
+                    .await?
                 }
                 Err(error) => return Err(error.into()),
             };

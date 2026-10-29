@@ -542,8 +542,12 @@ impl DatasetState {
                 );
             }
             Kind::AdvanceSourcePosition(a) => {
-                self.positions
-                    .insert((a.source.clone(), a.partition.clone()), a.position.clone());
+                let key = (a.source.clone(), a.partition.clone());
+                if a.clear {
+                    self.positions.remove(&key);
+                } else {
+                    self.positions.insert(key, a.position.clone());
+                }
             }
             Kind::Unconverted(a) => {
                 self.unknown.insert(a.table_id.clone());

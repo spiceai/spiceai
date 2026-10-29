@@ -450,6 +450,9 @@ pub struct AdvanceSourcePosition {
     pub partition: String,
     #[prost(bytes = "vec", tag = "3")]
     pub position: Vec<u8>,
+    /// Remove the entry instead of setting it.
+    #[prost(bool, tag = "4")]
+    pub clear: bool,
 }
 
 /// A mutation the tap saw but no converted method described. The state of

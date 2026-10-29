@@ -42,6 +42,33 @@ struct Inner {
     reader: ShadowCatalog,
     writer: Writer,
     poisoned: bool,
+    config: NativeCatalogConfig,
+    /// The state at the last checkpoint this catalog staged (or opened from), and
+    /// the records committed after it, from which the next checkpoint root is built.
+    floor_state: DatasetState,
+    since_floor: Vec<(u64, Vec<Record>)>,
+    /// The commit of the last checkpoint staged; its floor publishes with the next commit.
+    staged_checkpoint: u64,
+}
+
+/// Head-log tuning for a native catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeCatalogConfig {
+    /// The log's budgets; every writer of one log must use the same values.
+    pub log: HeadLogConfig,
+    /// Sealed batches listed in the head before the catalog checkpoints at the
+    /// newest one.
+    pub checkpoint_after_batches: usize,
+}
+
+impl Default for NativeCatalogConfig {
+    fn default() -> Self {
+        Self {
+            log: HeadLogConfig::default(),
+            // Small for the prototype, so short CDC runs checkpoint several times.
+            checkpoint_after_batches: 2,
+        }
+    }
 }
 fn invalid(error: impl std::fmt::Display) -> CatalogError {
     CatalogError::InvalidOperationNoSource {
@@ -113,10 +140,20 @@ impl ObjectNativeCatalog {
     /// # Errors
     /// Returns an error when conditional writes are unsupported or the prefix exists.
     pub async fn create(store: Arc<dyn ObjectStore>, prefix: Path) -> CatalogResult<Self> {
-        HeadLog::create(Arc::clone(&store), prefix.clone(), HeadLogConfig::default())
+        Self::create_with_config(store, prefix, NativeCatalogConfig::default()).await
+    }
+    /// [`Self::create`] with explicit head-log tuning.
+    /// # Errors
+    /// Returns an error when conditional writes are unsupported or the prefix exists.
+    pub async fn create_with_config(
+        store: Arc<dyn ObjectStore>,
+        prefix: Path,
+        config: NativeCatalogConfig,
+    ) -> CatalogResult<Self> {
+        HeadLog::create(Arc::clone(&store), prefix.clone(), config.log)
             .await
             .map_err(invalid)?;
-        Self::open(store, prefix).await
+        Self::open_with_config(store, prefix, config).await
     }
     /// Open the catalog kept in a local directory, creating it on first use. The
     /// directory is an fsync'd object store with conditional writes.
@@ -140,10 +177,20 @@ impl ObjectNativeCatalog {
     /// # Errors
     /// Returns an error on invalid history, takeover conflict, or storage failure.
     pub async fn open(store: Arc<dyn ObjectStore>, prefix: Path) -> CatalogResult<Self> {
+        Self::open_with_config(store, prefix, NativeCatalogConfig::default()).await
+    }
+    /// [`Self::open`] with explicit head-log tuning.
+    /// # Errors
+    /// Returns an error on invalid history, takeover conflict, or storage failure.
+    pub async fn open_with_config(
+        store: Arc<dyn ObjectStore>,
+        prefix: Path,
+        config: NativeCatalogConfig,
+    ) -> CatalogResult<Self> {
         let (reader, opened) = Reader::open(Arc::clone(&store), prefix.clone())
             .await
             .map_err(invalid)?;
-        let mut state = replay_state(opened)?;
+        let mut replayed = replay_state(opened)?;
         let generation = reader
             .state()
             .head
@@ -153,7 +200,7 @@ impl ObjectNativeCatalog {
         let writer = Writer::take_over(
             Arc::clone(&store),
             prefix.clone(),
-            HeadLogConfig::default(),
+            config.log,
             generation,
         )
         .await
@@ -173,8 +220,13 @@ impl ObjectNativeCatalog {
                     "catalog changed during takeover; reopen the catalog",
                 ));
             }
-            state = replay_state(opened)?;
+            replayed = replay_state(opened)?;
         }
+        let Replayed {
+            state,
+            floor_state,
+            since_floor,
+        } = replayed;
         Ok(Self {
             inner: StateSlot {
                 available: Notify::new(),
@@ -182,35 +234,81 @@ impl ObjectNativeCatalog {
                     reader: ShadowCatalog::from_state(state, store, prefix),
                     writer,
                     poisoned: false,
+                    config,
+                    floor_state,
+                    since_floor,
+                    staged_checkpoint: 0,
                 })),
             },
         })
     }
 }
-fn replay_state(opened: Opened) -> CatalogResult<DatasetState> {
+struct Replayed {
+    state: DatasetState,
+    floor_state: DatasetState,
+    since_floor: Vec<(u64, Vec<Record>)>,
+}
+fn replay_state(opened: Opened) -> CatalogResult<Replayed> {
     let mut state = DatasetState::default();
     if let Some(root) = opened.checkpoint_root {
         state
             .apply(&Record::decode(root).map_err(invalid)?)
             .map_err(invalid)?;
     }
+    let floor_state = state.clone();
+    let mut since_floor = Vec::with_capacity(opened.records.len());
     for entry in opened.records {
+        let mut records = Vec::new();
         for payload in Group::decode(entry.record.payload)
             .map_err(invalid)?
             .payloads
         {
-            state
-                .apply(&Record::decode(payload).map_err(invalid)?)
-                .map_err(invalid)?;
+            let record = Record::decode(payload).map_err(invalid)?;
+            state.apply(&record).map_err(invalid)?;
+            records.push(record);
         }
+        since_floor.push((entry.commit, records));
     }
     if !state.unknown.is_empty() {
         return Err(invalid("unconverted actions in native catalog history"));
     }
-    Ok(state)
+    Ok(Replayed {
+        state,
+        floor_state,
+        since_floor,
+    })
 }
 
 impl Inner {
+    /// Checkpoint at the newest sealed batch once enough batches are listed. The
+    /// root is the floor state with every record up to that batch end applied.
+    async fn maybe_checkpoint(&mut self) -> CatalogResult<()> {
+        let head = &self.writer.state().head;
+        let Some(&at) = head.batches.last() else {
+            return Ok(());
+        };
+        let floor = head.floor.max(self.staged_checkpoint);
+        let listed = head.batches.iter().filter(|&&end| end > floor).count();
+        if at <= floor || listed < self.config.checkpoint_after_batches {
+            return Ok(());
+        }
+        let mut root_state = self.floor_state.clone();
+        for (_, records) in self.since_floor.iter().filter(|(commit, _)| *commit <= at) {
+            for record in records {
+                root_state.apply(record).map_err(invalid)?;
+            }
+        }
+        let root = cayenne_metastore_actions::state_as_root(&root_state).encode_to_vec();
+        self.writer
+            .publish_checkpoint(at, root.into())
+            .await
+            .map_err(invalid)?;
+        self.floor_state = root_state;
+        self.since_floor.retain(|(commit, _)| *commit > at);
+        self.staged_checkpoint = at;
+        Ok(())
+    }
+
     fn table(&self, id: &str) -> CatalogResult<&cayenne_metastore_actions::TableState> {
         self.reader
             .state
@@ -237,7 +335,7 @@ impl Inner {
             .reader
             .prefix
             .clone()
-            .join("objects/blobs")
+            .join("objects").join("blobs")
             .join(blake3::hash(bytes).to_hex().as_str());
         self.reader
             .store
@@ -287,7 +385,7 @@ impl Inner {
             .reader
             .prefix
             .clone()
-            .join("objects/attempts")
+            .join("objects").join("attempts")
             .join(blake3::hash(attempt.attempt_id()).to_hex().as_str());
         let attempt_bytes = serde_json::to_vec(&attempt).map_err(invalid)?;
         self.reader
@@ -297,9 +395,15 @@ impl Inner {
             .map_err(invalid)?;
         // Refuse subsequent mutations unless this exact attempt is accepted.
         match self.writer.commit(&attempt).await.map_err(invalid)? {
-            Outcome::Accepted { .. } => {
+            Outcome::Accepted { commit } => {
                 self.reader.state = next;
                 self.poisoned = false;
+                self.since_floor.push((commit, vec![record]));
+                // The commit is acknowledged whatever happens to the checkpoint: a
+                // failed one leaves the batch index to grow until a later one lands.
+                if let Err(error) = self.maybe_checkpoint().await {
+                    tracing::warn!("Cayenne object-native catalog could not checkpoint, so its history keeps growing until a later checkpoint succeeds: {error}");
+                }
                 Ok(())
             }
             outcome => Err(invalid(format!(
@@ -1511,6 +1615,38 @@ fn rewrite_inline(
     Ok(batch)
 }
 impl ObjectNativeCatalog {
+    /// The runtime's bookkeeping value under `key` (a CDC position, a dataset
+    /// checkpoint), kept in the catalog beside the data it describes.
+    /// # Errors
+    /// Returns an error when the catalog must be reopened.
+    pub async fn sidecar_value(&self, key: &str) -> CatalogResult<Option<Vec<u8>>> {
+        let inner = self.read().await?;
+        Ok(inner
+            .reader
+            .state
+            .positions
+            .get(&(key.to_string(), String::new()))
+            .cloned())
+    }
+
+    /// Set (`Some`) or remove (`None`) the bookkeeping value under `key`, in one commit.
+    /// # Errors
+    /// Returns an error when the commit is not accepted.
+    pub async fn set_sidecar_value(&self, key: &str, value: Option<Vec<u8>>) -> CatalogResult<()> {
+        let mut inner = self.inner.take().await;
+        let clear = value.is_none();
+        inner
+            .commit(vec![Action::new(Kind::AdvanceSourcePosition(
+                proto::AdvanceSourcePosition {
+                    source: key.to_string(),
+                    partition: String::new(),
+                    position: value.unwrap_or_default(),
+                    clear,
+                },
+            ))])
+            .await
+    }
+
     pub(crate) async fn create_identified(
         &self,
         mut options: CreateTableOptions,
