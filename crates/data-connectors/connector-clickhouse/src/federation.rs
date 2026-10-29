@@ -78,8 +78,8 @@ fn function_support() -> FunctionSupport {
             .into_iter()
             .map(str::to_owned),
         )
+        .expression(Arc::new(supports_expression))
         .build()
-        .with_expression_support(Arc::new(supports_expression))
 }
 
 fn supports_expression(expr: &Expr, schema: Option<&DFSchema>) -> bool {

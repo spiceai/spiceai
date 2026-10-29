@@ -79,18 +79,38 @@ DuckDB CLI matching Spice's embedded DuckDB into `~/.cache/spicescript/`
 | `--matrix KEY=VALUE` | Choose which **runs** happen: only the matrix combinations with this value of a key under `matrix:` (as `${matrix.KEY}` prints it), such as `src=clickhouse`; repeat a key for several values. Scripts without the key or any of the values are skipped. Expected failures of the combinations left out are neither required to fail nor dropped by `--record-failures`. |
 | `--variant NAME` | Choose which **instances** start in each run: only this name under `variants:`, such as `cayenne`; repeat it for several. Scripts with none of them are skipped. Expected failures of the variants left out, and of comparisons between variants (the run compares a different set), are neither required to fail nor dropped by `--record-failures`. Neither option combines with `--record-durations`. |
 | `--work-dir DIR` | Where instances keep their spicepods, data and `spiced.log` (default `target/spicescript`). |
+| `--cell-width CHARS` | The widest a value is drawn in a mismatch report's tables (default 40): a longer one keeps its start and end around `…`. The report's first line still names the first mismatched value in full. `0` draws every value whole, for when you need the whole of a large value. |
+| `--log-capture DIR` | Leave each script with a failure's logs in `DIR/<script>/` (see **Logs and cleanup** below). CI uploads it from a failed shard as `spicescript-logs-<n>`. |
+| `--results PATH` | Write every script's outcome to this JSON file, passes included: its file, `outcome` (`passed`, or `failed` when anything failed other than as the ledger expects), run time, checks passed, every failed check with its `ledger` status (`expected`, `changed`, `new`, or `recorded` under `--record-failures`), the ledger entries that no longer fail, and the problems and notes the run prints. The file is rewritten as each script finishes, so an interrupted run leaves the scripts it finished; `complete` is set once the run reaches the end. CI uploads it from every shard as `spicescript-results-<n>`. |
 | `--keep` | Leave source containers running after the run, for debugging. |
 | `--spice-cli PATH` | The `spice` CLI that `spice` steps run. |
 | `--record-failures` | Rewrite each run script's entries in its directory's `recordings/expected-failures.json` with the failures this run saw (see [Expected failures](#expected-failures)). |
 | `--check` | Parse every script, including its corpora, and stop. Also fails on an `avoid:` whose defect no longer fails anywhere. |
 
 **Logs and cleanup.** Each failure prints the step, what was expected and what
-was seen, and the instance's `spiced.log` path. A run removes the containers,
-networks and `spiced` processes it started, including after SIGINT or SIGTERM
-and after a failed or interrupted start. A runner killed with SIGKILL can't
-clean up, so the next run reaps what dead runners left: `spiced` processes
-recorded in `spiced.pid`, and containers and networks named after the dead
-runner's pid.
+was seen, and the instance's `spiced.log` path. With
+`--log-capture DIR`, every script with a failure, expected or not, also
+leaves its logs in a directory of its own:
+
+```text
+DIR/<script>/script.yaml                  the script as run
+DIR/<script>/output.txt                   what the run printed for it
+DIR/<script>/[<combination>/]<source>.log each source container's output
+DIR/<script>/[<combination>/]<instance>/  its spiced.log (executors' too), spicepod, slt and random-query reports
+```
+
+`<combination>` is the matrix combination (`src_postgres`), for a script with
+a matrix; combinations whose values differ only in case or punctuation also
+get their position in the matrix (`k_a_b-1`, `k_a_b-2`). A container that fails to start or become healthy puts its last lines
+of output in the error either way. Processes a script starts inside a container
+(Debezium Server under `source-exec`) write to the container's output,
+`/proc/1/fd/1`, so its log has them too.
+
+A run removes the containers, networks and `spiced` processes it started,
+including after SIGINT or SIGTERM and after a failed or interrupted start. A
+runner killed with SIGKILL can't clean up, so the next run reaps what dead
+runners left: `spiced` processes recorded in `spiced.pid`, and containers and
+networks named after the dead runner's pid.
 
 ## Scripts
 

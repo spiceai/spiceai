@@ -3010,19 +3010,32 @@ jobs:
             --spiced "$(command -v spiced)" \
             --spice-cli "$(command -v spice)" \
             --work-dir "$RUNNER_TEMP/spicescript" \
+            --results "$RUNNER_TEMP/spicescript-results.json" \
+            --log-capture "$RUNNER_TEMP/spicescript-logs" \
             ${{ matrix.args }}
 
-      - name: Upload instance logs
+      # Every script's outcome, passes included, from every run: a script's
+      # failure rate across runs is read off these rather than off job logs.
+      - name: Upload script results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: spicescript-results-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/spicescript-results.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      # A directory per script with a failure: the script, what the run
+      # printed for it, its source containers' output and its instances' logs.
+      - name: Upload captured logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spicescript-logs-${{ strategy.job-index }}
           path: |
-            ${{ runner.temp }}/spicescript/**/spiced.log
-            ${{ runner.temp }}/spicescript/**/spicepod.yaml
-            ${{ runner.temp }}/spicescript/**/slt-*.txt
-            ${{ runner.temp }}/spicescript/**/random-queries-seed*.txt
+            ${{ runner.temp }}/spicescript-logs
             ${{ runner.temp }}/spicescript/harness-checks/*.log
+          if-no-files-found: warn
           retention-days: 7
 
   # Stable, matrix-proof summary check. It succeeds only if every E2E job above
