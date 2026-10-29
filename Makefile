@@ -132,12 +132,6 @@ endif
 # built and never run. None needs excluding today; one whose tests could not
 # run in the gate would be excluded by name here, with the reason beside it.
 #
-# Running cayenne's integration tests under the workspace resolve rather than
-# `-p cayenne` enables its `turso` feature, which puts 304 `*_turso` variants in
-# the gate alongside their SQLite siblings. They need more stack than the 2 MiB
-# std gives a thread; `test_with_backends!` reserves it (see
-# `crates/cayenne/tests/common/mod.rs`), so no name needs excluding here.
-#
 # Shared so `nextest` and `verify-cli` cannot drift onto different selections:
 # a different selection resolves different features, which would make verify-cli
 # recompile instead of reading the build nextest just did.

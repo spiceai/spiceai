@@ -65,9 +65,7 @@ pub async fn sidecar_for(
             source: format!("{engine} accelerator engine not available").into(),
         })?;
 
-    accelerator
-        .sidecar(source, Arc::clone(&registry), open_option)
-        .await
+    accelerator.sidecar(source, open_option).await
 }
 
 /// The dataset's sidecar, resolved from the runtime handle it carries.

@@ -43,16 +43,11 @@ use tempfile::TempDir;
 
 /// Which Cayenne metastore backend to use in a fixture.
 ///
-/// `Sqlite` is Cayenne's default (no `cayenne_metastore` param). `Turso` is
-/// available when the bench is built with `--features turso` and matches
-/// `cayenne_metastore: turso` in spicepods. The DuckDB side is unaffected;
-/// pairing a `Turso` Cayenne fixture against the same DuckDB fixture isolates
-/// the metastore's contribution to overall numbers.
+/// `Sqlite` is Cayenne's only metastore. The lane type keeps each bench's
+/// `BenchmarkId`s stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Metastore {
     Sqlite,
-    #[cfg(feature = "turso")]
-    Turso,
 }
 
 impl Metastore {
@@ -61,8 +56,6 @@ impl Metastore {
     pub fn lane(self) -> &'static str {
         match self {
             Metastore::Sqlite => "cayenne",
-            #[cfg(feature = "turso")]
-            Metastore::Turso => "cayenne_turso",
         }
     }
 
@@ -70,19 +63,12 @@ impl Metastore {
         let path = db_path.to_string_lossy();
         match self {
             Metastore::Sqlite => format!("sqlite://{path}"),
-            #[cfg(feature = "turso")]
-            Metastore::Turso => format!("libsql://{path}"),
         }
     }
 }
 
-/// All Cayenne lanes a bench should run. Compile-time gated on the `turso`
-/// feature so benches built without it cleanly drop to a single lane.
-pub const CAYENNE_LANES: &[Metastore] = &[
-    Metastore::Sqlite,
-    #[cfg(feature = "turso")]
-    Metastore::Turso,
-];
+/// All Cayenne lanes a bench should run.
+pub const CAYENNE_LANES: &[Metastore] = &[Metastore::Sqlite];
 
 /// Canonical schema for the comparison benches.
 ///
@@ -183,8 +169,7 @@ pub fn write_parquet(batch: &RecordBatch, path: &Path) {
 
 /// A clean Cayenne table backed by a fresh metastore + temp data dir.
 ///
-/// The backend (`SQLite` or `Turso`) is selected at fixture-creation time
-/// via [`Metastore`] so each bench can run multiple metastore lanes.
+/// The metastore is selected at fixture-creation time via [`Metastore`].
 pub struct CayenneFixture {
     pub _temp_dir: TempDir,
     pub table: Arc<CayenneTableProvider>,
