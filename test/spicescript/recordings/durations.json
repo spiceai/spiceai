@@ -116,6 +116,7 @@
   "settings-evolution": 54,
   "source-down-at-start": 36,
   "sql-ddl": 14,
+  "sql-ddl-agent": 16,
   "sql-explain-protocols": 1,
   "sql-operator-values": 1,
   "sql-schema-protocols": 1,
