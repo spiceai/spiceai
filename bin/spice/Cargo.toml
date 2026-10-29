@@ -32,6 +32,8 @@ tracing-subscriber.workspace = true
 
 # HTTP client
 reqwest = { workspace = true, features = ["stream"] }
+# Read the certificate error behind a failed TLS handshake
+rustls.workspace = true
 
 # Serialization
 serde.workspace = true
