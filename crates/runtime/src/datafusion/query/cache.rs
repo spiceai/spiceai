@@ -988,6 +988,7 @@ impl RevalidationClaims {
             claims: self,
             key,
             generation,
+            expires_at: claimed_at + self.time_to_live,
             _running: permit,
         })
     }
@@ -999,6 +1000,8 @@ struct RevalidationClaim<'a> {
     claims: &'a RevalidationClaims,
     key: u64,
     generation: u64,
+    /// When the claim stops holding its key.
+    expires_at: std::time::Instant,
     _running: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -1403,13 +1406,17 @@ impl Query {
         // again.
         //
         // Revalidations wait in the same admission queue as client queries, so at most a
-        // quarter of the CPU-sized admission limit run at once. A stale hit past that limit
-        // is served without one; the entry stays stale and a later hit revalidates it.
+        // quarter of the admission limit (the CPU-sized one when admission is unbounded) run
+        // at once. A stale hit past that limit is served without one; the entry stays stale
+        // and a later hit revalidates it.
         static REVALIDATION_CLAIMS: OnceLock<RevalidationClaims> = OnceLock::new();
         let claims = REVALIDATION_CLAIMS.get_or_init(|| {
             RevalidationClaims::new(
                 std::time::Duration::from_mins(5),
-                (cpu_budget::cpu_budget().max_concurrent_queries() / 4).max(1),
+                (df.query_admission_limit()
+                    .unwrap_or_else(|| cpu_budget::cpu_budget().max_concurrent_queries())
+                    / 4)
+                .max(1),
             )
         });
 
@@ -1435,7 +1442,7 @@ impl Query {
 
         // Get optional dedicated refresh runtime, fall back to current runtime if not configured
         let refresh_runtime = df.refresh_runtime().cloned();
-        let deadline = claims.time_to_live;
+        let deadline = tokio::time::Instant::from_std(claim.expires_at);
 
         // Build the background task
         let background_task = async move {
@@ -1521,7 +1528,10 @@ impl Query {
                     }
                 }
             };
-            if tokio::time::timeout(deadline, revalidation).await.is_err() {
+            if tokio::time::timeout_at(deadline, revalidation)
+                .await
+                .is_err()
+            {
                 tracing::debug!(
                     cache_key = cache_key_u64,
                     "Background revalidation did not finish before its deadline, cancelled"
@@ -4232,6 +4242,30 @@ body: SELECT CAST(random() * 1000000000000 AS BIGINT) AS v
         assert!(
             claims.claim(3).is_some(),
             "the refused key is claimed once a running revalidation ends"
+        );
+    }
+
+    /// An expired claim refused for want of a permit stays the holder of its key, so
+    /// releasing it frees both the key and the permit.
+    #[test]
+    fn an_expired_claim_refused_at_the_revalidation_limit_keeps_its_key() {
+        let claims = RevalidationClaims::new(Duration::ZERO, 1);
+        let expired = claims.claim(1).expect("an unheld key is claimed");
+
+        assert!(
+            claims.claim(1).is_none(),
+            "an expired claim is not replaced while no permit is free"
+        );
+        assert_eq!(
+            claims.held.get(&1).map(|held| held.generation),
+            Some(expired.generation),
+            "a refused replacement must leave the expired claim holding the key"
+        );
+
+        drop(expired);
+        assert!(
+            claims.claim(1).is_some(),
+            "the key and its permit are free once the expired claim is released"
         );
     }
 
