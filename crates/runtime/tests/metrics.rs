@@ -1861,7 +1861,7 @@ async fn server_timing_reports_the_recorded_duration_samples() -> Result<(), any
     let response = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{http_port}/v1/sql"))
         .header("user-agent", BUFFERED)
-        .header("accept", "text/csv")
+        .header("accept", "text/plain")
         .body(sql)
         .send()
         .await?;

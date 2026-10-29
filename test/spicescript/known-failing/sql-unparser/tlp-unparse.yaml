@@ -1,8 +1,5 @@
-# Known failing (#15538): `(NOT x) IS NULL` is unparsed without its parentheses, so the
-# source filters different rows, wherever SQL is unparsed for execution; and
-# nested IS predicates are a syntax error on MySQL. TLP over random
-# predicates without avoiding NOT. Federated to ClickHouse it breaks even with
-# NOT avoided. Move up a level once it passes.
+# Remaining known failures (#15538) are in ClickHouse federation. The
+# PostgreSQL and MySQL runs also guard the shared predicate unparser.
 name: tlp-unparse
 description: >
   Ternary logic partitioning over random predicates: for each predicate p the
