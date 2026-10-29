@@ -21,6 +21,7 @@ use std::ptr::NonNull;
 
 use snafu::ensure;
 
+use crate::mtp::DraftKind;
 use crate::{BatchFullSnafu, Error, Result, Token, sys};
 
 /// How a context is created.
@@ -58,9 +59,12 @@ impl ContextParams {
         self
     }
 
-    /// The C parameters; `mtp_of` makes an MTP draft context that reads that target's
-    /// hidden states.
-    pub(crate) fn raw(&self, mtp_of: Option<&Context<'_>>) -> sys::llama_context_params {
+    /// The C parameters; `draft_of` makes a draft context that reads that target, an MTP
+    /// context for an MTP head.
+    pub(crate) fn raw(
+        &self,
+        draft_of: Option<(&Context<'_>, DraftKind)>,
+    ) -> sys::llama_context_params {
         // SAFETY: returns a plain struct of defaults.
         let mut raw = unsafe { sys::llama_context_default_params() };
         if let Some(n_ctx) = self.n_ctx {
@@ -70,8 +74,10 @@ impl ContextParams {
             raw.n_batch = n_batch;
         }
         raw.n_rs_seq = self.n_rs_seq;
-        if let Some(target) = mtp_of {
-            raw.ctx_type = sys::llama_context_type_LLAMA_CONTEXT_TYPE_MTP;
+        if let Some((target, kind)) = draft_of {
+            if kind == DraftKind::Mtp {
+                raw.ctx_type = sys::llama_context_type_LLAMA_CONTEXT_TYPE_MTP;
+            }
             raw.ctx_other = target.as_ptr();
         }
         raw
