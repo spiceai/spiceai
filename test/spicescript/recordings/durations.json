@@ -119,7 +119,7 @@
   "slt-strings": 8,
   "source-down-at-start": 36,
   "sql-predicate-precedence": 17,
-  "sql-ddl": 14,
+  "sql-ddl": 47,
   "sql-ddl-agent": 21,
   "sql-explain-protocols": 1,
   "sql-operator-values": 1,
