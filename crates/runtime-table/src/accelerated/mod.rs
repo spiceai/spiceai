@@ -1901,6 +1901,15 @@ impl AcceleratedTable {
         matches!(self.write_mode, WriteMode::AcceleratorOnly)
     }
 
+    /// The lock every write to this table's accelerator holds for its whole
+    /// length. `#[doc(hidden)]` for integration tests that hold a write back
+    /// behind it; not a stable API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn accelerator_write_lock(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.accelerator_write_mutex)
+    }
+
     /// The key concurrent appends to this table may be grouped by (see
     /// [`Builder::groups_appends_by`]), or `None` when they must each be written
     /// alone: the table was not built for it, or its writes do not go to the

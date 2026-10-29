@@ -474,6 +474,99 @@ async fn an_append_too_large_to_share_a_write_keeps_its_place_in_the_queue() {
     rt.shutdown().await;
 }
 
+/// An append whose caller goes away after its rows were claimed into a shared
+/// write still gets the work every committed write gets, its broadcast to
+/// subscribers among it: the shared write commits its rows whether or not the
+/// caller waits.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn an_append_cancelled_after_its_rows_were_claimed_is_still_broadcast() {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let dir = tempfile::tempdir().expect("temp dir");
+    register_test_connectors().await;
+    let rt = start_runtime(vec![make_dataset("followup", dir.path(), true, &[])]).await;
+    let table = TableReference::bare("followup");
+    append(&rt, &table, &rows_of(1000..=1001, 0))
+        .await
+        .expect("seed");
+    let mut updates = rt
+        .datafusion()
+        .data_update_broadcaster()
+        .subscribe(&TableReference::full("spice", "public", "followup"))
+        .await;
+
+    let cancelled_rows = rows_of(1..=10, 1);
+    let kept_rows = rows_of(11..=20, 2);
+    let (turn, mut handles) =
+        queue_appends(&rt, &table, vec![cancelled_rows.clone(), kept_rows.clone()]).await;
+    // Hold the write back behind the dataset's write lock once it is claimed.
+    let write_lock = rt
+        .datafusion()
+        .hold_accelerator_write_lock(&table)
+        .await
+        .expect("an accelerated dataset");
+    drop(turn);
+    wait_for_queued(&rt, &table, 0).await;
+    let (_, groups, members) = rt.datafusion().append_queue_counts(&table);
+    assert_eq!(
+        (groups, members),
+        (1, 2),
+        "both appends were claimed together"
+    );
+
+    let kept = handles.pop().expect("kept append");
+    let cancelled = handles.pop().expect("cancelled append");
+    cancelled.abort();
+    assert!(
+        cancelled
+            .await
+            .expect_err("aborted while its write waits")
+            .is_cancelled(),
+        "the first append's caller went away"
+    );
+    drop(write_lock);
+    kept.await.expect("append task").expect("kept append");
+
+    // The shared write stored both appends' rows.
+    let expected = last_copy_of_each_key([&rows_of(1000..=1001, 0), &cancelled_rows, &kept_rows]);
+    assert_eq!(stored_rows(&rt, "followup").await, expected);
+
+    // And both were broadcast, the cancelled one's included.
+    let mut broadcast: Rows = Vec::new();
+    while broadcast.len() < cancelled_rows.len() + kept_rows.len() {
+        let update = tokio::time::timeout(Duration::from_secs(10), updates.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("only these rows were broadcast after the shared write: {broadcast:?}")
+            })
+            .expect("broadcast channel open");
+        for batch in &update.data {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column");
+            let values = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value column");
+            broadcast.extend(
+                ids.values()
+                    .iter()
+                    .copied()
+                    .zip(values.values().iter().copied()),
+            );
+        }
+    }
+    broadcast.sort_unstable();
+    let mut sent = [cancelled_rows, kept_rows].concat();
+    sent.sort_unstable();
+    assert_eq!(broadcast, sent);
+
+    rt.shutdown().await;
+}
+
 /// An append whose caller goes away while it is queued is never written.
 #[cfg(not(windows))]
 #[tokio::test]

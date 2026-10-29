@@ -3530,6 +3530,20 @@ impl DataFusion {
         Some(queue.take_turn().await)
     }
 
+    /// Hold `table_reference`'s accelerator write lock, which every write to its
+    /// acceleration holds for its whole length, until the guard is dropped;
+    /// `None` when it is not an accelerated dataset. `#[doc(hidden)]` for
+    /// integration tests; not a stable API.
+    #[doc(hidden)]
+    pub async fn hold_accelerator_write_lock(
+        &self,
+        table_reference: &TableReference,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let table_provider = self.get_table_provider(table_reference).await.ok()?;
+        let lock = accelerated_table_of(&table_provider, AcceleratedTable::accelerator_write_lock)?;
+        Some(lock.lock_owned().await)
+    }
+
     /// How many appends to `table_reference` wait to be written together, and
     /// how many groups and appends have been written together so far.
     /// `#[doc(hidden)]` for integration tests; not a stable API.
@@ -7762,10 +7776,21 @@ fn member_result(
 }
 
 /// The key `provider`'s accelerated table groups concurrent appends by, or `None`
-/// when it writes each alone or is not an accelerated table. Unwraps what
-/// registration stacks around the accelerated table, as
-/// `DataFusion::get_accelerated_table_provider` does.
+/// when it writes each alone or is not an accelerated table.
 fn append_group_key_of(provider: &Arc<dyn TableProvider>) -> Option<Arc<[String]>> {
+    accelerated_table_of(provider, |accelerated| {
+        accelerated.append_group_key().map(Arc::clone)
+    })
+    .flatten()
+}
+
+/// `read` of the accelerated table `provider` wraps, or `None` when it wraps none.
+/// Unwraps what registration stacks around the accelerated table, as
+/// `DataFusion::get_accelerated_table_provider` does.
+fn accelerated_table_of<T>(
+    provider: &Arc<dyn TableProvider>,
+    read: impl FnOnce(&AcceleratedTable) -> T,
+) -> Option<T> {
     let mut table = Arc::clone(provider);
     loop {
         if let Some(adaptor) = table.downcast_ref::<FederatedTableProviderAdaptor>() {
@@ -7775,7 +7800,7 @@ fn append_group_key_of(provider: &Arc<dyn TableProvider>) -> Option<Arc<[String]
         }
         if let Some(layered) = table.downcast_ref::<spice_table::SpiceTable>() {
             if let Some(accelerated) = layered.layer_as::<AcceleratedTable>() {
-                return accelerated.append_group_key().map(Arc::clone);
+                return Some(read(accelerated));
             }
             let inner = Arc::clone(layered.below());
             table = inner;
