@@ -16,6 +16,9 @@ limitations under the License.
 
 //! A GGUF model's `files` resolved against what the Hugging Face cache holds, with the Hub out
 //! of reach: the repository is listed from the cached files alone.
+//!
+//! Selected in the `nextest` gate (see `NEXTEST_FILTER` in the Makefile), like the other
+//! credential-free `llms` integration tests.
 
 use std::path::{Path, PathBuf};
 

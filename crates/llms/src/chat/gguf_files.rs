@@ -42,9 +42,9 @@ pub struct Quantization {
     /// The name a model's `files` can give it, unique in the repository: its folder when the
     /// folder holds no other quantization, or else the quantization tag of its file names
     /// (`UD-Q4_K_XL`, `Q8_0`, `BF16`), or its path when another quantization could go by that
-    /// name: has it, has it as its tag or path, or is in a folder of that name. Its tag and its
-    /// path stem name it too when no other quantization has them, so a name given while the
-    /// Hub listed the repository still resolves against the cache's shorter listing.
+    /// name: has it, has it as its tag or path, or is in a folder of that name. Its tag (its
+    /// file name, untagged) and its path stem name it too, so a name given while the Hub listed
+    /// the repository still resolves against the cache's shorter listing.
     pub name: String,
     /// Repository paths, shard 1 first.
     pub files: Vec<String>,
@@ -180,15 +180,22 @@ fn series(path: &str, present: &BTreeSet<&str>) -> std::result::Result<Vec<Strin
     }
 }
 
-/// The names a quantization answers to besides its own: the tag of its file names and its path
-/// stem, which [`quantizations`] names it by when its own name is shared.
+/// The names a quantization answers to besides its own: the name it goes by when its folder
+/// does not name it, and its path stem, which [`quantizations`] names it by when its own name
+/// is shared.
 fn aliases(quantization: &Quantization) -> impl Iterator<Item = String> {
     let first = quantization.files.first().map_or("", String::as_str);
     let stem = shard(first).map_or_else(
         || first.trim_end_matches(".gguf").to_string(),
         |(stem, _, _)| stem,
     );
-    tag(first).into_iter().chain(std::iter::once(stem))
+    [unfoldered_name(first), stem].into_iter()
+}
+
+/// The name a quantization goes by when its folder does not name it: the quantization tag of
+/// its first file's name, or that name without `.gguf` when it carries none.
+fn unfoldered_name(first: &str) -> String {
+    tag(first).unwrap_or_else(|| file_name(first).trim_end_matches(".gguf").to_string())
 }
 
 /// The quantization tag of a file name, if it carries one.
@@ -261,8 +268,7 @@ pub fn quantizations(listing: &[ListedFile]) -> Vec<Quantization> {
     let mut claims = Vec::new();
     for (dir, stem, files) in complete {
         let leaf = dir.rsplit('/').next().unwrap_or(&dir).to_string();
-        let own = tag(files[0])
-            .unwrap_or_else(|| file_name(files[0]).trim_end_matches(".gguf").to_string());
+        let own = unfoldered_name(files[0]);
         let stem = stem.trim_end_matches(".gguf").to_string();
         // A folder names the one quantization it holds; several in one folder go by their tags.
         let name = if !dir.is_empty() && in_folder.get(&dir) == Some(&1) {
@@ -866,6 +872,7 @@ mod tests {
             ("fallback_meets_folder", fallback_meets_folder()),
             ("tag_meets_folder", tag_meets_folder()),
             ("folder_named_like_a_tag", folder_named_like_a_tag()),
+            ("untagged_in_a_folder", untagged_in_a_folder()),
             (
                 "two_folders",
                 listing(&[
@@ -922,6 +929,15 @@ mod tests {
         ])
     }
 
+    /// A file with no quantization tag beside a tagged one in their folder: Copilot's case on
+    /// #15590.
+    fn untagged_in_a_folder() -> Vec<ListedFile> {
+        listing(&[
+            ("gguf/model.gguf", 4 * GB),
+            ("gguf/Other-Q8_0.gguf", 8 * GB),
+        ])
+    }
+
     /// A draft head published as a series of two shards.
     fn sharded_head() -> Vec<ListedFile> {
         listing(&[
@@ -969,6 +985,7 @@ mod tests {
             ("tags_in_one_folder", tags_in_one_folder()),
             ("tag_meets_folder", tag_meets_folder()),
             ("folder_named_like_a_tag", folder_named_like_a_tag()),
+            ("untagged_in_a_folder", untagged_in_a_folder()),
             ("sharded_head", sharded_head()),
         ];
         let mut pinned_a_head = false;

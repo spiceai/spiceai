@@ -89,7 +89,7 @@ tracing-subscriber.workspace = true
 
 # Integration tests are modules of `integration` (`tests/integration.rs`);
 # `model2vec_hf_cache` is compiled only with `local_embed`, which `llms::model2vec`
-# needs.
+# needs, and `gguf_hf_cache` only with `local_llm`, which `llms::chat::hf_files` needs.
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
