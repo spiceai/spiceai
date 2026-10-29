@@ -10,6 +10,7 @@ mod concurrent;
 mod core;
 mod dataset_lifecycle;
 mod floors;
+mod intent_roll_forward;
 mod position_deletes;
 mod read_programs;
 mod retention;
@@ -1912,6 +1913,69 @@ fn additional_runs() -> Vec<Run> {
             failure,
         });
     }
+    // One writer holding both datasets' leases commits a source transaction
+    // to A with a pending intent for B, then applies the intent to B.
+    for (name, mode, bound, failure) in [
+        ("intent-roll-forward-1-exhaust", "intent", 1, ""),
+        ("intent-roll-forward-2-exhaust", "intent", 2, ""),
+        (
+            "intent-roll-forward-two-takeovers-2-exhaust",
+            "intent-two-takeovers",
+            2,
+            "",
+        ),
+        (
+            "intent-roll-forward-disjoint-writer-1-exhaust",
+            "intent-disjoint-writer",
+            1,
+            "",
+        ),
+        (
+            "intent-roll-forward-no-intent",
+            "intent-no-intent",
+            1,
+            "eventual atomicity at quiescence",
+        ),
+        (
+            "intent-roll-forward-no-idempotency",
+            "intent-no-idempotency",
+            1,
+            "B applies each transaction at most once",
+        ),
+        (
+            "intent-roll-forward-second-writer",
+            "intent-second-writer",
+            1,
+            "eventual atomicity at quiescence",
+        ),
+        (
+            "intent-roll-forward-second-writer-blind-rebase",
+            "intent-second-writer-blind-rebase",
+            1,
+            "B keyed values follow commit order",
+        ),
+        (
+            "intent-roll-forward-abort-recovery",
+            "intent-abort-recovery",
+            1,
+            "acknowledged transactions in both datasets at quiescence",
+        ),
+        (
+            "intent-roll-forward-ingest-before-recovery",
+            "intent-ingest-before-recovery",
+            2,
+            "eventual atomicity at quiescence",
+        ),
+    ] {
+        runs.push(Run {
+            name,
+            family: "intent-roll-forward",
+            mode,
+            bound,
+            seed: None,
+            failure,
+        });
+    }
     runs
 }
 
@@ -2233,7 +2297,21 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
             }
             _ => false,
         };
-    added_required
+    let intent_required = run.family == "intent-roll-forward"
+        && run.failure.is_empty()
+        && run.seed.is_none()
+        && match name {
+            "crash between A and B then recovery completes B"
+            | "B CAS lost to maintenance and retried"
+            | "lost response resolved by attempt id"
+            | "paused writer's request fenced"
+            | "reader sees A before B" => true,
+            "B CAS lost to disjoint writer and rebased" => run.mode.contains("disjoint-writer"),
+            "two transactions applied to both" => run.bound >= 2,
+            _ => false,
+        };
+    intent_required
+        || added_required
         || standby_required
         || promotion_required
         || delivery_required
@@ -2347,6 +2425,7 @@ where
                 || run.name.starts_with("source-")
                 || run.family == "retention"
                 || run.family == "standby"
+                || run.family == "intent-roll-forward"
                 || run.mode.contains("restart")
                 || run.family == "action-compatibility")
                 && p.expectation != Expectation::Sometimes
@@ -2410,6 +2489,7 @@ pub fn run(name: &str) -> Result<(), String> {
                 .contains("symmetry")
                 .then_some(transactions::Protocol::representative),
         ),
+        "intent-roll-forward" => check(intent_roll_forward::Protocol::new(r.mode, r.bound), r),
         "window" => check(window::Protocol::new(r.mode, r.bound), r),
         "floors" => check(floors::Protocol::new(r.mode, r.bound), r),
         "concurrent" => check(concurrent::Protocol::new(r.mode, r.bound), r),

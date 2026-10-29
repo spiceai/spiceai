@@ -59,6 +59,7 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `commits-etag` | Explicit store-version CAS and delayed retry across head changes; I1–I3, I5 | Exhaustive/control 1; one writer, one original/retry pair |
 | `commits-storage` | Checkpoint parts/root before head publication, delayed GC, a query kept by retention, lagging reopen, late seal; I4, I7, I8 | Bound 2; samples 4 |
 | `transactions-txn` | Two datasets, one transaction, competing ordinary writes, reservations, commit/abort create race, helper Resolve, uncertain CAS, checkpoint/GC; one participant writes other keys while prepared so the Prepare can reach a checkpoint; I3–I6, I8 | Exhaustive 1 (two lease generations), controls 0 except owner restriction 1; samples 2, 3 (two outstanding handles per dataset) |
+| `intent-roll-forward*` | Proposed single-writer alternative to two-phase commit: one writer holding both datasets' leases commits A's actions, the source position and a pending intent for B in one A record, applies the intent to B under the transaction id, optionally marks it done in A; the next lease holder rolls pending intents forward. Maintenance on either head, delayed/duplicate CAS, lost responses resolved by attempt id, crash, pause and fencing; atomicity, at-most-once B apply, acknowledged/positioned transactions in both datasets at quiescence, I2, no retraction, B values in commit-point order, I5 | 1 or 2 source transactions on one key; one maintenance commit per dataset; one turnover and one crash (`two-takeovers`: two each); 2 copies per request; `disjoint-writer` adds one keyed write to another key of B |
 | `window-storage` | Canonical inline bytes, byte/count pressure, copy rule, cold replay, a running query, checkpoint/GC; I4, I7, I8 | Exhaustive 6 records; controls 5; samples 7, 9 |
 | `retention` / `retention-readers` | Readers never write and GC has no generations: removed objects deleted a fixed retention after GC observes the removal, which stays in durable state until the delete (timers restarted at takeover); never-committed uploads deleted once the head's store time is T_O past theirs; GC's empty commit on an idle head; fresh object names; a writer references only base-live objects or its own never-published uploads, while its base's store time is less than T_O minus a margin past the upload's; object timestamps that lag the writer's lower bound; deletes and commits that land arbitrarily late. `retention-readers` adds one query whose head GET responds late, and stops once the query settles. No dangling reference, rows or an error, and a query within the retention never fails | Exhaustive: 2 object names, 9 clock ticks, 6 head versions, retention 3, staleness 1, upload age 4, timestamp error 1, two sweeps, one takeover; the writer graph adds timestamp skew, the reader graph one query |
 | `window-txn` | Transaction resolution composed with explicit delayed byte-batch sealing and eviction; I3–I6, I8 | Exhaustive 0; samples 2, 3 |
@@ -160,6 +161,12 @@ as a separate maintenance process does.
 | `dataset-byte-window-metadata-prefix-no-sealed-floor` | Complete checkpoint and floor cross an unsealed batch: current recovery can succeed while an intermediate protected state is lost; I7 |
 | `dataset-byte-window-metadata-prefix-no-sealed-floor-without-readers` | Same early floor with no query registration: checks the separate complete-checkpoint case |
 | `transactions-two-participants-symmetry-no-create-once` | Decision overwrite still finds participant disagreement with symmetry enabled |
+| `intent-roll-forward-no-intent` | A's record omits the intent: a turnover after A commits finds nothing to roll forward, while the position in A skips redelivery; eventual atomicity |
+| `intent-roll-forward-no-idempotency` | Apply to B without checking the transaction id: the previous owner's apply landed before turnover and recovery applies it again; at-most-once B apply |
+| `intent-roll-forward-second-writer` | A second writer commits a keyed write to a key the intent writes: the intent's B actions no longer rebase, so roll-forward is blocked with A already committed and acknowledged; eventual atomicity |
+| `intent-roll-forward-second-writer-blind-rebase` | Same second writer, with the conflict ignored: the intent overwrites a write committed after the transaction's commit point; B values in commit-point order |
+| `intent-roll-forward-abort-recovery` | Recovery undoes A's actions and position instead of rolling forward: an acknowledged transaction can no longer be redelivered; acknowledged transactions in both datasets |
+| `intent-roll-forward-ingest-before-recovery` | A new owner ingests the next transaction before recovering a pending intent on the same key: the older intent then conflicts and is blocked; eventual atomicity |
 | `dataset-lifecycle-no-coverage` | Clear without coverage in the composed graph: I9 resurrected row |
 | `dataset-lifecycle-no-upload-age` | The orphan sweep takes an upload before it has aged, while the writer can still stage it: I4 |
 | `dataset-lifecycle-no-table-scope` | Dataset-wide comparison of independent allocators: valid child record refused (accepted rows still satisfy I9) |
@@ -354,6 +361,45 @@ and re-read redelivery from the source acknowledgement. Stream payloads are uniq
 append numbers so duplicates and gaps are observable. There is no backfill, multiple
 source partitions, evidence-retention expiry (see `commits-retry-expiry`) or real connector integration.
 
+## Single-writer cross-dataset intents
+
+`intent-roll-forward*` checks a proposal, not an accepted design: when one
+writer holds the writer leases of both datasets a source transaction touches,
+it skips Prepare and the decision object. A's record carries A's actions, the
+source position and a pending intent (B's actions, the transaction id and the B
+position they were planned against); the writer acknowledges the source once
+that record is accepted. It then applies the intent to B under the transaction
+id and may record the intent done in A. Each lease turnover is a head update
+on A and then on B, so a paused or fenced predecessor's requests lose their
+CAS. The next owner, holding both leases, scans A for intents without a done
+marker and applies each one B does not already hold, before ingesting anything
+else. It only rolls forward.
+
+B's CAS can lose to maintenance, which changes no keyed value; the writer
+re-reads B, checks the transaction id and re-plans on the new head. A loss to a
+keyed write on a key the intent writes is a conflict that cannot be rebased.
+Responses are never trusted: the writer reads the head and looks for its attempt
+id (epoch and base position) at the base position, resends an identical request
+while the outcome is unknown, and a request whose base is behind the head can no
+longer land. Readers see each dataset at its own snapshot, so A before B is
+visible and checked as a witness. The commit-order oracle orders B's writers by
+commit point: A's acceptance for a source transaction, its own CAS for the
+second writer.
+
+Atomicity, the acknowledged transactions and the source position are checked
+at quiescence: the latest owner is alive with both leases and no protocol step
+is enabled (crashes, turnovers, maintenance and the second writer are
+environment events and may still be pending). Safety holds in every exhaustive
+graph, including two turnovers and two crashes over two transactions. Under
+these preconditions the fast path is safe in the graph: the intent is in the
+same record as A's actions and the position; B's apply is idempotent by
+transaction id; turnover fences both heads; recovery completes before new
+ingest and only rolls forward; and no other writer commits a keyed write to
+the keys an intent writes between planning and applying it. The two
+second-writer controls show the last is required: a conflicting write either
+blocks roll-forward forever after A is acknowledged, or is overwritten out of
+commit order. That case needs two-phase commit.
+
 ## Limits
 
 Not covered: real HTTP/object storage; ETag collision probabilities; canonical
@@ -366,6 +412,14 @@ not three concurrent transactions. Its bound-one samples have one outstanding
 request per dataset and reach all-three commit, all-three abort, helper resolution
 after turnover, and checkpointed pending state at every seed. They do not reach
 Resolve batch eviction or a second outstanding handle per dataset. The original Milestone 1 graph retains its existing bounds. The new lifecycle siblings share its physical apply, rewrite, coverage and recovery helpers, and most compose one additional mechanism. Two combine them: `dataset-prepare-query-expiry` (prepared actions with queries bounded by retention, bound 3) and `dataset-prepare-query-expiry-byte-window` (prepared actions, query expiry and byte batches together, bound 5), where a query started during a prepared transaction must return its snapshot without the prepared rows. The prepared sibling abstracts the other participant and durable decision to a nondeterministic commit/abort; it does not recheck the existing multi-participant decision race. The child table stays unchanged in these siblings; parent/child allocation remains covered by the original graph. Their smaller action alphabets omit lease turnover, staging and the predecessor upload race. In the expiry sibling, terminal errors ignore late GET completions. Byte tokens stand for complete immutable action payloads: metadata-only records cost one symbolic byte and file/delete mutations two; the journal is an encoding dictionary and audit oracle, never a fallback for a missing batch. Store.root is a symbolic prefix descriptor rather than retained physical WAL; old-state recovery uses actual checkpoint pages and tail tokens. Pages include physical state and the checkpoint PK collection; recovery of protected states requires actual retained pages plus contiguous batch/window tokens.
+
+`intent-roll-forward*` has one key, at most two source transactions, one
+maintenance commit per dataset and at most two turnovers. It does not model
+A's checkpoint or log collection, which must retain a pending intent until B
+holds it; intent payload size; transactions over more than two datasets;
+lease expiry timing; a second writer's own retries; or re-planning B before A
+commits (a conflicting write that lands before A's commit also blocks, which
+is conservative). Its liveness is quiescence-based, not a fairness proof.
 
 Existing focused models retain their original bounds and controls. Their narrow
 limits above still apply: in particular only the restart profile clears caller
