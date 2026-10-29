@@ -364,7 +364,7 @@ odbc-api = { version = "29" } # arrow-odbc 25.3 requires odbc-api >=27, <30
 opendal = { version = "0.58", default-features = false, features = ["services-s3", "services-fs", "services-gcs", "services-memory"] }
 # orc-rust 0.9.0 is the first release on Arrow ^59.0, matching the workspace Arrow 59 pin.
 # Do not use datafusion-orc; the FileFormat lives in crates/dataformat-orc.
-orc-rust = { git = "https://github.com/spiceai/orc-rust.git", rev = "5b35c6d10a8cbd9750d501216ff04e72e23829b6", default-features = false, features = ["async"] } # orc-rust 0.9.0 + bounded metadata decompression
+orc-rust = { git = "https://github.com/spiceai/orc-rust.git", rev = "d9632e7ae973456c81c660c04e5f55cc86489bcb", default-features = false, features = ["async"] } # orc-rust 0.9.0 + bounded metadata decompression + bounded type tree
 opentelemetry = { version = "0.32", default-features = false, features = [
     "logs",
     "metrics",
