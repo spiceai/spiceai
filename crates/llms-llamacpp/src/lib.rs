@@ -1762,6 +1762,8 @@ const TOOL_CALL_OPENERS: &[&str] = &[
     "<|tool_call_start|>",
     "<｜tool▁calls▁begin｜>",
     "<｜tool▁call▁begin｜>",
+    "<｜DSML｜",
+    "<atem:function_calls>",
 ];
 
 /// Holds back content that may be the start of a tool call, and reads complete calls out of
@@ -1804,9 +1806,6 @@ impl ToolSplit {
                 return Ok(ToolPush::Calls(content.filter(|c| !c.is_empty()), calls));
             }
         }
-        if possible && !complete {
-            return Ok(ToolPush::Hold);
-        }
         // A tool-call opener spelled across tokens (as a grammar makes a model spell it) is
         // not a call yet, so its unfinished start stays held until it resolves either way.
         let keep = TOOL_CALL_OPENERS
@@ -1815,6 +1814,21 @@ impl ToolSplit {
             .max()
             .unwrap_or(0);
         let cut = self.held.len() - keep;
+        if possible && !complete {
+            // The engine also reports a possible call when the text only ends partway through
+            // an opener. The text before that unfinished opener is content unless it could
+            // itself start a call, so it goes out now and only the opener's start is held.
+            if keep == 0 || cut == 0 {
+                return Ok(ToolPush::Hold);
+            }
+            let (before_possible, before_complete) = self
+                .matcher
+                .prefix_could_be_tool(&self.held[..cut])
+                .map_err(|e| e.to_string())?;
+            if before_possible || before_complete {
+                return Ok(ToolPush::Hold);
+            }
+        }
         Ok(ToolPush::Content(self.held.drain(..cut).collect()))
     }
 
@@ -2690,6 +2704,13 @@ mod tests {
         out.finish(FinishReason::Stop, 1)
             .expect("the request succeeds");
         assert_eq!(sent(rx).concat(), "c:a c:<b");
+        // The same holds for the openers the engine's parser added later (DeepSeek DSML).
+        let (mut out, rx) = output(ToolChoice::Auto, None);
+        assert_eq!(out.route("a <｜DS"), None);
+        assert_eq!(out.route("x"), None);
+        out.finish(FinishReason::Stop, 1)
+            .expect("the request succeeds");
+        assert_eq!(sent(rx).concat(), "c:a c:<｜DSx");
     }
 
     #[test]
