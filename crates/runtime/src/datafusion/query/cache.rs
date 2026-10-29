@@ -926,7 +926,8 @@ fn entry_tables_changed(entry: &ServableEntry, provider: &QueryResultsCacheProvi
 }
 
 /// Cache keys with a stale-while-revalidate background revalidation pending or
-/// running, each held by the claim that took it.
+/// running, each held by the claim that took it, and the permits that bound how
+/// many run at once.
 ///
 /// A claim is taken on the stale hit's request path, so it is a sharded-map entry
 /// rather than a write to a cache that runs its own maintenance inline.
@@ -934,6 +935,7 @@ struct RevalidationClaims {
     held: DashMap<u64, HeldClaim>,
     time_to_live: std::time::Duration,
     next_generation: std::sync::atomic::AtomicU64,
+    running: Arc<tokio::sync::Semaphore>,
 }
 
 /// The claim currently holding a key.
@@ -945,17 +947,19 @@ struct HeldClaim {
 
 impl RevalidationClaims {
     /// `time_to_live` bounds how long a revalidation that never ends can keep its
-    /// key from being claimed again.
-    fn new(time_to_live: std::time::Duration) -> Self {
+    /// key from being claimed again. At most `max_running` claims are held at once.
+    fn new(time_to_live: std::time::Duration, max_running: usize) -> Self {
         Self {
             held: DashMap::new(),
             time_to_live,
             next_generation: std::sync::atomic::AtomicU64::new(0),
+            running: Arc::new(tokio::sync::Semaphore::new(max_running)),
         }
     }
 
     /// Claims `key` for one revalidation, or returns `None` while another claim
-    /// holds it. A claim older than the time-to-live no longer holds its key.
+    /// holds it or `max_running` claims are held. A claim older than the
+    /// time-to-live no longer holds its key.
     fn claim(&self, key: u64) -> Option<RevalidationClaim<'_>> {
         let generation = self
             .next_generation
@@ -965,21 +969,26 @@ impl RevalidationClaims {
             generation,
             claimed_at,
         };
-        match self.held.entry(key) {
+        let permit = match self.held.entry(key) {
             dashmap::Entry::Occupied(mut held) => {
                 if claimed_at.duration_since(held.get().claimed_at) < self.time_to_live {
                     return None;
                 }
+                let permit = Arc::clone(&self.running).try_acquire_owned().ok()?;
                 held.insert(claim);
+                permit
             }
             dashmap::Entry::Vacant(vacant) => {
+                let permit = Arc::clone(&self.running).try_acquire_owned().ok()?;
                 vacant.insert(claim);
+                permit
             }
-        }
+        };
         Some(RevalidationClaim {
             claims: self,
             key,
             generation,
+            _running: permit,
         })
     }
 }
@@ -990,6 +999,7 @@ struct RevalidationClaim<'a> {
     claims: &'a RevalidationClaims,
     key: u64,
     generation: u64,
+    _running: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl Drop for RevalidationClaim<'_> {
@@ -1391,9 +1401,17 @@ impl Query {
         // taken inside the spawned task coalesces only the revalidations that overlap
         // in time: a task that starts after the first one finished runs the same query
         // again.
+        //
+        // Revalidations wait in the same admission queue as client queries, so at most a
+        // quarter of the CPU-sized admission limit run at once. A stale hit past that limit
+        // is served without one; the entry stays stale and a later hit revalidates it.
         static REVALIDATION_CLAIMS: OnceLock<RevalidationClaims> = OnceLock::new();
-        let claims = REVALIDATION_CLAIMS
-            .get_or_init(|| RevalidationClaims::new(std::time::Duration::from_mins(5)));
+        let claims = REVALIDATION_CLAIMS.get_or_init(|| {
+            RevalidationClaims::new(
+                std::time::Duration::from_mins(5),
+                (cpu_budget::cpu_budget().max_concurrent_queries() / 4).max(1),
+            )
+        });
 
         let cache_key_u64 = cache_key.as_u64();
         // Released when the revalidation ends, whether it stores, fails, or is dropped
@@ -1401,7 +1419,7 @@ impl Query {
         let Some(claim) = claims.claim(cache_key_u64) else {
             tracing::debug!(
                 cache_key = cache_key_u64,
-                "Background revalidation already in progress for this cache key, skipped"
+                "Background revalidation already in progress for this cache key, or the revalidation limit is reached; skipped"
             );
             cache::metrics::sql_results::STALE_WHILE_REVALIDATE_SKIPPED.add(1, &[]);
             return;
@@ -1417,6 +1435,7 @@ impl Query {
 
         // Get optional dedicated refresh runtime, fall back to current runtime if not configured
         let refresh_runtime = df.refresh_runtime().cloned();
+        let deadline = claims.time_to_live;
 
         // Build the background task
         let background_task = async move {
@@ -1441,62 +1460,73 @@ impl Query {
             // is ordered after this point and rejects the write.
             let revalidation_started_at = std::time::Instant::now();
 
-            let result = background_context
-                .scope(async move { query.run().await })
-                .await;
+            // A revalidation holds one of the limited running permits, so one that hangs is
+            // cancelled when its claim expires rather than keeping the permit.
+            let revalidation = async {
+                let result = background_context
+                    .scope(async move { query.run().await })
+                    .await;
 
-            match result {
-                Ok(query_result) => {
-                    let schema = query_result
-                        .cached_schema()
-                        .unwrap_or_else(|| query_result.schema());
-                    let physical_plan = query_result.physical_plan();
-                    tracing::debug!(
-                        cache_key = cache_key_u64,
-                        "Background query execution succeeded, collecting batches"
-                    );
-                    match query_result.collect_batches().await {
-                        Ok(batches) => {
-                            tracing::debug!(
-                                cache_key = cache_key_u64,
-                                num_batches = batches.len(),
-                                "Collected batches, now caching"
-                            );
-                            Self::cache_revalidation_result(
-                                &df,
-                                &cache_key,
-                                batches,
-                                schema,
-                                input_tables,
-                                revalidation_started_at,
-                                physical_plan,
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                cache_key = cache_key_u64,
-                                "Background revalidation failed during collection: {}",
-                                e
-                            );
-                            record_revalidation_outcome(failed_revalidation_outcome(
-                                &e,
-                                RevalidationOutcome::CollectFailed,
-                            ));
+                match result {
+                    Ok(query_result) => {
+                        let schema = query_result
+                            .cached_schema()
+                            .unwrap_or_else(|| query_result.schema());
+                        let physical_plan = query_result.physical_plan();
+                        tracing::debug!(
+                            cache_key = cache_key_u64,
+                            "Background query execution succeeded, collecting batches"
+                        );
+                        match query_result.collect_batches().await {
+                            Ok(batches) => {
+                                tracing::debug!(
+                                    cache_key = cache_key_u64,
+                                    num_batches = batches.len(),
+                                    "Collected batches, now caching"
+                                );
+                                Self::cache_revalidation_result(
+                                    &df,
+                                    &cache_key,
+                                    batches,
+                                    schema,
+                                    input_tables,
+                                    revalidation_started_at,
+                                    physical_plan,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    cache_key = cache_key_u64,
+                                    "Background revalidation failed during collection: {}",
+                                    e
+                                );
+                                record_revalidation_outcome(failed_revalidation_outcome(
+                                    &e,
+                                    RevalidationOutcome::CollectFailed,
+                                ));
+                            }
                         }
                     }
+                    Err(e) => {
+                        tracing::debug!(
+                            cache_key = cache_key_u64,
+                            "Background revalidation query failed: {}",
+                            e
+                        );
+                        record_revalidation_outcome(failed_revalidation_outcome(
+                            &e,
+                            RevalidationOutcome::QueryFailed,
+                        ));
+                    }
                 }
-                Err(e) => {
-                    tracing::debug!(
-                        cache_key = cache_key_u64,
-                        "Background revalidation query failed: {}",
-                        e
-                    );
-                    record_revalidation_outcome(failed_revalidation_outcome(
-                        &e,
-                        RevalidationOutcome::QueryFailed,
-                    ));
-                }
+            };
+            if tokio::time::timeout(deadline, revalidation).await.is_err() {
+                tracing::debug!(
+                    cache_key = cache_key_u64,
+                    "Background revalidation did not finish before its deadline, cancelled"
+                );
+                record_revalidation_outcome(RevalidationOutcome::TimedOut);
             }
 
             tracing::debug!(
@@ -4180,12 +4210,37 @@ body: SELECT CAST(random() * 1000000000000 AS BIGINT) AS v
             .await;
     }
 
+    /// Stale hits on more keys than the limit start no more revalidations than the
+    /// limit. A refused key is left unclaimed, so a later stale hit can revalidate it
+    /// once a running revalidation ends.
+    #[test]
+    fn stale_hits_past_the_revalidation_limit_wait_for_a_running_one_to_end() {
+        let claims = RevalidationClaims::new(Duration::from_mins(5), 2);
+        let first = claims.claim(1).expect("the first key is claimed");
+        let _second = claims.claim(2).expect("the second key is claimed");
+
+        assert!(
+            claims.claim(3).is_none(),
+            "a third revalidation must not start while two run"
+        );
+        assert!(
+            claims.held.get(&3).is_none(),
+            "a refused key must stay unclaimed"
+        );
+
+        drop(first);
+        assert!(
+            claims.claim(3).is_some(),
+            "the refused key is claimed once a running revalidation ends"
+        );
+    }
+
     /// A claim whose revalidation outlives the time-to-live is replaced by a later
     /// claim on the same key. Releasing the expired claim must leave its replacement
     /// held, or a third stale hit would start a revalidation alongside the second.
     #[test]
     fn releasing_an_expired_revalidation_claim_keeps_its_replacement_held() {
-        let claims = RevalidationClaims::new(Duration::from_millis(50));
+        let claims = RevalidationClaims::new(Duration::from_millis(50), 4);
         let expired = claims.claim(7).expect("an unheld key is claimed");
         assert!(claims.claim(7).is_none(), "a held key is not claimed twice");
 
