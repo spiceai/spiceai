@@ -1,18 +1,40 @@
 name: 'Stop database services'
 description: |
-  Stops the PostgreSQL, MySQL, and ClickHouse servers this job started from
-  RUNNER_TEMP on a self-hosted Mac (install-postgres and the macOS service steps
-  in e2e_test_ci.yml), so none outlives the job on the shared host. Does nothing
-  for a service the job did not start that way, such as a Linux system service.
+  Stops the private database servers a job started on its allocated ports
+  (allocate-service-ports) and removes their data directories, so none outlives
+  the job on a shared self-hosted host: PostgreSQL from install-postgres with
+  isolated: 'true' (CI_PG_DIR), and servers that record a pid file and directory
+  in CI_MYSQL_PID / CI_MYSQL_DIR and CI_CLICKHOUSE_PID / CI_CLICKHOUSE_DIR.
+  Does nothing for a service the job did not start that way.
 runs:
   using: 'composite'
   steps:
     - name: Stop database services
       shell: bash
       run: |
-        if [ -n "${CI_PG_DATA:-}" ]; then
-          pg_ctl -D "$CI_PG_DATA" stop -m fast || true
+        if [ -n "${CI_PG_DIR:-}" ]; then
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            pg_bin="$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)"
+            sudo -u postgres "${pg_bin}/pg_ctl" -D "$CI_PG_DIR" stop -m fast || true
+            sudo rm -rf "$CI_PG_DIR"
+          else
+            pg_ctl -D "$CI_PG_DIR" stop -m fast || true
+            rm -rf "$CI_PG_DIR"
+          fi
         fi
-        for pid in ${CI_MYSQL_PID:-} ${CI_CLICKHOUSE_PID:-}; do
-          kill "$pid" 2>/dev/null || true
-        done
+        stop() {
+          local pid_file="$1" dir="$2" pid
+          if [ -f "$pid_file" ]; then
+            pid="$(cat "$pid_file")"
+            kill "$pid" 2>/dev/null || true
+            for _ in $(seq 1 30); do
+              kill -0 "$pid" 2>/dev/null || break
+              sleep 1
+            done
+          fi
+          if [ -n "$dir" ]; then
+            rm -rf "$dir" || true
+          fi
+        }
+        stop "${CI_MYSQL_PID:-}" "${CI_MYSQL_DIR:-}"
+        stop "${CI_CLICKHOUSE_PID:-}" "${CI_CLICKHOUSE_DIR:-}"

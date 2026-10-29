@@ -1061,7 +1061,7 @@ jobs:
               params:
                 {
                   pg_host: localhost,
-                  pg_port: '${env:PGPORT}',
+                  pg_port: 5432,
                   pg_db: testdb_acc,
                   pg_user: postgres,
                   pg_pass: postgres,
@@ -1076,14 +1076,14 @@ jobs:
 
       # Several runner instances share each self-hosted Mac, so this job's database
       # servers bind ports allocated to it rather than their stock ones.
-      - name: Allocate service ports
-        if: matrix.target.target_os == 'darwin'
+      - name: Allocate database service ports
         uses: ./.github/actions/allocate-service-ports
 
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
         with:
           pg-db: testdb
+          isolated: 'true'
 
       - name: Prepare PostgreSQL dataset
         env:
@@ -1148,6 +1148,9 @@ jobs:
             echo "      params:" >> spicepod.yaml
             for key in $(echo "$PARAMS" | jq -r 'keys[]'); do
               value=$(echo "$PARAMS" | jq -r --arg key "$key" '.[$key]')
+              if [ "$key" = "pg_port" ] && [ -n "${PGPORT:-}" ]; then
+                value="${PGPORT}"
+              fi
               echo "        $key: $value" >> spicepod.yaml
             done
           fi
@@ -1184,6 +1187,9 @@ jobs:
             echo "      params:" >> spicepod.yaml
             for key in $(echo "$PARAMS" | jq -r 'keys[]'); do
               value=$(echo "$PARAMS" | jq -r --arg key "$key" '.[$key]')
+              if [ "$key" = "pg_port" ] && [ -n "${PGPORT:-}" ]; then
+                value="${PGPORT}"
+              fi
               echo "        $key: $value" >> spicepod.yaml
             done
           fi
@@ -1254,7 +1260,7 @@ jobs:
               params:
                 {
                   pg_host: localhost,
-                  pg_port: '${env:PGPORT}',
+                  pg_port: 5432,
                   pg_db: testdb,
                   pg_user: postgres,
                   pg_pass: postgres,
@@ -1269,8 +1275,7 @@ jobs:
 
       # Several runner instances share each self-hosted Mac, so this job's database
       # servers bind ports allocated to it rather than their stock ones.
-      - name: Allocate service ports
-        if: matrix.target.target_os == 'darwin'
+      - name: Allocate database service ports
         uses: ./.github/actions/allocate-service-ports
 
       - name: Install PostgreSQL
@@ -1278,6 +1283,7 @@ jobs:
         uses: ./.github/actions/install-postgres
         with:
           pg-db: testdb
+          isolated: 'true'
 
       - name: Configure apt mirrors (Linux)
         if: matrix.target.target_os == 'linux'
@@ -1311,15 +1317,15 @@ jobs:
           }
           brew list --versions mysql@8.4 >/dev/null || HOMEBREW_NO_AUTO_UPDATE=1 retry brew install mysql@8.4
           mysql_bin="$(brew --prefix mysql@8.4)/bin"
-          dir="${RUNNER_TEMP}/mysql"
-          # Under /tmp, named by port, to stay under macOS's 104-byte socket path limit.
-          socket="/tmp/mysql-${CI_MYSQL_PORT}.sock"
+          dir="/var/tmp/spice-mysql-${CI_MYSQL_PORT}"
+          socket="${dir}/mysql.sock"
           rm -rf "$dir" && mkdir -p "$dir"
           "${mysql_bin}/mysqld" --no-defaults --initialize-insecure --datadir="$dir/data" --log-error="$dir/error.log"
           "${mysql_bin}/mysqld" --no-defaults --datadir="$dir/data" --port="$CI_MYSQL_PORT" --bind-address=127.0.0.1,::1 \
             --socket="$socket" --mysqlx=OFF --pid-file="$dir/mysqld.pid" --log-error="$dir/error.log" > /dev/null 2>&1 &
           {
-            echo "CI_MYSQL_PID=$!"
+            echo "CI_MYSQL_PID=${dir}/mysqld.pid"
+            echo "CI_MYSQL_DIR=${dir}"
             echo "MYSQL_TCP_PORT=${CI_MYSQL_PORT}"
             echo "MYSQL_UNIX_PORT=${socket}"
           } >> "$GITHUB_ENV"
@@ -1406,6 +1412,9 @@ jobs:
             echo "      params:" >> spicepod.yaml
             for key in $(echo "$PARAMS" | jq -r 'keys[]'); do
               value=$(echo "$PARAMS" | jq -r --arg key "$key" '.[$key]')
+              if [ "$key" = "pg_port" ] && [ -n "${PGPORT:-}" ]; then
+                value="${PGPORT}"
+              fi
               echo "        $key: $value" >> spicepod.yaml
             done
           fi
@@ -1442,6 +1451,9 @@ jobs:
             echo "      params:" >> spicepod.yaml
             for key in $(echo "$PARAMS" | jq -r 'keys[]'); do
               value=$(echo "$PARAMS" | jq -r --arg key "$key" '.[$key]')
+              if [ "$key" = "pg_port" ] && [ -n "${PGPORT:-}" ]; then
+                value="${PGPORT}"
+              fi
               echo "        $key: $value" >> spicepod.yaml
             done
           fi
@@ -1506,7 +1518,7 @@ jobs:
 
       # Several runner instances share each self-hosted Mac, so this job's database
       # servers bind ports allocated to it rather than their stock ones.
-      - name: Allocate service ports
+      - name: Allocate database service ports
         if: matrix.target.target_os == 'darwin'
         uses: ./.github/actions/allocate-service-ports
 
@@ -1537,20 +1549,31 @@ jobs:
         run: |
           CLICKHOUSE_VERSION="26.3.9.8-lts"
           BASE_URL="https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}"
-          dir="${RUNNER_TEMP}/clickhouse"
+          dir="/var/tmp/spice-clickhouse-${CI_CLICKHOUSE_PORT}"
           rm -rf "$dir" && mkdir -p "$dir"
           curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "${BASE_URL}/clickhouse-macos-aarch64" -o "$dir/clickhouse"
           chmod +x "$dir/clickhouse"
-          # Runs in place and unprivileged, every listener on this job's ports, rather than
-          # `clickhouse install` into the shared host's system paths and stock ports. The
-          # server keeps users and other state in its working directory, so start it there.
+          # Runs in place and unprivileged rather than `clickhouse install` into the shared
+          # host's system paths. Every listener and every state path moves, as on Linux; the
+          # working directory only collects preprocessed configs, so it is $dir as well.
           cd "$dir"
-          ./clickhouse server -- --path="$dir/data/" --listen_host=127.0.0.1 \
-            --tcp_port="$CI_CLICKHOUSE_PORT" --http_port="$CI_CLICKHOUSE_HTTP_PORT" \
-            --mysql_port="$CI_CLICKHOUSE_MYSQL_PORT" --postgresql_port="$CI_CLICKHOUSE_PG_PORT" \
-            --interserver_http_port="$CI_CLICKHOUSE_INTERSERVER_PORT" --logger.console=0 \
-            --logger.log="$dir/server.log" --logger.errorlog="$dir/server.err.log" > /dev/null 2>&1 &
-          echo "CI_CLICKHOUSE_PID=$!" >> "$GITHUB_ENV"
+          ./clickhouse server --pid-file="${dir}/clickhouse.pid" -- \
+            --listen_host=127.0.0.1 \
+            --http_port="${CI_CLICKHOUSE_HTTP_PORT}" \
+            --tcp_port="${CI_CLICKHOUSE_PORT}" \
+            --mysql_port="${CI_CLICKHOUSE_MYSQL_PORT}" \
+            --postgresql_port="${CI_CLICKHOUSE_PG_PORT}" \
+            --interserver_http_port="${CI_CLICKHOUSE_INTERSERVER_PORT}" \
+            --path="${dir}/" \
+            --tmp_path="${dir}/tmp/" \
+            --user_files_path="${dir}/user_files/" \
+            --format_schema_path="${dir}/format_schemas/" \
+            --user_directories.local_directory.path="${dir}/access/" \
+            --logger.log="${dir}/clickhouse.log" \
+            --logger.errorlog="${dir}/clickhouse.err.log" \
+            --logger.console=0 > /dev/null 2>&1 &
+          echo "CI_CLICKHOUSE_PID=${dir}/clickhouse.pid" >> "$GITHUB_ENV"
+          echo "CI_CLICKHOUSE_DIR=${dir}" >> "$GITHUB_ENV"
           echo "$dir" >> "$GITHUB_PATH"
           ch() { ./clickhouse client --host 127.0.0.1 --port "$CI_CLICKHOUSE_PORT" "$@"; }
           for attempt in {1..30}; do
@@ -1752,14 +1775,14 @@ jobs:
 
       # Several runner instances share each self-hosted Mac, so this job's database
       # servers bind ports allocated to it rather than their stock ones.
-      - name: Allocate service ports
-        if: matrix.target.target_os == 'darwin'
+      - name: Allocate database service ports
         uses: ./.github/actions/allocate-service-ports
 
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
         with:
           pg-db: testdb
+          isolated: 'true'
 
       - name: Check PostgreSQL
         env:
