@@ -10342,7 +10342,7 @@ dependencies = [
 
 [[package]]
 name = "http-body-limit"
-version = "2.4.0-unstable"
+version = "2.4.0"
 dependencies = [
  "async-compression",
  "brotli",
@@ -10354,7 +10354,7 @@ dependencies = [
  "snafu",
  "tokio",
  "tokio-util",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
