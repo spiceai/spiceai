@@ -6846,7 +6846,7 @@ impl DataFusion {
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
         let dialect = session.config().options().sql_parser.dialect;
-        let statement = session.sql_to_statement(sql, &dialect)?;
+        let statement = sql_depth_guard::sql_to_statement(session, sql, &dialect)?;
         sql_depth_guard::ensure_statement_within_depth_limits(&statement)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
