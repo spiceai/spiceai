@@ -145,13 +145,15 @@ pub(crate) struct State {
     allocator: [usize; 2],
     drawn: usize,
     candidate: Option<usize>,
-    pin: Option<usize>,
-    checked: bool,
+    /// The oldest running query's commit; retention keeps every state from it.
+    query: Option<usize>,
     queries: Vec<usize>,
     upload: Option<usize>,
     started: bool,
     staged: Option<(Head, usize)>,
     swept: bool,
+    /// Uploads past the age limit: the writer can no longer reference them.
+    aged: Vec<usize>,
     late: bool,
     refused: bool,
     recovered: Option<(Data, Keys)>,
@@ -168,8 +170,6 @@ pub(crate) enum Action {
     CollectLog,
     Recover,
     Choose,
-    Pin,
-    Recheck,
     SecondQuery,
     StagePage,
     PublishPage,
@@ -177,10 +177,13 @@ pub(crate) enum Action {
     StartUpload,
     FinishUpload,
     Takeover,
+    Age(usize),
     Sweep,
     SelectRemoved,
     Delete,
 }
+/// Fresh names for uploads, one per lease generation.
+const UPLOAD: usize = 5;
 impl Protocol {
     pub(crate) fn new(mode: &str, bound: usize) -> Self {
         Self {
@@ -192,7 +195,7 @@ impl Protocol {
         self.mode.contains(text)
     }
     fn low(s: &State) -> usize {
-        s.pin.unwrap_or(s.head.floor).min(s.head.floor)
+        s.query.unwrap_or(s.head.floor).min(s.head.floor)
     }
     fn referenced(s: &State, id: usize) -> bool {
         s.versions[Self::low(s)..]
@@ -200,7 +203,7 @@ impl Protocol {
             .any(|v| v.refs().contains(&id))
     }
     fn collect_through(&self, s: &State) -> usize {
-        if self.has("no-pin-log-retention") {
+        if self.has("no-query-log-retention") {
             return s.head.floor;
         }
         s.checkpoint
@@ -364,13 +367,13 @@ impl Model for Protocol {
                 allocator: [4, 0],
                 drawn: 0,
                 candidate: None,
-                pin: None,
-                checked: false,
+                query: None,
                 queries: vec![],
                 upload: None,
                 started: false,
                 staged: None,
                 swept: false,
+                aged: vec![],
                 late: false,
                 refused: false,
                 recovered: None,
@@ -409,12 +412,14 @@ impl Model for Protocol {
             if s.data.page.is_some() {
                 a.push(Action::RemovePage);
             }
-            let page = s.head.lease;
+            // Every object has a fresh name: a page is staged only from the
+            // writer's own upload, never by reusing an object found present.
+            let page = UPLOAD + s.head.lease;
             if s.staged.is_none()
                 && s.present.contains(&page)
                 && s.data.page != Some(page)
-                && (self.has("no-retirement-interlock")
-                    || !s.selected.as_ref().is_some_and(|v| v.contains(&page)))
+                && !s.removed.contains(&page)
+                && !s.aged.contains(&page)
             {
                 a.push(Action::StagePage);
             }
@@ -438,12 +443,6 @@ impl Model for Protocol {
         if s.candidate.is_none() {
             a.push(Action::Choose);
         }
-        if s.candidate.is_some() && s.pin.is_none() {
-            a.push(Action::Pin);
-        }
-        if s.pin.is_some() && !s.checked {
-            a.push(Action::Recheck);
-        }
         if s.queries.len() == 1 && s.queries[0] < s.head.pos {
             a.push(Action::SecondQuery);
         }
@@ -456,7 +455,18 @@ impl Model for Protocol {
         if s.upload.is_some() {
             a.push(Action::FinishUpload);
         }
-        if s.head.lease > 0 && !s.swept {
+        // Only uploads can be unreferenced without having been removed.
+        for id in [UPLOAD, UPLOAD + 1] {
+            if s.present.contains(&id)
+                && !s.aged.contains(&id)
+                && !s.removed.contains(&id)
+                && !Self::referenced(s, id)
+                && s.staged.is_none_or(|(_, p)| p != id)
+            {
+                a.push(Action::Age(id));
+            }
+        }
+        if !s.swept {
             a.push(Action::Sweep);
         }
         if s.selected.is_none() {
@@ -546,7 +556,7 @@ impl Model for Protocol {
                 r.page = None;
                 self.accept(&mut next, r);
             }
-            Action::StagePage => next.staged = Some((state.head, state.head.lease)),
+            Action::StagePage => next.staged = Some((state.head, UPLOAD + state.head.lease)),
             Action::PublishPage => {
                 let (base, id) = next.staged.take()?;
                 if state.head.accepts(base) {
@@ -557,7 +567,7 @@ impl Model for Protocol {
             }
             Action::StartUpload => {
                 next.started = true;
-                next.upload = Some(state.head.lease);
+                next.upload = Some(UPLOAD + state.head.lease);
             }
             Action::FinishUpload => {
                 let id = next.upload.take()?;
@@ -565,7 +575,7 @@ impl Model for Protocol {
                     next.present.push(id);
                     next.present.sort_unstable();
                 }
-                next.late |= id < state.head.lease && state.swept;
+                next.late |= id < UPLOAD + state.head.lease && state.swept;
             }
             Action::Takeover => {
                 next.head.lease = 1;
@@ -590,26 +600,30 @@ impl Model for Protocol {
                 next.collected = through;
             }
             Action::Recover => next.recovered = Self::recover(state, state.head.pos),
-            Action::Choose => next.candidate = Some(state.head.pos),
-            Action::Pin => next.pin = state.candidate,
-            Action::Recheck => {
-                next.checked = true;
-                if state.pin? >= state.head.floor || self.has("no-pin-recheck") {
-                    next.queries.push(state.candidate?);
-                }
+            // A query starts on the current head; retention, not a reader
+            // write, keeps its state until it expires.
+            Action::Choose => {
+                next.candidate = Some(state.head.pos);
+                next.query = Some(state.head.pos);
+                next.queries.push(state.head.pos);
             }
             Action::SecondQuery => next.queries.push(state.head.pos),
+            Action::Age(id) => {
+                next.aged.push(id);
+                next.aged.sort_unstable();
+            }
             Action::Sweep | Action::SelectRemoved => {
                 let sweep = matches!(action, Action::Sweep);
                 let ids: Vec<_> = state
                     .present
                     .iter()
                     .filter(|&&id| {
-                        (!sweep || id == 0)
-                            && (sweep || state.removed.contains(&id))
+                        // The orphan sweep takes only aged uploads. The
+                        // retention model's writer age check and head move are
+                        // what make an aged upload unreferenceable.
+                        (sweep != state.removed.contains(&id))
                             && !Self::referenced(state, id)
-                            && (self.has("no-retirement-interlock")
-                                || state.staged.is_none_or(|(_, p)| p != id))
+                            && (!sweep || self.has("no-upload-age") || state.aged.contains(&id))
                     })
                     .copied()
                     .collect();
@@ -641,7 +655,7 @@ impl Model for Protocol {
             }),
             Property::always("I7 composed query snapshots", |_, s: &State| {
                 s.queries.is_empty()
-                    || s.pin.is_some_and(|low| {
+                    || s.query.is_some_and(|low| {
                         (low..=s.head.pos).all(|v| {
                             Self::recover(s, v).is_some_and(|(data, index)| {
                                 data == s.versions[v]

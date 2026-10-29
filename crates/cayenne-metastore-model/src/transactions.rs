@@ -240,8 +240,18 @@ impl Model for Protocol {
             if !self.has("resolution-") {
                 action.push(Observe(i));
             }
-            if !self.has("resolution-")
-                && fold(&dataset.log).out != 0
+            // Padding after the outcome lets Resolve leave the window; padding
+            // while prepared (a write to another key) lets the Prepare reach a
+            // checkpoint, which names only records that left the window.
+            // One participant pads, which keeps the state space near the
+            // unpadded one.
+            let padded = |d: &Local| d.log.iter().filter(|r| r.0 == 0).count();
+            let others_padded = (0..state.ds.len()).any(|j| j != i && padded(&state.ds[j]) > 0);
+            if (!self.has("resolution-") && fold(&dataset.log).out != 0
+                || fold(&dataset.log).pending
+                    && padded(dataset) < 2
+                    && !others_padded
+                    && dataset.root.is_empty())
                 && dataset.log.len() < 8
                 && dataset.req.is_none()
                 && dataset.parked.is_none()
@@ -288,10 +298,10 @@ impl Model for Protocol {
             if dataset.parked.is_some() {
                 action.push(Switch(i));
             }
-            if dataset.root.is_empty() && !dataset.log.is_empty() {
+            if dataset.root.is_empty() && dataset.storage.first > dataset.floor {
                 action.push(Checkpoint(i));
             }
-            if dataset.root.len() > dataset.floor && dataset.root.len() == dataset.log.len() {
+            if dataset.root.len() > dataset.floor {
                 action.push(Publish(i));
             }
             if dataset.floor > 0 && dataset.root.iter().any(|r| r.0 == 1) && !dataset.gc {
@@ -394,7 +404,14 @@ impl Model for Protocol {
             }
             Advance(i) => {
                 let dataset = &mut next.ds[i];
-                let r = record(2, 0, 100 + dataset.log.len());
+                let kind = if fold(&dataset.log).pending { 0 } else { 2 };
+                let r = record(kind, 0, 100 + dataset.log.len());
+                if self.has("resolution-") {
+                    dataset.storage.observe("");
+                    for j in 0..dataset.storage.pending.len() {
+                        dataset.storage.create(j);
+                    }
+                }
                 if !dataset.storage.append(r, "") {
                     return None;
                 }
@@ -417,12 +434,16 @@ impl Model for Protocol {
                 }
             }
             Checkpoint(i) => {
-                next.ds[i].root = Self::decode(&state.ds[i])?;
+                // A checkpoint names the newest batch end, so the floor never
+                // splits a batch; records still in the window stay above it.
+                let first = state.ds[i].storage.first;
+                next.ds[i].root = Self::decode(&state.ds[i])?.get(..first)?.to_vec();
             }
             Publish(i) => {
                 next.ds[i].floor = state.ds[i].root.len();
-                // Fold a fresh storage checkpoint; pending state is encoded in records.
-                next.ds[i].storage.checkpoint();
+                if !next.ds[i].storage.publish(state.ds[i].root.len(), "") {
+                    return None;
+                }
             }
             Gc(i) => {
                 let v = fold(&state.ds[i].log);
