@@ -139,6 +139,25 @@ steps:
   - query: SELECT * FROM orders
     eventually: 90s
 
+  # Sustained changes: one committed transaction a second for 90 s, so the
+  # metastore commits often enough to seal and checkpoint its log before the
+  # restart and the kill below.
+  - source-exec:
+      src: |
+        DO $$
+        BEGIN
+          FOR i IN 1..90 LOOP
+            UPDATE orders SET o_qty = (o_qty + 1) % 50 WHERE o_id % 90 = i % 90;
+            UPDATE customers SET c_balance = c_balance + 1 WHERE c_id % 90 = i % 90;
+            COMMIT;
+            PERFORM pg_sleep(1);
+          END LOOP;
+        END $$;
+  - query: SELECT * FROM orders
+    eventually: 90s
+  - query: SELECT * FROM customers
+    eventually: 30s
+
   # Changes made while spiced is stopped arrive after it starts again.
   - stop: {}
   - source-exec:

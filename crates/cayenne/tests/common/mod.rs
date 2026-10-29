@@ -42,7 +42,7 @@ pub async fn fixture_catalog(
         Err(std::env::VarError::NotPresent) | Ok("sqlite") => {
             Ok(Arc::new(CayenneCatalog::new(connection_string)?))
         }
-        Ok("native") => {
+        Ok(selection @ ("native" | "native-nosync")) => {
             use cayenne::metastore::object_native::ObjectNativeCatalog;
             use object_store::{ObjectStore, ObjectStoreExt, path::Path};
             let database = connection_string
@@ -50,9 +50,12 @@ pub async fn fixture_catalog(
                 .ok_or("native harness requires a local SQLite fixture path")?;
             let directory = std::path::PathBuf::from(format!("{database}.native"));
             tokio::fs::create_dir_all(&directory).await?;
-            let store: Arc<dyn ObjectStore> = Arc::new(
-                object_store_occ::LocalConditionalPut::new_durable(&directory)?,
-            );
+            // `native-nosync` skips fsync, to measure what durability costs.
+            let store: Arc<dyn ObjectStore> = Arc::new(if selection == "native-nosync" {
+                object_store_occ::LocalConditionalPut::new(&directory)?
+            } else {
+                object_store_occ::LocalConditionalPut::new_durable(&directory)?
+            });
             let prefix = Path::from("catalog");
             // Tiny batches and a checkpoint at every sealed batch, so the suites
             // seal, checkpoint and reopen from checkpoint roots constantly.
@@ -65,8 +68,12 @@ pub async fn fixture_catalog(
             };
             let catalog = match store.head(&prefix.clone().join("head")).await {
                 Ok(_) => {
-                    ObjectNativeCatalog::open_with_config(Arc::clone(&store), prefix.clone(), config)
-                        .await?
+                    ObjectNativeCatalog::open_with_config(
+                        Arc::clone(&store),
+                        prefix.clone(),
+                        config,
+                    )
+                    .await?
                 }
                 Err(object_store::Error::NotFound { .. }) => {
                     ObjectNativeCatalog::create_with_config(
@@ -81,7 +88,7 @@ pub async fn fixture_catalog(
             let head = store.head(&prefix.join("head")).await?;
             assert!(head.size > 0, "native catalog must persist a head object");
             eprintln!(
-                "CAYENNE_TEST_CATALOG=native: durable head {} ({} bytes)",
+                "CAYENNE_TEST_CATALOG={selection}: head {} ({} bytes)",
                 head.location, head.size
             );
             Ok(Arc::new(catalog))

@@ -65,8 +65,8 @@ impl Default for NativeCatalogConfig {
     fn default() -> Self {
         Self {
             log: HeadLogConfig::default(),
-            // Small for the prototype, so short CDC runs checkpoint several times.
-            checkpoint_after_batches: 2,
+            // Small for the prototype, so short CDC runs checkpoint.
+            checkpoint_after_batches: 1,
         }
     }
 }
@@ -197,14 +197,9 @@ impl ObjectNativeCatalog {
             .lease
             .checked_add(1)
             .ok_or_else(|| invalid("catalog lease exhausted"))?;
-        let writer = Writer::take_over(
-            Arc::clone(&store),
-            prefix.clone(),
-            config.log,
-            generation,
-        )
-        .await
-        .map_err(invalid)?;
+        let writer = Writer::take_over(Arc::clone(&store), prefix.clone(), config.log, generation)
+            .await
+            .map_err(invalid)?;
         // Takeover fences the old writer. If it committed during replay,
         // rebuild from that fenced head before acknowledging the open.
         if writer.state().head.commit != reader.state().head.commit
@@ -335,7 +330,8 @@ impl Inner {
             .reader
             .prefix
             .clone()
-            .join("objects").join("blobs")
+            .join("objects")
+            .join("blobs")
             .join(blake3::hash(bytes).to_hex().as_str());
         self.reader
             .store
@@ -381,18 +377,6 @@ impl Inner {
             .prepare_group(vec![record.encode_to_vec().into()])
             .await
             .map_err(invalid)?;
-        let attempt_path = self
-            .reader
-            .prefix
-            .clone()
-            .join("objects").join("attempts")
-            .join(blake3::hash(attempt.attempt_id()).to_hex().as_str());
-        let attempt_bytes = serde_json::to_vec(&attempt).map_err(invalid)?;
-        self.reader
-            .store
-            .put(&attempt_path, attempt_bytes.into())
-            .await
-            .map_err(invalid)?;
         // Refuse subsequent mutations unless this exact attempt is accepted.
         match self.writer.commit(&attempt).await.map_err(invalid)? {
             Outcome::Accepted { commit } => {
@@ -402,7 +386,9 @@ impl Inner {
                 // The commit is acknowledged whatever happens to the checkpoint: a
                 // failed one leaves the batch index to grow until a later one lands.
                 if let Err(error) = self.maybe_checkpoint().await {
-                    tracing::warn!("Cayenne object-native catalog could not checkpoint, so its history keeps growing until a later checkpoint succeeds: {error}");
+                    tracing::warn!(
+                        "Cayenne object-native catalog could not checkpoint, so its history keeps growing until a later checkpoint succeeds: {error}"
+                    );
                 }
                 Ok(())
             }
@@ -1727,7 +1713,8 @@ impl ObjectNativeCatalog {
 }
 impl Inner {
     fn delete_batch(&self, files: &[DeleteFile]) -> CatalogResult<(Option<String>, Vec<Action>)> {
-        self.delete_batch_after_removal(files, &[])    }
+        self.delete_batch_after_removal(files, &[])
+    }
     fn delete_batch_after_removal(
         &self,
         files: &[DeleteFile],

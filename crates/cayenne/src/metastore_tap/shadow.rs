@@ -274,7 +274,11 @@ async fn run(
                 Command::Blob(bytes) => {
                     let digest = blake3::hash(&bytes).to_hex().to_string();
                     if !blobs.contains(&digest) {
-                        let path = prefix.clone().join("objects").join("blobs").join(digest.as_str());
+                        let path = prefix
+                            .clone()
+                            .join("objects")
+                            .join("blobs")
+                            .join(digest.as_str());
                         match store.put(&path, bytes.into()).await {
                             Ok(_) => {
                                 blobs.insert(digest);
