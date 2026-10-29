@@ -1,0 +1,88 @@
+name: unsigned-negation
+description: >
+  Ranking results remain unsigned. Unary negation produces a checked signed
+  result, including Int64's minimum, without wrapping or decimal results.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  arrow: arrow
+  cayenne: cayenne-file
+  duckdb: duckdb
+  federated: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: unsigned-negation
+  datasets:
+    - { from: 'postgres:public.ranking', name: ranking, params: '${sources.src.params}' }
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: >
+        CREATE TABLE ranking (id int PRIMARY KEY, g int, v text);
+        INSERT INTO ranking VALUES (1, 1, '0'), (2, 1, '1'),
+        (3, 1, '9223372036854775807'), (4, 2, '9223372036854775808'),
+        (5, NULL, NULL), (6, 2, '9223372036854775809'),
+        (7, 2, '18446744073709551615'), (8, 2, '-9223372036854775808');
+  - start: {}
+  - query: >
+      SELECT id, rank() OVER (ORDER BY g) AS r, dense_rank() OVER (ORDER BY g) AS d,
+        row_number() OVER (ORDER BY id) AS n FROM ranking ORDER BY id
+  - query: >
+      SELECT id, -rank() OVER (PARTITION BY g ORDER BY id % 2) AS r,
+        -dense_rank() OVER (PARTITION BY g ORDER BY id % 2) AS d,
+        -row_number() OVER (PARTITION BY g ORDER BY id) AS n
+      FROM ranking ORDER BY id
+  - query: >
+      SELECT arrow_typeof(rank() OVER (ORDER BY g)) AS r,
+        arrow_typeof(dense_rank() OVER (ORDER BY g)) AS d,
+        arrow_typeof(row_number() OVER (ORDER BY g, id)) AS n,
+        arrow_typeof(-rank() OVER (ORDER BY g)) AS nr,
+        arrow_typeof(-dense_rank() OVER (ORDER BY g)) AS nd,
+        arrow_typeof(-row_number() OVER (ORDER BY g, id)) AS nn
+      FROM ranking LIMIT 1
+    expect: { rows: [[UInt64, UInt64, UInt64, Int64, Int64, Int64]] }
+  - query: >
+      SELECT -arrow_cast('0', 'UInt64') AS z, -arrow_cast('1', 'UInt64') AS one,
+        -arrow_cast('9223372036854775807', 'UInt64') AS nmax,
+        -arrow_cast('9223372036854775808', 'UInt64') AS nmin,
+        -arrow_cast(NULL, 'UInt64') AS missing
+    expect: { rows: [['0', '-1', '-9223372036854775807', '-9223372036854775808', null]] }
+  - query: SELECT id, -arrow_cast(v, 'UInt64') AS n FROM ranking WHERE id <= 5 ORDER BY id
+    expect: { rows: [['1', '0'], ['2', '-1'], ['3', '-9223372036854775807'], ['4', '-9223372036854775808'], ['5', null]] }
+  - query: >
+      SELECT -arrow_cast('255', 'UInt8') AS a, -arrow_cast('65535', 'UInt16') AS b,
+        -arrow_cast('4294967295', 'UInt32') AS c,
+        arrow_typeof(-arrow_cast('255', 'UInt8')) AS ta,
+        arrow_typeof(-arrow_cast('65535', 'UInt16')) AS tb,
+        arrow_typeof(-arrow_cast('4294967295', 'UInt32')) AS tc
+    expect: { rows: [['-255', '-65535', '-4294967295', Int16, Int32, Int64]] }
+  - query: SELECT -arrow_cast('9223372036854775809', 'UInt64') AS n
+    expect-error: true
+  - query: SELECT -arrow_cast('18446744073709551615', 'UInt64') AS n
+    expect-error: true
+  - query: SELECT -arrow_cast(v, 'UInt64') AS n FROM ranking WHERE id = 6
+    expect-error: true
+  - query: SELECT -arrow_cast(v, 'UInt64') AS n FROM ranking WHERE id = 7
+    expect-error: true
+  - query: SELECT -(-arrow_cast(v, 'UInt64')) AS n FROM ranking WHERE id = 4
+    expect-error: true
+  - query: SELECT -arrow_cast(v, 'Int64') AS n FROM ranking WHERE id = 8
+    expect-error: true
+  - query: SELECT -rank() OVER (ORDER BY id), -dense_rank() OVER (ORDER BY id), -row_number() OVER (ORDER BY id) FROM ranking WHERE id < 0
+    expect-empty: true
+  - query: SELECT arrow_typeof(percent_rank() OVER (ORDER BY g)) AS p FROM ranking LIMIT 1
+    expect: { rows: [[Float64]] }
+  - query: SELECT -arrow_cast(v, 'UInt64') < 0 AS b FROM ranking WHERE id = 6
+    expect-error: true
+  - query: SELECT -arrow_cast(v, 'UInt64') IN (-1, -2) AS b FROM ranking WHERE id = 6
+    expect-error: true
+  - query: SELECT -(-arrow_cast(v, 'Int64')) AS n FROM ranking WHERE id = 8
+    expect-error: true
