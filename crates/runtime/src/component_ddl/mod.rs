@@ -110,11 +110,12 @@ pub(crate) struct SqlComponents {
     /// The instance directory, where the definitions are kept when
     /// `runtime.state.location` is unset.
     instance_dir: PathBuf,
-    /// The earlier definitions of datasets that another instance's change
-    /// dropped or pointed at another source, whose acceleration data this
-    /// instance could not delete: no definition of their names is served until
-    /// a retry deletes it, so none answers from the data they left. Held in
-    /// memory only: a restart serves the stored definitions.
+    /// The earlier definitions of datasets whose acceleration data this
+    /// instance could not delete when a change dropped them or gave their
+    /// names another source: no definition of their names is served until a
+    /// retry deletes it, so none answers from the data they left. Recorded
+    /// with what this instance serves (see [`served`]), so a restart keeps
+    /// them withheld.
     withheld: parking_lot::Mutex<Vec<Dataset>>,
 }
 
@@ -158,19 +159,19 @@ impl SqlComponents {
     }
 
     /// `spicepod` with `definitions` added, as [`plan::serve`] serves them,
-    /// without the datasets withheld until their acceleration data is deleted.
+    /// without the datasets withheld until their acceleration data is deleted,
+    /// whoever defines them now.
     fn serve(&self, spicepod: &App, definitions: &SqlDefinitions) -> App {
+        let mut app = plan::serve(spicepod.clone(), definitions);
         let withheld = self.withheld();
-        if withheld.is_empty() {
-            return plan::serve(spicepod.clone(), definitions);
+        if !withheld.is_empty() {
+            app.datasets.retain(|dataset| {
+                !withheld
+                    .iter()
+                    .any(|old| same_dataset(&old.name, &dataset.name))
+            });
         }
-        let mut served = definitions.clone();
-        served.datasets.retain(|dataset| {
-            !withheld
-                .iter()
-                .any(|old| same_dataset(&old.name, &dataset.name))
-        });
-        plan::serve(spicepod.clone(), &served)
+        app
     }
 }
 
@@ -613,9 +614,6 @@ impl Runtime {
             Ok(store) => {
                 self.status
                     .update_component_status(SQL_DEFINITIONS_STATUS, ComponentStatus::Ready);
-                if !store.is_shared() {
-                    return;
-                }
                 (Some(store), None)
             }
             Err(e) => {
@@ -666,9 +664,7 @@ impl Runtime {
         let spicepod = served
             .clone()
             .unwrap_or_else(|| Arc::new(AppBuilder::new("spice").build()));
-        if store.is_shared() {
-            self.retire_while_stopped(&store, &spicepod, &defined).await;
-        }
+        self.retire_while_stopped(&spicepod, &defined).await;
         if !defined.is_empty() {
             tracing::info!(
                 "Loading {} defined with SQL from {}",
@@ -685,27 +681,34 @@ impl Runtime {
         }
         *self.sql_components.spicepod.write().await = Some(spicepod);
         *self.sql_components.defined.write().await = Some(defined);
-        self.record_served(&store).await;
+        self.record_served().await;
         drop(serialized);
         Ok(store)
     }
 
-    /// When instances share the definitions, another can drop a dataset or
-    /// point it at another source while this one is stopped. Before anything
-    /// loads, delete the acceleration data of each dataset that `defined`
-    /// retires from what this instance recorded it served, and of each it
+    /// While this instance is stopped, another that shares the definitions
+    /// can drop a dataset or point it at another source, and a Spicepod edit
+    /// can start or stop declaring a name SQL defines. Before anything loads,
+    /// delete the acceleration data of each dataset this instance recorded it
+    /// served under such a name that `defined` and `spicepod` no longer serve
+    /// from the same source (`from` and connector parameters), and of each it
     /// withheld; a dataset whose data cannot be deleted is withheld until a
     /// retry deletes it.
-    async fn retire_while_stopped(
-        self: &Arc<Self>,
-        store: &DefinitionsStore,
-        spicepod: &Arc<App>,
-        defined: &SqlDefinitions,
-    ) {
+    async fn retire_while_stopped(self: &Arc<Self>, spicepod: &Arc<App>, defined: &SqlDefinitions) {
         let Some(recorded) = served::read(&self.sql_components.instance_dir).await else {
             return;
         };
-        let mut retired = plan::retired_datasets(spicepod, &recorded.definitions, defined, None);
+        let next = plan::serve((**spicepod).clone(), defined);
+        let mut retired: Vec<Dataset> = recorded
+            .served
+            .into_iter()
+            .filter(|before| {
+                next.datasets
+                    .iter()
+                    .find(|now| same_dataset(&now.name, &before.name))
+                    .is_none_or(|now| now.from != before.from || now.params != before.params)
+            })
+            .collect();
         retired.extend(recorded.withheld);
         let mut deleted = Vec::new();
         let mut withheld = Vec::new();
@@ -738,26 +741,34 @@ impl Runtime {
                 .iter()
                 .map(|dataset| dataset.name.clone())
                 .collect();
-            tracing::warn!(
-                "{}",
-                unapplied_change(store.location(), &ServeFailure { cause, unserved })
-            );
+            tracing::warn!("{}", withheld_change(&ServeFailure { cause, unserved }));
         }
         *self.sql_components.withheld.lock() = withheld;
     }
 
-    /// Record, in the instance directory, what this instance serves of the
-    /// definitions instances share, so that once restarted it can tell what
-    /// another instance changed meanwhile ([`Self::retire_while_stopped`]).
-    async fn record_served(&self, store: &DefinitionsStore) {
-        if !store.is_shared() {
-            return;
-        }
+    /// Record, in the instance directory, the definitions defined with SQL,
+    /// what this instance serves under each of their names, and what it
+    /// withholds, so that once restarted it can tell which acceleration data
+    /// a change made while it was stopped left ([`Self::retire_while_stopped`]).
+    pub(crate) async fn record_served(&self) {
         let Some(definitions) = self.sql_components.defined().await else {
             return;
         };
+        let served = self.read_app().await.map_or_else(Vec::new, |app| {
+            app.datasets
+                .iter()
+                .filter(|dataset| {
+                    definitions
+                        .datasets
+                        .iter()
+                        .any(|sql| same_dataset(&sql.name, &dataset.name))
+                })
+                .cloned()
+                .collect()
+        });
         let record = served::Served {
             definitions,
+            served,
             withheld: self.sql_components.withheld(),
         };
         if let Err(e) = served::write(&self.sql_components.instance_dir, &record).await {
@@ -767,6 +778,92 @@ impl Runtime {
                 util::single_line(&e.to_string())
             );
         }
+    }
+
+    /// Before a Spicepod reload serves `next` in place of `current`: unload
+    /// each dataset whose name SQL defines and whose source the reload
+    /// changes, as when the Spicepod starts or stops declaring the name, and
+    /// delete its acceleration data, so the definition served next does not
+    /// answer from it. One whose data cannot be deleted is withheld until a
+    /// retry deletes it. Returns the app then served, and `next` without what
+    /// is withheld. The caller holds `apply_app_lock`.
+    pub(crate) async fn retire_switched(
+        self: &Arc<Self>,
+        current: Arc<App>,
+        next: Arc<App>,
+    ) -> (Arc<App>, Arc<App>) {
+        let Some(defined) = self.sql_components.defined().await else {
+            return (current, next);
+        };
+        let switched: Vec<Dataset> = current
+            .datasets
+            .iter()
+            .filter(|before| {
+                defined
+                    .datasets
+                    .iter()
+                    .any(|sql| same_dataset(&sql.name, &before.name))
+                    && next
+                        .datasets
+                        .iter()
+                        .find(|after| same_dataset(&after.name, &before.name))
+                        .is_none_or(|after| {
+                            after.from != before.from || after.params != before.params
+                        })
+            })
+            .cloned()
+            .collect();
+        if switched.is_empty() {
+            return (current, next);
+        }
+        let without = |app: &App, retired: &[Dataset]| {
+            let mut app = app.clone();
+            app.datasets.retain(|dataset| {
+                !retired
+                    .iter()
+                    .any(|old| same_dataset(&old.name, &dataset.name))
+            });
+            Arc::new(app)
+        };
+        let unloaded = without(&current, &switched);
+        Arc::clone(self)
+            .apply_app_diff(Some(&current), Arc::clone(&unloaded))
+            .await;
+        let mut withheld = Vec::new();
+        let mut cause = None;
+        for dataset in switched {
+            let deleted = if self
+                .df
+                .table_exists(&datafusion::common::TableReference::parse_str(
+                    &dataset.name,
+                )) {
+                Err("it could not be unloaded; the Spice log says why".to_string())
+            } else {
+                Arc::clone(self)
+                    .delete_acceleration_data(&dataset, &current)
+                    .await
+            };
+            if let Err(e) = deleted {
+                cause.get_or_insert_with(|| {
+                    format!(
+                        "the acceleration data of dataset {} could not be deleted. Cause: {e}",
+                        display_dataset_name(&dataset.name)
+                    )
+                });
+                withheld.push(dataset);
+            }
+        }
+        let Some(cause) = cause else {
+            return (unloaded, next);
+        };
+        let unserved = withheld
+            .iter()
+            .map(|dataset| dataset.name.clone())
+            .collect();
+        tracing::warn!("{}", withheld_change(&ServeFailure { cause, unserved }));
+        let next = without(&next, &withheld);
+        self.sql_components.withheld.lock().extend(withheld);
+        (unloaded, next)
     }
 
     /// The error a failed read of the SQL definitions logs.
@@ -790,8 +887,9 @@ impl Runtime {
 
     /// Every [`SQL_DEFINITIONS_CHECK_INTERVAL`], until the runtime is gone:
     /// read the SQL definitions while they are not read (`store` is `None`),
-    /// and then, from a store other instances share, serve the changes they
-    /// make. `reported` is the failure already logged.
+    /// and then serve the changes other instances that share the store make,
+    /// and retry deleting the acceleration data of the datasets withheld until
+    /// it is. `reported` is the failure already logged.
     async fn keep_sql_definitions(
         runtime: Weak<Self>,
         mut store: Option<Arc<DefinitionsStore>>,
@@ -817,9 +915,6 @@ impl Runtime {
                             SQL_DEFINITIONS_STATUS,
                             ComponentStatus::Ready,
                         );
-                        if !read.is_shared() {
-                            return;
-                        }
                         store = Some(read);
                         reported = None;
                     }
@@ -975,7 +1070,7 @@ impl Runtime {
                         })
                         .collect();
                     *self.sql_components.defined.write().await = Some(stored);
-                    self.record_served(store).await;
+                    self.record_served().await;
                 }
                 return Err(failure);
             }
@@ -987,7 +1082,7 @@ impl Runtime {
         Arc::clone(self)
             .apply_app_diff(Some(&applied), current)
             .await;
-        self.record_served(store).await;
+        self.record_served().await;
         if stored != known {
             tracing::info!(
                 "Applied the change another instance made to the datasets and catalogs defined with SQL in {}: {}.",
@@ -1063,7 +1158,10 @@ impl Runtime {
                         .apply_app_diff(Some(&without_app), Arc::clone(served))
                         .await;
                     return Err(ServeFailure {
-                        cause: failed,
+                        cause: format!(
+                            "the acceleration data of dataset {} could not be deleted, so it is still served, with that data; run the statement again once the cause is fixed. Cause: {e}",
+                            display_dataset_name(&dataset.name)
+                        ),
                         unserved: Vec::new(),
                     });
                 }
@@ -1275,7 +1373,7 @@ impl Runtime {
                 Ok(()) => {
                     *self.sql_components.defined.write().await = Some(definitions);
                     Arc::clone(&self).apply_app_diff(Some(&applied), next).await;
-                    self.record_served(&store).await;
+                    self.record_served().await;
                     break (message, validate);
                 }
                 Err(e) => {
@@ -1759,6 +1857,20 @@ fn unapplied_change(location: &str, failure: &ServeFailure) -> String {
     )
 }
 
+/// The log line of datasets withheld when a restart or a Spicepod reload
+/// would serve them from another source and the acceleration data their
+/// earlier definitions loaded cannot be deleted.
+fn withheld_change(failure: &ServeFailure) -> String {
+    let shown = shown_datasets(failure.unserved.iter().map(String::as_str));
+    format!(
+        "Failed to apply a change to {}, so this instance does not serve {} until a retry, every {} seconds, applies it. Cause: {}",
+        dataset_phrase(&shown),
+        if shown.len() == 1 { "it" } else { "them" },
+        SQL_DEFINITIONS_CHECK_INTERVAL.as_secs(),
+        failure.cause
+    )
+}
+
 /// The log line of datasets withheld until the acceleration data their
 /// earlier definitions left was deleted, once it is: the change another
 /// instance made to them, a drop or a new definition, is then applied.
@@ -2019,6 +2131,26 @@ mod tests {
         assert_eq!(
             unapplied_change(location, &failure(&["orders", "sales.customers", "orders"])),
             "Failed to apply a change another instance made to the datasets and catalogs defined with SQL in s3://bucket/sql-definitions/definitions.json, so this instance serves it without datasets 'orders', 'sales.customers' until a retry, every 10 seconds, applies it. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
+        );
+    }
+
+    /// The log line of datasets a restart or a Spicepod reload withholds
+    /// names each of them, and when they are served.
+    #[test]
+    fn a_withheld_change_names_its_datasets() {
+        let failure = |unserved: &[&str]| {
+            ServeFailure {
+            cause: "the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)".to_string(),
+            unserved: unserved.iter().map(ToString::to_string).collect(),
+        }
+        };
+        assert_eq!(
+            withheld_change(&failure(&["orders"])),
+            "Failed to apply a change to dataset 'orders', so this instance does not serve it until a retry, every 10 seconds, applies it. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
+        );
+        assert_eq!(
+            withheld_change(&failure(&["orders", "sales.customers"])),
+            "Failed to apply a change to datasets 'orders', 'sales.customers', so this instance does not serve them until a retry, every 10 seconds, applies it. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
         );
     }
 

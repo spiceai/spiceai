@@ -317,10 +317,21 @@ impl Runtime {
         // the app state: with applies serialized by `_serialize`, no other path
         // mutates the app during the diff phase, so a write lock is not needed
         // until the final swap.
-        let current_app = self.read_app().await;
-        Arc::clone(&self)
+        let (current_app, new_app) = match self.read_app().await {
+            // A name SQL defines that the reload serves from another source,
+            // as when the Spicepod starts or stops declaring it, loses the
+            // acceleration data its earlier definition loaded first.
+            Some(current_app) => {
+                let (current_app, new_app) = self.retire_switched(current_app, new_app).await;
+                (Some(current_app), new_app)
+            }
+            None => (None, new_app),
+        };
+        let applied = Arc::clone(&self)
             .apply_app_diff(current_app.as_ref(), new_app)
-            .await
+            .await;
+        self.record_served().await;
+        applied
     }
 
     /// Diff-and-apply behind [`Runtime::apply_app`].

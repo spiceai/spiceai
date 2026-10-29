@@ -78,6 +78,25 @@ impl MetadataConnection {
             path: connection_string.to_string(),
             password: None,
         };
+        // A bare libpq URI names a PostgreSQL database; `DuckDB` attaches it
+        // only behind the `postgres:` prefix, which it is given.
+        if is_postgres_uri(connection_string) {
+            let unreadable = |reason| Unreadable {
+                database: MetadataDatabase::Postgres,
+                reason,
+            };
+            let pairs = postgres_uri(connection_string).map_err(unreadable)?;
+            return Ok(match without_password(&pairs, &["password"]) {
+                Some((path, password)) => Self {
+                    path: format!("postgres:{path}"),
+                    password: Some((MetadataDatabase::Postgres, password)),
+                },
+                None => Self {
+                    path: format!("postgres:{connection_string}"),
+                    password: None,
+                },
+            });
+        }
         let Some((prefix, rest)) = connection_string.split_once(':') else {
             return Ok(whole());
         };
@@ -241,6 +260,7 @@ fn pairs(s: &str, quote: char, escape_unquoted: bool) -> Result<Vec<Pair>, &'sta
 
 const BAD_PERCENT: &str =
     "a `%` that is not followed by two hex digits, or that encodes bytes that are not UTF-8";
+const NUL_BYTE: &str = "a `%00`, which encodes a byte no connection string can hold";
 const BAD_HOST: &str = "a host in `[` without its `]`, or with text after `]` that is not a port";
 const BAD_QUERY: &str = "a query parameter without `=`";
 
@@ -321,7 +341,10 @@ fn percent_decoded(s: &str) -> Result<String, &'static str> {
                 return Err(BAD_PERCENT);
             }
             let hex = std::str::from_utf8(&hex).map_err(|_| BAD_PERCENT)?;
-            bytes.push(u8::from_str_radix(hex, 16).map_err(|_| BAD_PERCENT)?);
+            match u8::from_str_radix(hex, 16).map_err(|_| BAD_PERCENT)? {
+                0 => return Err(NUL_BYTE),
+                byte => bytes.push(byte),
+            }
         } else {
             bytes.push(byte);
         }
@@ -464,6 +487,11 @@ mod tests {
                 BAD_HOST,
             ),
             (
+                "postgresql://u:hunter%00@127.0.0.1/x",
+                MetadataDatabase::Postgres,
+                NUL_BYTE,
+            ),
+            (
                 "postgres:postgresql://u@h/x?password",
                 MetadataDatabase::Postgres,
                 BAD_QUERY,
@@ -480,6 +508,26 @@ mod tests {
                 "{s}"
             );
         }
+    }
+
+    /// A bare libpq URI, which `DuckDB` attaches only behind `postgres:`, is
+    /// given the prefix, and loses its password as a prefixed one does.
+    #[test]
+    fn a_bare_uri_is_read_as_postgres() {
+        for scheme in ["postgres", "postgresql", "PostgreSQL"] {
+            assert_eq!(
+                split(&format!("{scheme}://u:hunter2@127.0.0.1:1/x")),
+                (
+                    "postgres:user='u' host='127.0.0.1' port='1' dbname='x'".to_string(),
+                    Some("hunter2".to_string())
+                ),
+                "{scheme}"
+            );
+        }
+        assert_eq!(
+            split("postgres://u@127.0.0.1:1/x"),
+            ("postgres:postgres://u@127.0.0.1:1/x".to_string(), None)
+        );
     }
 
     /// A `MySQL` string loses its password under either name.
