@@ -310,7 +310,12 @@ fn reader(response: Response, encoding: Option<Encoding>) -> (Reader, Arc<Atomic
         Some(Encoding::Gzip) => Box::pin(GzipDecoder::new(body)),
         Some(Encoding::Deflate) => Box::pin(ZlibDecoder::new(body)),
         Some(Encoding::Brotli) => Box::pin(BrotliDecoder::new(body)),
-        Some(Encoding::Zstd) => Box::pin(ZstdDecoder::new(body)),
+        Some(Encoding::Zstd) => {
+            // Concatenated frames are one body, as reqwest's own zstd decoder reads them.
+            let mut decoder = ZstdDecoder::new(body);
+            decoder.multiple_members(true);
+            Box::pin(decoder)
+        }
     };
     (reader, received)
 }
@@ -681,6 +686,17 @@ mod tests {
             ),
             "{error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn concatenated_zstd_frames_are_all_decoded() {
+        let mut body = zstd::encode_all(&b"{\"a\":1}\n"[..], 1).expect("zstd frame");
+        body.extend(zstd::encode_all(&b"{\"a\":2}\n"[..], 1).expect("zstd frame"));
+        let url = serve("Content-Encoding: zstd\r\n", body).await;
+        let decoded = read_bytes(get(&url).await, Limit::CompressionRatio)
+            .await
+            .expect("both frames decode");
+        assert_eq!(&decoded[..], b"{\"a\":1}\n{\"a\":2}\n");
     }
 
     #[tokio::test]
