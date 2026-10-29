@@ -19,7 +19,7 @@ limitations under the License.
 use crate::error::{
     CreateDirectorySnafu, Error, HomeDirectoryNotFoundSnafu, HttpClientBuildSnafu, Result,
     RuntimeExecutionSnafu, RuntimeNotInstalledSnafu, RuntimeVersionSnafu,
-    SpicedPathNotAnchorableSnafu, SpicedPathOverrideNotRunnableSnafu,
+    SpicedPathNotAnchorableSnafu, SpicedPathOverrideNotRunnableSnafu, TlsRootCertificateSnafu,
     WindowsNativeRuntimeUnsupportedSnafu,
 };
 use snafu::{OptionExt, ResultExt, ensure};
@@ -109,10 +109,27 @@ const TEST_USER_AGENT: &str = "spice/test (test; test)";
 /// because it would carry neither the deadline nor the same-origin redirect policy, and these
 /// clients send the API key in a header.
 fn build_http_client(user_agent: String, deadline: Deadline) -> Result<reqwest::Client> {
-    let builder = reqwest::Client::builder()
+    build_http_client_trusting(user_agent, deadline, Vec::new())
+}
+
+/// [`build_http_client`], trusting only `root_certificates` when any are given.
+///
+/// `--tls-root-certificate-file` names the CA the runtime's certificate chains to, and the
+/// HTTP client trusts exactly that CA — the same as the Flight client `spice sql` builds
+/// from the flag. With no certificates the platform's roots are used.
+fn build_http_client_trusting(
+    user_agent: String,
+    deadline: Deadline,
+    root_certificates: Vec<reqwest::Certificate>,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
         .user_agent(user_agent)
         .connect_timeout(CONNECT_TIMEOUT)
         .redirect(same_origin_redirect_policy());
+
+    if !root_certificates.is_empty() {
+        builder = builder.tls_certs_only(root_certificates);
+    }
 
     let builder = match deadline {
         Deadline::Total(duration) => builder.timeout(duration),
@@ -120,6 +137,38 @@ fn build_http_client(user_agent: String, deadline: Deadline) -> Result<reqwest::
     };
 
     builder.build().context(HttpClientBuildSnafu)
+}
+
+/// Read the certificates in a `--tls-root-certificate-file`.
+///
+/// # Errors
+///
+/// Returns an error naming the file if it cannot be read or holds no PEM certificate. A file
+/// that yields nothing is not ignored: the client would quietly fall back to the platform's
+/// roots and fail later with a certificate error that hides the real problem.
+fn load_root_certificates(path: &str) -> Result<Vec<reqwest::Certificate>> {
+    let pem = std::fs::read(path).map_err(|e| {
+        TlsRootCertificateSnafu {
+            path,
+            message: e.to_string(),
+        }
+        .build()
+    })?;
+    let certificates = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
+        TlsRootCertificateSnafu {
+            path,
+            message: e.to_string(),
+        }
+        .build()
+    })?;
+    ensure!(
+        !certificates.is_empty(),
+        TlsRootCertificateSnafu {
+            path,
+            message: "the file holds no PEM certificate",
+        }
+    );
+    Ok(certificates)
 }
 
 /// Treat a blank credential as absent.
@@ -174,6 +223,11 @@ pub struct RuntimeContext {
     /// silence deadline
     inference_http_client: reqwest::Client,
 
+    /// HTTP client for Spicepod registry downloads (`spice add`, `spice connect`). It keeps
+    /// the platform roots: `--tls-root-certificate-file` names the runtime's CA, and trusting
+    /// only that CA would reject the public registry.
+    registry_http_client: reqwest::Client,
+
     /// The deadline `inference_http_client` carries. Held so a caller that has to measure
     /// progress itself — a streamed response, where the transport's own silence deadline is
     /// reset by keep-alives — bounds it by the same value rather than a second constant.
@@ -214,6 +268,7 @@ impl RuntimeContext {
             cloud_region: None,
             user_agent: Self::default_user_agent(),
             extra_headers: HashMap::new(),
+            registry_http_client: http_client.clone(),
             http_client,
             inference_http_client,
             inference_deadline: INFERENCE_DEADLINE,
@@ -246,6 +301,8 @@ impl RuntimeContext {
             extra_headers: HashMap::new(),
             http_client: build_http_client(TEST_USER_AGENT.to_string(), control_plane)
                 .expect("the test control-plane client should build"),
+            registry_http_client: build_http_client(TEST_USER_AGENT.to_string(), control_plane)
+                .expect("the test registry client should build"),
             inference_http_client: build_http_client(TEST_USER_AGENT.to_string(), inference)
                 .expect("the test inference client should build"),
             inference_deadline: inference,
@@ -309,6 +366,20 @@ impl RuntimeContext {
         }
 
         ctx.api_key = normalize_credential(api_key);
+
+        // The flag is global, so every HTTP call the CLI makes to the runtime has to trust
+        // it, not only the Flight client `spice sql` builds. The registry client is left on
+        // the platform roots: the flag names the runtime's CA, not the registry's.
+        if let Some(path) = &tls_root_certificate_file {
+            let roots = load_root_certificates(path)?;
+            ctx.http_client = build_http_client_trusting(
+                ctx.user_agent.clone(),
+                CONTROL_PLANE_DEADLINE,
+                roots.clone(),
+            )?;
+            ctx.inference_http_client =
+                build_http_client_trusting(ctx.user_agent.clone(), ctx.inference_deadline, roots)?;
+        }
         ctx.tls_root_certificate_file = tls_root_certificate_file;
 
         // Load API key from .env if not provided
@@ -453,6 +524,14 @@ impl RuntimeContext {
     #[must_use]
     pub fn http_client(&self) -> &reqwest::Client {
         &self.http_client
+    }
+
+    /// HTTP client for Spicepod registry downloads. Same user agent, deadline and redirect
+    /// policy as [`RuntimeContext::http_client`], but trusting the platform roots even when
+    /// `--tls-root-certificate-file` is given, since that file names the runtime's CA.
+    #[must_use]
+    pub fn registry_http_client(&self) -> &reqwest::Client {
+        &self.registry_http_client
     }
 
     /// Get the HTTP client for requests whose duration is set by model inference.
@@ -1525,6 +1604,7 @@ mod tests {
             extra_headers: HashMap::new(),
             http_client: reqwest::Client::new(),
             inference_http_client: reqwest::Client::new(),
+            registry_http_client: reqwest::Client::new(),
             inference_deadline: INFERENCE_DEADLINE,
             tls_root_certificate_file: None,
         }
@@ -1575,6 +1655,7 @@ mod tests {
             extra_headers: HashMap::new(),
             http_client: reqwest::Client::new(),
             inference_http_client: reqwest::Client::new(),
+            registry_http_client: reqwest::Client::new(),
             inference_deadline: INFERENCE_DEADLINE,
             tls_root_certificate_file: None,
         };
@@ -2983,14 +3064,58 @@ mod tests {
 
     #[test]
     fn test_with_args_sets_tls_certificate() {
-        let ctx =
-            RuntimeContext::with_args(None, None, None, Some("/path/to/cert.pem".to_string()))
-                .expect("with_args should succeed");
+        let server = crate::test_support::TlsServer::answering("[]");
+        let ctx = RuntimeContext::with_args(None, None, None, Some(server.ca_file()))
+            .expect("with_args should succeed");
 
-        assert_eq!(
-            ctx.tls_root_certificate_file,
-            Some("/path/to/cert.pem".to_string())
-        );
+        assert_eq!(ctx.tls_root_certificate_file, Some(server.ca_file()));
+    }
+
+    /// `--tls-root-certificate-file` names the runtime's CA. Registry downloads (`spice add`,
+    /// `spice connect`) go to the public registry, so their client must keep the platform
+    /// roots rather than trusting only the runtime's CA.
+    #[tokio::test]
+    async fn registry_client_does_not_take_the_runtime_root_certificate() {
+        let server = crate::test_support::TlsServer::answering("[]");
+        let ctx = RuntimeContext::with_args(
+            Some(server.url().to_string()),
+            None,
+            None,
+            Some(server.ca_file()),
+        )
+        .expect("with_args should succeed");
+
+        ctx.http_client()
+            .get(server.url())
+            .send()
+            .await
+            .expect("the runtime client should trust the runtime's CA");
+        ctx.registry_http_client()
+            .get(server.url())
+            .send()
+            .await
+            .expect_err("the registry client should not trust a CA passed for the runtime");
+    }
+
+    /// The HTTP clients are built with the root certificate, so a file that cannot be used
+    /// is reported up front, naming it, rather than as a later connection failure.
+    #[test]
+    fn test_with_args_rejects_unusable_tls_root_certificate_file() {
+        let dir = TempDir::new().expect("temp dir should be created");
+        let missing = dir.path().join("missing.pem").display().to_string();
+        let not_pem = dir.path().join("not-a-certificate.pem");
+        std::fs::write(&not_pem, "not a certificate\n").expect("file should be written");
+        let not_pem = not_pem.display().to_string();
+
+        for path in [missing, not_pem] {
+            let message = RuntimeContext::with_args(None, None, None, Some(path.clone()))
+                .expect_err("an unusable root certificate file should be rejected")
+                .to_string();
+            assert!(
+                message.contains(&path) && message.contains("TLS root certificate"),
+                "expected an error naming {path}, got: {message}"
+            );
+        }
     }
 
     #[test]

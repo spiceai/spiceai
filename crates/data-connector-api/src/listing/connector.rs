@@ -5833,6 +5833,180 @@ mod tests {
             .expect("a well-formed range is still accepted after a rejected one");
     }
 
+    /// A footer whose Thrift list header declares more elements than the file could hold is
+    /// refused before anything is reserved for that count.
+    ///
+    /// Every footer list (`schema`, `row_groups`, `key_value_metadata`, `column_orders`) and
+    /// the offset index's `page_locations` decodes into a `Vec` sized from the element count
+    /// in that header, so an unreadable file of a few bytes can ask for room for `i32::MAX`
+    /// elements before a single one is read. That happens during schema inference at dataset
+    /// initialization, and again on every refresh of the dataset, and the process is killed
+    /// for it. A Spice patch to the `spiceai/arrow-rs` fork bounds the count by the bytes left
+    /// in the input ([spiceai/arrow-rs#32](https://github.com/spiceai/arrow-rs/pull/32)).
+    ///
+    /// Driven through `ParquetMetaDataReader::decode_metadata`, the public surface the footer
+    /// decode sits behind. The error has to name the declared count: an oversized footer is a
+    /// malformed file, and an error that does not say so reads like a truncated download.
+    #[test]
+    fn an_oversized_footer_list_length_is_a_parquet_error_and_not_an_allocation() {
+        use datafusion::parquet::file::metadata::ParquetMetaDataReader;
+
+        // Struct header, then field 2 (`schema`): a `list<SchemaElement>` declaring
+        // i32::MAX elements, with no element following it.
+        const FOOTER: &[u8] = &[0x29, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x00];
+
+        let error = ParquetMetaDataReader::decode_metadata(FOOTER)
+            .expect_err("no file holds as many schema elements as this footer declares");
+        let message = error.to_string();
+        assert!(
+            message.contains("Thrift list declares 2147483647 elements"),
+            "the error has to name the declared count, or an oversized footer is \
+             indistinguishable from a truncated one: {message}"
+        );
+    }
+
+    /// A Parquet footer whose schema nests deeper than 100 levels is refused, and one
+    /// at exactly 100 levels still opens.
+    ///
+    /// The footer's schema is a flat element list that the reader rebuilds into a tree by
+    /// recursing once per nesting level, so a file of a few KiB can declare enough levels to
+    /// exhaust the stack during schema inference at dataset initialization. A Spice patch to
+    /// the `spiceai/arrow-rs` fork bounds that depth.
+    #[test]
+    fn a_footer_schema_nested_past_the_depth_limit_is_a_parquet_error() {
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::arrow::arrow_writer::ArrowWriterOptions;
+        use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+
+        const MAX_DEPTH: usize = 100;
+
+        // A column whose leaf sits `depth` levels below the schema root.
+        fn file_with_leaf_at(depth: usize) -> bytes::Bytes {
+            let mut field =
+                arrow::datatypes::Field::new("leaf", arrow::datatypes::DataType::Int64, true);
+            for _ in 1..depth {
+                field = arrow::datatypes::Field::new_struct("s", vec![field], true);
+            }
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+            let mut buffer = Vec::new();
+            ArrowWriter::try_new_with_options(
+                &mut buffer,
+                schema,
+                ArrowWriterOptions::new().with_skip_arrow_metadata(true),
+            )
+            .expect("parquet writer")
+            .close()
+            .expect("writes the footer");
+            bytes::Bytes::from(buffer)
+        }
+
+        let reader =
+            SerializedFileReader::new(file_with_leaf_at(MAX_DEPTH)).expect("reads the footer");
+        assert_eq!(
+            reader
+                .metadata()
+                .file_metadata()
+                .schema_descr()
+                .column(0)
+                .path()
+                .parts()
+                .len(),
+            MAX_DEPTH,
+            "the accepted file has to sit exactly at the limit"
+        );
+
+        let Err(error) = SerializedFileReader::new(file_with_leaf_at(MAX_DEPTH + 1)) else {
+            panic!(
+                "a footer schema nested {} levels deep was accepted",
+                MAX_DEPTH + 1
+            );
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("Parquet schema nesting depth exceeds the maximum of 100"),
+            "the footer was refused, but not on the depth limit: {error}"
+        );
+    }
+
+    /// A Parquet page whose header declares more uncompressed bytes than its
+    /// compressed body can back is a scan error, raised before the reader allocates
+    /// the declared size.
+    ///
+    /// A Spice patch to `decode_page` in the `spiceai/arrow-rs` fork requires a page
+    /// above 64 MiB to carry at least 1/1000 of its declared size in compressed bytes
+    /// ([apache/arrow-rs#10734](https://github.com/apache/arrow-rs/issues/10734)).
+    /// Without it, a file of a few KiB whose pages each declare hundreds of MiB makes
+    /// every scan of it allocate that much per page, and concurrent scans of it can
+    /// exhaust memory. Driven through a `DataFusion` Parquet scan, the reader path a
+    /// file or object-store dataset takes.
+    #[tokio::test]
+    async fn a_page_declaring_more_than_its_compressed_bytes_can_back_is_an_error() {
+        use datafusion::execution::context::SessionContext;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::basic::{Compression, ZstdLevel};
+        use datafusion::parquet::file::properties::{EnabledStatistics, WriterProperties};
+        use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+        use datafusion::prelude::ParquetReadOptions;
+
+        // One value just past the 64 MiB that any page is allowed; zero bytes
+        // compress to a few KiB.
+        const VALUE_LEN: usize = 65 * 1024 * 1024;
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Binary, false),
+        ]));
+        let value = vec![0u8; VALUE_LEN];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::BinaryArray::from_vec(vec![
+                value.as_slice(),
+            ]))],
+        )
+        .expect("builds a batch");
+        let properties = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::None)
+            .build();
+        let dir = tempfile::tempdir().expect("creates a temporary directory");
+        let path = dir.path().join("page.parquet");
+        let file = std::fs::File::create(&path).expect("creates the file");
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(properties))
+            .expect("parquet writer");
+        writer.write(&batch).expect("writes the batch");
+        writer.close().expect("closes the file");
+
+        let reader = SerializedFileReader::new(std::fs::File::open(&path).expect("opens the file"))
+            .expect("reads the footer");
+        let column = reader.metadata().row_group(0).column(0);
+        assert!(
+            column.uncompressed_size() > 64 * 1024 * 1024
+                && column.compressed_size() * 1000 < column.uncompressed_size(),
+            "the page has to be past the bound for this guard to assert anything: \
+             {} compressed bytes for {} uncompressed",
+            column.compressed_size(),
+            column.uncompressed_size()
+        );
+
+        let scan = SessionContext::new()
+            .read_parquet(
+                path.to_str().expect("a UTF-8 path"),
+                ParquetReadOptions::default(),
+            )
+            .await
+            .expect("plans the scan")
+            .collect()
+            .await;
+        let Err(error) = scan else {
+            panic!("a page declaring {VALUE_LEN} bytes behind a few KiB of ZSTD was decoded");
+        };
+        assert!(
+            error.to_string().contains("exceeds the maximum allowed"),
+            "the scan failed, but not on the page-size bound: {error}"
+        );
+    }
+
     /// A second reader built for the *same* file has to stay on the generation the
     /// first one pinned.
     ///

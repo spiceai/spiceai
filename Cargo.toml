@@ -30,6 +30,7 @@ members = [
     "crates/document_parse",
     "crates/dotenv",
     "crates/duration-parse",
+    "crates/http-body-limit",
     "crates/dynamodb-streams",
     "crates/event_stream",
     "crates/flight_client",
@@ -290,7 +291,7 @@ datafusion-proto-common = "55.2.0"
 datafusion-pruning = "55.2.0"
 datafusion-spark = "55.2.0"
 datafusion-substrait = "55.2.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "2890f5ce7710ea23a86b5ed279391b5bbb9b5f93" } # branch: spiceai-55-release-2.4
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "f0af9b628dc48f0227ce6daf3d323b2ead3cc8a5" } # branch: spiceai-55-release-2.4
 delta_kernel = { version = "0.27.1", features = ["arrow-59", "internal-api"] }
 delta_kernel_default_engine = { version = "0.27.1", default-features = false, features = [
     "arrow-59",
@@ -353,7 +354,7 @@ odbc-api = { version = "29" } # arrow-odbc 25.3 requires odbc-api >=27, <30
 opendal = { version = "0.58", default-features = false, features = ["services-s3", "services-fs", "services-gcs", "services-memory"] }
 # orc-rust 0.9.0 is the first release on Arrow ^59.0, matching the workspace Arrow 59 pin.
 # Do not use datafusion-orc; the FileFormat lives in crates/dataformat-orc.
-orc-rust = { version = "0.9.0", default-features = false, features = ["async"] }
+orc-rust = { git = "https://github.com/spiceai/orc-rust.git", rev = "d9632e7ae973456c81c660c04e5f55cc86489bcb", default-features = false, features = ["async"] } # orc-rust 0.9.0 + bounded metadata decompression + bounded type tree
 opentelemetry = { version = "0.32", default-features = false, features = [
     "logs",
     "metrics",
@@ -417,8 +418,8 @@ rustls = "0.23"
 # Minimum versions for the transitive certificate-verification crates and their
 # trust data; `spiced` declares them to apply the floors.
 rustls-webpki = { version = "0.103.16", default-features = false }
-webpki-root-certs = "1.0.10"
-webpki-roots = "1.0.10"
+webpki-root-certs = "1.0.11"
+webpki-roots = "1.0.11"
 schemars = "1.2.1"
 scylla = "1.4.1"
 secrecy = "0.10.3"
@@ -655,22 +656,22 @@ iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev 
 # a duplicate-key error.
 
 # arrow-rs 59.3 with spice patches (spiceai-59-patches)
-arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }        # branch: spiceai-59 (arrow 59.3.0)
-arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }  # branch: spiceai-59 (arrow 59.3.0)
-arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }  # branch: spiceai-59 (arrow 59.3.0)
-arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" } # branch: spiceai-59 (arrow 59.3.0)
-arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }   # branch: spiceai-59 (arrow 59.3.0)
-arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }    # branch: spiceai-59 (arrow 59.3.0)
-arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }   # branch: spiceai-59 (arrow 59.3.0)
-arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" } # branch: spiceai-59 (arrow 59.3.0)
-arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }    # branch: spiceai-59 (arrow 59.3.0)
-arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }   # branch: spiceai-59 (arrow 59.3.0)
-arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }    # branch: spiceai-59 (arrow 59.3.0)
-arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }    # branch: spiceai-59 (arrow 59.3.0)
-arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" } # branch: spiceai-59 (arrow 59.3.0)
-arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" } # branch: spiceai-59 (arrow 59.3.0)
-arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" } # branch: spiceai-59 (arrow 59.3.0)
-parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }      # branch: spiceai-59 (arrow 59.3.0)
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2124b9e85c8c4f50fdacfa23d75cbad6a4db9086" }        # branch: spiceai-59 (arrow 59.3.0)
+arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2124b9e85c8c4f50fdacfa23d75cbad6a4db9086" }  # branch: spiceai-59 (arrow 59.3.0)
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2124b9e85c8c4f50fdacfa23d75cbad6a4db9086" }  # branch: spiceai-59 (arrow 59.3.0)
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2124b9e85c8c4f50fdacfa23d75cbad6a4db9086" } # branch: spiceai-59 (arrow 59.3.0)
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2124b9e85c8c4f50fdacfa23d75cbad6a4db9086" }   # branch: spiceai-59 (arrow 59.3.0)
+arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2124b9e85c8c4f50fdacfa23d75cbad6a4db9086" }    # branch: spiceai-59 (arrow 59.3.0)
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2124b9e85c8c4f50fdacfa23d75cbad6a4db9086" }   # branch: spiceai-59 (arrow 59.3.0)
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2124b9e85c8c4f50fdacfa23d75cbad6a4db9086" } # branch: spiceai-59 (arrow 59.3.0)
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2124b9e85c8c4f50fdacfa23d75cbad6a4db9086" }    # branch: spiceai-59 (arrow 59.3.0)
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2124b9e85c8c4f50fdacfa23d75cbad6a4db9086" }   # branch: spiceai-59 (arrow 59.3.0)
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2124b9e85c8c4f50fdacfa23d75cbad6a4db9086" }    # branch: spiceai-59 (arrow 59.3.0)
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2124b9e85c8c4f50fdacfa23d75cbad6a4db9086" }    # branch: spiceai-59 (arrow 59.3.0)
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2124b9e85c8c4f50fdacfa23d75cbad6a4db9086" } # branch: spiceai-59 (arrow 59.3.0)
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2124b9e85c8c4f50fdacfa23d75cbad6a4db9086" } # branch: spiceai-59 (arrow 59.3.0)
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2124b9e85c8c4f50fdacfa23d75cbad6a4db9086" } # branch: spiceai-59 (arrow 59.3.0)
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2124b9e85c8c4f50fdacfa23d75cbad6a4db9086" }      # branch: spiceai-59 (arrow 59.3.0)
 
 vortex = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)
 vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)

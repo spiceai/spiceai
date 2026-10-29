@@ -154,6 +154,7 @@ use change_generations::{
 };
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
+pub(crate) mod output_reservation;
 pub(crate) mod query_memory_pool;
 pub use runtime_datafusion::composed_catalog;
 // `error` and `refresh_sql` below are named throughout the runtime through these
