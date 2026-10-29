@@ -109,6 +109,12 @@ pub(crate) struct SqlComponents {
     /// The instance directory, where the definitions are kept when
     /// `runtime.state.location` is unset.
     instance_dir: PathBuf,
+    /// The earlier definitions of datasets that another instance's change
+    /// dropped or pointed at another source, whose acceleration data this
+    /// instance could not delete: no definition of their names is served until
+    /// a retry deletes it, so none answers from the data they left. Held in
+    /// memory only: a restart serves the stored definitions.
+    withheld: parking_lot::Mutex<Vec<Dataset>>,
 }
 
 impl std::fmt::Debug for SqlComponents {
@@ -127,6 +133,7 @@ impl SqlComponents {
             store: OnceCell::new(),
             unread: parking_lot::Mutex::new(None),
             instance_dir,
+            withheld: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -142,6 +149,32 @@ impl SqlComponents {
     pub(crate) async fn defined(&self) -> Option<SqlDefinitions> {
         self.defined.read().await.clone()
     }
+
+    /// The earlier definitions of the datasets not served until their
+    /// acceleration data is deleted.
+    fn withheld(&self) -> Vec<Dataset> {
+        self.withheld.lock().clone()
+    }
+
+    /// `spicepod` with `definitions` added, as [`plan::serve`] serves them,
+    /// without the datasets withheld until their acceleration data is deleted.
+    fn serve(&self, spicepod: &App, definitions: &SqlDefinitions) -> App {
+        let withheld = self.withheld();
+        if withheld.is_empty() {
+            return plan::serve(spicepod.clone(), definitions);
+        }
+        let mut served = definitions.clone();
+        served.datasets.retain(|dataset| {
+            !withheld
+                .iter()
+                .any(|old| same_dataset(&old.name, &dataset.name))
+        });
+        plan::serve(spicepod.clone(), &served)
+    }
+}
+
+fn same_dataset(a: &str, b: &str) -> bool {
+    resolved_dataset_name(a) == resolved_dataset_name(b)
 }
 
 /// Applies component statements against a runtime.
@@ -743,7 +776,9 @@ impl Runtime {
             let Some(known) = runtime.sql_components.defined().await else {
                 return;
             };
-            if stored == known {
+            // Datasets withheld until their acceleration data is deleted are
+            // retried even when the definitions did not change.
+            if stored == known && runtime.sql_components.withheld.lock().is_empty() {
                 reported = None;
                 continue;
             }
@@ -784,34 +819,34 @@ impl Runtime {
 
     /// Serve the change another instance made to the definitions a statement
     /// raced with: the statement's error names it, and `SHOW CREATE` shows it
-    /// from then on. When it cannot be served, the check that runs every 10
-    /// seconds serves it. The caller holds `apply_app_lock`.
+    /// from then on. When it cannot be served, the statement's error says so,
+    /// and the check that runs every 10 seconds, which runs once the caller
+    /// releases `apply_app_lock`, logs why and serves it.
     async fn serve_change_by_another(
         self: &Arc<Self>,
         store: &DefinitionsStore,
         known: SqlDefinitions,
         stored: SqlDefinitions,
     ) -> Option<ServeFailure> {
-        let failure = self.serve_definitions(store, known, stored).await.err()?;
-        tracing::warn!("{}", unapplied_change(store.location(), &failure));
-        Some(failure)
+        self.serve_definitions(store, known, stored).await.err()
     }
 
     /// Serve `stored`, the definitions `store` holds, when they differ from
-    /// `known`, the ones this instance serves. The caller holds
-    /// `apply_app_lock`. Returns the definitions now served. A dataset that
-    /// `stored` drops or points at another source, and whose acceleration data
-    /// cannot be deleted, is not served until a retry deletes it: its earlier
-    /// definition would answer for a dataset that no longer reads that data.
-    /// `known` stays the definitions this instance serves, so the check that
-    /// runs every 10 seconds retries.
+    /// `known`, the ones this instance serves, or while datasets are withheld.
+    /// The caller holds `apply_app_lock`. Returns the definitions now served.
+    /// A dataset that `stored` drops or points at another source, and whose
+    /// acceleration data cannot be deleted, is withheld until a retry deletes
+    /// it, and the rest of the change is served: its earlier definition would
+    /// answer for a dataset that no longer reads that data, and a later one
+    /// could load it.
     async fn serve_definitions(
         self: &Arc<Self>,
         store: &DefinitionsStore,
         known: SqlDefinitions,
         stored: SqlDefinitions,
     ) -> Result<SqlDefinitions, ServeFailure> {
-        if stored == known {
+        let withheld = self.sql_components.withheld();
+        if stored == known && withheld.is_empty() {
             return Ok(known);
         }
         let served = self
@@ -827,8 +862,12 @@ impl Runtime {
             // Unset only before the SQL definitions are read, when the app
             // served holds none of them.
             .unwrap_or_else(|| Arc::clone(&served));
-        let retired = plan::retired_datasets(&spicepod, &known, &stored, None);
-        let applied = self
+        // What the change retires, and the datasets still withheld: each of
+        // their earlier definitions, even of a name the change retires again,
+        // since any of them may have left data under it.
+        let mut retired = plan::retired_datasets(&spicepod, &known, &stored, None);
+        retired.extend(withheld.iter().cloned());
+        let applied = match self
             .retire(
                 &spicepod,
                 &served,
@@ -836,18 +875,43 @@ impl Runtime {
                 &retired,
                 OnUndeleted::KeepUnserved,
             )
-            .await?;
+            .await
+        {
+            Ok(applied) => applied,
+            Err(failure) => {
+                if !failure.unserved.is_empty() {
+                    // The rest of the change is served.
+                    *self.sql_components.withheld.lock() = retired
+                        .into_iter()
+                        .filter(|old| {
+                            failure
+                                .unserved
+                                .iter()
+                                .any(|name| same_dataset(name, &old.name))
+                        })
+                        .collect();
+                    *self.sql_components.defined.write().await = Some(stored);
+                }
+                return Err(failure);
+            }
+        };
+        self.sql_components.withheld.lock().clear();
         plan::warn_shadowed(&spicepod, &stored);
         let current = Arc::new(plan::serve((*spicepod).clone(), &stored));
         *self.sql_components.defined.write().await = Some(stored.clone());
         Arc::clone(self)
             .apply_app_diff(Some(&applied), current)
             .await;
-        tracing::info!(
-            "Applied the change another instance made to the datasets and catalogs defined with SQL in {}: {}.",
-            store.location(),
-            plan::changed_components(&known, &stored).join(", ")
-        );
+        if stored != known {
+            tracing::info!(
+                "Applied the change another instance made to the datasets and catalogs defined with SQL in {}: {}.",
+                store.location(),
+                plan::changed_components(&known, &stored).join(", ")
+            );
+        }
+        if !withheld.is_empty() {
+            tracing::info!("{}", served_again(&withheld));
+        }
         Ok(stored)
     }
 
@@ -874,7 +938,7 @@ impl Runtime {
                 .iter()
                 .any(|old| resolved_dataset_name(&old.name) == resolved_dataset_name(&ds.name))
         });
-        let without_app = Arc::new(plan::serve((**spicepod).clone(), &without));
+        let without_app = Arc::new(self.sql_components.serve(spicepod, &without));
         Arc::clone(self)
             .apply_app_diff(Some(served), Arc::clone(&without_app))
             .await;
@@ -897,32 +961,56 @@ impl Runtime {
                 unserved: Vec::new(),
             });
         }
+        let mut undeleted: Vec<String> = Vec::new();
+        let mut cause = None;
         for dataset in retired {
             if let Err(e) = Arc::clone(self)
                 .delete_acceleration_data(dataset, served)
                 .await
             {
-                let unserved = match on_undeleted {
-                    OnUndeleted::ServeEarlier => {
-                        Arc::clone(self)
-                            .apply_app_diff(Some(&without_app), Arc::clone(served))
-                            .await;
-                        Vec::new()
-                    }
-                    OnUndeleted::KeepUnserved => {
-                        retired.iter().map(|dataset| dataset.name.clone()).collect()
-                    }
-                };
-                return Err(ServeFailure {
-                    cause: format!(
-                        "the acceleration data of dataset {} could not be deleted. Cause: {e}",
-                        display_dataset_name(&dataset.name)
-                    ),
-                    unserved,
-                });
+                let failed = format!(
+                    "the acceleration data of dataset {} could not be deleted. Cause: {e}",
+                    display_dataset_name(&dataset.name)
+                );
+                if matches!(on_undeleted, OnUndeleted::ServeEarlier) {
+                    Arc::clone(self)
+                        .apply_app_diff(Some(&without_app), Arc::clone(served))
+                        .await;
+                    return Err(ServeFailure {
+                        cause: failed,
+                        unserved: Vec::new(),
+                    });
+                }
+                cause.get_or_insert(failed);
+                if !undeleted
+                    .iter()
+                    .any(|name| same_dataset(name, &dataset.name))
+                {
+                    undeleted.push(dataset.name.clone());
+                }
             }
         }
-        Ok(without_app)
+        let Some(cause) = cause else {
+            return Ok(without_app);
+        };
+        // A dataset whose data was deleted is served from its new definition;
+        // one whose data stays is not served.
+        let mut serving = definitions.clone();
+        serving.datasets.retain(|dataset| {
+            !undeleted
+                .iter()
+                .any(|name| same_dataset(name, &dataset.name))
+        });
+        Arc::clone(self)
+            .apply_app_diff(
+                Some(&without_app),
+                Arc::new(plan::serve((**spicepod).clone(), &serving)),
+            )
+            .await;
+        Err(ServeFailure {
+            cause,
+            unserved: undeleted,
+        })
     }
 
     /// The app the Spicepods declare, without the components defined with SQL
@@ -952,7 +1040,7 @@ impl Runtime {
             return app;
         }
         plan::warn_shadowed(&app, &defined);
-        Arc::new(plan::serve((*app).clone(), &defined))
+        Arc::new(self.sql_components.serve(&app, &defined))
     }
 
     /// Apply a component statement: validate the definition it makes, store
@@ -1000,10 +1088,23 @@ impl Runtime {
                     not_applied(&e)
                 }
             })?;
-            let defined = self
-                .serve_definitions(&store, known, stored)
-                .await
-                .map_err(|failure| not_applied(&failure.cause))?;
+            let defined = match self.serve_definitions(&store, known, stored).await {
+                Ok(defined) => defined,
+                Err(failure) if withholds(&op, &failure) => {
+                    return Err(not_applied(&withheld_dataset(
+                        op.component_name(),
+                        &failure.cause,
+                    )));
+                }
+                // The rest of the change is served, and this statement names
+                // no dataset withheld.
+                Err(failure) if !failure.unserved.is_empty() => self
+                    .sql_components
+                    .defined()
+                    .await
+                    .ok_or_else(|| not_applied(&failure.cause))?,
+                Err(failure) => return Err(not_applied(&failure.cause)),
+            };
             let served = self
                 .read_app()
                 .await
@@ -1035,7 +1136,7 @@ impl Runtime {
                 return Ok(message);
             }
 
-            let next = Arc::new(plan::serve((*spicepod).clone(), &definitions));
+            let next = Arc::new(self.sql_components.serve(&spicepod, &definitions));
             if let Some(component) = &validate {
                 tokio::time::timeout(
                     VALIDATION_TIMEOUT,
@@ -1484,15 +1585,8 @@ fn changed_by_another(op: &ComponentDdlOp, failure: Option<&ServeFailure>) -> St
         ComponentKind::Dataset => ("dataset", "TABLE"),
         ComponentKind::Catalog => ("catalog", "CATALOG"),
     };
-    let unserved = |failure: &ServeFailure| {
-        matches!(op.kind(), ComponentKind::Dataset)
-            && failure
-                .unserved
-                .iter()
-                .any(|dataset| resolved_dataset_name(dataset) == resolved_dataset_name(name))
-    };
     match failure {
-        Some(failure) if unserved(failure) => format!(
+        Some(failure) if withholds(op, failure) => format!(
             "another instance changed {noun} '{name}' while this statement ran, and this instance failed to apply that change, so it does not serve {noun} '{name}' until a retry applies it; Spice retries every {} seconds. Then run the statement again if it still applies. Cause: {}",
             SQL_DEFINITIONS_CHECK_INTERVAL.as_secs(),
             failure.cause
@@ -1510,28 +1604,72 @@ fn changed_by_another(op: &ComponentDdlOp, failure: Option<&ServeFailure>) -> St
     }
 }
 
+/// Whether `failure` withholds the dataset `op` names.
+fn withholds(op: &ComponentDdlOp, failure: &ServeFailure) -> bool {
+    matches!(op.kind(), ComponentKind::Dataset)
+        && failure
+            .unserved
+            .iter()
+            .any(|dataset| same_dataset(dataset, op.component_name()))
+}
+
+/// Why a statement that names `dataset`, which this instance withholds until
+/// it deletes the acceleration data an earlier definition left, was not
+/// applied.
+fn withheld_dataset(dataset: &str, cause: &str) -> String {
+    format!(
+        "this instance does not serve dataset {} until it deletes the acceleration data an earlier definition of it left, which another instance dropped or replaced; Spice retries every {} seconds, so run the statement again once it has. Cause: {cause}",
+        display_dataset_name(dataset),
+        SQL_DEFINITIONS_CHECK_INTERVAL.as_secs()
+    )
+}
+
+/// `names`, each once, as a message shows a dataset's name.
+fn shown_datasets<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut shown: Vec<String> = Vec::new();
+    for name in names {
+        let name = display_dataset_name(name);
+        if !shown.contains(&name) {
+            shown.push(name);
+        }
+    }
+    shown
+}
+
+/// `dataset 'a'`, or `datasets 'a', 'b'`.
+fn dataset_phrase(shown: &[String]) -> String {
+    match shown {
+        [name] => format!("dataset {name}"),
+        names => format!("datasets {}", names.join(", ")),
+    }
+}
+
 /// The log line of a change another instance made to the definitions in
 /// `location` that this instance could not serve, saying what it serves.
 fn unapplied_change(location: &str, failure: &ServeFailure) -> String {
     let seconds = SQL_DEFINITIONS_CHECK_INTERVAL.as_secs();
-    let serving = match failure.unserved.as_slice() {
-        [] => format!("keeps serving its earlier definitions and retries every {seconds} seconds"),
-        [dataset] => format!(
-            "does not serve dataset {} until a retry, every {seconds} seconds, applies it",
-            display_dataset_name(dataset)
-        ),
-        datasets => format!(
-            "does not serve datasets {} until a retry, every {seconds} seconds, applies it",
-            datasets
-                .iter()
-                .map(|dataset| display_dataset_name(dataset))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+    let serving = if failure.unserved.is_empty() {
+        format!("keeps serving its earlier definitions and retries every {seconds} seconds")
+    } else {
+        format!(
+            "serves it without {} until a retry, every {seconds} seconds, applies it",
+            dataset_phrase(&shown_datasets(failure.unserved.iter().map(String::as_str)))
+        )
     };
     format!(
         "Failed to apply a change another instance made to the datasets and catalogs defined with SQL in {location}, so this instance {serving}. Cause: {}",
         failure.cause
+    )
+}
+
+/// The log line of datasets served again once the acceleration data their
+/// earlier definitions left is deleted.
+fn served_again(withheld: &[Dataset]) -> String {
+    let shown = shown_datasets(withheld.iter().map(|dataset| dataset.name.as_str()));
+    format!(
+        "Deleted the earlier acceleration data of {}, so this instance serves {} again.",
+        dataset_phrase(&shown),
+        if shown.len() == 1 { "it" } else { "them" }
     )
 }
 
@@ -1778,11 +1916,33 @@ mod tests {
         );
         assert_eq!(
             unapplied_change(location, &failure(&["orders"])),
-            "Failed to apply a change another instance made to the datasets and catalogs defined with SQL in s3://bucket/sql-definitions/definitions.json, so this instance does not serve dataset 'orders' until a retry, every 10 seconds, applies it. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
+            "Failed to apply a change another instance made to the datasets and catalogs defined with SQL in s3://bucket/sql-definitions/definitions.json, so this instance serves it without dataset 'orders' until a retry, every 10 seconds, applies it. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
         );
         assert_eq!(
-            unapplied_change(location, &failure(&["orders", "sales.customers"])),
-            "Failed to apply a change another instance made to the datasets and catalogs defined with SQL in s3://bucket/sql-definitions/definitions.json, so this instance does not serve datasets 'orders', 'sales.customers' until a retry, every 10 seconds, applies it. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
+            unapplied_change(location, &failure(&["orders", "sales.customers", "orders"])),
+            "Failed to apply a change another instance made to the datasets and catalogs defined with SQL in s3://bucket/sql-definitions/definitions.json, so this instance serves it without datasets 'orders', 'sales.customers' until a retry, every 10 seconds, applies it. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
+        );
+    }
+
+    /// A statement that names a withheld dataset says why it is refused and
+    /// when to run it again; the log says when the dataset is served again.
+    #[test]
+    fn a_withheld_dataset_is_named_in_its_refusal_and_when_served_again() {
+        assert_eq!(
+            withheld_dataset(
+                "orders",
+                "the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
+            ),
+            "this instance does not serve dataset 'orders' until it deletes the acceleration data an earlier definition of it left, which another instance dropped or replaced; Spice retries every 10 seconds, so run the statement again once it has. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
+        );
+        let orders = Dataset::new("file:orders.csv", "orders");
+        assert_eq!(
+            served_again(&[orders.clone(), orders.clone()]),
+            "Deleted the earlier acceleration data of dataset 'orders', so this instance serves it again."
+        );
+        assert_eq!(
+            served_again(&[orders, Dataset::new("file:c.csv", "sales.customers")]),
+            "Deleted the earlier acceleration data of datasets 'orders', 'sales.customers', so this instance serves them again."
         );
     }
 }

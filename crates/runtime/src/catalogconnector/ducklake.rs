@@ -30,9 +30,7 @@ use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::duckdb::{install_and_load_extension, with_utc_session_timezone};
 use data_components::ducklake::provider::{DuckLakeCatalogProvider, DuckLakeFederation};
-use data_components::ducklake::{
-    DuckLakeS3Params, attach_error_message, build_ducklake_attach_sql, configure_duckdb_httpfs,
-};
+use data_components::ducklake::{DuckLakeS3Params, attach_ducklake, configure_duckdb_httpfs};
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
@@ -290,22 +288,18 @@ impl CatalogConnector for DuckLakeCatalog {
                         source: Box::new(e),
                     })?;
 
-                let attach_sql = build_ducklake_attach_sql(
+                attach_ducklake(
+                    &duckdb_wrapper.conn,
                     &connection_string_for_pool,
                     &catalog_name_for_pool,
                     automatic_migration,
-                );
-                duckdb_wrapper
-                    .conn
-                    .execute(&attach_sql, [])
-                    .map_err(|e| Error::UnableToAttachDuckLake {
-                        message: attach_error_message(&e, &connection_string_for_pool),
-                    })
-                    .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                        connector: PREFIX.to_string(),
-                        connector_component: connector_component_for_pool,
-                        source: Box::new(e),
-                    })?;
+                )
+                .map_err(|message| Error::UnableToAttachDuckLake { message })
+                .map_err(|e| super::Error::UnableToGetCatalogProvider {
+                    connector: PREFIX.to_string(),
+                    connector_component: connector_component_for_pool,
+                    source: Box::new(e),
+                })?;
 
                 Ok(pool)
             })

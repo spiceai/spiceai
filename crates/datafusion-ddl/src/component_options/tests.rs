@@ -1244,3 +1244,15 @@ fn every_test_spicepod_component_round_trips_through_its_create_statement() {
     assert!(datasets > 500, "only {datasets} datasets round-tripped");
     assert!(catalogs > 5, "only {catalogs} catalogs round-tripped");
 }
+
+/// A statement that cannot be read into tokens gives up each word that may be
+/// a value: a quoted word even when it spells a keyword, such as `'secret`, and
+/// an unquoted word that is not a keyword; a word shorter than four
+/// characters stays.
+#[test]
+fn an_unreadable_statement_gives_up_quoted_keywords() {
+    assert_eq!(
+        unreadable_parts("CREATE TABLE t WITH (pg_pass = 'secret, pg_user = Xy9, pg_db = mydb)"),
+        ["pg_pass", "'secret", "secret", "pg_user", "pg_db", "mydb"]
+    );
+}

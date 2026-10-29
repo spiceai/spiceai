@@ -80,19 +80,22 @@ impl<'a> RecordedStatement<'a> {
 }
 
 /// The parts of `text`, which cannot be read into tokens, that may be values:
-/// each word of at least [`SHORTEST_BARE_VALUE`] characters that is not a
-/// keyword, as written and without the quotes around it. A source that quotes
-/// the text back loses them, which may take out a name too; that fails closed.
+/// each word of at least [`SHORTEST_BARE_VALUE`] characters that is quoted or
+/// is not a keyword, as written and without the quotes around it. A quoted
+/// keyword, such as `'secret`, is a literal. A source that quotes the text
+/// back loses them, which may take out a name too; that fails closed.
 #[must_use]
 pub fn unreadable_parts(text: &str) -> Vec<String> {
     let mut parts = Vec::new();
     for word in text.split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | '=' | ';'))
     {
         let bare = word.trim_matches(|c: char| matches!(c, '\'' | '"' | '`'));
+        let quoted = bare.len() != word.len();
         if bare.chars().count() < SHORTEST_BARE_VALUE
-            || ALL_KEYWORDS
-                .binary_search(&bare.to_ascii_uppercase().as_str())
-                .is_ok()
+            || (!quoted
+                && ALL_KEYWORDS
+                    .binary_search(&bare.to_ascii_uppercase().as_str())
+                    .is_ok())
         {
             continue;
         }

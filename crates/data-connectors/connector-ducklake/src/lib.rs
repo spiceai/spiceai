@@ -22,9 +22,7 @@ use async_trait::async_trait;
 use data_components::Read;
 use data_components::duckdb::{install_and_load_extension, with_utc_session_timezone};
 use data_components::ducklake::writer::DuckDbFederatedTableWriter;
-use data_components::ducklake::{
-    DuckLakeS3Params, attach_error_message, build_ducklake_attach_sql, configure_duckdb_httpfs,
-};
+use data_components::ducklake::{DuckLakeS3Params, attach_ducklake, configure_duckdb_httpfs};
 use data_connector_api::ConnectorContext;
 use data_connector_api::{
     AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
@@ -243,19 +241,18 @@ fn create_ducklake_factory(
             source: Box::new(e),
         })?;
 
-    let attach_sql =
-        build_ducklake_attach_sql(connection_string, catalog_name, automatic_migration);
-    duckdb_wrapper
-        .conn
-        .execute(&attach_sql, [])
-        .map_err(|e| Error::UnableToAttachDuckLake {
-            message: attach_error_message(&e, connection_string),
-        })
-        .map_err(|e| DataConnectorError::UnableToConnectInternal {
-            dataconnector: "ducklake".to_string(),
-            connector_component: params.component.clone(),
-            source: Box::new(e),
-        })?;
+    attach_ducklake(
+        &duckdb_wrapper.conn,
+        connection_string,
+        catalog_name,
+        automatic_migration,
+    )
+    .map_err(|message| Error::UnableToAttachDuckLake { message })
+    .map_err(|e| DataConnectorError::UnableToConnectInternal {
+        dataconnector: "ducklake".to_string(),
+        connector_component: params.component.clone(),
+        source: Box::new(e),
+    })?;
 
     // The dialect was installed without a deny-list, so every Spice-only UDF was
     // unparsed verbatim into the statement sent to DuckDB. See #10703 / #13664.
