@@ -550,21 +550,35 @@ async fn a_sort_over_aggregate_output_slices_charges_each_slice_for_its_own_rows
     }
 }
 
-/// spiceai/datafusion#279. A nested-loop or cross join yields many output batches
-/// per probe batch without polling an input, so unless each output batch spends
-/// the cooperative budget, the task running it never yields: a cancelled or
-/// timed-out query cannot stop it, and on a single-threaded runtime nothing else
-/// runs. Each query here reads a probe side too large to finish, on a
-/// single-threaded runtime, and must give its 100 ms read timeout a chance to fire.
+/// spiceai/datafusion#279 and #280. A join with a high fan-out yields many output
+/// batches per input batch without polling an input, so unless each output batch
+/// spends the cooperative budget, the task running it never yields: a cancelled
+/// or timed-out query cannot stop it, and on a single-threaded runtime nothing
+/// else runs. Each query here runs on a single-threaded runtime and must give its
+/// 100 ms read timeout a chance to fire. A sort-merge join sorts its inputs
+/// first, and that read yields, so its inputs are finite and share one key.
 #[test]
-fn nested_loop_and_cross_joins_yield_to_the_scheduler() {
-    for (operator, sql) in [
+fn every_join_yields_to_the_scheduler() {
+    let mut never_yielded = Vec::new();
+    for (operator, prefer_hash_join, sql) in [
+        (
+            "HashJoinExec",
+            true,
+            "SELECT max(a.value + b.value) FROM range(1, 10000) b JOIN range(1, 1000000000000) a ON a.value % 2 = b.value % 2",
+        ),
+        (
+            "SortMergeJoinExec",
+            false,
+            "SELECT max(a.value + b.value) FROM range(1, 20000) b JOIN range(1, 20000) a ON a.value / 1000000 = b.value / 1000000",
+        ),
         (
             "NestedLoopJoinExec",
+            true,
             "SELECT max(a.value + b.value) FROM range(1, 10000) b JOIN range(1, 1000000000000) a ON a.value + b.value > 1",
         ),
         (
             "CrossJoinExec",
+            true,
             "SELECT max(a.value + b.value) FROM range(1, 10000) b CROSS JOIN range(1, 1000000000000) a",
         ),
     ] {
@@ -575,7 +589,9 @@ fn nested_loop_and_cross_joins_yield_to_the_scheduler() {
                 .build()
                 .expect("runtime builds");
             let result = runtime.block_on(async {
-                let ctx = spice_session(|_| {});
+                let ctx = spice_session(|config| {
+                    config.options_mut().optimizer.prefer_hash_join = prefer_hash_join;
+                });
                 let plan = ctx
                     .sql(sql)
                     .await
@@ -601,10 +617,12 @@ fn nested_loop_and_cross_joins_yield_to_the_scheduler() {
             });
             let _ = done.send(result);
         });
-        assert_eq!(
-            finished.recv_timeout(std::time::Duration::from_secs(30)),
-            Ok(true),
-            "{operator} never yielded, so its query's read timeout could not fire"
-        );
+        if finished.recv_timeout(std::time::Duration::from_secs(30)) != Ok(true) {
+            never_yielded.push(operator);
+        }
     }
+    assert!(
+        never_yielded.is_empty(),
+        "{never_yielded:?} never yielded, so their queries' read timeouts could not fire"
+    );
 }

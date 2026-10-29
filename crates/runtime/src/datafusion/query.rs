@@ -6050,11 +6050,13 @@ mod tests {
         assert!(guard_dropped.load(Ordering::SeqCst));
     }
 
-    /// Regression test for #15741: a client that disconnects drops the result
-    /// stream before its end, and the query's task-history row must record an
-    /// error rather than a success.
-    #[tokio::test]
-    async fn a_result_stream_dropped_before_its_end_records_a_cancellation() {
+    /// The task-history errors recorded while `consume` reads a tracked
+    /// two-batch stream and then drops it, each as `<span>: <message>`.
+    async fn task_history_errors_after<F, Fut>(consume: F) -> Vec<String>
+    where
+        F: FnOnce(SendableRecordBatchStream) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         use tracing_subscriber::layer::{Context, SubscriberExt};
 
         #[derive(Clone, Default)]
@@ -6098,6 +6100,13 @@ mod tests {
             arrow::datatypes::DataType::Int64,
             false,
         )]));
+        let batch = |value: i64| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![value])) as ArrayRef],
+            )
+            .expect("batch")
+        };
         let tracker = QueryTracker {
             task_history_enabled: true,
             log_errors: spicepod::component::runtime::QueryErrorLogging::None,
@@ -6118,14 +6127,41 @@ mod tests {
             tracing::info_span!("sql_query"),
             Arc::new(RequestContextBuilder::new(Protocol::Http).build()),
             Some(tracker),
-            pending_stream(&schema),
+            stream_from_batches(&schema, vec![batch(1), batch(2)]),
         );
-        drop(stream);
+        consume(stream).await;
 
+        errors.0.lock().clone()
+    }
+
+    /// Regression test for #15741: a client that disconnects drops the result
+    /// stream before its end, and the query's task-history row must record an
+    /// error rather than a success.
+    #[tokio::test]
+    async fn a_result_stream_dropped_before_its_end_records_a_cancellation() {
+        let errors = task_history_errors_after(|mut stream| async move {
+            stream.next().await.expect("first batch").expect("ok");
+            drop(stream);
+        })
+        .await;
         assert_eq!(
-            *errors.0.lock(),
+            errors,
             ["sql_query: Query was cancelled before its results were fully read"]
         );
+    }
+
+    /// A stream read to its end succeeded, and dropping it afterwards must not
+    /// record an error.
+    #[tokio::test]
+    async fn a_result_stream_read_to_its_end_records_no_error() {
+        let errors = task_history_errors_after(|mut stream| async move {
+            while let Some(batch) = stream.next().await {
+                batch.expect("ok");
+            }
+            drop(stream);
+        })
+        .await;
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     /// Collect all batches from a `SendableRecordBatchStream`.
