@@ -32,8 +32,9 @@ use arrow::{
     datatypes::DataType,
     error::ArrowError,
 };
-use arrow_schema::SchemaRef;
+use arrow_schema::{Schema, SchemaRef};
 use arrow_tools::record_batch::{slice_memory_size, try_cast_to};
+use arrow_tools::schema::schema_meta_get_computed_columns;
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use arrow_tools::type_rewrite::rewrite_data_type;
 use async_stream::stream;
@@ -51,7 +52,7 @@ use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_planner::ExtensionPlanner;
 use datafusion::{
-    common::TableReference,
+    common::{Column, TableReference},
     dataframe::DataFrame,
     datasource::TableProvider,
     error::DataFusionError,
@@ -2874,8 +2875,11 @@ impl RefreshTask {
             return Ok(update);
         };
 
+        // Computed columns, such as embeddings, are not compared: a model can return
+        // different vectors for the same text, so a re-read row would not match its stored copy.
+        let computed_columns = computed_columns(&self.federated.table_provider().await.schema());
         let existing_records = self
-            .stored_rows_to_compare(refresh, &filter_converter, stored_from)
+            .stored_rows_to_compare(refresh, &filter_converter, stored_from, &computed_columns)
             .await?;
 
         // Use the update stream's schema for dedup comparison, not the full federated
@@ -2895,6 +2899,7 @@ impl RefreshTask {
         let filter_fields: Vec<std::sync::Arc<arrow::datatypes::Field>> = output_schema
             .fields()
             .iter()
+            .filter(|field| !computed_columns.contains(field.name()))
             .map(|field| {
                 if let Some((_, acc_field)) = accelerator_schema.fields().find(field.name()) {
                     if field.data_type() == acc_field.data_type() {
@@ -2962,14 +2967,16 @@ impl RefreshTask {
     }
 
     /// The stored rows an append compares its incoming rows with: those `stored_from`
-    /// selects, plus every stored row whose time column is NULL.
+    /// selects, plus every stored row whose time column is NULL, without the `skipped` columns.
     async fn stored_rows_to_compare(
         &self,
         refresh: &Refresh,
         filter_converter: &TimestampFilterConvert,
         stored_from: StoredRowsFrom,
+        skipped: &[String],
     ) -> Result<Vec<RecordBatch>, RetryError<super::Error>> {
         let federated_provider = self.federated.table_provider().await;
+        let skipped: Vec<Column> = skipped.iter().map(Column::new_unqualified).collect();
 
         // The high-water filter below must widen in step with the source-side filter in
         // `get_full_or_incremental_append_update`: on a day-granular time column, if the
@@ -2986,6 +2993,7 @@ impl RefreshTask {
             )
             .await,
         )
+        .and_then(|df| df.drop_columns(&skipped))
         .map_err(find_datafusion_root)
         .context(super::UnableToScanTableProviderSnafu)?;
         if let Some(filter) = stored_from.filter(filter_converter) {
@@ -3052,6 +3060,7 @@ impl RefreshTask {
                 )
                 .await,
             )
+            .and_then(|df| df.drop_columns(&skipped))
             .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?
             .filter(ident(tc).is_null())
@@ -3950,6 +3959,17 @@ fn filter_records(
     let predicates = dedup_predicates(update_data, existing_records, filter_schema, used)?;
 
     filter_record_batch(update_data, &predicates.into()).context(super::FailedToFilterUpdatesSnafu)
+}
+
+/// The columns computed from another column of `schema`, such as its embeddings.
+fn computed_columns(schema: &Schema) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .filter_map(|field| schema_meta_get_computed_columns(schema, field.name()))
+        .flatten()
+        .map(|field| field.name().clone())
+        .collect()
 }
 
 /// Produces the rows in `update_data` that are absent from `existing_records`, while consuming
@@ -6707,7 +6727,7 @@ mod tests {
         let converter = task
             .get_accelerator_filter_converter(refresh)
             .expect("the time column has a filter converter");
-        task.stored_rows_to_compare(refresh, &converter, stored_from)
+        task.stored_rows_to_compare(refresh, &converter, stored_from, &[])
             .await
             .expect("the comparison set is read")
             .iter()
