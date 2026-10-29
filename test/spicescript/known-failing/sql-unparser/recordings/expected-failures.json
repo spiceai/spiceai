@@ -2,84 +2,6 @@
   "random-queries-known": [
     {
       "run": "random-queries-known[backend=postgres]",
-      "who": "arrow",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 90,
-      "kind": "error",
-      "signature": "Spice rejected it: Query execution failed. Schema mismatch: Query returned an unexpected data type for column c1259: expected Int32, received Int64. Is the column data type supported by the data accelerator (https://spiceai.org/docs/reference/datatypes)?: Schema mismatch: Query returned an unexpecte",
-      "group": "case-widening+unread-groups",
-      "labels": [
-        "case-widening",
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "arrow",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 268,
-      "kind": "error",
-      "signature": "Spice rejected it: Query execution failed. Schema mismatch: Query returned an unexpected data type for column c3810: expected Int32, received Decimal128(20, 0). Is the column data type supported by the data accelerator (https://spiceai.org/docs/reference/datatypes)?: Schema mismatch: Query returned ",
-      "group": "case-widening+not+unsigned-rank",
-      "labels": [
-        "case-widening",
-        "not",
-        "unsigned-rank"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "cayenne",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 90,
-      "kind": "error",
-      "signature": "Spice rejected it: Query execution failed. Schema mismatch: Query returned an unexpected data type for column c1259: expected Int32, received Int64. Is the column data type supported by the data accelerator (https://spiceai.org/docs/reference/datatypes)?: Schema mismatch: Query returned an unexpecte",
-      "group": "case-widening+unread-groups",
-      "labels": [
-        "case-widening",
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "cayenne",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 268,
-      "kind": "error",
-      "signature": "Spice rejected it: Query execution failed. Schema mismatch: Query returned an unexpected data type for column c3810: expected Int32, received Decimal128(20, 0). Is the column data type supported by the data accelerator (https://spiceai.org/docs/reference/datatypes)?: Schema mismatch: Query returned ",
-      "group": "case-widening+not+unsigned-rank",
-      "labels": [
-        "case-widening",
-        "not",
-        "unsigned-rank"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "duckdb",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 0,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"0\\\"\", actual: \"\\\"138\\\"\" }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "duckdb",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 19,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"129\\\"\", actual: \"\\\"150\\\"\" }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
       "who": "duckdb",
       "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
       "query": 21,
@@ -101,18 +23,6 @@
       "group": "set-operation-nulls",
       "labels": [
         "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "duckdb",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 50,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: RowCountMismatch { expected: 14, actual: 1 }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
       ]
     },
     {
@@ -182,18 +92,6 @@
       "run": "random-queries-known[backend=postgres]",
       "who": "duckdb",
       "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 111,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"107\\\"\", actual: \"\\\"123\\\"\" }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "duckdb",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
       "query": 114,
       "kind": "error",
       "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: Referenced table \\\"right\\\" not found!\\nCandidate tables: \\\"left\\\"\\n\\nLINE 1: ...\\\".\\\"dt\\\", \\\"r1600\\\".\\\"b\\\" FROM \\\"t\\\" AS \\\"r1600\\\") AS \\\"right\\\" WHERE NOT \\\"right\\\".\\\"c1609",
@@ -246,18 +144,6 @@
       "run": "random-queries-known[backend=postgres]",
       "who": "duckdb",
       "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 128,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: RowCountMismatch { expected: 3, actual: 8 }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "duckdb",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
       "query": 133,
       "kind": "error",
       "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: Referenced table \\\"right\\\" not found!\\nCandidate tables: \\\"left\\\"\\n\\nLINE 1: ....\\\"t_id\\\", \\\"r1923\\\".\\\"label\\\" FROM \\\"u\\\" AS \\\"r1923\\\") AS \\\"right\\\" WHERE \\\"right\\\".\\\"c1926",
@@ -295,18 +181,6 @@
       "run": "random-queries-known[backend=postgres]",
       "who": "duckdb",
       "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 200,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"130\\\"\", actual: \"\\\"150\\\"\" }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "duckdb",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
       "query": 202,
       "kind": "error",
       "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: Referenced table \\\"right\\\" not found!\\nCandidate tables: \\\"left\\\"\\n\\nLINE 1: ...\\\".\\\"s\\\", \\\"r2773\\\".\\\"dt\\\" FROM \\\"t\\\" AS \\\"r2773\\\") AS \\\"right\\\" WHERE (-\\\"right\\\".\\\"c2777\\\"",
@@ -334,7 +208,7 @@
       "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
       "query": 216,
       "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: Referenced table \\\"right\\\" not found!\\nCandidate tables: \\\"left\\\"\\n\\nLINE 1: ... (SELECT \\\"r2981\\\".\\\"label\\\" FROM \\\"u\\\" AS \\\"r2981\\\") AS \\\"right\\\" WHERE \\\"right\\\".\\\"c2984\\\"",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: Referenced table \\\"right\\\" not found!\\nCandidate tables: \\\"left\\\"\\n\\nLINE 1: ...(SELECT \\\"r2981\\\".\\\"label\\\" FROM \\\"u\\\" AS \\\"r2981\\\") AS \\\"right\\\" WHERE (\\\"right\\\".\\\"c2984\\\"",
       "group": "set-operation-nulls+unread-groups",
       "labels": [
         "set-operation-nulls",
@@ -352,67 +226,6 @@
       "labels": [
         "not",
         "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "duckdb",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 239,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: RowCountMismatch { expected: 2, actual: 1 }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "duckdb",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 246,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"1\\\"\", actual: \"\\\"126\\\"\" }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "duckdb",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 293,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: RowCountMismatch { expected: 2, actual: 1 }",
-      "group": "unread-groups+unsigned-rank",
-      "labels": [
-        "unread-groups",
-        "unsigned-rank"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 0,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"0\\\"\", actual: \"\\\"138\\\"\" }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 19,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"129\\\"\", actual: \"\\\"150\\\"\" }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
       ]
     },
     {
@@ -438,18 +251,6 @@
       "group": "set-operation-nulls",
       "labels": [
         "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 50,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: RowCountMismatch { expected: 14, actual: 1 }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
       ]
     },
     {
@@ -519,18 +320,6 @@
       "run": "random-queries-known[backend=postgres]",
       "who": "federated",
       "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 111,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"107\\\"\", actual: \"\\\"123\\\"\" }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
       "query": 114,
       "kind": "error",
       "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: column left.c1602 does not exist\\nSQLSTATE: 42703\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/docs/17/index.html\": code: 'Cli",
@@ -583,18 +372,6 @@
       "run": "random-queries-known[backend=postgres]",
       "who": "federated",
       "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 128,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: RowCountMismatch { expected: 3, actual: 8 }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
       "query": 133,
       "kind": "error",
       "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: column left.c1924 does not exist\\nSQLSTATE: 42703\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/docs/17/index.html\": code: 'Cli",
@@ -626,18 +403,6 @@
       "group": "set-operation-nulls",
       "labels": [
         "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=postgres]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 200,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"130\\\"\", actual: \"\\\"150\\\"\" }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
       ]
     },
     {
@@ -693,44 +458,467 @@
     },
     {
       "run": "random-queries-known[backend=postgres]",
-      "who": "federated",
+      "who": "cayenne",
       "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 239,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: RowCountMismatch { expected: 2, actual: 1 }",
-      "group": "unread-groups",
+      "query": 90,
+      "kind": "error",
+      "signature": "Spice rejected it: Query execution failed. Schema mismatch: Query returned an unexpected data type for column c1259: expected Int32, received Int64. Is the column data type supported by the data accelerator (https://spiceai.org/docs/reference/datatypes)?: Schema mismatch: Query returned an unexpecte",
+      "group": "case-widening+unread-groups",
       "labels": [
+        "case-widening",
         "unread-groups"
       ]
     },
     {
       "run": "random-queries-known[backend=postgres]",
-      "who": "federated",
+      "who": "cayenne",
       "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 246,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"1\\\"\", actual: \"\\\"126\\\"\" }",
-      "group": "unread-groups",
+      "query": 268,
+      "kind": "error",
+      "signature": "Spice rejected it: Query execution failed. Schema mismatch: Query returned an unexpected data type for column c3810: expected Int32, received Decimal128(20, 0). Is the column data type supported by the data accelerator (https://spiceai.org/docs/reference/datatypes)?: Schema mismatch: Query returned ",
+      "group": "case-widening+not+unsigned-rank",
       "labels": [
+        "case-widening",
+        "not",
+        "unsigned-rank"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=postgres]",
+      "who": "arrow",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
+      "query": 90,
+      "kind": "error",
+      "signature": "Spice rejected it: Query execution failed. Schema mismatch: Query returned an unexpected data type for column c1259: expected Int32, received Int64. Is the column data type supported by the data accelerator (https://spiceai.org/docs/reference/datatypes)?: Schema mismatch: Query returned an unexpecte",
+      "group": "case-widening+unread-groups",
+      "labels": [
+        "case-widening",
         "unread-groups"
       ]
     },
     {
       "run": "random-queries-known[backend=postgres]",
-      "who": "federated",
+      "who": "arrow",
       "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"tables\":[\"t\",\"u\"]}",
-      "query": 293,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: RowCountMismatch { expected: 2, actual: 1 }",
-      "group": "unread-groups+unsigned-rank",
+      "query": 268,
+      "kind": "error",
+      "signature": "Spice rejected it: Query execution failed. Schema mismatch: Query returned an unexpected data type for column c3810: expected Int32, received Decimal128(20, 0). Is the column data type supported by the data accelerator (https://spiceai.org/docs/reference/datatypes)?: Schema mismatch: Query returned ",
+      "group": "case-widening+not+unsigned-rank",
       "labels": [
-        "unread-groups",
+        "case-widening",
+        "not",
         "unsigned-rank"
       ]
     },
     {
       "run": "random-queries-known[backend=mysql]",
-      "who": "arrow",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 18,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
+      "group": "sql-unparser"
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 34,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c460' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9.",
+      "group": "set-operation-nulls",
+      "labels": [
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 37,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c503' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9.",
+      "group": "not+set-operation-nulls",
+      "labels": [
+        "not",
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 55,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c721' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9.",
+      "group": "decimal-int+set-operation-nulls",
+      "labels": [
+        "decimal-int",
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 57,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c758' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9.",
+      "group": "set-operation-nulls",
+      "labels": [
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 60,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
+      "group": "sql-unparser"
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 64,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c840' in 'where clause''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/",
+      "group": "not+set-operation-nulls",
+      "labels": [
+        "not",
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 79,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1073' in 'where clause''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors",
+      "group": "set-operation-nulls",
+      "labels": [
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 82,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1103' in 'where clause''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors",
+      "group": "decimal-int+not+set-operation-nulls",
+      "labels": [
+        "decimal-int",
+        "not",
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 94,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1224' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
+      "group": "not+set-operation-nulls+unread-groups",
+      "labels": [
+        "not",
+        "set-operation-nulls",
+        "unread-groups"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 98,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1290' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
+      "group": "set-operation-nulls",
+      "labels": [
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 107,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1415' in 'where clause''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors",
+      "group": "set-operation-nulls",
+      "labels": [
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 115,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1506' in 'where clause''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors",
+      "group": "not+set-operation-nulls",
+      "labels": [
+        "not",
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 136,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1804' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
+      "group": "case-widening+set-operation-nulls",
+      "labels": [
+        "case-widening",
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 138,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
+      "group": "sql-unparser"
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 139,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1825' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
+      "group": "decimal-int+set-operation-nulls",
+      "labels": [
+        "decimal-int",
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 141,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1858' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
+      "group": "set-operation-nulls",
+      "labels": [
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 143,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
+      "group": "join-key-dependency",
+      "labels": [
+        "join-key-dependency"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 146,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
+      "group": "join-key-dependency+unread-groups",
+      "labels": [
+        "join-key-dependency",
+        "unread-groups"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 149,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1951' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
+      "group": "set-operation-nulls",
+      "labels": [
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 159,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
+      "group": "sql-unparser"
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 169,
+      "kind": "wrong-answer",
+      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"15\\\"\", actual: \"\\\"13\\\"\" }",
+      "group": "not+set-operation-nulls+unread-groups",
+      "labels": [
+        "not",
+        "set-operation-nulls",
+        "unread-groups"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 202,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c2644' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
+      "group": "not+set-operation-nulls",
+      "labels": [
+        "not",
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 225,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c2953' in 'where clause''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors",
+      "group": "not+set-operation-nulls",
+      "labels": [
+        "not",
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 229,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
+      "group": "sql-unparser"
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 237,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c3089' in 'where clause''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors",
+      "group": "not+set-operation-nulls",
+      "labels": [
+        "not",
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 241,
+      "kind": "wrong-answer",
+      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"116\\\"\", actual: \"\\\"192\\\"\" }",
+      "group": "case-widening+not",
+      "labels": [
+        "case-widening",
+        "not"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 245,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
+      "group": "sql-unparser"
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 250,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
+      "group": "sql-unparser"
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 251,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c3276' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
+      "group": "not+set-operation-nulls",
+      "labels": [
+        "not",
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 257,
+      "kind": "wrong-answer",
+      "signature": "the answer differs from the oracle's: RowCountMismatch { expected: 8, actual: 6 }",
+      "group": "unread-groups",
+      "labels": [
+        "unread-groups"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 265,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c3433' in 'where clause''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors",
+      "group": "set-operation-nulls",
+      "labels": [
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 267,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c3446' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
+      "group": "set-operation-nulls",
+      "labels": [
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 282,
+      "kind": "error",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c3621' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
+      "group": "case-widening+set-operation-nulls",
+      "labels": [
+        "case-widening",
+        "set-operation-nulls"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "cayenne",
       "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
       "query": 4,
       "kind": "error",
@@ -742,7 +930,7 @@
     },
     {
       "run": "random-queries-known[backend=mysql]",
-      "who": "arrow",
+      "who": "cayenne",
       "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
       "query": 254,
       "kind": "error",
@@ -755,7 +943,7 @@
     },
     {
       "run": "random-queries-known[backend=mysql]",
-      "who": "cayenne",
+      "who": "arrow",
       "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
       "query": 4,
       "kind": "error",
@@ -767,7 +955,7 @@
     },
     {
       "run": "random-queries-known[backend=mysql]",
-      "who": "cayenne",
+      "who": "arrow",
       "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
       "query": 254,
       "kind": "error",
@@ -845,30 +1033,6 @@
       "run": "random-queries-known[backend=mysql]",
       "who": "duckdb",
       "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 73,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: RowCountMismatch { expected: 249, actual: 1 }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "duckdb",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 74,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"0\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "duckdb",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
       "query": 79,
       "kind": "error",
       "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: Values list \\\"left\\\" does not have a column named \\\"c1073\\\"\\n\\nLINE 1: ...\\\".\\\"c1069\\\" <> CAST('2024-10-16' AS DATE)) IS NOT TRUE AND (\\\"left\\\".\\\"c1073\\\" IS NOT DISTINCT FR",
@@ -897,7 +1061,7 @@
       "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
       "query": 94,
       "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: Referenced table \\\"right\\\" not found!\\nCandidate tables: \\\"left\\\"\\n\\nLINE 1: ... \\\"r1222\\\".\\\"t_id\\\" FROM \\\"u\\\" AS \\\"r1222\\\") AS \\\"right\\\" WHERE NOT \\\"right\\\".\\\"c1224\\\" IS N",
+      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: Referenced table \\\"right\\\" not found!\\nCandidate tables: \\\"left\\\"\\n\\nLINE 1: ... \\\"r1222\\\".\\\"t_id\\\" FROM \\\"u\\\" AS \\\"r1222\\\") AS \\\"right\\\" WHERE NOT (\\\"right\\\".\\\"c1224\\\" IS ",
       "group": "not+set-operation-nulls+unread-groups",
       "labels": [
         "not",
@@ -1008,18 +1172,6 @@
       "run": "random-queries-known[backend=mysql]",
       "who": "duckdb",
       "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 155,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: RowCountMismatch { expected: 34, actual: 366 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "duckdb",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
       "query": 202,
       "kind": "error",
       "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: Referenced table \\\"right\\\" not found!\\nCandidate tables: \\\"left\\\"\\n\\nLINE 1: ...\\\".\\\"f\\\", \\\"r2643\\\".\\\"ts\\\" FROM \\\"t\\\" AS \\\"r2643\\\") AS \\\"right\\\" WHERE (((\\\"right\\\".\\\"c2646\\",
@@ -1027,19 +1179,6 @@
       "labels": [
         "not",
         "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "duckdb",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 203,
-      "kind": "empty",
-      "signature": "Spice returned no rows, the oracle 400",
-      "group": "not+unread-groups",
-      "labels": [
-        "not",
-        "unread-groups"
       ]
     },
     {
@@ -1066,31 +1205,6 @@
       "labels": [
         "not",
         "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "duckdb",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 242,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"0\\\"\", actual: \"\\\"400\\\"\" }",
-      "group": "not+unread-groups",
-      "labels": [
-        "not",
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "duckdb",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 249,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: RowCountMismatch { expected: 3, actual: 150 }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
       ]
     },
     {
@@ -1142,2300 +1256,9 @@
         "case-widening",
         "set-operation-nulls"
       ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 18,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 21,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 29,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
-      "group": "case-widening+unread-groups",
-      "labels": [
-        "case-widening",
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 34,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c460' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9.",
-      "group": "set-operation-nulls",
-      "labels": [
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 37,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c503' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9.",
-      "group": "not+set-operation-nulls",
-      "labels": [
-        "not",
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 55,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c721' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9.",
-      "group": "decimal-int+set-operation-nulls",
-      "labels": [
-        "decimal-int",
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 57,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c758' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9.",
-      "group": "set-operation-nulls",
-      "labels": [
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 60,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 64,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c840' in 'where clause''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/",
-      "group": "not+set-operation-nulls",
-      "labels": [
-        "not",
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 73,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: RowCountMismatch { expected: 249, actual: 1 }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 74,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"0\\\"\", actual: \"\\\"1\\\"\" }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 79,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1073' in 'where clause''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors",
-      "group": "set-operation-nulls",
-      "labels": [
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 82,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1103' in 'where clause''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors",
-      "group": "decimal-int+not+set-operation-nulls",
-      "labels": [
-        "decimal-int",
-        "not",
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 94,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1224' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
-      "group": "not+set-operation-nulls+unread-groups",
-      "labels": [
-        "not",
-        "set-operation-nulls",
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 98,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1290' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
-      "group": "set-operation-nulls",
-      "labels": [
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 107,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1415' in 'where clause''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors",
-      "group": "set-operation-nulls",
-      "labels": [
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 115,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1506' in 'where clause''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors",
-      "group": "not+set-operation-nulls",
-      "labels": [
-        "not",
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 119,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
-      "group": "case-widening",
-      "labels": [
-        "case-widening"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 136,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1804' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
-      "group": "case-widening+set-operation-nulls",
-      "labels": [
-        "case-widening",
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 138,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 139,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1825' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
-      "group": "decimal-int+set-operation-nulls",
-      "labels": [
-        "decimal-int",
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 141,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1858' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
-      "group": "set-operation-nulls",
-      "labels": [
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 143,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
-      "group": "join-key-dependency",
-      "labels": [
-        "join-key-dependency"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 144,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 146,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
-      "group": "join-key-dependency+unread-groups",
-      "labels": [
-        "join-key-dependency",
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 149,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c1951' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
-      "group": "set-operation-nulls",
-      "labels": [
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 155,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: RowCountMismatch { expected: 34, actual: 366 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 159,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 169,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"15\\\"\", actual: \"\\\"13\\\"\" }",
-      "group": "not+set-operation-nulls+unread-groups",
-      "labels": [
-        "not",
-        "set-operation-nulls",
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 202,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c2644' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
-      "group": "not+set-operation-nulls",
-      "labels": [
-        "not",
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 203,
-      "kind": "empty",
-      "signature": "Spice returned no rows, the oracle 400",
-      "group": "not+unread-groups",
-      "labels": [
-        "not",
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 205,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 225,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c2953' in 'where clause''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors",
-      "group": "not+set-operation-nulls",
-      "labels": [
-        "not",
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 229,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 237,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c3089' in 'where clause''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors",
-      "group": "not+set-operation-nulls",
-      "labels": [
-        "not",
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 241,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
-      "group": "case-widening+not",
-      "labels": [
-        "case-widening",
-        "not"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 242,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"0\\\"\", actual: \"\\\"400\\\"\" }",
-      "group": "not+unread-groups",
-      "labels": [
-        "not",
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 245,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 249,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: RowCountMismatch { expected: 3, actual: 150 }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 250,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 251,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c3276' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
-      "group": "not+set-operation-nulls",
-      "labels": [
-        "not",
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 257,
-      "kind": "wrong-answer",
-      "signature": "the answer differs from the oracle's: RowCountMismatch { expected: 8, actual: 6 }",
-      "group": "unread-groups",
-      "labels": [
-        "unread-groups"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 265,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c3433' in 'where clause''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors",
-      "group": "set-operation-nulls",
-      "labels": [
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 267,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c3446' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
-      "group": "set-operation-nulls",
-      "labels": [
-        "set-operation-nulls"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 277,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to u",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "random-queries-known[backend=mysql]",
-      "who": "federated",
-      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
-      "query": 282,
-      "kind": "error",
-      "signature": "Spice rejected it: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'left.c3621' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/9",
-      "group": "case-widening+set-operation-nulls",
-      "labels": [
-        "case-widening",
-        "set-operation-nulls"
-      ]
     }
   ],
   "tlp-unparse": [
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 2,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 9,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 19,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 30,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 34,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 38,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 65,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 86,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 89,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 91,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 94,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 710 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 105,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 107,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 109,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 110,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "decimal-int+not",
-      "labels": [
-        "decimal-int",
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 119,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 127,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 132,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 133,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 134,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 136,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 710 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 138,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 139,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 142,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 149,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 732 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 151,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 153,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 710 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 174,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 181,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 732 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 189,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 710 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 2,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 9,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 19,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 30,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 34,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 38,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 65,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 86,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 89,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 91,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 94,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 710 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 105,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 107,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 109,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 110,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "decimal-int+not",
-      "labels": [
-        "decimal-int",
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 119,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 127,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 132,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 133,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 134,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 136,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 710 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 138,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 139,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 142,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 149,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 732 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 151,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 153,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 710 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 174,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 181,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 732 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=postgres]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 189,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 710 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 2,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 9,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 19,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 30,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 34,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 38,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 65,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 86,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 89,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 91,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 94,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 710 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 105,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 107,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 109,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 110,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "decimal-int+not",
-      "labels": [
-        "decimal-int",
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 119,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 127,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 132,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 133,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 134,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 136,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 710 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 138,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 139,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 142,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 149,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 732 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 151,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 153,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 710 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 174,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 181,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 732 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "duckdb",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 189,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 710 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 0,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 2,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 7,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 8,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 9,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 17,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 18,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 19,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 20,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 26,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 27,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 30,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 32,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 34,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 36,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 38,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 40,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 48,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 63,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 65,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 67,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 80,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 86,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 89,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 91,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 93,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 94,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 710 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 97,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 105,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 107,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 109,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 110,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "decimal-int+not",
-      "labels": [
-        "decimal-int",
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 111,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 115,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 119,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 124,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 125,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 127,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 129,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 132,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 133,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 134,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 135,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 136,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 710 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 138,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 139,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 142,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 149,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 732 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 151,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 153,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 710 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 157,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 160,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 161,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 162,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 174,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 800 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 176,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 181,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 732 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 183,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 184,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 189,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 710 }",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 190,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=mysql]",
-      "who": "federated",
-      "key": "tlp: {\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"skip-columns\":[\"b\"],\"table\":\"t\"}",
-      "query": 192,
-      "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right",
-      "group": "not",
-      "labels": [
-        "not"
-      ]
-    },
     {
       "run": "tlp-unparse[backend=clickhouse]",
       "who": "federated",
@@ -3443,15 +1266,6 @@
       "query": 0,
       "kind": "error",
       "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 125 ('TRUE'): TRUE) IS NOT TRUE UNION ALL SELECT ",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=clickhouse]",
-      "who": "federated",
-      "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
-      "query": 2,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: NoExpectedAnswer",
       "group": "sql-unparser"
     },
     {
@@ -3467,24 +1281,6 @@
       "run": "tlp-unparse[backend=clickhouse]",
       "who": "federated",
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
-      "query": 15,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: NoExpectedAnswer",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=clickhouse]",
-      "who": "federated",
-      "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
-      "query": 16,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 90 }",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=clickhouse]",
-      "who": "federated",
-      "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 17,
       "kind": "error",
       "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 77 ('TRUE'): TRUE UNION ALL SELECT t.id, t.i, t.b",
@@ -3496,7 +1292,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 19,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 100 ('TRUE'): TRUE IS NULL OR ((t.b = true) AND (",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 101 ('TRUE'): TRUE) IS NULL OR ((t.b = true) AND ",
       "group": "sql-unparser"
     },
     {
@@ -3505,7 +1301,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 20,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 121 ('TRUE'): TRUE UNION ALL SELECT t.id, t.i, t.",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 123 ('TRUE'): TRUE UNION ALL SELECT t.id, t.i, t.",
       "group": "sql-unparser"
     },
     {
@@ -3514,7 +1310,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 23,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 133 ('TRUE'): TRUE IS NULL UNION ALL SELECT t.id,",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 134 ('TRUE'): TRUE) IS NULL UNION ALL SELECT t.id",
       "group": "sql-unparser"
     },
     {
@@ -3525,18 +1321,6 @@
       "kind": "error",
       "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 127 ('TRUE'): TRUE = false)) UNION ALL SELECT t.i",
       "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=clickhouse]",
-      "who": "federated",
-      "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
-      "query": 26,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: NoExpectedAnswer",
-      "group": "decimal-int",
-      "labels": [
-        "decimal-int"
-      ]
     },
     {
       "run": "tlp-unparse[backend=clickhouse]",
@@ -3562,25 +1346,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 34,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 77 ('TRUE'): TRUE IS NOT TRUE IS NOT TRUE UNION A",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=clickhouse]",
-      "who": "federated",
-      "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
-      "query": 36,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: NoExpectedAnswer",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=clickhouse]",
-      "who": "federated",
-      "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
-      "query": 42,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: NoExpectedAnswer",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 79 ('TRUE'): TRUE) IS NOT TRUE) IS NOT TRUE UNION",
       "group": "sql-unparser"
     },
     {
@@ -3589,7 +1355,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 43,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 92 ('TRUE'): TRUE IS NULL IS NOT TRUE UNION ALL S",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 94 ('TRUE'): TRUE) IS NULL) IS NOT TRUE UNION ALL",
       "group": "sql-unparser"
     },
     {
@@ -3619,7 +1385,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 54,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 120 ('TRUE'): TRUE AND (t.big BETWEEN 13 AND 1)) ",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 122 ('TRUE'): TRUE AND (t.big BETWEEN 13 AND 1)) ",
       "group": "sql-unparser"
     },
     {
@@ -3628,7 +1394,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 56,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 115 ('TRUE'): TRUE = false) UNION ALL SELECT t.id",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 117 ('TRUE'): TRUE = false) UNION ALL SELECT t.id",
       "group": "sql-unparser"
     },
     {
@@ -3653,15 +1419,6 @@
       "run": "tlp-unparse[backend=clickhouse]",
       "who": "federated",
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
-      "query": 63,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: NoExpectedAnswer",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=clickhouse]",
-      "who": "federated",
-      "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 64,
       "kind": "error",
       "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 244 ('TRUE'): TRUE)) UNION ALL SELECT t.id, t.i, ",
@@ -3673,7 +1430,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 68,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 96 ('TRUE'): TRUE IS NOT TRUE IS NOT TRUE UNION A",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 98 ('TRUE'): TRUE) IS NOT TRUE) IS NOT TRUE UNION",
       "group": "sql-unparser"
     },
     {
@@ -3682,7 +1439,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 70,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 109 ('TRUE'): TRUE IS NOT TRUE IS NULL UNION ALL ",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 111 ('TRUE'): TRUE) IS NOT TRUE) IS NULL UNION AL",
       "group": "sql-unparser"
     },
     {
@@ -3691,7 +1448,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 75,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 171 ('TRUE'): TRUE) UNION ALL SELECT t.id, t.i, t",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 173 ('TRUE'): TRUE) UNION ALL SELECT t.id, t.i, t",
       "group": "sql-unparser"
     },
     {
@@ -3718,7 +1475,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 83,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 102 ('TRUE'): TRUE AND (t.id > t.id)) UNION ALL S",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 104 ('TRUE'): TRUE AND (t.id > t.id)) UNION ALL S",
       "group": "sql-unparser"
     },
     {
@@ -3727,7 +1484,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 85,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 142 ('TRUE'): TRUE UNION ALL SELECT t.id, t.i, t.",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 144 ('TRUE'): TRUE UNION ALL SELECT t.id, t.i, t.",
       "group": "sql-unparser"
     },
     {
@@ -3736,7 +1493,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 86,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 163 ('TRUE'): TRUE) UNION ALL SELECT t.id, t.i, t",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 165 ('TRUE'): TRUE) UNION ALL SELECT t.id, t.i, t",
       "group": "sql-unparser"
     },
     {
@@ -3860,18 +1617,9 @@
       "run": "tlp-unparse[backend=clickhouse]",
       "who": "federated",
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
-      "query": 116,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: NoExpectedAnswer",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=clickhouse]",
-      "who": "federated",
-      "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 118,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 127 ('TRUE'): TRUE IS NOT TRUE UNION ALL SELECT t",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 128 ('TRUE'): TRUE) IS NOT TRUE UNION ALL SELECT ",
       "group": "sql-unparser"
     },
     {
@@ -3880,7 +1628,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 120,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 137 ('TRUE'): TRUE IS NULL UNION ALL SELECT t.id,",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 138 ('TRUE'): TRUE) IS NULL UNION ALL SELECT t.id",
       "group": "sql-unparser"
     },
     {
@@ -3896,18 +1644,9 @@
       "run": "tlp-unparse[backend=clickhouse]",
       "who": "federated",
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
-      "query": 123,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: RowCountMismatch { expected: 400, actual: 68 }",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=clickhouse]",
-      "who": "federated",
-      "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 125,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 91 ('TRUE'): TRUE AND t.s IN ('banana', 'banana',",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 93 ('TRUE'): TRUE AND t.s IN ('banana', 'banana',",
       "group": "sql-unparser"
     },
     {
@@ -3916,7 +1655,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 126,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 94 ('TRUE'): TRUE UNION ALL SELECT t.id, t.i, t.b",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 96 ('TRUE'): TRUE UNION ALL SELECT t.id, t.i, t.b",
       "group": "sql-unparser"
     },
     {
@@ -3934,7 +1673,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 134,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 121 ('TRUE'): TRUE) = false) UNION ALL SELECT t.i",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 123 ('TRUE'): TRUE) = false) UNION ALL SELECT t.i",
       "group": "sql-unparser"
     },
     {
@@ -3970,7 +1709,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 145,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 90 ('TRUE'): TRUE AND ((t.id + -36) = t.id)) IS N",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 92 ('TRUE'): TRUE AND ((t.id + -36) = t.id)) IS N",
       "group": "sql-unparser"
     },
     {
@@ -3997,7 +1736,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 162,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 171 ('TRUE'): TRUE OR (lower(t.s) = 'apple'))) AN",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 173 ('TRUE'): TRUE OR (lower(t.s) = 'apple'))) AN",
       "group": "sql-unparser"
     },
     {
@@ -4015,7 +1754,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 165,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 95 ('TRUE'): TRUE IS NOT TRUE UNION ALL SELECT t.",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 96 ('TRUE'): TRUE) IS NOT TRUE UNION ALL SELECT t",
       "group": "sql-unparser"
     },
     {
@@ -4031,27 +1770,9 @@
       "run": "tlp-unparse[backend=clickhouse]",
       "who": "federated",
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
-      "query": 172,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: NoExpectedAnswer",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=clickhouse]",
-      "who": "federated",
-      "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 173,
       "kind": "error",
       "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 203 ('TRUE'): TRUE) UNION ALL SELECT t.id, t.i, t",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=clickhouse]",
-      "who": "federated",
-      "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
-      "query": 177,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: NoExpectedAnswer",
       "group": "sql-unparser"
     },
     {
@@ -4078,7 +1799,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 187,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 91 ('TRUE'): TRUE UNION ALL SELECT t.id, t.i, t.b",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 93 ('TRUE'): TRUE UNION ALL SELECT t.id, t.i, t.b",
       "group": "sql-unparser"
     },
     {
@@ -4087,7 +1808,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 189,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 172 ('TRUE'): TRUE) UNION ALL SELECT t.id, t.i, t",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 174 ('TRUE'): TRUE) UNION ALL SELECT t.id, t.i, t",
       "group": "sql-unparser"
     },
     {
@@ -4096,7 +1817,7 @@
       "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
       "query": 191,
       "kind": "error",
-      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 106 ('TRUE'): TRUE OR ((t.big * 2) BETWEEN 55 AND",
+      "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 108 ('TRUE'): TRUE OR ((t.big * 2) BETWEEN 55 AND",
       "group": "sql-unparser"
     },
     {
@@ -4107,179 +1828,15 @@
       "kind": "error",
       "signature": "Spice rejected the partitions: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (62): DB::Exception: Syntax error: failed at position 167 ('TRUE'): TRUE) UNION ALL SELECT t.id, t.i, t",
       "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=clickhouse]",
-      "who": "federated",
-      "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
-      "query": 198,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: NoExpectedAnswer",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "tlp-unparse[backend=clickhouse]",
-      "who": "federated",
-      "key": "tlp: {\"avoid\":[\"not\"],\"depth\":3,\"oracle\":\"ref\",\"queries\":200,\"seed\":1,\"table\":\"t\"}",
-      "query": 199,
-      "kind": "wrong-answer",
-      "signature": "the partitions are not the table: NoExpectedAnswer",
-      "group": "sql-unparser"
     }
   ],
-  "unparse-pruned-aggregate": [
+  "unparse-nullable-having": [
     {
-      "run": "unparse-pruned-aggregate",
-      "who": "duckdb",
-      "key": "query: SELECT count(*) AS n FROM (SELECT max(id) AS m FROM e) x",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"1\\\"\", actual: \"\\\"11\\\"\" }",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "unparse-pruned-aggregate",
-      "who": "duckdb",
-      "key": "query: SELECT count(*) AS n FROM (SELECT max(id) AS m FROM e WHERE v = 99) x",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"1\\\"\", actual: \"\\\"0\\\"\" }",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "unparse-pruned-aggregate",
-      "who": "duckdb",
-      "key": "query: SELECT count(*) AS n FROM (SELECT v, max(id) AS m FROM e GROUP BY v) x",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"3\\\"\", actual: \"\\\"11\\\"\" }",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "unparse-pruned-aggregate",
-      "who": "duckdb",
-      "key": "query: SELECT 42 AS k FROM (SELECT sum(v) AS s FROM e) x",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1, actual: 11 }",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "unparse-pruned-aggregate",
-      "who": "duckdb",
-      "key": "query: SELECT count(*) AS n FROM (SELECT v FROM e GROUP BY v) x",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"3\\\"\", actual: \"\\\"11\\\"\" }",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "unparse-pruned-aggregate",
+      "run": "unparse-nullable-having",
       "who": "mysql",
-      "key": "query: SELECT count(*) AS n FROM (SELECT max(id) AS m FROM e) x",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"1\\\"\", actual: \"\\\"11\\\"\" }",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "unparse-pruned-aggregate",
-      "who": "mysql",
-      "key": "query: SELECT count(*) AS n FROM (SELECT max(id) AS m FROM e WHERE v = 99) x",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"1\\\"\", actual: \"\\\"0\\\"\" }",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "unparse-pruned-aggregate",
-      "who": "mysql",
-      "key": "query: SELECT count(*) AS n FROM (SELECT v, max(id) AS m FROM e GROUP BY v) x",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"3\\\"\", actual: \"\\\"11\\\"\" }",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "unparse-pruned-aggregate",
-      "who": "mysql",
-      "key": "query: SELECT 42 AS k FROM (SELECT sum(v) AS s FROM e) x",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1, actual: 11 }",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "unparse-pruned-aggregate",
-      "who": "mysql",
-      "key": "query: SELECT count(*) AS n FROM (SELECT v FROM e GROUP BY v) x",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"3\\\"\", actual: \"\\\"11\\\"\" }",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "unparse-pruned-aggregate",
-      "who": "postgres",
-      "key": "query: SELECT count(*) AS n FROM (SELECT max(id) AS m FROM e) x",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"1\\\"\", actual: \"\\\"11\\\"\" }",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "unparse-pruned-aggregate",
-      "who": "postgres",
-      "key": "query: SELECT count(*) AS n FROM (SELECT max(id) AS m FROM e WHERE v = 99) x",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"1\\\"\", actual: \"\\\"0\\\"\" }",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "unparse-pruned-aggregate",
-      "who": "postgres",
-      "key": "query: SELECT count(*) AS n FROM (SELECT v, max(id) AS m FROM e GROUP BY v) x",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"3\\\"\", actual: \"\\\"11\\\"\" }",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "unparse-pruned-aggregate",
-      "who": "postgres",
-      "key": "query: SELECT 42 AS k FROM (SELECT sum(v) AS s FROM e) x",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1, actual: 11 }",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "unparse-pruned-aggregate",
-      "who": "postgres",
-      "key": "query: SELECT count(*) AS n FROM (SELECT v FROM e GROUP BY v) x",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"3\\\"\", actual: \"\\\"11\\\"\" }",
-      "group": "sql-unparser"
-    }
-  ],
-  "unparse-set-operations": [
-    {
-      "run": "unparse-set-operations",
-      "who": "duckdb",
-      "key": "query: SELECT a FROM w INTERSECT SELECT a FROM w WHERE id > 1",
+      "key": "query: SELECT count(*) AS n FROM (SELECT CASE WHEN v = 0 THEN NULL ELSE v END AS k, max(id) AS m FROM e GROUP BY CASE WHEN v = 0 THEN NULL ELSE v END HAVING CASE WHEN v = 0 THEN NULL ELSE v END IS NULL) x",
       "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: Referenced table \\\"right\\\" not found!\\nCandidate tables: \\\"left\\\"\\n\\nLINE 1: ... (SELECT \\\"right\\\".\\\"a\\\" FROM \\\"w\\\" AS \\\"right\\\") AS \\\"right\\\" WHERE (\\\"right\\\".\\\"id\\",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "unparse-set-operations",
-      "who": "duckdb",
-      "key": "query: SELECT a, s FROM w EXCEPT SELECT a, s FROM w WHERE id IN (2, 4)",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: Referenced table \\\"right\\\" not found!\\nCandidate tables: \\\"left\\\"\\n\\nLINE 1: ...\\\"right\\\".\\\"a\\\", \\\"right\\\".\\\"s\\\" FROM \\\"w\\\" AS \\\"right\\\") AS \\\"right\\\" WHERE \\\"right\\",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "unparse-set-operations",
-      "who": "federated",
-      "key": "query: SELECT a FROM w INTERSECT SELECT a FROM w WHERE id > 1",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: column right.id does not exist\\nSQLSTATE: 42703\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/docs/17/index.html\": code:",
-      "group": "sql-unparser"
-    },
-    {
-      "run": "unparse-set-operations",
-      "who": "federated",
-      "key": "query: SELECT a, s FROM w EXCEPT SELECT a, s FROM w WHERE id IN (2, 4)",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: column right.id does not exist\\nSQLSTATE: 42703\\nFor details, refer to the PostgreSQL manual: https://www.postgresql.org/docs/17/index.html\": code:",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 'e.v' in 'having clause''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-error",
       "group": "sql-unparser"
     }
   ]
