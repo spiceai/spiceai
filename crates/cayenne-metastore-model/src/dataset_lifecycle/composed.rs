@@ -420,7 +420,7 @@ impl Model for Protocol {
                 actions.push(Action::CollectStorage);
             }
         }
-        actions.retain(|a| self.next_state(s, a.clone()).is_some());
+        crate::prune_for_simulation(self, s, actions);
     }
     fn next_state(&self, s: &State, action: Action) -> Option<State> {
         let mut n = s.clone();

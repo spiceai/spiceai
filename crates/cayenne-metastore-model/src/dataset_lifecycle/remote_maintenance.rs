@@ -331,7 +331,7 @@ impl Model for Protocol {
                 _ => true,
             });
         }
-        action.retain(|action| self.next_state(state, action.clone()).is_some());
+        crate::prune_for_simulation(self, state, action);
     }
     fn next_state(&self, state: &State, action: Action) -> Option<State> {
         let mut next = state.clone();

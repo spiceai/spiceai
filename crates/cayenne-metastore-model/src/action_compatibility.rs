@@ -35,7 +35,7 @@ impl Model for Protocol {
             a.extend([Action::Append(false), Action::Append(true)]);
         }
         a.push(Action::Open);
-        a.retain(|a| self.next_state(s, a.clone()).is_some());
+        crate::prune_for_simulation(self, s, a);
     }
     fn next_state(&self, s: &State, a: Action) -> Option<State> {
         let mut n = s.clone();

@@ -381,7 +381,7 @@ impl Model for Protocol {
         {
             action.push(Fence);
         }
-        action.retain(|x| self.next_state(state, x.clone()).is_some());
+        crate::prune_for_simulation(self, state, action);
     }
     fn next_state(&self, state: &State, action: Action) -> Option<State> {
         use Action::{

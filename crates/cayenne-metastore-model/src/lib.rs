@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use stateright::{Checker, Expectation, Model};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 mod action_compatibility;
 mod commits;
@@ -1784,14 +1785,59 @@ where
 {
     let mut state = initial.clone();
     for action in actions {
-        let mut enabled = vec![];
-        model.actions(&state, &mut enabled);
-        if !enabled.contains(action) {
+        let mut listed = vec![];
+        model.actions(&state, &mut listed);
+        if !listed.contains(action) {
             return None;
         }
         state = model.next_state(&state, action.clone())?;
     }
     Some(state)
+}
+/// Set while a simulation run is checked. Models list candidate actions and
+/// reject the disabled ones in `next_state`, which the exhaustive checkers
+/// handle at no extra cost. Stateright's simulation checker records a
+/// rejected pick in the path, so a reported path cannot be reconstructed; it
+/// gets only the enabled actions.
+static SIMULATING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn prune_for_simulation<M: Model>(
+    model: &M,
+    state: &M::State,
+    actions: &mut Vec<M::Action>,
+) where
+    M::Action: Clone,
+{
+    if SIMULATING.load(Ordering::Relaxed) {
+        actions.retain(|action| model.next_state(state, action.clone()).is_some());
+    }
+}
+
+struct Simulating;
+impl Simulating {
+    fn start(on: bool) -> Self {
+        SIMULATING.store(on, Ordering::Relaxed);
+        Self
+    }
+}
+impl Drop for Simulating {
+    fn drop(&mut self) {
+        SIMULATING.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Whether any listed action has a next state. Models list candidate actions and
+/// reject the disabled ones in `next_state`, so the list alone can be non-empty
+/// at a terminal state.
+fn has_next<M: Model>(model: &M, state: &M::State) -> bool
+where
+    M::Action: Clone,
+{
+    let mut listed = vec![];
+    model.actions(state, &mut listed);
+    listed
+        .into_iter()
+        .any(|action| model.next_state(state, action).is_some())
 }
 fn minimize<M: Model>(
     model: &M,
@@ -1842,6 +1888,7 @@ where
     M::Action: Clone + PartialEq + std::fmt::Debug + Send + Sync,
 {
     println!("START {}", run.name);
+    let _simulating = Simulating::start(run.seed.is_some());
     let start = Instant::now();
     // A timed-out Stateright broker is closed too. Terminate rather than using
     // broker closure as evidence that the search exhausted its graph.
@@ -2128,9 +2175,7 @@ where
                 )
             };
             let valid = replay(c.model(), initial, &action).is_some_and(|state| {
-                let mut enabled = vec![];
-                c.model().actions(&state, &mut enabled);
-                if p.expectation == Expectation::Eventually && !enabled.is_empty() {
+                if p.expectation == Expectation::Eventually && has_next(c.model(), &state) {
                     return false;
                 }
                 (p.condition)(c.model(), &state) == (p.expectation == Expectation::Sometimes)
