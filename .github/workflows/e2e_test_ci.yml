@@ -109,7 +109,8 @@ jobs:
                 builder: "spiceai-dev-runners",
                 runner: "ubuntu-latest",
                 target_os: "linux",
-                target_arch: "x86_64"
+                target_arch: "x86_64",
+                test_timeout_minutes: 5
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
                 // `spiceai-macos-large` on every event, trunk pushes included. A three-hour
@@ -121,7 +122,10 @@ jobs:
                 // binds ports from allocate-spice-ports / allocate-service-ports.
                 runner: "spiceai-macos",
                 target_os: "darwin",
-                target_arch: "aarch64"
+                target_arch: "aarch64",
+                // A host's first Homebrew install of a database, and the build artifact
+                // download, can take a few minutes each on these runners.
+                test_timeout_minutes: 15
               }
             ];
 
@@ -730,7 +734,7 @@ jobs:
     needs:
       - build
       - setup-matrix
-    timeout-minutes: 5
+    timeout-minutes: ${{ matrix.target.test_timeout_minutes }}
 
     strategy:
       matrix:
@@ -809,7 +813,7 @@ jobs:
     needs:
       - build
       - setup-matrix
-    timeout-minutes: 5
+    timeout-minutes: ${{ matrix.target.test_timeout_minutes }}
 
     strategy:
       matrix:
@@ -877,7 +881,7 @@ jobs:
     needs:
       - build
       - setup-matrix
-    timeout-minutes: 5
+    timeout-minutes: ${{ matrix.target.test_timeout_minutes }}
 
     strategy:
       fail-fast: false
@@ -1044,7 +1048,7 @@ jobs:
     needs:
       - build
       - setup-matrix
-    timeout-minutes: 5
+    timeout-minutes: ${{ matrix.target.test_timeout_minutes }}
 
     strategy:
       fail-fast: false
@@ -1243,7 +1247,7 @@ jobs:
     needs:
       - build
       - setup-matrix
-    timeout-minutes: 5
+    timeout-minutes: ${{ matrix.target.test_timeout_minutes }}
 
     strategy:
       fail-fast: false
@@ -1507,7 +1511,7 @@ jobs:
     needs:
       - build
       - setup-matrix
-    timeout-minutes: 5
+    timeout-minutes: ${{ matrix.target.test_timeout_minutes }}
 
     strategy:
       matrix:
@@ -1678,7 +1682,7 @@ jobs:
     needs:
       - build
       - setup-matrix
-    timeout-minutes: 5
+    timeout-minutes: ${{ matrix.target.test_timeout_minutes }}
 
     strategy:
       matrix:
@@ -1763,7 +1767,7 @@ jobs:
     needs:
       - build
       - setup-matrix
-    timeout-minutes: 5
+    timeout-minutes: ${{ matrix.target.test_timeout_minutes }}
 
     strategy:
       fail-fast: false
@@ -1923,7 +1927,7 @@ jobs:
     needs:
       - build
       - setup-matrix
-    timeout-minutes: 5
+    timeout-minutes: ${{ matrix.target.test_timeout_minutes }}
 
     strategy:
       matrix:
@@ -2539,7 +2543,7 @@ jobs:
     needs:
       - build
       - setup-matrix
-    timeout-minutes: 5
+    timeout-minutes: ${{ matrix.target.test_timeout_minutes }}
 
     strategy:
       matrix:
