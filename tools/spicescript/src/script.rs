@@ -62,6 +62,56 @@ pub struct Script {
     /// The directory the script is in; `corpus` and `slt` files are relative to it.
     #[serde(skip)]
     pub dir: std::path::PathBuf,
+    /// The runs and variants `--matrix` and `--variant` left out (see
+    /// [`Script::select`]).
+    #[serde(skip)]
+    pub left_out: LeftOut,
+}
+
+/// `--matrix` and `--variant`: the matrix values and variants a run keeps.
+#[derive(Debug, Default)]
+pub struct Selection {
+    /// The values to keep, by matrix key, as `${matrix.<key>}` prints them.
+    pub matrix: BTreeMap<String, Vec<String>>,
+    pub variants: Vec<String>,
+}
+
+impl Selection {
+    pub fn is_empty(&self) -> bool {
+        self.matrix.is_empty() && self.variants.is_empty()
+    }
+
+    /// The selection as the command line spells it.
+    pub fn describe(&self) -> String {
+        self.matrix
+            .iter()
+            .flat_map(|(k, values)| values.iter().map(move |v| format!("--matrix {k}={v}")))
+            .chain(self.variants.iter().map(|v| format!("--variant {v}")))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// What a [`Selection`] left out of a script: its ledger entries there are
+/// not expected to fail this run, and recording keeps them.
+#[derive(Debug, Default, Clone)]
+pub struct LeftOut {
+    /// Run labels (`name[key=value,…]`) of the combinations left out.
+    pub runs: std::collections::BTreeSet<String>,
+    pub variants: std::collections::BTreeSet<String>,
+}
+
+impl LeftOut {
+    /// Whether a check of `run` by `who` (an instance, `<binary>/<variant>`
+    /// with several binaries, `variants` for a comparison between them, or
+    /// empty) could have been left out.
+    pub fn covers(&self, run: &str, who: &str) -> bool {
+        let variant = who.rsplit_once('/').map_or(who, |(_, v)| v);
+        self.runs.contains(run)
+            || self.variants.contains(variant)
+            // A comparison between the variants that ran is not the one recorded.
+            || (who == "variants" && !self.variants.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,6 +170,7 @@ pub struct VariantSpec {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[expect(clippy::struct_excessive_bools, reason = "independent script switches")]
 pub struct Defaults {
     #[serde(default)]
     pub expect: Option<Expect>,
@@ -142,6 +193,11 @@ pub struct Defaults {
     /// answer as over Flight.
     #[serde(default)]
     pub also_http: bool,
+    /// Also run every query through the asynchronous `/v1/queries` API (a
+    /// distributed job on a cluster) and require the same answer as over
+    /// Flight.
+    #[serde(default)]
+    pub also_async: bool,
     /// The variant every other variant's answers are compared with.
     #[serde(default)]
     pub compare_to: Option<String>,
@@ -165,7 +221,7 @@ pub struct Defaults {
     #[serde(default)]
     pub executor_args: Option<Vec<String>>,
     /// Always run as a cluster: a scheduler with this many executors, over
-    /// node mTLS from the nearest `cluster-pki/` above the script.
+    /// node mTLS with a CA and certificates generated for the run.
     #[serde(default)]
     pub cluster: Option<ClusterDefaults>,
     /// When the script runs as a cluster, the column each acceleration without
@@ -202,6 +258,11 @@ pub struct ClusterDefaults {
     /// Executors made ready but not started, for `add-executor` steps.
     #[serde(default)]
     pub spare: usize,
+    /// Runs each executor in a container of its own (Linux only), writing
+    /// shuffle output to its own `/tmp`, so executors read each other's
+    /// shuffle output over the network, as they do on separate hosts.
+    #[serde(default)]
+    pub containers: bool,
 }
 
 fn one() -> usize {
@@ -226,6 +287,7 @@ impl Default for Defaults {
             ready_timeout: None,
             query_timeout: None,
             also_http: false,
+            also_async: false,
             compare_to: None,
             api_key: None,
             tls: None,
@@ -271,6 +333,10 @@ pub struct Step {
     pub except: Vec<String>,
     /// Run the step only in matrix combinations with these values.
     pub when: Map<String, Value>,
+    /// For a query from a `corpus`, the position of that corpus in the
+    /// script's steps: its queries share one `eventually` limit, counted from
+    /// when the first of them starts, rather than taking one each.
+    pub corpus: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -344,6 +410,12 @@ pub enum Action {
     SourceExec {
         source: String,
         sql: Vec<String>,
+    },
+    Write {
+        source: String,
+        sql: Vec<String>,
+        mirror: String,
+        key: String,
     },
     Refresh {
         dataset: String,
@@ -519,7 +591,16 @@ pub struct TlpStep {
     pub avoid: crate::tlp::Avoid,
 }
 
-/// Random queries over nested subqueries, each compared with an oracle.
+/// Query transports available to random protocol comparisons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryProtocol {
+    Flight,
+    FlightSql,
+    Http,
+}
+
+/// Random queries compared with an oracle or across protocols.
 #[derive(Debug, Clone)]
 pub struct RandomQueriesStep {
     pub tables: Vec<String>,
@@ -527,7 +608,9 @@ pub struct RandomQueriesStep {
     pub queries: u64,
     /// How many relations deep a query nests.
     pub depth: u32,
-    pub oracle: String,
+    pub oracle: Option<String>,
+    /// Transports that must return the same rows for each generated query.
+    pub protocols: Vec<QueryProtocol>,
     /// Equalities two of the tables may be joined on, `a.x = b.y`.
     pub joins: Vec<String>,
     pub skip_columns: Vec<String>,
@@ -665,6 +748,8 @@ pub enum KillSignal {
 
 #[derive(Debug, Clone)]
 pub struct QueryStep {
+    /// Compare this query over these transports; omitted keeps the existing path.
+    pub protocols: Option<Vec<QueryProtocol>>,
     /// Names the answer, so a later query can expect `same-as` it.
     pub id: Option<String>,
     pub sql: String,
@@ -726,7 +811,8 @@ impl Script {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read script {}", path.display()))?;
         let base = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut script = Self::parse_in(&text, base)
+        let shared = SharedVariants::find(base)?;
+        let mut script = Self::parse_in(&text, base, &shared)
             .with_context(|| format!("Invalid script {}", path.display()))?;
         script.dir = base.to_path_buf();
         script.file_stem = path
@@ -763,20 +849,86 @@ impl Script {
             .with_context(|| format!("Failed to write {}", path.display()))
     }
 
-    #[cfg(test)]
-    pub fn parse(text: &str) -> Result<Self> {
-        Self::parse_in(text, Path::new("."))
+    /// Keeps only the matrix values and variants `selection` names, and
+    /// records what it left out. `false` when the script has none of a
+    /// requested key's values, or none of the variants: it is not run.
+    pub fn select(&mut self, selection: &Selection) -> bool {
+        if selection.is_empty() {
+            return true;
+        }
+        let all_runs = self.run_labels();
+        for (key, keep) in &selection.matrix {
+            let Some(values) = self.matrix.get_mut(key) else {
+                return false;
+            };
+            values.retain(|v| keep.contains(&matrix_value_text(v)));
+            if values.is_empty() {
+                return false;
+            }
+        }
+        if !selection.variants.is_empty() {
+            let dropped: Vec<String> = self
+                .variants
+                .keys()
+                .filter(|n| !selection.variants.contains(n))
+                .cloned()
+                .collect();
+            if dropped.len() == self.variants.len() {
+                return false;
+            }
+            for name in dropped {
+                self.variants.shift_remove(&name);
+                self.left_out.variants.insert(name);
+            }
+        }
+        let kept: std::collections::BTreeSet<String> = self.run_labels().into_iter().collect();
+        self.left_out.runs = all_runs.into_iter().filter(|r| !kept.contains(r)).collect();
+        true
     }
 
-    /// Parses a script whose `corpus` paths are relative to `base`.
-    pub fn parse_in(text: &str, base: &Path) -> Result<Self> {
+    /// The label of each matrix combination's run, `name[key=value,…]`.
+    pub fn run_labels(&self) -> Vec<String> {
+        matrix_combinations(&self.matrix)
+            .iter()
+            .map(|combo| self.run_label(combo))
+            .collect()
+    }
+
+    /// A matrix combination's run, as failures and the ledger name it:
+    /// `name[key=value,…]` with the keys in alphabetical order, or the name
+    /// alone without a matrix. The keys are sorted here rather than taken in
+    /// the map's order, which `serde_json`'s `preserve_order` feature changes
+    /// whenever a build also links a crate that enables it.
+    pub fn run_label(&self, combo: &Map<String, Value>) -> String {
+        let mut pairs: Vec<(&String, &Value)> = combo.iter().collect();
+        pairs.sort_unstable_by_key(|(k, _)| *k);
+        let combo_label = pairs
+            .iter()
+            .map(|(k, v)| format!("{k}={}", matrix_value_text(v)))
+            .collect::<Vec<_>>()
+            .join(",");
+        if combo_label.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}[{combo_label}]", self.name)
+        }
+    }
+
+    #[cfg(test)]
+    pub fn parse(text: &str) -> Result<Self> {
+        Self::parse_in(text, Path::new("."), &SharedVariants::default())
+    }
+
+    /// Parses a script whose `corpus` paths are relative to `base`, and
+    /// whose variants may name one of `shared`.
+    pub fn parse_in(text: &str, base: &Path, shared: &SharedVariants) -> Result<Self> {
         let mut root: Value = yaml::from_str(text)?;
         let steps = root
             .as_object_mut()
             .context("A script must be a YAML mapping")?
             .remove("steps")
             .context("A script needs `steps`")?;
-        expand_variant_presets(&mut root)?;
+        expand_shared_variants(&mut root, shared)?;
         let mut script: Script = serde_json::from_value(root)?;
         let Value::Array(steps) = steps else {
             bail!("`steps` must be a list");
@@ -786,7 +938,15 @@ impl Script {
             let context = || format!("step {}", i + 1);
             read_sql_files(&mut step, base).with_context(context)?;
             if let Some(corpus) = step.get("corpus") {
-                expanded.extend(expand_corpus(corpus, &step, base).with_context(context)?);
+                expanded.extend(
+                    expand_corpus(corpus, &step, base)
+                        .with_context(context)?
+                        .into_iter()
+                        .map(|query| Step {
+                            corpus: Some(i),
+                            ..query
+                        }),
+                );
             } else {
                 expanded.push(parse_step(0, step).with_context(context)?);
             }
@@ -872,36 +1032,103 @@ impl Script {
     }
 }
 
-/// A variant written as a word instead of a patch: `federated` (the spicepod
-/// as written), or `<engine>` / `<engine>-<mode>`, which accelerates every
-/// dataset with that engine (and mode).
-fn expand_variant_presets(root: &mut Value) -> Result<()> {
-    const ENGINES: &[&str] = &["arrow", "cayenne", "duckdb", "sqlite", "turso", "postgres"];
+/// Every combination of the matrix values, in declaration order.
+pub fn matrix_combinations(matrix: &IndexMap<String, Vec<Value>>) -> Vec<Map<String, Value>> {
+    matrix
+        .iter()
+        .fold(vec![Map::new()], |combos, (key, values)| {
+            combos
+                .into_iter()
+                .flat_map(|combo| {
+                    values.iter().map(move |v| {
+                        let mut next = combo.clone();
+                        next.insert(key.clone(), v.clone());
+                        next
+                    })
+                })
+                .collect()
+        })
+}
+
+/// A matrix value as run labels and `--matrix` spell it: a string as is,
+/// anything else as JSON.
+pub fn matrix_value_text(v: &Value) -> String {
+    v.as_str().map_or_else(|| v.to_string(), str::to_string)
+}
+
+/// The file defining the variants scripts name instead of writing the patch:
+/// the one in a script's directory, or else the nearest directory above it.
+pub const VARIANTS_FILE: &str = "variants.yaml";
+
+/// Variant patches by name, from a [`VARIANTS_FILE`].
+#[derive(Debug, Default)]
+pub struct SharedVariants {
+    /// The file they came from; `None` when no directory had one.
+    path: Option<std::path::PathBuf>,
+    patches: IndexMap<String, Value>,
+}
+
+impl SharedVariants {
+    /// The variants of the [`VARIANTS_FILE`] in `dir` or the nearest
+    /// directory above it; none when there is no such file.
+    pub fn find(dir: &Path) -> Result<Self> {
+        let dir = std::path::absolute(dir)?;
+        let Some(path) = dir
+            .ancestors()
+            .map(|d| d.join(VARIANTS_FILE))
+            .find(|p| p.is_file())
+        else {
+            return Ok(Self::default());
+        };
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        Self::parse(&text, path.clone()).with_context(|| format!("Invalid {}", path.display()))
+    }
+
+    fn parse(text: &str, path: std::path::PathBuf) -> Result<Self> {
+        let patches: IndexMap<String, Value> = yaml::from_str(text)?;
+        for (name, patch) in &patches {
+            ensure!(
+                patch.is_object(),
+                "variant '{name}' must be a patch (a mapping), as a script writes one"
+            );
+            VariantSpec::deserialize(patch)
+                .with_context(|| format!("variant '{name}' is not a valid patch"))?;
+        }
+        Ok(Self {
+            path: Some(path),
+            patches,
+        })
+    }
+}
+
+/// Replaces each variant written as a name instead of a patch with that
+/// variant's patch from `shared`.
+fn expand_shared_variants(root: &mut Value, shared: &SharedVariants) -> Result<()> {
     let Some(Value::Object(variants)) = root.get_mut("variants") else {
         return Ok(());
     };
     for (name, variant) in variants.iter_mut() {
-        let Value::String(preset) = variant else {
+        let Value::String(shared_name) = variant else {
             continue;
         };
-        let (engine, mode) = match preset.split_once('-') {
-            Some((engine, mode)) => (engine, Some(mode)),
-            None => (preset.as_str(), None),
+        let patch = match (&shared.path, shared.patches.get(shared_name.as_str())) {
+            (_, Some(patch)) => patch.clone(),
+            (Some(path), None) => bail!(
+                "variant '{name}': '{shared_name}' is not defined in {}; define it there, or write the patch (it defines {})",
+                path.display(),
+                shared
+                    .patches
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            (None, None) => bail!(
+                "variant '{name}': '{shared_name}' names a shared variant, but there is no {VARIANTS_FILE} in the script's directory or above it; write the patch"
+            ),
         };
-        *variant = if preset == "federated" {
-            Value::Object(Map::new())
-        } else {
-            ensure!(
-                ENGINES.contains(&engine) && mode.is_none_or(|m| m == "memory" || m == "file"),
-                "variant '{name}': '{preset}' is not a preset; use `federated`, an engine ({}), or `<engine>-memory` / `<engine>-file`, or write the patch",
-                ENGINES.join(", ")
-            );
-            let mut acceleration = serde_json::json!({ "enabled": true, "engine": engine });
-            if let Some(mode) = mode {
-                acceleration["mode"] = Value::String(mode.to_string());
-            }
-            serde_json::json!({ "datasets": { "*": { "acceleration": acceleration } } })
-        };
+        *variant = patch;
     }
     Ok(())
 }
@@ -1089,6 +1316,7 @@ const ACTIONS: &[&str] = &[
     "pause-source",
     "unpause-source",
     "source-exec",
+    "write",
     "refresh",
     "query",
     "spice-exec",
@@ -1136,7 +1364,12 @@ fn read_sql_files(step: &mut Value, base: &Path) -> Result<()> {
 fn step_key(name: &str, arg: &Value) -> String {
     let text = match arg {
         Value::String(s) => s.clone(),
-        other => other.to_string(),
+        other => {
+            // Ledger identities must not depend on serde_json's preserve_order feature.
+            let mut canonical = other.clone();
+            canonical.sort_all_objects();
+            canonical.to_string()
+        }
     };
     format!(
         "{name}: {}",
@@ -1258,6 +1491,26 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
         "stop-source" => Action::StopSource(string_arg(&arg, name)?),
         "pause-source" => Action::PauseSource(string_arg(&arg, name)?),
         "unpause-source" => Action::UnpauseSource(string_arg(&arg, name)?),
+        "write" => {
+            let Value::Object(m) = arg else {
+                bail!("`write` takes a mapping of source name to SQL");
+            };
+            let (source, sql) = single_entry(m, "`write` takes exactly one source")?;
+            let sql = match sql {
+                Value::String(s) => vec![s],
+                v => serde_json::from_value(v).context("SQL must be a string or a list")?,
+            };
+            let mirror = opts
+                .string("mirror")?
+                .context("`write` requires `mirror`: a postgres source")?;
+            ensure!(source != mirror, "a write target cannot be its own mirror");
+            Action::Write {
+                source,
+                sql,
+                mirror,
+                key: opts.string("key")?.unwrap_or_else(|| "id".into()),
+            }
+        }
         "source-exec" => {
             let Value::Object(m) = arg else {
                 bail!("`source-exec` takes a mapping of source name to SQL");
@@ -1303,7 +1556,18 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
             let sql = string_arg(&arg, name)?;
             let timing = opts.timing("a query")?;
             let (expect_error, error_contains) = opts.expected_error("expect-error")?;
+            let protocols = opts.protocols()?;
+            let parameters = opts.parse("parameters", "`parameters` is a list of values")?;
+            let session = opts.string("flight-session")?;
+            ensure!(
+                (parameters.is_none() && session.is_none())
+                    || protocols
+                        .as_deref()
+                        .is_none_or(|p| p == [QueryProtocol::FlightSql]),
+                "prepared queries support only `protocols: [flightsql]`"
+            );
             Action::Query(QueryStep {
+                protocols,
                 id: opts.string("id")?,
                 sql,
                 oracle_sql: opts.string("oracle-sql")?,
@@ -1315,8 +1579,8 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
                 show: opts.bool("show")?,
                 sent: opts.parse("sent", "invalid `sent`")?.unwrap_or_default(),
                 key: api_key_choice(opts.string("api-key")?),
-                parameters: opts.parse("parameters", "`parameters` is a list of values")?,
-                session: opts.string("flight-session")?,
+                parameters,
+                session,
             })
         }
         "spice-exec" => {
@@ -1463,7 +1727,7 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
         "random-queries" => {
             let mut inner = Opts::of_mapping(
                 arg,
-                "`random-queries` takes a mapping with `tables` and an `oracle`",
+                "`random-queries` takes a mapping with `tables` and `oracle` or `protocols`",
             )?;
             let tables = inner.list("tables")?;
             ensure!(!tables.is_empty(), "`random-queries` needs `tables`");
@@ -1471,9 +1735,14 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
             let queries = inner.whole_number("queries", 100)?;
             let depth =
                 u32::try_from(inner.whole_number("depth", 2)?).context("`depth` is too large")?;
-            let oracle = inner
-                .string("oracle")?
-                .context("`random-queries` needs an `oracle`")?;
+            let oracle = inner.string("oracle")?;
+            let protocols = inner
+                .protocols()?
+                .unwrap_or_else(|| vec![QueryProtocol::Flight]);
+            ensure!(
+                oracle.is_some() || protocols.len() >= 2,
+                "`random-queries` needs an `oracle` or at least two `protocols`"
+            );
             let joins = inner.list("joins")?;
             let skip_columns = inner.list("skip-columns")?;
             let avoid = avoid_list(&inner.list("avoid")?)?;
@@ -1484,6 +1753,7 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
                 queries,
                 depth,
                 oracle,
+                protocols,
                 joins,
                 skip_columns,
                 avoid,
@@ -1828,6 +2098,7 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
         only,
         except,
         when,
+        corpus: None,
     })
 }
 
@@ -1923,6 +2194,26 @@ impl Opts {
             .map(serde_json::from_value)
             .transpose()
             .with_context(|| error.to_string())
+    }
+
+    fn protocols(&mut self) -> Result<Option<Vec<QueryProtocol>>> {
+        let protocols: Option<Vec<QueryProtocol>> = self.parse(
+            "protocols",
+            "`protocols` is a list of flight, flightsql or http",
+        )?;
+        if let Some(protocols) = &protocols {
+            ensure!(
+                protocols.iter().any(|p| *p != QueryProtocol::Http),
+                "`protocols` needs flight or flightsql to supply the result schema"
+            );
+            for (i, protocol) in protocols.iter().enumerate() {
+                ensure!(
+                    !protocols[..i].contains(protocol),
+                    "`protocols` must not repeat {protocol:?}"
+                );
+            }
+        }
+        Ok(protocols)
     }
 
     /// A pattern or a list of patterns, compiled.
@@ -2034,6 +2325,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ledger_keys_sort_nested_objects() {
+        let arg: Value =
+            serde_json::from_str(r#"{"table":"t","seed":1,"options":{"z":2,"a":1},"queries":200}"#)
+                .expect("parse generator arguments");
+        assert_eq!(
+            step_key("tlp", &arg),
+            r#"tlp: {"options":{"a":1,"z":2},"queries":200,"seed":1,"table":"t"}"#,
+        );
+    }
+
+    #[test]
+    fn query_protocols_keep_prepared_statements_on_flightsql() {
+        let script = |options: &str| {
+            Script::parse(&format!(
+                "name: protocols\nspicepod: {{}}\nsteps:\n  - query: SELECT 1\n    {options}"
+            ))
+        };
+        let parsed = script("protocols: [flightsql, http]").expect("query protocols");
+        let Action::Query(query) = &parsed.steps[0].action else {
+            panic!("expected query");
+        };
+        assert_eq!(
+            query.protocols.as_deref(),
+            Some([QueryProtocol::FlightSql, QueryProtocol::Http].as_slice())
+        );
+        script("parameters: []\n    protocols: [flightsql]").expect("prepared Flight SQL");
+        script("parameters: []\n    protocols: [flightsql, http]")
+            .expect_err("prepared statements cannot compare HTTP");
+        script("protocols: [http]").expect_err("HTTP alone supplies no Arrow schema");
+    }
+
+    #[test]
+    fn random_query_protocols() {
+        let script = |options: &str| {
+            Script::parse(&format!(
+                "name: protocols\nspicepod: {{}}\nsteps:\n  - random-queries: {{ tables: [t], {options} }}"
+            ))
+        };
+        let legacy = script("oracle: ref").expect("legacy random query script");
+        let Action::RandomQueries(step) = &legacy.steps[0].action else {
+            panic!("expected random queries");
+        };
+        assert_eq!(step.protocols, [QueryProtocol::Flight]);
+        assert_eq!(step.oracle.as_deref(), Some("ref"));
+        let differential = script("protocols: [flightsql, http]")
+            .expect("protocol comparison needs no external oracle");
+        let Action::RandomQueries(step) = &differential.steps[0].action else {
+            panic!("expected random queries");
+        };
+        assert_eq!(
+            step.protocols,
+            [QueryProtocol::FlightSql, QueryProtocol::Http]
+        );
+        for options in [
+            "protocols: []",
+            "protocols: [http]",
+            "protocols: [flightsql]",
+            "protocols: [flightsql, flightsql]",
+            "protocols: [flightsql, adbc]",
+        ] {
+            assert!(script(options).is_err(), "must reject {options}");
+        }
+    }
+
+    #[test]
     fn parses_steps_with_sibling_options() {
         let script = Script::parse(
             r"
@@ -2076,11 +2432,36 @@ steps:
     }
 
     #[test]
-    fn variant_presets_expand_to_acceleration_patches() {
-        let script = Script::parse(
-            "name: p\nspicepod: {}\nvariants: { federated: federated, cayenne: cayenne-file, arrow: arrow }\nsteps: [ { start: {} } ]",
+    fn a_corpus_marks_its_queries_with_its_position() {
+        let suite = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/spicescript");
+        let script = Script::parse_in(
+            "name: c\nspicepod: {}\nsteps:\n  - start: {}\n  - corpus: corpus/layout.sql\n    eventually: 30s\n  - query: SELECT 1\n  - corpus: corpus/layout.sql\n",
+            &suite,
+            &SharedVariants::default(),
         )
-        .expect("presets parse");
+        .expect("script parses");
+        let corpora: Vec<Option<usize>> = script.steps.iter().map(|s| s.corpus).collect();
+        let first = corpora.iter().filter(|c| **c == Some(1)).count();
+        let second = corpora.iter().filter(|c| **c == Some(3)).count();
+        assert!(first > 1, "{corpora:?}");
+        assert_eq!(first, second, "{corpora:?}");
+        assert_eq!(corpora[0], None, "start");
+        assert_eq!(corpora[1 + first], None, "the query between the corpora");
+        assert_eq!(corpora.len(), 2 + 2 * first);
+    }
+
+    #[test]
+    fn shared_variants_come_from_the_nearest_variants_file() {
+        // A known-failing group's script uses the suite's file, two levels up.
+        let group = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/spicescript/known-failing/cayenne");
+        let shared = SharedVariants::find(&group).expect("the suite's variants file parses");
+        let script = Script::parse_in(
+            "name: p\nspicepod: {}\nvariants: { federated: federated, cayenne: cayenne-file, arrow: arrow, own: { env: { A: b } } }\nsteps: [ { start: {} } ]",
+            &group,
+            &shared,
+        )
+        .expect("shared variants parse");
         assert!(script.variants["federated"].datasets.is_empty());
         assert_eq!(
             script.variants["cayenne"].datasets["*"],
@@ -2090,14 +2471,95 @@ steps:
             script.variants["arrow"].datasets["*"],
             serde_json::json!({ "acceleration": { "enabled": true, "engine": "arrow" } })
         );
-        let err = Script::parse(
+        assert_eq!(script.variants["own"].env["A"], "b");
+        let err = Script::parse_in(
             "name: p\nspicepod: {}\nvariants: { x: cayenne-disk }\nsteps: [ { start: {} } ]",
+            &group,
+            &shared,
         )
-        .expect_err("an unknown mode is refused");
+        .expect_err("a name the file does not define is refused");
         assert!(
-            format!("{err:#}").contains("'cayenne-disk' is not a preset"),
+            format!("{err:#}").contains("'cayenne-disk' is not defined in")
+                && format!("{err:#}").contains("test/spicescript/variants.yaml"),
             "{err:#}"
         );
+        let err = Script::parse(
+            "name: p\nspicepod: {}\nvariants: { x: arrow }\nsteps: [ { start: {} } ]",
+        )
+        .expect_err("a name without a variants file is refused");
+        assert!(
+            format!("{err:#}").contains("there is no variants.yaml"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_selection_keeps_matrix_values_and_variants_and_records_the_rest() {
+        let text = "name: s\nmatrix: { src: [postgres, clickhouse], n: [1, 2] }\nvariants: { a: {}, b: {}, c: {} }\nspicepod: {}\nsteps: [ { start: {} } ]";
+        let mut script = Script::parse(text).expect("parses");
+        let selection = Selection {
+            matrix: BTreeMap::from([("src".to_string(), vec!["clickhouse".to_string()])]),
+            variants: vec!["b".into(), "c".into()],
+        };
+        assert!(script.select(&selection));
+        assert_eq!(
+            script.run_labels(),
+            ["s[n=1,src=clickhouse]", "s[n=2,src=clickhouse]"]
+        );
+        assert_eq!(script.variants.keys().collect::<Vec<_>>(), ["b", "c"]);
+        assert_eq!(
+            script.left_out.runs.iter().collect::<Vec<_>>(),
+            ["s[n=1,src=postgres]", "s[n=2,src=postgres]"]
+        );
+        assert!(script.left_out.covers("s[n=1,src=clickhouse]", "a"));
+        assert!(script.left_out.covers("s[n=1,src=clickhouse]", "trunk/a"));
+        assert!(script.left_out.covers("s[n=1,src=clickhouse]", "variants"));
+        assert!(script.left_out.covers("s[n=1,src=postgres]", "b"));
+        assert!(!script.left_out.covers("s[n=1,src=clickhouse]", "b"));
+        assert!(!script.left_out.covers("s[n=1,src=clickhouse]", ""));
+        // A number is selected as it prints. Labels list keys alphabetically.
+        let mut script = Script::parse(text).expect("parses");
+        let by_number = Selection {
+            matrix: BTreeMap::from([("n".to_string(), vec!["2".to_string()])]),
+            variants: Vec::new(),
+        };
+        assert!(script.select(&by_number));
+        assert_eq!(
+            script.run_labels(),
+            ["s[n=2,src=postgres]", "s[n=2,src=clickhouse]"]
+        );
+        assert!(!script.left_out.covers("s[n=2,src=postgres]", "variants"));
+        // A script without the key, value or any variant is not run.
+        for selection in [
+            Selection {
+                matrix: BTreeMap::from([("mode".to_string(), vec!["file".to_string()])]),
+                variants: Vec::new(),
+            },
+            Selection {
+                matrix: BTreeMap::from([("src".to_string(), vec!["mysql".to_string()])]),
+                variants: Vec::new(),
+            },
+            Selection {
+                matrix: BTreeMap::new(),
+                variants: vec!["d".into()],
+            },
+        ] {
+            let mut script = Script::parse(text).expect("parses");
+            assert!(!script.select(&selection), "{}", selection.describe());
+        }
+    }
+
+    #[test]
+    fn a_shared_variant_must_be_a_valid_patch() {
+        for (text, message) in [
+            ("a: cayenne-file\n", "variant 'a' must be a patch"),
+            ("a: { datasets: [] }\n", "variant 'a' is not a valid patch"),
+            ("a: { dataset: {} }\n", "variant 'a' is not a valid patch"),
+        ] {
+            let err = SharedVariants::parse(text, "variants.yaml".into())
+                .expect_err("an invalid entry is refused");
+            assert!(format!("{err:#}").contains(message), "{text}: {err:#}");
+        }
     }
 
     #[test]

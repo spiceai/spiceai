@@ -1,0 +1,66 @@
+# Known failing (#15548): a Cayenne caching acceleration does not
+# ask the origin when a filter on the response leaves a cached entry no rows,
+# and with caching_ttl: 1h a caching_max_items budget is not enforced for at
+# least 90 seconds (it is within 30 s when caching_ttl is 30s), and when it is
+# enforced it evicts the newest entry rather than the oldest.
+name: http-caching-known
+description: >
+  A filter on the response that leaves a cached entry no rows asks the origin
+  rather than answering empty; caching_max_items holds a Cayenne caching
+  acceleration to its budget within a minute whatever its caching_ttl; and
+  the entry it evicts is the oldest.
+
+sources:
+  api: { kind: mock-http }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: http-caching-known
+  datasets:
+    - from: ${sources.api.url}/v1
+      name: plain
+      params: &api { file_format: json, allowed_request_paths: '/*', max_retries: '0', response_cache_max_size_bytes: '0' }
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 1h } }
+    - from: ${sources.api.url}/v1
+      name: budget
+      params: *api
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 1h, caching_max_items: '1' } }
+    - from: ${sources.api.url}/v1
+      name: oldest_out
+      params: *api
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: caching, params: { caching_ttl: 30s, caching_stale_while_revalidate_ttl: 1h, caching_max_items: '2' } }
+
+steps:
+  - source-exec:
+      api:
+        - "{ path: /v1/a, headers: { content-type: application/json }, body: '[{\"k\": \"a\"}]' }"
+        - "{ path: /v1/b, headers: { content-type: application/json }, body: '[{\"k\": \"b\"}]' }"
+        - "{ path: /v1/c, headers: { content-type: application/json }, body: '[{\"k\": \"c\"}]' }"
+  - start: {}
+  - query: SELECT content FROM plain WHERE request_path = '/a'
+    expect: { rows: [['{"k":"a"}']] }
+  - query: SELECT content FROM plain WHERE request_path = '/a' AND content LIKE '%nope%'
+    expect-empty: true
+  - source-query: { api: count /v1/a }
+    expect: { rows: [['2']] }
+  - query: SELECT content FROM budget WHERE request_path = '/a'
+    expect: { rows: [['{"k":"a"}']] }
+  - query: SELECT content FROM budget WHERE request_path = '/b'
+    expect: { rows: [['{"k":"b"}']] }
+  - query: SELECT content FROM budget WHERE request_path = '/c'
+    expect: { rows: [['{"k":"c"}']] }
+  - query: SELECT count(*) AS n FROM budget
+    expect: { rows: [['1']] }
+    eventually: 60s
+  - query: SELECT content FROM oldest_out WHERE request_path = '/a'
+    expect: { rows: [['{"k":"a"}']] }
+  - query: SELECT content FROM oldest_out WHERE request_path = '/b'
+    expect: { rows: [['{"k":"b"}']] }
+  - query: SELECT content FROM oldest_out WHERE request_path = '/c'
+    expect: { rows: [['{"k":"c"}']] }
+  - query: SELECT count(*) AS n FROM oldest_out
+    expect: { rows: [['2']] }
+    eventually: 60s
+  - query: SELECT request_path FROM oldest_out
+    expect: { rows: [[/b], [/c]] }

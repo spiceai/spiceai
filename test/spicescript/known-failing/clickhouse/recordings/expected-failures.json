@@ -1,0 +1,402 @@
+{
+  "clickhouse-decimals": [
+    {
+      "run": "clickhouse-decimals",
+      "who": "cayenne",
+      "key": "query: SELECT id, d FROM wide ORDER BY id",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for wide: Acceleration not ready; loading initial data for wide",
+      "varies": true,
+      "group": "clickhouse",
+      "may-pass": true
+    },
+    {
+      "run": "clickhouse-decimals",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM wide WHERE d > 0 ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for wide: Acceleration not ready; loading initial data for wide",
+      "varies": true,
+      "group": "clickhouse",
+      "may-pass": true
+    },
+    {
+      "run": "clickhouse-decimals",
+      "who": "cayenne",
+      "key": "query: SELECT id, d FROM neg ORDER BY id",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for neg: Acceleration not ready; loading initial data for neg",
+      "varies": true,
+      "group": "clickhouse",
+      "may-pass": true
+    },
+    {
+      "run": "clickhouse-decimals",
+      "who": "cayenne",
+      "key": "query: SELECT id FROM neg WHERE d < -0.01 ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for neg: Acceleration not ready; loading initial data for neg",
+      "varies": true,
+      "group": "clickhouse",
+      "may-pass": true
+    },
+    {
+      "run": "clickhouse-decimals",
+      "who": "federated",
+      "key": "query: SELECT id, d FROM wide ORDER BY id",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Input/output error: `Other error: `Unsupported column type \\\"Decimal(38, 10)\\\".``\": code: 'Cl",
+      "varies": true,
+      "group": "clickhouse",
+      "may-pass": true
+    },
+    {
+      "run": "clickhouse-decimals",
+      "who": "federated",
+      "key": "query: SELECT id, d FROM neg ORDER BY id",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow: Failed to parse decimal string as BigInteger '0.-50000': invalid digit found in string\":",
+      "varies": true,
+      "group": "clickhouse",
+      "may-pass": true
+    }
+  ],
+  "clickhouse-literals-known": [
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE d IN (-999999999999.999999, -0.5) ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (69): DB::Exception: Number is too big to place in Decimal(18, 6)`\": code: 'Client specified an invalid argu",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE d IN (2.5, 999999999999.999999) ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (69): DB::Exception: Number is too big to place in Decimal(18, 6)`\": code: 'Client specified an invalid argu",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm = TIMESTAMP '1900-01-01 00:00:00' ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm < TIMESTAMP '1900-01-01 00:00:00' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: expected an empty answer, got 1 rows from Spice and 0 expected",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm >= TIMESTAMP '1900-01-01 00:00:00' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 7, actual: 6 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm <> TIMESTAMP '1900-01-01 00:00:00' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 6, actual: 7 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm = TIMESTAMP '1970-01-01 00:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '1970-01-01 00:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm < TIMESTAMP '1970-01-01 00:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '1970-01-01 00:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm >= TIMESTAMP '1970-01-01 00:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '1970-01-01 00:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm <> TIMESTAMP '1970-01-01 00:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '1970-01-01 00:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm = TIMESTAMP '2000-02-29 12:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2000-02-29 12:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm < TIMESTAMP '2000-02-29 12:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2000-02-29 12:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm >= TIMESTAMP '2000-02-29 12:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2000-02-29 12:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm <> TIMESTAMP '2000-02-29 12:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2000-02-29 12:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm = TIMESTAMP '2261-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2261-12-31 23:59:59.999999' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm < TIMESTAMP '2261-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2261-12-31 23:59:59.999999' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm >= TIMESTAMP '2261-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2261-12-31 23:59:59.999999' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm <> TIMESTAMP '2261-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2261-12-31 23:59:59.999999' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm IN (TIMESTAMP '1900-01-01 00:00:00', TIMESTAMP '1970-01-01 00:00:00.000001') ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '1970-01-01 00:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm BETWEEN TIMESTAMP '1900-01-01 00:00:00' AND TIMESTAMP '1970-01-01 00:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '1970-01-01 00:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm IN (TIMESTAMP '1970-01-01 00:00:00.000001', TIMESTAMP '2000-02-29 12:00:00.000001') ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '1970-01-01 00:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm BETWEEN TIMESTAMP '1970-01-01 00:00:00.000001' AND TIMESTAMP '2000-02-29 12:00:00.000001' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '1970-01-01 00:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm IN (TIMESTAMP '2000-02-29 12:00:00.000001', TIMESTAMP '2038-01-19 03:14:08') ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2000-02-29 12:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm BETWEEN TIMESTAMP '2000-02-29 12:00:00.000001' AND TIMESTAMP '2038-01-19 03:14:08' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2000-02-29 12:00:00.000001' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm IN (TIMESTAMP '2038-01-19 03:14:08', TIMESTAMP '2261-12-31 23:59:59.999999') ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2261-12-31 23:59:59.999999' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dtm BETWEEN TIMESTAMP '2038-01-19 03:14:08' AND TIMESTAMP '2261-12-31 23:59:59.999999' ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (6): DB::Exception: Cannot parse string '2261-12-31 23:59:59.999999' as DateTime: syntax error at position 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt = DATE '1900-01-01' ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt < DATE '1900-01-01' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: expected an empty answer, got 3 rows from Spice and 0 expected",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt >= DATE '1900-01-01' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 7, actual: 4 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt <> DATE '1900-01-01' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 6, actual: 7 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt = DATE '1969-12-31' ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 2",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt < DATE '1969-12-31' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1, actual: 3 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt >= DATE '1969-12-31' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 6, actual: 4 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt <> DATE '1969-12-31' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 5, actual: 7 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt = DATE '2299-12-31' ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 2",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt <> DATE '2299-12-31' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 5, actual: 7 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt IN (DATE '1900-01-01', DATE '1969-12-31') ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 3",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt BETWEEN DATE '1900-01-01' AND DATE '1969-12-31' ORDER BY id",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 3",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt IN (DATE '1969-12-31', DATE '2000-02-29') ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 2 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt BETWEEN DATE '1969-12-31' AND DATE '2000-02-29' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 2 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt IN (DATE '2000-02-29', DATE '2299-12-31') ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 2 }",
+      "group": "clickhouse"
+    },
+    {
+      "run": "clickhouse-literals-known",
+      "who": "federated",
+      "key": "query: SELECT id FROM c WHERE dt BETWEEN DATE '2000-02-29' AND DATE '2299-12-31' ORDER BY id",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 2 }",
+      "group": "clickhouse"
+    }
+  ]
+}

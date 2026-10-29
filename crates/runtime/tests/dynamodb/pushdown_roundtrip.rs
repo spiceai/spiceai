@@ -19,9 +19,8 @@ limitations under the License.
 //!
 //! The items hold what `DynamoDB` evaluates differently from SQL over the
 //! converted rows: one instant written in five offsets, one of them beyond
-//! the ±14 hours of any time zone, a timestamp finer than its column, numbers
-//! an integer column reads as NULL, decimals an `f64` rounds, maps a string
-//! column renders as JSON, a map key that contains a dot, a date padded with a
+//! the ±14 hours of any time zone, a timestamp finer than its column,
+//! decimals an `f64` rounds, maps a string column renders as JSON, a map key that contains a dot, a date padded with a
 //! space, and attribute names no bare placeholder can spell. A second table
 //! holds an item that unnesting reads a column from twice.
 
@@ -125,7 +124,6 @@ fn items() -> Vec<HashMap<String, AttributeValue>> {
             "k4",
             vec![
                 ("s", map),
-                ("n", n("5.5")),
                 ("f", n("0.10000000000000000001")),
                 ("ts", s("2024-09-03T08:34:56.155-04:00")),
                 ("d", s("2024-01-01T00:00:00")),
@@ -136,7 +134,6 @@ fn items() -> Vec<HashMap<String, AttributeValue>> {
             "k1",
             vec![
                 ("s", n("5")),
-                ("n", n("99999999999999999999")),
                 ("f", n("-1.5")),
                 ("b", s("true")),
                 ("ts", s("2024-09-04T00:00:00.000Z")),
@@ -398,7 +395,7 @@ fn cases() -> Vec<Case> {
         p("s IS NOT NULL"),
         e("s LIKE '%b'"),
         e("s ILIKE 'AL%'"),
-        // A column whose declared integer type reads 5.5 and 10^20 as NULL.
+        // A column declared as an integer.
         p("n = 5"),
         p("n <> 5"),
         p("n > 5"),
@@ -596,7 +593,6 @@ async fn dynamodb_pushdown_round_trips() -> Result<(), anyhow::Error> {
                 p("\"m.x.y\" = 1"),
                 p("\"m.x.y\" IN (1, 2)"),
                 p("\"m.x.y\" IS NOT NULL"),
-                // A number that is not an integer reads as NULL too.
                 Case::either("SELECT * FROM {t} WHERE \"m.x.y\" IS NULL ORDER BY pk, sk"),
                 p("\"m.x.y\" > 0"),
                 // A map-valued `m` is flattened away, which leaves `m` NULL.
@@ -621,6 +617,7 @@ async fn dynamodb_pushdown_round_trips() -> Result<(), anyhow::Error> {
             ];
             assert_round_trips(&rt, &shallow, &shallow_cases).await?;
             assert_every_path_is_read(&rt).await?;
+            assert_numbers_that_do_not_fit_fail_the_query(&rt, &client).await?;
             assert_colliding_paths_fail_unnesting(&rt, &client).await
         })
         .await
@@ -649,6 +646,42 @@ async fn assert_every_path_is_read(rt: &Arc<Runtime>) -> Result<(), anyhow::Erro
             found == every_item,
             "{sql} returned {found:?} instead of every item"
         );
+    }
+    Ok(())
+}
+
+/// A number that does not fit the integer column `n` fails the query rather
+/// than reading as NULL, whether or not a condition on `n` is pushed down. The
+/// items are written once the round trips are done, since they fail every
+/// query that reads them.
+async fn assert_numbers_that_do_not_fit_fail_the_query(
+    rt: &Arc<Runtime>,
+    client: &Client,
+) -> Result<(), anyhow::Error> {
+    for (sk, value) in [("fraction", "5.5"), ("beyond-i64", "99999999999999999999")] {
+        client
+            .put_item()
+            .table_name(TABLE)
+            .set_item(Some(item("u9", sk, vec![("n", n(value))])))
+            .send()
+            .await?;
+    }
+    for sql in [
+        "SELECT n FROM federated",
+        "SELECT n FROM federated WHERE n > 5",
+        "SELECT n FROM federated WHERE pk = 'u9'",
+    ] {
+        match run_query(rt, sql).await {
+            Ok(batches) => anyhow::bail!(
+                "{sql} returned {} rows instead of failing on a number that does not fit",
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>()
+            ),
+            Err(e) => anyhow::ensure!(
+                e.to_string()
+                    .contains("which does not fit its column type Int64"),
+                "{sql} failed other than on the number that does not fit: {e}"
+            ),
+        }
     }
     Ok(())
 }

@@ -30,7 +30,9 @@ mod compare;
 mod docker;
 mod generate;
 mod ledger;
+mod pki;
 mod reap;
+mod results;
 mod rqg;
 mod runner;
 mod script;
@@ -65,7 +67,7 @@ struct Cli {
     from: Option<PathBuf>,
 
     /// Run every instance as a cluster: a scheduler with one executor,
-    /// over node mTLS from the nearest `cluster-pki/` above the script.
+    /// over node mTLS with a CA and certificates generated for the run.
     #[arg(long)]
     cluster: bool,
 
@@ -117,6 +119,39 @@ struct Cli {
     /// otherwise wait out every limit in full.
     #[arg(long = "max-wait", value_name = "DURATION", value_parser = humantime::parse_duration)]
     max_wait: Option<std::time::Duration>,
+
+    /// Run only the matrix combinations with this value, as `KEY=VALUE` (a
+    /// key under the script's `matrix:`, such as `src=clickhouse`). Each
+    /// combination is a separate run with its own sources; this picks which
+    /// runs happen. Repeat a key for several values. Scripts without the key
+    /// or any of its values are skipped.
+    #[arg(long = "matrix", value_name = "KEY=VALUE", value_parser = parse_matrix_value)]
+    matrix: Vec<(String, String)>,
+
+    /// Run only this variant (a name under the script's `variants:`, such as
+    /// `cayenne`). Variants are the instances within each run, compared with
+    /// each other; this picks which of them start. Repeat it for several.
+    /// Scripts with none of them are skipped.
+    #[arg(long = "variant", value_name = "NAME", value_parser = parse_variant_name)]
+    variants: Vec<String>,
+
+    /// Write every script's outcome, passes included, to this JSON file,
+    /// rewritten as each script finishes.
+    #[arg(long, value_name = "PATH")]
+    results: Option<PathBuf>,
+
+    /// Leave the logs of each script with a failure, expected or not, in a
+    /// directory of its own under this one: the script and what the run
+    /// printed for it, each source container's output, and each instance's
+    /// `spiced.log` and spicepod, a directory per matrix combination.
+    #[arg(long = "log-capture", value_name = "DIR")]
+    log_capture: Option<PathBuf>,
+
+    /// The widest a value is drawn in a failure report's table, in
+    /// characters; a longer one keeps its start and end. 0 draws every value
+    /// whole.
+    #[arg(long = "cell-width", value_name = "CHARS", default_value_t = compare::DEFAULT_CELL_WIDTH)]
+    cell_width: usize,
 }
 
 #[tokio::main]
@@ -135,6 +170,7 @@ async fn run(cli: Cli) -> Result<bool> {
     // Retried comparisons would print every intermediate mismatch; the runner
     // reports the last one with both answers.
     result_compare::set_print_diagnostics(false);
+    compare::set_cell_width(cli.cell_width);
     let targets = targets(&cli.spiced)?;
     let mut paths = script_paths(&cli.scripts)?;
     // Parse everything first, so a typo in the last script fails before the
@@ -143,6 +179,40 @@ async fn run(cli: Cli) -> Result<bool> {
         .iter()
         .map(|p| script::Script::load(p, cli.record_durations || cli.check))
         .collect::<Result<Vec<_>>>()?;
+    let mut selection = script::Selection::default();
+    for (key, value) in &cli.matrix {
+        selection
+            .matrix
+            .entry(key.clone())
+            .or_default()
+            .push(value.clone());
+    }
+    selection.variants.clone_from(&cli.variants);
+    if !selection.is_empty() {
+        anyhow::ensure!(
+            !cli.record_durations,
+            "--record-durations records whole scripts' run times; run it without {}",
+            selection.describe()
+        );
+        let before = scripts.len();
+        (paths, scripts) = paths
+            .into_iter()
+            .zip(scripts)
+            .filter_map(|(path, mut script)| script.select(&selection).then_some((path, script)))
+            .unzip();
+        anyhow::ensure!(
+            !scripts.is_empty(),
+            "No script has {}",
+            selection.describe()
+        );
+        if scripts.len() < before {
+            println!(
+                "{} of {before} scripts have {}; running those",
+                scripts.len(),
+                selection.describe()
+            );
+        }
+    }
     if let Some((index, count)) = cli.partition {
         let share = partition(&scripts, count);
         (paths, scripts) = paths
@@ -172,6 +242,8 @@ async fn run(cli: Cli) -> Result<bool> {
             from.display()
         );
     }
+    // A fresh CA and node certificates for this run's cluster instances.
+    let pki = pki::generate(&work_dir.join(format!("pki-{}", std::process::id())))?;
     let options = runner::Options {
         targets,
         from: cli.from,
@@ -179,6 +251,12 @@ async fn run(cli: Cli) -> Result<bool> {
         work_dir,
         keep: cli.keep,
         spice_cli: cli.spice,
+        pki,
+        log_capture: cli
+            .log_capture
+            .as_deref()
+            .map(std::path::absolute)
+            .transpose()?,
     };
     let mut ledger = ledger::Ledger::load(&scripts)?;
     let mut passed = 0;
@@ -193,33 +271,73 @@ async fn run(cli: Cli) -> Result<bool> {
     // Longest first, by recorded duration (a script without one counts as
     // long): each asks for slots in this order, and slots are granted in the
     // order asked.
-    let mut order: Vec<&script::Script> = scripts.iter().collect();
-    order.sort_by_key(|s| std::cmp::Reverse(s.duration.unwrap_or(std::time::Duration::MAX)));
+    let mut order: Vec<(&PathBuf, &script::Script)> = paths.iter().zip(&scripts).collect();
+    order.sort_by_key(|(_, s)| std::cmp::Reverse(s.duration.unwrap_or(std::time::Duration::MAX)));
     let slots = runner::Slots::new(cli.jobs);
     let mut running = futures::stream::FuturesUnordered::new();
-    for script in order {
+    for (path, script) in order {
         let (options, slots) = (&options, &slots);
         running.push(async move {
             let started = std::time::Instant::now();
             let (report, out) = runner::run_script_buffered(script, options, slots).await;
-            (script, report, out, started.elapsed())
+            (path, script, report, out, started.elapsed())
         });
     }
-    while let Some((script, report, out, waited)) = futures::StreamExt::next(&mut running).await {
+    let mut results = results::Results {
+        partition: cli.partition.map(|(i, n)| format!("{i}/{n}")),
+        complete: false,
+        seconds: 0.0,
+        scripts: Vec::new(),
+    };
+    while let Some((path, script, report, out, waited)) =
+        futures::StreamExt::next(&mut running).await
+    {
         print!("{out}");
         let report = report?;
-        // From its first slot, not from when it started waiting for one.
-        let took = report.started.map_or(waited, |t| t.elapsed());
+        // A log that cannot be saved is a warning, as in the runner: the
+        // script's own outcome still counts, and the other scripts still run.
+        if let Some(root) = &options.log_capture
+            && !report.failures.is_empty()
+            && let Err(e) = capture_script(
+                &runner::capture_dir(root, script),
+                path,
+                &out,
+                &report.failures,
+            )
+        {
+            println!("warning: {e:#}");
+        }
+        // The time it held slots, not the time it waited for them.
+        let took = if report.ran.is_zero() {
+            waited
+        } else {
+            report.ran
+        };
         done += 1;
-        let problems = if cli.record_failures {
+        let (problems, verdict): (Vec<String>, _) = if cli.record_failures {
             ledger.record(script, &report.failures);
-            report.failures.iter().map(ToString::to_string).collect()
+            (
+                report.failures.iter().map(ToString::to_string).collect(),
+                None,
+            )
         } else {
             let verdict = ledger.judge(script, &report.failures);
             expected += verdict.expected;
             notes.extend(verdict.notes.iter().cloned());
-            verdict.problems()
+            (verdict.problems(), Some(verdict))
         };
+        if let Some(file) = &cli.results {
+            results.scripts.push(results::ScriptResult::new(
+                script,
+                path,
+                &report,
+                took,
+                verdict.as_ref(),
+                &problems,
+            ));
+            results.seconds = run_started.elapsed().as_secs_f64();
+            results.write(file)?;
+        }
         let shown_expected = if cli.record_failures {
             0
         } else {
@@ -281,6 +399,12 @@ async fn run(cli: Cli) -> Result<bool> {
         }
         println!();
     }
+    if let Some(file) = &cli.results {
+        results.complete = true;
+        results.seconds = run_started.elapsed().as_secs_f64();
+        results.write(file)?;
+        println!("results: {}", file.display());
+    }
     println!(
         "{} scripts: {passed} checks passed, {} failed{}, in {:.1}s",
         scripts.len(),
@@ -289,6 +413,29 @@ async fn run(cli: Cli) -> Result<bool> {
         run_started.elapsed().as_secs_f64()
     );
     Ok(failures.is_empty() || cli.record_failures)
+}
+
+/// `--log-capture`'s files for a whole script, beside its combinations'
+/// logs: the script as run, and what the run printed for it, with each
+/// failure in full.
+fn capture_script(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    out: &str,
+    failures: &[runner::Failure],
+) -> Result<()> {
+    use std::fmt::Write as _;
+    std::fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
+    std::fs::copy(path, dir.join("script.yaml"))
+        .with_context(|| format!("Failed to copy {} into {}", path.display(), dir.display()))?;
+    // The progress lines name each failure; what went wrong is printed with
+    // the run's summary, so it is added here as the summary prints it.
+    let mut text = out.to_string();
+    for failure in failures {
+        let _ = write!(text, "\nFAILED {failure}\n");
+    }
+    std::fs::write(dir.join("output.txt"), text)
+        .with_context(|| format!("Failed to write {}", dir.join("output.txt").display()))
 }
 
 /// The scripts named on the command line, directories expanded.
@@ -350,6 +497,24 @@ fn expected_failures_note(expected: usize) -> String {
     }
 }
 
+fn parse_matrix_value(text: &str) -> Result<(String, String), String> {
+    match text.split_once('=') {
+        Some((key, value)) if !key.is_empty() => Ok((key.to_string(), value.to_string())),
+        _ => Err(format!(
+            "`{text}` is not KEY=VALUE, a key under the script's `matrix:`; to run one of its `variants:`, use --variant {text}"
+        )),
+    }
+}
+
+fn parse_variant_name(text: &str) -> Result<String, String> {
+    if text.contains('=') {
+        return Err(format!(
+            "`{text}` is a matrix value, not a variant name; to run the combinations with it, use --matrix {text}"
+        ));
+    }
+    Ok(text.to_string())
+}
+
 fn parse_partition(text: &str) -> Result<(usize, usize), String> {
     let parsed = text
         .split_once('/')
@@ -384,11 +549,13 @@ fn partition(scripts: &[script::Script], count: usize) -> Vec<usize> {
     share
 }
 
-/// The scripts directly in a directory, in name order.
+/// The scripts directly in a directory, in name order: every YAML file but
+/// the shared variants.
 fn scripts_in(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "yaml" || x == "yml"))
+        .filter(|p| p.file_name().is_none_or(|n| n != script::VARIANTS_FILE))
         .collect();
     entries.sort();
     Ok(entries)
@@ -447,6 +614,23 @@ mod tests {
             parse_partition("0/3").is_err()
                 && parse_partition("4/3").is_err()
                 && parse_partition("x").is_err()
+        );
+    }
+
+    #[test]
+    fn a_selection_meant_for_the_other_flag_names_it() {
+        assert_eq!(
+            parse_matrix_value("src=clickhouse"),
+            Ok(("src".to_string(), "clickhouse".to_string()))
+        );
+        assert_eq!(
+            parse_matrix_value("cayenne"),
+            Err("`cayenne` is not KEY=VALUE, a key under the script's `matrix:`; to run one of its `variants:`, use --variant cayenne".to_string())
+        );
+        assert_eq!(parse_variant_name("cayenne"), Ok("cayenne".to_string()));
+        assert_eq!(
+            parse_variant_name("src=clickhouse"),
+            Err("`src=clickhouse` is a matrix value, not a variant name; to run the combinations with it, use --matrix src=clickhouse".to_string())
         );
     }
 }

@@ -27,9 +27,9 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
+use data_components::mysql::pool::{self, PoolParams, PoolSettings};
 use data_components::mysql::provider::MySQLCatalogProvider;
 use datafusion_table_providers::mysql::MySQLTableFactory;
-use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
 use runtime_datafusion::function_support::deny_spice_functions_for_mysql_table_providers;
 use std::any::Any;
 use std::sync::Arc;
@@ -51,6 +51,9 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("db").description("The MySQL database name."),
     ParameterSpec::component("sslmode").description("The SSL mode for the connection."),
     ParameterSpec::component("sslrootcert").description("The path to the SSL root certificate."),
+    ParameterSpec::component("connection_max_lifetime")
+        .description(pool::CONNECTION_MAX_LIFETIME_DESCRIPTION)
+        .default("5m"),
 ];
 
 /// A catalog connector for `MySQL`, providing access to schemas and tables
@@ -80,13 +83,38 @@ impl CatalogConnector for MySQLCatalog {
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let connector_component = ConnectorComponent::from(catalog);
 
-        let pool = MySQLConnectionPool::new(self.params.parameters.to_secret_map())
-            .await
-            .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                connector: PREFIX.to_string(),
-                connector_component: connector_component.clone(),
-                source: Box::new(e),
-            })?;
+        // The catalog takes no pool size parameters, so its pool keeps the size its connection
+        // parameters give; only the connection lifetime is resolved here.
+        let pool_settings = PoolSettings::resolve(
+            PoolParams {
+                connection_max_lifetime: self.params.user_set("connection_max_lifetime"),
+                connection_string: self
+                    .params
+                    .parameters
+                    .get("connection_string")
+                    .expose()
+                    .ok(),
+                ..PoolParams::default()
+            },
+            None,
+        )
+        .map_err(|error| super::Error::InvalidConfigurationNoSource {
+            connector: PREFIX.to_string(),
+            connector_component: connector_component.clone(),
+            message: error.to_string(),
+        })?;
+
+        let pool = pool::connect(
+            self.params.parameters.to_secret_map(),
+            pool_settings,
+            format!("catalog '{}'", catalog.name),
+        )
+        .await
+        .map_err(|e| super::Error::UnableToGetCatalogProvider {
+            connector: PREFIX.to_string(),
+            connector_component: connector_component.clone(),
+            source: Box::new(e),
+        })?;
 
         let pool = Arc::new(pool);
         // Install the Spice function deny-list so federation evaluates locally

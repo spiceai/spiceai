@@ -32,6 +32,7 @@ const LIBRARIES: &[&str] = &[
     "cpp-httplib",
     "llama",
     "ggml",
+    "ggml-rpc",
     "ggml-cuda",
     "ggml-metal",
     "ggml-cpu",
@@ -46,21 +47,31 @@ fn main() {
     let release = env::var("DEP_LLAMA_CPP_SRC_RELEASE").unwrap_or_default();
     let cuda = env::var_os("CARGO_FEATURE_CUDA").is_some();
     let metal = env::var_os("CARGO_FEATURE_METAL").is_some();
+    // RDMA for the links between the nodes of a split model links libibverbs, which most
+    // hosts lack, so only a build asked for it gets it.
+    let rdma = env::var_os("LLAMA_CPP_RPC_RDMA").is_some_and(|v| v == "1");
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("Cargo sets CARGO_CFG_TARGET_OS");
     println!("cargo:rerun-if-changed=shim");
+    // A pinned git source never changes, but a local `[patch]` of llama-cpp-src does, and cargo
+    // would keep the libraries built from its older sources.
+    for dir in ["src", "include", "common", "ggml/src", "ggml/include"] {
+        println!("cargo:rerun-if-changed={}", root.join(dir).display());
+    }
     println!("cargo:rerun-if-env-changed=CMAKE_CUDA_ARCHITECTURES");
     println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
+    println!("cargo:rerun-if-env-changed=LLAMA_CPP_RPC_RDMA");
     println!("cargo:rustc-env=LLAMA_CPP_RELEASE={release}");
 
-    let build = cmake_build(&root, cuda, metal);
+    let rdma = rdma && target_os == "linux";
+    let build = cmake_build(&root, cuda, metal, rdma);
     compile_shim(&root);
     link_libraries(&build, cuda, metal);
-    link_system(&target_os, cuda, metal);
+    link_system(&target_os, cuda, metal, rdma);
     bindings(&root);
 }
 
 /// Configures and builds llama.cpp's common library and everything it links.
-fn cmake_build(root: &Path, cuda: bool, metal: bool) -> PathBuf {
+fn cmake_build(root: &Path, cuda: bool, metal: bool, rdma: bool) -> PathBuf {
     let on_off = |on: bool| if on { "ON" } else { "OFF" };
     let mut config = cmake::Config::new(root);
     // A debug llama.cpp decodes many times slower, so it is optimized in every profile.
@@ -87,7 +98,11 @@ fn cmake_build(root: &Path, cuda: bool, metal: bool) -> PathBuf {
         // machine has it, which would make the binary need it too.
         .define("GGML_CUDA_NCCL", "OFF")
         .define("GGML_METAL", on_off(metal))
-        .define("GGML_METAL_EMBED_LIBRARY", on_off(metal));
+        .define("GGML_METAL_EMBED_LIBRARY", on_off(metal))
+        // The RPC backend joins the GPUs of several nodes into one model: the head reaches
+        // each other node's GPU through it, and those nodes serve theirs with it.
+        .define("GGML_RPC", "ON")
+        .define("GGML_RPC_RDMA", on_off(rdma));
     if cuda {
         let arch = env::var("CMAKE_CUDA_ARCHITECTURES")
             .ok()
@@ -143,15 +158,18 @@ fn index_libraries(dir: &Path, found: &mut BTreeMap<String, PathBuf>) {
     }
 }
 
-/// Compiles the C interfaces to llama.cpp's C++ speculative decoding and JSON-schema
-/// conversion. They go on the link line before the libraries they call.
+/// Compiles the C interfaces to llama.cpp's C++ speculative decoding, JSON-schema conversion
+/// and architecture table. They go on the link line before the libraries they call.
 fn compile_shim(root: &Path) {
     cc::Build::new()
         .cpp(true)
         .std("c++17")
         .file("shim/spice_mtp.cpp")
         .file("shim/spice_grammar.cpp")
+        .file("shim/spice_split.cpp")
         .include("shim")
+        // `spice_split.cpp` reads llama.cpp's internal architecture table.
+        .include(root.join("src"))
         .include(root.join("include"))
         .include(root.join("common"))
         .include(root.join("ggml/include"))
@@ -162,7 +180,7 @@ fn compile_shim(root: &Path) {
 }
 
 /// The system libraries llama.cpp's static libraries need, after them on the link line.
-fn link_system(target_os: &str, cuda: bool, metal: bool) {
+fn link_system(target_os: &str, cuda: bool, metal: bool, rdma: bool) {
     if cuda {
         let cuda_root = env::var("CUDA_PATH")
             .or_else(|_| env::var("CUDA_HOME"))
@@ -181,6 +199,9 @@ fn link_system(target_os: &str, cuda: bool, metal: bool) {
         for lib in ["cudart", "cublas", "cublasLt", "cuda"] {
             println!("cargo:rustc-link-lib=dylib={lib}");
         }
+    }
+    if rdma {
+        println!("cargo:rustc-link-lib=dylib=ibverbs");
     }
     if metal {
         for framework in ["Foundation", "Metal", "MetalKit"] {
@@ -210,17 +231,27 @@ fn bindings(root: &Path) {
         .clang_arg(format!("-I{}", root.join("include").display()))
         .clang_arg(format!("-I{}", root.join("ggml/include").display()))
         .allowlist_function("llama_.*")
+        .allowlist_function("ggml_backend_rpc_.*")
+        .allowlist_function("ggml_backend_(reg|dev)_.*")
+        .allowlist_function("ggml_backend_load_all")
         .allowlist_function("spice_mtp_.*")
+        .allowlist_function("spice_dflash_kind")
+        .allowlist_function("spice_arch_splits_by_tensor")
         .allowlist_function("spice_json_schema_to_grammar")
         .allowlist_function("spice_string_free")
         .allowlist_type("llama_.*")
         .allowlist_type("spice_mtp.*")
+        .allowlist_type("spice_draft_kind")
         .allowlist_type("ggml_log_level")
+        .allowlist_type("ggml_backend_dev_type")
         .allowlist_var("LLAMA_.*")
         // llama.cpp is C++ behind a C API, and an exception it does not catch would unwind
         // into Rust, which only an unwinding ABI allows. Rust then aborts where it would
         // catch it, as llama.cpp's own unhandled exception would.
         .override_abi(bindgen::Abi::CUnwind, "(llama|spice)_.*")
+        // `FILE` only crosses the API as a pointer. glibc declares fields of its `_IO_FILE`
+        // as bitfields, and bindgen's accessors for those fail the lint gate.
+        .opaque_type("_IO_FILE")
         .layout_tests(false)
         .generate()
         .expect("bindgen generates the llama.cpp bindings")

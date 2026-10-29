@@ -199,6 +199,103 @@ async fn downloads_into_the_layout_huggingface_hub_reads() {
     assert!(!repo.join("snapshots").join(C1).join("onnx").exists());
 }
 
+/// Every directory the cache creates under its root is `0755` and every file in it `0644`,
+/// whatever the umask Spice runs under, so a cache one account fills can be read by another
+/// and written only by its owner. The root, and `HF_HOME` above it, are `0755` narrowed by the
+/// umask when the cache creates them: their mode decides who else can read the cache.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_cache_is_0755_and_0644_under_its_root_whatever_the_umask() {
+    use nix::sys::stat::{Mode, umask};
+
+    crate::require_process_per_test("it sets the process umask");
+    let files = model_files();
+    let (config, onnx) = (files[0].1.etag(), files[3].1.etag());
+    let expected = |root_mode: &str| {
+        let mut expected = vec![
+            (".".to_string(), root_mode),
+            ("hub".to_string(), root_mode),
+            ("hub/.locks".to_string(), "0755"),
+            ("hub/.locks/models--o--m".to_string(), "0755"),
+            (format!("hub/.locks/models--o--m/{config}.lock"), "0644"),
+            (format!("hub/.locks/models--o--m/{onnx}.lock"), "0644"),
+            ("hub/models--o--m".to_string(), "0755"),
+            ("hub/models--o--m/blobs".to_string(), "0755"),
+            (format!("hub/models--o--m/blobs/{config}"), "0644"),
+            (format!("hub/models--o--m/blobs/{onnx}"), "0644"),
+            ("hub/models--o--m/refs".to_string(), "0755"),
+            ("hub/models--o--m/refs/main".to_string(), "0644"),
+            ("hub/models--o--m/snapshots".to_string(), "0755"),
+            (format!("hub/models--o--m/snapshots/{C1}"), "0755"),
+            (format!("hub/models--o--m/snapshots/{C1}/onnx"), "0755"),
+        ];
+        expected.sort();
+        expected
+            .into_iter()
+            .map(|(path, mode)| (path, mode.to_string()))
+            .collect::<Vec<_>>()
+    };
+
+    let mut caches = vec![];
+    for (name, mask) in [
+        ("077", Mode::S_IRWXG | Mode::S_IRWXO),
+        ("000", Mode::empty()),
+    ] {
+        let fixture = Fixture::new().await;
+        fixture.mock.commit(MODEL, C1, files.clone());
+        fixture.mock.branch(MODEL, "main", C1);
+
+        let previous = umask(mask);
+        let downloaded = fixture
+            .open(None, &[])
+            .await
+            .download(&["config.json", "onnx/model.onnx"])
+            .await;
+        umask(previous);
+        downloaded.expect("the files download");
+        caches.push((name, modes_under(&fixture.home.path().join("hf"))));
+    }
+    assert_eq!(
+        caches,
+        vec![("077", expected("0700")), ("000", expected("0755"))],
+        "each umask's cache, as (path, mode)"
+    );
+}
+
+/// Every entry under `root` but symlinks, as its path relative to `root` (`.` for `root`
+/// itself) and its permission bits in octal, in path order.
+#[cfg(unix)]
+fn modes_under(root: &Path) -> Vec<(String, String)> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut entries = vec![];
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&path).expect("an entry of the cache");
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            pending.extend(
+                std::fs::read_dir(&path)
+                    .expect("a directory of the cache")
+                    .map(|entry| entry.expect("a directory entry").path()),
+            );
+        }
+        let relative = path.strip_prefix(root).expect("a path under the root");
+        let name = if relative.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            relative.display().to_string()
+        };
+        entries.push((
+            name,
+            format!("{:04o}", metadata.permissions().mode() & 0o777),
+        ));
+    }
+    entries.sort();
+    entries
+}
+
 #[tokio::test]
 async fn a_second_load_downloads_nothing() {
     let fixture = Fixture::new().await;
@@ -915,6 +1012,7 @@ async fn a_connection_failure_keeps_its_kind_through_the_revision_cache() {
             huggingface_hub::HubConfig {
                 endpoint: url::Url::parse(&format!("http://{closed}")).expect("a URL"),
                 token: None,
+                token_scope: huggingface_hub::settings::TokenScope::Any,
             },
             tokio::runtime::Handle::current(),
         )

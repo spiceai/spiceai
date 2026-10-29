@@ -117,6 +117,7 @@ pub mod changes;
 #[cfg(test)]
 mod deletion;
 mod latest_by_time;
+mod slow_refresh;
 
 /// The largest UTC offset a time may carry (+14:00), in nanoseconds.
 const MAX_UTC_OFFSET_NANOS: u128 = 14 * 3_600 * 1_000_000_000;
@@ -526,6 +527,7 @@ impl RefreshTaskBuilder {
             runtime_status: self.runtime_status,
             dataset_name: self.dataset_name,
             dataset_metric_labels,
+            refresh_durations: slow_refresh::RefreshDurations::default(),
             federated: self.federated,
             federated_source: self.federated_source,
             accelerator: self.accelerator,
@@ -610,6 +612,9 @@ pub struct RefreshTask {
     /// Prebuilt per-dataset metric labels (see [`DatasetMetricLabels`]), reused
     /// by the hot metric-record sites instead of re-allocating the label.
     dataset_metric_labels: DatasetMetricLabels,
+    /// How long recent successful refreshes took, which a running refresh is compared
+    /// with to report one that is far slower.
+    refresh_durations: slow_refresh::RefreshDurations,
     federated: Arc<FederatedTable>,
     federated_source: Option<String>,
     accelerator: Arc<dyn TableProvider>,
@@ -756,7 +761,8 @@ impl RefreshTask {
                     Arc::new(ProviderChangeSinkBackend::new(context)),
                     util::session_state::session_context(),
                     &Handle::current(),
-                    changes::cdc_config().prefetch_buffer,
+                    changes::dataset_cdc_config(self.cdc_param_overrides.as_deref())
+                        .prefetch_buffer,
                 )
             })
             .await
@@ -802,13 +808,12 @@ impl RefreshTask {
     /// Returns an error if the source cannot be queried, the refresh SQL fails to
     /// plan or execute, or the resulting data cannot be written to the accelerator.
     pub async fn run(&self, refresh: Refresh) -> super::Result<RefreshOutcome> {
-        // Wait for a source not reached yet before taking a refresh slot: the wait lasts
-        // as long as the source is down, and an accelerated view's source is the tables
-        // it reads, whose own refreshes need a slot.
-        let _ = self.federated.try_wait_table_provider().await;
-
-        // Limit parallel refreshes via a semaphore
-        let _permit = self.semaphore.acquire().await;
+        // Source-consuming refreshes wait before taking a refresh slot: an accelerated
+        // view's source is the tables it reads, whose refreshes also need a slot.
+        // Snapshot refreshes read their store independently of the federated source.
+        if refresh.mode != RefreshMode::Snapshot {
+            let _ = self.federated.try_wait_table_provider().await;
+        }
 
         let max_retries = if refresh.retry_enabled {
             refresh.retry_max_attempts
@@ -832,6 +837,9 @@ impl RefreshTask {
             .last()
             .unwrap_or_else(|| unreachable!("There is always at least one span"));
         let result = retry(retry_strategy, || async {
+            // Limit parallel refreshes via a semaphore. The permit covers one attempt, so a
+            // refresh waiting out a retry backoff does not hold back other datasets.
+            let _permit = self.semaphore.acquire().await;
             match self.run_once(&refresh).await {
                 Ok(outcome) => Ok(outcome),
                 Err(retry_err) => {
@@ -871,6 +879,14 @@ impl RefreshTask {
         &self,
         refresh: &Refresh,
     ) -> Result<RefreshOutcome, RetryError<super::Error>> {
+        // Snapshot polling owns its status and metrics and reads no source, including
+        // the timestamp queries used to measure a source-consuming refresh's lag.
+        if refresh.mode == RefreshMode::Snapshot {
+            let labels = self.get_dataset_label_sets(&refresh.mode).await;
+            let _timer = MultiTimeMeasurement::new(&metrics::REFRESH_DURATION_MS, &labels);
+            return self.refresh_from_snapshot(refresh, &labels).await;
+        }
+
         // A refresh whose source has not been reached yet waits for it before it runs,
         // and reports `Refreshing` only then: while the source cannot be reached, the
         // dataset is served from its acceleration and reports `Error` with the cause.
@@ -974,6 +990,10 @@ impl RefreshTask {
         );
 
         let start_time = SystemTime::now();
+        let started = Instant::now();
+        // Warns if this refresh runs far longer than the dataset's recent ones did. Dropped,
+        // and so cancelled, when the refresh returns.
+        let _slow_refresh_watch = self.watch_for_slow_refresh(refresh.mode);
 
         // The source commit an append refresh loads, saved only once its rows are
         // written: a refresh that fails or is cancelled must be read again.
@@ -1025,12 +1045,7 @@ impl RefreshTask {
                     .map(|()| RefreshOutcome::Refreshed);
             }
             RefreshMode::Snapshot => {
-                // For snapshot mode, poll the snapshot store for a newer snapshot
-                // and reload the accelerator from it. The federated source is
-                // never queried for refreshes in this mode.
-                return self
-                    .refresh_from_snapshot(refresh, &dataset_metrics_label_sets)
-                    .await;
+                unreachable!("Snapshot refreshes return before reading the source")
             }
         };
 
@@ -1098,6 +1113,9 @@ impl RefreshTask {
             return Err(e);
         }
 
+        self.refresh_durations
+            .record(refresh.mode, started.elapsed());
+
         // Only record metrics if a refresh was successful
         self.handle_metrics(
             &dataset_metrics_label_sets,
@@ -1117,6 +1135,24 @@ impl RefreshTask {
         }
 
         Ok(RefreshOutcome::Refreshed)
+    }
+
+    /// Starts the watch that reports this refresh if it runs far longer than the dataset's
+    /// recent refreshes in `mode` did; `None` until there are enough of them.
+    fn watch_for_slow_refresh(
+        &self,
+        mode: RefreshMode,
+    ) -> Option<tokio_util::task::AbortOnDropHandle<()>> {
+        if is_spice_internal_dataset(&self.dataset_name) {
+            return None;
+        }
+        let slow = self.refresh_durations.slow_after(mode)?;
+        Some(slow_refresh::watch(
+            self.component_type(),
+            self.dataset_name.clone(),
+            mode,
+            slow,
+        ))
     }
 
     /// Ends a refresh that found nothing to fetch: the skip is counted, the dataset is

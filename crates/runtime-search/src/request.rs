@@ -25,11 +25,13 @@ use datafusion::sql::sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Token;
+use runtime_query_engine::sql_depth_guard::ensure_filter_within_depth_limit;
 use schemars::JsonSchema;
 use search::pipeline::valid_keywords;
 use serde::{Deserialize, Serialize};
+use snafu::ResultExt;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, WhereConditionTooDeepSnafu};
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -234,6 +236,9 @@ impl SearchRequest {
         if next_token != Token::EOF {
             return Err(Error::InvalidWhereCondition { where_cond });
         }
+
+        // The request's cache key clones and hashes the condition recursively.
+        ensure_filter_within_depth_limit(&expr).context(WhereConditionTooDeepSnafu)?;
 
         Ok(expr)
     }
@@ -653,5 +658,49 @@ pub(crate) mod tests {
         };
         let req = SearchRequest::try_from(base).expect("non-empty text must succeed");
         assert_eq!(req.text, " boots ");
+    }
+
+    /// Regression test: a long `where` chain overflowed the stack while the
+    /// request's cache key cloned and hashed it, aborting the process. On a
+    /// 2 MiB thread, the default worker stack, it is now rejected when the
+    /// request is parsed, and a condition at the cap still builds a key.
+    #[test]
+    fn deep_where_condition_is_rejected_before_the_cache_key() {
+        use runtime_query_engine::sql_depth_guard::MAX_UNPROTECTED_EXPR_DEPTH;
+
+        let request = |where_cond: String| SearchRequestBaseJson {
+            text: "x".to_string(),
+            datasets: None,
+            limit: None,
+            where_cond: Some(where_cond),
+            additional_columns: vec![],
+        };
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let deep = vec!["1=1"; 2000].join(" AND ");
+                match SearchRequest::try_from(request(deep)) {
+                    Ok(parsed) => {
+                        let _ = SearchKey::from(&parsed);
+                        panic!("a 2000-term where condition was accepted");
+                    }
+                    Err(err) => assert_eq!(
+                        err,
+                        format!(
+                            "Invalid WHERE condition: it is nested more than \
+                             {MAX_UNPROTECTED_EXPR_DEPTH} levels deep. Simplify it (for example, \
+                             replace a long chain of OR conditions with an IN list)."
+                        )
+                    ),
+                }
+
+                let at = vec!["true"; MAX_UNPROTECTED_EXPR_DEPTH].join(" AND ");
+                let parsed = SearchRequest::try_from(request(at))
+                    .expect("a where condition at the cap is accepted");
+                let _ = SearchKey::from(&parsed);
+            })
+            .expect("test thread spawns")
+            .join()
+            .expect("test thread completes");
     }
 }

@@ -23,6 +23,7 @@ use std::ptr::NonNull;
 use snafu::{OptionExt, ResultExt};
 
 use crate::context::{Context, ContextParams};
+use crate::rpc::Device;
 use crate::{
     Backend, CreateContextSnafu, LoadModelSnafu, ModelPathSnafu, Result, TextTooLongSnafu, Token,
     sys,
@@ -33,6 +34,7 @@ use crate::{
 pub struct ModelParams {
     gpu_layers: Option<u32>,
     load_mtp: bool,
+    devices: Vec<Device>,
 }
 
 impl ModelParams {
@@ -47,6 +49,15 @@ impl ModelParams {
     #[must_use]
     pub fn with_load_mtp(mut self, load_mtp: bool) -> Self {
         self.load_mtp = load_mtp;
+        self
+    }
+
+    /// Places the model on `devices` instead of this node's GPUs. One device holds all of it;
+    /// across two or more, every tensor is split tensor-parallel, and each device holds and
+    /// reads its share of every weight.
+    #[must_use]
+    pub fn with_devices(mut self, devices: Vec<Device>) -> Self {
+        self.devices = devices;
         self
     }
 }
@@ -78,8 +89,19 @@ impl Model {
             .and_then(|layers| i32::try_from(layers).ok())
             .unwrap_or(-1);
         raw_params.load_mtp = params.load_mtp;
+        // llama.cpp reads the list up to its null entry while it loads, and keeps a copy.
+        let mut devices: Vec<sys::ggml_backend_dev_t> =
+            params.devices.iter().map(|device| device.0).collect();
+        if !devices.is_empty() {
+            if devices.len() > 1 {
+                raw_params.split_mode = sys::llama_split_mode_LLAMA_SPLIT_MODE_TENSOR;
+            }
+            devices.push(std::ptr::null_mut());
+            raw_params.devices = devices.as_mut_ptr();
+        }
         crate::log::clear_last_error();
-        // SAFETY: `c_path` is a NUL-terminated path that outlives the call.
+        // SAFETY: `c_path` is a NUL-terminated path and `devices` a null-terminated list, both
+        // of which outlive the call.
         let raw = unsafe { sys::llama_model_load_from_file(c_path.as_ptr(), raw_params) };
         let raw = NonNull::new(raw).with_context(|| LoadModelSnafu {
             path: display,
@@ -108,6 +130,22 @@ impl Model {
     pub fn n_layer_nextn(&self) -> i32 {
         // SAFETY: reads the loaded model's hyperparameters.
         unsafe { sys::llama_model_n_layer_nextn(self.raw.as_ptr()) }
+    }
+
+    /// Whether the model has an encoder, as an encoder-decoder model such as T5 does: its
+    /// decoder reads the encoder's output, so it cannot decode a prompt on its own.
+    #[must_use]
+    pub fn has_encoder(&self) -> bool {
+        // SAFETY: reads the loaded model's architecture.
+        unsafe { sys::llama_model_has_encoder(self.raw.as_ptr()) }
+    }
+
+    /// Whether the model is a diffusion model, such as `LLaDA` or Dream, which generates by
+    /// unmasking a whole sequence rather than one token after another.
+    #[must_use]
+    pub fn is_diffusion(&self) -> bool {
+        // SAFETY: reads the loaded model's architecture.
+        unsafe { sys::llama_model_is_diffusion(self.raw.as_ptr()) }
     }
 
     /// The chat template the GGUF file carries, if any.

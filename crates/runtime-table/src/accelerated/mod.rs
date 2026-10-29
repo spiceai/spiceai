@@ -1181,7 +1181,9 @@ impl Builder {
                 .or(self.cpu_runtime.as_ref())
                 .cloned()
                 .unwrap_or_else(Handle::current);
-            let capacity = refresh_task::changes::cdc_config().prefetch_buffer;
+            let capacity =
+                refresh_task::changes::dataset_cdc_config(self.cdc_param_overrides.as_deref())
+                    .prefetch_buffer;
             let native = if let Some(engine) = &self.change_sink_engine {
                 engine
                     .change_sink(context.clone(), &runtime, capacity)

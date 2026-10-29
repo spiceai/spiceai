@@ -1,0 +1,43 @@
+{
+  "random-queries-known": [
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 169,
+      "kind": "wrong-answer",
+      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"15\\\"\", actual: \"\\\"13\\\"\" }",
+      "group": "not+set-operation-nulls+unread-groups",
+      "labels": [
+        "not",
+        "set-operation-nulls",
+        "unread-groups"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 241,
+      "kind": "wrong-answer",
+      "signature": "the answer differs from the oracle's: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"116\\\"\", actual: \"\\\"192\\\"\" }",
+      "group": "case-widening+not",
+      "labels": [
+        "case-widening",
+        "not"
+      ]
+    },
+    {
+      "run": "random-queries-known[backend=mysql]",
+      "who": "federated",
+      "key": "random-queries: {\"depth\":2,\"joins\":[\"t.id = u.t_id\"],\"oracle\":\"ref\",\"queries\":300,\"seed\":1,\"skip-columns\":[\"b\"],\"tables\":[\"t\",\"u\"]}",
+      "query": 257,
+      "kind": "wrong-answer",
+      "signature": "the answer differs from the oracle's: RowCountMismatch { expected: 8, actual: 6 }",
+      "group": "unread-groups",
+      "labels": [
+        "unread-groups"
+      ]
+    }
+  ]
+}

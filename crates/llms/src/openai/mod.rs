@@ -354,10 +354,6 @@ mod chat_backend_tests {
 /// had stopped sending the header at all: with no key there must be no
 /// `Authorization` header, and with a key it must carry it as a bearer token.
 #[cfg(test)]
-#[expect(
-    clippy::expect_used,
-    reason = "a failed set-up in a test should name itself and stop"
-)]
 pub(crate) mod authorization_header_tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
@@ -457,10 +453,6 @@ pub(crate) mod authorization_header_tests {
 /// request is read in `OpenAI`'s shape and sent through a client built the way the
 /// runtime builds one, and the body the endpoint receives must carry the same object.
 #[cfg(test)]
-#[expect(
-    clippy::expect_used,
-    reason = "a failed set-up in a test should name itself and stop"
-)]
 mod allowed_tools_wire_tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;

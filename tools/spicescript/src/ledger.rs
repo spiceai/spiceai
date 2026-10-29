@@ -82,16 +82,26 @@ impl Entry {
         (&self.run, &self.who, &self.key, self.query)
     }
 
-    fn matches(&self, signature: &str) -> bool {
-        match &self.pattern {
-            Some(pattern) => Regex::new(pattern).is_ok_and(|re| re.is_match(signature)),
-            None => self.signature == signature || self.also.iter().any(|s| s == signature),
+    /// Whether a failure's first line, as `normalized` gives it, is this
+    /// entry's. A `pattern` sees the whole line: the part it names can lie
+    /// past the cut a signature makes, as an error in the second of several
+    /// datasets a readiness failure lists does.
+    fn matches(&self, normalized: &str) -> bool {
+        if let Some(pattern) = &self.pattern {
+            return Regex::new(pattern).is_ok_and(|re| re.is_match(normalized));
         }
+        let signature = truncated(normalized);
+        self.signature == signature || self.also.contains(&signature)
     }
 }
 
 fn failure_id(f: &Failure) -> (&str, &str, &str, Option<u64>) {
     (&f.run, &f.who, &f.key, f.query)
+}
+
+/// Whether two failures are of the same check, the one a ledger entry names.
+pub fn same_check(a: &Failure, b: &Failure) -> bool {
+    failure_id(a) == failure_id(b)
 }
 
 /// What a script's failures mean against its ledger entries.
@@ -227,7 +237,7 @@ impl Ledger {
             match entries.iter().position(|e| e.id() == failure_id(failure)) {
                 Some(i) => {
                     matched[i] = true;
-                    if entries[i].matches(&signature(&failure.message)) {
+                    if entries[i].matches(&normalized(&failure.message)) {
                         verdict.expected += 1;
                     } else {
                         verdict.changed.push((failure.clone(), entries[i].clone()));
@@ -237,11 +247,14 @@ impl Ledger {
             }
         }
         let none_failed = failures.is_empty();
-        if none_failed && !entries.is_empty() && entries.iter().all(|e| e.may_pass) {
+        // Entries for runs and variants `--matrix` or `--variant` left out
+        // were not checked, so their passing says nothing.
+        let ran = |e: &Entry| !script.left_out.covers(&e.run, &e.who);
+        let checked = entries.iter().filter(|e| ran(e)).count();
+        if none_failed && checked > 0 && entries.iter().filter(|e| ran(e)).all(|e| e.may_pass) {
             verdict.notes.push(format!(
-                "{}: none of its {} expected failures failed this run; if this repeats, its bug may be fixed",
+                "{}: none of its {checked} expected failures failed this run; if this repeats, its bug may be fixed",
                 script.name,
-                entries.len()
             ));
         }
         // A run, or one instance of it, that failed outside its steps: starting
@@ -252,7 +265,7 @@ impl Ledger {
             .map(|f| (f.run.as_str(), f.who.as_str()))
             .collect();
         for (entry, matched) in entries.iter().zip(matched) {
-            if !matched && !entry.may_pass {
+            if !matched && !entry.may_pass && ran(entry) {
                 let stopped = stopped
                     .iter()
                     .any(|&(run, who)| run == entry.run && (who.is_empty() || who == entry.who));
@@ -273,8 +286,9 @@ impl Ledger {
     }
 
     /// Replaces a script's entries with its current failures, keeping the
-    /// group and `may-pass` of an entry that is still there, and a `may-pass`
-    /// entry that passed this time.
+    /// group and `may-pass` of an entry that is still there, a `may-pass`
+    /// entry that passed this time, and the entries of runs and variants
+    /// `--matrix` or `--variant` left out.
     pub fn record(&mut self, script: &Script, failures: &[Failure]) {
         let old = self.entries(script).to_vec();
         let group_of_dir = known_failing_group(&script.dir);
@@ -298,7 +312,7 @@ impl Ledger {
                 let (signature, also) = match previous {
                     Some(e) if e.varies => {
                         let mut also = e.also.clone();
-                        if !e.matches(&now) {
+                        if !e.matches(&normalized(&f.message)) {
                             also.push(now);
                         }
                         (e.signature.clone(), also)
@@ -322,10 +336,10 @@ impl Ledger {
                 }
             })
             .collect();
-        entries.extend(
-            old.into_iter()
-                .filter(|e| e.may_pass && !failures.iter().any(|f| failure_id(f) == e.id())),
-        );
+        entries.extend(old.into_iter().filter(|e| {
+            (e.may_pass || script.left_out.covers(&e.run, &e.who))
+                && !failures.iter().any(|f| failure_id(f) == e.id())
+        }));
         let file = self.files.entry(script.dir.clone()).or_default();
         if entries.is_empty() {
             file.remove(&script.file_stem);
@@ -446,6 +460,19 @@ pub fn kind(message: &str) -> String {
 /// text and row counts stay, so a different failure has a different
 /// signature.
 pub fn signature(message: &str) -> String {
+    truncated(&normalized(message))
+}
+
+/// A signature's length: enough to tell failures apart, short enough to
+/// read in the ledger.
+const SIGNATURE_CHARS: usize = 300;
+
+fn truncated(normalized: &str) -> String {
+    normalized.chars().take(SIGNATURE_CHARS).collect()
+}
+
+/// A failure's first line normalized as [`signature`] does, uncut.
+fn normalized(message: &str) -> String {
     const DETAIL: &[&str] = &[" --- ", " with top memory consumers"];
     static RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         [
@@ -519,7 +546,7 @@ pub fn signature(message: &str) -> String {
     for (re, to) in RULES.iter() {
         text = re.replace_all(&text, *to).into_owned();
     }
-    text.chars().take(300).collect()
+    text
 }
 
 /// `text` with each JSON object or array in it rewritten with sorted keys.
@@ -789,6 +816,47 @@ mod tests {
             1,
             "another failure is still a change"
         );
+    }
+
+    #[test]
+    fn a_pattern_matches_past_where_a_signature_is_cut() {
+        let script = script_in("t/known-failing/g");
+        let mut conflict = entry("a", false);
+        conflict.pattern =
+            Some("spiced not ready: a dataset is in Error: .*Database schema conflict".into());
+        let ledger = ledger(&script, vec![conflict]);
+        // The readiness failure lists every dataset; with a healthy one first,
+        // the erroring one's message starts past the signature's 300 characters.
+        let mut start = failure("a");
+        start.message = r#"spiced not ready: a dataset is in Error: [{"from":"mysql:orders","name":"orders","replication_enabled":false,"acceleration_enabled":true,"status":"Refreshing","properties":{"search":"unsupported","vector_search":"unsupported"}},{"from":"mysql:customers","name":"customers","replication_enabled":false,"acceleration_enabled":true,"status":"Error","error":{"category":"dataset","type":"validation","code":"dataset.validation"},"error_message":"External error: Invalid operation: Failed to commit inline mutation transaction Database error: Failed to commit transaction: Database schema conflict","properties":{"vector_search":"unsupported","search":"unsupported"}}]; see /tmp/w/spiced.log"#.into();
+        assert!(
+            !signature(&start.message).contains("Database schema conflict"),
+            "the test needs the core past the cut"
+        );
+        let verdict = ledger.judge(&script, &[start]);
+        assert_eq!((verdict.expected, verdict.changed.len()), (1, 0));
+    }
+
+    #[test]
+    fn entries_of_what_a_selection_left_out_are_neither_gone_nor_dropped() {
+        let mut script = script_in("x");
+        script.left_out.variants.insert("other".into());
+        let mut skipped = entry("other", false);
+        skipped.key = "assert-status: b".into();
+        let mut ledger = ledger(&script, vec![entry("a", false), skipped.clone()]);
+        // The selected variant's expected failure fails; the other's never ran.
+        let verdict = ledger.judge(&script, &[failure("a")]);
+        assert_eq!(verdict.expected, 1);
+        assert!(verdict.gone.is_empty(), "{:?}", verdict.gone);
+        // Recording keeps the entry the run could not have seen.
+        ledger.record(&script, &[failure("a")]);
+        assert_eq!(
+            ledger.entries(&script),
+            [entry("a", false), skipped.clone()]
+        );
+        // Without the selection, the same run reports it gone.
+        let verdict = ledger.judge(&script_in("x"), &[failure("a")]);
+        assert_eq!(verdict.gone, [skipped]);
     }
 
     #[test]

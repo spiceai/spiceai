@@ -20,6 +20,8 @@ on:
       - '.github/scripts/test_codeql_workflow.py'
       - '.github/scripts/docker_pull.sh'
       - '.github/scripts/test_docker_pull.py'
+      - '.github/scripts/mssql_tpch_restore.sh'
+      - '.github/scripts/test_mssql_tpch_restore.py'
   push:
     branches:
       - trunk
@@ -32,6 +34,8 @@ on:
       - '.github/scripts/test_codeql_workflow.py'
       - '.github/scripts/docker_pull.sh'
       - '.github/scripts/test_docker_pull.py'
+      - '.github/scripts/mssql_tpch_restore.sh'
+      - '.github/scripts/test_mssql_tpch_restore.py'
   workflow_dispatch:
 
 concurrency:
@@ -58,7 +62,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
 
@@ -70,6 +74,7 @@ jobs:
           python .github/scripts/test_check_workflow_yaml.py -v
           python .github/scripts/test_codeql_workflow.py -v
           python .github/scripts/test_docker_pull.py -v
+          python .github/scripts/test_mssql_tpch_restore.py -v
 
       - name: Validate GitHub Actions definitions
         run: python .github/scripts/check_workflow_yaml.py

@@ -17,6 +17,7 @@ limitations under the License.
 use crate::federated::FederatedTableProvider;
 use crate::parameters::ConnectorContext;
 use data_components::cdc::{AccelerationContents, ChangesStream};
+use data_components::csv_header_projection::HeaderProjectedCsvFormat;
 use data_components::file_schema_drift::{FileSchemaDriftGuard, FileSchemaDriftLayer};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -34,9 +35,10 @@ use datafusion::catalog::Session;
 use datafusion::common::{Constraints, DFSchema, GetExt, Result as DFResult, ScalarValue};
 use datafusion::config::{ConfigField, TableParquetOptions};
 use datafusion::datasource::TableProvider;
+#[cfg(test)]
+use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::file_format::{
     FileFormat, csv::CsvFormat, file_compression_type::FileCompressionType, json::JsonFormat,
-    parquet::ParquetFormat,
 };
 use datafusion::datasource::listing::{
     ListingFileFilter, ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
@@ -77,6 +79,7 @@ use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ExposedParamLookup, Parameters};
 use util::levenshtein::closest_match;
 
+use super::parquet_nan::listing_parquet_format;
 use super::{
     DelimitedFormat, ParsedFileExtension, detect_file_extension_from_path,
     detect_file_extension_from_url_or_path, parse_file_extension_param,
@@ -1189,9 +1192,7 @@ pub trait ListingTableConnector: DataConnector {
                 ),
             )),
             (Some("parquet"), _) | (None, Some("parquet"))=> Ok((
-                Some(Arc::new(
-                    ParquetFormat::default().with_options(self.get_table_parquet_options(dataset).await?),
-                )),
+                Some(listing_parquet_format(self.get_table_parquet_options(dataset).await?)),
                 listing_extension(
                     configured_extension.as_ref(),
                     path_extension.as_ref(),
@@ -1268,9 +1269,7 @@ pub trait ListingTableConnector: DataConnector {
                         }
                     },
                     Some("parquet") => Ok((
-                        Some(Arc::new(
-                            ParquetFormat::default().with_options(self.get_table_parquet_options(dataset).await?),
-                        )),
+                        Some(listing_parquet_format(self.get_table_parquet_options(dataset).await?)),
                         listing_extension(
                             configured_extension.as_ref(),
                             path_extension.as_ref(),
@@ -1896,6 +1895,11 @@ pub trait ListingTableConnector: DataConnector {
             name = dataset.name,
             sanitized_url = schema_infer_url.sanitized_url(),
         );
+
+        // Headered CSV is read by column name. Wrap here, not in
+        // `get_file_format_and_extension`, so Hugging Face can still downcast
+        // the unwrapped `CsvFormat` for its positional commit check.
+        let file_format = HeaderProjectedCsvFormat::wrap(file_format);
 
         // `target_partitions` and `collect_statistics` are read from the scanning
         // session's config at scan time, so they are no longer copied onto the options.
@@ -4390,6 +4394,659 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_file_format_and_extension_keeps_unwrapped_csv_format() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "csv".to_string());
+        let (connector, dataset) = setup_connector("test:test.csv".to_string(), params);
+        let (Some(file_format), _) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("csv format")
+        else {
+            panic!("expected a CSV file format");
+        };
+        assert!(
+            file_format.as_ref().downcast_ref::<CsvFormat>().is_some(),
+            "Hugging Face downcasts CsvFormat from get_file_format_and_extension"
+        );
+        assert!(
+            file_format
+                .as_ref()
+                .downcast_ref::<HeaderProjectedCsvFormat>()
+                .is_none()
+        );
+    }
+
+    fn write_events_csv(path: &std::path::Path, header: &str, rows: &[&str]) {
+        let mut text = String::from(header);
+        text.push('\n');
+        for row in rows {
+            text.push_str(row);
+            text.push('\n');
+        }
+        std::fs::write(path, text).expect("write csv");
+    }
+
+    async fn csv_listing_sums(
+        provider: Arc<dyn TableProvider>,
+        refresh: bool,
+    ) -> (Option<i64>, Option<i64>) {
+        let mut config = datafusion::prelude::SessionConfig::new();
+        if refresh {
+            data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        }
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let batches = ctx
+            .sql("SELECT sum(amount_cents), sum(user_id) FROM events")
+            .await
+            .expect("sql")
+            .collect()
+            .await
+            .expect("collect");
+        let batch = &batches[0];
+        let amounts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("amount_cents");
+        let users = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("user_id");
+        (
+            (!amounts.is_null(0)).then(|| amounts.value(0)),
+            (!users.is_null(0)).then(|| users.value(0)),
+        )
+    }
+
+    /// `(event_id, "user.name")` for every row of a flattened JSON listing,
+    /// ordered by `event_id`.
+    async fn json_user_names(
+        provider: Arc<dyn TableProvider>,
+        refresh: bool,
+    ) -> Vec<(i64, Option<String>)> {
+        let mut config = datafusion::prelude::SessionConfig::new();
+        if refresh {
+            data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        }
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let batches = ctx
+            .sql(r#"SELECT event_id, "user.name" FROM events ORDER BY event_id"#)
+            .await
+            .expect("sql")
+            .collect()
+            .await
+            .expect("collect");
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let ids = arrow::compute::cast(batch.column(0), &DataType::Int64).expect("event_id");
+            let ids = ids
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("event_id as Int64");
+            let names = arrow::compute::cast(batch.column(1), &DataType::Utf8).expect("user.name");
+            let names = names
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("user.name as Utf8");
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    ids.value(row),
+                    (!names.is_null(row)).then(|| names.value(row).to_string()),
+                ));
+            }
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_binds_csv_columns_by_header_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.csv");
+        write_events_csv(
+            &path,
+            "event_id,user_id,region,amount_cents,ts",
+            &["1,10,us,100,t0", "2,20,eu,200,t1"],
+        );
+
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "csv".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("csv format")
+        else {
+            panic!("expected a CSV file format");
+        };
+
+        let template = connector
+            .listing_table_template(&dataset, &url, &extension, Arc::clone(&file_format))
+            .await
+            .expect("template");
+        assert!(
+            template
+                .options
+                .format
+                .as_ref()
+                .downcast_ref::<HeaderProjectedCsvFormat>()
+                .is_some(),
+            "listing options must wrap a headered CSV so columns bind by name"
+        );
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30))
+        );
+
+        write_events_csv(
+            &path,
+            "event_id,amount_cents,region,user_id,ts",
+            &["1,100,us,10,t0", "2,200,eu,20,t1"],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30)),
+            "values must follow the header names after a column reorder"
+        );
+
+        write_events_csv(
+            &path,
+            "event_id,user_id,region,amt,ts",
+            &["1,10,us,100,t0", "2,20,eu,200,t1"],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (None, Some(30)),
+            "a renamed column is NULL on a federated read"
+        );
+
+        let mut config = datafusion::prelude::SessionConfig::new();
+        data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let message = ctx
+            .sql("SELECT * FROM events")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a refresh scan must not load NULLs for a renamed column")
+            .to_string();
+        assert!(message.contains("'amount_cents'"), "{message}");
+        assert!(message.contains("Dataset 'test'"), "{message}");
+    }
+
+    fn write_events_ndjson(path: &std::path::Path, lines: &[&str]) {
+        let mut text = String::new();
+        for line in lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        std::fs::write(path, text).expect("write ndjson");
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_rejects_json_rename_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"region":"us","amount_cents":100,"ts":"t0"}"#,
+                r#"{"event_id":2,"user_id":20,"region":"eu","amount_cents":200,"ts":"t1"}"#,
+            ],
+        );
+
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("jsonl format")
+        else {
+            panic!("expected a JSONL file format");
+        };
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"amount_cents":100,"region":"us","user_id":10,"ts":"t0"}"#,
+                r#"{"event_id":2,"amount_cents":200,"region":"eu","user_id":20,"ts":"t1"}"#,
+            ],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30)),
+            "JSON object keys bind by name after a reorder"
+        );
+
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"region":"us","amt":100,"ts":"t0"}"#,
+                r#"{"event_id":2,"user_id":20,"region":"eu","amt":200,"ts":"t1"}"#,
+            ],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (None, Some(30)),
+            "a renamed JSON column is NULL on a federated read"
+        );
+
+        let mut config = datafusion::prelude::SessionConfig::new();
+        data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let message = ctx
+            .sql("SELECT * FROM events")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a refresh scan must not overwrite accelerated JSON with NULLs")
+            .to_string();
+        assert!(message.contains("'amount_cents'"), "{message}");
+        assert!(message.contains("Dataset 'test'"), "{message}");
+    }
+
+    const EVENTS_JSON_BASELINE: &[&str] = &[
+        r#"{"event_id":1,"user_id":10,"region":"us","amount_cents":100,"ts":"t0"}"#,
+        r#"{"event_id":2,"user_id":20,"region":"eu","amount_cents":200,"ts":"t1"}"#,
+    ];
+    const EVENTS_JSON_RENAMED: &[&str] = &[
+        r#"{"event_id":1,"user_id":10,"region":"us","amt":100,"ts":"t0"}"#,
+        r#"{"event_id":2,"user_id":20,"region":"eu","amt":200,"ts":"t1"}"#,
+    ];
+
+    fn write_events_json_array(path: &std::path::Path, objects: &[&str]) {
+        std::fs::write(path, format!("[{}]", objects.join(","))).expect("write json array");
+    }
+
+    fn write_events_json_pointer(path: &std::path::Path, objects: &[&str]) {
+        std::fs::write(path, format!(r#"{{"data":[{}]}}"#, objects.join(",")))
+            .expect("write json pointer");
+    }
+
+    async fn assert_listing_json_rename_fails_refresh(
+        label: &str,
+        from: String,
+        params: HashMap<String, String>,
+        file_path: &std::path::Path,
+        write: fn(&std::path::Path, &[&str]),
+    ) {
+        write(file_path, EVENTS_JSON_BASELINE);
+        let (connector, dataset) = setup_connector(from.clone(), params);
+        let url = Url::parse(&from).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: format: {e}"))
+        else {
+            panic!("{label}: expected a JSON file format");
+        };
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: listing table: {e}"));
+
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), true).await,
+            (Some(300), Some(30)),
+            "{label}: last good accelerated read before rename"
+        );
+
+        write(file_path, EVENTS_JSON_RENAMED);
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (None, Some(30)),
+            "{label}: a renamed JSON column is NULL on a federated read"
+        );
+
+        let mut config = datafusion::prelude::SessionConfig::new();
+        data_components::file_schema_drift::mark_acceleration_refresh(&mut config);
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("events", provider)
+            .expect("register listing table");
+        let message = ctx
+            .sql("SELECT * FROM events")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("a refresh scan must not overwrite accelerated JSON with NULLs")
+            .to_string();
+        assert!(message.contains("'amount_cents'"), "{label}: {message}");
+        assert!(message.contains("Dataset 'test'"), "{label}: {message}");
+        let file_name = file_path.file_name().expect("file name").to_string_lossy();
+        assert!(
+            message.contains(&format!(
+                "'{}/{}'",
+                file_path.parent().expect("parent").display(),
+                file_name
+            )) || message.contains(&format!("'{file_name}'")),
+            "{label}: example file path: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_rejects_json_array_rename_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.json");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "json".to_string());
+        assert_listing_json_rename_fails_refresh(
+            "file_format json",
+            format!("file://{}/", dir.path().display()),
+            params,
+            &path,
+            write_events_json_array,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_rejects_auto_json_rename_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.json");
+        assert_listing_json_rename_fails_refresh(
+            "auto-detected json",
+            format!("file://{}", path.display()),
+            HashMap::new(),
+            &path,
+            write_events_json_array,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_rejects_json_pointer_rename_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        params.insert("json_pointer".to_string(), "/data".to_string());
+        assert_listing_json_rename_fails_refresh(
+            "jsonl json_pointer",
+            format!("file://{}/", dir.path().display()),
+            params,
+            &path,
+            write_events_json_pointer,
+        )
+        .await;
+    }
+
+    async fn assert_listing_json_empty_refresh_clears(
+        label: &str,
+        from: String,
+        params: HashMap<String, String>,
+        file_path: &std::path::Path,
+        write: fn(&std::path::Path, &[&str]),
+        write_empty: impl Fn(&std::path::Path),
+    ) {
+        write(file_path, EVENTS_JSON_BASELINE);
+        let (connector, dataset) = setup_connector(from.clone(), params);
+        let url = Url::parse(&from).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: format: {e}"))
+        else {
+            panic!("{label}: expected a JSON file format");
+        };
+
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: listing table: {e}"));
+
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), true).await,
+            (Some(300), Some(30)),
+            "{label}: last good accelerated read before empty"
+        );
+
+        write_empty(file_path);
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (None, None),
+            "{label}: federated empty source has no values"
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), true).await,
+            (None, None),
+            "{label}: empty source must clear on refresh, not fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_clears_jsonl_on_empty_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        assert_listing_json_empty_refresh_clears(
+            "jsonl empty",
+            format!("file://{}/", dir.path().display()),
+            params,
+            &path,
+            write_events_ndjson,
+            |p| std::fs::write(p, "\n\n").expect("blank jsonl"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_clears_json_array_on_empty_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.json");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "json".to_string());
+        assert_listing_json_empty_refresh_clears(
+            "file_format json empty",
+            format!("file://{}/", dir.path().display()),
+            params,
+            &path,
+            write_events_json_array,
+            |p| write_events_json_array(p, &[]),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_clears_json_pointer_on_empty_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        params.insert("json_pointer".to_string(), "/data".to_string());
+        assert_listing_json_empty_refresh_clears(
+            "jsonl json_pointer empty",
+            format!("file://{}/", dir.path().display()),
+            params,
+            &path,
+            write_events_json_pointer,
+            |p| write_events_json_pointer(p, &[]),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_allows_json_sparse_nullable_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        write_events_ndjson(&path, EVENTS_JSON_BASELINE);
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("jsonl format")
+        else {
+            panic!("expected a JSONL file format");
+        };
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"region":"us","ts":"t0"}"#,
+                r#"{"event_id":2,"user_id":20,"region":"eu","ts":"t1"}"#,
+            ],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (None, Some(30)),
+            "omitted amount_cents is NULL on a federated read"
+        );
+        assert_eq!(
+            csv_listing_sums(provider, true).await,
+            (None, Some(30)),
+            "a sparse nullable key must not fail refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_allows_json_unregistered_field_type_change_on_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.jsonl");
+        write_events_ndjson(&path, EVENTS_JSON_BASELINE);
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "jsonl".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("jsonl format")
+        else {
+            panic!("expected a JSONL file format");
+        };
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"region":"us","amount_cents":100,"ts":"t0","extra":1}"#,
+                r#"{"event_id":2,"user_id":20,"region":"eu","amount_cents":200,"ts":"t1","extra":{}}"#,
+            ],
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30)),
+            "unregistered extra is ignored on a federated read"
+        );
+        assert_eq!(
+            csv_listing_sums(provider, true).await,
+            (Some(300), Some(30)),
+            "an unregistered field that changes type must not fail refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_listing_table_allows_json_flatten_null_parent_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.json");
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"user":{"name":"a"},"amount_cents":100,"ts":"t0"}"#,
+                r#"{"event_id":2,"user_id":20,"user":{"name":"b"},"amount_cents":200,"ts":"t1"}"#,
+            ],
+        );
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "json".to_string());
+        params.insert("flatten_json".to_string(), "true".to_string());
+        let (connector, dataset) = setup_connector(table_url.clone(), params);
+        let url = Url::parse(&table_url).expect("url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("flattened json format")
+        else {
+            panic!("expected a JSONL file format");
+        };
+        assert!(
+            file_format
+                .as_ref()
+                .downcast_ref::<SpiceJsonFormat>()
+                .is_some_and(|json| json.options().flatten_json.as_deref() == Some(".")),
+            "listing must enable flatten_json so user.name is a registered column"
+        );
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("listing table");
+        assert_eq!(
+            json_user_names(Arc::clone(&provider), false).await,
+            vec![(1, Some("a".to_string())), (2, Some("b".to_string()))],
+            "user.name reads the flattened child while the parent is an object"
+        );
+
+        write_events_ndjson(
+            &path,
+            &[
+                r#"{"event_id":1,"user_id":10,"user":null,"amount_cents":100,"ts":"t0"}"#,
+                r#"{"event_id":2,"user_id":20,"user":null,"amount_cents":200,"ts":"t1"}"#,
+            ],
+        );
+        assert_eq!(
+            json_user_names(Arc::clone(&provider), false).await,
+            vec![(1, None), (2, None)],
+            "a flattened null parent is NULL for user.name on a federated read"
+        );
+        assert_eq!(
+            csv_listing_sums(Arc::clone(&provider), false).await,
+            (Some(300), Some(30)),
+            "registered columns keep their values on a federated read"
+        );
+        assert_eq!(
+            json_user_names(Arc::clone(&provider), true).await,
+            vec![(1, None), (2, None)],
+            "user becoming null in every record is NULL for user.name on refresh"
+        );
+        assert_eq!(
+            csv_listing_sums(provider, true).await,
+            (Some(300), Some(30)),
+            "user becoming null in every record must not fail refresh"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_file_format_and_extension_tsv_from_params() {
         let mut params = HashMap::new();
         params.insert("file_format".to_string(), "tsv".to_string());
@@ -5405,6 +6062,611 @@ mod tests {
         arrow::util::pretty::pretty_format_batches(&batches)
             .expect("format rows")
             .to_string()
+    }
+
+    async fn float_cell(ctx: &SessionContext, sql: &str) -> f64 {
+        use arrow::array::Float64Array;
+
+        let batches = ctx
+            .sql(sql)
+            .await
+            .expect("plan sql")
+            .collect()
+            .await
+            .expect("collect rows");
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("float column")
+            .value(0)
+    }
+
+    /// Same `id`/`f` layout as the reporter's `tricky.parquet`: NaN at 2 and 12,
+    /// +inf at 3, -inf at 4, NULL at 7 and 16.
+    fn write_tricky_parquet(path: &std::path::Path) {
+        use arrow::array::{Decimal128Array, Float64Array, Int64Array};
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("k", DataType::Int64, true),
+            Field::new("amt", DataType::Decimal128(10, 2), true),
+            Field::new("f", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(1..=20)),
+                Arc::new(Int64Array::from_iter_values(0..20)),
+                Arc::new(
+                    Decimal128Array::from_iter_values((0..20).map(|i| i * 100))
+                        .with_precision_and_scale(10, 2)
+                        .expect("decimal scale"),
+                ),
+                Arc::new(Float64Array::from(vec![
+                    Some(1.5),
+                    Some(f64::NAN),
+                    Some(f64::INFINITY),
+                    Some(f64::NEG_INFINITY),
+                    Some(-0.0),
+                    Some(0.0),
+                    None,
+                    Some(1e308),
+                    Some(-1e-308),
+                    Some(2.5),
+                    Some(3.5),
+                    Some(f64::NAN),
+                    Some(0.1),
+                    Some(0.2),
+                    Some(0.300_000_000_000_000_04),
+                    None,
+                    Some(1.0),
+                    Some(1.0),
+                    Some(-2.5),
+                    Some(100.0),
+                ])),
+            ],
+        )
+        .expect("valid batch");
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(path).expect("create parquet"),
+            file_schema,
+            None,
+        )
+        .expect("parquet writer");
+        writer.write(&batch).expect("write parquet");
+        writer.close().expect("close parquet");
+    }
+
+    async fn register_tricky_listing(table_url: &str) -> SessionContext {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "parquet".to_string());
+        let (connector, dataset) = setup_connector(table_url.to_string(), params);
+        let url = Url::parse(table_url).expect("table url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("parquet listing format")
+        else {
+            panic!("expected a parquet file format");
+        };
+        assert!(
+            file_format
+                .as_ref()
+                .is::<crate::listing::parquet_nan::NanSafeParquetFormat>(),
+            "the production listing path must wrap Parquet so float stats cannot be trusted"
+        );
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("create_listing_table production path");
+        let ctx = SessionContext::new();
+        ctx.register_table("t", provider)
+            .expect("register listing table");
+        ctx
+    }
+
+    async fn assert_tricky_float_answers(ctx: &SessionContext) {
+        let max_float = float_cell(ctx, "SELECT MAX(f) AS mx FROM t").await;
+        assert!(
+            max_float.is_nan(),
+            "MAX(f) must be NaN, not the parquet stat (inf); got {max_float}"
+        );
+        let max_non_null = float_cell(ctx, "SELECT MAX(f) AS mx FROM t WHERE f IS NOT NULL").await;
+        assert!(
+            max_non_null.is_nan(),
+            "MAX(f) WHERE f IS NOT NULL must be NaN; got {max_non_null}"
+        );
+        assert_eq!(
+            pretty_rows(
+                ctx,
+                "SELECT COUNT(*) AS n FROM t WHERE f = CAST('NaN' AS DOUBLE)"
+            )
+            .await,
+            ["+---+", "| n |", "+---+", "| 2 |", "+---+"].join("\n"),
+            "f = NaN must not prune the file"
+        );
+        assert_eq!(
+            pretty_rows(
+                ctx,
+                "SELECT id FROM t WHERE f > CAST('inf' AS DOUBLE) ORDER BY id"
+            )
+            .await,
+            ["+----+", "| id |", "+----+", "| 2  |", "| 12 |", "+----+",].join("\n"),
+            "f > inf matches NaN under DataFusion total order"
+        );
+        let min_float = float_cell(ctx, "SELECT MIN(f) AS mn FROM t").await;
+        assert!(
+            min_float.is_infinite() && min_float.is_sign_negative(),
+            "MIN(f) must stay -inf; got {min_float}"
+        );
+    }
+
+    async fn assert_non_float_max_keeps_stats_shortcut(ctx: &SessionContext) {
+        let int_max_plan = physical_plan_with_statistics(ctx, "SELECT MAX(k) FROM t").await;
+        assert!(
+            int_max_plan.contains("PlaceholderRowExec"),
+            "integer MAX must keep the stats shortcut:\n{int_max_plan}"
+        );
+        let decimal_max_plan = physical_plan_with_statistics(ctx, "SELECT MAX(amt) FROM t").await;
+        assert!(
+            decimal_max_plan.contains("PlaceholderRowExec"),
+            "decimal MAX must keep the stats shortcut:\n{decimal_max_plan}"
+        );
+        let float_max_plan = physical_plan_with_statistics(ctx, "SELECT MAX(f) FROM t").await;
+        assert!(
+            !float_max_plan.contains("PlaceholderRowExec"),
+            "float MAX must not fold parquet min/max that omitted NaN:\n{float_max_plan}"
+        );
+        assert_eq!(
+            pretty_rows(ctx, "SELECT MAX(k) AS mx FROM t").await,
+            ["+----+", "| mx |", "+----+", "| 19 |", "+----+"].join("\n")
+        );
+    }
+
+    /// Parquet writers omit `NaN` from float min/max. The listing `FileFormat`
+    /// must not answer `MAX(f)` from those stats or prune `f = NaN` / `f > inf`.
+    /// Integer and decimal `MAX` still use the statistics shortcut.
+    ///
+    /// Regression test for the federated parquet path of the same class as
+    /// spiceai/spiceai#14719.
+    #[tokio::test]
+    async fn listing_parquet_nan_stats_do_not_answer_max_or_prune() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_tricky_parquet(&dir.path().join("tricky.parquet"));
+        let ctx = register_tricky_listing(&format!("file://{}/", dir.path().display())).await;
+        assert_tricky_float_answers(&ctx).await;
+        assert_non_float_max_keeps_stats_shortcut(&ctx).await;
+    }
+
+    /// Two row groups: RG0 is finite + `inf` (footer max `inf`), RG1 holds `NaN`
+    /// (footer max omits it). `TopK` `ORDER BY f DESC LIMIT 1` attaches a dynamic
+    /// `f > threshold` after RG0; `DataFusion`'s runtime `RowGroupPruner` then
+    /// evaluates that against footer min/max and can skip RG1. The listing
+    /// wrapper must not let that happen.
+    fn write_multi_rg_nan_after_inf_parquet(path: &std::path::Path) {
+        use arrow::array::{Float64Array, Int64Array};
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+        use datafusion::parquet::file::statistics::Statistics as ParquetStatistics;
+
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("f", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    Some(4),
+                    Some(5),
+                    Some(6),
+                ])),
+                Arc::new(Float64Array::from(vec![
+                    Some(1.0),
+                    Some(2.0),
+                    Some(f64::INFINITY),
+                    Some(f64::NAN),
+                    Some(0.5),
+                    Some(1.5),
+                ])),
+            ],
+        )
+        .expect("valid batch");
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(path).expect("create parquet"),
+            file_schema,
+            Some(properties),
+        )
+        .expect("parquet writer");
+        writer.write(&batch).expect("write parquet");
+        writer.close().expect("close parquet");
+
+        let reader = SerializedFileReader::new(std::fs::File::open(path).expect("open parquet"))
+            .expect("read footer");
+        assert_eq!(
+            reader.num_row_groups(),
+            2,
+            "TopK row-group pruning needs NaN in a later row group"
+        );
+        let double_max = |rg: usize| -> f64 {
+            match reader.metadata().row_group(rg).column(1).statistics() {
+                Some(ParquetStatistics::Double(stats)) => {
+                    *stats.max_opt().expect("row group must publish a float max")
+                }
+                other => panic!("expected double stats on f, got {other:?}"),
+            }
+        };
+        assert!(
+            double_max(0).is_infinite() && double_max(0).is_sign_positive(),
+            "RG0 footer max must be inf so TopK's first threshold is inf"
+        );
+        let rg1_max = double_max(1);
+        assert!(
+            (rg1_max - 1.5).abs() < f64::EPSILON,
+            "RG1 footer max must omit NaN (the hole the runtime pruner would use); got {rg1_max}"
+        );
+    }
+
+    /// Regression for the Codex finding on spiceai/spiceai#15510: `pruning=false`
+    /// does not stop `DataFusion`'s runtime dynamic-filter `RowGroupPruner`.
+    #[tokio::test]
+    async fn listing_parquet_topk_dynamic_filter_does_not_skip_nan_row_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_multi_rg_nan_after_inf_parquet(&dir.path().join("multi_rg.parquet"));
+        let ctx = register_tricky_listing(&format!("file://{}/", dir.path().display())).await;
+
+        let topk_plan =
+            physical_plan_with_statistics(&ctx, "SELECT f FROM t ORDER BY f DESC LIMIT 1").await;
+        assert!(
+            topk_plan.contains("TopK"),
+            "the query must take the TopK path that attaches a dynamic filter:\n{topk_plan}"
+        );
+        assert!(
+            !topk_plan.contains("predicate=DynamicFilter"),
+            "float TopK must not attach a dynamic filter the runtime pruner would evaluate against footer min/max:\n{topk_plan}"
+        );
+
+        let top = float_cell(&ctx, "SELECT f FROM t ORDER BY f DESC LIMIT 1").await;
+        assert!(
+            top.is_nan(),
+            "ORDER BY f DESC LIMIT 1 must be NaN, not the inf from RG0; got {top}\nplan:\n{topk_plan}"
+        );
+
+        let max_float = float_cell(&ctx, "SELECT MAX(f) AS mx FROM t").await;
+        assert!(
+            max_float.is_nan(),
+            "MAX(f) must be NaN on the multi-row-group file; got {max_float}"
+        );
+
+        let int_topk_plan =
+            physical_plan_with_statistics(&ctx, "SELECT k FROM t ORDER BY k DESC LIMIT 1").await;
+        assert!(
+            int_topk_plan.contains("DynamicFilter"),
+            "integer TopK must still attach a dynamic filter so trusted stats can prune:\n{int_topk_plan}"
+        );
+        assert_eq!(
+            pretty_rows(&ctx, "SELECT k FROM t ORDER BY k DESC LIMIT 1").await,
+            ["+---+", "| k |", "+---+", "| 6 |", "+---+"].join("\n")
+        );
+    }
+
+    /// Cluster executors must serialize listing parquet and restore the
+    /// NaN-safe `FileSource` on decode. Emitting a bare `ParquetScan` would
+    /// encode, then lose float-filter refusal when `DataFusion` rebuilds
+    /// `ParquetSource`.
+    #[tokio::test]
+    async fn listing_parquet_scan_round_trips_through_physical_plan_proto() {
+        use crate::listing::{NanSafeListingPhysicalCodec, is_nan_safe_listing_parquet_scan};
+        use datafusion_proto::physical_plan::{AsExecutionPlan, DefaultPhysicalExtensionCodec};
+        use datafusion_proto::protobuf::PhysicalPlanNode;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_multi_rg_nan_after_inf_parquet(&dir.path().join("multi_rg.parquet"));
+        let ctx = register_tricky_listing(&format!("file://{}/", dir.path().display())).await;
+        let planned = ctx
+            .sql("SELECT f FROM t ORDER BY f DESC LIMIT 1")
+            .await
+            .expect("plan sql")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        assert!(
+            is_nan_safe_listing_parquet_scan(&planned),
+            "the scheduler plan must wrap parquet scans before encode"
+        );
+
+        // Encode before any collect. TopK mutates its DynamicFilter as it
+        // runs; serializing after that would snapshot `f > NaN` and the
+        // decoded heap would drop every row.
+        let default_codec = DefaultPhysicalExtensionCodec {};
+        let proto = PhysicalPlanNode::try_from_physical_plan(Arc::clone(&planned), &default_codec)
+            .expect("listing parquet scan must serialize for distributed execution");
+        assert!(
+            listing_scan_is_extension(&proto),
+            "encode must tag the scan so decode can restore the NaN-safe source:\n{proto:?}"
+        );
+        let default_decode = proto.try_into_physical_plan(ctx.task_ctx().as_ref(), &default_codec);
+        assert!(
+            default_decode.is_err(),
+            "DefaultPhysicalExtensionCodec must not decode the tagged scan as a bare ParquetSource"
+        );
+
+        let codec = NanSafeListingPhysicalCodec;
+        let decoded = proto
+            .try_into_physical_plan(ctx.task_ctx().as_ref(), &codec)
+            .expect("tagged listing parquet scan must decode");
+        assert!(
+            is_nan_safe_listing_parquet_scan(&decoded),
+            "decode must restore the NaN-safe source"
+        );
+        let decoded_plan = datafusion::physical_plan::displayable(decoded.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            !decoded_plan.contains("predicate=DynamicFilter"),
+            "decoded float TopK must not carry a dynamic filter on the scan:\n{decoded_plan}"
+        );
+
+        let planned_top = collect_float_cell(Arc::clone(&planned), ctx.task_ctx()).await;
+        assert!(
+            planned_top.is_nan(),
+            "the live plan must return NaN; got {planned_top}"
+        );
+        // Collect the restored TopK once. A second collect of this same tree
+        // (the scan child, or TopK again) can come back empty: the decoded
+        // `ParquetSource` shares execution state with its parent.
+        let decoded_top = collect_float_cell(Arc::clone(&decoded), ctx.task_ctx()).await;
+        assert!(
+            decoded_top.is_nan(),
+            "the restored plan must return NaN; got {decoded_top}"
+        );
+
+        let scan_tree = proto
+            .try_into_physical_plan(ctx.task_ctx().as_ref(), &codec)
+            .expect("second decode of the tagged scan");
+        let scan = scan_tree
+            .children()
+            .into_iter()
+            .find(|child| {
+                child
+                    .as_ref()
+                    .downcast_ref::<datafusion::datasource::source::DataSourceExec>()
+                    .is_some()
+            })
+            .map(Arc::clone)
+            .expect("decoded TopK must still have a DataSourceExec");
+        let scan_rows = datafusion::physical_plan::collect(scan, ctx.task_ctx())
+            .await
+            .expect("collect freshly decoded scan");
+        let scan_n: usize = scan_rows.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            scan_n, 6,
+            "freshly decoded scan must read every row; batches={scan_rows:?}"
+        );
+
+        let int_plan = ctx
+            .sql("SELECT k FROM t ORDER BY k DESC LIMIT 1")
+            .await
+            .expect("plan int sql")
+            .create_physical_plan()
+            .await
+            .expect("int physical plan");
+        let int_proto = PhysicalPlanNode::try_from_physical_plan(int_plan, &codec)
+            .expect("integer listing parquet scan must serialize");
+        assert!(
+            listing_scan_is_extension(&int_proto),
+            "integer-only TopK must still tag the scan so decode keeps the wrapper:\n{int_proto:?}"
+        );
+        let int_decoded = int_proto
+            .try_into_physical_plan(ctx.task_ctx().as_ref(), &codec)
+            .expect("integer listing parquet scan must decode");
+        assert!(
+            is_nan_safe_listing_parquet_scan(&int_decoded),
+            "integer listing parquet decode must restore the NaN-safe source"
+        );
+    }
+
+    /// Cluster executors use a default function registry. A pushed Spice UDF
+    /// on the parquet scan must still decode via the active codec's
+    /// `try_decode_udf`, not `DefaultPhysicalExtensionCodec`.
+    #[tokio::test]
+    async fn listing_parquet_spice_udf_predicate_round_trips_on_executor_task_ctx() {
+        use crate::listing::{
+            decode_nan_safe_listing_parquet_scan, is_nan_safe_listing_parquet_scan,
+        };
+        use datafusion::common::{Result, internal_datafusion_err};
+        use datafusion::execution::{FunctionRegistry, TaskContext};
+        use datafusion::physical_plan::ExecutionPlan;
+        use datafusion_expr::ScalarUDF;
+        use datafusion_proto::physical_plan::{
+            AsExecutionPlan, DefaultPhysicalExtensionCodec, PhysicalExtensionCodec,
+            PhysicalProtoConverterExtension,
+        };
+        use datafusion_proto::protobuf::PhysicalPlanNode;
+        use runtime_datafusion::udf::register_core_scalar_udfs;
+
+        struct SchedulerUdfCodec {
+            functions: SessionContext,
+        }
+
+        impl std::fmt::Debug for SchedulerUdfCodec {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("SchedulerUdfCodec").finish_non_exhaustive()
+            }
+        }
+
+        impl PhysicalExtensionCodec for SchedulerUdfCodec {
+            fn try_decode(
+                &self,
+                buf: &[u8],
+                inputs: &[Arc<dyn ExecutionPlan>],
+                ctx: &TaskContext,
+                proto_converter: &dyn PhysicalProtoConverterExtension,
+            ) -> Result<Arc<dyn ExecutionPlan>> {
+                if !inputs.is_empty() {
+                    return Err(internal_datafusion_err!(
+                        "NaN-safe listing parquet scan is a leaf and must not have inputs"
+                    ));
+                }
+                decode_nan_safe_listing_parquet_scan(buf, ctx, self, proto_converter)
+            }
+
+            fn try_encode(
+                &self,
+                _node: Arc<dyn ExecutionPlan>,
+                _buf: &mut Vec<u8>,
+                _proto_converter: &dyn PhysicalProtoConverterExtension,
+            ) -> Result<()> {
+                Err(internal_datafusion_err!(
+                    "NaN-safe listing parquet scans serialize via FileSource::try_to_proto"
+                ))
+            }
+
+            fn try_decode_udf(&self, name: &str, _buf: &[u8]) -> Result<Arc<ScalarUDF>> {
+                self.functions.udf(name)
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_tricky_parquet(&dir.path().join("tricky.parquet"));
+        let scheduler = register_tricky_listing(&format!("file://{}/", dir.path().display())).await;
+        register_core_scalar_udfs(&scheduler);
+
+        let sql = "SELECT k FROM t WHERE bucket(10, k) = 0 ORDER BY k";
+        let planned = scheduler
+            .sql(sql)
+            .await
+            .expect("plan sql")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        assert!(
+            is_nan_safe_listing_parquet_scan(&planned),
+            "the scheduler plan must wrap parquet scans before encode"
+        );
+        let planned_text = datafusion::physical_plan::displayable(planned.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            planned_text.contains("bucket"),
+            "the plan must use the Spice bucket UDF:\n{planned_text}"
+        );
+        assert!(
+            planned_text.contains("predicate="),
+            "bucket must be pushed onto the parquet scan so inner ParquetScan decode sees it:\n{planned_text}"
+        );
+
+        let proto = PhysicalPlanNode::try_from_physical_plan(
+            Arc::clone(&planned),
+            &DefaultPhysicalExtensionCodec {},
+        )
+        .expect("listing parquet scan must serialize");
+        assert!(
+            listing_scan_is_extension(&proto),
+            "encode must tag the scan:\n{proto:?}"
+        );
+
+        let executor = SessionContext::new();
+        let executor_task_ctx = executor.task_ctx();
+        assert!(
+            executor_task_ctx.udf("bucket").is_err(),
+            "executor TaskContext must not preload Spice UDFs"
+        );
+
+        let codec = SchedulerUdfCodec {
+            functions: scheduler.clone(),
+        };
+        let decoded = proto
+            .try_into_physical_plan(executor_task_ctx.as_ref(), &codec)
+            .expect("pushed Spice UDF predicate must decode on an executor TaskContext");
+        assert!(
+            is_nan_safe_listing_parquet_scan(&decoded),
+            "decode must restore the NaN-safe source"
+        );
+
+        let expected = pretty_rows(&scheduler, sql).await;
+        let decoded_batches = datafusion::physical_plan::collect(
+            Arc::clone(&decoded),
+            Arc::clone(&executor_task_ctx),
+        )
+        .await
+        .expect("execute decoded plan");
+        let got = arrow::util::pretty::pretty_format_batches(&decoded_batches)
+            .expect("format decoded rows")
+            .to_string();
+        assert_eq!(
+            got, expected,
+            "decoded executor plan must return the scheduler rows"
+        );
+    }
+
+    async fn collect_float_cell(
+        plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        task_ctx: Arc<datafusion::execution::TaskContext>,
+    ) -> f64 {
+        use arrow::array::Float64Array;
+
+        let plan_text = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        let batches = datafusion::physical_plan::collect(plan, task_ctx)
+            .await
+            .unwrap_or_else(|err| panic!("collect plan: {err}\n{plan_text}"));
+        assert!(
+            !batches.is_empty() && batches[0].num_rows() > 0,
+            "plan returned no rows:\n{plan_text}"
+        );
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("float column")
+            .value(0)
+    }
+
+    fn listing_scan_is_extension(proto: &datafusion_proto::protobuf::PhysicalPlanNode) -> bool {
+        use datafusion_proto::protobuf::physical_plan_node::PhysicalPlanType;
+        match proto.physical_plan_type.as_ref() {
+            Some(PhysicalPlanType::Extension(_)) => true,
+            Some(PhysicalPlanType::Sort(sort)) => sort
+                .input
+                .as_ref()
+                .is_some_and(|input| listing_scan_is_extension(input)),
+            Some(PhysicalPlanType::Projection(projection)) => projection
+                .input
+                .as_ref()
+                .is_some_and(|input| listing_scan_is_extension(input)),
+            Some(PhysicalPlanType::Merge(coalesce)) => coalesce
+                .input
+                .as_ref()
+                .is_some_and(|input| listing_scan_is_extension(input)),
+            Some(PhysicalPlanType::CoalesceBatches(coalesce)) => coalesce
+                .input
+                .as_ref()
+                .is_some_and(|input| listing_scan_is_extension(input)),
+            Some(PhysicalPlanType::GlobalLimit(limit)) => limit
+                .input
+                .as_ref()
+                .is_some_and(|input| listing_scan_is_extension(input)),
+            Some(PhysicalPlanType::LocalLimit(limit)) => limit
+                .input
+                .as_ref()
+                .is_some_and(|input| listing_scan_is_extension(input)),
+            Some(PhysicalPlanType::Filter(filter)) => filter
+                .input
+                .as_ref()
+                .is_some_and(|input| listing_scan_is_extension(input)),
+            _ => false,
+        }
     }
 
     /// Regression test for Glue TPC-H plans that switched every `HashJoinExec`
@@ -7335,6 +8597,70 @@ mod tests {
             message.contains("Thrift list declares 2147483647 elements"),
             "the error has to name the declared count, or an oversized footer is \
              indistinguishable from a truncated one: {message}"
+        );
+    }
+
+    /// A Parquet footer whose schema nests deeper than 100 levels is refused, and one
+    /// at exactly 100 levels still opens.
+    ///
+    /// The footer's schema is a flat element list that the reader rebuilds into a tree by
+    /// recursing once per nesting level, so a file of a few KiB can declare enough levels to
+    /// exhaust the stack during schema inference at dataset initialization. A Spice patch to
+    /// the `spiceai/arrow-rs` fork bounds that depth.
+    #[test]
+    fn a_footer_schema_nested_past_the_depth_limit_is_a_parquet_error() {
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::arrow::arrow_writer::ArrowWriterOptions;
+        use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+
+        const MAX_DEPTH: usize = 100;
+
+        // A column whose leaf sits `depth` levels below the schema root.
+        fn file_with_leaf_at(depth: usize) -> bytes::Bytes {
+            let mut field =
+                arrow::datatypes::Field::new("leaf", arrow::datatypes::DataType::Int64, true);
+            for _ in 1..depth {
+                field = arrow::datatypes::Field::new_struct("s", vec![field], true);
+            }
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+            let mut buffer = Vec::new();
+            ArrowWriter::try_new_with_options(
+                &mut buffer,
+                schema,
+                ArrowWriterOptions::new().with_skip_arrow_metadata(true),
+            )
+            .expect("parquet writer")
+            .close()
+            .expect("writes the footer");
+            bytes::Bytes::from(buffer)
+        }
+
+        let reader =
+            SerializedFileReader::new(file_with_leaf_at(MAX_DEPTH)).expect("reads the footer");
+        assert_eq!(
+            reader
+                .metadata()
+                .file_metadata()
+                .schema_descr()
+                .column(0)
+                .path()
+                .parts()
+                .len(),
+            MAX_DEPTH,
+            "the accepted file has to sit exactly at the limit"
+        );
+
+        let Err(error) = SerializedFileReader::new(file_with_leaf_at(MAX_DEPTH + 1)) else {
+            panic!(
+                "a footer schema nested {} levels deep was accepted",
+                MAX_DEPTH + 1
+            );
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("Parquet schema nesting depth exceeds the maximum of 100"),
+            "the footer was refused, but not on the depth limit: {error}"
         );
     }
 

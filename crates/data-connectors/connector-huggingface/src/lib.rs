@@ -18,7 +18,8 @@ limitations under the License.
 //! reads the Parquet, CSV, TSV, JSON and ORC files of a dataset on the Hugging Face Hub.
 //!
 //! Each scan reads one commit of the dataset (see [`table`]), and the files are read through
-//! the Hub's own API, so private and gated datasets work with an `hf_token`.
+//! the Hub's own API, so private and gated datasets work with a token: `hf_token`, `HF_TOKEN`,
+//! or the one `hf auth login` saves (see [`huggingface_hub::settings`]).
 
 use std::any::Any;
 use std::collections::BTreeSet;
@@ -61,6 +62,7 @@ mod tests;
 
 // The Hub client and `hf://` locations live in `huggingface-hub`, the one client every
 // component reads the Hub through; they keep their names here.
+use huggingface_hub::settings::{self, Access, Environment, ParamToken, ProcessEnvironment};
 use huggingface_hub::{client as hub, location};
 
 use hub::{Commit, EntryKind, Hub, HubConfig};
@@ -84,11 +86,9 @@ const INFERABLE_FORMATS: &[&str] = &[
 
 #[derive(Debug, Snafu)]
 enum Error {
-    #[snafu(display(
-        "`hf_endpoint` {endpoint:?} is not a valid endpoint: use an https:// URL such as '{}' (http:// is accepted only for a loopback address). See: {DOCS_URL}",
-        hub::DEFAULT_ENDPOINT
-    ))]
-    InvalidEndpoint { endpoint: String },
+    // The cause names the setting at fault and how to fix it.
+    #[snafu(display("{source}. See: {DOCS_URL}"))]
+    Settings { source: settings::Error },
 
     #[snafu(display("{source}"))]
     Hub { source: hub::Error },
@@ -122,13 +122,11 @@ enum ColumnsError {
 static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     let mut all_parameters = vec![
         ParameterSpec::component("token")
-            .description("A Hugging Face User Access Token, to read private and gated datasets.")
+            .description("A Hugging Face User Access Token, to read private and gated datasets. Defaults to `HF_TOKEN`, then `HUGGING_FACE_HUB_TOKEN`, then the token `hf auth login` saves.")
             .secret(),
-        ParameterSpec::component("endpoint")
-            .description(
-                "The Hugging Face Hub endpoint, to read through a mirror or proxy of the Hub.",
-            )
-            .default(hub::DEFAULT_ENDPOINT),
+        ParameterSpec::component("endpoint").description(
+            "The Hugging Face Hub endpoint, to read through a mirror or proxy of the Hub. Defaults to `HF_ENDPOINT`, then `https://huggingface.co`.",
+        ),
     ];
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters
@@ -160,26 +158,25 @@ fn store_for(
     Ok(store)
 }
 
-/// Parses `hf_endpoint`. The token is sent to it, so it must be https unless it is loopback.
-fn parse_endpoint(endpoint: &str) -> Result<Url, Error> {
-    let invalid = || Error::InvalidEndpoint {
-        endpoint: endpoint.to_string(),
+/// The endpoint and the token a dataset with `params` reads the Hub with, resolved in `env` as
+/// every Hugging Face component resolves them. An `hf_token` a secret store loaded because the
+/// Spicepod does not set it is scoped like `HF_TOKEN`, which the environment secret store
+/// reads for it: it never goes to an `hf_endpoint` the Spicepod sets.
+async fn access(params: &Parameters, env: &impl Environment) -> Result<Access, Error> {
+    let endpoint = match params.get("endpoint").expose() {
+        ExposedParamLookup::Present(endpoint) => Some(endpoint),
+        ExposedParamLookup::Absent(_) => None,
     };
-    let url = Url::parse(endpoint).map_err(|_| invalid())?;
-    let loopback = match url.host() {
-        Some(url::Host::Domain(domain)) => domain == "localhost",
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    };
-    let valid = url.has_host()
-        && url.query().is_none()
-        && url.fragment().is_none()
-        && url.username().is_empty()
-        && url.password().is_none()
-        && (url.scheme() == "https" || (url.scheme() == "http" && loopback));
-    ensure!(valid, InvalidEndpointSnafu { endpoint });
-    Ok(url)
+    let token = params.get("token").ok().map(|token| {
+        if params.is_autoloaded("token") {
+            ParamToken::SecretStore(token.clone())
+        } else {
+            ParamToken::Spicepod(token.clone())
+        }
+    });
+    Access::resolve_in(env, token, endpoint)
+        .await
+        .context(SettingsSnafu)
 }
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -208,17 +205,22 @@ impl DataConnectorFactory for HuggingFaceFactory {
         _context: &'a dyn ConnectorContext,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
-            let endpoint = match params.parameters.get("endpoint").expose() {
-                ExposedParamLookup::Present(endpoint) => parse_endpoint(endpoint)?,
-                ExposedParamLookup::Absent(_) => parse_endpoint(hub::DEFAULT_ENDPOINT)?,
-            };
-            let token: Option<SecretString> = params.parameters.get("token").ok().cloned();
+            let Access {
+                endpoint,
+                token,
+                token_scope,
+                ..
+            } = access(&params.parameters, &ProcessEnvironment).await?;
             let component = match &params.component {
                 ConnectorComponent::Dataset(dataset) => dataset.name.to_string(),
                 ConnectorComponent::Catalog(catalog) => catalog.name.clone(),
             };
             let store = store_for(
-                HubConfig { endpoint, token },
+                HubConfig {
+                    endpoint,
+                    token,
+                    token_scope,
+                },
                 &component,
                 params.io_runtime.clone(),
             )
@@ -840,7 +842,7 @@ fn hub_error(dataset: &DatasetSpec, source: hub::Error) -> DataConnectorError {
     match source {
         hub::Error::RepoNotFound { .. }
         | hub::Error::RevisionNotFound { .. }
-        | hub::Error::InvalidToken
+        | hub::Error::InvalidToken { .. }
         | hub::Error::InvalidEndpoint { .. } => DataConnectorError::InvalidConfigurationNoSource {
             dataconnector,
             connector_component,

@@ -1,0 +1,63 @@
+name: memory-limit
+description: >
+  Under a `runtime.query.memory_limit` (1 GiB) smaller than what the
+  queries hold at once, queries over a Cayenne acceleration of 2 million
+  rows — sorts, high-cardinality aggregations, distinct counts, joins,
+  window functions — answer as PostgreSQL does, spilling as needed; and
+  federated, the same. (Smaller limits refuse spillable work:
+  known-failing/cayenne/memory-limit-spill.yaml.)
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  cayenne: {}
+  federated: { datasets: { '*': { acceleration: null } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: memory-limit
+  runtime:
+    query: { memory_limit: 1GiB }
+  datasets:
+    - from: postgres:public.big
+      name: big
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file }
+    - from: postgres:public.dim
+      name: dim
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file }
+
+defaults:
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+  ready-timeout: 5m
+
+steps:
+  # 2,000,000 rows of about 100 bytes: a few hundred MiB across the queries'
+  # sorts and hash tables.
+  - source-exec:
+      src: |
+        CREATE TABLE big (id bigint PRIMARY KEY, k int NOT NULL, g int NOT NULL, s text NOT NULL, v double precision NOT NULL);
+        INSERT INTO big SELECT i, (i::bigint * 7919) % 1000003, i % 97, md5(i::text) || md5((i * 3)::text), (i % 1000) / 7.0
+          FROM generate_series(1, 2000000) i;
+        CREATE TABLE dim (id int PRIMARY KEY, label text NOT NULL);
+        INSERT INTO dim SELECT i, 'label ' || i FROM generate_series(0, 1000002) i;
+  - start: {}
+  - query: SELECT count(*) AS n, sum(k) AS sk FROM big
+
+  # A sort of every row, kept small in the answer by a window over it.
+  - query: SELECT id, s FROM big ORDER BY s DESC, id LIMIT 20
+  - query: SELECT s, id FROM (SELECT s, id, row_number() OVER (ORDER BY s, id) AS r FROM big) t WHERE r % 200000 = 0 ORDER BY r
+  # High-cardinality aggregation and distinct counts.
+  - query: SELECT count(*) AS groups, sum(c) AS rows FROM (SELECT k, count(*) AS c FROM big GROUP BY k) t
+  - query: SELECT count(DISTINCT k) AS dk, count(DISTINCT s) AS ds FROM big
+  - query: SELECT g, count(DISTINCT k) AS dk, max(s) AS ms FROM big GROUP BY g ORDER BY g
+  # A join building on the large side.
+  - query: SELECT count(*) AS n, count(DISTINCT d.label) AS labels FROM big b JOIN dim d ON b.k = d.id
+  - query: SELECT d.id, count(*) AS n FROM dim d JOIN big b ON b.k = d.id GROUP BY d.id ORDER BY n DESC, d.id LIMIT 10
+  # Windows partitioned over many groups.
+  - query: SELECT g, max(rk) AS top FROM (SELECT g, rank() OVER (PARTITION BY g ORDER BY v DESC, id) AS rk FROM big) t GROUP BY g ORDER BY g
