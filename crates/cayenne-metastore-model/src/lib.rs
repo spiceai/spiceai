@@ -13,6 +13,7 @@ mod floors;
 mod intent_roll_forward;
 mod position_deletes;
 mod read_programs;
+mod replicas;
 mod retention;
 mod seq_order;
 mod source_positions;
@@ -381,6 +382,94 @@ pub fn runs() -> Vec<Run> {
             bound: 0,
             seed: None,
             failure: "rows or an error",
+        },
+        Run {
+            name: "replicas",
+            family: "replicas",
+            mode: "replicas",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "replicas-readers",
+            family: "replicas",
+            mode: "replicas-readers",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "replicas-readers-source-404-only",
+            family: "replicas",
+            mode: "replicas-readers-source-404-only",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "replicas-readers-adoption-all-present",
+            family: "replicas",
+            mode: "replicas-readers-adoption-all-present",
+            bound: 0,
+            seed: None,
+            failure: "an adopted head references only objects in the replica",
+        },
+        Run {
+            name: "replicas-readers-no-frontier",
+            family: "replicas",
+            mode: "replicas-readers-no-frontier",
+            bound: 0,
+            seed: None,
+            failure: "a head confirmed current references only objects in the replica",
+        },
+        Run {
+            name: "replicas-readers-adopt-lower",
+            family: "replicas",
+            mode: "replicas-readers-adopt-lower",
+            bound: 0,
+            seed: None,
+            failure: "a reader never adopts a lower head",
+        },
+        Run {
+            name: "replicas-readers-replica-time",
+            family: "replicas",
+            mode: "replicas-readers-replica-time",
+            bound: 0,
+            seed: None,
+            failure: "a query within the protection window never fails",
+        },
+        Run {
+            name: "replicas-readers-missing-as-empty",
+            family: "replicas",
+            mode: "replicas-readers-missing-as-empty",
+            bound: 0,
+            seed: None,
+            failure: "rows or an error",
+        },
+        Run {
+            name: "replicas-orphan-head-age",
+            family: "replicas",
+            mode: "replicas-orphan-head-age",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "replicas-eu-age-only",
+            family: "replicas",
+            mode: "replicas-eu-age-only",
+            bound: 0,
+            seed: None,
+            failure: "replica GC never deletes an object the source head references",
+        },
+        Run {
+            name: "replicas-eu-orphan-no-source-check",
+            family: "replicas",
+            mode: "replicas-eu-orphan-no-source-check",
+            bound: 0,
+            seed: None,
+            failure: "replica GC never deletes an object the source head references",
         },
         Run {
             name: "naming",
@@ -2324,8 +2413,15 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
                 "dataset-lifecycle"
                 | "source-positions"
                 | "retention"
+                | "replicas"
+                | "replicas-readers"
+                | "replicas-readers-source-404-only"
+                | "replicas-orphan-head-age"
                 | "unknown-action-refusal" => *expectation == Expectation::Sometimes,
                 "commits-retry-expiry" => name == "unresolved past evidence horizon",
+                "replicas-eu-orphan-no-source-check" => {
+                    name == "writer commits an upload the replica already deleted"
+                }
                 "commits-restart-turnover" => matches!(
                     name,
                     "restart and lease turnover" | "persisted attempt restored"
@@ -2426,6 +2522,7 @@ where
                 || run.family == "retention"
                 || run.family == "standby"
                 || run.family == "intent-roll-forward"
+                || run.family == "replicas"
                 || run.mode.contains("restart")
                 || run.family == "action-compatibility")
                 && p.expectation != Expectation::Sometimes
@@ -2481,6 +2578,7 @@ pub fn run(name: &str) -> Result<(), String> {
         "standby" => check(standby::Protocol::new(r.mode), r),
         "action-compatibility" => check(action_compatibility::Protocol::new(r.mode), r),
         "retention" => check(retention::Protocol::new(r.mode), r),
+        "replicas" => check(replicas::Protocol::new(r.mode), r),
         "commits" => check(commits::Protocol::new(r.mode, r.bound), r),
         "transactions" => check_with_symmetry(
             transactions::Protocol::new(r.mode, r.bound),

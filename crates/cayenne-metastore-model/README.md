@@ -62,6 +62,7 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `intent-roll-forward*` | Proposed single-writer alternative to two-phase commit: one writer holding both datasets' leases commits A's actions, the source position and a pending intent for B in one A record, applies the intent to B under the transaction id, optionally marks it done in A; the next lease holder rolls pending intents forward. Maintenance on either head, delayed/duplicate CAS, lost responses resolved by attempt id, crash, pause and fencing; atomicity, at-most-once B apply, acknowledged/positioned transactions in both datasets at quiescence, I2, no retraction, B values in commit-point order, I5 | 1 or 2 source transactions on one key; one maintenance commit per dataset; one turnover and one crash (`two-takeovers`: two each); 2 copies per request; `disjoint-writer` adds one keyed write to another key of B |
 | `window-storage` | Canonical inline bytes, byte/count pressure, copy rule, cold replay, a running query, checkpoint/GC; I4, I7, I8 | Exhaustive 6 records; controls 5; samples 7, 9 |
 | `retention` / `retention-readers` | Readers never write and GC has no generations: removed objects deleted a fixed retention after GC observes the removal, which stays in durable state until the delete (timers restarted at takeover); never-committed uploads deleted once the head's store time is T_O past theirs; GC's empty commit on an idle head; fresh object names; a writer references only base-live objects or its own never-published uploads, while its base's store time is less than T_O minus a margin past the upload's; object timestamps that lag the writer's lower bound; deletes and commits that land arbitrarily late. `retention-readers` adds one query whose head GET responds late, and stops once the query settles. No dangling reference, rows or an error, and a query within the retention never fails | Exhaustive: 2 object names, 9 clock ticks, 6 head versions, retention 3, staleness 1, upload age 4, timestamp error 1, two sweeps, one takeover; the writer graph adds timestamp skew, the reader graph one query |
+| `replicas` / `replicas-readers` | Regional read-only replicas: writers and the source GC use only the source location; one-way replication copies objects and head versions to the replica one at a time in any order, with no delete replication and nothing committed to the replica; the replica head key holds whichever version arrived last. A replica reader adopts only a newer replicated head whose newly referenced objects are present in the replica, confirms it with a conditional GET on the source head timed from the request, starts a query from a head confirmed within S and reads only the replica. The source GC deletes a removed object T after its removal and an aged never-committed upload, after which the writer cannot commit it. The replica GC deletes a copy T after it reads the removal in the replica head, and a copy no replicated head mentions once the source returns 404. Checks that a head confirmed current references only replica objects, no lower head is adopted, a query within T - S never fails, rows or an error, and the replica GC never deletes an object the source head references | Exhaustive: 5 head versions, 8 clock ticks, retention 3, staleness 1, upload age 4; the GC graph has 2 objects and no reader, the reader graph 1 object and one query and stops once it settles; `replicas-orphan-head-age` keeps 4 versions |
 | `window-txn` | Transaction resolution composed with explicit delayed byte-batch sealing and eviction; I3–I6, I8 | Exhaustive 0; samples 2, 3 |
 | `concurrent-txn-overlap`, `concurrent-txn-disjoint` | Two transaction identities, overlapping/disjoint footprints, ordinary writer, rejected and late Prepare, opposite reservations, cleanup, checkpointed pending ids; I4, I6, I8 | Exhaustive/control 0; samples 1, 2 |
 | `concurrent-floor-aligned` | Published floor at batch boundaries, reader reopen, a query kept by retention and delayed deletion; I4, I7, I8 | Exhaustive 6 records; samples 7, 9 |
@@ -184,6 +185,13 @@ as a separate maintenance process does.
 | `retention-readers-sweep-removed` | The orphan sweep ignores recorded removals: it deletes a recently removed, old upload a query still reads |
 | `retention-readers-response-time` | A head confirmation is timed from its response instead of its request: a late response admits a query whose objects are already deleted |
 | `retention-readers-missing-as-empty` | A missing object reads as empty: wrong rows instead of an error |
+| `replicas-readers-adoption-all-present` | Checks the stronger property that an adopted head references only objects present in the replica: it fails under the incremental frontier check (see below), not a removed safeguard |
+| `replicas-readers-no-frontier` | The reader adopts a replicated head without checking its new objects are in the replica: a head confirmed current references a missing object |
+| `replicas-readers-adopt-lower` | The reader adopts whatever the replica head shows: after an out-of-order arrival it adopts a lower head |
+| `replicas-readers-replica-time` | Freshness taken from the replica head's own `LastModified` instead of a source confirmation: a head that arrived long after the source moved on starts a query whose object the replica GC already deleted |
+| `replicas-readers-missing-as-empty` | A missing replica object reads as empty: wrong rows instead of an error |
+| `replicas-eu-age-only` | The replica GC deletes copies by age alone, without a removal record or source check: it deletes an object the source head references |
+| `replicas-eu-orphan-no-source-check` | The replica GC deletes a copy no replicated head mentions once the replica's clock is T_O past it, without a source HEAD: it deletes an object the source head references, both after an unreplicated commit and before the writer's commit of an upload on an idle head (a required witness) |
 | `source-ack-before-acceptance` | Acknowledge buffered changes before CAS acceptance: I2 |
 | `source-position-before-data` | Separate offset record lands first: logged prefix lacks rows (I10) |
 | `source-position-after-data` | Separate data record lands first, crash/redelivery appends it again: I10 |
@@ -281,8 +289,8 @@ not model stale asynchronous rewrite publication.
 The PK index refreshes as a checkpoint collection.
 The graph does not model asynchronous index construction or real index bytes.
 
-`retention` and `retention-readers` are the only reader and garbage-collection
-protocol. Readers never write: a query starts from a head confirmed within the
+`retention` and `retention-readers` are the only single-location reader and
+garbage-collection protocol. Readers never write: a query starts from a head confirmed within the
 staleness bound S of when its GET was sent, and every object it needs survives at
 least T - S, because each was live at that confirmation and GC deletes a removed
 object only T after observing its removal. The removal stays recorded in durable
@@ -304,6 +312,44 @@ graph adds one query with a late GET response and stops once that query settles.
 Other graphs abstract this contract: a query is protected from its start until it
 expires, and the orphan sweep takes only an upload that has aged, which the writer
 can no longer reference.
+
+`replicas` and `replicas-readers` add a read-only replica location. Nothing commits
+to the replica and source deletes do not replicate, so only the replica GC removes a
+copy. Replication copies each object and each head version independently, so a head
+can arrive before its objects and a newer head before an older one; the replica head
+key then regresses to the older version. A reader adopts a head only if it is newer
+than the one it holds and every object it newly references answers a HEAD in the
+replica; it waits otherwise. A replica alone cannot show its lag, so freshness is a
+conditional GET on the source head, timed from when it was sent. A head confirmed
+current was live at the source at that time, so every object it references was
+neither removed nor deleted there, and the replica GC has no removal or 404 to act
+on: the query is protected for T - S from its start, as in the retention graph.
+Replication lag does not shorten that window; it consumes S instead, because a
+reader whose replicated head is behind the source cannot confirm it and cannot start
+a query until a newer head and its objects arrive. The replica GC starts a removal's
+timer when it reads the removal in the replica head, which is no earlier than the
+removal at the source, and sweeps a copy no replicated head mentions only once the
+source returns 404, which is permanent because names are never reused. An orphan the
+source has not swept may still be committed, so the replica's own clock cannot age
+it: on an idle head the writer commits an upload the replica's clock calls old.
+
+The model also checks two simplifications. `replicas-readers-source-404-only`
+deletes any copy the source returns 404 for, with no removal timers: queries stay
+protected, because the source deletes a removed object only T after its removal.
+`replicas-orphan-head-age` sweeps an unmentioned copy once the replica head's
+`LastModified` is T_O past it, the source sweep's rule applied to the replicated
+head: the writer's base is at least as new as any replicated head, so it would refuse
+that upload, and no HEAD to the source is needed.
+
+The design's frontier check covers only newly referenced objects, and
+`replicas-readers-adoption-all-present` shows it does not ensure every object of an
+adopted head is in the replica. The reader adopts v1 holding o; v3, which removes o,
+arrives before v2; the replica GC deletes o T after reading the removal; v2 arrives,
+the replica head regresses to it, and the reader adopts v2, which carries o from v1
+and so is not checked. The head is already superseded at the source, so it can never
+be confirmed and no query reads it: the checked guarantee is that a head confirmed
+current references only replica objects. HEADing every referenced object at adoption
+would restore the stronger property at one request per object.
 
 ## Composition boundaries and liveness
 
@@ -432,7 +478,15 @@ check how the caller recovers the logical write. `standby` has one dataset, one
 source partition, at most one crash and one pause, never-lost ingest CAS
 responses, a single global clock (no clock drift between instances or against
 the lease object), and no retention, checkpoints or GC; its availability bound
-holds only under the urgent-step timing assumptions above. Results are symbolic protocol
+holds only under the urgent-step timing assumptions above. The replica graphs have one source writer that
+commits atomically, one source GC, one replica GC whose timers are never lost, and
+one reader with one query; the reader graph has one object. They abstract the
+writer's in-flight commits and timestamp skew to the retention graph's age rule, and
+copies to atomic steps that read the source. Readers read the replica head key, so a
+regressed key can hide an arrived newer head until the next source commit
+replicates; reading the highest-numbered replicated version would avoid that, and
+neither is checked for liveness. Reclaiming every copy the source deleted is a
+reachable witness, not a bounded-growth property under fairness. Results are symbolic protocol
 evidence, not observations of the Spice engine or a storage provider.
 
 All checkers use a 540-second watchdog. Incomplete budget probes establish no
