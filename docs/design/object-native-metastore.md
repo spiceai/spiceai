@@ -622,27 +622,34 @@ rows a query returns.
   fixed retention T (about an hour) after it observes that record. No LIST is
   needed, as Delta Lake deletes from its `remove` actions and Iceberg from
   expired snapshots.
+- *The removal stays recorded* in durable state until GC deletes the file, so
+  a new GC after a takeover still knows it, and the sweep of uploads that never
+  committed skips it.
 - *Readers write nothing.* A query starts from a state confirmed current within
-  the staleness bound S, so every file it needs survives at least T − S. A
+  the staleness bound S, counted from when the confirming request was sent, so
+  every file it needs survives at least T − S. A
   query that outlives that may fail, with an error saying to rerun it; it never
   gets other rows. A read-only node needs only read access to the location.
-- *Uploads that never committed* are collected by age. Every object has a fresh
-  name. A writer references only objects live in its commit's base and its own
-  uploads younger than an age limit (about a day). GC deletes an unreferenced
-  upload once it is older than that by the store's clock, after the head has
-  moved and been re-read: a commit sent before the upload was old then cannot
-  land, and one sent after fails the writer's check. On an idle dataset, GC
-  moves the head with an empty commit.
-- *No clock is compared across machines.* GC times uploads on the store's
-  clock and removals on its own; the writer measures a duration on its own
-  monotonic clock; a takeover restarts the removal timers.
+- *Uploads that never committed* are collected by age on the store's clock.
+  Every object has a fresh name. A writer references only objects live in its
+  commit's base and its own uploads it has never published, and refuses an
+  upload once its base's store time is an age limit (about a day) past the
+  upload's. GC deletes an unreferenced upload once the head it read is that
+  age limit past the upload's `LastModified`. A commit that lands after GC's
+  read is based on that head or a newer one, so the writer would have refused
+  the upload. On an idle dataset, GC makes an empty commit so the head's time
+  advances.
+- *No clock is compared across machines.* Upload ages are differences of two
+  store timestamps; GC times removals on its own clock; a takeover restarts
+  the removal timers.
 - *Long uploads* that cannot commit within the age limit are split across
   several commits. If that ever binds, a `PREPARE_UPLOAD` record can protect a
   long upload's objects by reference until it commits or a `RELEASE_UPLOAD`
   drops them.
 
-The protocol model checks this as one graph: with any rule removed, a committed
-state references a deleted file, or a query within the retention fails.
+The protocol model checks this in two graphs, one for references and one for
+queries: with any rule removed, a committed state references a deleted file, or
+a query within the retention fails.
 
 *Details in:* [Checkpoints and garbage collection](object-native-metastore-technical.md#checkpoints-and-garbage-collection).
 
@@ -659,11 +666,16 @@ state references a deleted file, or a query within the retention fails.
   generation and GC lists only generations no live writer uses. Rejected: it
   avoids listing the whole prefix, but needs explicit generation closes once
   writers run on several nodes, an interlock and an admission guard for reused
-  content addresses, and repeated sweeps to catch late uploads. The age rule,
-  the head move and fresh names need none of them.
-- *Alternative: an age limit without the head move.* Rejected: the writer
-  checks age when it sends a commit, but a store can apply the request much
-  later, so a late commit could reference an upload GC already deleted.
+  content addresses, and repeated sweeps to catch late uploads. The age rule
+  and fresh names need none of them.
+- *Alternative: the writer ages uploads on its own clock, and GC waits for the
+  head to move and rechecks.* Rejected: it compares the writer's clock with the
+  store's, so a store clock that runs ahead lets GC delete an upload the writer
+  still thinks young. Measuring both ages against the head removes the clock
+  comparison, and the head move and the recheck with it.
+- *Alternative: GC times candidates on its own clock from the first LIST that
+  saw them.* Rejected: GC would have to remember its listings, and a restart
+  would start every wait again.
 
 ## User-facing surface (proposal for the Enhancement)
 

@@ -67,8 +67,8 @@ objects that records reference.
 | **The copy rule** | When a batch is sealed, by whom, and when the head may drop its records. | Each part is needed: a cut that depends on the observed head, sealing before a batch is final, dropping before the batch exists, or a listed range that does not match the dropped records each lose or corrupt records for lagging readers (model). |
 | **Floor and checkpoint in the head** | Where readers start, and what GC may reclaim. | Readers and GC learn both from the same atomic object as the commits. GC that uses a checkpoint the head does not name loses a running query's state (model). |
 | **Lease generation in the head** | The current owner's generation. | A new owner's CAS makes every older writer's next CAS fail, and the generation tells the older writer, once it re-reads, that it must stop rather than retry (model). |
-| **Deletion from the log, after a retention** | GC deletes a file a fixed retention T after the record that removed it. | No LIST for what was once live; the records already say what left. A query that starts from a recent state can read for the retention, with no reader write (model). |
-| **Uploads collected by age** | Every object has a fresh name; GC deletes an unreferenced upload once it is old by the store's clock, after the head has moved and been re-read. | A delayed or fenced writer's upload is either collected or never referenced: a writer references only its own young uploads, and a commit sent before an upload was old fails once the head moves (model). |
+| **Deletion from the log, after a retention** | GC deletes a file a fixed retention T after the record that removed it; the removal stays in durable state until then. | No LIST for what was once live; the records already say what left. A query that starts from a recent state can read for the retention, with no reader write, and a new GC after a takeover still knows every pending removal (model). |
+| **Uploads collected by age on the store's clock** | Every object has a fresh name; GC deletes an unreferenced upload once the head's `LastModified` is T_O past the upload's. | A delayed or fenced writer's upload is either collected or never referenced: a writer references only its own unpublished uploads, aged against the head its commit is based on, so a commit that lands after GC read the head would have been refused. No machine's clock is involved (model). |
 | **Identical retry** | Resolves a lost CAS response. | The retry carries the same bytes and condition, so success is acceptance and failure proves rejection, with no extra record to write (model). |
 | **Group commit** | Folds queued commits into the next CAS. | A writer can have one useful CAS in flight, because each CAS needs the version the previous one produced. Group commit gives the throughput instead. |
 
@@ -612,6 +612,10 @@ multipart uploads, on S3 Express, or on GCS or Azure.
   means nothing changed. A 200 carries every record still in the window,
   inline. A node that is further behind fetches the listed batches it needs,
   in parallel.
+- **Freshness counts from when the GET was sent.** A head is confirmed as of
+  the moment its request left, not when the response arrived, so a response
+  that stalls cannot make an old head look fresh (model:
+  `retention-readers-response-time` fails).
 - **Datasets in use refresh in the background.** A dataset queried within the
   last one or two refresh intervals is refreshed ahead of its queries, so they
   rarely wait. Refreshing early is always safe: a newer committed head never
@@ -691,7 +695,11 @@ commit n (`checkpoints/<n>`) consists of:
   - per table, a list of **pages** for each large collection (live files,
   deletion vectors, write-back markers, the PK index), each with its key range
   and BLAKE3 digest;
-  - recent attempt ids, the retained evidence for resolving uncertain writes.
+  - recent attempt ids, the retained evidence for resolving uncertain writes;
+  - the **pending removals**: each object a record removed that GC has not yet
+    deleted, with the commit that removed it. Together with the removals in
+    later records, they tell a new GC after a takeover what is still waiting
+    out the retention, and the orphan sweep skips them.
 - **Pages**: sorted, size-bounded (~1–4 MiB), immutable chunks of one
 collection, such as live files or deletion vectors, stored as objects. The
 `object_store_occ` WAL splits its checkpoints into pages the same way.
@@ -1153,7 +1161,7 @@ metastore (direction document, "Relationship to the datalake tier"):
 | Record of which files are live   | Local metastore                                                                                                 | The destination                                                 |
 | After losing the instance's disk | The S3 files remain, but nothing says which are live                                                            | Recovered from the destination alone                            |
 | Readers                          | The owning instance only                                                                                        | Any instance                                                    |
-| GC of S3 objects                 | Root in the local metastore; deletes objects unreferenced for a grace period (5 min by default)                 | Deletion from the log after a retention; uploads collected by age after a head move (decision 1.10) |
+| GC of S3 objects                 | Root in the local metastore; deletes objects unreferenced for a grace period (5 min by default)                 | Deletion from the log after a retention; uploads collected by age on the store's clock (decision 1.10) |
 | Requirements                     | A primary key, `changes` or `append` refresh, no partitioned tables                                             | None of these                                                   |
 | Settings                         | Location, promotion thresholds, file size, check and GC intervals                                               | The destination                                                 |
 
@@ -1346,10 +1354,10 @@ snapshot expiry are separate from orphan-file cleanup:
   that removed them. The records say what left, so no LIST is needed.
 - **Uploads that never committed** (a failed commit, a crash, a fenced writer,
   a partial checkpoint) are found by a paged LIST and deleted once they are
-  old by the store's clock, after the head has moved and been re-read.
+  old by the store's clock, measured against the head.
 
-Both halves are checked in one graph (model: `retention`, exhaustive, with a
-negative control per rule).
+Both halves are checked in two graphs (model: `retention` for references and
+`retention-readers` for queries, exhaustive, with a negative control per rule).
 
 **Removed objects: a fixed retention.** An object leaves the live state at the
 record that removes it. GC keeps:
@@ -1364,22 +1372,26 @@ record that removes it. GC keeps:
   what it names (`dataset-lifecycle-no-query-log-retention` keeps the data but
   loses a running query's metadata).
 
-A takeover restarts the timer for everything waiting to be deleted, so no
-clock is compared across machines (`retention-keep-timestamps`, which keeps
-the predecessor's times from a clock one tick apart, fails).
+A removal stays recorded until GC deletes the object: in the records after the
+floor, and in each checkpoint root's pending removals. A takeover learns them
+from there and restarts the timer for everything waiting to be deleted, so no
+clock is compared across machines (`retention-readers-keep-timestamps`, which
+keeps the predecessor's times from a clock one tick apart, fails; so does
+`retention-readers-volatile-removals`, where removals live only in GC's
+memory and the orphan sweep takes one a query still reads).
 
 **What a query is guaranteed.**
 
-- A query starts from a state confirmed current within the staleness bound S.
-  The poll already gives this; a query on a staler dataset first re-reads the
-  head, one conditional GET.
+- A query starts from a state confirmed current within the staleness bound S,
+  counted from when the confirming GET was sent. The poll already gives this;
+  a query on a staler dataset first re-reads the head, one conditional GET.
 - Every object that state references was live at the confirmation, so its
   removal came later, and GC deletes it no earlier than T after that. The
-  query can read for at least T − S (`retention` holds;
-  `retention-stale-start` fails).
+  query can read for at least T − S (`retention-readers` holds;
+  `retention-readers-stale-start` fails).
 - **Rows or an error, never other rows.** Each read returns the referenced
   immutable object or fails the query; a missing object is never empty
-  (`retention-missing-as-empty` and `dataset-query-expiry-missing-as-empty`
+  (`retention-readers-missing-as-empty` and `dataset-query-expiry-missing-as-empty`
   fail). A query error is final: a read that completes after it cannot turn
   the query back into a result.
 - **A query that outlives the retention may fail**, with an error that says to
@@ -1389,7 +1401,7 @@ the predecessor's times from a clock one tick apart, fails).
 - **Maintenance is never blocked.** Compaction commits whenever it is ready.
   The retention only delays deleting its inputs.
 
-**Uploads that never committed: age, a head move and a recheck.**
+**Uploads that never committed: age on the store's clock.**
 
 - **Every object has a fresh name.** Data files already do
   (`<write_id>_<ordinal>`). Batches, checkpoint roots and pages are named by
@@ -1400,30 +1412,46 @@ the predecessor's times from a clock one tick apart, fails).
   the checkpoint that names them. A retried commit, identical or after a lost
   race, references the same uploads; only a retry past the age limit
   re-uploads.
-- **The writer's age check.** A record may reference only objects live in the
-  state its CAS is conditioned on, or the writer's own uploads younger than
-  T_O minus a margin. The writer measures that age on its monotonic clock from
-  when it started the upload, and the margin covers that clock's rate error.
-  An upload past the limit is uploaded again under a new name
-  (`retention-no-age-check` and `retention-no-margin` fail).
-- **GC's age test uses the store's clock.** It compares each object's
-  `LastModified` with the `Date` of the same LIST response, so GC's own clock
-  is never involved. `LastModified` is at or after the moment the upload
-  started, which is all the writer's check relies on. On a local directory,
-  the file's modification time and GC's clock are the same machine's.
-- **GC waits for the head to move, then rechecks.** GC selects unreferenced
-  objects at least T_O old, waits until the head has moved past the version it
-  read, re-reads the head, keeps anything a late commit just referenced, and
-  deletes the rest. In Milestone 1 the move is the writer's next commit; on an
-  idle dataset GC makes an empty commit. A commit sent before an object was
-  old was conditioned on an older head, so once the head moves it cannot land;
-  a commit sent after fails the writer's age check (`retention-no-head-move`
-  and `retention-no-recheck` fail). A bound on create-to-commit time alone
-  would not be enough: the check happens when a commit is sent, and a store
-  can apply a request much later, for example after a writer process paused
-  mid-commit resumes.
-- **The LIST is paged.** GC works one page at a time: select, wait for one
-  head move, recheck, delete.
+- **Every age is a difference of two store timestamps.** No machine's clock
+  is compared with the store's (`retention-writer-clock`, where the writer
+  ages its upload on its own monotonic clock while the store's clock runs
+  ahead, fails).
+- **What a record may reference.** Objects live in the state its CAS is
+  conditioned on, or the writer's own uploads that it has never published.
+  Once a record publishes an upload, the writer may reference it again only
+  while it is live in the base (`retention-reref-published`, which lets a
+  writer reference its upload again after removing it, fails: GC's delete of
+  the removed object lands under the new commit).
+- **The writer's age check.** The writer refuses its own upload once the store
+  time of its CAS base is T_O minus a margin past a lower bound on the
+  upload's `LastModified`, and uploads it again under a new name. The base's
+  store time is the `Date` of the response that gave the writer that head (a
+  GET, or its own CAS). The lower bound is the newest store time the writer
+  saw before starting the upload, such as that base's time or any response's
+  `Date`. The margin covers one-second timestamps and skew between the store's
+  servers (`retention-no-age-check` and `retention-no-margin` fail).
+- **GC's age test uses the head.** GC deletes a listed object that the head it
+  read does not reference, that no pending removal names, and whose
+  `LastModified` is at least T_O before the head's. A commit that lands after
+  that read is based on that head or a newer one, so its base's store time is
+  at least the head's, and the writer's check would have refused the upload.
+  A commit that landed before the read is in the head, and GC keeps what it
+  references. Neither a head move nor a recheck is needed for safety
+  (`retention-list-date`, which ages by the LIST's `Date` instead of the
+  head's, fails: a commit based on an older head lands after the delete).
+- **An idle dataset.** If the head has not moved since the uploads were
+  listed, they never age against it; GC then makes an empty commit to advance
+  the head's time. This is for progress only.
+- **Deletes and commits may land late.** A store can apply a request much
+  later than it was sent, for example after a paused process resumes. The age
+  check ties the commit to its base, not to when it was sent, so a late commit
+  either fails its CAS or was refused.
+- **One store, one clock.** In Milestone 1 every object, data files included,
+  lives in the dataset's one location, so both timestamps come from the same
+  store. On a local directory, file modification times and the head's are the
+  same machine's.
+- **The LIST is paged.** GC works one page at a time: read the head, select,
+  delete.
 - **Versioned buckets.** Deletes leave noncurrent versions; see
   [Multi-region](#multi-region) for how GC removes them and keeps replicas in
   step.
@@ -1456,8 +1484,8 @@ retention bound, and none has readers register.
 **Why not generations.** Listing only the generations no live writer uses
 avoids listing the whole prefix, but it needs explicit generation closes once
 writers run on several nodes, a retirement interlock and an admission guard
-for content-addressed reuse, and repeated sweeps to catch late uploads. Age, a
-head move and fresh names need none of them.
+for content-addressed reuse, and repeated sweeps to catch late uploads. Age on
+the store's clock and fresh names need none of them.
 
 **The floor.** The head's `floor` is the newest published checkpoint.
 
@@ -1481,7 +1509,10 @@ head move and fresh names need none of them.
 | Schedule | Handled by |
 |---|---|
 | A query starts on a state, an object it needs is removed, and GC deletes it | **The retention.** The removal came after the query's confirmation, and GC waits T after it, so the query has at least T − S. Past that, it fails with an error, never other rows. |
-| A writer's upload is deleted by GC, and the writer then publishes a record referencing it | **The age check and the head move.** GC deletes only uploads at least T_O old, after the head has moved: an older commit's CAS fails, and a newer one fails the age check. |
+| A writer's upload is deleted by GC, and the writer then publishes a record referencing it | **The age check against the base.** GC deletes only uploads T_O older than the head it read; any commit landing later is based on that head or a newer one, so the writer refused the upload. |
+| A writer removes its own upload, GC deletes it after T, and the writer references it again before the delete lands | **Publication ends the writer's claim.** After a record publishes an upload, the writer references it only while it is live in the base. |
+| GC takes over, or its sweep runs, while a removed object is waiting out the retention | **Pending removals are durable.** The checkpoint root and the later records list them, and the sweep skips them. |
+| A head GET's response arrives long after the request | **Freshness counts from the request.** The confirmation is as old as the request, so a stalled response cannot extend a query's protection. |
 | A CAS dispatched long ago finally reaches the store | **The ETag never repeats.** Its condition names a head version that was replaced, so it fails. |
 | A sealer creates a batch long after GC deleted it | **Readers consult only what the head lists.** The batch is unlisted, so no reader reads it; it is an upload that never committed, and a later sweep collects it. |
 | A GC process loses its lease, and a delete it issued earlier completes after the new owner has moved on | **Garbage is permanent, so a late delete is harmless.** An object GC selected is unreachable from every state within the retention, and no record can reference it again: names are fresh, and the age check refuses old uploads. The lease only saves duplicate work. |
@@ -1497,15 +1528,15 @@ head move and fresh names need none of them.
 - a file can be listed and then be gone by the time it is read: GC deleted it
   in between (SlateDB issue #1215).
 
-Collection by age with a head move, and acceptance guards beyond writer
+Collection by age on the store's clock, and acceptance guards beyond writer
 fencing, are not in it; those are ours.
 
-**Milestone 1's form.** GC runs in the writer's process, so the head move is
-the writer's own next commit, staging protection is an in-memory set, and the
+**Milestone 1's form.** GC runs in the writer's process, so an idle head's
+empty commit is the writer's, staging protection is an in-memory set, and the
 floor moves with the writer's next commit. Cross-process races still exist,
 because a fenced former writer's delayed requests can land after failover, so
-the age check and the head move are needed from day one. In Milestone 2, GC on
-another node moves the head itself, so it holds the GC lease
+the age check on the store's clock is needed from day one. In Milestone 2, GC
+on another node makes its own empty commits, so it holds the GC lease
 (`leases/gc.json`); nothing in the layout changes.
 
 ## Small writes and the inline tier
@@ -1615,7 +1646,7 @@ Milestone 1 is single-writer, but nothing in its format assumes it:
 | Domain per dataset                                           | Writers in different datasets never contend                                            |
 | Snapshot tokens are opaque in the snapshot type | A future several-heads-per-dataset improvement can generalize a token to one commit number per head |
 | Within a table, `seq` order is commit order from Milestone 1 | Milestone 3 adds writers without changing what any `seq` comparison means |
-| GC by retention and age with a head move; the floor in the head | Remote GC needs no layout change, only the GC lease to move the head |
+| GC by retention and by age on the store's clock; pending removals and the floor in the head's state | Remote GC needs no layout change, only the GC lease for its empty commits |
 | Snapshot tokens are vectors; cross-dataset outcomes are logged `Resolve` records | Atomic cross-dataset reads can be added later |
 
 Two traps to avoid:
@@ -1651,8 +1682,19 @@ A maintenance record that loses a race re-validates against the new head
 cap, its lease) and retries, or re-plans. The ingest writer that loses
 retries its unchanged actions with their original `seq`s. Leases over file
 sets avoid duplicate work; correctness rests on the publication-time guards
-and on a fence that the head CAS itself enforces. Checking a separately
-stored lease and then sending an unfenced CAS is not enough.
+and on a fence that the head CAS itself enforces:
+
+- **A lease turnover writes the head.** The maintenance unit's generation is
+  recorded in the dataset's state, so taking over a unit is a commit, and a
+  plan from the old generation loses its CAS
+  (`remote-maintenance-minimal-lease-outside-head`, where the turnover writes
+  only a separate lease object, fails I3).
+- **A retry checks the generation in the head it lost to** before rebasing,
+  and an expired unit re-plans instead
+  (`remote-maintenance-no-retry-lease-check` fails I3; with the file-set lease
+  also gone, two maintainers rewrite one input into duplicate live rows).
+- The publication itself reads nothing but the head. Checking a separately
+  stored lease and then sending an unfenced CAS is not enough.
 
 *Model-checked* (`remote-maintenance*`): one ingest writer buffering keyed
 upserts and deletes on two tables, racing one or two maintenance nodes that
@@ -2029,7 +2071,14 @@ GC always use the source.
    - a referenced object missing *below* the frontier is still an error;
    - *freshness* adds the replication lag, and the lag counts toward the
      reader's staleness bound S, so a regional query is protected for T − S
-     minus that lag.
+     minus that lag;
+   - the replica alone cannot show its lag: a readable frontier proves the
+     objects are present, not that the head is recent. A regional reader
+     therefore confirms its head with a conditional GET on the source head
+     (`If-None-Match` the replica copy's ETag, usually a small 304), timed from
+     when that request was sent, while everything else stays in the region.
+     *Open:* whether replicated objects keep their ETags under every
+     encryption mode, or the head carries its commit number for this check.
 
 **Versioned buckets.** S3 replication requires versioning on both buckets, and
 a user may enable versioning without replication. On a versioned bucket every
@@ -2097,7 +2146,8 @@ A library change, with no Cayenne or runtime change.
     rule, identical retry and resolution, a conditional poll, a parallel cold
     open, and "advance after my own commit";
   - GC: deletion from the log after the retention, and collection of uploads
-    that never committed by age, with the head move and the recheck;
+    that never committed by age on the store's clock, and pending removals in
+    checkpoint roots;
   - `WalStateStore` moves onto the head log. Its API, receipts and whole-head
     OCC stay as they are; its records move from `wal/<uuid>` chains into the
     window and batches.
@@ -2378,6 +2428,9 @@ region).
   small ids cost one byte; an absent id means 0, the state location, so
   Milestone 1 records need no change. Paths inside a location keep the state
   location's fresh-name layout.
+- **Upload age crosses stores.** A file's `LastModified` comes from its
+  location's clock and the head's from the state location's, so the age
+  margin must also cover skew between the two stores' clocks.
 - **The registry is committed state.** Each id maps to the location's
   identity (its canonical URL) and a state: active, draining or retired.
   Credentials are not stored; a node resolves them from its Spicepod by URL.
