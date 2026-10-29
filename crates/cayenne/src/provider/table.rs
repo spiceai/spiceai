@@ -47787,7 +47787,7 @@ mod tests {
 
     #[test]
     fn protected_merge_leaves_a_merged_run_alone_when_small_runs_arrive() {
-        // Measured on the Anise warm rig: 500-row writes produce runs of about
+        // Measured under OTLP ingest: 500-row writes produce runs of about
         // 100 KiB, and a merged output grows toward the tier-0 ceiling. Eight new
         // runs merge with each other; the 7 MiB output is not rewritten to absorb
         // them.
