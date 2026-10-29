@@ -2305,6 +2305,8 @@ mod tests {
         models: RerankModelStores,
         chat: Arc<MockChat>,
         evaluate: Arc<MockEvaluate>,
+        // The rerank UDTF holds the engine weakly; it must outlive each query.
+        _engine: Arc<TestQueryEngine>,
     }
 
     impl ModelFixture {
@@ -2349,6 +2351,7 @@ mod tests {
                 models,
                 chat,
                 evaluate,
+                _engine: test_engine,
             }
         }
 
