@@ -116,18 +116,14 @@ while :; do
 
   probe=$((probe + 1))
   if [ "${probe}" -ge "${MAX_PROBE}" ]; then
-    break
+    # Fail rather than hand out a pair this job does not own: another job may
+    # hold it, and two runtimes on one pair can answer each other's tests.
+    echo "::error::No free port pair within ${MAX_PROBE} tries of ${HTTP_BASE}+${offset}: each is listening or reserved by another job in ${LOCK_DIR}." >&2
+    exit 1
   fi
 
   echo "Port ${http_port}/${flight_port} is already held or reserved on this host; trying the next pair."
 done
-
-if [ "${probe}" -ge "${MAX_PROBE}" ]; then
-  # Report rather than fail: spiced will refuse to bind and say so, and the
-  # readiness wait turns that into a named failure. Failing here instead would
-  # replace a specific diagnosis with a vaguer one.
-  echo "::warning::Could not find a free port pair within ${MAX_PROBE} tries of ${HTTP_BASE}+${offset}; using ${http_port}/${flight_port} anyway."
-fi
 
 http_endpoint="http://127.0.0.1:${http_port}"
 # No scheme: `spice run --flight-endpoint` hands this to `spiced --flight`

@@ -60,9 +60,10 @@ assert_between() {
 
 # run_alloc <runner-name> [extra env assignments...] — runs the script with a
 # fresh GITHUB_ENV and leaves the resulting assignments in $alloc_env, the
-# stdout in $alloc_output.
+# stdout in $alloc_output, and the exit status in $alloc_status.
 alloc_env=""
 alloc_output=""
+alloc_status=0
 run_alloc() {
   local runner="$1"
   shift
@@ -71,6 +72,7 @@ run_alloc() {
   : >"$env_file"
 
   alloc_output=$(env RUNNER_NAME="$runner" GITHUB_ENV="$env_file" SPICE_PORT_LOCK_DIR="$work_dir/locks" "$@" bash "$script" 2>&1)
+  alloc_status=$?
   alloc_env=$(cat "$env_file")
 }
 
@@ -202,9 +204,11 @@ run_alloc 'github-runner-01' SPICE_PORT_SPAN=1 SPICE_PORT_MAX_PROBE=3
 assert_eq 'a span of one always yields the base port' \
   '20000' "$(value_of SPICE_HTTP_PORT)"
 
-# Ten probes from the top of a small window stay inside it.
+# Ten probes from the top of a small window stay inside it. Each seed gets its
+# own lock directory: eight reservations would not fit in four ports.
 for probe_seed in 1 2 3 4 5 6 7 8; do
-  run_alloc "github-runner-${probe_seed}" SPICE_PORT_SPAN=4 SPICE_PORT_MAX_PROBE=10
+  run_alloc "github-runner-${probe_seed}" SPICE_PORT_SPAN=4 SPICE_PORT_MAX_PROBE=10 \
+    SPICE_PORT_LOCK_DIR="$work_dir/locks-span-${probe_seed}"
   assert_between "a span of four keeps seed ${probe_seed} in the window" \
     20000 20003 "$(value_of SPICE_HTTP_PORT)"
 done
@@ -275,6 +279,18 @@ if [ -d "$work_dir/locks/$first" ]; then
 else
   pass 'the previous reservation is released'
 fi
+
+printf 'case: with every candidate pair reserved, allocation fails\n'
+# Handing out a pair another job holds would let two runtimes share it, so
+# exhaustion exits non-zero, exports nothing, and keeps no reservation.
+full="$work_dir/locks-full"
+mkdir -p "$full"
+for p in 20000 20001 20002 20003; do mkdir "$full/$p" && echo another-runner >"$full/$p/owner"; done
+run_alloc 'spiceai-macos-runner-024' SPICE_PORT_SPAN=4 SPICE_PORT_MAX_PROBE=4 SPICE_PORT_LOCK_DIR="$full"
+assert_eq 'exhaustion exits non-zero' '1' "$alloc_status"
+assert_eq 'exhaustion exports nothing' '' "$alloc_env"
+assert_eq 'exhaustion keeps no reservation' '0' \
+  "$(grep -lx spiceai-macos-runner-024 "$full"/*/owner 2>/dev/null | wc -l | tr -d ' ')"
 
 if [ "$failures" -ne 0 ]; then
   printf '\n%s check(s) failed\n' "$failures"
