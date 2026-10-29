@@ -69,6 +69,8 @@ mod abfs;
 mod acceleration;
 #[cfg(feature = "adbc")]
 mod adbc;
+#[cfg(not(windows))]
+mod append_coalescing;
 mod cache;
 mod catalog;
 mod cayenne;
