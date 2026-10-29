@@ -3113,7 +3113,7 @@
       "who": "federated",
       "key": "query: SELECT t.id, u.id AS uid FROM t FULL OUTER JOIN u ON t.id = u.t_id WHERE coalesce(t.id, 0) < 30 OR u.id < 10",
       "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42S22 (1054): Unknown column 't.id' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 1054 (42S22): Unknown column 't.id' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/",
       "group": "federation-mysql"
     },
     {
@@ -3137,7 +3137,7 @@
       "who": "federated",
       "key": "query: SELECT b, count(*) FILTER (WHERE i > 0) AS pos, count(*) FILTER (WHERE i < 0) AS neg FROM t GROUP BY b",
       "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right synt",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right synt",
       "group": "federation-mysql"
     },
     {
@@ -3145,7 +3145,7 @@
       "who": "federated",
       "key": "query: SELECT b, i % 3 AS k, count(*), sum(d) FROM t GROUP BY GROUPING SETS ((b), (i % 3), ())",
       "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR HY000 (3889): Secondary engine operation failed. Reason: \\\"You have not defined the secondary engine for at least one of the query ta",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 3889 (HY000): Secondary engine operation failed. Reason: \\\"You have not defined the secondary engine for at least one of the query ta",
       "group": "federation-mysql"
     },
     {
@@ -3153,7 +3153,7 @@
       "who": "federated",
       "key": "query: SELECT id, date_trunc('month', ts) AS month FROM t WHERE id < 40",
       "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1305): FUNCTION <namespace>.date_trunc does not exist'\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysq",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 1305 (42000): FUNCTION <namespace>.date_trunc does not exist'\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysq",
       "group": "federation-mysql"
     },
     {
@@ -3161,7 +3161,7 @@
       "who": "federated",
       "key": "query: SELECT date_trunc('week', ts) AS week, count(*) FROM t GROUP BY date_trunc('week', ts)",
       "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1305): FUNCTION <namespace>.date_trunc does not exist'\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysq",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 1305 (42000): FUNCTION <namespace>.date_trunc does not exist'\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysq",
       "group": "federation-mysql"
     },
     {
@@ -3169,7 +3169,7 @@
       "who": "federated",
       "key": "query: SELECT id, EXTRACT(DOW FROM dt) AS dow, EXTRACT(DOY FROM dt) AS doy, EXTRACT(QUARTER FROM dt) AS q FROM t WHERE id < 40",
       "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1305): FUNCTION <namespace>.date_part does not exist'\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 1305 (42000): FUNCTION <namespace>.date_part does not exist'\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql",
       "group": "federation-mysql"
     },
     {
@@ -3193,7 +3193,7 @@
       "who": "federated",
       "key": "query: SELECT id, position('a' IN s) AS p, left(s, 2) AS l2, right(s, 2) AS r2 FROM t WHERE s IS NOT NULL",
       "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1305): FUNCTION <namespace>.strpos does not exist'\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-er",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 1305 (42000): FUNCTION <namespace>.strpos does not exist'\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-er",
       "group": "federation-mysql"
     },
     {
@@ -3201,7 +3201,7 @@
       "who": "federated",
       "key": "query: SELECT id FROM t WHERE s ILIKE 'apple'",
       "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right synt",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right synt",
       "group": "federation-mysql"
     },
     {
@@ -3217,7 +3217,7 @@
       "who": "federated",
       "key": "query: SELECT id, starts_with(s, 'ap') AS sw FROM t WHERE s IS NOT NULL",
       "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 42000 (1305): FUNCTION <namespace>.starts_with does not exist'\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mys",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 1305 (42000): FUNCTION <namespace>.starts_with does not exist'\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mys",
       "group": "federation-mysql"
     },
     {

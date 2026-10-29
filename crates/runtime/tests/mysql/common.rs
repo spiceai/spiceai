@@ -97,7 +97,15 @@ pub async fn start_mysql_docker_container_retrying_startup()
 pub async fn start_mysql_docker_container_with_image(
     image: &str,
 ) -> Result<RunningContainer, anyhow::Error> {
-    start_mysql_container_inner(image, &[]).await
+    start_mysql_container_inner(image, &[], false).await
+}
+
+/// Start a `MySQL` container whose health check stops once the server is healthy. Each check
+/// opens a connection, which takes a connection id, so a test that arranges which ids its own
+/// connections get needs the checks to stop. Needs Docker 25 or later for `start_interval`.
+#[instrument]
+pub async fn start_quiet_mysql_docker_container() -> Result<RunningContainer, anyhow::Error> {
+    start_mysql_container_inner(&source_image(Source::MySql)?, &[], true).await
 }
 
 /// Start a single-node `MySQL` container with GTIDs fully enabled
@@ -109,6 +117,7 @@ pub async fn start_mysql_gtid_docker_container() -> Result<RunningContainer, any
     start_mysql_container_inner(
         &source_image(Source::MySql)?,
         &["--gtid-mode=ON", "--enforce-gtid-consistency=ON"],
+        false,
     )
     .await
 }
@@ -119,6 +128,7 @@ pub async fn start_mysql_gtid_docker_container() -> Result<RunningContainer, any
 async fn start_mysql_container_inner(
     image: &str,
     mysqld_args: &[&str],
+    quiet_once_healthy: bool,
 ) -> Result<RunningContainer, anyhow::Error> {
     let mut builder = ContainerRunnerBuilder::new(MYSQL_DOCKER_CONTAINER)
         .image(image.to_string())
@@ -138,6 +148,22 @@ async fn start_mysql_container_inner(
             start_period: Some(30_000_000_000), // 30s
             start_interval: None,
         });
+    if quiet_once_healthy {
+        // Checks every second until the first passes within the start period, then hourly.
+        builder = builder.healthcheck(HealthConfig {
+            test: Some(vec![
+                "CMD-SHELL".to_string(),
+                format!(
+                    "mysqladmin ping -h127.0.0.1 -uroot --password={MYSQL_ROOT_PASSWORD} --silent"
+                ),
+            ]),
+            interval: Some(3_600_000_000_000), // 1h
+            timeout: Some(5_000_000_000),      // 5s
+            retries: Some(120),
+            start_period: Some(180_000_000_000), // 3m
+            start_interval: Some(1_000_000_000), // 1s
+        });
+    }
     if !mysqld_args.is_empty() {
         builder = builder.command(mysqld_args.iter().copied());
     }
