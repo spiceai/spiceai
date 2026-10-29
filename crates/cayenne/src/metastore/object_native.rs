@@ -118,6 +118,24 @@ impl ObjectNativeCatalog {
             .map_err(invalid)?;
         Self::open(store, prefix).await
     }
+    /// Open the catalog kept in a local directory, creating it on first use. The
+    /// directory is an fsync'd object store with conditional writes.
+    /// # Errors
+    /// Returns an error when the directory cannot be used or the history is invalid.
+    pub async fn open_or_create_local(directory: &std::path::Path) -> CatalogResult<Self> {
+        tokio::fs::create_dir_all(directory)
+            .await
+            .map_err(invalid)?;
+        let store: Arc<dyn ObjectStore> = Arc::new(
+            object_store_occ::LocalConditionalPut::new_durable(directory).map_err(invalid)?,
+        );
+        let prefix = Path::from("catalog");
+        match store.head(&prefix.clone().join("head")).await {
+            Ok(_) => Self::open(store, prefix).await,
+            Err(object_store::Error::NotFound { .. }) => Self::create(store, prefix).await,
+            Err(error) => Err(invalid(error)),
+        }
+    }
     /// Replay committed records, then fence the previous writer with the next lease.
     /// # Errors
     /// Returns an error on invalid history, takeover conflict, or storage failure.

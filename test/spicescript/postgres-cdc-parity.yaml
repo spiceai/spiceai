@@ -13,6 +13,12 @@ variants:
     datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: key } } } }
   sqlite-position:
     datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: position } } } }
+  # The prototype object-native metastore: a head log in a local directory,
+  # with no SQL metastore.
+  object-native-key:
+    datasets: { '*': { acceleration: { params: { cayenne_metastore: object_native, cayenne_deletion_mode: key } } } }
+  object-native-position:
+    datasets: { '*': { acceleration: { params: { cayenne_metastore: object_native, cayenne_deletion_mode: position } } } }
   turso-key:
     datasets: { '*': { acceleration: { params: { cayenne_metastore: turso, cayenne_deletion_mode: key } } } }
   turso-position:

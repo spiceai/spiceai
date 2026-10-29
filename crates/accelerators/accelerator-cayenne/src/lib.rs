@@ -2849,10 +2849,40 @@ impl CayenneAccelerator {
         metastore_type: &str,
     ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
         let connection_string = match metastore_type {
+            "object_native" => {
+                return Self::init_object_native_catalog(&self.catalog, metadata_dir).await;
+            }
             "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
             _ => format!("sqlite://{metadata_dir}/cayenne.db"), // Default to SQLite
         };
         Self::init_cayenne_catalog(&self.catalog, connection_string).await
+    }
+
+    /// Get or create the object-native catalog, kept as a head log in
+    /// `{metadata_dir}/object_native` with no SQL metastore.
+    async fn init_object_native_catalog(
+        cell: &OnceCell<Arc<dyn cayenne::MetadataCatalog>>,
+        metadata_dir: &str,
+    ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
+        let directory = PathBuf::from(metadata_dir).join("object_native");
+        cell.get_or_try_init(move || async move {
+            let catalog = Arc::new(
+                cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_local(
+                    &directory,
+                )
+                .await
+                .boxed()
+                .context(AccelerationInitializationFailedSnafu)?,
+            ) as Arc<dyn cayenne::MetadataCatalog>;
+            catalog
+                .init()
+                .await
+                .boxed()
+                .context(AccelerationInitializationFailedSnafu)?;
+            Ok::<Arc<dyn cayenne::MetadataCatalog>, Error>(catalog)
+        })
+        .await
+        .map(Arc::clone)
     }
 
     /// Get or create the shared in-memory (`memdb`) catalog for `mode: memory`
@@ -3525,8 +3555,8 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("metadata_dir")
             .description("Path for storing Cayenne metadata (SQLite catalog). If not specified, defaults to '{cayenne_file_path}/metadata'."),
         ParameterSpec::component("metastore")
-            .description("Metastore backend for Cayenne catalog. Options: 'sqlite' (default), 'turso' (requires 'turso' feature enabled at build time)")
-            .one_of(&["sqlite", "turso"])
+            .description("Metastore backend for Cayenne catalog. Options: 'sqlite' (default), 'turso' (requires 'turso' feature enabled at build time), 'object_native' (prototype)")
+            .one_of(&["sqlite", "turso", "object_native"])
             .default("sqlite"),
         ParameterSpec::runtime("file_watcher"),
         ParameterSpec::component("unsupported_type_action")
@@ -4420,6 +4450,14 @@ impl DataAccelerator for CayenneAccelerator {
                 .acceleration()
                 .and_then(|a| a.params.get("cayenne_metastore"))
                 .map_or("sqlite", String::as_str);
+            ensure!(
+                metastore_type != "object_native",
+                InvalidConfigurationSnafu {
+                    detail: Arc::from(format!(
+                        "Failed to create partitioned acceleration for dataset {table_name}: `cayenne_metastore: object_native` does not support `partition_by` yet. Remove `partition_by` or use `cayenne_metastore: sqlite`."
+                    )),
+                }
+            );
             let catalog_connection_string = match metastore_type {
                 "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
                 _ => format!("sqlite://{metadata_dir}/cayenne.db"),
