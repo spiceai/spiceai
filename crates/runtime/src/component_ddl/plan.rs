@@ -30,6 +30,8 @@ use datafusion_ddl::component_ddl::{ComponentDdlOp, OptionsChange};
 use datafusion_ddl::component_options::{
     ComponentKind, ConnectorParameters, component_with_options, component_without_options,
 };
+use runtime_acceleration::Engine;
+use spicepod::acceleration::{Acceleration, Mode};
 use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
 
@@ -246,7 +248,7 @@ fn drop_dataset(
             return Ok(Planned {
                 definitions,
                 message: format!(
-                    "Dropped the SQL definition of dataset {display}. The Spicepod's definition of {display} is the one served, and stays."
+                    "Dropped the SQL definition of dataset {display}. The Spicepod's definition of {display} stays."
                 ),
                 validate: None,
             });
@@ -387,7 +389,7 @@ fn drop_catalog(
             return Ok(Planned {
                 definitions,
                 message: format!(
-                    "Dropped the SQL definition of catalog '{name}'. The Spicepod's definition of '{name}' is the one served, and stays."
+                    "Dropped the SQL definition of catalog '{name}'. The Spicepod's definition of '{name}' stays."
                 ),
                 validate: None,
             });
@@ -459,6 +461,60 @@ pub(crate) fn retired_datasets(
                         || (replaces(&old.name) && new != *old)
                 }
             }
+        })
+        .cloned()
+        .collect()
+}
+
+/// The acceleration of `dataset` when its data outlives the dataset's table, in
+/// a file or another database, where a later definition of its name finds it.
+fn kept_acceleration(dataset: &Dataset) -> Option<&Acceleration> {
+    dataset.acceleration.as_ref().filter(|acceleration| {
+        acceleration.enabled
+            && (acceleration.mode != Mode::Memory
+                || acceleration
+                    .engine
+                    .as_deref()
+                    .and_then(|engine| Engine::try_from(engine).ok())
+                    == Some(Engine::PostgreSQL))
+    })
+}
+
+/// Whether `after`, served under a name in place of `before`, or of nothing,
+/// starts to keep its acceleration data in a store that `before` did not keep
+/// its data in: acceleration turned on, or another engine, mode, or
+/// acceleration parameter. What that store holds under the name, an earlier
+/// definition left, so it is deleted before `after` loads, and `after` starts
+/// from its source.
+pub(crate) fn starts_store(before: Option<&Dataset>, after: &Dataset) -> bool {
+    let Some(kept) = kept_acceleration(after) else {
+        return false;
+    };
+    before.and_then(kept_acceleration).is_none_or(|earlier| {
+        earlier.engine != kept.engine || earlier.mode != kept.mode || earlier.params != kept.params
+    })
+}
+
+/// The datasets of `after` whose names `defined` defines and whose acceleration
+/// [`starts_store`] in place of the dataset `before` holds under the name.
+pub(crate) fn started_datasets(
+    before: &[Dataset],
+    after: &[Dataset],
+    defined: &SqlDefinitions,
+) -> Vec<Dataset> {
+    after
+        .iter()
+        .filter(|now| {
+            defined
+                .datasets
+                .iter()
+                .any(|sql| same_dataset(&sql.name, &now.name))
+                && starts_store(
+                    before
+                        .iter()
+                        .find(|earlier| same_dataset(&earlier.name, &now.name)),
+                    now,
+                )
         })
         .cloned()
         .collect()
@@ -578,7 +634,7 @@ pub(crate) fn display_dataset_name(name: &str) -> String {
 /// `spicepod`, the app the Spicepods declare, with the SQL-defined `defined`
 /// added: the app the runtime serves. A SQL-defined component whose name the
 /// Spicepod declares is left out: the Spicepod's is the one served (see
-/// [`warn_shadowed`]).
+/// [`shadowed_warnings`]).
 pub(crate) fn serve(mut spicepod: App, defined: &SqlDefinitions) -> App {
     for dataset in &defined.datasets {
         if !spicepod_declares_dataset(&spicepod, &dataset.name) {
@@ -621,15 +677,6 @@ pub(crate) fn shadowed_warnings(spicepod: &App, defined: &SqlDefinitions) -> Vec
     datasets.chain(catalogs).collect()
 }
 
-/// Log [`shadowed_warnings`]: when the definitions load, and when the
-/// Spicepod changes, the two moments a Spicepod name can come to shadow one
-/// SQL defined. A statement cannot, so applying one logs nothing.
-pub(crate) fn warn_shadowed(spicepod: &App, defined: &SqlDefinitions) {
-    for warning in shadowed_warnings(spicepod, defined) {
-        tracing::warn!("{warning}");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use app::AppBuilder;
@@ -662,6 +709,102 @@ mod tests {
 
     fn plan(spicepod: &App, defined: &SqlDefinitions, op: &ComponentDdlOp) -> DFResult<Planned> {
         super::plan(spicepod, defined, op, None)
+    }
+
+    fn accelerated(name: &str, engine: &str, mode: Mode) -> Dataset {
+        let mut dataset = dataset(name);
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some(engine.to_string()),
+            mode,
+            ..Acceleration::default()
+        });
+        dataset
+    }
+
+    /// A definition that starts to keep its acceleration data in a store the
+    /// definition served before it did not keep its data in finds there only
+    /// what an earlier definition left, so that store starts from the source;
+    /// one that keeps its store keeps its data.
+    #[test]
+    fn a_definition_that_starts_a_store_starts_from_its_source() {
+        let cayenne = accelerated("orders", "cayenne", Mode::File);
+        let federated = dataset("orders");
+        let mut disabled = cayenne.clone();
+        if let Some(acceleration) = disabled.acceleration.as_mut() {
+            acceleration.enabled = false;
+        }
+        let mut tuned = cayenne.clone();
+        if let Some(acceleration) = tuned.acceleration.as_mut() {
+            acceleration.params = Some(spicepod::param::Params::from_string_map(
+                [(
+                    "cayenne_file_path".to_string(),
+                    "/data/orders".to_string(),
+                )]
+                .into(),
+            ));
+        }
+
+        // Nothing served before, or acceleration turned on.
+        assert!(starts_store(None, &cayenne));
+        assert!(starts_store(Some(&federated), &cayenne));
+        assert!(starts_store(Some(&disabled), &cayenne));
+        // Another engine, mode, or acceleration parameter.
+        assert!(starts_store(
+            Some(&accelerated("orders", "duckdb", Mode::File)),
+            &cayenne
+        ));
+        assert!(starts_store(
+            Some(&accelerated("orders", "cayenne", Mode::Memory)),
+            &cayenne
+        ));
+        assert!(starts_store(Some(&tuned), &cayenne));
+        assert!(starts_store(Some(&cayenne), &tuned));
+        // The same store keeps its data; a new source in it is retired with
+        // the definition before it (`retired_datasets`).
+        assert!(!starts_store(Some(&cayenne), &cayenne));
+        let mut moved = cayenne.clone();
+        moved.from = "file:other.csv".to_string();
+        assert!(!starts_store(Some(&cayenne), &moved));
+        // Data kept only in memory ends with its table; PostgreSQL keeps it in
+        // its database whatever the mode.
+        assert!(!starts_store(None, &federated));
+        assert!(!starts_store(
+            None,
+            &accelerated("orders", "arrow", Mode::Memory)
+        ));
+        assert!(starts_store(
+            None,
+            &accelerated("orders", "postgres", Mode::Memory)
+        ));
+        assert!(!starts_store(Some(&cayenne), &disabled));
+
+        // Only the names SQL defines, each against what was served under it.
+        let defined = SqlDefinitions {
+            datasets: vec![cayenne.clone()],
+            ..SqlDefinitions::default()
+        };
+        let items = accelerated("items", "cayenne", Mode::File);
+        assert_eq!(
+            started_datasets(
+                std::slice::from_ref(&federated),
+                &[cayenne.clone(), items.clone()],
+                &defined
+            ),
+            vec![cayenne.clone()]
+        );
+        assert_eq!(
+            started_datasets(
+                std::slice::from_ref(&cayenne),
+                &[cayenne.clone(), items],
+                &defined
+            ),
+            Vec::<Dataset>::new()
+        );
+        assert_eq!(
+            started_datasets(&[], std::slice::from_ref(&cayenne), &defined),
+            vec![cayenne]
+        );
     }
 
     fn message(result: DFResult<Planned>) -> String {
@@ -786,7 +929,7 @@ mod tests {
         let dropped = plan(&spicepod, &defined, &op).expect("drop the SQL definition");
         assert_eq!(
             dropped.message,
-            "Dropped the SQL definition of dataset 'orders'. The Spicepod's definition of 'orders' is the one served, and stays."
+            "Dropped the SQL definition of dataset 'orders'. The Spicepod's definition of 'orders' stays."
         );
         assert!(dropped.definitions.datasets.is_empty());
         assert_eq!(

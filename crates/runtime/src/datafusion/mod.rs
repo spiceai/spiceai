@@ -5507,13 +5507,15 @@ impl DataFusion {
     /// The checkpoint goes first, and must go, as in a settings rebuild: one
     /// that outlived the table would mark the next definition's empty table
     /// loaded. A checkpoint store that does not exist was never written; any
-    /// other failure to open it fails the deletion.
-    pub(crate) async fn delete_acceleration_data(&self, dataset: &Dataset) -> Result<()> {
+    /// other failure to open it fails the deletion. Returns whether a
+    /// checkpoint was cleared: whether an earlier load had marked data there
+    /// loaded.
+    pub(crate) async fn delete_acceleration_data(&self, dataset: &Dataset) -> Result<bool> {
         let Some(acceleration) = dataset.acceleration.as_ref().filter(|a| a.enabled) else {
-            return Ok(());
+            return Ok(false);
         };
         if !dataset.is_file_accelerated() {
-            return Ok(());
+            return Ok(false);
         }
         let checkpoint = match dataset_checkpointer(
             dataset,
@@ -5533,7 +5535,9 @@ impl DataFusion {
                 });
             }
         };
+        let mut cleared = false;
         if let Some(checkpoint) = checkpoint {
+            cleared = checkpoint.exists().await;
             checkpoint
                 .delete()
                 .await
@@ -5542,7 +5546,8 @@ impl DataFusion {
                 })?;
         }
         self.drop_acceleration_for_recreate(dataset, acceleration, None)
-            .await
+            .await?;
+        Ok(cleared)
     }
 
     /// Drops `source`'s accelerated table so the next create builds it again, empty,

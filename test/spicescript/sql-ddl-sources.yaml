@@ -3,10 +3,11 @@ description: >
   A dataset defined with SQL answers from the source its served definition
   names, never from acceleration data a definition with another source
   loaded: after an ALTER of a connector parameter; when a Spicepod starts or
-  stops declaring its name, while Spice runs and across a restart; and when
+  stops declaring its name, while Spice runs and across a restart; when
   another instance that shares the definitions points it at another source
-  while this one is stopped. Each acceleration is Cayenne in a file, which a
-  load finds marked loaded.
+  while this one is stopped; and when a definition starts to keep its data in
+  a store an earlier definition of its name left data in. Each acceleration
+  keeps its data in a file, which a load finds marked loaded.
 
 sources:
   lake: { kind: files }
@@ -100,6 +101,11 @@ steps:
     eventually: 60s
     expect: { oracle: other }
     oracle-sql: SELECT id, amount FROM orders
+  - query: SELECT id, amount FROM sw
+    only: a
+    consistently: 5s
+    expect: { oracle: other }
+    oracle-sql: SELECT id, amount FROM orders
   - edit-spicepod:
       spicepod: { datasets: [] }
     only: a
@@ -122,6 +128,11 @@ steps:
   - query: SELECT id, amount FROM sw
     only: a
     eventually: 60s
+    expect: { oracle: other }
+    oracle-sql: SELECT id, amount FROM orders
+  - query: SELECT id, amount FROM sw
+    only: a
+    consistently: 5s
     expect: { oracle: other }
     oracle-sql: SELECT id, amount FROM orders
   - restart:
@@ -147,6 +158,204 @@ steps:
   - start: {}
     only: a
   - query: SELECT id, amount FROM sw
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
+
+  # A definition that starts to keep its acceleration data in a store finds
+  # there only what an earlier definition of its name left, so the store
+  # starts from the source: acceleration turned on again, another engine,
+  # another mode, acceleration set again after a RESET, and a name dropped and
+  # created again. Each dataset loads `orders`, then reads `orders_next`.
+  - spice-exec: "CREATE TABLE l1 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l1
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - spice-exec: "ALTER TABLE l1 SET (acceleration.enabled = false)"
+    only: a
+  - spice-exec: "ALTER TABLE l1 SET (from = 'file://${sources.lake.path}/orders_next/')"
+    only: a
+  - spice-exec: "ALTER TABLE l1 SET (acceleration.enabled = true)"
+    only: a
+  - query: SELECT id, amount FROM l1
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
+  - query: SELECT id, amount FROM l1
+    only: a
+    consistently: 5s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
+  - spice-exec: "CREATE TABLE l2 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l2
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - spice-exec: "ALTER TABLE l2 SET (acceleration.engine = 'duckdb')"
+    only: a
+  - spice-exec: "ALTER TABLE l2 SET (from = 'file://${sources.lake.path}/orders_next/')"
+    only: a
+  - spice-exec: "ALTER TABLE l2 SET (acceleration.engine = 'cayenne')"
+    only: a
+  - query: SELECT id, amount FROM l2
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
+  - spice-exec: "CREATE TABLE l3 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l3
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - spice-exec: "ALTER TABLE l3 SET (acceleration.mode = 'memory')"
+    only: a
+  - spice-exec: "ALTER TABLE l3 SET (from = 'file://${sources.lake.path}/orders_next/')"
+    only: a
+  - spice-exec: "ALTER TABLE l3 SET (acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l3
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
+  - spice-exec: "CREATE TABLE l4 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l4
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - spice-exec: "ALTER TABLE l4 RESET (acceleration)"
+    only: a
+  - spice-exec: "ALTER TABLE l4 SET (from = 'file://${sources.lake.path}/orders_next/')"
+    only: a
+  - spice-exec: "ALTER TABLE l4 SET (acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l4
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
+  - spice-exec: "CREATE TABLE l5 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l5
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - spice-exec: "ALTER TABLE l5 SET (acceleration.enabled = false)"
+    only: a
+  - spice-exec: "DROP TABLE l5"
+    only: a
+  - spice-exec: "CREATE TABLE l5 WITH (from = 'file://${sources.lake.path}/orders_next/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l5
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
+
+  # A name a Spicepod stops declaring, which SQL then defines, while Spice
+  # runs and across a restart.
+  - edit-spicepod:
+      spicepod:
+        datasets:
+          - from: postgres:public.orders
+            name: p1
+            params: ${sources.other.params}
+            acceleration: { enabled: true, engine: cayenne, mode: file }
+    only: a
+  - query: SELECT id, amount FROM p1
+    only: a
+    eventually: 60s
+    expect: { oracle: other }
+    oracle-sql: SELECT id, amount FROM orders
+  - edit-spicepod:
+      spicepod: { datasets: [] }
+    only: a
+  - query: SELECT id, amount FROM p1
+    only: a
+    eventually: 60s
+    expect-error: p1
+  - spice-exec: "CREATE TABLE p1 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM p1
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - restart:
+      patch:
+        spicepod:
+          datasets:
+            - from: postgres:public.orders
+              name: p2
+              params: ${sources.other.params}
+              acceleration: { enabled: true, engine: cayenne, mode: file }
+    only: a
+  - query: SELECT id, amount FROM p2
+    only: a
+    eventually: 60s
+    expect: { oracle: other }
+    oracle-sql: SELECT id, amount FROM orders
+  - restart:
+      patch: { spicepod: { datasets: [] } }
+    only: a
+  - spice-exec: "CREATE TABLE p2 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM p2
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+
+  # Another instance turns acceleration on again with another source, while
+  # this one is stopped, and while it runs.
+  - spice-exec: "CREATE TABLE l6 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l6
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - spice-exec: "ALTER TABLE l6 SET (acceleration.enabled = false)"
+    only: a
+  - stop: {}
+    only: a
+  - spice-exec: "ALTER TABLE l6 SET (from = 'file://${sources.lake.path}/orders_next/', acceleration.enabled = true)"
+    only: b
+  - start: {}
+    only: a
+  - query: SELECT id, amount FROM l6
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
+  - spice-exec: "CREATE TABLE l7 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: b
+  - query: SELECT id, amount FROM l7
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - spice-exec: "ALTER TABLE l7 SET (acceleration.enabled = false)"
+    only: b
+  - assert-log:
+      contains: ['Applied the change another instance made to the datasets and catalogs defined with SQL in .*dataset ''l7'' \(changed\)']
+    eventually: 30s
+    only: a
+  - spice-exec: "ALTER TABLE l7 SET (from = 'file://${sources.lake.path}/orders_next/', acceleration.enabled = true)"
+    only: b
+  - query: SELECT id, amount FROM l7
     only: a
     eventually: 60s
     expect: { oracle: ref }
