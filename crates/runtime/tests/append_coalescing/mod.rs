@@ -73,7 +73,9 @@ fn make_dataset(name: &str, dir: &Path, keyed: bool, params: &[(&str, &str)]) ->
         enabled: true,
         engine: Some("cayenne".to_string()),
         mode: Mode::File,
-        refresh_mode: Some(RefreshMode::Append),
+        // An append refresh needs a key or a time column; a dataset without a key
+        // keeps the default refresh mode, and takes appends all the same.
+        refresh_mode: keyed.then_some(RefreshMode::Append),
         primary_key: keyed.then(|| "id".to_string()),
         params: Some(Params::from_string_map(acceleration_params)),
         ..Acceleration::default()
