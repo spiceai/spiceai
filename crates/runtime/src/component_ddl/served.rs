@@ -41,7 +41,7 @@ const SERVED_FILE: &str = "served.json";
 /// definitions of the datasets it withheld until their acceleration data is
 /// deleted.
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Served {
+pub(crate) struct Record {
     pub(crate) definitions: SqlDefinitions,
     #[serde(default)]
     pub(crate) served: Vec<Dataset>,
@@ -56,7 +56,7 @@ pub(crate) fn path(instance_dir: &Path) -> PathBuf {
 
 /// What `instance_dir` recorded it served, or `None` when it recorded nothing
 /// or the record cannot be read.
-pub(crate) async fn read(instance_dir: &Path) -> Option<Served> {
+pub(crate) async fn read(instance_dir: &Path) -> Option<Record> {
     let bytes = tokio::fs::read(path(instance_dir)).await.ok()?;
     serde_json::from_slice(&bytes).ok()
 }
@@ -65,7 +65,7 @@ pub(crate) async fn read(instance_dir: &Path) -> Option<Served> {
 /// reader finds the earlier record or this one, never part of either. The
 /// record and its folder are readable by their owner only: the definitions
 /// keep their values as written, which can be credentials.
-pub(crate) async fn write(instance_dir: &Path, served: &Served) -> std::io::Result<()> {
+pub(crate) async fn write(instance_dir: &Path, served: &Record) -> std::io::Result<()> {
     let path = path(instance_dir);
     let Some(folder) = path.parent() else {
         return Ok(());
@@ -95,7 +95,7 @@ mod tests {
     async fn what_was_served_is_read_back() {
         let dir = tempfile::tempdir().expect("temp dir");
         assert_eq!(read(dir.path()).await, None);
-        let served = Served {
+        let served = Record {
             definitions: SqlDefinitions {
                 datasets: vec![Dataset::new("file:y.csv", "s1")],
                 ..SqlDefinitions::default()

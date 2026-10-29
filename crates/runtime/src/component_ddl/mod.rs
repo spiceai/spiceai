@@ -761,7 +761,7 @@ impl Runtime {
                 .cloned()
                 .collect()
         });
-        let record = served::Served {
+        let record = served::Record {
             definitions,
             served,
             withheld: self.sql_components.withheld(),
