@@ -1424,6 +1424,9 @@ the predecessor's times from a clock one tick apart, fails).
   mid-commit resumes.
 - **The LIST is paged.** GC works one page at a time: select, wait for one
   head move, recheck, delete.
+- **Versioned buckets.** Deletes leave noncurrent versions; see
+  [Multi-region](#multi-region) for how GC removes them and keeps replicas in
+  step.
 - **Cost.** Orphan cleanup LISTs the dataset's prefix on a slow schedule, as
   Delta Lake's `VACUUM` and Iceberg's `remove_orphan_files` do. Removed
   objects are still deleted from the log, without a LIST.
@@ -1976,15 +1979,64 @@ writers' files, and the PK and deletion indexes merge state they did not write.
 
 ### Multi-region
 
-- **Write in one region, read in others:** supported. Replicated buckets do not
-preserve object order, so a replica may receive a record before the objects it
-references.
-  - A replica therefore exposes only a **readable frontier**: the highest commit
-    whose entire dependency closure (every record, page and object it needs)
-    it has confirmed present.
-  - Content hashes verify an object's identity; they do not show that
-    replication is complete.
-  - A referenced object missing *below* the frontier is still an error.
+**Replication: data in any direction, state one way.**
+
+- **Data objects can be replicated freely.** Every object is immutable and has
+  a fresh name, so a copy is either absent or exactly the object referenced.
+- **The state location has exactly one writable copy.** Commits and the lease
+  are conditional writes on one head object, and a conditional write is atomic
+  only within one bucket. With two-way replication (S3's replica modification
+  sync), each bucket accepts its own conditional write: two writers both hold
+  the lease and both commit, and the replication merge keeps one head and
+  drops the other's acknowledged commits. So the state location replicates
+  only one way, to a copy that nothing writes.
+- **Failover to a state replica is not supported.** Its newest head may name
+  objects that never arrived, writes acknowledged after its newest complete
+  head are lost to it, and a lease cannot fence writers across two buckets.
+  Restoring from a replica would be a separate feature: recover from the newest
+  complete head (CDC resumes from that head's source position, so nothing is
+  applied twice or skipped) and retire the old bucket.
+
+**Write in one region, read in others: two patterns.** Writers, the lease and
+GC always use the source.
+
+1. **One state location, replicated data.** Readers in each region poll the
+   head in the state location and read data files from the nearest replica.
+   - *Cost and efficiency:* the bytes that dominate a query cross regions once,
+     through replication, rather than on every query. A poll is a small
+     conditional GET, usually answered as unchanged.
+   - *Freshness:* a regional reader sees a commit as soon as the source head
+     names it. A file not yet replicated is read from the source; a 404 at the
+     replica falls back to the source, never to an empty result.
+   - *Retention:* unchanged, because readers confirm against the source head.
+2. **One-way replicated state, for per-region readers.** Regional readers read
+   the head and everything else from their region's replica, so a poll stays in
+   the region too. Replication does not preserve object order, so:
+   - a replica exposes only a **readable frontier**: a reader adopts a head only
+     after confirming that the objects it newly references are present (a HEAD
+     request per new batch, page or file, usually a few per commit), and
+     otherwise keeps its current head and retries;
+   - a reader never adopts a head with a lower commit number than the one it
+     holds. Whether S3 keeps replicated versions of one key in order is not
+     documented, so the reader does not rely on it;
+   - a referenced object missing *below* the frontier is still an error;
+   - *freshness* adds the replication lag, and the lag counts toward the
+     reader's staleness bound S, so a regional query is protected for T − S
+     minus that lag.
+
+**Versioned buckets.** S3 replication requires versioning on both buckets, and
+a user may enable versioning without replication. On a versioned bucket every
+head update leaves a noncurrent version, and a delete without a version id only
+adds a delete marker. A delete by version id is never replicated, and delete
+markers replicate only when the rule enables it. So on a versioned bucket:
+
+- GC deletes without a version id, so the marker can replicate and the
+  replica's copy is removed too;
+- the noncurrent versions (old heads, deleted objects) and expired delete
+  markers are then removed. *Open:* GC removes them itself by version id once
+  the source reports the version replicated, or the docs require a lifecycle
+  rule. The first asks nothing of the user and is preferred.
+- On an unversioned bucket nothing changes.
 - **Writers in several regions over disjoint keys:** supported, either against
 one bucket (paying cross-region latency per commit) or with a log per region
 (a possible future improvement).
@@ -2317,8 +2369,8 @@ region).
   statistics beside its files, and has its own part of the PK index.
 - **A file reference carries a location id.** A `u32`, encoded as a varint so
   small ids cost one byte; an absent id means 0, the state location, so
-  Milestone 1 records need no change. Paths inside a location stay
-  `obj/<gen>/<hash>`.
+  Milestone 1 records need no change. Paths inside a location keep the state
+  location's fresh-name layout.
 - **The registry is committed state.** Each id maps to the location's
   identity (its canonical URL) and a state: active, draining or retired.
   Credentials are not stored; a node resolves them from its Spicepod by URL.

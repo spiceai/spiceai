@@ -844,8 +844,24 @@ the check is coarser, and any commit to a table the write read is a conflict.
 
 ## Multi-region
 
-- **Write in one region, read in others:** supported. A replica exposes only a
-  readable frontier whose full dependency closure it has confirmed present.
+- **Replication: data in any direction, state one way.** Data objects are
+  immutable with fresh names, so they can be replicated freely. The state
+  location has exactly one writable copy: a conditional write is atomic only
+  within one bucket, so two writable copies would let two writers both hold
+  the lease and the merge drop acknowledged commits. It may replicate one way to
+  a copy nothing writes; failing over to that copy is not supported.
+- **Write in one region, read in others:** supported, with writers, the lease
+  and GC on the source, in two patterns:
+  - *one state location and replicated data:* readers poll the source head and
+    read files from the nearest replica, falling back to the source for a file
+    not yet replicated. Query bytes cross regions once, by replication;
+  - *one-way replicated state:* regional readers also poll their replica. A
+    replica exposes only a readable frontier, a head whose newly referenced
+    objects it has confirmed present, and a reader never adopts a lower head.
+    Freshness adds the replication lag.
+- **Versioned buckets** (which replication requires): GC deletes without a
+  version id so the delete marker replicates, and noncurrent versions are then
+  removed.
 - **Writers in several regions over disjoint keys:** supported, against one
   bucket (paying cross-region latency per commit), or with a log per region (a
   possible future improvement).
