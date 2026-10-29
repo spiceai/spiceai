@@ -127,7 +127,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [llama.cpp](#llamacpp) | `a337bb5ce3590beb8763494b4381fe830bac0bc8` | `spiceai-b11803` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `aa8e8d43949970b91fb42a2243b4f60f810d9bbd` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
-| [orc-rust](#orc-rust) | `8d0e0fd8d20504602f0cd34cb2f5d14f9c34e11f` | `phillip/bound-type-tree` (TEMPORARY: spiceai/orc-rust#2) |
+| [orc-rust](#orc-rust) | `d9632e7ae973456c81c660c04e5f55cc86489bcb` | `spiceai-0.9` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
 | [sea-query](#sea-query) | `ae75baef819513fb8d19af014972dcfa324e201a` | `spiceai` |

@@ -14785,7 +14785,7 @@ dependencies = [
 [[package]]
 name = "orc-rust"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/orc-rust.git?rev=8d0e0fd8d20504602f0cd34cb2f5d14f9c34e11f#8d0e0fd8d20504602f0cd34cb2f5d14f9c34e11f"
+source = "git+https://github.com/spiceai/orc-rust.git?rev=d9632e7ae973456c81c660c04e5f55cc86489bcb#d9632e7ae973456c81c660c04e5f55cc86489bcb"
 dependencies = [
  "arrow",
  "async-trait",
