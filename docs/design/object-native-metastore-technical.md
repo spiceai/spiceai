@@ -2005,9 +2005,16 @@ GC always use the source.
    - *Cost and efficiency:* the bytes that dominate a query cross regions once,
      through replication, rather than on every query. A poll is a small
      conditional GET, usually answered as unchanged.
-   - *Freshness:* a regional reader sees a commit as soon as the source head
-     names it. A file not yet replicated is read from the source; a 404 at the
-     replica falls back to the source, never to an empty result.
+   - *A file not yet replicated,* two choices, open for the Enhancement review
+     (a per-region intent or one default):
+     - *wait for replication:* the regional reader advances to a head only once
+       every file it newly references is present in the replica, the readable
+       frontier of pattern 2 applied to data. No query reads across regions; a
+       commit becomes queryable in the region only after its files replicate;
+     - *read from the source:* the reader advances with the source head, and a
+       404 at the replica falls back to the source. Freshest, with cross-region
+       reads for recent files.
+   - Either way, a file missing from both is an error, never an empty result.
    - *Retention:* unchanged, because readers confirm against the source head.
 2. **One-way replicated state, for per-region readers.** Regional readers read
    the head and everything else from their region's replica, so a poll stays in
