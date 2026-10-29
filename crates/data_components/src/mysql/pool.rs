@@ -58,11 +58,22 @@ const LIFETIME_JITTER_DIVISOR: u32 = 5;
 /// server are logged at DEBUG for this long.
 const SERVER_LOG_INTERVAL: Duration = Duration::from_mins(10);
 
+/// How long a pool keeps an idle connection above its minimum before closing it.
+/// `mysql_async` resets a returned connection before it can be used again, and a query that
+/// starts meanwhile opens another connection. Were that connection closed as soon as it was
+/// returned, queries that follow each other closely would open a connection every other query.
+pub const DEFAULT_IDLE_CONNECTION_TTL: Duration = Duration::from_secs(30);
+
+/// How often a pool closes its idle connections that are past their idle time or lifetime.
+const DEFAULT_IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
 /// The `connection_string` query keys `mysql_async` reads for the settings resolved here.
 const URL_POOL_MIN: &str = "pool_min";
 const URL_POOL_MAX: &str = "pool_max";
 const URL_MAX_LIFETIME: &str = "abs_conn_ttl";
 const URL_MAX_LIFETIME_JITTER: &str = "abs_conn_ttl_jitter";
+const URL_IDLE_TTL: &str = "inactive_connection_ttl";
+const URL_IDLE_CHECK_INTERVAL: &str = "ttl_check_interval";
 const URL_POOL_KEYS: [&str; 4] = [
     URL_POOL_MIN,
     URL_POOL_MAX,
@@ -121,11 +132,13 @@ pub struct PoolParams<'a> {
     pub connection_string: Option<&'a str>,
 }
 
-/// The pool size used for a bound that neither the Spicepod nor the connection string sets.
+/// The pool settings used where neither the Spicepod nor the connection string sets them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PoolSizeDefaults {
+pub struct PoolDefaults {
     pub min: usize,
     pub max: usize,
+    /// How long an idle connection above `min` is kept before it is closed.
+    pub idle_ttl: Duration,
 }
 
 /// The resolved pool settings.
@@ -138,6 +151,10 @@ pub struct PoolSettings {
     pub max_lifetime: Option<Duration>,
     /// The upper bound of the random amount added to each connection's lifetime.
     pub max_lifetime_jitter: Option<Duration>,
+    /// How long an idle connection above the pool minimum is kept before it is closed.
+    pub idle_ttl: Duration,
+    /// How often idle connections are checked against their idle time and lifetime.
+    pub idle_check_interval: Duration,
 }
 
 /// A resolved pool bound, and where it came from, for an error to name.
@@ -150,21 +167,18 @@ struct Bound {
 
 impl PoolSettings {
     /// Resolves the pool settings from the Spicepod parameters, the connection string, and
-    /// the defaults. `size_defaults` is `None` for a component that has no pool size
-    /// parameters, whose pool keeps the size the connection parameters give.
+    /// the defaults. `defaults` is `None` for a component that has no pool size parameters,
+    /// whose pool keeps the size the connection parameters give and the default idle time.
     ///
     /// # Errors
     ///
     /// Returns an error when a value is invalid, when the pool minimum exceeds a maximum the
     /// user set, or when a setting is given in both the Spicepod and the connection string
     /// with different values.
-    pub fn resolve(
-        params: PoolParams<'_>,
-        size_defaults: Option<PoolSizeDefaults>,
-    ) -> Result<Self> {
+    pub fn resolve(params: PoolParams<'_>, defaults: Option<PoolDefaults>) -> Result<Self> {
         let url = UrlPoolSettings::parse(params.connection_string)?;
 
-        let size = match size_defaults {
+        let size = match defaults {
             Some(defaults) => {
                 let min = resolve_bound(URL_POOL_MIN, params.pool_min, url.pool_min, defaults.min)?;
                 let mut max =
@@ -211,10 +225,20 @@ impl PoolSettings {
             }
         };
 
+        let idle_ttl = match url.idle_ttl {
+            Some(seconds) => Duration::from_secs(seconds),
+            None => defaults.map_or(DEFAULT_IDLE_CONNECTION_TTL, |defaults| defaults.idle_ttl),
+        };
+        let idle_check_interval = url
+            .idle_check_interval
+            .map_or(DEFAULT_IDLE_CHECK_INTERVAL, Duration::from_secs);
+
         Ok(Self {
             size,
             max_lifetime,
             max_lifetime_jitter,
+            idle_ttl,
+            idle_check_interval,
         })
     }
 
@@ -226,6 +250,8 @@ impl PoolSettings {
         pool_opts
             .with_abs_conn_ttl(self.max_lifetime)
             .with_abs_conn_ttl_jitter(self.max_lifetime_jitter)
+            .with_inactive_connection_ttl(self.idle_ttl)
+            .with_ttl_check_interval(self.idle_check_interval)
     }
 }
 
@@ -346,6 +372,8 @@ struct UrlPoolSettings {
     pool_max: Option<usize>,
     max_lifetime: Option<u64>,
     max_lifetime_jitter: Option<u64>,
+    idle_ttl: Option<u64>,
+    idle_check_interval: Option<u64>,
 }
 
 impl UrlPoolSettings {
@@ -366,6 +394,11 @@ impl UrlPoolSettings {
                 URL_MAX_LIFETIME_JITTER => {
                     settings.max_lifetime_jitter =
                         Some(parse_url_seconds(URL_MAX_LIFETIME_JITTER, &value)?);
+                }
+                URL_IDLE_TTL => settings.idle_ttl = Some(parse_url_seconds(URL_IDLE_TTL, &value)?),
+                URL_IDLE_CHECK_INTERVAL => {
+                    settings.idle_check_interval =
+                        Some(parse_url_seconds(URL_IDLE_CHECK_INTERVAL, &value)?);
                 }
                 _ => {}
             }
@@ -469,7 +502,16 @@ fn jitter_for(lifetime: Option<Duration>, url_jitter: Option<u64>) -> Option<Dur
 mod tests {
     use super::*;
 
-    const DEFAULTS: Option<PoolSizeDefaults> = Some(PoolSizeDefaults { min: 1, max: 5 });
+    const DEFAULTS: Option<PoolDefaults> = Some(PoolDefaults {
+        min: 1,
+        max: 5,
+        idle_ttl: DEFAULT_IDLE_CONNECTION_TTL,
+    });
+    const CHANGES_MODE_DEFAULTS: Option<PoolDefaults> = Some(PoolDefaults {
+        min: 0,
+        max: 2,
+        idle_ttl: Duration::ZERO,
+    });
 
     fn sized(min: usize, max: usize) -> PoolConstraints {
         PoolConstraints::new(min, max).expect("a valid pool size")
@@ -485,6 +527,8 @@ mod tests {
             size: Some(sized(1, 5)),
             max_lifetime: Some(Duration::from_mins(5)),
             max_lifetime_jitter: Some(Duration::from_mins(1)),
+            idle_ttl: Duration::from_secs(30),
+            idle_check_interval: Duration::from_secs(10),
         };
         assert_eq!(resolve(PoolParams::default()), Ok(expected));
         // A connection string without pool settings takes Spice's defaults, not the 10 and
@@ -512,6 +556,8 @@ mod tests {
                 size: Some(sized(2, 20)),
                 max_lifetime: Some(Duration::from_mins(10)),
                 max_lifetime_jitter: Some(Duration::from_mins(2)),
+                idle_ttl: Duration::from_secs(30),
+                idle_check_interval: Duration::from_secs(10),
             })
         );
     }
@@ -520,7 +566,7 @@ mod tests {
     fn connection_string_settings_apply_when_the_spicepod_sets_none() {
         let settings = resolve(PoolParams {
             connection_string: Some(
-                "mysql://user:pass@db.internal/app?pool_min=3&pool_max=30&abs_conn_ttl=120",
+                "mysql://user:pass@db.internal/app?pool_min=3&pool_max=30&abs_conn_ttl=120&inactive_connection_ttl=0&ttl_check_interval=3",
             ),
             ..PoolParams::default()
         });
@@ -531,6 +577,8 @@ mod tests {
                 size: Some(sized(3, 30)),
                 max_lifetime: Some(Duration::from_mins(2)),
                 max_lifetime_jitter: None,
+                idle_ttl: Duration::ZERO,
+                idle_check_interval: Duration::from_secs(3),
             })
         );
 
@@ -574,9 +622,33 @@ mod tests {
                 connection_string: Some("mysql://user:pass@db.internal/app?pool_min=3"),
                 ..PoolParams::default()
             },
-            Some(PoolSizeDefaults { min: 0, max: 2 }),
+            CHANGES_MODE_DEFAULTS,
         );
         assert_eq!(changes_mode.map(|s| s.size), Ok(Some(sized(3, 3))));
+    }
+
+    #[test]
+    fn idle_connections_are_kept_unless_the_defaults_or_connection_string_say_otherwise() {
+        let idle_ttl = |defaults, connection_string| {
+            PoolSettings::resolve(
+                PoolParams {
+                    connection_string,
+                    ..PoolParams::default()
+                },
+                defaults,
+            )
+            .map(|s| s.idle_ttl)
+        };
+        assert_eq!(idle_ttl(DEFAULTS, None), Ok(Duration::from_secs(30)));
+        // A `refresh_mode: changes` dataset's pool closes each connection once it is returned.
+        assert_eq!(idle_ttl(CHANGES_MODE_DEFAULTS, None), Ok(Duration::ZERO));
+        assert_eq!(
+            idle_ttl(
+                CHANGES_MODE_DEFAULTS,
+                Some("mysql://user:pass@db.internal/app?inactive_connection_ttl=45")
+            ),
+            Ok(Duration::from_secs(45))
+        );
     }
 
     #[test]
@@ -678,13 +750,15 @@ mod tests {
     }
 
     #[test]
-    fn connection_string_lifetimes_are_bounded() {
+    fn connection_string_durations_are_bounded() {
         for (url, key) in [
             ("abs_conn_ttl=31536001", "abs_conn_ttl"),
             (
                 "abs_conn_ttl_jitter=18446744073709551615",
                 "abs_conn_ttl_jitter",
             ),
+            ("inactive_connection_ttl=soon", "inactive_connection_ttl"),
+            ("ttl_check_interval=-1", "ttl_check_interval"),
         ] {
             let error = resolve(PoolParams {
                 connection_string: Some(&format!("mysql://user:pass@db.internal/app?{url}")),
@@ -785,6 +859,8 @@ mod tests {
                 size: None,
                 max_lifetime: Some(Duration::from_mins(5)),
                 max_lifetime_jitter: Some(Duration::from_mins(1)),
+                idle_ttl: Duration::from_secs(30),
+                idle_check_interval: Duration::from_secs(10),
             })
         );
     }

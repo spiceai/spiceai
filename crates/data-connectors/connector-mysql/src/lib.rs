@@ -17,7 +17,7 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::inferred_schema::InferredSchema;
-use data_components::mysql::pool::{self, PoolParams, PoolSettings, PoolSizeDefaults};
+use data_components::mysql::pool::{self, PoolDefaults, PoolParams, PoolSettings};
 use data_components::mysql_replication::{ReplicationMetrics, ReplicationMetricsCollector};
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -45,14 +45,24 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 pub mod replication;
 
-const DEFAULT_POOL_SIZE: PoolSizeDefaults = PoolSizeDefaults { min: 1, max: 5 };
+const DEFAULT_POOL: PoolDefaults = PoolDefaults {
+    min: 1,
+    max: 5,
+    idle_ttl: pool::DEFAULT_IDLE_CONNECTION_TTL,
+};
 /// `refresh_mode: changes` datasets use the pool only for schema probes at initialization;
 /// replication runs over its own dedicated connections. Unless the user sized the pool, it
-/// holds no idle connection, which matters at N CDC datasets per source database.
-const CHANGES_MODE_POOL_SIZE: PoolSizeDefaults = PoolSizeDefaults { min: 0, max: 2 };
+/// holds no idle connection and closes each connection once it is returned, which matters at
+/// N CDC datasets per source database.
+const CHANGES_MODE_POOL: PoolDefaults = PoolDefaults {
+    min: 0,
+    max: 2,
+    idle_ttl: Duration::ZERO,
+};
 
 pub struct MySQL {
     mysql_factory: MySQLTableFactory,
@@ -353,9 +363,9 @@ fn resolve_pool_settings(params: &ConnectorParams) -> pool::Result<PoolSettings>
             connection_string: params.parameters.get("connection_string").expose().ok(),
         },
         Some(if is_changes_mode {
-            CHANGES_MODE_POOL_SIZE
+            CHANGES_MODE_POOL
         } else {
-            DEFAULT_POOL_SIZE
+            DEFAULT_POOL
         }),
     )
 }
