@@ -44,6 +44,10 @@ const MIN_HEURISTIC_SECRET_LEN: usize = 4;
 /// inside a longer word), so a short password does not mangle the message.
 const MIN_UNBOUNDED_SECRET_LEN: usize = 4;
 
+/// Query-string and `driver_options` keys (after any `adbc.` style prefix)
+/// that hold a password, collected at any length.
+const PASSWORD_KEYS: &[&str] = &["password", "passwd", "pwd", "pass"];
+
 /// Query-string and `driver_options` keys whose values are treated as secrets.
 const SECRET_KEY_MARKERS: &[&str] = &[
     "password",
@@ -114,21 +118,25 @@ pub fn connection_secrets(
         }
     }
 
-    let is_secret_key = |key: &str| {
-        let key = percent_decoded(key.trim()).to_ascii_lowercase();
-        SECRET_KEY_MARKERS.iter().any(|marker| key.contains(marker))
-    };
-    let query = uri
-        .split_once('?')
-        .map(|(_, q)| q.split('#').next().unwrap_or_default());
-    for pair in query
+    let normalized_key = |key: &str| percent_decoded(key.trim()).to_ascii_lowercase();
+    // The query both with the URL fragment removed and, as libpq reads it,
+    // with `#` kept as data.
+    let query = uri.split_once('?').map(|(_, q)| q);
+    let queries = query
         .into_iter()
+        .flat_map(|q| [q, q.split('#').next().unwrap_or_default()]);
+    for pair in queries
         .flat_map(|q| q.split('&').chain(q.split(['&', ';'])))
         .chain(driver_options.into_iter().flat_map(|o| o.split(';')))
     {
-        if let Some((key, value)) = pair.split_once('=')
-            && is_secret_key(key)
-        {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let key = normalized_key(key);
+        let key = key.rsplit('.').next().unwrap_or_default();
+        if PASSWORD_KEYS.contains(&key) {
+            push(value.trim(), 1);
+        } else if SECRET_KEY_MARKERS.iter().any(|marker| key.contains(marker)) {
             push(value.trim(), MIN_HEURISTIC_SECRET_LEN);
         }
     }
@@ -486,12 +494,25 @@ mod scrub_tests {
                 scrub_connection_secrets(&format!("invalid token: \"{echoed}\""), &secrets);
             assert_eq!(scrubbed, "invalid token: \"***\"", "{uri}");
         }
-        // A short password is scrubbed where it stands alone, not inside words.
-        let secrets = connection_secrets("postgresql://alice:%Z@localhost/db", None, None);
+        // A `#` that libpq keeps as data does not hide a later password.
+        let uri = "postgresql://localhost/db?application_name=x#y&password=CANARY%ZZSECRET";
+        let secrets = connection_secrets(uri, None, None);
         assert_eq!(
-            scrub_connection_secrets("invalid percent-encoded token: \"%Z\" (%Zeta)", &secrets),
-            "invalid percent-encoded token: \"***\" (%Zeta)"
+            scrub_connection_secrets("invalid token: \"CANARY%ZZSECRET\"", &secrets),
+            "invalid token: \"***\""
         );
+        // A short password is scrubbed where it stands alone, not inside words.
+        for uri in [
+            "postgresql://alice:%Z@localhost/db",
+            "postgresql://localhost/db?password=%Z",
+        ] {
+            let secrets = connection_secrets(uri, None, None);
+            assert_eq!(
+                scrub_connection_secrets("invalid percent-encoded token: \"%Z\" (%Zeta)", &secrets),
+                "invalid percent-encoded token: \"***\" (%Zeta)",
+                "{uri}"
+            );
+        }
         let secrets = connection_secrets("file:test.db", None, None);
         assert_eq!(
             scrub_connection_secrets("cannot open test.db", &secrets),
