@@ -40,10 +40,7 @@ use mistralrs_core::{CalledFunction, ToolCallResponse, ToolCallType};
 
 const START: &str = "<|start|>";
 const CHANNEL: &str = "<|channel|>";
-const MESSAGE: &str = "<|message|>";
 const CONSTRAIN: &str = "<|constrain|>";
-/// The markers that close a message's body.
-const CLOSE: [&str; 3] = ["<|end|>", "<|return|>", "<|call|>"];
 
 /// The control tokens that mark a Harmony reply's messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +91,34 @@ impl Markers {
             self.constrain,
         ]
         .map(|token| format!("<[{}]>", token.0))
+    }
+
+    /// `text` as the markers it spells, each as its token with its text, and the text between
+    /// them, as a prompt tokenized with its markers as tokens holds it.
+    fn spell<'t>(&self, text: &'t str) -> Vec<(Option<Token>, &'t str)> {
+        let spelled = [
+            (START, self.start),
+            (CHANNEL, self.channel),
+            ("<|message|>", self.message),
+            ("<|end|>", self.end),
+            ("<|return|>", self.done),
+            ("<|call|>", self.call),
+            (CONSTRAIN, self.constrain),
+        ];
+        let mut out = Vec::new();
+        let mut rest = text;
+        while !rest.is_empty() {
+            let (token, len) = match spelled.iter().find(|(s, _)| rest.starts_with(s)) {
+                Some((s, token)) => (Some(*token), s.len()),
+                None => {
+                    let next = spelled.iter().filter_map(|(s, _)| rest.find(s)).min();
+                    (None, next.unwrap_or(rest.len()))
+                }
+            };
+            out.push((token, &rest[..len]));
+            rest = &rest[len..];
+        }
+        out
     }
 }
 
@@ -171,7 +196,10 @@ impl Reader {
     /// message. A custom one may go on to name that message's channel, or to open its body,
     /// as `<|start|>assistant<|channel|>final<|message|>` does, and the reply then goes on in
     /// that header or body. The prompt is tokenized with the markers it spells as their
-    /// tokens, so its text marks what the model reads.
+    /// tokens, so its text marks what the model reads, and the rest of its open message is
+    /// read here as a reply is: a marker marks only where it would in a reply, so `<|end|>`
+    /// inside a call's unfinished JSON arguments is text, and a call goes on from the
+    /// arguments the prompt began.
     ///
     /// A grammar holds a reply from its first header (`harmony_reply`, `harmony_call`), so a
     /// reply held to one starts in a header whatever the prompt opened.
@@ -184,22 +212,19 @@ impl Reader {
         };
         // The reply's first header starts after the role, where a stock prompt ends.
         let open = &prompt[at + START.len()..];
-        let open = &open[word(open).len()..];
-        self.route = match open.split_once(MESSAGE) {
-            None => Route::Header(open.to_string()),
-            // The prompt's last message is closed, so the reply starts a new one.
-            Some((_, body)) if CLOSE.iter().any(|close| body.contains(close)) => {
-                Route::Header(String::new())
+        for (token, text) in self.markers.spell(&open[word(open).len()..]) {
+            match token {
+                Some(token) if self.marks(token, "") => {
+                    if !matches!(self.mark(token), Mark::Next) {
+                        // The prompt's last message is closed, so the reply starts a new one.
+                        self.route = Route::Header(String::new());
+                    }
+                }
+                _ => {
+                    self.text(text);
+                }
             }
-            Some((header, body)) => match route(header, &self.tools) {
-                // A call's arguments go on from what the prompt began.
-                Route::Call { name, .. } => Route::Call {
-                    name,
-                    arguments: body.to_string(),
-                },
-                route => route,
-            },
-        };
+        }
         self
     }
 
@@ -367,32 +392,11 @@ pub(crate) const TEST_MARKERS: Markers = Markers {
 /// between markers.
 #[cfg(test)]
 pub(crate) fn spell(reply: &str) -> Vec<(Option<Token>, String)> {
-    const SPELLED: [(&str, Token); 7] = [
-        ("<|start|>", TEST_MARKERS.start),
-        ("<|channel|>", TEST_MARKERS.channel),
-        ("<|message|>", TEST_MARKERS.message),
-        ("<|end|>", TEST_MARKERS.end),
-        ("<|return|>", TEST_MARKERS.done),
-        ("<|call|>", TEST_MARKERS.call),
-        ("<|constrain|>", TEST_MARKERS.constrain),
-    ];
-    let mut out = Vec::new();
-    let mut rest = reply;
-    while !rest.is_empty() {
-        if let Some((spelled, token)) = SPELLED.iter().find(|(s, _)| rest.starts_with(s)) {
-            out.push((Some(*token), (*spelled).to_string()));
-            rest = &rest[spelled.len()..];
-        } else {
-            let next = SPELLED
-                .iter()
-                .filter_map(|(s, _)| rest.find(s))
-                .min()
-                .unwrap_or(rest.len());
-            out.push((None, rest[..next].to_string()));
-            rest = &rest[next..];
-        }
-    }
-    out
+    TEST_MARKERS
+        .spell(reply)
+        .into_iter()
+        .map(|(token, text)| (token, text.to_string()))
+        .collect()
 }
 
 #[cfg(test)]
