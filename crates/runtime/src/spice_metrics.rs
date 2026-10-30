@@ -29,11 +29,12 @@ use crate::Runtime;
 use crate::accelerated::Retention;
 use crate::accelerated::refresh::Refresh;
 use crate::component::dataset::TimeFormat;
-use crate::component::dataset::acceleration::{Acceleration, Engine};
 use crate::datafusion::Error as DataFusionError;
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::dataupdate::{DataUpdate, UpdateType};
-use crate::internal_table::{Error as InternalTableError, create_internal_accelerated_table};
+use crate::internal_table::{
+    Error as InternalTableError, create_internal_accelerated_table, internal_acceleration,
+};
 use crate::secrets::Secrets;
 
 #[derive(Debug, Snafu)]
@@ -115,11 +116,7 @@ pub async fn register_metrics_table(
         metrics_table_reference.clone(),
         otel_arrow::schema(),
         None,
-        // An internal table has no source, and Cayenne requires one.
-        Acceleration {
-            engine: Engine::Arrow,
-            ..Acceleration::default()
-        },
+        internal_acceleration(),
         Refresh::default(),
         retention,
         Arc::new(RwLock::new(Secrets::default())),

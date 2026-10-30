@@ -32,7 +32,7 @@ use runtime::{
         access::AccessMode,
         dataset::{
             TimeFormat,
-            acceleration::{Acceleration, Engine, RefreshMode},
+            acceleration::{Acceleration, RefreshMode},
             builder::DatasetBuilder,
             replication::Replication,
         },
@@ -40,6 +40,7 @@ use runtime::{
     dataconnector::{create_new_connector, parameters::ConnectorParamsBuilder},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     federated::FederatedTable,
+    internal_table::{InternalAccelerationSource, internal_acceleration},
     spice_metrics::get_metrics_table_reference,
     status,
 };
@@ -89,6 +90,11 @@ pub enum Error {
         "Spice Cloud HTTP client not initialized. Ensure the extension is initialized before use."
     ))]
     ClientNotInitialized {},
+
+    #[snafu(display("Unable to configure the Spice Cloud metrics table: {source}"))]
+    UnableToCreateInternalSource {
+        source: runtime::internal_table::Error,
+    },
 
     #[snafu(display("Unable to build accelerated table: {source}"))]
     UnableToBuildAcceleratedTable {
@@ -195,10 +201,7 @@ impl SpiceExtension {
             runtime.status(),
             metrics_table_reference.clone(),
             from.as_str(),
-            Acceleration {
-                engine: Engine::Arrow,
-                ..Acceleration::default()
-            },
+            internal_acceleration(),
             refresh,
             retention,
             runtime.secrets(),
@@ -378,6 +381,14 @@ pub async fn create_synced_internal_accelerated_table(
     )
     .await?;
     let federated_table = Arc::new(FederatedTable::new_unchecked(source_table_provider));
+    let source = InternalAccelerationSource::new(
+        &runtime,
+        table_reference.clone(),
+        acceleration.clone(),
+        Arc::clone(&secrets),
+    )
+    .await
+    .context(UnableToCreateInternalSourceSnafu)?;
 
     let accelerated_table_provider = accelerator_engine_registry
         .create_accelerator_table(
@@ -386,7 +397,7 @@ pub async fn create_synced_internal_accelerated_table(
             None,
             &acceleration,
             secrets,
-            None,
+            Some(&source),
             ctx,
         )
         .await

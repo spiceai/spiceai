@@ -1,6 +1,7 @@
 name: runtime-tables
 description: >
-  Spice's own system tables keep their SQL surface. runtime.task_history and
+  Spice's own system tables are Cayenne tables held in memory and keep their
+  SQL surface. runtime.task_history and
   runtime.metrics report the column types users query (the Map of labels, the
   OTel resource and scope structs, nanosecond UTC timestamps, unsigned and
   binary attribute fields); after 100 queries task_history holds exactly one
@@ -36,29 +37,70 @@ steps:
   - query: >-
       SELECT column_name, data_type, is_nullable FROM information_schema.columns
       WHERE table_schema = 'runtime' AND table_name = 'task_history' ORDER BY ordinal_position
-    expect: {}
+    expect:
+      rows:
+        - ["trace_id", "Utf8", "NO"]
+        - ["span_id", "Utf8", "NO"]
+        - ["parent_span_id", "Utf8", "YES"]
+        - ["task", "Utf8", "NO"]
+        - ["input", "Utf8", "NO"]
+        - ["captured_output", "Utf8", "YES"]
+        - ["start_time", "Timestamp(ns, \"UTC\")", "NO"]
+        - ["end_time", "Timestamp(ns, \"UTC\")", "NO"]
+        - ["execution_duration_ms", "Float64", "NO"]
+        - ["error_message", "Utf8", "YES"]
+        - ["labels", "Map(\"entries\": non-null Struct(\"keys\": non-null Utf8, \"values\": non-null Utf8), unsorted)", "NO"]
   - query: >-
       SELECT column_name, data_type, is_nullable FROM information_schema.columns
       WHERE table_schema = 'runtime' AND table_name = 'metrics' ORDER BY ordinal_position
-    expect: {}
+    expect:
+      rows:
+        - ["time_unix_nano", "Timestamp(ns, \"UTC\")", "NO"]
+        - ["start_time_unix_nano", "Timestamp(ns, \"UTC\")", "YES"]
+        - ["resource", "Struct(\"schema_url\": Utf8, \"attributes\": List(non-null Struct(\"key\": non-null Utf8, \"type\": non-null UInt8, \"str\": Utf8, \"int\": Int64, \"double\": Float64, \"bool\": Boolean, \"bytes\": Binary, \"ser\": Binary), field: 'attributes'), \"dropped_attributes_count\": UInt32)", "YES"]
+        - ["scope", "Struct(\"name\": Utf8, \"version\": Utf8, \"attributes\": List(non-null Struct(\"key\": non-null Utf8, \"type\": non-null UInt8, \"str\": Utf8, \"int\": Int64, \"double\": Float64, \"bool\": Boolean, \"bytes\": Binary, \"ser\": Binary), field: 'attributes'), \"dropped_attributes_count\": UInt32)", "YES"]
+        - ["schema_url", "Utf8", "YES"]
+        - ["metric_type", "UInt8", "NO"]
+        - ["name", "Utf8", "NO"]
+        - ["description", "Utf8", "YES"]
+        - ["unit", "Utf8", "YES"]
+        - ["aggregation_temporality", "Int32", "YES"]
+        - ["is_monotonic", "Boolean", "YES"]
+        - ["flags", "UInt32", "YES"]
+        - ["attributes", "List(non-null Struct(\"key\": non-null Utf8, \"type\": non-null UInt8, \"str\": Utf8, \"int\": Int64, \"double\": Float64, \"bool\": Boolean, \"bytes\": Binary, \"ser\": Binary), field: 'attributes')", "YES"]
+        - ["series_id", "Utf8", "NO"]
+        - ["data_number", "Struct(\"int_value\": Int64, \"double_value\": Float64)", "YES"]
+        - ["data_histogram", "Struct(\"count\": UInt64, \"sum\": Float64, \"bucket_counts\": List(UInt64), \"explicit_bounds\": List(Float64), \"min\": Float64, \"max\": Float64)", "YES"]
 
   # 100 queries, each recorded once.
   - corpus: corpus/runtime-tables-load.sql
     expect: { rows: [['true']] }
   - query: >-
       SELECT count(*) AS n, count(DISTINCT span_id) AS spans, count(error_message) AS errors
-      FROM runtime.task_history WHERE task = 'sql_query' AND input LIKE '%AS th_load FROM t%'
+      FROM runtime.task_history WHERE task = 'sql_query' AND starts_with(input, 'SELECT count(*) = ')
     expect: { rows: [['100', '100', '0']] }
     eventually: 60s
+  # The values read back from the stored rows, not only the declared types.
   - query: >-
-      SELECT arrow_typeof(labels) AS labels_type, arrow_typeof(start_time) AS start_type
-      FROM runtime.task_history WHERE task = 'sql_query' AND input LIKE '%AS th_load FROM t%' LIMIT 1
-    expect: {}
-  - query: >-
-      SELECT labels['protocol'] AS protocol, labels['datasets'] AS datasets, count(*) AS n
-      FROM runtime.task_history WHERE task = 'sql_query' AND input LIKE '%AS th_load FROM t%'
+      SELECT arrow_typeof(labels) AS labels_type, arrow_typeof(start_time) AS start_type,
+      count(*) AS n
+      FROM runtime.task_history WHERE task = 'sql_query' AND starts_with(input, 'SELECT count(*) = ')
       GROUP BY 1, 2
-    expect: {}
+    expect:
+      rows:
+        - ['Map("entries": non-null Struct("keys": non-null Utf8, "values": non-null Utf8), unsorted)', 'Timestamp(ns, "UTC")', '100']
+  - query: >-
+      SELECT labels['protocol'] AS protocol, labels['datasets'] AS datasets,
+      labels['rows_produced'] AS rows_produced, labels['missing'] AS missing, count(*) AS n
+      FROM runtime.task_history WHERE task = 'sql_query' AND starts_with(input, 'SELECT count(*) = ')
+      GROUP BY 1, 2, 3, 4
+    expect: { rows: [['Flight', 't', '1', null, '100']] }
+  - query: >-
+      SELECT count(*) AS n FROM runtime.task_history
+      WHERE task = 'sql_query' AND starts_with(input, 'SELECT count(*) = ')
+      AND end_time >= start_time AND start_time > now() - INTERVAL '1 hour'
+      AND CAST(labels['query_execution_duration_ms'] AS DOUBLE) >= 0
+    expect: { rows: [['100']] }
 
   # The same rows over HTTP, checked as JSON where their values cannot be
   # literal: ids, times and durations.
@@ -68,7 +110,7 @@ steps:
       body: >-
         SELECT trace_id, span_id, parent_span_id, task, start_time, end_time,
         execution_duration_ms, labels FROM runtime.task_history
-        WHERE task = 'sql_query' AND input LIKE '%AS th_load FROM t%'
+        WHERE task = 'sql_query' AND starts_with(input, 'SELECT count(*) = ')
     expect:
       status: 200
       json:
@@ -84,7 +126,55 @@ steps:
   - query: SELECT count(*) > 0 AS has_rows FROM runtime.metrics
     expect: { rows: [['true']] }
     eventually: 90s
+  # Struct and list-of-struct fields read back by name.
   - query: >-
-      SELECT scope['name'] AS scope_name, arrow_typeof(resource) AS resource_type
-      FROM runtime.metrics LIMIT 1
-    expect: {}
+      SELECT DISTINCT a['key'] AS k, a['str'] AS s, a['type'] AS ty
+      FROM (SELECT unnest(resource['attributes']) AS a FROM runtime.metrics)
+      WHERE a['key'] IN ('telemetry.sdk.language', 'telemetry.sdk.name')
+    expect: { rows: [['telemetry.sdk.language', 'rust', '1'], ['telemetry.sdk.name', 'opentelemetry', '1']] }
+  - query: >-
+      SELECT count(DISTINCT scope['name']) > 5 AS scopes, bool_and(scope['version'] IS NULL) AS no_version,
+      bool_and(coalesce(resource['dropped_attributes_count'], 0) = 0) AS none_dropped
+      FROM runtime.metrics WHERE scope['name'] IN ('runtime', 'http', 'telemetry', 'dataset', 'process', 'tokio_runtime', 'cayenne')
+    expect: { rows: [['true', 'true', 'true']] }
+  # What the metrics table reports agrees with what ran: the latest export
+  # counts the 100 queries on t.
+  - query: >-
+      SELECT sum(c) AS n FROM (
+        SELECT time_unix_nano AS t, data_histogram['count'] AS c, unnest(attributes) AS a
+        FROM runtime.metrics WHERE name = 'query_duration_ms')
+      WHERE a['key'] = 'datasets' AND a['str'] = 't'
+      AND t = (SELECT max(time_unix_nano) FROM runtime.metrics WHERE name = 'query_duration_ms')
+    expect: { rows: [['100']] }
+    eventually: 90s
+
+  # Both tables are Cayenne in memory: their scans are Cayenne's, and nothing
+  # they hold reached the instance's directory.
+  - explain: SELECT * FROM runtime.task_history
+    contains: [CayenneAccelerationExec]
+  - explain: SELECT * FROM runtime.metrics
+    contains: [CayenneAccelerationExec]
+  - assert-files: { lacks: ['\.spice/data', '(?i)\.(vortex|sqlite|db)$', '(?i)cayenne'] }
+
+  # Retention: with the shortest period and check interval allowed (60 s
+  # each), a query's row is there at first and gone after the first check that
+  # finds it older than 60 s, while a newer query's row stays. The restart empties the in-memory tables.
+  - restart:
+      patch:
+        spicepod:
+          runtime:
+            task_history: { retention_period: 60s, retention_check_interval: 60s }
+  - query: SELECT 1 AS th_old
+    expect: { rows: [['1']] }
+  - query: SELECT count(*) AS n FROM runtime.task_history WHERE task = 'sql_query' AND input = 'SELECT 1 AS th_old'
+    expect: { rows: [['1']] }
+    eventually: 15s
+  - query: SELECT count(*) AS n FROM runtime.task_history WHERE task = 'sql_query' AND input = 'SELECT 1 AS th_old'
+    expect: { rows: [['0']] }
+    eventually: 180s
+  - query: SELECT 2 AS th_new
+    expect: { rows: [['2']] }
+  - query: SELECT count(*) AS n FROM runtime.task_history WHERE task = 'sql_query' AND input = 'SELECT 2 AS th_new'
+    expect: { rows: [['1']] }
+    eventually: 15s
+  - assert-log: { lacks: ['(?i)task.history.*(error|fail|invalid)', '(?i)metrics.*(error|fail)'] }
