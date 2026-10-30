@@ -26,7 +26,7 @@ pub mod s3;
 pub mod snapshot_engine;
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -479,6 +479,9 @@ pub struct CayenneAccelerator {
     /// `runtime.params.cayenne_vnext: enabled`, new datasets go here while
     /// datasets already in the SQL metastore stay there.
     native_catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
+    /// Datasets already told that they stay on SQLite under `cayenne_vnext`, so
+    /// the line is logged once per dataset, not on every metastore lookup.
+    vnext_notices: parking_lot::Mutex<HashSet<String>>,
     /// Separate catalog for `mode: memory` (in-RAM) tables, backed by an in-memory
     /// `SQLite` `memdb` metastore. File-mode and memory-mode tables cannot share one
     /// metastore (memory-mode data must never touch disk), so memory tables use this.
@@ -1588,6 +1591,7 @@ impl CayenneAccelerator {
         Self {
             catalog: Arc::new(OnceCell::new()),
             native_catalog: Arc::new(OnceCell::new()),
+            vnext_notices: parking_lot::Mutex::new(HashSet::new()),
             memory_catalog: Arc::new(OnceCell::new()),
             instance_id: CAYENNE_ACCELERATOR_INSTANCE_COUNTER
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -2893,23 +2897,30 @@ impl CayenneAccelerator {
         }
         // The object-native metastore does not hold partitioned tables yet, and a
         // `mode: memory` table keeps its metastore in RAM, so both stay on SQLite.
-        if !source.is_file_accelerated()
-            || source
-                .acceleration()
-                .is_some_and(|acceleration| !acceleration.partition_by.is_empty())
-        {
+        if !source.is_file_accelerated() {
             return Ok("sqlite");
         }
         let table_name = source.name().to_string();
+        let partitioned = source
+            .acceleration()
+            .is_some_and(|acceleration| !acceleration.partition_by.is_empty());
         if Self::vnext_enabled(source)? {
+            if partitioned {
+                self.vnext_notice(&table_name, "uses the SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled, because the new metastore does not support `partition_by` yet.");
+                return Ok("sqlite");
+            }
             if path_exists(format!("{metadata_dir}/cayenne.db")).await
                 && self
                     .catalog_holds(metadata_dir, "sqlite", source, &table_name)
                     .await?
             {
+                self.vnext_notice(&table_name, "stays on its existing SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled: existing datasets keep their metastore. To move it, delete its acceleration so it rebuilds from the source.");
                 return Ok("sqlite");
             }
             return Ok("object_native");
+        }
+        if partitioned {
+            return Ok("sqlite");
         }
         if self.native_catalog_exists(metadata_dir, source).await?
             && self
@@ -2919,6 +2930,12 @@ impl CayenneAccelerator {
             return Ok("object_native");
         }
         Ok("sqlite")
+    }
+
+    fn vnext_notice(&self, dataset: &str, outcome: &str) {
+        if self.vnext_notices.lock().insert(dataset.to_string()) {
+            tracing::info!("Dataset '{dataset}' {outcome}");
+        }
     }
 
     async fn catalog_holds(
@@ -3198,18 +3215,6 @@ impl CayenneAccelerator {
                 .context(AccelerationCreationFailedSnafu)?;
             // Get or create the shared catalog (lazy initialization)
             let metastore_type = self.metastore_type_for(source, &metadata_dir).await?;
-            if metastore_type == "sqlite" && Self::vnext_enabled(source)? {
-                let dataset = source.name();
-                if acceleration.is_some_and(|a| !a.partition_by.is_empty()) {
-                    tracing::info!(
-                        "Dataset '{dataset}' uses the SQLite Cayenne metastore although `runtime.params.{CAYENNE_VNEXT_PARAM}` is enabled, because the new metastore does not support `partition_by` yet."
-                    );
-                } else {
-                    tracing::info!(
-                        "Dataset '{dataset}' stays on its existing SQLite Cayenne metastore although `runtime.params.{CAYENNE_VNEXT_PARAM}` is enabled: existing datasets keep their metastore. To move it, delete its acceleration so it rebuilds from the source."
-                    );
-                }
-            }
             self.get_or_create_catalog(&metadata_dir, metastore_type, source)
                 .await?
         };
