@@ -46,7 +46,7 @@ byte-unit.workspace = true
 bytes.workspace = true
 ctor.workspace = true
 cache = { path = "../cache" }
-cayenne = { path = "../cayenne", features = ["turso", "partition-table-provider"] }
+cayenne = { path = "../cayenne", features = ["partition-table-provider"] }
 chrono.workspace = true
 chunking = { path = "../chunking" }
 clap.workspace = true
