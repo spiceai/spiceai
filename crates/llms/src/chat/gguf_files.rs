@@ -115,10 +115,11 @@ pub enum ResolveError {
 static SHARD: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"^(?P<stem>.+)-(?P<i>\d{5})-of-(?P<n>\d{5})\.gguf$").ok());
 
-/// A quantization tag at the end of a file stem: `Q4_K_M`, `UD-Q2_K_XL`, `IQ4_XS`, `BF16`, …
+/// A quantization tag at the end of a file stem, or the whole stem: `Q4_K_M`, `UD-Q2_K_XL`,
+/// `IQ4_XS`, `BF16`, …
 static TAG: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)[-_.](?P<tag>(?:UD-)?(?:I?Q\d(?:_[0-9A-Z]+)*|BF16|F16|F32|MXFP4(?:_MOE)?|NVFP4|TQ\d_\d))$",
+        r"(?i)(?:^|[-_.])(?P<tag>(?:UD-)?(?:I?Q\d(?:_[0-9A-Z]+)*|BF16|F16|F32|MXFP4(?:_MOE)?|NVFP4|TQ\d_\d))$",
     )
     .ok()
 });
