@@ -30,7 +30,8 @@ rig. They are not S3 performance, which roadmap step 1 measures.
 as `retention-list-date`, is a negative control and must fail. The model README
 gives each run's bounds and limits. `dataset-lifecycle` composes Milestone 1's
 mechanisms for one dataset, and its siblings add a transaction, query expiry and
-the byte window.
+the head's byte budget. The model calls the inline records the *window* and
+the head's `checkpoint` field the *floor*; run names keep those words.
 
 **Terms.** The *destination* is the location in `runtime.state.location`. The
 *mem-tier* is Cayenne's in-memory write buffer. A *file group* is a set of files
@@ -47,17 +48,17 @@ object, before the head drops them. The head and its batches are the dataset's
 commit log. Data files and other bulk content are immutable objects that records
 reference.
 
-| Component | Why it is needed |
-|---|---|
-| **Head, changed only by CAS**: the commit point; success is acceptance | One write orders and accepts a commit, and fails for a writer whose view is stale. Guards are checked once, locally, against the exact version the CAS replaces. A retry after a lost response is the identical CAS, so failure proves rejection. What this needs from the store is the [store contract](#the-store-contract). |
-| **A window of records inline in the head, under a byte budget** | A reader within the window polls with one GET, and a commit is its uploads, then one CAS. A prototype on RustFS (1974c52704, 2026-10-28) made 59,999 polls of 1,000 datasets with 59,999 requests, 593 of them changed, and its commits averaged one CAS and 0.05 batch creates. With one object per commit, as the `object_store_occ` WAL stores records today, a changed poll k commits behind costs 1 + k requests in two dependent steps (arithmetic, not measured). Several records per window avoid copying each one out on the next commit; the budget bounds what a changed poll downloads. |
-| **Commit numbers** name each accepted record and the state after it | Maintenance and schema changes alter state without drawing a `seq`, so naming states by `seq` gives two states one name. |
-| **Batches, listed in the head**, hold the records that left the window | A cold open fetches a few objects in parallel. Batch lengths vary, so readers fetch exactly what the head lists, without a LIST. Both performance and correctness: a LIST is a slower, paged request that would add a dependent step to every cold open, and it shows objects no commit references, such as a late or duplicate batch create. |
-| **The copy rule**: when a batch is sealed, by whom, and when the head may drop its records | Each part keeps a lagging reader from losing or misreading records. Each part is checked in the model, with a negative control per part ([The copy rule](#the-copy-rule)). |
-| **Floor and checkpoint in the head** | Readers and GC learn where to start and what is reclaimable from the same atomic object as the commits. |
-| **Lease generation in the head** | A new owner's CAS makes every older writer's next CAS fail, and tells it to stop rather than retry. With several writers (Milestones 2 and 3), each unit's generation is in the dataset state instead, and a takeover fences only that unit's older owner. |
-| **GC: removals after a retention T, uploads by age on the store's clock** | No LIST for what was once live; a query can read for the retention, and readers write nothing. No machine's clock is compared with the store's. |
-| **Group commit** | A writer has one useful CAS in flight; folding queued commits into the next CAS gives the throughput. |
+| Component                                                                                  | Why it is needed                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Head, changed only by CAS**: the commit point; success is acceptance                     | One write orders and accepts a commit, and fails for a writer whose view is stale. Guards are checked once, locally, against the exact version the CAS replaces. A retry after a lost response is the identical CAS, so failure proves rejection. The [store contract](#appendix-the-store-contract) lists what this needs from the store.                                                                                                                                                                                                                                                            |
+| **Inline records in the head, under a byte budget**                                        | A reader no further behind than the inline records polls with one GET, and a commit is its uploads, then one CAS. A prototype on RustFS (1974c52704, 2026-10-28) made 59,999 polls of 1,000 datasets with 59,999 requests, 593 of them changed, and its commits averaged one CAS and 0.05 batch creates. With one object per commit, as the `object_store_occ` WAL stores records today, a changed poll k commits behind costs 1 + k requests in two dependent steps. Keeping several records inline avoids copying each one out on the next commit; the budget bounds what a changed poll downloads. |
+| **Commit numbers** name each accepted record and the state after it                        | Maintenance and schema changes alter state without drawing a `seq`, so naming states by `seq` gives two states one name.                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| **Batches, listed in the head**, hold the records no longer inline                         | A cold open fetches a few objects in parallel. Batch lengths vary, so readers fetch exactly what the head lists, without a LIST. Both performance and correctness: a LIST is a slower, paged request that would add a dependent step to every cold open, and it shows objects no commit references, such as a late or duplicate batch create.                                                                                                                                                                                                                                                         |
+| **The copy rule**: when a batch is sealed, by whom, and when the head may drop its records | Each part keeps a lagging reader from losing or misreading records. Each part is checked in the model, with a negative control per part ([The copy rule](#the-copy-rule)).                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| **The checkpoint in the head**                                                             | Readers and GC learn where to start and what is reclaimable from the same atomic object as the commits.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| **Lease generation in the head**                                                           | A new writer's takeover CAS makes every older writer's next CAS fail, and tells it to stop rather than retry. With several writers (Milestones 2 and 3), each leased unit's generation is in the dataset state, and a takeover fences only that unit's older holder.                                                                                                                                                                                                                                                                                                                                  |
+| **GC: removals after a retention T, uploads by age on the store's clock**                  | No LIST for what was once live; a query can read for the retention, and readers write nothing. No machine's clock is compared with the store's.                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| **Group commit**                                                                           | A writer has one useful CAS in flight; folding queued commits into the next CAS gives the throughput.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 How the stored objects of one dataset relate. Each box is one object, with its
 path and fields; an arrow leaves the field that holds a reference and enters the
@@ -69,9 +70,14 @@ object it names.
 
 ## What it builds on
 
-The design extends two existing pieces. The `object_store_occ` WAL
-(`WalStateStore`, `object_store_occ/src/wal/`) is a transactional K/V store on  
-object storage that Cayenne does not use yet. This design keeps its commit point, its receipts and its resolution of uncertain writes, and moves its records from one object per commit into the head (inline) and into batches. Its sibling `object_store_occ::lease` already fences snapshot writers. Cayenne's
+The design changes two existing pieces rather than adding new ones beside them.
+The `object_store_occ` WAL (`WalStateStore`, `object_store_occ/src/wal/`) is a
+transactional K/V store on  
+object storage that nothing outside its crate uses yet (a search of
+`crates/`, `bin/` and `tools/` finds no caller). Step 1 replaces its storage, one
+object per commit, with the head and batches, and keeps its commit point, its
+receipts, its resolution of uncertain writes, its API and its test suite, so no
+second log remains. Its sibling `object_store_occ::lease` already fences snapshot writers. Cayenne's
 `MetadataCatalog` trait is the other: a new `ObjectNativeCatalog` implements it
 over the head log, with no SQL. It replaces the SQL metastore, SQLite or Turso
 behind `MetastoreBackend`, which has no object-storage commit protocol.
@@ -90,38 +96,17 @@ The design needs two conditional primitives, which `object_store` and
 
 **A version never repeats.** Once the head moves from version V, no later write
 may produce V's ETag again, or a delayed CAS conditioned on V could apply. The
-head's bytes never repeat, because its commit number, lease generation and floor
-only grow. This is required: one S3-compatible store returned the same ETag for
+head's bytes never repeat, because its commit number, lease generation and
+checkpoint only grow. This is required: one S3-compatible store returned the same ETag for
 rewritten identical bytes, then accepted a delayed CAS conditioned on the first
 version.
+
+What the design needs from a store, and how each requirement is tested, is
+the [store contract](#appendix-the-store-contract).
 
 **Uploads and the head CAS proceed independently;** only writes to one path need
 ordering. A prototype that funnelled every put through one writer measured head
 CAS P99 rising from 12 ms to 175 ms behind 16 concurrent 1 MiB uploads.
-
-### The store contract
-
-Everything the design assumes about a store, numbered so that tests and review
-can cite them. The checks marked "prototype" ran in the prototype's store check
-at 3b06c85377 (2026-10-28) on RustFS, a local directory and a fsync'd local
-directory; S3, GCS and Azure promise C1, C2 and C6 in their documentation, but no
-check here has run on them.
-
-| # | The store must | Why | Checked |
-|---|---|---|---|
-| C1 | Of concurrent creates of one name, accept exactly one, and keep the first bytes | Immutable objects never change; sealers race safely | Prototype |
-| C2 | Apply a write conditioned on version V only while the object is at V, accept exactly one of concurrent writes on V, and return the new version | The head CAS is the commit point | Prototype: 8 writers, 200 rounds, one winner each |
-| C3 | Enforce conditions, not accept and ignore them | Otherwise commits are lost silently | `probe_conditional_writes` at open; prototype |
-| C4 | Never reissue a version for different bytes | A delayed CAS conditioned on V must fail once the head has moved | Prototype; RustFS repeats an ETag for identical bytes, which the design never writes |
-| C5 | Evaluate a delayed or retried conditional write against the version at the time it applies | A lost response leaves a write in flight | Not checked |
-| C6 | Return a write, or a later one, to every GET once the write has succeeded | A missing referenced object is an error, never an empty result | Not checked |
-| C7 | Answer `If-None-Match` with the current version with 304, and with an older one with the body | One-request polls | Prototype |
-| C8 | Set `LastModified` from the store's clock, with skew between its servers within the margin | GC compares the head's and an upload's ages on the store's clock | Not checked |
-| C9 | For a local directory: keep every write whose call returned through a crash | Acknowledged state survives a restart | Fsync'd local arm; the WAL's process-kill suite |
-
-GC needs nothing from LIST beyond eventual completeness: an object a LIST misses
-is a leak a later sweep collects. Step 1 turns this table into a conformance
-suite in `object_store_occ`, run against every implementation.
 
 ## The head and the write path
 
@@ -135,10 +120,10 @@ The head is a small object, bounded by the byte budget H, holding:
 | `features` | The named features the records use, beyond those `format` implies. | A reader refuses a dataset listing a feature it does not know (I11), so a change in meaning can ship without a new `format`. |
 | `incarnation` | A random id fixed when the dataset is created. | A dataset recreated under the same name never mixes with the old one's objects or attempts. |
 | `commit` | The commit number of the newest accepted record. | Names the current state. Readers, recovery and GC compare commit numbers. |
-| `window` | The newest accepted records, ending at `commit`, oldest first, in full. `w_first` is `commit` minus the window's length, plus one. | One-request polls, two-round-trip commits, and records leave in batches. |
-| `batches` | The last commit number of each sealed batch and its sealer's lease generation, in order, covering `floor + 1 .. w_first − 1`. A batch's name derives from its first commit and that generation. | Variable-length batches cannot be named by arithmetic, and readers fetch only what is listed. |
-| `floor` | The commit number of the newest published checkpoint, and the lease generation that wrote its root. | Readers start from it, and GC reclaims below it. |
-| `lease` | The lease generation of the current owner. Object names include it. | A stale owner learns it must stop, a takeover changes the head even with nothing committed, and names from different owners never collide. |
+| `inline_records` | The newest accepted records, ending at `commit`, oldest first, in full. `first_inline` is the commit number of the oldest. | One-request polls, two-round-trip commits, and records leave in batches. |
+| `batches` | The last commit number of each sealed batch and its sealer's lease generation, in order, covering `checkpoint + 1 .. first_inline − 1`. A batch's name derives from its first commit and that generation. | Variable-length batches cannot be named by arithmetic, and readers fetch only what is listed. |
+| `checkpoint` | The commit number of the newest published checkpoint, and the lease generation that wrote its root. | Readers start from it, and GC reclaims below it. |
+| `lease` | The generation of the ingest writer's lease, `leases/writer.json`. Whoever takes that lease raises it, with one CAS of the head. Object names include it. | A stale writer learns it must stop, a takeover changes the head even with nothing committed, and names from different owners never collide. Other leased units, such as maintenance units and source partitions from Milestone 2, keep their generations in the dataset state ([Ownership and fencing](#ownership-and-fencing)). |
 
 Each record holds the attempt id, the writer's lease generation, the actions with
 their guards, the BLAKE3 digest of every object they reference, and any inline
@@ -155,7 +140,7 @@ Internal constants, not head fields and not user settings:
 | H | Head byte budget | About 128 KiB to start |
 | B, K | Batch byte budget and record-count limit | Set in step 1 |
 | R | Largest record; a record above about R/2 is stored as an object | Set in step 1 |
-| M | Head content outside the window (fields, envelopes, the batch index at its largest) | Derived |
+| M | Head content outside the inline records (fields, envelopes, the batch index at its largest) | Derived |
 | T | Retention of removed objects | About an hour |
 | S | Staleness bound for a head confirmation | Per dataset, from its freshness need |
 | T_O | Age limit for uncommitted uploads | About a day |
@@ -180,7 +165,7 @@ that carries it, and V's ETag. A commit:
 2. Evaluates the record's guards locally against the state at V, including the
    `seq` rule and the age check ([Garbage collection](#garbage-collection)). The
    CAS succeeds only on V, so this is exactly the state before the record.
-3. If the window would exceed its byte or count budget, ensures the oldest final
+3. If the inline records would exceed their byte or count budget, ensures the oldest final
    batch exists, drops its records and appends its range to `batches`.
 4. CASes the head from V to the new head. **Success is acceptance.** The writer
    applies its own record and acknowledges.
@@ -225,17 +210,17 @@ sequenceDiagram
     Note over W: commit trigger: a CDC position waiting to be acked (~2 s), a SQL COMMIT, or a freshness bound. Nothing is acknowledged yet
     W->>S: PUT data/<table_id>/<write_id>_<ordinal>.vortex and objects/<kind>/<lease>-<counter> (parallel)
     W->>W: guards and the age check against the state at head version V
-    opt window full
+    opt inline records full
         W->>S: ensure wal/<first commit>-<lease> exists (usually already sealed)
     end
-    W->>S: PUT head (If-Match: V): window + record
+    W->>S: PUT head (If-Match: V): inline records + record
     alt 200
         S-->>W: new ETag
-        W->>M: mark the window committed
+        W->>M: mark the buffered writes committed
         W->>SRC: ack source position / return COMMIT
     else 412 or another failure
         W->>S: GET head and resolve the attempt
-        Note over W: Milestone 1: fenced or a bug, stop<br/>Milestones 2–3: check guards and footprints against the winners in the window, retry
+        Note over W: Milestone 1: fenced or a bug, stop<br/>Milestones 2–3: check guards and footprints against the winners' inline records, retry
     end
     W-->>S: background: PUT wal/<first commit>-<lease> when a batch becomes final
     Note over W,S: never ack before the head CAS succeeds
@@ -247,15 +232,15 @@ Model: `commits-commit`, `commit-guards`, `commit-no-cas`, `commits-etag`, `comm
 
 ### The copy rule
 
-Every record above the floor that has left the window is in a batch the head
-lists, and that batch existed before the head stopped carrying the record.
-Records at or below the floor are in the checkpoint and may be reclaimed. Commit
+Every record above the checkpoint that is no longer inline is in a batch the
+head lists, and that batch existed before the head stopped carrying the record.
+Records at or below the checkpoint's commit are in the checkpoint and may be reclaimed. Commit
 numbers are dense, so record `a + 1` follows record `a`.
 
-- **Deterministic cut.** The batch starting at `a = w_first` ends at
+- **Deterministic cut.** The batch starting at `a = first_inline` ends at
   `c = min(a + K − 1, largest c whose records a..c fit B)`. The cut depends only
   on the immutable records `a..`, never on which head a sealer read. A batch may
-  be sealed only once final: the window holds record `c + 1`, or `c = a + K − 1`.
+  be sealed only once final: the head holds record `c + 1` inline, or `c = a + K − 1`.
   So every write of a batch carries identical bytes.
 - **Anyone may seal** a final batch from a head they observed, by
   create-if-absent; a duplicate or late create writes identical bytes, at worst
@@ -267,7 +252,7 @@ numbers are dense, so record `a + 1` follows record `a`.
   index and the batch disagree.
 - **Sizes** count the encoded record, inline payload included, within the
   [budgets](#protocol-constants). A sealer copies each record's original bytes.
-- **The floor moves only to a batch end** (or to `w_first − 1`), so a batch is
+- **The checkpoint moves only to a batch end** (or to `first_inline − 1`), so a batch is
   wholly retained or wholly reclaimable.
 - **A checkpoint bounds the batch index.** The writer checkpoints before the
   index would push the head past H.
@@ -284,11 +269,11 @@ re-plans. There are three outcomes: **accepted**, **rejected**, **unresolved**.
 
 | Head found | Outcome |
 |---|---|
-| Past commit n, and record n + 1 (in the window or a listed batch) is ours | accepted |
+| Past commit n, and record n + 1 (inline or in a listed batch) is ours | accepted |
 | Past commit n, and record n + 1 is another attempt | rejected |
 | Still at version V | **retry the identical CAS** (same bytes, same condition); a success is acceptance |
 | At commit n, but a version other than V (a takeover changed the head) | rejected: V can never hold again |
-| Record n + 1 reclaimed below the floor | accepted if retained evidence (attempt ids in checkpoint roots) names our attempt, else unresolved |
+| Record n + 1 reclaimed below the checkpoint | accepted if retained evidence (attempt ids in checkpoint roots) names our attempt, else unresolved |
 | Unreadable | unresolved: read the head again later, and never retry meanwhile |
 
 - **A retry needs the original bytes and condition.** After a restart, an
@@ -356,7 +341,7 @@ Model: `commit-no-lease`, `commits-commit`; standbys: `standby`, `standby-three`
 - **The head is a cached value,** kept with its ETag and treated as fresh for the
   dataset's staleness bound S. A query that finds it older refreshes it with a
   conditional GET (`If-None-Match`); concurrent queries share one refresh. A 304
-  means nothing changed; a 200 carries the window. S3 `GetObject` and GCS and
+  means nothing changed; a 200 carries the inline records. S3 `GetObject` and GCS and
   Azure reads accept `If-None-Match`, and `object_store` exposes it as
   `GetOptions::with_if_none_match`, returning `Error::NotModified` for a 304; the
   snapshot reader already uses it (`runtime-acceleration/src/snapshot/mod.rs`).
@@ -375,15 +360,15 @@ Model: `commit-no-lease`, `commits-commit`; standbys: `standby`, `standby-three`
   never hint.
 - **Cold open: two dependent steps,** whatever the tail length: GET the head;
   then, in parallel with bounded concurrency, the checkpoint root named by
-  `floor` and the batches covering `floor + 1 .. w_first − 1` (Diagram 3). Then
-  apply the window. The checkpoint cadence keeps the batch count small. Pages
+  `checkpoint` and the batches covering `checkpoint + 1 .. first_inline − 1`
+  (Diagram 3). Then apply the inline records. The checkpoint cadence keeps the batch count small. Pages
   load when first needed: live files when a scan plans, deletion vectors when the
   deletion index builds.
 - **The state lives in memory.** The writer and same-node readers keep it there,
   and queries never fetch from the metastore's storage.
 - **A referenced object that is missing is an error, never an empty result**
-  (I4). A listed batch missing above the floor is an error, never an empty range;
-  a reader below the floor reopens from the checkpoint.
+  (I4). A listed batch missing above the checkpoint is an error, never an empty
+  range; a reader older than the checkpoint reopens from it.
 - **Readers consult only the head and what it lists,** so a late write elsewhere,
   such as a stale batch create, cannot change what they read.
 - **A record whose guards fail on apply** is a corruption error that refuses the
@@ -412,11 +397,11 @@ A checkpoint at commit n (`checkpoints/<n>-<lease>`) is:
   collection under `objects/`, as the `object_store_occ` WAL pages its
   checkpoints.
 
-The tip is that checkpoint plus the records in listed batches, then the window.
+The tip is that checkpoint plus the records in listed batches, then the inline records.
 
 ```mermaid
 flowchart LR
-    HEAD["head<br/>floor = 40 · batches [41–42] · window [43–44]"]
+    HEAD["head<br/>checkpoint = 40 · batches [41–42] · inline [43–44]"]
 
     subgraph CKPT["checkpoint at commit 40"]
         ROOT["checkpoints/40-&lt;lease&gt;<br/>dataset entry · table entries<br/>(schema ref, high-water, groups,<br/>stats / cold refs)"]
@@ -436,22 +421,22 @@ flowchart LR
     VX["data/&lt;table_id&gt;/&lt;write_id&gt;_&lt;ordinal&gt;.vortex<br/>data/&lt;table_id&gt;/delete_&lt;uuidv7&gt;.arrow"]
 
     HEAD -->|"1 · GET head"| APPLY
-    HEAD -->|"2 · names floor and batches"| ROOT
+    HEAD -->|"2 · names checkpoint and batches"| ROOT
     HEAD -->|"2 · in parallel"| B41
     ROOT -->|"3 · root"| APPLY["apply(state, record)<br/>in commit order"]
-    B41 -->|"3 · records 41–42, then the window's 43–44"| APPLY
+    B41 -->|"3 · records 41–42, then the inline 43–44"| APPLY
     APPLY -->|"4 · state ready, queries start"| MEM["in-memory dataset state<br/>(what queries read)"]
     ROOT -.->|"5 · on first use"| OBJ
     P1 -.->|"6 · scans read files"| VX
     P3 -.->|"6 · scans read files"| VX
 ```
 
-*Diagram 3: dataset state. The head names a checkpoint and the batches after it, and its window holds the newest records; `apply` folds them into the in-memory state queries read. Edge numbers give the load order: queries can start at step 4, and pages and objects load lazily. Commit numbers are shown unpadded.*
+*Diagram 3: dataset state. The head names a checkpoint and the batches after it, and holds the newest records inline; `apply` folds them into the in-memory state queries read. Edge numbers give the load order: queries can start at step 4, and pages and objects load lazily. Commit numbers are shown unpadded.*
 
 **Writing a checkpoint at commit n,** a batch end: re-emit only the pages whose
 key range changed, under fresh names; reference unchanged pages by name and
 digest (they are live in the previous checkpoint); write the root after all its
-pages. The next commit's CAS sets `floor` to n and trims the batch index, so a
+pages. The next commit's CAS sets `checkpoint` to n and trims the batch index, so a
 writer's checkpoint costs no CAS of its own; a separate maintenance process needs
 one. Two checkpoints at one commit are identical, because `apply` is
 deterministic and a commit number names one state.
@@ -570,7 +555,7 @@ Two numbers order things, and they are kept apart (decision 1.8):
 | Density | Dense | Sparse: a buffer lost in a crash leaves a gap |
 | Scope | Per dataset (one head) | Per table: the parent and each partition child have their own allocator |
 | Assigned by | The CAS that accepts the record | Cayenne's allocator, while buffering, as today |
-| Used for | Naming states: snapshot tokens, checkpoints, batches, the floor, when a file was removed | Visibility, and compaction and bake cutoffs |
+| Used for | Naming states: snapshot tokens, checkpoints, batches, when a file was removed | Visibility, and compaction and bake cutoffs |
 
 "Commit n" names both the n-th accepted record and the state after it. A byte
 location inside a file is always a *file offset*. Iceberg splits its snapshot and
@@ -722,13 +707,13 @@ two halves. The table at the end gives the reason for each rule.
 
 - GC keeps every object the current state references; every object of an
   unresolved `Prepare`; every object removed less than T ago, timed on GC's own
-  clock from when it observed the removal; and the floor checkpoint and every
-  batch above it.
-- A floor move is a removal. GC moves the floor first (by the next commit's CAS,
+  clock from when it observed the removal; and the checkpoint the head names and
+  every batch above it.
+- Moving the head's checkpoint is a removal. GC moves it first (by the next commit's CAS,
   or its own), uses only a checkpoint the head names, and never retires the
   newest one. A crash between a checkpoint's pages and its root leaves an
   uncommitted upload for the sweep.
-- **Pending removals are durable:** in the records after the floor and in each
+- **Pending removals are durable:** in the records after the checkpoint and in each
   checkpoint root. A new GC after a takeover learns them there and restarts each
   timer. The orphan sweep skips them.
 - Attempt evidence is kept for the evidence horizon, T_O.
@@ -799,8 +784,8 @@ retention only delays deleting its inputs.
 | A versioned bucket keeps a deleted object's bytes | Deleting without a version id leaves a marker that replicates and removes the replica's copy |
 
 **Milestone 1's form.** GC runs in the writer's process: an idle head's empty
-commit is the writer's, staging protection is an in-memory set, and the floor
-moves with the writer's next commit. A fenced former writer's delayed requests
+commit is the writer's, staging protection is an in-memory set, and the
+checkpoint moves with the writer's next commit. A fenced former writer's delayed requests
 can land after failover, so the age check is needed from the start. In
 Milestone 2, GC on another node holds the GC lease (`leases/gc.json`) for its
 empty commits; the layout does not change.
@@ -823,10 +808,10 @@ Decision 1.5 sets the direction; the SQL inline tier is retired once step 5's
   and the next checkpoint moves them into a file (DuckLake's metadata inlining,
   in log form). The commit is the CAS alone: inline avoids an upload round trip.
 - **Inline payloads cost bandwidth, not requests:** a reader re-downloads one in
-  every changed poll while it is in the window. That is what bounds H.
+  every changed poll while it is inline. That is what bounds H.
 - **The per-record bound, not H, decides what stays inline.** A record above
-  about R/2 is stored as an object referenced from the window. A busy CDC
-  table's 2 s window is often tens of KB to MBs, so its rows go to files.
+  about R/2 is stored as an object referenced from its record. A busy CDC
+  table's 2 s of changes is often tens of KB to MBs, so its rows go to files.
 - **Caching writes** (`Recovery::Rebuildable`) need no durable acknowledgement,
   since the origin can re-supply them. They commit at the freshness and size
   bounds of decision 1.2, not per 500 ms batch; they go through the mem-tier (not
@@ -847,7 +832,7 @@ Model: `window-storage`.
     head
     wal/…
   datasets/<slug>-<dataset_id>/
-    head                                   # mutable, CAS only: commit number, window, batch index, floor, lease generation
+    head                                   # mutable, CAS only: commit number, inline records, batch index, checkpoint, lease generation
     wal/<first commit>-<lease>             # batches: immutable records first..last, in order
     checkpoints/<commit>-<lease>           # checkpoint root: table entries and the pages of each collection
     objects/<kind>/<lease>-<counter>       # pages, manifests, deletion-vector lists, stats, PK index, …
@@ -883,7 +868,7 @@ flowchart LR
     subgraph DEST["destination: s3:// · file:// · mem://"]
         D2["data/&lt;table_id&gt;/&lt;write_id&gt;_&lt;ordinal&gt;.vortex<br/>data/&lt;table_id&gt;/delete_&lt;uuidv7&gt;.arrow"]
         OBJ["objects/&lt;kind&gt;/&lt;lease&gt;-&lt;counter&gt;"]
-        HEAD["head<br/>window, batch index, floor"]
+        HEAD["head<br/>inline records, batch index, checkpoint"]
         WAL["wal/&lt;first commit&gt;-&lt;lease&gt;<br/>batches"]
         CK["checkpoints/&lt;commit&gt;-&lt;lease&gt;"]
     end
@@ -1012,7 +997,7 @@ Model: `position-delete*`.
 writers are assigned them; per-file min/max of each key column; and the commit's
 keys as sorted 64-bit digests, compared by one linear merge, O(n + m). Small
 digest lists ride in the record; larger ones are an object counted against the
-window budget only by reference. Any uncertainty is a conflict, and a digest
+head budget only by reference. Any uncertainty is a conflict, and a digest
 collision can only report a false conflict. Appenders' `service` ranges do not
 overlap, so min/max decides the metric-appender case. Overlapping keys are
 resolved by abort and re-plan, or key-range ownership with a lease per range
@@ -1060,8 +1045,8 @@ partition drained). A handoff action records that point.
 
 **Several writers on one head.** The protocol is optimistic, for mostly
 non-conflicting writes. The CAS serializes writers, and any writer may seal a
-final batch. A lost race costs one GET and a retry CAS; the window holds the
-records to check. At a 2 s cadence and about 50 ms per conditional write, about
+final batch. A lost race costs one GET and a retry CAS; the inline records
+hold the records to check. At a 2 s cadence and about 50 ms per conditional write, about
 10% of commits race with 4 writers and about 40% with 20. A race between
 independent writers costs a retry, not an abort, but only with randomized backoff
 and group commit. A prototype measured 6.0–6.1 and 11.8–12.6 requests per commit
@@ -1069,7 +1054,7 @@ with 2 and 4 writers appending back to back, and without backoff some writers
 starved: up to 207 attempts for one commit, and commit P99 of 2.5–7.6 s at 4
 writers. Milestone 3 therefore needs randomized backoff and group commit, or
 routes a dataset's commits through one committer. More throughput per dataset is
-the "several logs per dataset" future work. Footprints count against the window
+the "several logs per dataset" future work. Footprints count against the head
 budget. Readers in other processes poll at the dataset's freshness interval.
 
 ```mermaid
@@ -1211,9 +1196,10 @@ flowchart LR
   from the log, the age sweep, pending removals); `WalStateStore` onto the head
   log, its API, receipts and whole-head OCC unchanged; the text decoder; the
   protocol constants.
-- **Code:** `object_store_occ`: the head log in a new module beside `wal/`;
+- **Code:** `object_store_occ`: `wal/` rebuilt on the head log, keeping
+  `WalStateStore`'s API so its storage suite runs unchanged;
   `LocalConditionalPut` (durable create and CAS, uploads independent of the head
-  CAS); `wal/` (`WalStateStore`); GC beside `cleanup.rs`;
+  CAS); GC beside `cleanup.rs`;
   `probe_conditional_writes` (`capabilities.rs`), reused; the deterministic
   simulation in its tests. A text decoder for heads, records, batches and pages
   under `tools/`.
@@ -1225,12 +1211,11 @@ flowchart LR
   turnover, uploads past the age limit, late uploads after a sweep) against the
   real storage code, compared with a serial reference; commit and poll latency
   at P99 and P99.9, with sample counts, on S3 Standard, S3 Express, RustFS and a
-  fsync'd local directory; and a conformance suite for the
-  [store contract](#the-store-contract), C1 to C9, that passes on memory, a local
-  directory, a fsync'd local directory and RustFS in CI, and on S3 Standard and S3
-  Express before each is supported. A store fails the suite by a negative
-  control: a wrapper that ignores conditions, reissues versions or loses
-  unsynced writes.
+  fsync'd local directory; and a conformance suite with a test for every
+  requirement of the [store contract](#appendix-the-store-contract), C1 to C9,
+  each with its negative control, passing on memory, a local directory, a
+  fsync'd local directory and RustFS in CI, and on S3 Standard and S3 Express
+  before each is supported.
 
 ### Step 2: the native catalog behind the flag
 
@@ -1471,9 +1456,9 @@ themselves are in the direction document, and the shadow log is the roadmap's
 
 1. **A per-write publication id in the head.** Not included: the head's bytes
    never repeat without it (model: `commits-etag-repeat`).
-2. **A clipped floor**, with a batch above the floor still listed and readers
-   skipping its records at or below the floor. Not proposed: it complicates the
-   decoder. Moving the floor only to batch ends is a simplification, not a safety
+2. **A checkpoint inside a batch**, with that batch still listed and readers
+   skipping its records at or below the checkpoint. Not proposed: it complicates
+   the decoder. Moving the checkpoint only to batch ends is a simplification, not a safety
    rule.
 3. **FlatBuffers**, as SlateDB's manifest uses: zero-copy reads do not help a
    head decoded once per poll.
@@ -1499,7 +1484,7 @@ themselves are in the direction document, and the shadow log is the roadmap's
    `remove-dangling-deletes`): it changes the `seq` on compaction outputs, which
    Cayenne's visibility code reads; `applied_through` adds a field instead.
 9. **The PK index as a separate object tagged with `as_of`:** GC removes records
-   below the floor regardless, so an older index could not be brought up to date,
+   below the checkpoint regardless, so an older index could not be brought up to date,
    and one that misses keys can admit duplicate live rows.
 
 ## Appendix: invariants
@@ -1521,3 +1506,25 @@ the model README maps each to its runs.
 | I10 | A source position becomes durable only together with the state it covers. |
 | I11 | A reader that meets an action it does not understand refuses the dataset; it never skips the action. |
 | I12 | The state at every commit equals running the accepted writes one at a time in commit order, read-dependent writes included, and each key has at most one live row. |
+
+## Appendix: the store contract
+
+Everything the design assumes about a store, numbered so that tests and review
+can cite them. Each requirement has a test in the conformance suite step 1
+builds, and a store wrapper that breaks it (ignoring conditions, reissuing
+versions, delaying writes, losing unsynced writes) must fail that test.
+
+| #   | The store must                                                                                                                                 | Why                                                              | Tested by                                                                                                                                |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| C1  | Accept exactly one of concurrent creates of one name and keep the first bytes.                                                                 | Immutable objects never change; sealers race safely              | Many clients create one name at once, over many rounds: one succeeds, the rest conflict, and a read returns the winner's bytes           |
+| C2  | Apply a write conditioned on version V only while the object is at V, accept exactly one of concurrent writes on V, and return the new version | The head CAS is the commit point                                 | Concurrent CASes on one version, over many rounds: one winner each; a stale CAS is refused; the returned version conditions the next CAS |
+| C3  | Enforce conditions, not accept and ignore them                                                                                                 | Otherwise commits are lost silently                              | `probe_conditional_writes` at open, and a store wrapper that drops conditions must fail C1 and C2                                        |
+| C4  | Never reissue a version for different bytes                                                                                                    | A delayed CAS conditioned on V must fail once the head has moved | Rewrite an object with different bytes, then CAS on the first version: refused                                                           |
+| C5  | Evaluate a delayed or retried conditional write against the version at the time it applies                                                     | A lost response leaves a write in flight                         | A proxy holds a CAS while a competing write lands, then releases it: refused                                                             |
+| C6  | Return a write, or a later one, to every GET once the write has succeeded                                                                      | A missing referenced object is an error, never an empty result   | After each successful write, a second client's GET returns it or a later version                                                         |
+| C7  | Answer `If-None-Match` with the current version with 304, and with an older one with the body                                                  | One-request polls                                                | Conditional GETs with the current and an older version                                                                                   |
+| C8  | Set `LastModified` from the store's clock, with skew between its servers within the margin                                                     | GC compares the head's and an upload's ages on the store's clock | Writes in sequence from several clients: `LastModified` never goes back by more than the margin                                          |
+| C9  | For a local directory: keep every write whose call returned through a crash                                                                    | Acknowledged state survives a restart                            | The WAL's process-kill suite: kill between operations, reopen, and every returned write is present                                       |
+
+GC needs nothing from LIST beyond eventual completeness: an object a LIST misses
+is a leak a later sweep collects.

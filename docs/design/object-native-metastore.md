@@ -355,7 +355,7 @@ the GC design.
 
 **1.8 Two numbers: commit numbers name states, `seq`s order mutations.** Every
 accepted record, data or maintenance, gets the next commit number, which names
-the state after it: snapshot tokens, checkpoints and the floor use it.
+the state after it: snapshot tokens and checkpoints use it.
 Cayenne's sequence numbers (`seq`s) stay as they are, drawn per write per
 table while buffering. Within each table, every `seq` in a record is above
 every `seq` in earlier records, so `seq` order is commit order and Milestone 1
