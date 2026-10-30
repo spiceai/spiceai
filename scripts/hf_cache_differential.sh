@@ -42,14 +42,14 @@ for case in "${CASES[@]}"; do
   kind="$1"; repo="$2"; shift 2; files=("$@")
   slug="${repo//\//__}"
   plural="${kind}s"
-  # Python rather than curl, so HF_TOKEN never appears in a process's arguments. Both requests
-  # send it with add_unredirected_header, so a redirect does not carry it to another host.
+  # HF_TOKEN goes from the environment into a header, never into a process's arguments, and
+  # add_unredirected_header keeps it off a redirect.
   commit=$(python3 - "$plural" "$repo" <<'PY'
 import json, os, sys, urllib.request
 plural, repo = sys.argv[1:]
 request = urllib.request.Request(f"https://huggingface.co/api/{plural}/{repo}/revision/main")
-if os.environ.get("HF_TOKEN", "").strip():
-    request.add_unredirected_header("Authorization", f"Bearer {os.environ['HF_TOKEN'].strip()}")
+if token := os.environ.get("HF_TOKEN", "").strip():
+    request.add_unredirected_header("Authorization", f"Bearer {token}")
 print(json.load(urllib.request.urlopen(request))["sha"])
 PY
 )
@@ -74,8 +74,8 @@ tree = {}
 url = f"https://huggingface.co/api/{plural}/{repo}/paths-info/{commit}"
 data = "&".join(["expand=false"] + [f"paths={urllib.parse.quote(f)}" for f in files]).encode()
 request = urllib.request.Request(url, data=data)
-if os.environ.get("HF_TOKEN", "").strip():
-    request.add_unredirected_header("Authorization", f"Bearer {os.environ['HF_TOKEN'].strip()}")
+if token := os.environ.get("HF_TOKEN", "").strip():
+    request.add_unredirected_header("Authorization", f"Bearer {token}")
 for entry in json.load(urllib.request.urlopen(request)):
     tree[entry["path"]] = entry
 problems = []
