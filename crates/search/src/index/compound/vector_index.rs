@@ -91,6 +91,11 @@ impl CompoundVectorIndex {
     }
 
     #[must_use]
+    pub fn secondary(&self) -> &Arc<dyn VectorIndex> {
+        &self.secondary
+    }
+
+    #[must_use]
     pub fn read_mode(&self) -> CompoundReadMode {
         self.read_mode
     }
