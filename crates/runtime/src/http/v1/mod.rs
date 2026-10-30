@@ -21,6 +21,7 @@ pub mod datasets;
 pub mod decisions;
 pub mod embeddings;
 pub mod functions;
+pub mod gemini;
 pub mod iceberg;
 pub mod messages;
 pub mod responses;

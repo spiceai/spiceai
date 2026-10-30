@@ -61,6 +61,11 @@ pub enum MessageCreateStreamResponse {
     /// actually reported.
     #[serde(rename = "error")]
     Error { error: ApiError },
+    /// An event type this client does not know. Anthropic adds stream event types over time and
+    /// asks clients to ignore the ones they do not handle, so it is skipped rather than failing
+    /// the whole stream.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -391,7 +396,8 @@ pub fn transform_stream(
                     Ok(
                         MessageCreateStreamResponse::Ping
                         | MessageCreateStreamResponse::ContentBlockStop { .. }
-                        | MessageCreateStreamResponse::MessageStop,
+                        | MessageCreateStreamResponse::MessageStop
+                        | MessageCreateStreamResponse::Unknown,
                     ) => None,
                     Ok(MessageCreateStreamResponse::Error { error }) => {
                         // An error Anthropic delivered as a stream packet is the same failure as
@@ -741,6 +747,43 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// An event type Anthropic adds after this client was written is skipped: the stream around
+    /// it still answers in full.
+    #[tokio::test]
+    async fn an_unknown_event_type_is_skipped() {
+        let events: Vec<Result<MessageCreateStreamResponse, OpenAIError>> = [
+            r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-haiku-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"po"}}"#,
+            r#"{"type":"future_event","detail":"a field no client knows"}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ng"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]
+        .iter()
+        .map(|event| Ok(serde_json::from_str(event).expect("a stream event")))
+        .collect();
+        let chunks: Vec<_> = transform_stream(
+            Box::pin(futures::stream::iter(events)),
+            context_with(vec![]),
+        )
+        .collect()
+        .await;
+
+        let mut text = String::new();
+        let mut finish_reasons = Vec::new();
+        for chunk in chunks {
+            let chunk = chunk.expect("no event fails the stream");
+            for choice in chunk.choices {
+                text.push_str(&choice.delta.content.unwrap_or_default());
+                finish_reasons.extend(choice.finish_reason);
+            }
+        }
+        assert_eq!(text, "pong");
+        assert_eq!(finish_reasons, [FinishReason::Stop]);
     }
 
     /// The `usage` of a streamed event, from its JSON as Anthropic sends it.
