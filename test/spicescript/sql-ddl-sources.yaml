@@ -721,7 +721,7 @@ steps:
     oracle-sql: SELECT id, ts FROM old
   - spice-exec: "CREATE TABLE c1 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'file')"
     only: a
-    expect-error: "dataset 'C1' keeps its acceleration data in the same `sqlite` store"
+    expect-error: "dataset 'C1' keeps its acceleration data in the same SQLite file"
   - query: SELECT id, ts FROM "C1"
     only: a
     consistently: 5s
@@ -736,7 +736,7 @@ steps:
     oracle-sql: SELECT id, ts FROM old
   - spice-exec: "CREATE TABLE c2 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'turso', acceleration.mode = 'file')"
     only: a
-    expect-error: "dataset 'C2' keeps its acceleration data in the same `turso` store"
+    expect-error: "dataset 'C2' keeps its acceleration data in the same Turso file"
   - query: SELECT id, ts FROM "C2"
     only: a
     consistently: 5s
@@ -751,7 +751,7 @@ steps:
     oracle-sql: SELECT id, ts FROM old
   - spice-exec: "CREATE TABLE c3 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'duckdb', acceleration.mode = 'memory')"
     only: a
-    expect-error: "dataset 'C3' keeps its acceleration data in the same `duckdb` store"
+    expect-error: "dataset 'C3' keeps its acceleration data in the same DuckDB memory instance"
   - query: SELECT id, ts FROM "C3"
     only: a
     consistently: 5s
