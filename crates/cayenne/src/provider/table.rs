@@ -2524,6 +2524,11 @@ pub struct CayenneTableProvider {
     /// serve a short list. A hit skips object-store LIST and per-file
     /// footer/catalog fetches; the query still prunes with its own predicate.
     cached_snapshot_listing: Arc<ArcSwapOption<CachedSnapshotListing>>,
+    /// Triggered seq-prefix bakes skipped in a row because another table's bake
+    /// held the process-wide bake slot (see
+    /// [`Self::bake_seq_prefix_protected_snapshots_on_trigger`]). Shared across
+    /// writer clones.
+    bake_slot_skips: Arc<AtomicUsize>,
     /// Bumped whenever [`Self::cached_snapshot_listing`] is dropped. Distinct
     /// from [`Self::current_dir_generation`]: bumping that generation aborts
     /// compaction. An in-flight LIST samples this at start and skips storing
@@ -4258,6 +4263,11 @@ const BAKE_KEEP_RECENT_SNAPSHOTS: usize = 3;
 /// of the prefix cannot stop every later bake — and with it the only shrink of
 /// the deletion index.
 const BAKE_MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Triggered seq-prefix bakes a table skips in a row, while other tables hold
+/// the process-wide bake slot, before its next one waits for the slot (see
+/// `CayenneTableProvider::bake_seq_prefix_protected_snapshots_on_trigger`).
+const BAKE_SLOT_SKIPS_BEFORE_WAIT: usize = 3;
 
 /// Default deletion-index size (count of live PK tombstones, `delete_len()`) at
 /// or above which a seq-prefix bake is worth triggering. The bake exists to
@@ -10769,6 +10779,7 @@ impl CayenneTableProvider {
             ),
             scan_file_statistics_flights: Arc::default(),
             cached_snapshot_listing: Arc::new(ArcSwapOption::empty()),
+            bake_slot_skips: Arc::new(AtomicUsize::new(0)),
             listing_cache_epoch: Arc::new(AtomicU64::new(0)),
             table_statistics: Arc::new(RwLock::new(CachedTableStatistics {
                 optimizer_inexact: table_statistics
@@ -13140,6 +13151,7 @@ impl CayenneTableProvider {
             scan_file_statistics: Arc::clone(&self.scan_file_statistics),
             scan_file_statistics_flights: Arc::clone(&self.scan_file_statistics_flights),
             cached_snapshot_listing: Arc::clone(&self.cached_snapshot_listing),
+            bake_slot_skips: Arc::clone(&self.bake_slot_skips),
             listing_cache_epoch: Arc::clone(&self.listing_cache_epoch),
             table_statistics: Arc::clone(&self.table_statistics),
             table_statistics_persistence_lock: Arc::clone(&self.table_statistics_persistence_lock),
@@ -29313,11 +29325,22 @@ impl CayenneTableProvider {
 
     /// The compaction trigger's bake. It skips, returning `Ok(false)`, while
     /// another table's bake holds the process-wide bake slot, so the background
-    /// pass goes on to its other work and the bake runs on a later tick — unless
-    /// the deletion index is over its memory ceiling, where the bake is its only
-    /// shrink and waits its turn.
+    /// pass goes on to its other work and the bake runs on a later tick.
+    ///
+    /// After [`BAKE_SLOT_SKIPS_BEFORE_WAIT`] skips in a row, or with its deletion
+    /// index over its memory ceiling, it waits for the slot instead. Skipping
+    /// alone is not fair: a table whose ticks keep landing while other tables
+    /// bake would skip for as long as they keep baking, and its deletion index —
+    /// which only a bake shrinks — would grow without bound. The slot is a
+    /// semaphore that hands a released permit to its waiters in order, so a
+    /// waiting table bakes next, ahead of any table that merely tries. Waiting
+    /// only after repeated skips keeps the common case — the slot free, or one
+    /// other bake briefly in the way — from parking a background pass, and with
+    /// it the compaction permit it holds, for a whole bake.
     pub(crate) async fn bake_seq_prefix_protected_snapshots_on_trigger(&self) -> Result<bool> {
-        let wait = if self.deletion_index_over_memory_ceiling() {
+        let wait = if self.deletion_index_over_memory_ceiling()
+            || self.bake_slot_skips.load(Ordering::Relaxed) >= BAKE_SLOT_SKIPS_BEFORE_WAIT
+        {
             BakeSlotWait::Wait
         } else {
             BakeSlotWait::Skip
@@ -29388,13 +29411,16 @@ impl CayenneTableProvider {
         } else if let Ok(permit) = budget.try_acquire_owned() {
             Some(permit)
         } else {
+            let skips = self.bake_slot_skips.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
+                skips,
                 "Skipping seq-prefix bake: another table's bake is running"
             );
             return Ok(false);
         };
+        self.bake_slot_skips.store(0, Ordering::Relaxed);
         // Boxed so the whole bake body lives on the heap rather than in the caller's
         // frame. This is one of the largest async fns in the crate, and its future is
         // inlined into every caller's — the compaction trigger, and the property tests

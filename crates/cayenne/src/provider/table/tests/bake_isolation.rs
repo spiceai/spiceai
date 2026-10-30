@@ -305,3 +305,62 @@ async fn a_bake_encodes_on_half_the_maintenance_permits() {
         "the bake holds half of the two maintenance permits ({held:?})"
     );
 }
+
+/// A table whose triggered bakes keep finding another table's bake in the slot
+/// gets its turn: after three skips in a row its next triggered bake waits for
+/// the slot and runs once the other bake finishes, instead of skipping again.
+///
+/// Skipping alone, a table whose ticks kept landing during other tables' bakes
+/// never baked, and its deletion index grew without bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_table_that_keeps_finding_the_slot_taken_waits_its_turn() {
+    let (first, _first_catalog, _first_tmp) = bakeable_table("bake_isolation_holder").await;
+    let (starved, _starved_catalog, _starved_tmp) = bakeable_table("bake_isolation_starved").await;
+
+    let (reached, release) = hold_bake_mid_encode(&first);
+    let first = Arc::new(first);
+    let first_bake = tokio::spawn({
+        let first = Arc::clone(&first);
+        async move { first.bake_seq_prefix_protected_snapshots().await }
+    });
+    tokio::time::timeout(Duration::from_secs(60), reached)
+        .await
+        .expect("the first bake reaches its encode within 60 s")
+        .expect("the bake hook fired");
+
+    for skip in 1..=3 {
+        assert!(
+            !starved
+                .bake_seq_prefix_protected_snapshots_on_trigger()
+                .await
+                .expect("triggered bake"),
+            "skip {skip}: the slot is taken, so the triggered bake skips"
+        );
+    }
+    let starved = Arc::new(starved);
+    let mut turn = tokio::spawn({
+        let starved = Arc::clone(&starved);
+        async move { starved.bake_seq_prefix_protected_snapshots_on_trigger().await }
+    });
+    // The slot is still held, so a bake that returns here skipped a fourth time.
+    if let Ok(early) = tokio::time::timeout(Duration::from_secs(2), &mut turn).await {
+        release.notify_one();
+        panic!(
+            "after three skips the triggered bake must wait for the slot, but it returned \
+             {early:?} while the other table's bake still held it"
+        );
+    }
+    release.notify_one();
+    assert!(
+        first_bake.await.expect("bake task").expect("first bake"),
+        "the holding bake commits once released"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(60), turn)
+            .await
+            .expect("the waiting bake runs within 60 s of the slot freeing")
+            .expect("bake task")
+            .expect("waiting bake"),
+        "the table that kept finding the slot taken bakes once it frees"
+    );
+}
