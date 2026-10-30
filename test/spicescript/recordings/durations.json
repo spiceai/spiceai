@@ -122,7 +122,7 @@
   "results-cache-swr": 7,
   "retention": 10,
   "retention-fallback": 3,
-  "runtime-tables": 186,
+  "runtime-tables": 190,
   "schema-add-column": 30,
   "schema-ddl": 31,
   "search": 4,
