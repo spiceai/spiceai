@@ -46,7 +46,7 @@ use arrow::array::{ArrayRef, RecordBatch};
 use parking_lot::Mutex;
 use vortex_datafusion::VortexWriteObserver;
 
-use super::pk_index::{PkBloom, pk_keyset_entry_overhead_bytes};
+use super::pk_index::{PkIndexBloom, pk_digest_bytes, pk_index_bloom_hash, pk_keyset_entry_bytes};
 use super::pk_keyset_budget::{KeysetReservation, PkKeysetBudget, global_pk_keyset_budget};
 use super::table::CayenneTableProvider;
 use crate::row_converter::RowConverter;
@@ -76,10 +76,9 @@ struct Shared {
     incomplete: AtomicBool,
 }
 
-/// One written batch's key hashes, and its shortest encoded key.
+/// One written batch's key hashes.
 struct Hashes {
     hashes: Vec<u64>,
-    shortest_key: usize,
 }
 
 /// The keys written so far, owned by the recording thread.
@@ -88,13 +87,10 @@ struct Recorder {
     /// The process-wide keyset budget, when one is installed.
     fleet: Option<PkKeysetBudget>,
     keys: WrittenKeys,
-    /// The shortest encoded key written, which bounds the exact keyset's size
-    /// from below.
-    shortest_key: usize,
 }
 
 enum WrittenKeys {
-    /// The [`PkBloom::split_block_hash`] of every key written, while an exact
+    /// The [`pk_index_bloom_hash`] of every key written, while an exact
     /// keyset of them may still fit the budget.
     Hashed(Vec<u64>),
     Filter(FirstLoadPkFilter),
@@ -103,7 +99,7 @@ enum WrittenKeys {
 /// A filter of a first load's keys, with its bytes held against the
 /// process-wide keyset budget until the table publishes them.
 pub(super) struct FirstLoadPkFilter {
-    bloom: PkBloom,
+    bloom: PkIndexBloom,
     reservation: Option<KeysetReservation>,
 }
 
@@ -173,7 +169,6 @@ impl FirstLoadPkObserver {
             budget,
             fleet,
             keys: WrittenKeys::Hashed(Vec::new()),
-            shortest_key: usize::MAX,
         };
         let (sender, receiver) = std::sync::mpsc::channel::<Hashes>();
         let (recorded_tx, recorded_rx) = tokio::sync::oneshot::channel();
@@ -238,24 +233,19 @@ impl Recorder {
     /// Records one written batch's key hashes, or says why the load cannot
     /// install a filter of its keys.
     fn record(&mut self, batch: &Hashes) -> Result<(), &'static str> {
-        const NOT_SPLIT_BLOCK: &str = "the filter does not use the split-block layout";
-        self.shortest_key = self.shortest_key.min(batch.shortest_key);
         let hashes = match &mut self.keys {
             WrittenKeys::Filter(filter) => {
-                return filter
-                    .bloom
-                    .insert_split_block_hashes(&batch.hashes)
-                    .then_some(())
-                    .ok_or(NOT_SPLIT_BLOCK);
+                filter.bloom.insert_hashes(&batch.hashes);
+                return Ok(());
             }
             WrittenKeys::Hashed(hashes) => hashes,
         };
         hashes.extend_from_slice(&batch.hashes);
         let written = u64::try_from(hashes.len()).unwrap_or(u64::MAX);
-        if exact_keyset_may_fit(written, self.shortest_key, self.budget) {
+        if exact_keyset_may_fit(written, self.budget) {
             return Ok(());
         }
-        let mut bloom = PkBloom::with_byte_budget(self.budget);
+        let mut bloom = PkIndexBloom::with_byte_budget(self.budget);
         let reservation = match &self.fleet {
             Some(fleet) => Some(
                 fleet
@@ -264,21 +254,21 @@ impl Recorder {
             ),
             None => None,
         };
-        if !bloom.insert_split_block_hashes(hashes) {
-            return Err(NOT_SPLIT_BLOCK);
-        }
+        bloom.insert_hashes(hashes);
         self.keys = WrittenKeys::Filter(FirstLoadPkFilter { bloom, reservation });
         Ok(())
     }
 
     fn finish(self, live_rows: u64) -> Option<FirstLoadPkFilter> {
-        if exact_keyset_may_fit(live_rows, self.shortest_key, self.budget) {
+        if exact_keyset_may_fit(live_rows, self.budget) {
             return None;
         }
         match self.keys {
             WrittenKeys::Filter(mut filter) => {
                 // Written copies include those the resolution dropped.
-                filter.bloom.inserted_keys = usize::try_from(live_rows).unwrap_or(usize::MAX);
+                filter
+                    .bloom
+                    .set_inserted_keys(usize::try_from(live_rows).unwrap_or(usize::MAX));
                 Some(filter)
             }
             WrittenKeys::Hashed(_) => None,
@@ -286,12 +276,10 @@ impl Recorder {
     }
 }
 
-/// Whether an exact keyset of `keys` keys may fit `budget`: a lower bound on
-/// its size, charging each key as the keyset does with the `shortest_key`
-/// written, is within it.
-fn exact_keyset_may_fit(keys: u64, shortest_key: usize, budget: usize) -> bool {
-    let entry = shortest_key.saturating_add(pk_keyset_entry_overhead_bytes());
-    keys.saturating_mul(u64::try_from(entry).unwrap_or(u64::MAX))
+/// Whether an exact keyset of `keys` keys may fit `budget`: its size, charging
+/// each key as the keyset does, is within it.
+fn exact_keyset_may_fit(keys: u64, budget: usize) -> bool {
+    keys.saturating_mul(u64::try_from(pk_keyset_entry_bytes()).unwrap_or(u64::MAX))
         <= u64::try_from(budget).unwrap_or(u64::MAX)
 }
 
@@ -319,14 +307,9 @@ impl VortexWriteObserver for FirstLoadPkObserver {
                 return;
             }
         };
-        let mut shortest_key = usize::MAX;
         let hashes: Vec<u64> = rows
             .iter()
-            .map(|row| {
-                let key = row.as_ref();
-                shortest_key = shortest_key.min(key.len());
-                PkBloom::split_block_hash(key)
-            })
+            .map(|row| pk_index_bloom_hash(pk_digest_bytes(row.as_ref())))
             .collect();
         let count = hashes.len();
         let queue = self.queue.lock();
@@ -339,10 +322,7 @@ impl VortexWriteObserver for FirstLoadPkObserver {
         let cause = if queued.saturating_add(count) > shared.queue_limit {
             "the load got too far ahead of recording its keys"
         } else if sender
-            .send(Hashes {
-                hashes,
-                shortest_key,
-            })
+            .send(Hashes { hashes })
             .is_err()
         {
             "the thread recording the keys is gone"
@@ -363,7 +343,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use vortex_datafusion::VortexWriteObserver;
 
-    use super::{FirstLoadPkFilter, FirstLoadPkObserver, PkKeysetBudget};
+    use super::{FirstLoadPkFilter, FirstLoadPkObserver, PkKeysetBudget, pk_digest_bytes};
     use crate::row_converter::{RowConverter, SortField};
 
     const ROWS: usize = 1024;
@@ -423,7 +403,7 @@ mod tests {
         let filter = load_two_batches(usize::MAX, None)
             .await
             .expect("a load whose keys were all recorded yields a filter");
-        assert_eq!(filter.bloom.inserted_keys, 2 * ROWS);
+        assert_eq!(filter.bloom.inserted_keys(), 2 * ROWS);
         let converter = key_converter();
         for first in [0, 1024] {
             let keys = converter
@@ -431,7 +411,7 @@ mod tests {
                 .expect("keys");
             assert!(
                 keys.iter()
-                    .all(|key| filter.bloom.maybe_contains(key.as_ref())),
+                    .all(|key| filter.bloom.maybe_contains(pk_digest_bytes(key.as_ref()))),
                 "the filter holds every key written"
             );
         }

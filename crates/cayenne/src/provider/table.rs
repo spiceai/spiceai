@@ -66,7 +66,8 @@ use super::pk_deletion_mode::{AutoDeletionMode, AutoKeyTableKind, PkDeletionMode
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
     CheckedOutShardedPkIndex, ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence,
-    PendingPkKeys, PkBloom, PkCheckoutGuard, PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome,
+    PendingPkKeys, PkBloom, PkCheckoutGuard, PkDigestSet, PkExistenceRef, PkIndexBloom,
+    PkKeysetInsertOutcome,
     RowLocation, ShardedPkIndex, approx_captured_file_bytes, deserialize_pk_bloom_sidecar,
     pk_digest, pk_digest_bytes, serialize_pk_bloom_sidecar, shard_of_pk,
 };
@@ -13550,10 +13551,10 @@ impl CayenneTableProvider {
     /// (~10 bits/key at 4×), capped at `max_bytes`. The bloom cannot grow, so
     /// later inserts degrade the false-positive rate gradually; a false
     /// positive is only a redundant tombstone under upsert.
-    fn bloom_from_keyset(keyset: &CachedPkKeyset, max_bytes: usize) -> PkBloom {
-        let mut bloom = PkBloom::with_expected_keys(keyset.len().saturating_mul(4), max_bytes);
-        for key in keyset.rows() {
-            bloom.insert(key.as_ref());
+    fn bloom_from_keyset(keyset: &CachedPkKeyset, max_bytes: usize) -> PkIndexBloom {
+        let mut bloom = PkIndexBloom::with_expected_keys(keyset.len().saturating_mul(4), max_bytes);
+        for digest in keyset.digests() {
+            bloom.insert(digest);
         }
         bloom
     }
@@ -13613,7 +13614,7 @@ impl CayenneTableProvider {
 
     /// Cache the filter a first load built of the keys it wrote, as the
     /// table-wide index (see `first_load_pk`).
-    pub(crate) fn install_first_load_pk_bloom(&self, bloom: PkBloom) {
+    pub(crate) fn install_first_load_pk_bloom(&self, bloom: PkIndexBloom) {
         let (_, checkout) = self.take_cached_pk_index();
         self.store_cached_pk_index(CachedPkIndex::Bloom(bloom), checkout);
     }
@@ -13686,10 +13687,10 @@ impl CayenneTableProvider {
                 }
                 let mut bloom = match &index {
                     CachedPkIndex::Exact(keyset) => Self::bloom_from_keyset(keyset, max_bytes),
-                    CachedPkIndex::Bloom(_) => PkBloom::with_byte_budget(max_bytes),
+                    CachedPkIndex::Bloom(_) => PkIndexBloom::with_byte_budget(max_bytes),
                 };
-                for key in keys.iter() {
-                    bloom.insert(key.as_ref());
+                for digest in keys.digests() {
+                    bloom.insert(digest);
                 }
                 index = CachedPkIndex::Bloom(bloom);
             }
@@ -14103,8 +14104,8 @@ impl CayenneTableProvider {
     ) -> bool {
         match index {
             CachedPkIndex::Bloom(bloom) => {
-                for key in keys.iter() {
-                    bloom.insert(key.as_ref());
+                for digest in keys.digests() {
+                    bloom.insert(digest);
                 }
                 true
             }
@@ -14115,9 +14116,9 @@ impl CayenneTableProvider {
                 // Reuse each key's stored digest (the keyset is digest-keyed) and
                 // fold the presence check and the insert into a single hash
                 // lookup — the common case on re-touched PKs (e.g. CDC updates)
-                // is "present", where this clones neither the key nor re-hashes.
-                for (digest, key) in keys.iter_with_digest() {
-                    match keyset.try_insert_with_digest(digest, key, location.clone(), max_bytes) {
+                // is "present", where this does not re-hash.
+                for digest in keys.digests() {
+                    match keyset.try_insert_digest(digest, location.clone(), max_bytes) {
                         PkKeysetInsertOutcome::OverBudget => return false,
                         PkKeysetInsertOutcome::Updated | PkKeysetInsertOutcome::Inserted => {
                             // Stamp the key's last-commit sequence for per-key OCC.
@@ -14288,10 +14289,10 @@ impl CayenneTableProvider {
             if self.upsert_bloom_eligible() {
                 let mut bloom = match &index {
                     CachedPkIndex::Exact(keyset) => Self::bloom_from_keyset(keyset, max_bytes),
-                    CachedPkIndex::Bloom(_) => PkBloom::with_byte_budget(max_bytes),
+                    CachedPkIndex::Bloom(_) => PkIndexBloom::with_byte_budget(max_bytes),
                 };
-                for key in keys.iter() {
-                    bloom.insert(key.as_ref());
+                for digest in keys.digests() {
+                    bloom.insert(digest);
                 }
                 tracing::debug!(
                     table = self.table_metadata.table_name.as_str(),
@@ -14932,7 +14933,7 @@ impl CayenneTableProvider {
                     && self.should_capture_positions()
                 {
                     for (key, position) in entries {
-                        if let Some(location) = keyset.location_mut(&key) {
+                        if let Some(location) = keyset.location_mut(key.as_ref()) {
                             *location = RowLocation::FilePositioned {
                                 file_path: Arc::clone(&file_path),
                                 position,
@@ -15777,7 +15778,7 @@ impl CayenneTableProvider {
         for keys in staged_keys {
             for key in keys.iter() {
                 // Single hash lookup, preserving any durable-scan `RowLocation`.
-                keyset.insert_if_absent(key.clone(), RowLocation::FileUnlocated);
+                keyset.insert_if_absent(key.as_ref(), RowLocation::FileUnlocated);
             }
         }
     }
@@ -15786,10 +15787,13 @@ impl CayenneTableProvider {
     /// fast path, which reconstructs the index without the full-table scan and
     /// therefore has the same blind spot. Mirrors
     /// [`Self::fold_mem_tier_keys_into_bloom`].
-    fn fold_inflight_staged_keys_into_bloom(staged_keys: &[Arc<PkDigestSet>], bloom: &mut PkBloom) {
+    fn fold_inflight_staged_keys_into_bloom(
+        staged_keys: &[Arc<PkDigestSet>],
+        bloom: &mut PkIndexBloom,
+    ) {
         for keys in staged_keys {
-            for key in keys.iter() {
-                bloom.insert(key.as_ref());
+            for digest in keys.digests() {
+                bloom.insert(digest);
             }
         }
     }
@@ -15805,7 +15809,7 @@ impl CayenneTableProvider {
     /// record NO tombstone, and leak the prior copy — a durable over-count that
     /// compaction cannot heal because there is no tombstone to apply. This covers
     /// BOTH cold-rebuild callers (the serial `prepare_stream_for_insert` and the
-    /// sharded `build_sharded_pk_index`, which re-shards the keyset via `from_exact`)
+    /// sharded `build_sharded_pk_index`, which routes each key to its shard)
     /// and is a no-op for non-memory tables (empty `mem_tier` segments).
     ///
     /// Keys already present from the durable scan keep their `RowLocation`; RAM-only
@@ -15832,7 +15836,7 @@ impl CayenneTableProvider {
                     let rows = converter.convert_columns(&pk_columns)?;
                     for r in 0..batch.num_rows() {
                         // Single hash lookup, preserving any durable-scan `RowLocation`.
-                        keyset.insert_if_absent(rows.row(r).owned(), RowLocation::MEM_TIER);
+                        keyset.insert_if_absent(rows.row(r).as_ref(), RowLocation::MEM_TIER);
                     }
                 }
             }
@@ -15858,7 +15862,7 @@ impl CayenneTableProvider {
         mem_snapshots: &[Arc<crate::provider::mem_tier::MemTier>],
         pk_indices: &[usize],
         converter: &RowConverter,
-        bloom: &mut PkBloom,
+        bloom: &mut PkIndexBloom,
     ) -> Result<()> {
         for tier in mem_snapshots {
             for seg in tier.segments.iter() {
@@ -15883,7 +15887,7 @@ impl CayenneTableProvider {
         batch: &RecordBatch,
         pk_col_indices: &[usize],
         converter: &RowConverter,
-        bloom: &mut PkBloom,
+        bloom: &mut PkIndexBloom,
     ) -> Result<()> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -15894,7 +15898,7 @@ impl CayenneTableProvider {
             .collect();
         let rows = converter.convert_columns(&pk_columns)?;
         for row_idx in 0..batch.num_rows() {
-            bloom.insert(rows.row(row_idx).as_ref());
+            bloom.insert(pk_digest_bytes(rows.row(row_idx).as_ref()));
         }
         Ok(())
     }
@@ -15909,11 +15913,11 @@ impl CayenneTableProvider {
         converter: &RowConverter,
         expected_keys: usize,
         max_bytes: usize,
-    ) -> Result<PkBloom> {
+    ) -> Result<PkIndexBloom> {
         let ctx = self.create_session_context();
         let pk_projection = pk_indices.to_vec();
         let projected_pk_indices: Vec<usize> = (0..pk_indices.len()).collect();
-        let mut bloom = PkBloom::with_expected_keys(expected_keys, max_bytes);
+        let mut bloom = PkIndexBloom::with_expected_keys(expected_keys, max_bytes);
 
         let scan_plan = self
             .create_snapshot_scan_plan(&ctx.state(), snapshot_id, Some(&pk_projection), &[], None)
@@ -15941,7 +15945,7 @@ impl CayenneTableProvider {
         converter: &RowConverter,
         protected_snapshots: &HashMap<String, i64>,
         inlined_batches: &[RecordBatch],
-        bloom: &mut PkBloom,
+        bloom: &mut PkIndexBloom,
     ) -> Result<()> {
         let ctx = self.create_session_context();
         let pk_projection = pk_indices.to_vec();
@@ -16039,7 +16043,7 @@ impl CayenneTableProvider {
         tracing::debug!(
             table = self.table_metadata.table_name.as_str(),
             snapshot_id,
-            keys = bloom.inserted_keys,
+            keys = bloom.inserted_keys(),
             blob_bytes = bytes.len(),
             "Persisted PK-index bloom checkpoint to the metastore"
         );
@@ -16219,7 +16223,7 @@ impl CayenneTableProvider {
                         ),
                     });
                 }
-                keyset.insert(rows.row(row_index).owned(), RowLocation::Inlined);
+                keyset.insert(rows.row(row_index).as_ref(), RowLocation::Inlined);
             }
         }
 
@@ -16326,7 +16330,7 @@ impl CayenneTableProvider {
                     });
                 }
 
-                let key = rows.row(row_idx).owned();
+                let key = rows.row(row_idx);
 
                 // Insert or update the key in the keyset.
                 // Keys from protected snapshots may override keys from the main listing table
@@ -16337,7 +16341,7 @@ impl CayenneTableProvider {
                 // unions all files, so scan order != per-file position. The entry is
                 // `FileUnlocated` and falls back to key-based deletes until a later
                 // write/compaction row_idx() read-back upgrades it to `FilePositioned`.
-                keyset.insert(key, RowLocation::FileUnlocated);
+                keyset.insert(key.as_ref(), RowLocation::FileUnlocated);
             }
 
             *row_id_base += i64::try_from(batch.num_rows()).map_err(|_| Error::Internal {
@@ -16585,7 +16589,7 @@ impl CayenneTableProvider {
                 Vec::from(blooms)
                     .into_iter()
                     .next()
-                    .unwrap_or_else(|| PkBloom::with_byte_budget(0)),
+                    .unwrap_or_else(|| PkIndexBloom::with_byte_budget(0)),
             ),
         })
     }
@@ -16737,8 +16741,8 @@ impl CayenneTableProvider {
         // there) and builds the N shard views in ONE budget-bounded streaming
         // pass — routing each scanned key to its shard as it arrives, degrading
         // an over-budget upsert table to bounded per-shard blooms mid-scan. It
-        // never materializes the whole exact keyset just to re-shard
-        // (`from_exact`) or discard it: on a large freshly-snapshotted table
+        // never materializes the whole exact keyset just to re-shard or discard
+        // it: on a large freshly-snapshotted table
         // that second O(rows) pass and its unbounded allocation ran inside the
         // CDC apply loop and starved the stream for the entire run.
         //
@@ -16753,7 +16757,7 @@ impl CayenneTableProvider {
                     .await
                 {
                     Ok(Some(CachedPkIndex::Exact(keyset))) => {
-                        Some(ShardedPkIndex::from_exact(keyset, 1))
+                        Some(ShardedPkIndex::from_exact(keyset))
                     }
                     Ok(Some(CachedPkIndex::Bloom(bloom))) => {
                         Some(ShardedPkIndex::Bloom(vec![bloom].into_boxed_slice()))
@@ -17144,7 +17148,7 @@ impl CayenneTableProvider {
                     let pending_hit = ctx.pending.is_some_and(|pending| {
                         pending.is_incomplete() || pending.location_by_digest(digest).is_some()
                     });
-                    if bloom.maybe_contains(key.as_ref()) || pending_hit {
+                    if bloom.maybe_contains(digest) || pending_hit {
                         match &self.pk_deletion_strategy {
                             PkDeletionStrategyWithCache::Int64Pk { .. } => {
                                 if let Some(arr) = int64_pk_array {
@@ -17245,7 +17249,7 @@ impl CayenneTableProvider {
     /// delete" for an absent key, so a split buys nothing there.
     fn bloom_split_shard_batch(
         batch: &RecordBatch,
-        bloom: &PkBloom,
+        bloom: &PkIndexBloom,
         cold_existence: Option<&ColdPkExistence>,
         pending_existence: Option<&PendingPkExistence>,
         pk_indices: &[usize],
@@ -17289,7 +17293,7 @@ impl CayenneTableProvider {
             let is_miss = !null_pk
                 && !cold_hit
                 && !pending_hit
-                && !bloom.maybe_contains(key.as_ref())
+                && !bloom.maybe_contains(digest)
                 && !incoming_keys.contains(&digest)
                 && !miss_keys.contains_digest(digest);
             if is_miss {
@@ -50668,9 +50672,9 @@ mod tests {
                     bloom_bytes <= budget_bytes / 4,
                     "conversion bloom must be right-sized, got {bloom_bytes} bytes for a {budget_bytes}-byte budget"
                 );
-                for key in keys.iter() {
+                for digest in keys.digests() {
                     assert!(
-                        bloom.maybe_contains(key.as_ref()),
+                        bloom.maybe_contains(digest),
                         "right-sized bloom must have no false negatives"
                     );
                 }
@@ -50728,8 +50732,8 @@ mod tests {
             .expect("table created");
         provider.maybe_install_warm_pk_caches().await;
 
-        // 8k 8-byte keys ≈ 750 KiB accounted per cache (96 B/entry — see
-        // `approx_pk_keyset_entry_bytes`): under the 1 MiB budget, so neither
+        // 8k keys ≈ 563 KiB accounted per cache (72 B/entry — see
+        // `pk_keyset_entry_bytes`): under the 1 MiB budget, so neither
         // cache would convert WITHOUT the split, but over the 512 KiB
         // half-budget each cache must respect. The window is what gives this
         // test its teeth, so keep the count inside it if the per-entry estimate
@@ -76973,10 +76977,12 @@ mod tests {
 
     #[test]
     fn test_pk_bloom_sidecar_roundtrip() {
-        let mut bloom = PkBloom::with_expected_keys(10_000, 64 * 1024 * 1024);
-        let keys: Vec<[u8; 8]> = (0..10_000u64).map(u64::to_be_bytes).collect();
+        let mut bloom = PkIndexBloom::with_expected_keys(10_000, 64 * 1024 * 1024);
+        let keys: Vec<u128> = (0..10_000u64)
+            .map(|n| pk_digest_bytes(&n.to_be_bytes()))
+            .collect();
         for key in &keys {
-            bloom.insert(key);
+            bloom.insert(*key);
         }
 
         let bytes = serialize_pk_bloom_sidecar(&bloom, "snap-abc-123");
@@ -76985,10 +76991,10 @@ mod tests {
 
         assert_eq!(snapshot_id, "snap-abc-123");
         assert_eq!(restored.size_bytes(), bloom.size_bytes());
-        assert_eq!(restored.inserted_keys, bloom.inserted_keys);
+        assert_eq!(restored.inserted_keys(), bloom.inserted_keys());
         for key in &keys {
             assert!(
-                restored.maybe_contains(key),
+                restored.maybe_contains(*key),
                 "a restored bloom must retain every inserted key (no false negatives across persistence)"
             );
         }
@@ -77245,7 +77251,7 @@ mod tests {
             .convert_columns(&key2_cols)
             .expect("convert key 2");
         assert!(
-            bloom.maybe_contains(key2_rows.row(0).as_ref()),
+            bloom.maybe_contains(pk_digest_bytes(key2_rows.row(0).as_ref())),
             "the un-checkpointed RAM key must be folded into the persisted-bloom rebuild"
         );
 
@@ -80851,7 +80857,7 @@ mod tests {
         // WITHOUT touching id=1's stamp — the stale-stamp shape that a dropped /
         // stale-present / unstamped entry leaves behind.
         let mut keyset = CachedPkKeyset::with_capacity(1);
-        keyset.insert(key.clone(), RowLocation::FileUnlocated);
+        keyset.insert(key.as_ref(), RowLocation::FileUnlocated);
         keyset.record_sequence(digest, 5);
         let (_, checkout) = provider.take_cached_pk_index();
         provider.store_cached_pk_index(CachedPkIndex::Exact(keyset), checkout);
@@ -80899,7 +80905,7 @@ mod tests {
         // fallback) only because the flag was set.
         provider.clear_cached_pk_keyset();
         let mut delta_updated = CachedPkKeyset::with_capacity(1);
-        delta_updated.insert(key.clone(), RowLocation::FileUnlocated);
+        delta_updated.insert(key.as_ref(), RowLocation::FileUnlocated);
         delta_updated.record_sequence(digest, 5);
         let (_, checkout) = provider.take_cached_pk_index();
         provider.store_cached_pk_index(CachedPkIndex::Exact(delta_updated), checkout);
@@ -80923,7 +80929,7 @@ mod tests {
         // rebuild is conservative (over-abort), so clearing the flag never lets a
         // real post-rebuild commit miss a concurrent write.
         let mut floor_stamped = CachedPkKeyset::with_capacity(1);
-        floor_stamped.insert(key, RowLocation::FileUnlocated);
+        floor_stamped.insert(key.as_ref(), RowLocation::FileUnlocated);
         floor_stamped.record_sequence(digest, 5);
         floor_stamped.stamp_all_sequences_min(current_high_water);
         let (_, checkout) = provider.take_cached_pk_index();
@@ -81211,8 +81217,9 @@ mod tests {
     async fn a_table_keyset_discard_keeps_the_per_shard_index() {
         let ctx = SessionContext::new();
         // A 1 MiB index budget is 512 KiB per cache at N>1, so the table-wide log (a
-        // quarter of that) overflows at ~1.4 K keys while the per-shard index still
-        // holds the same keys exactly.
+        // quarter of that) overflows at ~2.3 K keys (57 B per 9-byte key, see
+        // `approx_pk_digest_set_entry_bytes`) while the per-shard index still holds
+        // the same keys exactly.
         let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
             "pk_table_discard_keeps_sharded",
             ctx.runtime_env(),
@@ -81252,7 +81259,7 @@ mod tests {
         // more keys than its log may hold.
         let (table_index, checkout) = provider.take_cached_pk_index();
         let table_index = table_index.expect("the warm table-wide index is cached");
-        let concurrent: Vec<i64> = (1_000..3_000).collect();
+        let concurrent: Vec<i64> = (1_000..5_000).collect();
         provider.record_file_pk_keys(&pk_digest_set_for_ids(&converter, &concurrent), 11);
         provider.store_cached_pk_index(table_index, checkout);
         assert!(
@@ -81505,7 +81512,7 @@ mod tests {
 
         match provider.pk_keyset_cache.lock().as_ref() {
             Some(CachedPkIndex::Bloom(bloom)) => assert!(
-                bloom.maybe_contains(committed.as_ref()),
+                bloom.maybe_contains(pk_digest(&committed)),
                 "the restore must replay the key committed during the checkout"
             ),
             other => panic!(
@@ -81617,7 +81624,7 @@ mod tests {
         };
         match provider.pk_keyset_cache.lock().as_ref() {
             Some(CachedPkIndex::Bloom(bloom)) => assert!(
-                bloom.maybe_contains(&key_7),
+                bloom.maybe_contains(pk_digest_bytes(&key_7)),
                 "the rebuilt index must hold key 7, whose row the checkpoint moved into a file"
             ),
             Some(CachedPkIndex::Exact(_)) => {
@@ -81794,7 +81801,7 @@ mod tests {
             Some(ShardedPkIndex::Bloom(blooms)) => {
                 let shard = crate::provider::pk_index::shard_of_pk(&committed_key, blooms.len());
                 assert!(
-                    blooms[shard].maybe_contains(&committed_key),
+                    blooms[shard].maybe_contains(pk_digest_bytes(&committed_key)),
                     "the restore must replay the key committed during the checkout"
                 );
             }
