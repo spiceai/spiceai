@@ -701,12 +701,56 @@ steps:
     eventually: 60s
     expect: { oracle: ref }
     oracle-sql: SELECT id, ts FROM new
+  # A name that prints as another's, `"k7.t"` next to `k7.t`, would use its
+  # engine table, in Cayenne as in any engine, so it is refused, and `k7.t`
+  # keeps its data, across the restart too.
+  - generate:
+      lake:
+        table: ev7
+        rows: 20
+        seed: 35
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: ts, sequence: 1000 }
+  - spice-exec: "CREATE TABLE k7.t WITH (from = 'file://${sources.lake.path}/ev7/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds', acceleration.refresh_check_interval = '1h')"
+    only: a
+  - query: SELECT count(*) AS n FROM k7.t
+    only: a
+    eventually: 60s
+    expect: { rows: [['20']] }
+  - generate:
+      lake:
+        table: ev7
+        rows: 5
+        seed: 36
+        format: csv
+        mode: replace
+        columns:
+          - { name: id, sequence: 5000 }
+          - { name: ts, sequence: 5000 }
+  - refresh: k7.t
+    only: a
+  - query: SELECT count(*) AS n FROM k7.t
+    only: a
+    expect: { rows: [['25']] }
+  - query: SELECT id, ts FROM k7.t
+    only: a
+    id: k7-kept
+    expect: {}
+  - spice-exec: "CREATE TABLE \"k7.t\" WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+    expect-error: "dataset 'k7.t' keeps its acceleration data in the Cayenne table `k7.t`"
   - restart: {}
     only: a
   - query: SELECT id, ts FROM k6_t
     only: a
     eventually: 60s
     expect: { same-as: k6-kept }
+  - query: SELECT id, ts FROM k7.t
+    only: a
+    eventually: 60s
+    expect: { same-as: k7-kept }
 
   # Two names that differ only in case would share one table in an engine
   # that does not keep such tables apart, so the statement that defines the
@@ -806,6 +850,31 @@ steps:
     eventually: 60s
     expect: { oracle: ref }
     oracle-sql: SELECT id, ts FROM new
+
+  # An accelerated view's table counts too: a dataset whose name differs only
+  # in case from a view's, in the same SQLite file, is refused, and the view
+  # keeps its rows.
+  - restart:
+      patch:
+        spicepod:
+          views:
+            - name: '"C6"'
+              sql: SELECT id, ts FROM "C1"
+              acceleration: { enabled: true, engine: sqlite, mode: file }
+    only: a
+  - query: SELECT id, ts FROM "C6"
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - spice-exec: "CREATE TABLE c6 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'file')"
+    only: a
+    expect-error: "view 'C6' keeps its acceleration data in the same SQLite file"
+  - query: SELECT id, ts FROM "C6"
+    only: a
+    consistently: 5s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
 
   # An instance that has written no acceleration file creates the first one
   # of each engine that keeps one.

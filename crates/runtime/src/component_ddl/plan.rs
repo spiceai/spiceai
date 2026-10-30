@@ -564,14 +564,23 @@ pub(crate) fn changed_components(known: &SqlDefinitions, stored: &SqlDefinitions
     changed
 }
 
-/// A dataset name in a message: its parts quoted, as SQL resolves them.
+/// A dataset name in a message, as SQL resolves it. A part that holds a `.`
+/// or a `"` is quoted as SQL writes it, so `"s1.t1"`, one name, does not print
+/// as `s1.t1`, a table in schema `s1`.
 pub(crate) fn display_dataset_name(name: &str) -> String {
+    let part = |part: &str| {
+        if part.contains(['.', '"']) {
+            format!("\"{}\"", part.replace('"', "\"\""))
+        } else {
+            part.to_string()
+        }
+    };
     let reference = TableReference::parse_str(name);
     match reference.schema() {
         Some(schema) if schema != SPICE_DEFAULT_SCHEMA => {
-            format!("'{schema}.{}'", reference.table())
+            format!("'{}.{}'", part(schema), part(reference.table()))
         }
-        _ => format!("'{}'", reference.table()),
+        _ => format!("'{}'", part(reference.table())),
     }
 }
 

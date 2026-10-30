@@ -60,6 +60,7 @@ pub(crate) use store::{DefinitionsStore, SqlDefinitions};
 use crate::Runtime;
 use crate::component::catalog::CatalogBuilder;
 use crate::component::dataset::builder::DatasetBuilder;
+use crate::dataaccelerator::AccelerationSource;
 use crate::dataconnector::get_connector_factory;
 use crate::status::ComponentStatus;
 use plan::{Component, Planned, display_dataset_name};
@@ -1394,9 +1395,9 @@ impl Runtime {
                     .datasets
                     .iter()
                     .find(|dataset| same_dataset(&dataset.name, op.component_name()))
-                && let Some((other, store)) = self.dataset_sharing_table(dataset, &next).await
+                && let Some(shared) = self.component_sharing_table(dataset, &next).await
             {
-                return Err(not_applied(&shares_table_with(&other, &store)));
+                return Err(not_applied(&shares_table_with(&shared)));
             }
             if let Some(component) = &validate {
                 tokio::time::timeout(
@@ -1799,9 +1800,32 @@ impl Runtime {
             .with_runtime(Arc::clone(self))
             .build()
             .ok()?;
-        let acceleration = built.acceleration.as_ref()?;
+        self.source_store(&built).await
+    }
+
+    /// The store `view`'s acceleration keeps its data in, as
+    /// [`Self::acceleration_store`] gives a dataset's.
+    async fn view_acceleration_store(
+        self: &Arc<Self>,
+        view: &spicepod::component::view::View,
+        app: &Arc<App>,
+    ) -> Option<Store> {
+        if !view.acceleration.as_ref().is_some_and(|a| a.enabled) {
+            return None;
+        }
+        let spec = crate::component::view::ViewBuilder::try_from(view.clone())
+            .ok()?
+            .build();
+        let built = crate::component::view::View::new(spec, Arc::clone(self), Arc::clone(app));
+        self.source_store(&built).await
+    }
+
+    /// The store `source`'s acceleration keeps its data in, as
+    /// [`Self::acceleration_store`] describes it.
+    async fn source_store(&self, source: &dyn AccelerationSource) -> Option<Store> {
+        let acceleration = source.acceleration()?;
         let engine = acceleration.engine;
-        if !built.is_file_accelerated() {
+        if !source.is_file_accelerated() {
             return engine
                 .shares_memory_instance()
                 .then_some(Store::SharedMemory(engine));
@@ -1811,9 +1835,9 @@ impl Runtime {
             .accelerator_engine_registry()
             .get_accelerator_engine(engine)
             .await?;
-        let location = match accelerator.acceleration_layout(&built) {
+        let location = match accelerator.acceleration_layout(source) {
             AccelerationLayout::None => {
-                if let Ok(path) = accelerator.file_path(&built) {
+                if let Ok(path) = accelerator.file_path(source) {
                     place(std::path::Path::new(&path))
                         .await
                         .display()
@@ -1883,30 +1907,64 @@ impl Runtime {
         started
     }
 
-    /// Another dataset of `app` whose acceleration keeps its data in the table
-    /// `dataset`'s would: one whose name differs from `dataset`'s only in case,
-    /// in the same store, of an engine that reads such names as one table.
-    /// Returns its name and the store.
-    async fn dataset_sharing_table(
+    /// Another dataset or view of `app` whose acceleration keeps its data in
+    /// the table `dataset`'s would. An engine names a component's table after
+    /// the name the component prints as, so two names that print alike, such
+    /// as `"s1.t1"` and `s1.t1`, share one table in a store of any engine, and
+    /// Cayenne finds a table by that name in a metastore other datasets may
+    /// share; `DuckDB`, `SQLite`, and Turso also read names that differ only in
+    /// case as one table.
+    async fn component_sharing_table(
         self: &Arc<Self>,
         dataset: &Dataset,
         app: &Arc<App>,
-    ) -> Option<(String, Store)> {
+    ) -> Option<SharedTable> {
         let store = self.acceleration_store(dataset, app).await?;
-        if !store.engine().reads_case_variant_names_as_one_table() {
-            return None;
-        }
-        // The engine's table is named after the dataset as it registers.
         let table = |name: &str| datafusion::common::TableReference::parse_str(name).to_string();
         let own = table(&dataset.name);
-        for other in &app.datasets {
-            if same_dataset(&other.name, &dataset.name)
-                || !table(&other.name).eq_ignore_ascii_case(&own)
-            {
-                continue;
+        let folds_case = store.engine().reads_case_variant_names_as_one_table();
+        // Whether `other`, the name another component prints as, names the
+        // same table, and whether it prints alike rather than in another case.
+        let names_own = |other: &str| {
+            if other == own {
+                Some(true)
+            } else {
+                (folds_case && other.eq_ignore_ascii_case(&own)).then_some(false)
             }
-            if self.acceleration_store(other, app).await.as_ref() == Some(&store) {
-                return Some((other.name.clone(), store));
+        };
+        let others = app
+            .datasets
+            .iter()
+            .filter(|other| !same_dataset(&other.name, &dataset.name))
+            .map(|other| ("dataset", &other.name, None, Some(other)))
+            .chain(
+                app.views
+                    .iter()
+                    .map(|view| ("view", &view.name, Some(view), None)),
+            );
+        for (kind, name, view, other) in others {
+            let Some(alike) = names_own(&table(name)) else {
+                continue;
+            };
+            let other_store = match (view, other) {
+                (Some(view), _) => self.view_acceleration_store(view, app).await,
+                (None, Some(other)) => self.acceleration_store(other, app).await,
+                (None, None) => None,
+            };
+            let Some(other_store) = other_store else {
+                continue;
+            };
+            let shares = other_store == store
+                || (alike
+                    && store.engine() == Engine::Cayenne
+                    && other_store.engine() == Engine::Cayenne);
+            if shares {
+                return Some(SharedTable {
+                    kind,
+                    name: name.clone(),
+                    table: alike.then(|| own.clone()),
+                    store,
+                });
             }
         }
         None
@@ -2052,32 +2110,64 @@ impl Store {
     }
 }
 
-/// Why a statement that defines a dataset is refused when `other`, whose name
-/// differs from the dataset's only in case, keeps its acceleration data in the
-/// same `store`, of an engine that reads the two names as one table.
-fn shares_table_with(other: &str, store: &Store) -> String {
-    let shown = display_dataset_name(other);
+/// A dataset or view whose acceleration keeps its data in the table that a
+/// statement's dataset would use.
+#[derive(Debug)]
+struct SharedTable {
+    /// `dataset` or `view`.
+    kind: &'static str,
+    /// Its name, as declared.
+    name: String,
+    /// The table both would use, when the two names print alike; `None` when
+    /// they differ only in case.
+    table: Option<String>,
+    /// The store the statement's dataset would keep its data in.
+    store: Store,
+}
+
+/// Why a statement that defines a dataset is refused when `shared` keeps its
+/// acceleration data in the table the dataset would use.
+fn shares_table_with(shared: &SharedTable) -> String {
+    let SharedTable {
+        kind,
+        name,
+        table,
+        store,
+    } = shared;
+    let shown = display_dataset_name(name);
     let engine = store.engine();
-    let name = match engine {
+    let engine_name = match engine {
         Engine::DuckDB => "DuckDB".to_string(),
         Engine::Sqlite => "SQLite".to_string(),
         Engine::Turso => "Turso".to_string(),
+        Engine::Cayenne => "Cayenne".to_string(),
         other => format!("`{other}`"),
     };
+    if engine == Engine::Cayenne {
+        let table = table.as_deref().unwrap_or_default();
+        return format!(
+            "{kind} {shown} keeps its acceleration data in the Cayenne table `{table}`, which this dataset would use too. Give this dataset another name."
+        );
+    }
     let (place, apart) = match store {
         Store::Located { .. } => (
-            format!("the same {name} file"),
+            format!("the same {engine_name} file"),
             format!("set its own `acceleration.params.{engine}_file`"),
         ),
         Store::SharedMemory(_) => (
-            format!("the same {name} memory instance"),
+            format!("the same {engine_name} memory instance"),
             "accelerate it in a file (`acceleration.mode = 'file'`)".to_string(),
         ),
     };
-    format!(
-        "dataset {shown} keeps its acceleration data in {place}, and {name} reads table names that differ only in case as one table, so the two datasets cannot keep their data apart there. Give this dataset a name that differs from {shown} by more than case, or keep its data apart: {apart}, or use the `{}` engine.",
-        Engine::default()
-    )
+    let default = Engine::default();
+    match table {
+        Some(table) => format!(
+            "{kind} {shown} keeps its acceleration data in {place}, in the table `{table}`, which this dataset would use too. Give this dataset another name, or keep its data apart: {apart}, or use the `{default}` engine."
+        ),
+        None => format!(
+            "{kind} {shown} keeps its acceleration data in {place}, and {engine_name} reads table names that differ only in case as one table, so the two cannot keep their data apart there. Give this dataset a name that differs from {shown} by more than case, or keep its data apart: {apart}, or use the `{default}` engine."
+        ),
+    }
 }
 
 /// What [`Runtime::retire`] serves when it cannot delete a retired dataset's
@@ -2609,26 +2699,66 @@ mod tests {
         );
     }
 
-    /// A statement that would put a dataset's acceleration in the table of a
-    /// dataset whose name differs only in case names that dataset, the
-    /// engine, and how to keep the two apart: a file of its own, or the
-    /// default engine, which is `cayenne` where it is built.
+    /// A statement that would put a dataset's acceleration in the table of
+    /// another dataset or view, one whose name differs only in case or prints
+    /// alike, names it, the engine, and how to keep the two apart: another
+    /// name, a file of its own, or the default engine, which is `cayenne`
+    /// where it is built.
     #[cfg(not(windows))]
     #[test]
     fn a_dataset_that_would_share_a_table_names_the_other() {
+        let shared = |kind, name: &str, table: Option<&str>, store| SharedTable {
+            kind,
+            name: name.to_string(),
+            table: table.map(str::to_string),
+            store,
+        };
         assert_eq!(
-            shares_table_with(
+            shares_table_with(&shared(
+                "dataset",
                 "\"Orders\"",
-                &Store::Located {
+                None,
+                Store::Located {
                     engine: Engine::Sqlite,
                     location: "/data/accelerated_sqlite.db".to_string(),
                 }
-            ),
-            "dataset 'Orders' keeps its acceleration data in the same SQLite file, and SQLite reads table names that differ only in case as one table, so the two datasets cannot keep their data apart there. Give this dataset a name that differs from 'Orders' by more than case, or keep its data apart: set its own `acceleration.params.sqlite_file`, or use the `cayenne` engine."
+            )),
+            "dataset 'Orders' keeps its acceleration data in the same SQLite file, and SQLite reads table names that differ only in case as one table, so the two cannot keep their data apart there. Give this dataset a name that differs from 'Orders' by more than case, or keep its data apart: set its own `acceleration.params.sqlite_file`, or use the `cayenne` engine."
         );
         assert_eq!(
-            shares_table_with("\"Orders\"", &Store::SharedMemory(Engine::DuckDB)),
-            "dataset 'Orders' keeps its acceleration data in the same DuckDB memory instance, and DuckDB reads table names that differ only in case as one table, so the two datasets cannot keep their data apart there. Give this dataset a name that differs from 'Orders' by more than case, or keep its data apart: accelerate it in a file (`acceleration.mode = 'file'`), or use the `cayenne` engine."
+            shares_table_with(&shared(
+                "view",
+                "\"Orders\"",
+                None,
+                Store::SharedMemory(Engine::DuckDB)
+            )),
+            "view 'Orders' keeps its acceleration data in the same DuckDB memory instance, and DuckDB reads table names that differ only in case as one table, so the two cannot keep their data apart there. Give this dataset a name that differs from 'Orders' by more than case, or keep its data apart: accelerate it in a file (`acceleration.mode = 'file'`), or use the `cayenne` engine."
+        );
+        // Two names that print alike: `s1.t1`, a table in schema `s1`, and
+        // `"s1.t1"`, one name, which prints quoted.
+        assert_eq!(
+            shares_table_with(&shared(
+                "dataset",
+                "s1.t1",
+                Some("s1.t1"),
+                Store::Located {
+                    engine: Engine::DuckDB,
+                    location: "/data/accelerated_duckdb.db".to_string(),
+                }
+            )),
+            "dataset 's1.t1' keeps its acceleration data in the same DuckDB file, in the table `s1.t1`, which this dataset would use too. Give this dataset another name, or keep its data apart: set its own `acceleration.params.duckdb_file`, or use the `cayenne` engine."
+        );
+        assert_eq!(
+            shares_table_with(&shared(
+                "dataset",
+                "\"s1.t1\"",
+                Some("s1.t1"),
+                Store::Located {
+                    engine: Engine::Cayenne,
+                    location: "/data/s1_t1".to_string(),
+                }
+            )),
+            "dataset '\"s1.t1\"' keeps its acceleration data in the Cayenne table `s1.t1`, which this dataset would use too. Give this dataset another name."
         );
     }
 
