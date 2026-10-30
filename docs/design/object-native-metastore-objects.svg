@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1790 779" width="1790" height="779" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<style>
+.title { font-size: 15px; font-weight: 600; fill: #1f2328; }
+.kind { font-size: 11px; fill: #59636e; }
+.path { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; fill: #1f2328; }
+.field { font-size: 13px; fill: #1f2328; }
+.edge { font-size: 12px; font-weight: 500; paint-order: stroke; stroke: #ffffff; stroke-width: 4px; }
+.note { font-size: 13px; fill: #59636e; }
+.keyhead { font-size: 13px; font-weight: 600; fill: #1f2328; }
+.region { font-size: 13px; font-weight: 600; fill: #59636e; letter-spacing: 0.04em; }
+.prefix { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; fill: #1f2328; }
+</style>
+<defs>
+<marker id="arrow-ref" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0969da"/></marker>
+<marker id="arrow-hold" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8250df"/></marker>
+<marker id="arrow-fence" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#bf8700"/></marker>
+</defs>
+<rect x="0" y="0" width="1790" height="779" fill="#ffffff"/>
+<text x="20" y="28" class="note">Every path is under</text>
+<text x="158" y="28" class="prefix">&lt;runtime.state.location&gt;/cayenne/v1/datasets/&lt;slug&gt;-&lt;dataset_id&gt;/</text>
+<text x="20" y="48" class="note">&lt;generation&gt; is the lease generation of the writer that created the object, so two owners never write the same name.</text>
+<text x="20" y="78" class="keyhead">Key</text>
+<rect x="64" y="67" width="26" height="14" rx="3" fill="#fff4e5" stroke="#d4a72c"/>
+<text x="98" y="79" class="note">mutable · written only by CAS</text>
+<rect x="318.8" y="67" width="26" height="14" rx="3" fill="#eef6ff" stroke="#54aeff"/>
+<text x="352.8" y="79" class="note">immutable · create-if-absent</text>
+<rect x="566.4" y="67" width="26" height="14" rx="3" fill="#f3f0ff" stroke="#a371f7"/>
+<text x="600.4" y="79" class="note">stored inside another object</text>
+<rect x="814.0" y="67" width="26" height="14" rx="3" fill="#e9f7ec" stroke="#4ac26b"/>
+<text x="848.0" y="79" class="note">immutable · data, not metastore</text>
+<line x1="64" y1="100" x2="100" y2="100" stroke="#0969da" stroke-width="1.6"/>
+<text x="108" y="104" class="note">references by name and digest; a reader follows it</text>
+<line x1="478.0" y1="100" x2="514.0" y2="100" stroke="#8250df" stroke-width="1.6"/>
+<text x="522.0" y="104" class="note">holds records inline</text>
+<line x1="682.0" y1="100" x2="718.0" y2="100" stroke="#bf8700" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="726.0" y="104" class="note">fencing: a takeover writes the new generation into the head</text>
+<rect x="14" y="116" width="1276" height="647" rx="12" fill="none" stroke="#afb8c1" stroke-dasharray="5 4"/>
+<text x="28" y="138" class="region">METASTORE · the dataset's commit log and state</text>
+<rect x="1340" y="116" width="420" height="647" rx="12" fill="#f6fff8" stroke="#4ac26b" stroke-dasharray="5 4"/>
+<text x="1354" y="138" class="region">DATA · table rows and deletes</text>
+<rect x="60" y="150" width="360" height="147" rx="8" fill="#fff4e5" stroke="#d4a72c" stroke-width="1.5"/>
+<text x="72" y="172" class="title">Lease</text>
+<text x="408" y="172" class="kind" text-anchor="end">mutable · written only by CAS</text>
+<text x="72" y="192" class="path">leases/writer.json</text>
+<line x1="60" y1="218" x2="420" y2="218" stroke="#d4a72c" stroke-width="1"/>
+<text x="72" y="240.5" class="field">holder</text>
+<text x="72" y="261.5" class="field">generation</text>
+<text x="72" y="282.5" class="field">expiry</text>
+<rect x="60" y="330" width="360" height="231" rx="8" fill="#fff4e5" stroke="#d4a72c" stroke-width="1.5"/>
+<text x="72" y="352" class="title">Head</text>
+<text x="408" y="352" class="kind" text-anchor="end">mutable · written only by CAS</text>
+<text x="72" y="372" class="path">head</text>
+<line x1="60" y1="398" x2="420" y2="398" stroke="#d4a72c" stroke-width="1"/>
+<text x="72" y="420.5" class="field">format, features</text>
+<text x="72" y="441.5" class="field">incarnation</text>
+<text x="72" y="462.5" class="field">commit: newest commit number</text>
+<text x="72" y="483.5" class="field">lease: ingest writer&#x27;s generation</text>
+<text x="72" y="504.5" class="field">batches: [last commit, generation] …</text>
+<text x="72" y="525.5" class="field">inline_records: first_inline … commit</text>
+<text x="72" y="546.5" class="field">checkpoint: commit, generation</text>
+<rect x="480" y="150" width="360" height="105" rx="8" fill="#eef6ff" stroke="#54aeff" stroke-width="1.5"/>
+<text x="492" y="172" class="title">Batch</text>
+<text x="828" y="172" class="kind" text-anchor="end">immutable · create-if-absent</text>
+<text x="492" y="192" class="path">wal/&lt;first commit&gt;-&lt;generation&gt;</text>
+<line x1="480" y1="218" x2="840" y2="218" stroke="#54aeff" stroke-width="1"/>
+<text x="492" y="240.5" class="field">records first … last, in order</text>
+<rect x="480" y="300" width="360" height="189" rx="8" fill="#f3f0ff" stroke="#a371f7" stroke-width="1.5"/>
+<text x="492" y="322" class="title">Record</text>
+<text x="828" y="322" class="kind" text-anchor="end">stored inside another object</text>
+<text x="492" y="342" class="path">no path: inline in the head, or in a batch</text>
+<line x1="480" y1="368" x2="840" y2="368" stroke="#a371f7" stroke-width="1"/>
+<text x="492" y="390.5" class="field">commit number, attempt id</text>
+<text x="492" y="411.5" class="field">writer generation</text>
+<text x="492" y="432.5" class="field">actions and guards: add or remove files</text>
+<text x="492" y="453.5" class="field">object refs, each with its BLAKE3 digest</text>
+<text x="492" y="474.5" class="field">source position</text>
+<rect x="480" y="550" width="360" height="189" rx="8" fill="#eef6ff" stroke="#54aeff" stroke-width="1.5"/>
+<text x="492" y="572" class="title">Checkpoint root</text>
+<text x="828" y="572" class="kind" text-anchor="end">immutable · create-if-absent</text>
+<text x="492" y="592" class="path">checkpoints/&lt;commit&gt;-&lt;generation&gt;</text>
+<line x1="480" y1="618" x2="840" y2="618" stroke="#54aeff" stroke-width="1"/>
+<text x="492" y="640.5" class="field">dataset entry, table entries</text>
+<text x="492" y="661.5" class="field">page refs: collection, key range, digest</text>
+<text x="492" y="682.5" class="field">recent attempt ids</text>
+<text x="492" y="703.5" class="field">pending removals: object, removing commit</text>
+<text x="492" y="724.5" class="field">unit lease generations (Milestones 2, 3)</text>
+<rect x="900" y="150" width="360" height="147" rx="8" fill="#eef6ff" stroke="#54aeff" stroke-width="1.5"/>
+<text x="912" y="172" class="title">Page or object</text>
+<text x="1248" y="172" class="kind" text-anchor="end">immutable · create-if-absent</text>
+<text x="912" y="192" class="path">objects/&lt;kind&gt;/&lt;generation&gt;-&lt;counter&gt;</text>
+<line x1="900" y1="218" x2="1260" y2="218" stroke="#54aeff" stroke-width="1"/>
+<text x="912" y="240.5" class="field">a sorted chunk of one collection:</text>
+<text x="912" y="261.5" class="field">live files, deletion vectors, PK index;</text>
+<text x="912" y="282.5" class="field">or a manifest, statistics, …</text>
+<rect x="1370" y="300" width="360" height="123" rx="8" fill="#e9f7ec" stroke="#4ac26b" stroke-width="1.5"/>
+<text x="1382" y="322" class="title">Data file</text>
+<text x="1718" y="322" class="kind" text-anchor="end">immutable · data, not metastore</text>
+<text x="1382" y="342" class="path">data/&lt;table_id&gt;/&lt;write_id&gt;_&lt;ordinal&gt;.vortex</text>
+<text x="1382" y="360" class="path">data/&lt;table_id&gt;/delete_&lt;uuidv7&gt;.arrow</text>
+<line x1="1370" y1="386" x2="1730" y2="386" stroke="#4ac26b" stroke-width="1"/>
+<text x="1382" y="408.5" class="field">rows (Vortex) or deletes (Arrow IPC)</text>
+<path d="M420,500.5 C450.0,500.5 450.0,172 480,172" fill="none" stroke="#0969da" stroke-width="1.6" marker-end="url(#arrow-ref)"/>
+<circle cx="420" cy="500.5" r="3" fill="#0969da"/>
+<text x="450.0" y="330.25" class="edge" text-anchor="middle" fill="#0969da">lists</text>
+<path d="M420,521.5 C450.0,521.5 450.0,322 480,322" fill="none" stroke="#8250df" stroke-width="1.6" marker-end="url(#arrow-hold)"/>
+<circle cx="420" cy="521.5" r="3" fill="#8250df"/>
+<text x="450.0" y="415.75" class="edge" text-anchor="middle" fill="#8250df">holds inline</text>
+<path d="M420,542.5 C450.0,542.5 450.0,572 480,572" fill="none" stroke="#0969da" stroke-width="1.6" marker-end="url(#arrow-ref)"/>
+<circle cx="420" cy="542.5" r="3" fill="#0969da"/>
+<text x="450.0" y="551.25" class="edge" text-anchor="middle" fill="#0969da">names</text>
+<path d="M660.0,255 L660.0,300" fill="none" stroke="#8250df" stroke-width="1.6" marker-end="url(#arrow-hold)"/>
+<circle cx="660.0" cy="255" r="3" fill="#8250df"/>
+<text x="668.0" y="281.5" class="edge" text-anchor="start" fill="#8250df">holds</text>
+<path d="M840,449.5 C870.0,449.5 870.0,172 900,172" fill="none" stroke="#0969da" stroke-width="1.6" marker-end="url(#arrow-ref)"/>
+<circle cx="840" cy="449.5" r="3" fill="#0969da"/>
+<path d="M840,428.5 C1105.0,428.5 1105.0,322 1370,322" fill="none" stroke="#0969da" stroke-width="1.6" marker-end="url(#arrow-ref)"/>
+<circle cx="840" cy="428.5" r="3" fill="#0969da"/>
+<text x="1080.0" y="379.25" class="edge" text-anchor="middle" fill="#0969da">adds / removes</text>
+<path d="M840,657.5 C870.0,657.5 870.0,172 900,172" fill="none" stroke="#0969da" stroke-width="1.6" marker-end="url(#arrow-ref)"/>
+<circle cx="840" cy="657.5" r="3" fill="#0969da"/>
+<path d="M1260,257.5 C1315.0,257.5 1315.0,322 1370,322" fill="none" stroke="#0969da" stroke-width="1.6" marker-end="url(#arrow-ref)"/>
+<circle cx="1260" cy="257.5" r="3" fill="#0969da"/>
+<text x="1272" y="247.5" class="edge" text-anchor="start" fill="#0969da">live files list</text>
+<path d="M60,257.5 C16,257.5 16,479.5 60,479.5" fill="none" stroke="#bf8700" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#arrow-fence)"/>
+<circle cx="60" cy="257.5" r="3" fill="#bf8700"/>
+<text x="72" y="317" class="edge" text-anchor="start" fill="#bf8700">a takeover CAS copies it to lease</text>
+</svg>
