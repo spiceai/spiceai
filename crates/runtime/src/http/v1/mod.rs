@@ -553,9 +553,7 @@ async fn buffered_body_response(
 fn buffered_error_response(e: &DataFusionError) -> Response {
     let kind = SqlErrorKind::of_datafusion_error(e);
     let message = if matches!(kind, SqlErrorKind::ResourcesExhausted) {
-        format!(
-            "The query result is too large to buffer in memory for this response. {e}"
-        )
+        format!("The query result is too large to buffer in memory for this response. {e}")
     } else {
         e.to_string()
     };
@@ -594,9 +592,9 @@ fn plain_text_size(data: &[RecordBatch]) -> Result<usize, ArrowError> {
         }
     }
     // `| a | b |` plus the line break.
-    let line_len = widths
-        .iter()
-        .fold(2_usize, |len, width| len.saturating_add(width.saturating_add(3)));
+    let line_len = widths.iter().fold(2_usize, |len, width| {
+        len.saturating_add(width.saturating_add(3))
+    });
     Ok(lines.saturating_mul(line_len))
 }
 
@@ -1388,8 +1386,16 @@ mod tests {
         let value = "x".repeat(600 * 1024);
         let cases = [
             (1 << 20, ResponseMimeType::Json, StatusCode::OK),
-            (1 << 20, ResponseMimeType::Plain, StatusCode::SERVICE_UNAVAILABLE),
-            (256 << 10, ResponseMimeType::Json, StatusCode::SERVICE_UNAVAILABLE),
+            (
+                1 << 20,
+                ResponseMimeType::Plain,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                256 << 10,
+                ResponseMimeType::Json,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
             (8 << 20, ResponseMimeType::Plain, StatusCode::OK),
         ];
         for (limit, format, expected) in cases {
@@ -1891,7 +1897,11 @@ mod tests {
                         assert_eq!(status, expected_status, "{format:?} raw={raw}: {body}");
                         assert_eq!(body, expected_body, "{format:?} raw={raw}");
                     } else {
-                        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{format:?} raw={raw}");
+                        assert_eq!(
+                            status,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "{format:?} raw={raw}"
+                        );
                         assert!(
                             body.contains("too large to buffer"),
                             "{format:?} raw={raw}: the error names the cause: `{body}`"
@@ -1911,7 +1921,10 @@ mod tests {
             assert_eq!(data, batches);
             assert_eq!(
                 reservation.size(),
-                batches.iter().map(RecordBatch::get_array_memory_size).sum::<usize>()
+                batches
+                    .iter()
+                    .map(RecordBatch::get_array_memory_size)
+                    .sum::<usize>()
             );
         }
     }
