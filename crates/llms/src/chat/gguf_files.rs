@@ -345,7 +345,13 @@ pub fn draft_head(listing: &[ListedFile], quantization: &Quantization) -> Vec<St
     with_tag("Q8_0")
         .or_else(|| {
             let own = tag(quantization.files.first()?)?;
-            with_tag(&own).or_else(|| with_tag(own.trim_start_matches("UD-")))
+            // the tag without its `UD-` prefix, which `TAG` matches in any case
+            let plain = own
+                .get(..3)
+                .filter(|prefix| prefix.eq_ignore_ascii_case("UD-"))
+                .and_then(|_| own.get(3..))
+                .unwrap_or(&own);
+            with_tag(&own).or_else(|| with_tag(plain))
         })
         .unwrap_or_default()
 }
