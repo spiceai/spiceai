@@ -89,7 +89,7 @@ impl MetadataConnection {
             return Ok(match without_password(&pairs, &["password"]) {
                 Some((path, password)) => Self {
                     path: format!("postgres:{path}"),
-                    password: Some((MetadataDatabase::Postgres, password)),
+                    password: password.map(|password| (MetadataDatabase::Postgres, password)),
                 },
                 None => Self {
                     path: format!("postgres:{connection_string}"),
@@ -122,7 +122,7 @@ impl MetadataConnection {
         Ok(match split {
             Some((path, password)) => Self {
                 path: format!("{prefix}:{path}"),
-                password: Some((database, password)),
+                password: password.map(|password| (database, password)),
             },
             None => whole(),
         })
@@ -139,39 +139,48 @@ struct Pair {
 }
 
 /// The string without its password pairs, kept as written, and the password,
-/// the last one as the database reads it. `None` when there is no password.
-fn without_password_in(s: &str, pairs: &[Pair], keys: &[&str]) -> Option<(String, String)> {
+/// the last one as the database reads it, or `None` when that is empty: an
+/// earlier password it overrides is no less a secret, and leaves the string
+/// too. `None` when no password pair holds a value.
+fn without_password_in(s: &str, pairs: &[Pair], keys: &[&str]) -> Option<(String, Option<String>)> {
     let is_password = |pair: &Pair| keys.iter().any(|key| pair.key.eq_ignore_ascii_case(key));
+    if !pairs
+        .iter()
+        .any(|pair| is_password(pair) && !pair.value.is_empty())
+    {
+        return None;
+    }
     let password = pairs
         .iter()
         .rev()
         .find(|pair| is_password(pair))?
         .value
         .clone();
-    if password.is_empty() {
-        return None;
-    }
     let path = pairs
         .iter()
         .filter(|pair| !is_password(pair))
         .map(|pair| &s[pair.span.clone()])
         .collect::<Vec<_>>()
         .join(" ");
-    Some((path, password))
+    Some((path, (!password.is_empty()).then_some(password)))
 }
 
-/// `pairs`, written as libpq pairs, without the password, and the password.
-fn without_password(pairs: &[(String, String)], keys: &[&str]) -> Option<(String, String)> {
+/// `pairs`, written as libpq pairs, without the password pairs, and the
+/// password, as [`without_password_in`] gives them.
+fn without_password(pairs: &[(String, String)], keys: &[&str]) -> Option<(String, Option<String>)> {
     let is_password = |key: &str| keys.iter().any(|k| key.eq_ignore_ascii_case(k));
+    if !pairs
+        .iter()
+        .any(|(key, value)| is_password(key) && !value.is_empty())
+    {
+        return None;
+    }
     let password = pairs
         .iter()
         .rev()
         .find(|(key, _)| is_password(key))?
         .1
         .clone();
-    if password.is_empty() {
-        return None;
-    }
     let path = pairs
         .iter()
         .filter(|(key, _)| !is_password(key))
@@ -183,7 +192,7 @@ fn without_password(pairs: &[(String, String)], keys: &[&str]) -> Option<(String
         })
         .collect::<Vec<_>>()
         .join(" ");
-    Some((path, password))
+    Some((path, (!password.is_empty()).then_some(password)))
 }
 
 fn is_postgres_uri(s: &str) -> bool {
@@ -396,6 +405,37 @@ mod tests {
                 Some("second".to_string())
             )
         );
+    }
+
+    /// A password emptied by a later password pair leaves the string with
+    /// neither: the database reads the empty one, and the earlier one is no
+    /// less a secret. With no secret to give, none is given.
+    #[test]
+    fn a_password_emptied_later_leaves_the_string() {
+        for (s, path) in [
+            (
+                "postgres:dbname=x user=u password=hunter2 password=",
+                "postgres:dbname=x user=u",
+            ),
+            (
+                "postgres:dbname=x password=hunter2 user=u password=''",
+                "postgres:dbname=x user=u",
+            ),
+            (
+                "postgres:postgresql://u:hunter2@127.0.0.1:1/x?password=",
+                "postgres:user='u' host='127.0.0.1' port='1' dbname='x'",
+            ),
+            (
+                "postgresql://u:hunter2@127.0.0.1:1/x?password=",
+                "postgres:user='u' host='127.0.0.1' port='1' dbname='x'",
+            ),
+            (
+                "mysql:host=localhost password=hunter2 passwd=",
+                "mysql:host=localhost",
+            ),
+        ] {
+            assert_eq!(split(s), (path.to_string(), None), "{s}");
+        }
     }
 
     /// A URI is rewritten as libpq pairs without its password, from its user
