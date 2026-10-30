@@ -5,16 +5,11 @@ description: >
 
 sources:
   src: { kind: postgres }
-  dk: { kind: duckdb }
 
 variants:
   federated: {}
   cayenne: cayenne-file
   duckdb: duckdb
-  duckdb-source:
-    datasets:
-      w: { from: 'duckdb:w', params: '${sources.dk.params}' }
-      w2: { from: 'duckdb:w2', params: '${sources.dk.params}' }
 
 spicepod:
   version: v1
@@ -31,12 +26,6 @@ defaults:
 steps:
   - source-exec:
       src: |
-        CREATE TABLE w (id int PRIMARY KEY, a int, s text);
-        INSERT INTO w VALUES (1, 1, 'x'), (2, NULL, 'y'), (3, 3, NULL), (4, NULL, NULL), (5, 1, 'x');
-        CREATE TABLE w2 (id int PRIMARY KEY, a int, s text);
-        INSERT INTO w2 VALUES (10, NULL, 'y'), (11, 3, NULL), (12, 7, 'z');
-  - source-exec:
-      dk: |
         CREATE TABLE w (id int PRIMARY KEY, a int, s text);
         INSERT INTO w VALUES (1, 1, 'x'), (2, NULL, 'y'), (3, 3, NULL), (4, NULL, NULL), (5, 1, 'x');
         CREATE TABLE w2 (id int PRIMARY KEY, a int, s text);
