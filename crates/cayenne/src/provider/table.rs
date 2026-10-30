@@ -30215,16 +30215,16 @@ impl CayenneTableProvider {
                 // `BAKE_LINK_MIN_FILE_BYTES`), so it needs no check.
                 let holds = file.object_meta.size < link_min_file_bytes
                     || match Box::pin(self.bake_file_holds_deleted_rows(
-                    state,
-                    snapshot_id,
-                    &captured,
-                    file,
-                    *threshold,
-                    pk_indices,
-                    deletion_snapshot,
-                ))
-                .await
-                {
+                        state,
+                        snapshot_id,
+                        &captured,
+                        file,
+                        *threshold,
+                        pk_indices,
+                        deletion_snapshot,
+                    ))
+                    .await
+                    {
                         Ok(holds) => holds,
                         Err(error) => {
                             tracing::debug!(

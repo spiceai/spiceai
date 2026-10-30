@@ -686,9 +686,9 @@ impl CayenneContext {
         let trigger = self.bake_deletion_index_trigger();
         let scaled = self.deletion_index_yield.scale_trigger(trigger);
         match self.ingest_stats.bake_residual() {
-            Some(residual) if residual >= trigger => scaled.max(
-                residual.saturating_mul(tuning::BAKE_TRIGGER_RESIDUAL_HEADROOM),
-            ),
+            Some(residual) if residual >= trigger => {
+                scaled.max(residual.saturating_mul(tuning::BAKE_TRIGGER_RESIDUAL_HEADROOM))
+            }
             _ => scaled,
         }
     }
