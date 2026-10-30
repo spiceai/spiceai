@@ -708,3 +708,73 @@ async fn a_bake_rewrites_small_files_it_could_keep() {
         "after a bake that rewrote every small file",
     );
 }
+
+/// A triggered bake that leaves the deletion index at or above the trigger —
+/// its cutoff cannot reach the tombstones — raises the trigger past its
+/// residual, so the next compaction tick does not bake again for nothing.
+///
+/// The deletes below land after the checkpoints the bake folds, so every
+/// tombstone is newer than any cutoff it can reach. Without the backoff the
+/// trigger stays at 10 and every tick bakes; on the rig, cold tables baked about
+/// once a second, each pruning nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_futile_bake_backs_its_trigger_off() {
+    use super::super::super::compaction::CompactionRunner as _;
+    const TRIGGER: usize = 10;
+    let ctx = SessionContext::new();
+    let (provider, _catalog, _tmp) = create_cdc_table_with_schema(
+        "bake_partial_futile",
+        ctx.runtime_env(),
+        schema(Key::Composite),
+        Key::Composite.columns(),
+        VortexConfig {
+            bake_deletion_index_trigger: TRIGGER,
+            ..config()
+        },
+        on_conflict(Key::Composite),
+    )
+    .await;
+    provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+    provider.test_bake_files.lock().link_min_file_bytes = Some(0);
+    for c in 0..9 {
+        let fresh = c * ROWS_PER_CHECKPOINT;
+        let rows: Vec<(i64, i64)> = (fresh..fresh + 2_000).map(|ts| (ts, c)).collect();
+        upsert(&provider, Key::Composite, &rows).await;
+        if c >= 6 {
+            // Delete keys of checkpoint 0, after every checkpoint the bake folds.
+            let keys: Vec<i64> = ((c - 6) * 100..(c - 5) * 100).collect();
+            delete(&provider, Key::Composite, &keys).await;
+        }
+        provider.checkpoint_mem_tier().await.expect("checkpoint");
+    }
+    let tombstones = provider.pk_deletion_snapshot().delete_len();
+    assert!(
+        tombstones >= TRIGGER,
+        "precondition: {tombstones} tombstones are over the trigger of {TRIGGER}"
+    );
+    assert_eq!(
+        provider.context.effective_bake_deletion_index_trigger(),
+        TRIGGER,
+        "precondition: the trigger starts unscaled"
+    );
+
+    provider
+        .run_compaction_trigger()
+        .await
+        .expect("compaction trigger");
+    let residual = provider
+        .context
+        .ingest_stats_bake_residual()
+        .expect("the trigger baked and recorded its residual");
+    assert!(
+        residual >= TRIGGER,
+        "precondition: the bake could not prune the tombstones (residual {residual})"
+    );
+    assert!(
+        provider.context.effective_bake_deletion_index_trigger()
+            >= residual * crate::provider::tuning::BAKE_TRIGGER_RESIDUAL_HEADROOM,
+        "after a futile bake the trigger backs off past its residual of {residual}, \
+         but it is {}",
+        provider.context.effective_bake_deletion_index_trigger()
+    );
+}

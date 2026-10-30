@@ -669,11 +669,28 @@ impl CayenneContext {
 
     /// The deletion-index size at which the seq-prefix bake runs:
     /// [`Self::bake_deletion_index_trigger`], scaled up by how few rows the last
-    /// reclaim found its tombstones hiding (see [`super::deletion_yield`]).
+    /// reclaim found its tombstones hiding (see [`super::deletion_yield`]), and
+    /// raised past a futile bake's residual.
+    ///
+    /// A bake is futile when it left the deletion index at or above the trigger:
+    /// its prefix cutoff could not reach the tombstones (they are newer than the
+    /// settled prefix, or a cold file still needs them), so the next tick would
+    /// bake again — on the rig, about once a second — and prune nothing. The
+    /// next bake then waits for the index to pass
+    /// `BAKE_TRIGGER_RESIDUAL_HEADROOM` × that residual, the backoff
+    /// `tuning::futile_bake_step` applies through the adaptive controller, which
+    /// only runs with dynamic tuning on. A bake that brings the index under the
+    /// trigger lifts it.
     #[must_use]
     pub(crate) fn effective_bake_deletion_index_trigger(&self) -> usize {
-        self.deletion_index_yield
-            .scale_trigger(self.bake_deletion_index_trigger())
+        let trigger = self.bake_deletion_index_trigger();
+        let scaled = self.deletion_index_yield.scale_trigger(trigger);
+        match self.ingest_stats.bake_residual() {
+            Some(residual) if residual >= trigger => scaled.max(
+                residual.saturating_mul(tuning::BAKE_TRIGGER_RESIDUAL_HEADROOM),
+            ),
+            _ => scaled,
+        }
     }
 
     /// The deletion-index size at which the whole-table reclaim runs:
@@ -926,8 +943,16 @@ impl CayenneContext {
             .record_publish_latency(d, chrono::Utc::now().timestamp_millis());
     }
 
+    /// The residual the last committed seq-prefix bake left, if any (see
+    /// [`Self::record_bake_residual`]).
+    #[cfg(test)]
+    pub(crate) fn ingest_stats_bake_residual(&self) -> Option<usize> {
+        self.ingest_stats.bake_residual()
+    }
+
     /// Record the live deletion-index size a committed seq-prefix bake left
-    /// behind, for the adaptive controller's futile-bake backoff.
+    /// behind, for the futile-bake backoff (see
+    /// [`Self::effective_bake_deletion_index_trigger`]).
     pub(crate) fn record_bake_residual(&self, deletion_index_len: usize) {
         self.ingest_stats
             .record_bake(deletion_index_len, chrono::Utc::now().timestamp_millis());
