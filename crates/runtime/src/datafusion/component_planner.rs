@@ -102,11 +102,17 @@ pub(crate) fn names_a_dataset(name: &ObjectName) -> bool {
         .is_none_or(|catalog| catalog == SPICE_DEFAULT_CATALOG)
 }
 
-fn refuse_reserved_schema(name: &ObjectName) -> DFResult<()> {
+fn refuse_reserved_name(name: &ObjectName) -> DFResult<()> {
     let reference = table_reference(name);
     if runtime_datafusion::is_spice_internal_dataset(&reference) {
         return Err(DataFusionError::Plan(format!(
             "Table '{reference}' is in a schema Spice reserves for its own tables. Choose another schema."
+        )));
+    }
+    if runtime_datafusion::is_catalog_acceleration_dataset_name(reference.table()) {
+        return Err(DataFusionError::Plan(format!(
+            "Table '{reference}' has a name Spice reserves: a name that starts with `{}` belongs to the tables Spice keeps for accelerated catalogs. Choose another name.",
+            runtime_datafusion::CATALOG_ACCELERATION_DATASET_PREFIX
         )));
     }
     Ok(())
@@ -135,7 +141,7 @@ async fn plan_create_dataset(
     create: &CreateTable,
     handler: Arc<dyn ComponentDdlHandler>,
 ) -> DFResult<LogicalPlan> {
-    refuse_reserved_schema(&create.name)?;
+    refuse_reserved_name(&create.name)?;
     let name = dataset_name(&create.name);
     if create.query.is_some() {
         return Err(DataFusionError::NotImplemented(format!(
@@ -173,7 +179,7 @@ async fn plan_alter_dataset(
     alter: &AlterTable,
     handler: Arc<dyn ComponentDdlHandler>,
 ) -> DFResult<LogicalPlan> {
-    refuse_reserved_schema(&alter.name)?;
+    refuse_reserved_name(&alter.name)?;
     let name = dataset_name(&alter.name);
     let [AlterTableOperation::SetOptionsParens { options }] = alter.operations.as_slice() else {
         return Err(DataFusionError::NotImplemented(format!(
@@ -202,7 +208,7 @@ async fn plan_drop_dataset(
             "DROP TABLE drops one dataset per statement.".to_string(),
         ));
     };
-    refuse_reserved_schema(name)?;
+    refuse_reserved_name(name)?;
     plan_op(
         ComponentDdlOp::DropDataset {
             name: dataset_name(name),

@@ -78,6 +78,12 @@ steps:
     expect: { oracle: ref }
     eventually: 60s
 
+  # A name that starts as the datasets Spice keeps for an accelerated
+  # catalog's tables do, in any case, would take such a table's data.
+  - spice-exec: "CREATE TABLE __catalog_accel_pg__public__t WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv')"
+    expect-error: Spice reserves
+  - spice-exec: "CREATE TABLE \"__Catalog_Accel_pg__public__t\" WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv')"
+    expect-error: Spice reserves
   # Kept across a restart, and gone for good once dropped.
   - restart: {}
   - query: SELECT id, region, amount FROM orders ORDER BY id

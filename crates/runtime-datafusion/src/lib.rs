@@ -67,6 +67,22 @@ pub fn is_spice_internal_schema(catalog: &str, schema: &str) -> bool {
             || schema == SPICE_EVAL_SCHEMA)
 }
 
+/// The start of the name of each dataset Spice keeps for a table of an
+/// accelerated catalog, `__catalog_accel_{catalog}__{schema}__{table}`. No
+/// other dataset may take such a name: it would take that table's acceleration
+/// data.
+pub const CATALOG_ACCELERATION_DATASET_PREFIX: &str = "__catalog_accel_";
+
+/// Whether `table`, a dataset's table name, starts as the name of a dataset
+/// Spice keeps for an accelerated catalog's table does
+/// ([`CATALOG_ACCELERATION_DATASET_PREFIX`]), in any ASCII case.
+#[must_use]
+pub fn is_catalog_acceleration_dataset_name(table: &str) -> bool {
+    table
+        .get(..CATALOG_ACCELERATION_DATASET_PREFIX.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(CATALOG_ACCELERATION_DATASET_PREFIX))
+}
+
 /// Whether `dataset` names a table in one of Spice's reserved schemas. A
 /// reference with no catalog is resolved against [`SPICE_DEFAULT_CATALOG`].
 #[must_use]
