@@ -202,6 +202,15 @@ struct BakeOutput<'a> {
     input_ids: &'a [String],
 }
 
+/// One selected seq-prefix bake input's on-disk size, and the highest commit
+/// sequence its files hold — what it adds to the bake's cutoff.
+#[derive(Debug, Clone, Copy)]
+struct BakeInputSize {
+    bytes: u64,
+    files: usize,
+    max_sequence: i64,
+}
+
 /// Whether a seq-prefix bake waits for the process-wide bake slot or skips when
 /// another table's bake holds it (see `compaction::bake_budget`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,6 +304,8 @@ pub(crate) struct TestBakeFiles {
     /// `(files rewritten, files kept)` by the last committed bake that split
     /// its inputs, or `None` when it rewrote every file unsplit.
     pub(crate) last: Option<(usize, usize)>,
+    /// In place of [`BAKE_MAX_INPUT_BYTES`].
+    pub(crate) max_input_bytes: Option<u64>,
 }
 
 /// An on-conflict deletion update with the deletion index it extends to, built
@@ -4255,13 +4266,18 @@ fn protected_merge_input_budget_for_pool(
 /// [`CayenneTableProvider::bake_keep_recent_snapshots`].
 const BAKE_KEEP_RECENT_SNAPSHOTS: usize = 3;
 
-/// On-disk bytes of protected snapshots one seq-prefix bake folds, beyond its
-/// first two: the prefix stops at the snapshot that would take it past this.
+/// On-disk bytes of protected snapshots one seq-prefix bake aims to fold.
 ///
-/// Stopping early only lowers the bake's cutoff, so the next bake takes the rest.
-/// The first two are always admitted, so a large earlier bake output at the head
-/// of the prefix cannot stop every later bake — and with it the only shrink of
-/// the deletion index.
+/// Past this the prefix is stopped at the shortest point, of at least two
+/// snapshots, where the clean-prefix gate still holds, and kept whole when no
+/// such point exists (see `CayenneTableProvider::bake_prefix_within_bytes`).
+/// Stopping early only lowers the bake's cutoff, so the next bake takes the
+/// rest. The gate is why the stop cannot simply be the first snapshot past the
+/// bound: candidates are ordered by id, and an earlier bake's output takes an id
+/// minted after the snapshots that bake kept back, so it sits in the middle of
+/// the prefix holding the oldest rows. Stopping before it with a cutoff past its
+/// threshold would leave it a live snapshot the prune could resurrect rows of,
+/// so the gate would decline that bake, and the same stop every later one.
 const BAKE_MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Triggered seq-prefix bakes a table skips in a row, while other tables hold
@@ -29571,6 +29587,8 @@ impl CayenneTableProvider {
         let max_pass_bytes = self.protected_merge_input_budget_bytes();
         let mut selected_input_bytes: u64 = 0;
         let mut selected_input_files: usize = 0;
+        // Each selected input's size and the highest sequence it adds to T.
+        let mut selected_sizes: Vec<BakeInputSize> = Vec::with_capacity(candidate_ids.len());
         // Why the prefix stopped short, for the skip log below. A budget stop is
         // expected steady state; a sizing failure is an I/O problem that must not
         // masquerade as one.
@@ -29614,11 +29632,6 @@ impl CayenneTableProvider {
                 stopped_early = Some("over_budget");
                 break;
             }
-            if selected.len() >= 2 && next > BAKE_MAX_INPUT_BYTES {
-                // The same truncation, against the per-bake bound.
-                stopped_early = Some("over_bake_bytes");
-                break;
-            }
             selected_input_bytes = next;
             selected_input_files += candidate_files;
             if files.is_empty() {
@@ -29637,14 +29650,26 @@ impl CayenneTableProvider {
                 // [resurrect-critical: `threshold` is the true commit-seq of every
                 // row here, so T is never understated.]
                 cutoff = cutoff.max(threshold);
+                selected_sizes.push(BakeInputSize {
+                    bytes: candidate_bytes,
+                    files: candidate_files,
+                    max_sequence: threshold,
+                });
                 selected.push((id.clone(), threshold));
                 continue;
             }
             // T accumulates the highest per-file max_sequence over the selected
             // prefix — every selected file then satisfies `max_sequence <= T`.
+            let mut max_sequence = i64::MIN;
             for f in &files {
-                cutoff = cutoff.max(f.max_sequence);
+                max_sequence = max_sequence.max(f.max_sequence);
             }
+            cutoff = cutoff.max(max_sequence);
+            selected_sizes.push(BakeInputSize {
+                bytes: candidate_bytes,
+                files: candidate_files,
+                max_sequence,
+            });
             selected.push((id.clone(), threshold));
         }
 
@@ -29675,6 +29700,29 @@ impl CayenneTableProvider {
                  budget"
             );
             return Ok(false);
+        }
+        // Bound the bytes this bake folds, at a point the clean-prefix gate below
+        // accepts (see `BAKE_MAX_INPUT_BYTES`).
+        let max_input_bytes = self.bake_max_input_bytes();
+        if selected_input_bytes > max_input_bytes {
+            let keep = Box::pin(self.bake_prefix_within_bytes(
+                &selected,
+                &selected_sizes,
+                max_input_bytes,
+            ))
+            .await;
+            if keep < selected.len() {
+                selected.truncate(keep);
+                selected_sizes.truncate(keep);
+                cutoff = selected_sizes
+                    .iter()
+                    .map(|size| size.max_sequence)
+                    .max()
+                    .unwrap_or(cutoff);
+                selected_input_bytes = selected_sizes.iter().map(|size| size.bytes).sum();
+                selected_input_files = selected_sizes.iter().map(|size| size.files).sum();
+                stopped_early = Some("over_bake_bytes");
+            }
         }
         // `cutoff` is now the seq-prefix cutoff T (the max max_sequence over the
         // selected older prefix). It was raised above from `i64::MIN` by at least
@@ -30134,6 +30182,51 @@ impl CayenneTableProvider {
         self.schedule_orphan_dv_sweep();
 
         Ok(true)
+    }
+
+    /// The bytes one seq-prefix bake aims to fold: [`BAKE_MAX_INPUT_BYTES`], or a
+    /// test's override.
+    fn bake_max_input_bytes(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(bytes) = self.test_bake_files.lock().max_input_bytes {
+            return bytes;
+        }
+        BAKE_MAX_INPUT_BYTES
+    }
+
+    /// How many of `selected`, a bake's prefix in order, to fold under
+    /// `max_input_bytes`: the shortest prefix that holds at least two snapshots
+    /// and every snapshot that fits the bound, and that the clean-prefix gate
+    /// accepts at its own cutoff; or all of them, when no shorter one is accepted.
+    ///
+    /// A stop that the gate would refuse would decline this bake and, being the
+    /// same stop next tick, every later one (see [`BAKE_MAX_INPUT_BYTES`]).
+    async fn bake_prefix_within_bytes(
+        &self,
+        selected: &[(String, i64)],
+        sizes: &[BakeInputSize],
+        max_input_bytes: u64,
+    ) -> usize {
+        let mut fits = selected.len();
+        let mut bytes: u64 = 0;
+        for (index, size) in sizes.iter().enumerate() {
+            bytes = bytes.saturating_add(size.bytes);
+            if index >= 2 && bytes > max_input_bytes {
+                fits = index;
+                break;
+            }
+        }
+        for keep in fits..selected.len() {
+            let kept: std::collections::HashSet<String> =
+                selected[..keep].iter().map(|(id, _)| id.clone()).collect();
+            let Some(cutoff) = sizes[..keep].iter().map(|size| size.max_sequence).max() else {
+                continue;
+            };
+            if self.bake_clean_prefix_holds(&kept, cutoff).await.0 {
+                return keep;
+            }
+        }
+        selected.len()
     }
 
     /// Split each bake input's files by whether the bake's deletion filter removes

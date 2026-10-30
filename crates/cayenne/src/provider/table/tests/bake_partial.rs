@@ -410,3 +410,74 @@ async fn splitting_a_bakes_inputs_leaves_their_listings_whole() {
         );
     }
 }
+
+/// Checkpoint `c` with fresh keys only, at version `c`: no key it writes was
+/// written before, so it records no tombstone.
+async fn write_fresh_checkpoints(
+    tables: &[&CayenneTableProvider],
+    model: &mut Model,
+    range: std::ops::Range<i64>,
+) {
+    for c in range {
+        let fresh = c * ROWS_PER_CHECKPOINT;
+        let rows: Vec<(i64, i64)> = (fresh..fresh + ROWS_PER_CHECKPOINT).map(|ts| (ts, c)).collect();
+        for (ts, v) in &rows {
+            model.insert((*ts, hash_of(*ts)), *v);
+        }
+        for provider in tables {
+            write_checkpoint(provider, &rows).await;
+        }
+    }
+}
+
+/// The byte bound never stops a bake's prefix where the clean-prefix gate would
+/// refuse it.
+///
+/// The first bake folds checkpoints 0-2 and keeps 3-5 back; its output's id is
+/// minted after theirs, so the second bake's prefix runs 3, 4, 5, then that
+/// output. Checkpoints 3-5 hold sequences past the first bake's delete fence.
+/// Stopped at the bound after 3 and 4, the cutoff would pass the output's
+/// threshold while leaving the output live, the gate would decline, and so
+/// would every later bake at the same stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_byte_bound_never_stops_a_bake_where_its_prune_is_unsafe() {
+    let t = table("bake_partial_bound", false).await;
+    let mut model = Model::new();
+    write_checkpoints(&[&t.provider], &mut model, 0..3).await;
+    let fence_before_fresh = t.provider.pk_deletion_snapshot().max_sequence_number();
+    write_fresh_checkpoints(&[&t.provider], &mut model, 3..6).await;
+    assert_eq!(
+        t.provider.pk_deletion_snapshot().max_sequence_number(),
+        fence_before_fresh,
+        "precondition: fresh-only checkpoints record no tombstone"
+    );
+    assert!(
+        t.provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("first bake"),
+        "the first bake folds checkpoints 0-2"
+    );
+    write_checkpoints(&[&t.provider], &mut model, 6..9).await;
+
+    // Every snapshot is over a one-byte bound.
+    t.provider.test_bake_files.lock().max_input_bytes = Some(1);
+    let tombstones_before = t.provider.pk_deletion_snapshot().delete_len();
+    assert!(
+        t.provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("second bake"),
+        "the second bake runs: the bound extends its prefix to the first bake's output \
+         rather than stop where the clean-prefix gate declines"
+    );
+    assert!(
+        t.provider.pk_deletion_snapshot().delete_len() < tombstones_before,
+        "the second bake pruned tombstones"
+    );
+    assert_rows(
+        &rows_of(&t.provider, t.name).await,
+        &model,
+        "after a bake under the byte bound",
+    );
+}
