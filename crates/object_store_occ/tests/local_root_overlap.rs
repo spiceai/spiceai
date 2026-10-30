@@ -178,3 +178,61 @@ async fn writes_to_other_directories_do_not_wait_behind_a_blocked_publication() 
         .expect("batch task")
         .expect("the batch publishes once its lock is free");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_waiting_on_one_directory_do_not_hold_back_another() {
+    let directory = tempfile::tempdir().expect("state directory");
+    let store = std::sync::Arc::new(
+        LocalConditionalPut::new_durable(directory.path()).expect("durable state store"),
+    );
+    let blocked_dir = directory.path().join("a");
+    std::fs::create_dir_all(&blocked_dir).expect("blocked directory");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(blocked_dir.join(".spice-occ-lock"))
+        .expect("blocked directory lock");
+    held.lock().expect("hold the blocked directory lock");
+    // More writes to the blocked directory than there are workers: one
+    // publishing under the held lock, the rest waiting behind it. Polling each
+    // once queues it, or leaves it waiting to be admitted.
+    let paths: Vec<_> = (0..12)
+        .map(|index| Path::from(format!("a/{index}")))
+        .collect();
+    let mut waiting: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            Box::pin(conditional_put(
+                store.as_ref(),
+                path,
+                Bytes::from_static(b"waiting").into(),
+                &Expected::Absent,
+            ))
+        })
+        .collect();
+    for write in &mut waiting {
+        assert!(
+            futures::poll!(write).is_pending(),
+            "a write to the blocked directory finished under its held lock"
+        );
+    }
+    let other = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        conditional_put(
+            store.as_ref(),
+            &Path::from("b/head"),
+            Bytes::from_static(b"head").into(),
+            &Expected::Absent,
+        ),
+    )
+    .await;
+    held.unlock().expect("release the blocked directory lock");
+    other
+        .expect("the write to another directory waited behind the blocked one")
+        .expect("write to another directory");
+    for write in futures::future::join_all(waiting).await {
+        write.expect("a waiting write publishes once its lock is free");
+    }
+}

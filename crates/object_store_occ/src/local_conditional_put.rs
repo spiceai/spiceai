@@ -96,14 +96,16 @@ pub struct LocalConditionalPut {
     durable: bool,
     /// The queue the workers publish from.
     writes: Arc<WriteQueue>,
-    /// Bounds the puts accepted but not yet taken by a worker, and so the
-    /// payloads they hold.
-    pending: Arc<tokio::sync::Semaphore>,
 }
 
 /// Workers publishing in parallel, each taking any directory not being
 /// published by another.
 const WRITE_WORKERS: usize = 8;
+
+/// Puts to one directory accepted but not yet taken by a worker, which bounds
+/// the payloads queued for a directory whose publication is slow. The bound is
+/// per directory, so puts waiting on one directory never hold back another.
+const PENDING_PER_DIRECTORY: usize = WRITE_WORKERS;
 
 struct Publication {
     location: Path,
@@ -118,7 +120,7 @@ struct Publication {
 struct Queued {
     directory: PathBuf,
     publication: Publication,
-    _pending: tokio::sync::OwnedSemaphorePermit,
+    admitted: tokio::sync::OwnedSemaphorePermit,
 }
 
 #[derive(Default)]
@@ -134,6 +136,9 @@ struct WriteQueueState {
 struct WriteQueue {
     state: parking_lot::Mutex<WriteQueueState>,
     changed: parking_lot::Condvar,
+    /// Each directory's admission bound, present while a put to it is queued
+    /// or waiting to be admitted.
+    admission: parking_lot::Mutex<std::collections::HashMap<PathBuf, Arc<tokio::sync::Semaphore>>>,
 }
 
 impl WriteQueue {
@@ -149,12 +154,42 @@ impl WriteQueue {
                 .position(|entry| !state.publishing.contains(&entry.directory));
             if let Some(entry) = free.and_then(|index| state.queued.remove(index)) {
                 state.publishing.insert(entry.directory.clone());
-                return Some((entry.directory, entry.publication));
+                let Queued {
+                    directory,
+                    publication,
+                    admitted,
+                } = entry;
+                // Taken by a worker: no longer pending, so the directory's
+                // bound admits the next put.
+                drop(admitted);
+                self.release_admission(&directory);
+                return Some((directory, publication));
             }
             if state.closed && state.queued.is_empty() {
                 return None;
             }
             self.changed.wait(&mut state);
+        }
+    }
+
+    /// The admission bound for `directory`, created on first use.
+    fn admission(&self, directory: &std::path::Path) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(
+            self.admission
+                .lock()
+                .entry(directory.to_path_buf())
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(PENDING_PER_DIRECTORY))),
+        )
+    }
+
+    /// Forget a directory's bound once nothing holds or waits on it. A put
+    /// clones the bound under the same lock, so it is never forgotten in use.
+    fn release_admission(&self, directory: &std::path::Path) {
+        let mut admission = self.admission.lock();
+        if admission.get(directory).is_some_and(|bound| {
+            Arc::strong_count(bound) == 1 && bound.available_permits() == PENDING_PER_DIRECTORY
+        }) {
+            admission.remove(directory);
         }
     }
 
@@ -594,7 +629,6 @@ impl LocalConditionalPut {
             root,
             durable,
             writes,
-            pending: Arc::new(tokio::sync::Semaphore::new(WRITE_WORKERS)),
         })
     }
 }
@@ -632,14 +666,20 @@ impl ObjectStore for LocalConditionalPut {
         }
         let path = self.inner.path_to_filesystem(location)?;
         let (reply, result) = tokio::sync::oneshot::channel();
-        let pending = Arc::clone(&self.pending)
-            .acquire_owned()
-            .await
-            .map_err(worker_error)?;
         // Equivalent roots and keys name the same directory lock, so they are
         // never published by two workers at once and publish in order.
+        let directory = publication_lock_path(&self.root, location);
+        let admission = self.writes.admission(&directory);
+        let pending = admission.acquire_owned().await;
+        let pending = match pending {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.writes.release_admission(&directory);
+                return Err(worker_error(error));
+            }
+        };
         self.writes.push(Queued {
-            directory: publication_lock_path(&self.root, location),
+            directory,
             publication: Publication {
                 location: location.clone(),
                 path,
@@ -647,7 +687,7 @@ impl ObjectStore for LocalConditionalPut {
                 options: opts,
                 reply,
             },
-            _pending: pending,
+            admitted: pending,
         });
         result
             .await
