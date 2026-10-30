@@ -35,7 +35,8 @@ limitations under the License.
 //! nothing fails rather than passing vacuously.
 
 use anyhow::{Context, Result, bail, ensure};
-use serde_json::{Map, Value};
+use serde_json::{Map, Number, Value};
+use std::cmp::Ordering;
 
 use crate::script::LineCount;
 
@@ -57,8 +58,8 @@ enum Predicate {
     Matches(regex::Regex),
     Type(JsonType),
     Length(LineCount),
-    Above(f64),
-    Below(f64),
+    Above(Number),
+    Below(Number),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -137,13 +138,13 @@ impl JsonAssertion {
             predicates.push(Predicate::Length(LineCount::parse(&v)?));
         }
         for (key, make) in [
-            ("above", Predicate::Above as fn(f64) -> Predicate),
+            ("above", Predicate::Above as fn(Number) -> Predicate),
             ("below", Predicate::Below),
         ] {
             if let Some(v) = map.remove(key) {
-                let bound = v
-                    .as_f64()
-                    .with_context(|| format!("`{key}` must be a number"))?;
+                let Value::Number(bound) = v else {
+                    bail!("`{key}` must be a number");
+                };
                 predicates.push(make(bound));
             }
         }
@@ -257,22 +258,17 @@ impl Predicate {
                 };
                 (!want.holds(len)).then(|| format!("length {len}, expected {want}"))
             }
-            Self::Above(bound) => number_failure(value, |n| n > *bound, "above", *bound),
-            Self::Below(bound) => number_failure(value, |n| n < *bound, "below", *bound),
+            Self::Above(bound) => number_failure(value, Ordering::Greater, "above", bound),
+            Self::Below(bound) => number_failure(value, Ordering::Less, "below", bound),
         }
     }
 }
 
-fn number_failure(
-    value: &Value,
-    holds: impl Fn(f64) -> bool,
-    what: &str,
-    bound: f64,
-) -> Option<String> {
-    match value.as_f64() {
-        Some(n) if holds(n) => None,
-        Some(n) => Some(format!("{n} is not {what} {bound}")),
-        None => Some(format!(
+fn number_failure(value: &Value, want: Ordering, what: &str, bound: &Number) -> Option<String> {
+    match value {
+        Value::Number(n) if compare_numbers(n, bound) == Some(want) => None,
+        Value::Number(n) => Some(format!("{n} is not {what} {bound}")),
+        _ => Some(format!(
             "expected a number {what} {bound}, got {} {}",
             JsonType::of(value),
             one_value(value)
@@ -284,12 +280,7 @@ fn number_failure(
 /// `7.0`), and containers compare member by member under the same rule.
 fn json_equal(got: &Value, want: &Value) -> bool {
     match (got, want) {
-        (Value::Number(a), Value::Number(b)) => match (integer(a), integer(b)) {
-            (Some(a), Some(b)) => a == b,
-            (Some(int), None) => b.as_f64().is_some_and(|float| float_is(float, int)),
-            (None, Some(int)) => a.as_f64().is_some_and(|float| float_is(float, int)),
-            (None, None) => a.as_f64() == b.as_f64(),
-        },
+        (Value::Number(a), Value::Number(b)) => compare_numbers(a, b) == Some(Ordering::Equal),
         (Value::Array(a), Value::Array(b)) => {
             a.len() == b.len() && a.iter().zip(b).all(|(x, y)| json_equal(x, y))
         }
@@ -298,29 +289,48 @@ fn json_equal(got: &Value, want: &Value) -> bool {
     }
 }
 
+/// Orders two JSON numbers by exact value. An integer is never rounded to a
+/// float: an integer and a float compare through the float's whole part, which
+/// converts to `i128` exactly, and then its fraction.
+fn compare_numbers(a: &Number, b: &Number) -> Option<Ordering> {
+    match (integer(a), integer(b)) {
+        (Some(a), Some(b)) => Some(a.cmp(&b)),
+        (Some(a), None) => b
+            .as_f64()
+            .and_then(|b| compare_float(b, a))
+            .map(Ordering::reverse),
+        (None, Some(b)) => a.as_f64().and_then(|a| compare_float(a, b)),
+        (None, None) => a.as_f64()?.partial_cmp(&b.as_f64()?),
+    }
+}
+
 /// A JSON integer, signed or unsigned, without rounding.
-fn integer(number: &serde_json::Number) -> Option<i128> {
+fn integer(number: &Number) -> Option<i128> {
     number
         .as_i64()
         .map(i128::from)
         .or_else(|| number.as_u64().map(i128::from))
 }
 
-/// Whether `float` is exactly the integer `int`. The integer is never rounded
-/// to a float: a float is converted only when it is a whole number within
-/// `i128`'s range, where that conversion is exact.
-fn float_is(float: f64, int: i128) -> bool {
+/// Orders `float` against the integer `int` exactly.
+fn compare_float(float: f64, int: i128) -> Option<Ordering> {
     // 2^127; `i128::MAX as f64` rounds up to it, so the upper bound is exclusive.
     const LIMIT: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
-    if float.fract() != 0.0 || !(-LIMIT..LIMIT).contains(&float) {
-        return false;
+    if float.is_nan() {
+        return None;
+    }
+    if float >= LIMIT {
+        return Some(Ordering::Greater);
+    }
+    if float < -LIMIT {
+        return Some(Ordering::Less);
     }
     #[expect(
         clippy::cast_possible_truncation,
         reason = "a whole number in [-2^127, 2^127) converts to i128 exactly"
     )]
-    let whole = float as i128;
-    whole == int
+    let whole = float.trunc() as i128;
+    Some(whole.cmp(&int).then(float.fract().partial_cmp(&0.0)?))
 }
 
 fn objects_equal(a: &Map<String, Value>, b: &Map<String, Value>) -> bool {
@@ -551,6 +561,33 @@ mod tests {
         ] {
             assert_eq!(json_equal(&num(a), &num(b)), equal, "{a} vs {b}");
             assert_eq!(json_equal(&num(b), &num(a)), equal, "{b} vs {a}");
+        }
+    }
+
+    /// `above` and `below` order integers, floats and the two mixed exactly.
+    #[test]
+    fn bounds_compare_exactly_across_integer_and_float() {
+        for (n, bounds, holds) in [
+            ("9007199254740993", "above: 9007199254740992", true),
+            ("9007199254740992", "below: 9007199254740993", true),
+            ("9007199254740993", "below: 9007199254740992", false),
+            ("9007199254740993", "above: 9007199254740992.0", true),
+            ("9007199254740992", "above: 9007199254740992.0", false),
+            ("9007199254740992.0", "below: 9007199254740993", true),
+            // A script's integers stop at `i64::MAX` (the YAML parser's limit); a
+            // response's go to `u64::MAX`.
+            ("18446744073709551615", "above: 9223372036854775807", true),
+            ("9223372036854775807", "below: 9223372036854775806", false),
+            ("-9223372036854775808", "below: -9223372036854775807", true),
+            ("-1", "below: 18446744073709551615", true),
+            ("1.5", "above: 1, below: 2", true),
+            ("2", "above: 1.5, below: 2.5", true),
+            ("2", "below: 2.0", false),
+            ("1e300", "above: 18446744073709551615", true),
+        ] {
+            let body: Value = serde_json::from_str(&format!("{{\"n\": {n}}}")).expect("body");
+            let check = assertion(&format!("{{ pointer: /n, {bounds} }}")).check(&body);
+            assert_eq!(check.is_none(), holds, "{n} {bounds}: {check:?}");
         }
     }
 
