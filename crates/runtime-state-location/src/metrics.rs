@@ -610,6 +610,7 @@ mod tests {
             "rate_control",
             "results_cache_warmup",
             "snapshots",
+            "cayenne_metastore",
         ] {
             for counter in [
                 "state_store_conflicts_total",
@@ -622,7 +623,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(series.len(), 8, "no series for an unmetered feature");
+        assert_eq!(series.len(), 10, "no series for an unmetered feature");
     }
 
     #[test]

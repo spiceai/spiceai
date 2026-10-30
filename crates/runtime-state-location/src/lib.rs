@@ -348,15 +348,19 @@ async fn build_unmetered_object_store(
                 location: local_path.display().to_string(),
             })?;
 
-        let store: Arc<dyn ObjectStore> = Arc::new(
-            object_store_occ::LocalConditionalPut::new(&local_path).map_err(|source| {
-                Error::LocalFileSystemInit {
-                    usage,
-                    location: local_path.display().to_string(),
-                    source: Box::new(source),
-                }
-            })?,
-        );
+        // The Cayenne metastore acknowledges a source once its commit is
+        // published, so its puts must be on disk when they return.
+        let local = if feature == StateFeature::CayenneMetastore {
+            object_store_occ::LocalConditionalPut::new_durable(&local_path)
+        } else {
+            object_store_occ::LocalConditionalPut::new(&local_path)
+        };
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(local.map_err(|source| Error::LocalFileSystemInit {
+                usage,
+                location: local_path.display().to_string(),
+                source: Box::new(source),
+            })?);
 
         return Ok((store, feature_prefix("")));
     }
@@ -774,6 +778,29 @@ mod tests {
             UpdateResult::Conflict { current } => assert_eq!(current, remote_update),
             other => panic!("expected Conflict, got {other:?}"),
         }
+    }
+
+    /// The Cayenne metastore acknowledges a source only once its commit is
+    /// durable, so on a local directory every put must be synced: a store that
+    /// returns before the bytes reach the disk loses acknowledged commits on
+    /// power loss.
+    #[tokio::test]
+    async fn a_file_location_keeps_the_cayenne_metastore_on_synced_puts() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let state_location = format!("file://{}", temp_dir.path().display());
+        let (store, prefix) = build_object_store(
+            secrets(),
+            Handle::current(),
+            &runtime_state(&state_location, &[]),
+            StateFeature::CayenneMetastore,
+        )
+        .await
+        .expect("file state store should build");
+        assert_eq!(prefix, "cayenne");
+        assert!(
+            store.to_string().ends_with(", durable)"),
+            "the Cayenne metastore's local store does not sync its puts: {store}"
+        );
     }
 
     #[tokio::test]
