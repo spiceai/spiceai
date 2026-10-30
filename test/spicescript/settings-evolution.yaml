@@ -105,6 +105,18 @@ steps:
       patch: { datasets: { trips: { acceleration: { partition_by: null } } } }
     when: { refresh_mode: changes }
     except: object-native
+  # A dataset in the object-native metastore cannot take `partition_by` yet: it
+  # is refused with a message naming the fix, never moved to a new, empty table.
+  - restart:
+      ready: false
+      patch: { datasets: { trips: { acceleration: { partition_by: ['bucket(4, id)'] } } } }
+    only: object-native
+  - assert-status: { dataset: trips, status: Error, message-contains: "Remove `partition_by`" }
+    eventually: 60s
+    only: object-native
+  - restart:
+      patch: { datasets: { trips: { acceleration: { partition_by: null } } } }
+    only: object-native
   - query: SELECT * FROM trips
     eventually: 60s
   - source-exec: { src: "UPDATE trips SET fare = 0 WHERE id % 97 = 4; INSERT INTO trips VALUES (10004, 'city 4', 39.99, 'partitioned'); DELETE FROM trips WHERE id = 40" }
