@@ -44,6 +44,18 @@ impl Engine {
     pub fn shares_memory_instance(&self) -> bool {
         matches!(self, Engine::DuckDB | Engine::Sqlite | Engine::Turso)
     }
+
+    /// Whether the engine keeps two tables apart in one store when their names
+    /// differ only in case: Cayenne does, and Arrow keeps every table on its
+    /// own. `SQLite` and Turso read such names as one table, `DuckDB` refuses
+    /// to create the second, and `PostgreSQL` is not known to keep them apart.
+    #[must_use]
+    pub fn keeps_case_variant_tables_apart(&self) -> bool {
+        matches!(
+            self,
+            Engine::Arrow | Engine::PartitionedArrow | Engine::Cayenne
+        )
+    }
 }
 
 /// The engine named by [`spicepod::acceleration::DEFAULT_ENGINE`]: the one an

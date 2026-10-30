@@ -7,9 +7,10 @@ description: >
   another instance that shares the definitions points it at another source
   while this one is stopped; and when a definition starts to keep its data in
   a store an earlier definition of its name left data in, a file or the one
-  instance DuckDB or SQLite keeps every memory-mode dataset in. A change that
-  leaves the data where it is keeps it, and an instance creates its first
-  acceleration file of each engine.
+  instance DuckDB or SQLite keeps every memory-mode dataset in, also under a
+  name that differs only in case. A change that leaves the data where it is
+  keeps it, two names that differ only in case never share an engine's table,
+  and an instance creates its first acceleration file of each engine.
 
 sources:
   lake: { kind: files }
@@ -655,6 +656,105 @@ steps:
     only: a
     consistently: 10s
     expect: { same-as: k5-kept }
+
+  # Two names that differ only in case would share one table in an engine
+  # that does not keep such tables apart, so the statement that defines the
+  # second is refused, and the first keeps its rows: SQLite and Turso in a
+  # file, and DuckDB in memory.
+  - spice-exec: "CREATE TABLE \"C1\" WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, ts FROM "C1"
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - spice-exec: "CREATE TABLE c1 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'file')"
+    only: a
+    expect-error: "dataset 'C1' keeps its acceleration data in the same `sqlite` store"
+  - query: SELECT id, ts FROM "C1"
+    only: a
+    consistently: 5s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - spice-exec: "CREATE TABLE \"C2\" WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'turso', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, ts FROM "C2"
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - spice-exec: "CREATE TABLE c2 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'turso', acceleration.mode = 'file')"
+    only: a
+    expect-error: "dataset 'C2' keeps its acceleration data in the same `turso` store"
+  - query: SELECT id, ts FROM "C2"
+    only: a
+    consistently: 5s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - spice-exec: "CREATE TABLE \"C3\" WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'duckdb', acceleration.mode = 'memory')"
+    only: a
+  - query: SELECT id, ts FROM "C3"
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - spice-exec: "CREATE TABLE c3 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'duckdb', acceleration.mode = 'memory')"
+    only: a
+    expect-error: "dataset 'C3' keeps its acceleration data in the same `duckdb` store"
+  - query: SELECT id, ts FROM "C3"
+    only: a
+    consistently: 5s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+
+  # A table a dataset the Spicepod no longer declares left under a name that
+  # differs only in case is what the store holds under the name SQL then
+  # defines, so it is deleted first: SQLite and DuckDB in a file, appending
+  # on `ts`, where `new`'s rows are older than the left rows.
+  - restart:
+      patch:
+        spicepod:
+          datasets:
+            - from: file://${sources.lake.path}/old/
+              name: '"C4"'
+              params: { file_format: csv }
+              time_column: ts
+              time_format: unix_seconds
+              acceleration: { enabled: true, engine: sqlite, mode: file, refresh_mode: append, refresh_check_interval: 1h }
+            - from: file://${sources.lake.path}/old/
+              name: '"C5"'
+              params: { file_format: csv }
+              time_column: ts
+              time_format: unix_seconds
+              acceleration: { enabled: true, engine: duckdb, mode: file, refresh_mode: append, refresh_check_interval: 1h }
+    only: a
+  - query: SELECT id, ts FROM "C4"
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - query: SELECT id, ts FROM "C5"
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - restart:
+      patch: { spicepod: { datasets: [] } }
+    only: a
+  - spice-exec: "CREATE TABLE c4 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'file', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds', acceleration.refresh_check_interval = '1h')"
+    only: a
+  - query: SELECT id, ts FROM c4
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM new
+  - spice-exec: "CREATE TABLE c5 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'duckdb', acceleration.mode = 'file', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds', acceleration.refresh_check_interval = '1h')"
+    only: a
+  - query: SELECT id, ts FROM c5
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM new
 
   # An instance that has written no acceleration file creates the first one
   # of each engine that keeps one.

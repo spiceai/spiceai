@@ -1387,6 +1387,17 @@ impl Runtime {
             }
 
             let next = Arc::new(self.sql_components.serve(&spicepod, &definitions));
+            // Refused before anything is validated or deleted: clearing the
+            // store under this name would delete the other dataset's data.
+            if defines(&op)
+                && let Some(dataset) = next
+                    .datasets
+                    .iter()
+                    .find(|dataset| same_dataset(&dataset.name, op.component_name()))
+                && let Some((other, engine)) = self.dataset_sharing_table(dataset, &next).await
+            {
+                return Err(not_applied(&shares_table_with(&other, engine)));
+            }
             if let Some(component) = &validate {
                 tokio::time::timeout(
                     VALIDATION_TIMEOUT,
@@ -1872,6 +1883,36 @@ impl Runtime {
         started
     }
 
+    /// Another dataset of `app` whose acceleration keeps its data in the table
+    /// `dataset`'s would: one whose name differs from `dataset`'s only in case,
+    /// in the same store, of an engine that does not keep such tables apart.
+    /// Returns its name and the engine.
+    async fn dataset_sharing_table(
+        self: &Arc<Self>,
+        dataset: &Dataset,
+        app: &Arc<App>,
+    ) -> Option<(String, Engine)> {
+        let store = self.acceleration_store(dataset, app).await?;
+        let engine = store.engine();
+        if engine.keeps_case_variant_tables_apart() {
+            return None;
+        }
+        // The engine's table is named after the dataset as it registers.
+        let table = |name: &str| datafusion::common::TableReference::parse_str(name).to_string();
+        let own = table(&dataset.name);
+        for other in &app.datasets {
+            if same_dataset(&other.name, &dataset.name)
+                || !table(&other.name).eq_ignore_ascii_case(&own)
+            {
+                continue;
+            }
+            if self.acceleration_store(other, app).await.as_ref() == Some(&store) {
+                return Some((other.name.clone(), engine));
+            }
+        }
+        None
+    }
+
     /// Delete the acceleration data of `dataset`, a definition `app` served and
     /// that no longer serves. A failure is its whole chain on one line: its
     /// innermost error can be a bare code, such as `DuckDB`'s, whose layer
@@ -2000,6 +2041,26 @@ enum Store {
     /// The one in-process instance the engine keeps every memory-mode dataset
     /// in ([`Engine::shares_memory_instance`]).
     SharedMemory(Engine),
+}
+
+impl Store {
+    /// The engine that keeps the data.
+    fn engine(&self) -> Engine {
+        match self {
+            Store::Located { engine, .. } | Store::SharedMemory(engine) => *engine,
+        }
+    }
+}
+
+/// Why a statement that defines a dataset is refused when `other`, whose name
+/// differs from the dataset's only in case, keeps its acceleration data in the
+/// same store of `engine`, which does not keep such tables apart.
+fn shares_table_with(other: &str, engine: Engine) -> String {
+    let shown = display_dataset_name(other);
+    format!(
+        "dataset {shown} keeps its acceleration data in the same `{engine}` store, which reads table names that differ only in case as one table, so the two datasets would share their data. Give this dataset a name that differs from {shown} by more than case, or keep its acceleration data in another store, such as a file of its own or the default engine, `{}`.",
+        Engine::default()
+    )
 }
 
 /// What [`Runtime::retire`] serves when it cannot delete a retired dataset's
@@ -2528,6 +2589,18 @@ mod tests {
                 "Permission denied (os error 13)"
             ),
             "this instance does not serve dataset 'orders' until it deletes the acceleration data stored under its name; Spice retries every 10 seconds, so run the statement again once it has. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
+        );
+    }
+
+    /// A statement that would put a dataset's acceleration in the table of a
+    /// dataset whose name differs only in case names that dataset, the
+    /// engine, and how to keep the two apart.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_dataset_that_would_share_a_table_names_the_other() {
+        assert_eq!(
+            shares_table_with("\"Orders\"", Engine::Sqlite),
+            "dataset 'Orders' keeps its acceleration data in the same `sqlite` store, which reads table names that differ only in case as one table, so the two datasets would share their data. Give this dataset a name that differs from 'Orders' by more than case, or keep its acceleration data in another store, such as a file of its own or the default engine, `cayenne`."
         );
     }
 

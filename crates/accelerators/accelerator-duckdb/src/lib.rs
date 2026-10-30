@@ -1380,18 +1380,28 @@ fn drop_acceleration_tables(
     // full-refresh layout). `DROP TABLE` errors on a view (and `DROP VIEW` on a
     // table), so dispatch on the actual object type, then drop every internal
     // data table so the acceleration can be recreated cleanly with a new schema.
-    let escaped = table_name.replace('"', "\"\"");
+    // DuckDB reads names that differ only in case as one, so what the store
+    // holds under the name may be spelled in another case: each object is
+    // found as DuckDB reads the name, and dropped by the name it is stored as.
     let mut dropped = false;
-    if duckdb_view_exists(&tx, table_name)? {
+    if let Some(view) = stored_name_read_as(
+        &tx,
+        "SELECT view_name FROM duckdb_views() WHERE NOT internal",
+        table_name,
+    )? {
+        let escaped = view.replace('"', "\"\"");
         tx.execute(&format!("DROP VIEW IF EXISTS \"{escaped}\""), [])
             .boxed()?;
         dropped = true;
-    } else if duckdb_table_exists(&tx, table_name)? {
+    } else if let Some(table) =
+        stored_name_read_as(&tx, "SELECT table_name FROM duckdb_tables()", table_name)?
+    {
+        let escaped = table.replace('"', "\"\"");
         tx.execute(&format!("DROP TABLE IF EXISTS \"{escaped}\""), [])
             .boxed()?;
         dropped = true;
     }
-    for (internal_table, _) in list_internal_data_tables(&tx, table_name)? {
+    for internal_table in internal_data_tables_read_as(&tx, table_name)? {
         let escaped_internal = internal_table.replace('"', "\"\"");
         tx.execute(&format!("DROP TABLE IF EXISTS \"{escaped_internal}\""), [])
             .boxed()?;
@@ -1402,6 +1412,50 @@ fn drop_acceleration_tables(
         tracing::info!("Deleted the DuckDB acceleration data of dataset '{table_name}'.");
     }
     Ok(())
+}
+
+/// The name, of those `query` lists, that `DuckDB` reads as `name`: one that
+/// differs from it at most in ASCII case.
+fn stored_name_read_as(
+    tx: &duckdb::Transaction<'_>,
+    query: &str,
+    name: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut stmt = tx.prepare(query).boxed()?;
+    let mut rows = stmt.query([]).boxed()?;
+    while let Some(row) = rows.next().boxed()? {
+        let stored: String = row.get(0).boxed()?;
+        if stored.eq_ignore_ascii_case(name) {
+            return Ok(Some(stored));
+        }
+    }
+    Ok(None)
+}
+
+/// The internal `__data_{table_name}_{unix_ms}` tables of the table `DuckDB`
+/// reads as `table_name`, by the names they are stored as.
+fn internal_data_tables_read_as(
+    tx: &duckdb::Transaction<'_>,
+    table_name: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let prefix = format!("__data_{table_name}_");
+    let mut stmt = tx
+        .prepare("SELECT table_name FROM duckdb_tables()")
+        .boxed()?;
+    let mut rows = stmt.query([]).boxed()?;
+    let mut tables = Vec::new();
+    while let Some(row) = rows.next().boxed()? {
+        let name: String = row.get(0).boxed()?;
+        // Only a remainder that is a unix-ms timestamp, as in
+        // `list_internal_data_tables`.
+        if let Some((head, timestamp)) = name.split_at_checked(prefix.len())
+            && head.eq_ignore_ascii_case(&prefix)
+            && timestamp.parse::<u64>().is_ok()
+        {
+            tables.push(name);
+        }
+    }
+    Ok(tables)
 }
 
 /// Whether `error` is `DuckDB` refusing a write to a catalog entry that another
@@ -3783,6 +3837,57 @@ mod tests {
         underlying
             .execute(&format!("DROP TABLE IF EXISTS \"{table_name}\""), [])
             .expect("drop of non-existent table should succeed");
+    }
+
+    /// What the store holds under a name in another case is what `DuckDB`
+    /// reads the name as, so dropping the name deletes it: the view, its
+    /// internal data tables, and a base table, and nothing else.
+    #[test]
+    fn drop_deletes_what_is_stored_under_the_name_in_another_case() {
+        use datafusion_table_providers::duckdb::DuckDB;
+        use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+
+        let pool =
+            Arc::new(DuckDbConnectionPool::new_memory().expect("to create DuckDB connection pool"));
+        let stored = |pool: &DuckDbConnectionPool| -> Vec<String> {
+            let mut conn = pool.connect_sync().expect("to get connection from pool");
+            let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("to get DuckDB connection");
+            let mut stmt = duckdb_conn
+                .get_underlying_conn_mut()
+                .prepare(
+                    "SELECT table_name FROM duckdb_tables() UNION ALL SELECT view_name FROM duckdb_views() WHERE NOT internal ORDER BY 1",
+                )
+                .expect("to prepare the listing");
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .expect("to list the stored objects")
+                .collect::<Result<_, _>>()
+                .expect("to read the stored names")
+        };
+        {
+            let mut conn = pool.connect_sync().expect("to get connection from pool");
+            let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("to get DuckDB connection");
+            duckdb_conn
+                .get_underlying_conn_mut()
+                .execute_batch(
+                    "CREATE TABLE \"__data_Orders_1700000000000\" (id INTEGER);
+                     CREATE VIEW \"Orders\" AS SELECT * FROM \"__data_Orders_1700000000000\";
+                     CREATE TABLE \"Items\" (id INTEGER);
+                     CREATE TABLE \"__data_Ordersx_1700000000000\" (id INTEGER);
+                     CREATE TABLE kept (id INTEGER);",
+                )
+                .expect("to create the stored objects");
+        }
+
+        super::drop_acceleration_tables(Arc::clone(&pool), "orders").expect("to drop orders");
+        super::drop_acceleration_tables(Arc::clone(&pool), "items").expect("to drop items");
+
+        assert_eq!(
+            stored(&pool),
+            vec![
+                "__data_Ordersx_1700000000000".to_string(),
+                "kept".to_string()
+            ]
+        );
     }
 
     #[test]

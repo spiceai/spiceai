@@ -734,8 +734,13 @@ impl DataAccelerator for SqliteAccelerator {
         let dropped = conn
             .conn
             .call(move |conn| {
+                // SQLite reads names that differ only in ASCII case as one
+                // table, as `NOCASE` compares them, so the table the store
+                // holds under the name may be spelled in another case.
                 let exists = conn
-                    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")?
+                    .prepare(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? COLLATE NOCASE",
+                    )?
                     .query([table.as_str()])?
                     .next()?
                     .is_some();
@@ -1637,6 +1642,52 @@ mod tests {
         assert!(std::path::Path::new(&path).exists());
 
         // cleanup
+        std::fs::remove_file(&path).expect("file should be removed");
+    }
+
+    /// A table the store holds under the name in another case is the one
+    /// `SQLite` reads the name as, so dropping the name deletes it, and
+    /// nothing else.
+    #[tokio::test]
+    async fn drop_table_deletes_a_table_stored_under_another_case() {
+        let path = std::env::temp_dir().join(format!(
+            "sqlite_drop_another_case_{}.db",
+            std::process::id()
+        ));
+        if path.exists() {
+            std::fs::remove_file(&path).expect("stale test file should be removed");
+        }
+        rusqlite::Connection::open(&path)
+            .expect("to create the SQLite file")
+            .execute_batch(
+                "CREATE TABLE \"Orders\" (id INTEGER); INSERT INTO \"Orders\" VALUES (1); CREATE TABLE kept (id INTEGER);",
+            )
+            .expect("to create the stored tables");
+        let dataset = TestAccelerationSource::new("orders").with_acceleration(Acceleration {
+            engine: Engine::Sqlite,
+            mode: Mode::File,
+            params: HashMap::from([(
+                "sqlite_file".to_string(),
+                path.to_string_lossy().to_string(),
+            )]),
+            ..Default::default()
+        });
+
+        SqliteAccelerator::new()
+            .drop_table("orders", &dataset)
+            .await
+            .expect("to drop orders");
+
+        let tables: Vec<String> = rusqlite::Connection::open(&path)
+            .expect("to open the SQLite file")
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .expect("to prepare the listing")
+            .query_map([], |row| row.get(0))
+            .expect("to list the tables")
+            .collect::<Result<_, _>>()
+            .expect("to read the table names");
+        assert_eq!(tables, vec!["kept".to_string()]);
+
         std::fs::remove_file(&path).expect("file should be removed");
     }
 
