@@ -31,16 +31,23 @@ use datafusion::{
 use flight_client::{Credentials, FlightClient};
 use futures::TryStreamExt;
 use runtime::{Runtime, datafusion::query::QueryBuilder};
+use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
+use secrecy::SecretString;
 use spicepod::{
     component::{
         dataset::Dataset,
-        runtime::{Runtime as RuntimeConfig, RuntimeMode},
+        runtime::{ApiKey, Runtime as RuntimeConfig, RuntimeMode},
     },
     param::Params,
 };
 
 use super::start_spice_test_app_with_metrics_port;
 use crate::utils::test_request_context;
+
+/// The upstream's only API key. The sidecar's datasets pass it explicitly, so
+/// the connector never autoloads `spiceai_api_key` from the environment or a
+/// `.env` file, where CI keeps a Spice Cloud key the upstream would reject.
+const API_KEY: &str = "sidecar-roundtrip";
 
 fn assert_same_rows(
     actual: &[RecordBatch],
@@ -68,8 +75,10 @@ async fn rows(runtime: &Arc<Runtime>, sql: &str) -> anyhow::Result<Vec<RecordBat
 #[tokio::test]
 async fn sidecar_substrait_connector_roundtrip() -> anyhow::Result<()> {
     test_request_context().scope(async {
+        let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str(API_KEY)]))
+            as Arc<dyn FlightBasicAuth + Send + Sync>;
         let (_channel, upstream, metrics_port) =
-            start_spice_test_app_with_metrics_port(None, None, None, None).await?;
+            start_spice_test_app_with_metrics_port(Some(auth), None, None, None).await?;
         let endpoint = format!("http://127.0.0.1:{}", metrics_port - 1);
         let input = RecordBatch::try_from_iter(vec![
             ("id", Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as arrow::array::ArrayRef),
@@ -106,6 +115,7 @@ async fn sidecar_substrait_connector_roundtrip() -> anyhow::Result<()> {
             let mut dataset = Dataset::new(format!("{prefix}:remote_orders"), name.to_string());
             dataset.params = Some(Params::from_string_map(HashMap::from([
                 ("spiceai_endpoint".to_string(), endpoint.clone()),
+                ("spiceai_api_key".to_string(), API_KEY.to_string()),
             ])));
             app = app.with_dataset(dataset);
         }
@@ -173,7 +183,8 @@ async fn sidecar_substrait_connector_roundtrip() -> anyhow::Result<()> {
 
         // An ordinary DataFusion session has no federation analyzer. Its scan
         // must still send a Substrait plan rather than taking the SQL path.
-        let client = FlightClient::try_new(endpoint.into(), Credentials::anonymous(), None, None).await?;
+        let credentials = Credentials::new("", SecretString::from(API_KEY));
+        let client = FlightClient::try_new(endpoint.into(), credentials, None, None).await?;
         #[expect(clippy::disallowed_methods, reason = "the test connects to a real Spice runtime")]
         let factory = FlightFactory::new("spice.ai", client, Arc::new(DefaultDialect {})).with_substrait(true);
         let provider = factory.table_provider(TableReference::bare("remote_orders")).await

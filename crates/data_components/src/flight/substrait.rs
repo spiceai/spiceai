@@ -20,7 +20,7 @@ use std::{fmt, sync::Arc};
 
 use arrow::{
     array::RecordBatch,
-    datatypes::{DataType, Field, SchemaRef},
+    datatypes::{DataType, Field, Fields, SchemaRef},
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -452,24 +452,47 @@ impl SubstraitExec {
 
 /// Flight expands only top-level views. Reverse that exact representation
 /// change; never coerce arbitrary remote types.
+///
+/// Top-level nullability is the remote's inference, not data: a remote
+/// rewrite (checked integer arithmetic) can widen it. The planned nullability
+/// applies once Arrow confirms a non-nullable column holds no nulls.
 fn conform_batch(
     batch: RecordBatch,
     expected: &SchemaRef,
     wire: Option<&SchemaRef>,
 ) -> Result<RecordBatch> {
     let batch = match wire {
-        Some(wire) if batch.schema().fields() == wire.fields() => {
+        Some(wire) if same_fields_except_nullability(batch.schema().fields(), wire.fields()) => {
             arrow_tools::schema::cast_view_columns(batch, expected)?
         }
         _ => batch,
     };
-    if batch.schema().fields() != expected.fields() {
+    if batch.schema().fields() == expected.fields() {
+        return Ok(batch);
+    }
+    if !same_fields_except_nullability(batch.schema().fields(), expected.fields()) {
         return Err(DataFusionError::Execution(format!(
             "Remote Substrait result schema differs from the planned schema: expected {expected:?}, received {:?}",
             batch.schema(),
         )));
     }
-    Ok(batch)
+    RecordBatch::try_new(Arc::clone(expected), batch.columns().to_vec()).map_err(|error| {
+        DataFusionError::Execution(format!(
+            "Remote Substrait result does not match the planned schema: {error}"
+        ))
+    })
+}
+
+fn same_fields_except_nullability(actual: &Fields, expected: &Fields) -> bool {
+    actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected.iter())
+            .all(|(actual, expected)| {
+                actual.name() == expected.name()
+                    && actual.data_type() == expected.data_type()
+                    && actual.metadata() == expected.metadata()
+            })
 }
 
 impl DisplayAs for SubstraitExec {
@@ -564,5 +587,51 @@ impl ExecutionPlan for SubstraitExec {
         let stream = normalized_batches(query, self.datasets.clone())
             .map(move |batch| conform_batch(batch?, &expected, wire.as_ref()));
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{Int64Array, RecordBatch},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    use super::conform_batch;
+
+    fn batch(nullable: bool, values: Vec<Option<i64>>) -> RecordBatch {
+        let schema = Schema::new(vec![Field::new("n", DataType::Int64, nullable)]);
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int64Array::from(values))])
+            .expect("valid batch")
+    }
+
+    #[test]
+    fn conform_batch_takes_planned_nullability_when_the_data_allows_it() {
+        let expected = batch(false, vec![]).schema();
+        let conformed = conform_batch(batch(true, vec![Some(2), Some(3)]), &expected, None)
+            .expect("no nulls in a non-nullable column");
+        assert_eq!(conformed.schema(), expected);
+
+        let error = conform_batch(batch(true, vec![Some(2), None]), &expected, None)
+            .expect_err("a null in a non-nullable column");
+        assert!(
+            error.to_string().contains("declared as non-nullable"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn conform_batch_rejects_a_different_type() {
+        let expected = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)]));
+        let error = conform_batch(batch(true, vec![Some(2)]), &expected, None)
+            .expect_err("Int64 is not Int32");
+        assert!(
+            error
+                .to_string()
+                .contains("differs from the planned schema"),
+            "{error}"
+        );
     }
 }
