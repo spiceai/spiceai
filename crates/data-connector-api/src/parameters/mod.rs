@@ -169,3 +169,20 @@ pub struct ConnectorParams {
     pub component: ConnectorComponent,
     pub io_runtime: Handle,
 }
+
+impl ConnectorParams {
+    /// The value of parameter `name` if the component's spicepod sets it, and `None` if it is
+    /// left at its default. [`Parameters`] fills in each spec's default, so whether the
+    /// parameter was set is read from the spicepod's own params.
+    #[must_use]
+    pub fn user_set(&self, name: &str) -> Option<&str> {
+        let spicepod_params = match &self.component {
+            ConnectorComponent::Dataset(dataset) => &dataset.params,
+            ConnectorComponent::Catalog(catalog) => &catalog.params,
+        };
+        spicepod_params
+            .contains_key(&self.parameters.user_param(name).0)
+            .then(|| self.parameters.get(name).expose().ok())
+            .flatten()
+    }
+}

@@ -1188,7 +1188,7 @@
       ]
     },
     "OtelTemporality": {
-      "description": "Aggregation temporality preference for the OTEL metrics push exporter.\n\nControls how counter and histogram values are encoded on the wire:\n\n- **`Delta`** (default): each export contains the change since the previous\n  export. Required by Datadog's OTLP intake and recommended by AWS\n  `CloudWatch`, New Relic, and most push-based `SaaS` backends. Aligns with the\n  `OpenTelemetry` guidance for push exporters.\n- **`Cumulative`**: each export carries the running total since process\n  start. Use this for `OTel` collectors that downstream into Prometheus or\n  other pull-based / cumulative-native backends.\n- **`LowMemory`**: counters use cumulative, histograms use delta. Reduces\n  the SDK's in-process state for histogram-heavy workloads.\n\nThis setting only affects the OTLP push exporter; the runtime's Prometheus\nscrape endpoint always exposes cumulative metrics regardless of this value.",
+      "description": "Aggregation temporality preference for the OTEL metrics push exporter.\n\nControls how counter and histogram values are encoded on the wire:\n\n- **`Delta`** (default): each export contains the change since the previous\n  export. Required by Datadog's OTLP intake and recommended by AWS\n  `CloudWatch`, New Relic, and most push-based `SaaS` backends. Aligns with the\n  `OpenTelemetry` guidance for push exporters.\n- **`Cumulative`**: each export carries the running total since process\n  start. Use this for `OTel` collectors that downstream into Prometheus or\n  other pull-based / cumulative-native backends.\n- **`LowMemory`**: synchronous counters and histograms use delta; observable\n  counters, up-down counters, and gauges use cumulative. Delta lets the SDK\n  drop per-series state after each export, which reduces memory for\n  high-cardinality counters and histograms.\n\nThis setting only affects the OTLP push exporter; the runtime's Prometheus\nscrape endpoint always exposes cumulative metrics regardless of this value.",
       "oneOf": [
         {
           "description": "Delta temporality. Default — required by Datadog and recommended for\npush-based backends.",
@@ -1201,7 +1201,7 @@
           "const": "cumulative"
         },
         {
-          "description": "Counters use cumulative, histograms use delta.",
+          "description": "Synchronous counters and histograms use delta; observable counters,\nup-down counters, and gauges use cumulative.",
           "type": "string",
           "const": "low_memory"
         }

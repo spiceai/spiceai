@@ -73,9 +73,15 @@ ARG CARGO_FEATURES=default
 ARG INSTALL_ORACLE_ODPIC=false
 ARG ORACLE_INSTANTCLIENT_SHA256_AMD64=05b4c01c77521eee32c89550d3a2e2f4d9f9601a79af96da441dfdd2d2a32ec4
 ARG ORACLE_INSTANTCLIENT_SHA256_ARM64=1d27641f16df1b1384f5d61cdcbd95a5ca57ba5d25ed881edde56543f8c6d135
+# Set to a unique value per release build (spiced_docker.yml passes the run id)
+# so this layer is never replayed from the GHA build cache. The CA bundle and
+# every library ldd copies into the sandbox below come from this layer.
+ARG APT_CACHE_BUST=
 
 # Install required packages
-RUN apt-get update \
+RUN echo "apt cache bust: ${APT_CACHE_BUST}" \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade --yes --no-install-recommends \
     && apt-get install --yes --no-install-recommends ca-certificates libssl3 findutils tzdata \
     && if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
       apt-get install --yes --no-install-recommends unixodbc; \

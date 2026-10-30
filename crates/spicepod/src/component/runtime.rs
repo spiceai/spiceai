@@ -503,8 +503,10 @@ fn default_otel_signals() -> Vec<OtelSignal> {
 /// - **`Cumulative`**: each export carries the running total since process
 ///   start. Use this for `OTel` collectors that downstream into Prometheus or
 ///   other pull-based / cumulative-native backends.
-/// - **`LowMemory`**: counters use cumulative, histograms use delta. Reduces
-///   the SDK's in-process state for histogram-heavy workloads.
+/// - **`LowMemory`**: synchronous counters and histograms use delta; observable
+///   counters, up-down counters, and gauges use cumulative. Delta lets the SDK
+///   drop per-series state after each export, which reduces memory for
+///   high-cardinality counters and histograms.
 ///
 /// This setting only affects the OTLP push exporter; the runtime's Prometheus
 /// scrape endpoint always exposes cumulative metrics regardless of this value.
@@ -519,7 +521,8 @@ pub enum OtelTemporality {
     /// Cumulative temporality. Use for `OTel` collectors that downstream into
     /// Prometheus or other cumulative-native backends.
     Cumulative,
-    /// Counters use cumulative, histograms use delta.
+    /// Synchronous counters and histograms use delta; observable counters,
+    /// up-down counters, and gauges use cumulative.
     LowMemory,
 }
 

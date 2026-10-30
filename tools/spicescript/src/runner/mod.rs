@@ -26,7 +26,7 @@ limitations under the License.
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -324,6 +324,8 @@ pub struct Options {
     /// The directory holding this run's node mTLS CA and certificates
     /// (`ca.crt`, `<role>.crt`, `<role>.key`), generated when it starts.
     pub pki: PathBuf,
+    /// `--log-capture`: where a script with a failure leaves its logs.
+    pub log_capture: Option<PathBuf>,
 }
 
 /// A failed check: where it ran, which step, and what went wrong.
@@ -486,8 +488,8 @@ struct Background {
 struct BackgroundStats {
     iterations: u64,
     latencies: Vec<Duration>,
-    /// Every failure's message, in order.
-    errors: Vec<String>,
+    /// Every failure's time and message, in order.
+    errors: Vec<(chrono::DateTime<chrono::Utc>, String)>,
 }
 
 impl Instance {
@@ -650,30 +652,29 @@ async fn run_combination(
         state: BTreeMap::new(),
         kinds: BTreeMap::new(),
     };
-    let matrix_ctx = json!({ "matrix": combo });
-    for (name, spec) in &script.sources {
-        let kind = template::substitute_text(&spec.kind, &matrix_ctx)?;
-        let version = spec
-            .version
-            .as_deref()
-            .map(|v| template::substitute_text(v, &matrix_ctx))
-            .transpose()?;
-        let src = source::start(
-            name,
-            run_id,
-            &kind,
-            version.as_deref(),
-            &options.work_dir.join(run_id).join("sources"),
-            spec,
-        )
-        .await
-        .with_context(|| format!("Failed to start source '{name}' ({kind})"))?;
-        sources.by_name.insert(name.clone(), Arc::from(src));
-        sources.state.insert(name.clone(), SourceState::Running);
-        sources.kinds.insert(name.clone(), kind);
-    }
-
     let result = async {
+        let matrix_ctx = json!({ "matrix": combo });
+        for (name, spec) in &script.sources {
+            let kind = template::substitute_text(&spec.kind, &matrix_ctx)?;
+            let version = spec
+                .version
+                .as_deref()
+                .map(|v| template::substitute_text(v, &matrix_ctx))
+                .transpose()?;
+            let src = source::start(
+                name,
+                run_id,
+                &kind,
+                version.as_deref(),
+                &options.work_dir.join(run_id).join("sources"),
+                spec,
+            )
+            .await
+            .with_context(|| format!("Failed to start source '{name}' ({kind})"))?;
+            sources.by_name.insert(name.clone(), Arc::from(src));
+            sources.state.insert(name.clone(), SourceState::Running);
+            sources.kinds.insert(name.clone(), kind);
+        }
         let mut instances = create_instances(script, options, combo, run_id, &sources).await?;
         match schedule {
             Schedule::Lockstep => {
@@ -755,6 +756,12 @@ async fn run_combination(
     }
     .await;
 
+    if let Some(root) = &options.log_capture
+        && (result.is_err() || !report.failures.is_empty())
+    {
+        let dir = combination_capture_dir(&capture_dir(root, script), script, run_label);
+        capture_combination(&sources, run_id, &options.work_dir.join(run_id), &dir).await;
+    }
     if !options.keep {
         for src in sources.by_name.values() {
             if let Err(e) = src.remove().await {
@@ -763,6 +770,127 @@ async fn run_combination(
         }
     }
     result
+}
+
+/// `--log-capture`'s directory for a script: one per script, by name.
+pub fn capture_dir(root: &Path, script: &Script) -> PathBuf {
+    root.join(sanitize(&script.name))
+}
+
+/// A matrix combination's directory within its script's: the script's own
+/// for a script without a matrix, else one named by the combination's values.
+fn combination_capture_dir(script_dir: &Path, script: &Script, run_label: &str) -> PathBuf {
+    let dir_name = |label: &str| {
+        label
+            .strip_prefix(script.name.as_str())
+            .map(|combo| sanitize(combo).trim_matches('_').to_string())
+            .unwrap_or_default()
+    };
+    let labels = script.run_labels();
+    let names: Vec<String> = labels.iter().map(|label| dir_name(label)).collect();
+    let name = match labels.iter().position(|label| label == run_label) {
+        Some(index) => distinct_name(&names, index),
+        None => dir_name(run_label),
+    };
+    if name.is_empty() {
+        script_dir.to_path_buf()
+    } else {
+        script_dir.join(name)
+    }
+}
+
+/// `names[index]`, a [`sanitize`]d name, followed by its position after a
+/// `-` when another of `names` is the same. Names that differ only in case or
+/// punctuation (`a-b` and `a_b`) sanitize the same, and the `-` is never part
+/// of a sanitized name, so the result names only this one.
+fn distinct_name(names: &[String], index: usize) -> String {
+    let name = &names[index];
+    if names.iter().filter(|other| *other == name).count() > 1 {
+        format!("{name}-{}", index + 1)
+    } else {
+        name.clone()
+    }
+}
+
+/// Saves what a failed combination leaves to read into `dir`: each source
+/// container's output as `<source>.log`, for a failure that may be the
+/// source's (a broker that never came back, a database that restarted into
+/// recovery), and from `work`, the run's directory, every instance's
+/// `spiced.log`, spicepod, sqllogictest reports and random-query
+/// failures at their paths there.
+/// A log that cannot be saved is a warning: the run's own failure is the one
+/// to report.
+async fn capture_combination(sources: &Sources, run_id: &str, work: &Path, dir: &Path) {
+    if let Err(e) = tokio::fs::create_dir_all(dir).await {
+        say!("warning: Failed to create {}: {e}", dir.display());
+        return;
+    }
+    // Containers are named `spicescript-<run id>-<source>[-<part>]`.
+    let prefix = format!("spicescript-{run_id}-");
+    let containers: Vec<_> = sources
+        .by_name
+        .values()
+        .flat_map(|src| src.containers())
+        .collect();
+    let names: Vec<String> = containers
+        .iter()
+        .map(|container| {
+            sanitize(
+                container
+                    .name
+                    .strip_prefix(&prefix)
+                    .unwrap_or(&container.name),
+            )
+        })
+        .collect();
+    for (index, container) in containers.iter().enumerate() {
+        let path = dir.join(format!("{}.log", distinct_name(&names, index)));
+        if let Err(e) = container.save_logs(&path).await {
+            say!("warning: {e:#}");
+        }
+    }
+    let (work, to) = (work.to_path_buf(), dir.to_path_buf());
+    match tokio::task::spawn_blocking(move || copy_instance_logs(&work, &work, &to)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => say!("warning: {e:#}"),
+        Err(e) => say!("warning: copying instance logs panicked: {e}"),
+    }
+    say!("   logs captured in {}", dir.display());
+}
+
+/// Copies the log-like files under `dir` (instance and executor
+/// `spiced.log`s, spicepods, sqllogictest reports) from `root` to `to`,
+/// keeping their paths below `root`; data files stay behind.
+fn copy_instance_logs(root: &Path, dir: &Path, to: &Path) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.is_dir() {
+            copy_instance_logs(root, &path, to)?;
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let wanted = name == "spiced.log"
+            || name == "spicepod.yaml"
+            || ((name.starts_with("slt-") || name.starts_with("random-queries-seed"))
+                && path.extension().is_some_and(|x| x == "txt"));
+        if !wanted {
+            continue;
+        }
+        let target = to.join(path.strip_prefix(root)?);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&path, &target).with_context(|| {
+            format!("Failed to copy {} to {}", path.display(), target.display())
+        })?;
+    }
+    Ok(())
 }
 
 async fn create_instances(
@@ -1432,6 +1560,33 @@ mod tests {
             ]
         );
         assert_eq!(matrix_combinations(&IndexMap::new()), vec![Map::new()]);
+    }
+
+    #[test]
+    fn combinations_differing_only_in_punctuation_capture_apart() {
+        let script = Script::parse(
+            "name: s\nspicepod: {}\nmatrix: { k: [a-b, a_b, c], m: [x] }\nsteps: [{ start: {} }]",
+        )
+        .expect("script parses");
+        let dirs: Vec<PathBuf> = script
+            .run_labels()
+            .iter()
+            .map(|label| combination_capture_dir(Path::new("cap/s"), &script, label))
+            .collect();
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from("cap/s/k_a_b_m_x-1"),
+                PathBuf::from("cap/s/k_a_b_m_x-2"),
+                PathBuf::from("cap/s/k_c_m_x"),
+            ]
+        );
+        let plain =
+            Script::parse("name: s\nspicepod: {}\nsteps: [{ start: {} }]").expect("script parses");
+        assert_eq!(
+            combination_capture_dir(Path::new("cap/s"), &plain, "s"),
+            PathBuf::from("cap/s")
+        );
     }
 }
 

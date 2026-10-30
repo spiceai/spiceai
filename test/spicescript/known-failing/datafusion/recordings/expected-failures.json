@@ -1,70 +1,4 @@
 {
-  "case-mixed-widths": [
-    {
-      "run": "case-mixed-widths",
-      "who": "arrow",
-      "key": "query: SELECT id, CASE WHEN id > 10 THEN a ELSE a + 1 END AS c FROM w",
-      "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Schema mismatch: Query returned an unexpected data type for column c: expected Int32, received Int64. Is the column data type supported by the data accelerator (https://spiceai.org/docs/reference/datatypes)?: Schema mismatch: Query returned an unexpe",
-      "group": "datafusion"
-    },
-    {
-      "run": "case-mixed-widths",
-      "who": "arrow",
-      "key": "query: SELECT id, CASE WHEN id > 10 THEN a ELSE count(*) OVER (PARTITION BY a) END AS c FROM w",
-      "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Schema mismatch: Query returned an unexpected data type for column c: expected Int32, received Int64. Is the column data type supported by the data accelerator (https://spiceai.org/docs/reference/datatypes)?: Schema mismatch: Query returned an unexpe",
-      "group": "datafusion"
-    },
-    {
-      "run": "case-mixed-widths",
-      "who": "arrow",
-      "key": "query: SELECT id, -rank() OVER (ORDER BY id) AS r FROM w",
-      "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Unary operator '-' only supports signed numeric, interval and timestamp types: Unary operator '-' only supports signed numeric, interval and timestamp types",
-      "group": "datafusion"
-    },
-    {
-      "run": "case-mixed-widths",
-      "who": "cayenne",
-      "key": "query: SELECT id, CASE WHEN id > 10 THEN a ELSE a + 1 END AS c FROM w",
-      "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Schema mismatch: Query returned an unexpected data type for column c: expected Int32, received Int64. Is the column data type supported by the data accelerator (https://spiceai.org/docs/reference/datatypes)?: Schema mismatch: Query returned an unexpe",
-      "group": "datafusion"
-    },
-    {
-      "run": "case-mixed-widths",
-      "who": "cayenne",
-      "key": "query: SELECT id, CASE WHEN id > 10 THEN a ELSE count(*) OVER (PARTITION BY a) END AS c FROM w",
-      "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Schema mismatch: Query returned an unexpected data type for column c: expected Int32, received Int64. Is the column data type supported by the data accelerator (https://spiceai.org/docs/reference/datatypes)?: Schema mismatch: Query returned an unexpe",
-      "group": "datafusion"
-    },
-    {
-      "run": "case-mixed-widths",
-      "who": "cayenne",
-      "key": "query: SELECT id, -rank() OVER (ORDER BY id) AS r FROM w",
-      "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Unary operator '-' only supports signed numeric, interval and timestamp types: Unary operator '-' only supports signed numeric, interval and timestamp types",
-      "group": "datafusion"
-    },
-    {
-      "run": "case-mixed-widths",
-      "who": "duckdb",
-      "key": "query: SELECT id, -rank() OVER (ORDER BY id) AS r FROM w",
-      "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Unary operator '-' only supports signed numeric, interval and timestamp types: Unary operator '-' only supports signed numeric, interval and timestamp types",
-      "group": "datafusion"
-    },
-    {
-      "run": "case-mixed-widths",
-      "who": "federated",
-      "key": "query: SELECT id, -rank() OVER (ORDER BY id) AS r FROM w",
-      "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Unary operator '-' only supports signed numeric, interval and timestamp types: Unary operator '-' only supports signed numeric, interval and timestamp types",
-      "group": "datafusion"
-    }
-  ],
   "flight-prepared-coalesce": [
     {
       "run": "flight-prepared-coalesce",
@@ -83,37 +17,37 @@
       "group": "datafusion"
     }
   ],
-  "groupby-join-key-dependency": [
+  "qualified-outer-reference": [
     {
-      "run": "groupby-join-key-dependency",
+      "run": "qualified-outer-reference",
+      "who": "federated",
+      "key": "query: SELECT (SELECT (SELECT schema_a.foo.a) FROM (SELECT a FROM bar) foo) AS v FROM schema_a.foo ORDER BY v",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"1\\\"\", actual: \"\\\"10\\\"\" }",
+      "group": "datafusion"
+    },
+    {
+      "run": "qualified-outer-reference",
+      "who": "federated",
+      "key": "query: SELECT schema_a.foo.a AS v FROM schema_a.foo WHERE EXISTS (SELECT 1 FROM (SELECT a FROM bar) foo WHERE EXISTS (SELECT 1 WHERE schema_a.foo.a = 1)) ORDER BY v",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
+      "group": "datafusion"
+    },
+    {
+      "run": "qualified-outer-reference",
       "who": "arrow",
-      "key": "query: SELECT count(*) AS n FROM (SELECT l, id FROM (SELECT DISTINCT b.label AS l, a.id AS id FROM u b JOIN t a ON a.id = b.t_id) x GROUP BY l, id) g",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"60\\\"\", actual: \"\\\"25\\\"\" }",
+      "key": "query: SELECT schema_a.foo.a AS v FROM schema_a.foo WHERE EXISTS (SELECT 1 FROM (SELECT a FROM bar) foo WHERE EXISTS (SELECT 1 WHERE schema_a.foo.a = 1)) ORDER BY v",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
       "group": "datafusion"
     },
     {
-      "run": "groupby-join-key-dependency",
-      "who": "arrow",
-      "key": "query: SELECT count(*) AS n FROM (SELECT s, id FROM (SELECT DISTINCT a.s AS s, b.id AS id FROM t a LEFT JOIN u b ON a.id = b.t_id) x GROUP BY s, id) g",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"64\\\"\", actual: \"\\\"61\\\"\" }",
-      "group": "datafusion"
-    },
-    {
-      "run": "groupby-join-key-dependency",
+      "run": "qualified-outer-reference",
       "who": "cayenne",
-      "key": "query: SELECT count(*) AS n FROM (SELECT l, id FROM (SELECT DISTINCT b.label AS l, a.id AS id FROM u b JOIN t a ON a.id = b.t_id) x GROUP BY l, id) g",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"60\\\"\", actual: \"\\\"25\\\"\" }",
-      "group": "datafusion"
-    },
-    {
-      "run": "groupby-join-key-dependency",
-      "who": "cayenne",
-      "key": "query: SELECT count(*) AS n FROM (SELECT s, id FROM (SELECT DISTINCT a.s AS s, b.id AS id FROM t a LEFT JOIN u b ON a.id = b.t_id) x GROUP BY s, id) g",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"64\\\"\", actual: \"\\\"61\\\"\" }",
+      "key": "query: SELECT schema_a.foo.a AS v FROM schema_a.foo WHERE EXISTS (SELECT 1 FROM (SELECT a FROM bar) foo WHERE EXISTS (SELECT 1 WHERE schema_a.foo.a = 1)) ORDER BY v",
+      "kind": "empty",
+      "signature": "Spice returned no rows, expected 1",
       "group": "datafusion"
     }
   ],
