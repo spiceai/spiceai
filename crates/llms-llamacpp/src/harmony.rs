@@ -175,6 +175,25 @@ pub(crate) enum Held {
     Call,
 }
 
+/// Where a prompt leaves a reply that a grammar holds, as the grammar goes on from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Opened {
+    /// The first message's header, before any of it: the grammar of a whole reply.
+    Header,
+    /// The header after `<|channel|>`.
+    Channel,
+    /// The header after `<|channel|>analysis`.
+    AnalysisHeader,
+    /// The header after `<|channel|>final`.
+    FinalHeader,
+    /// An analysis message's body.
+    Analysis,
+    /// A final message's body, before any of it.
+    Final,
+    /// The arguments of a call to the tool `name`, before any of them.
+    Call(String),
+}
+
 /// Reads one reply.
 #[derive(Debug, Clone)]
 pub(crate) struct Reader {
@@ -183,6 +202,8 @@ pub(crate) struct Reader {
     tools: Vec<String>,
     held: Held,
     route: Route,
+    /// Where the grammar the reply is held to goes on from.
+    opened: Opened,
 }
 
 impl Reader {
@@ -195,6 +216,7 @@ impl Reader {
             tools,
             held,
             route: Route::Header(String::new()),
+            opened: Opened::Header,
         }
     }
 
@@ -209,21 +231,23 @@ impl Reader {
     /// text, and a call goes on from the arguments the prompt began. Each header is read
     /// from after its role, as the header after a stock prompt's `<|start|>assistant` is.
     ///
-    /// A grammar holds a reply from its first header (`harmony_reply`, `harmony_call`), so a
-    /// reply held to one starts in a header whatever the prompt opened.
+    /// A reply held to a grammar goes on from where the prompt leaves it when the grammar
+    /// can go on from there too ([`Reader::opened`]). From a message the grammar does not
+    /// allow there, such as a final message before a required call, or from a final message
+    /// or call whose body the prompt already began, the grammar holds the whole reply from its
+    /// first header, so the reply is read from a header.
     pub(crate) fn after(mut self, prompt: &str) -> Self {
-        if self.held != Held::Nothing {
-            return self;
-        }
         let Some(first) = prompt.find(START) else {
             return self;
         };
-        // Whether the text read next starts with a message's role.
-        let mut role = false;
+        // Whether the text read next starts with a message's role, and whether the prompt
+        // wrote any of the body of the message it leaves open.
+        let (mut role, mut written) = (false, false);
         for (token, text) in self.markers.spell(&prompt[first..]) {
             match token {
                 Some(token) if self.marks(token, "") => {
                     role = token == self.markers.start;
+                    written = false;
                     if !matches!(self.mark(token), Mark::Next) {
                         // The message is closed, so the reply starts a new one.
                         self.route = Route::Header(String::new());
@@ -235,11 +259,41 @@ impl Reader {
                     } else {
                         text
                     };
+                    written |= !text.is_empty();
                     self.text(text);
                 }
             }
         }
+        if self.held != Held::Nothing {
+            self.opened = self.continued(written);
+            if self.opened == Opened::Header {
+                self.route = Route::Header(String::new());
+            }
+        }
         self
+    }
+
+    /// Where the grammar the reply is held to goes on from, as the prompt leaves the reply,
+    /// with `written` text in the open message's body: the first header when the grammar
+    /// cannot go on from the message the prompt opened.
+    fn continued(&self, written: bool) -> Opened {
+        let reply = self.held == Held::Reply;
+        match &self.route {
+            Route::Header(header) if header == CHANNEL => Opened::Channel,
+            Route::Header(header) if header == "<|channel|>analysis" => Opened::AnalysisHeader,
+            Route::Header(header) if reply && header == "<|channel|>final" => Opened::FinalHeader,
+            Route::Reasoning => Opened::Analysis,
+            Route::Content { last: true } if reply && !written => Opened::Final,
+            Route::Call { name, arguments } if !reply && arguments.is_empty() => {
+                Opened::Call(name.clone())
+            }
+            _ => Opened::Header,
+        }
+    }
+
+    /// Where the grammar the reply is held to goes on from, as [`Reader::after`] found it.
+    pub(crate) fn opened(&self) -> &Opened {
+        &self.opened
     }
 
     pub(crate) fn markers(&self) -> &Markers {

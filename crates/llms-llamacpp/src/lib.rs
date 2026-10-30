@@ -550,12 +550,10 @@ impl LlamaCpp {
         // Harmony is read only when the template this request renders with writes it: named
         // templates may mix a Harmony one with one that is not.
         let markers = request_markers(self.harmony, template);
-        // A Harmony grammar holds the whole reply, by the vocabulary's markers.
-        let grammar = match &markers {
-            Some(markers) if !obliged.is_empty() => Some(harmony_call(markers, &obliged)?),
-            Some(markers) => content()?.map(|reply| harmony_reply(markers, &reply)),
-            None => content()?,
-        };
+        // A required Harmony call has a grammar of its own (below); otherwise the content's
+        // grammar holds the reply.
+        let harmony_call_held = markers.is_some() && !obliged.is_empty();
+        let content = if harmony_call_held { None } else { content()? };
         // Each choice reads its own reply, so each has its own reader.
         let matchers = (0..choices)
             .map(|_| {
@@ -575,19 +573,30 @@ impl LlamaCpp {
             .first()
             .and_then(Option::as_ref)
             .is_some_and(ToolCallingMatcher::requires_tool_call);
-        let ban_eog = require_tool_call && grammar.is_none();
+        let ban_eog = require_tool_call && !harmony_call_held && content.is_none();
         let nameable = nameable_tools(&callable, &obliged);
         let held = if !obliged.is_empty() {
             harmony::Held::Call
-        } else if grammar.is_some() {
+        } else if content.is_some() {
             harmony::Held::Reply
         } else {
             harmony::Held::Nothing
         };
-        let prompt = self.prompt(&req.messages, reasoning, tools)?;
+        let prompt = self.prompt(&req.messages, reasoning, tools.clone())?;
         // Every choice's reply starts where the prompt leaves it, so the prompt is read once.
         let reader =
             markers.map(|markers| harmony::Reader::new(markers, nameable, held).after(&prompt));
+        // A Harmony grammar holds the reply by the vocabulary's markers, from where the prompt
+        // leaves it.
+        let grammar = match &reader {
+            Some(reader) if harmony_call_held => {
+                Some(harmony_call(reader.markers(), &obliged, reader.opened())?)
+            }
+            Some(reader) => {
+                content.map(|reply| harmony_reply(reader.markers(), &reply, reader.opened()))
+            }
+            None => content,
+        };
         let stop = match &req.stop {
             Some(StopConfiguration::String(s)) => vec![s.clone()],
             Some(StopConfiguration::StringArray(s)) => s.clone(),
@@ -2463,12 +2472,14 @@ fn content_grammar(
 
 /// The grammar of a whole Harmony reply that must call one of `tools`: any reasoning, then a
 /// `commentary` message addressed to the tool, its arguments held to the tool's schema, as
-/// llama.cpp's server forces one. Each marker is its token, never text spelling it.
+/// llama.cpp's server forces one. Each marker is its token, never text spelling it. The
+/// grammar goes on from where the prompt leaves the reply, `opened`.
 fn harmony_call(
     markers: &harmony::Markers,
     tools: &[&Tool],
+    opened: &harmony::Opened,
 ) -> std::result::Result<String, OpenAIError> {
-    let [_, channel, message, _, _] = markers.terminals();
+    let [start, channel, message, end, _] = markers.terminals();
     let mut grammar = harmony_rules(markers);
     let mut calls = Vec::with_capacity(tools.len());
     for (i, tool) in tools.iter().enumerate() {
@@ -2481,24 +2492,49 @@ fn harmony_call(
     grammar.push_str("call ::= ");
     grammar.push_str(&calls.join(" | "));
     grammar.push('\n');
-    let _ = writeln!(
-        grammar,
-        "root ::= analysis? {channel} \"commentary to=functions.\" call"
-    );
+    let call = format!("{channel} \"commentary to=functions.\" call");
+    let after_analysis = format!("reasoning {end} {start} \"assistant\" {call}");
+    let root = match opened {
+        harmony::Opened::Channel => {
+            format!("\"analysis\" {message} {after_analysis} | \"commentary to=functions.\" call")
+        }
+        harmony::Opened::AnalysisHeader => format!("{message} {after_analysis}"),
+        harmony::Opened::Analysis => after_analysis,
+        harmony::Opened::Call(name) => match tools.iter().position(|t| t.function.name == *name) {
+            Some(i) => format!("tool{i}-root"),
+            None => format!("analysis? {call}"),
+        },
+        // The reader goes on from no other message under a required call.
+        harmony::Opened::Header | harmony::Opened::FinalHeader | harmony::Opened::Final => {
+            format!("analysis? {call}")
+        }
+    };
+    let _ = writeln!(grammar, "root ::= {root}");
     Ok(grammar)
 }
 
 /// The grammar of a whole Harmony reply held to a `response_format`: analysis messages, then
 /// a final message whose body is `reply`'s JSON, as llama.cpp's server holds one. A preamble
-/// is ruled out, since its text would be content outside the schema.
-fn harmony_reply(markers: &harmony::Markers, reply: &str) -> String {
-    let [_, channel, message, _, _] = markers.terminals();
+/// is ruled out, since its text would be content outside the schema. The grammar goes on
+/// from where the prompt leaves the reply, `opened`.
+fn harmony_reply(markers: &harmony::Markers, reply: &str, opened: &harmony::Opened) -> String {
+    let [start, channel, message, end, _] = markers.terminals();
     let mut grammar = harmony_rules(markers);
     grammar.push_str(&prefix_rules(reply, "reply-"));
-    let _ = writeln!(
-        grammar,
-        "root ::= analysis* {channel} \"final\" constrain? {message} reply-root"
-    );
+    let whole = format!("analysis* {channel} \"final\" constrain? {message} reply-root");
+    let after_analysis = format!("reasoning {end} {start} \"assistant\" {whole}");
+    let root = match opened {
+        harmony::Opened::Channel => format!(
+            "\"analysis\" {message} {after_analysis} | \"final\" constrain? {message} reply-root"
+        ),
+        harmony::Opened::AnalysisHeader => format!("{message} {after_analysis}"),
+        harmony::Opened::FinalHeader => format!("constrain? {message} reply-root"),
+        harmony::Opened::Analysis => after_analysis,
+        harmony::Opened::Final => "reply-root".to_string(),
+        // The reader goes on from no call under a `response_format`.
+        harmony::Opened::Header | harmony::Opened::Call(_) => whole,
+    };
+    let _ = writeln!(grammar, "root ::= {root}");
     grammar
 }
 
@@ -3644,7 +3680,8 @@ mod tests {
     #[test]
     fn a_required_harmony_call_is_forced_by_a_grammar_over_the_whole_reply() {
         let tool = weather_tool();
-        let grammar = harmony_call(&HARMONY_MARKERS, &[&tool]).expect("the tool's schema converts");
+        let grammar = harmony_call(&HARMONY_MARKERS, &[&tool], &harmony::Opened::Header)
+            .expect("the tool's schema converts");
         // the test vocabulary's markers are tokens 1 to 7, matched as tokens
         assert!(
             grammar.ends_with("root ::= analysis? <[2]> \"commentary to=functions.\" call\n"),
@@ -3685,7 +3722,7 @@ mod tests {
         let reply = content_grammar("m", HARMONY, Some(&answer_schema()), &[], &[])
             .expect("the schema converts")
             .expect("a json_schema format has a grammar");
-        let grammar = harmony_reply(&HARMONY_MARKERS, &reply);
+        let grammar = harmony_reply(&HARMONY_MARKERS, &reply, &harmony::Opened::Header);
         // analysis messages, then the final one: no preamble, whose text would be content
         assert!(
             grammar.ends_with("root ::= analysis* <[2]> \"final\" constrain? <[3]> reply-root\n"),
