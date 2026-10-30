@@ -286,17 +286,45 @@ fn ends_embedded_url(c: char) -> bool {
 }
 
 fn is_secret_query_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    key == "sig" || SECRET_QUERY_KEY_MARKERS.iter().any(|m| key.contains(m))
+    let key = percent_encoding::percent_decode_str(key)
+        .decode_utf8_lossy()
+        .to_ascii_lowercase();
+    if key == "sig" {
+        return true;
+    }
+    // `author` is not `auth`; `authorization` still is.
+    let key = if key.contains("authoriz") {
+        key
+    } else {
+        key.replace("author", "")
+    };
+    SECRET_QUERY_KEY_MARKERS.iter().any(|m| key.contains(m))
+}
+
+/// Whether `authority` (no userinfo) is a plausible `host[:port]`, i.e. its
+/// port, if any, is numeric.
+fn is_host_and_port(authority: &str) -> bool {
+    let after_host = match authority.rfind(']') {
+        Some(bracket) => &authority[bracket + 1..],
+        None => authority,
+    };
+    match after_host.rfind(':') {
+        Some(colon) => after_host[colon + 1..].chars().all(|c| c.is_ascii_digit()),
+        None => true,
+    }
 }
 
 /// If `s` starts with a URL that has an authority, `s`'s URL prefix with the
 /// userinfo removed and secret query values replaced, plus how many bytes of
 /// `s` that prefix covers. `None` when `s` does not start with such a URL.
 ///
+/// `embedded` is set when `s` is free text (an error message), where
+/// whitespace and quotes end the URL; otherwise `s` is a whole source.
+///
 /// This is a string scan, not a URL parse, so it also fails closed for URLs a
-/// parser would reject (a bad port, an unknown scheme).
-fn redact_url_at(s: &str) -> Option<(String, usize)> {
+/// parser would reject (a bad port, an unknown scheme, a raw `?`, `#` or quote
+/// inside the password).
+fn redact_url_at(s: &str, embedded: bool) -> Option<(String, usize)> {
     let colon = s.find(':')?;
     let scheme = &s[..colon];
     if !scheme.starts_with(|c: char| c.is_ascii_alphabetic()) || !scheme.chars().all(is_scheme_char)
@@ -312,10 +340,34 @@ fn redact_url_at(s: &str) -> Option<(String, usize)> {
     } else {
         return None;
     };
+    let ends_url = |c: char| embedded && ends_embedded_url(c);
 
-    let authority_len = s[authority_start..]
-        .find(|c: char| matches!(c, '/' | '\\' | '?' | '#') || ends_embedded_url(c))
-        .unwrap_or(s.len() - authority_start);
+    // The authority as a URL parser would read it, ending at the path, query
+    // or fragment. When that has no `@` but is not a valid `host[:port]`,
+    // the password itself contains `?`, `#` or a quote (`user:pa?ss@host`);
+    // extend the authority to the last `@` before the path so it is still
+    // removed.
+    let after_start = &s[authority_start..];
+    let strict_len = after_start
+        .find(|c: char| matches!(c, '/' | '\\' | '?' | '#') || ends_url(c))
+        .unwrap_or(after_start.len());
+    let strict = &after_start[..strict_len];
+    let authority_len = if strict.contains('@') || is_host_and_port(strict) {
+        strict_len
+    } else {
+        let extended_len = after_start
+            .find(|c: char| matches!(c, '/' | '\\') || (embedded && c.is_whitespace()))
+            .unwrap_or(after_start.len());
+        match after_start[..extended_len].rfind('@') {
+            Some(at) => {
+                let host_len = after_start[at + 1..extended_len]
+                    .find(|c: char| matches!(c, '?' | '#') || ends_url(c))
+                    .unwrap_or(extended_len - at - 1);
+                at + 1 + host_len
+            }
+            None => strict_len,
+        }
+    };
     let authority_end = authority_start + authority_len;
     let authority = &s[authority_start..authority_end];
 
@@ -329,7 +381,7 @@ fn redact_url_at(s: &str) -> Option<(String, usize)> {
     }
 
     let rest = &s[authority_end..];
-    let url_len = rest.find(ends_embedded_url).unwrap_or(rest.len());
+    let url_len = rest.find(ends_url).unwrap_or(rest.len());
     let rest = &rest[..url_len];
     let (before_fragment, fragment) = rest.split_at(rest.find('#').unwrap_or(rest.len()));
     match before_fragment.split_once('?') {
@@ -369,7 +421,7 @@ fn redact_url_at(s: &str) -> Option<(String, usize)> {
 /// source without credentials is returned unchanged.
 #[must_use]
 pub(crate) fn redact_source_credentials(from: &str) -> String {
-    if let Some((redacted, len)) = redact_url_at(from) {
+    if let Some((redacted, len)) = redact_url_at(from, false) {
         let redacted = format!("{redacted}{}", &from[len..]);
         if redacted != from {
             return redacted;
@@ -377,7 +429,7 @@ pub(crate) fn redact_source_credentials(from: &str) -> String {
     }
     if let Some((pos, delimiter_len)) = runtime_component::find_first_delimiter(from) {
         let start = pos + delimiter_len;
-        if let Some((redacted, len)) = redact_url_at(&from[start..]) {
+        if let Some((redacted, len)) = redact_url_at(&from[start..], false) {
             return format!("{}{redacted}{}", &from[..start], &from[start + len..]);
         }
     }
@@ -394,7 +446,7 @@ pub(crate) fn redact_message_credentials(message: &str) -> String {
     let mut prev: Option<char> = None;
     while let Some(c) = rest.chars().next() {
         if prev.is_none_or(|p| !is_scheme_char(p))
-            && let Some((redacted, len)) = redact_url_at(rest)
+            && let Some((redacted, len)) = redact_url_at(rest, true)
         {
             out.push_str(&redacted);
             prev = redacted.chars().last();
@@ -1251,6 +1303,37 @@ mod tests {
         );
         let plain = "Unable to authenticate with datasource credentials: user@example.com";
         assert_eq!(redact_message_credentials(plain), plain);
+    }
+
+    /// Passwords with characters a URL parser would treat as delimiters,
+    /// percent-encoded secret keys, and keys that only look like secrets.
+    #[test]
+    fn redact_source_credentials_handles_delimiters_in_secrets() {
+        for (from, want) in [
+            ("https://u:pa?ss@h/f.csv", "https://h/f.csv"),
+            ("https://u:pa#ss@h/f.csv", "https://h/f.csv"),
+            ("https://u:pa\"ss@h/f.csv", "https://h/f.csv"),
+            ("https://u:pa\tss@h/f.csv", "https://h/f.csv"),
+            ("https://h/f.csv?%74oken=T0K", "https://h/f.csv?%74oken=***"),
+            (
+                "https://[::1]:8443/f.csv?a=1",
+                "https://[::1]:8443/f.csv?a=1",
+            ),
+            (
+                "https://h/f.csv?author=alice",
+                "https://h/f.csv?author=alice",
+            ),
+            (
+                "https://h/f.csv?email=a@b.example",
+                "https://h/f.csv?email=a@b.example",
+            ),
+        ] {
+            assert_eq!(redact_source_credentials(from), want, "{from}");
+        }
+        assert_eq!(
+            redact_message_credentials("bad url 'https://u:pa?ss@h/f.csv': invalid port"),
+            "bad url 'https://h/f.csv': invalid port"
+        );
     }
 
     /// A query the results cache refuses (e.g. one calling `random()` or
