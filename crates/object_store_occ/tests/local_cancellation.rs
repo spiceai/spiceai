@@ -57,7 +57,10 @@ fn cancellation_case(shutdown: bool, queue_write: bool) {
     let writer = Arc::clone(&first);
     let task =
         runtime.spawn(async move { writer.put_opts(&Path::from("state"), payload, opts).await });
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // A bound on liveness, not a latency target: while other processes issue
+    // full fsyncs the filesystem holds this test's many small writes, which
+    // has stretched the publication past 20 s on a loaded machine.
+    let deadline = Instant::now() + Duration::from_secs(120);
     let mut staged = None;
     while Instant::now() < deadline {
         staged = std::fs::read_dir(directory.path())

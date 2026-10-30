@@ -104,51 +104,77 @@ async fn conditional_writes_to_the_same_file_have_one_winner() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn writes_to_other_directories_do_not_wait_behind_a_large_write() {
+async fn writes_to_other_directories_do_not_wait_behind_a_blocked_publication() {
     let directory = tempfile::tempdir().expect("state directory");
     let store = std::sync::Arc::new(
         LocalConditionalPut::new_durable(directory.path()).expect("durable state store"),
     );
-    let head = Path::from("log/head");
-    let payload = Bytes::from(vec![7_u8; 512 * 1024 * 1024]);
-    // The large create goes to another directory, as a sealed batch does.
-    let large = {
+    // Holding the batch directory's lock blocks its publication after staging,
+    // as a slow publication would, for as long as the test keeps it.
+    let wal = directory.path().join("log").join("wal");
+    std::fs::create_dir_all(&wal).expect("batch directory");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(wal.join(".spice-occ-lock"))
+        .expect("batch directory lock");
+    held.lock().expect("hold the batch directory lock");
+    let blocked = {
         let store = std::sync::Arc::clone(&store);
         tokio::spawn(async move {
             conditional_put(
                 store.as_ref(),
                 &Path::from("log/wal/00000000000000000001"),
-                payload.into(),
+                Bytes::from_static(b"batch").into(),
                 &Expected::Absent,
             )
             .await
-            .expect("large create");
-            std::time::Instant::now()
         })
     };
-    // Send the small write only once the large one is being staged.
-    let wal = directory.path().join("log").join("wal");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while std::fs::read_dir(&wal).map_or(true, |mut entries| entries.next().is_none()) {
+    while std::fs::read_dir(&wal)
+        .expect("list batch directory")
+        .filter_map(Result::ok)
+        .all(|entry| !entry.file_name().to_string_lossy().contains('#'))
+    {
         assert!(
             std::time::Instant::now() < deadline,
-            "the large write never started staging"
+            "the blocked write never started staging"
         );
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
-    conditional_put(
-        store.as_ref(),
-        &head,
-        Bytes::from_static(b"head").into(),
-        &Expected::Absent,
-    )
-    .await
-    .expect("small create");
-    let small_done = std::time::Instant::now();
-    let large_done = large.await.expect("large task");
+    // Writes to many other directories, so that one queued behind the blocked
+    // publication would show, wherever directories are assigned to workers.
+    let others = (0..64).map(|index| {
+        let store = std::sync::Arc::clone(&store);
+        let path = Path::from(format!("log-{index}/head"));
+        async move {
+            let written = conditional_put(
+                store.as_ref(),
+                &path,
+                Bytes::from_static(b"head").into(),
+                &Expected::Absent,
+            );
+            (
+                path.clone(),
+                tokio::time::timeout(std::time::Duration::from_secs(60), written).await,
+            )
+        }
+    });
+    for (path, written) in futures::future::join_all(others).await {
+        written
+            .unwrap_or_else(|_| panic!("the write to {path} waited behind the blocked publication"))
+            .expect("write to another directory");
+    }
     assert!(
-        small_done < large_done,
-        "the head write finished {:?} after the large write",
-        small_done.duration_since(large_done)
+        !blocked.is_finished(),
+        "the batch published under a held lock"
     );
+    held.unlock().expect("release the batch directory lock");
+    blocked
+        .await
+        .expect("batch task")
+        .expect("the batch publishes once its lock is free");
 }

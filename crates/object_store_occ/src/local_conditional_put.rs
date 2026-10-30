@@ -43,9 +43,9 @@ limitations under the License.
 //! **Concurrency model**: each put takes an advisory lock for the object's
 //! directory. Two clients whose roots and keys name the same file
 //! therefore share one lock, including across processes. Puts are published by
-//! dedicated filesystem workers, one per shard of directories: puts to one
-//! directory publish in order, and puts to different directories publish in
-//! parallel. A worker retains its lock through publication after caller
+//! dedicated filesystem workers sharing one queue: a worker takes the oldest
+//! put whose directory no other worker is publishing, so puts to one directory
+//! publish in order and puts to different directories publish in parallel. A worker retains its lock through publication after caller
 //! cancellation or Tokio shutdown. Accepted writes may finish after their caller
 //! stops waiting.
 //! The lock file is not an object and is not removed: unlinking it would let
@@ -94,11 +94,15 @@ pub struct LocalConditionalPut {
     inner: Arc<LocalFileSystem>,
     root: PathBuf,
     durable: bool,
-    /// One queue per worker; a directory always maps to the same worker.
-    writes: Vec<tokio::sync::mpsc::Sender<Publication>>,
+    /// The queue the workers publish from.
+    writes: Arc<WriteQueue>,
+    /// Bounds the puts accepted but not yet taken by a worker, and so the
+    /// payloads they hold.
+    pending: Arc<tokio::sync::Semaphore>,
 }
 
-/// Workers publishing in parallel, each for a fixed shard of directories.
+/// Workers publishing in parallel, each taking any directory not being
+/// published by another.
 const WRITE_WORKERS: usize = 8;
 
 struct Publication {
@@ -107,6 +111,67 @@ struct Publication {
     payload: PutPayload,
     options: PutOptions,
     reply: tokio::sync::oneshot::Sender<Result<PutResult, ObjectStoreError>>,
+}
+
+/// A publication waiting for a worker, with its directory's lock path and the
+/// permit that counts it as pending.
+struct Queued {
+    directory: PathBuf,
+    publication: Publication,
+    _pending: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[derive(Default)]
+struct WriteQueueState {
+    queued: std::collections::VecDeque<Queued>,
+    /// Directories a worker is publishing to now.
+    publishing: std::collections::HashSet<PathBuf>,
+    /// No more puts will be queued; workers exit once the queue is empty.
+    closed: bool,
+}
+
+#[derive(Default)]
+struct WriteQueue {
+    state: parking_lot::Mutex<WriteQueueState>,
+    changed: parking_lot::Condvar,
+}
+
+impl WriteQueue {
+    /// Blocks until a publication whose directory is free can be taken, or
+    /// returns `None` once the queue is closed and empty. Taking the oldest
+    /// free entry keeps each directory's puts in the order they were queued.
+    fn take(&self) -> Option<(PathBuf, Publication)> {
+        let mut state = self.state.lock();
+        loop {
+            let free = state
+                .queued
+                .iter()
+                .position(|entry| !state.publishing.contains(&entry.directory));
+            if let Some(entry) = free.and_then(|index| state.queued.remove(index)) {
+                state.publishing.insert(entry.directory.clone());
+                return Some((entry.directory, entry.publication));
+            }
+            if state.closed && state.queued.is_empty() {
+                return None;
+            }
+            self.changed.wait(&mut state);
+        }
+    }
+
+    fn finish(&self, directory: &std::path::Path) {
+        self.state.lock().publishing.remove(directory);
+        self.changed.notify_all();
+    }
+
+    fn push(&self, entry: Queued) {
+        self.state.lock().queued.push_back(entry);
+        self.changed.notify_all();
+    }
+
+    fn close(&self) {
+        self.state.lock().closed = true;
+        self.changed.notify_all();
+    }
 }
 
 fn worker_error(source: impl std::error::Error + Send + Sync + 'static) -> ObjectStoreError {
@@ -170,14 +235,9 @@ fn publication_lock_path(root: &std::path::Path, location: &Path) -> PathBuf {
 
 /// Runs on its own thread with blocking filesystem calls. The lock and
 /// publication have one owner, even when the caller drops its future or shuts
-/// its runtime down. The bounded queue limits pending payloads; closing all
-/// senders drains accepted writes and exits.
-fn write_worker(
-    root: &std::path::Path,
-    durable: bool,
-    mut receive: tokio::sync::mpsc::Receiver<Publication>,
-) {
-    while let Some(request) = receive.blocking_recv() {
+/// its runtime down. Closing the queue drains accepted writes and exits.
+fn write_worker(root: &std::path::Path, durable: bool, queue: &WriteQueue) {
+    while let Some((directory, request)) = queue.take() {
         let result = publish(
             root,
             durable,
@@ -186,6 +246,7 @@ fn write_worker(
             &request.payload,
             &request.options,
         );
+        queue.finish(&directory);
         // A dropped receiver means an unknown outcome for the caller, not abort.
         let _ = request.reply.send(result);
     }
@@ -516,22 +577,31 @@ impl LocalConditionalPut {
     fn with_durability(root: impl Into<PathBuf>, durable: bool) -> Result<Self, ObjectStoreError> {
         let root = root.into();
         let inner = Arc::new(LocalFileSystem::new_with_prefix(&root)?);
-        let mut writes = Vec::with_capacity(WRITE_WORKERS);
+        let writes = Arc::new(WriteQueue::default());
         for worker in 0..WRITE_WORKERS {
-            let (send, receive) = tokio::sync::mpsc::channel(1);
             let worker_root = root.clone();
-            std::thread::Builder::new()
+            let queue = Arc::clone(&writes);
+            let spawned = std::thread::Builder::new()
                 .name(format!("local-state-writer-{worker}"))
-                .spawn(move || write_worker(&worker_root, durable, receive))
-                .map_err(worker_error)?;
-            writes.push(send);
+                .spawn(move || write_worker(&worker_root, durable, &queue));
+            if let Err(source) = spawned {
+                writes.close();
+                return Err(worker_error(source));
+            }
         }
         Ok(Self {
             inner,
             root,
             durable,
             writes,
+            pending: Arc::new(tokio::sync::Semaphore::new(WRITE_WORKERS)),
         })
+    }
+}
+
+impl Drop for LocalConditionalPut {
+    fn drop(&mut self) {
+        self.writes.close();
     }
 }
 
@@ -562,27 +632,26 @@ impl ObjectStore for LocalConditionalPut {
         }
         let path = self.inner.path_to_filesystem(location)?;
         let (reply, result) = tokio::sync::oneshot::channel();
-        // Equivalent roots and keys name the same directory lock, so they map
-        // to the same worker and publish in order.
-        let shard = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            publication_lock_path(&self.root, location).hash(&mut hasher);
-            usize::try_from(hasher.finish() % WRITE_WORKERS as u64).unwrap_or_default()
-        };
-        self.writes
-            .get(shard)
-            .ok_or_else(|| worker_error(io::Error::other("no local state writer for shard")))?
-            .send(Publication {
+        let pending = Arc::clone(&self.pending)
+            .acquire_owned()
+            .await
+            .map_err(worker_error)?;
+        // Equivalent roots and keys name the same directory lock, so they are
+        // never published by two workers at once and publish in order.
+        self.writes.push(Queued {
+            directory: publication_lock_path(&self.root, location),
+            publication: Publication {
                 location: location.clone(),
                 path,
                 payload,
                 options: opts,
                 reply,
-            })
+            },
+            _pending: pending,
+        });
+        result
             .await
-            .map_err(|_| worker_error(io::Error::other("local state writer stopped")))?;
-        result.await.map_err(worker_error)?
+            .map_err(|_| worker_error(io::Error::other("local state writer stopped")))?
     }
 
     async fn put_multipart_opts(
