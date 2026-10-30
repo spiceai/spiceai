@@ -751,6 +751,26 @@ async fn an_ordered_aggregate_emits_its_remaining_groups_once() {
 
     let rows: Vec<usize> = output.iter().map(RecordBatch::num_rows).collect();
     assert_eq!(rows, vec![BATCH_SIZE; GROUPS / BATCH_SIZE]);
+    let mut got: Vec<(i32, i32, i64)> = output
+        .iter()
+        .flat_map(|batch| {
+            let column = |index: usize| batch.column(index).as_any();
+            let k = column(0).downcast_ref::<Int32Array>().expect("k is Int32");
+            let g = column(1).downcast_ref::<Int32Array>().expect("g is Int32");
+            let probe = column(2)
+                .downcast_ref::<Int64Array>()
+                .expect("probe is Int64");
+            (0..batch.num_rows())
+                .map(|row| (k.value(row), g.value(row), probe.value(row)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    got.sort_unstable();
+    let expected: Vec<(i32, i32, i64)> = (0..groups).map(|g| (2000, g, i64::from(g))).collect();
+    assert_eq!(
+        got, expected,
+        "every group must be emitted once with its sum"
+    );
     let emits = emits.lock().expect("emit log lock is not poisoned").clone();
     assert_eq!(
         emits,
