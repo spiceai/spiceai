@@ -304,7 +304,10 @@ fn percent_encode(text: &str) -> String {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
             out.push(char::from(byte));
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            out.push('%');
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 0x0f)]));
         }
     }
     out
