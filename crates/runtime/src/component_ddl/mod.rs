@@ -86,6 +86,15 @@ const CONFLICT_ATTEMPTS: usize = 4;
 /// source.
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Why a statement that Spice stopped before storing its change was not
+/// applied.
+const SHUTTING_DOWN: &str = "Spice is shutting down. Run the statement again once it has started.";
+
+/// What a statement reports when Spice stops while it applies a change it
+/// stored, which takes effect when Spice starts again.
+const STORED_WHILE_SHUTTING_DOWN: &str =
+    "Spice is shutting down, so the change takes effect when it starts again.";
+
 /// The status that holds the runtime not ready, as `ready_state: on_load`
 /// reads readiness, until the SQL definitions are read: until then, none of
 /// the datasets and catalogs they define is served.
@@ -1336,6 +1345,10 @@ impl Runtime {
                 op.component_name()
             ))
         };
+        // A change Spice starts while it stops would be cut short.
+        if self.status.is_shutdown() {
+            return Err(not_applied(&SHUTTING_DOWN));
+        }
         let store = self
             .sql_definitions_store()
             .await
@@ -1422,17 +1435,27 @@ impl Runtime {
                 return Err(not_applied(&shares_table_with(&shared)));
             }
             if let Some(component) = &validate {
-                tokio::time::timeout(
-                    VALIDATION_TIMEOUT,
-                    Arc::clone(&self).validate_component(component, &next),
-                )
-                .await
-                .map_err(|_| {
-                    not_applied(&format!(
-                        "validating it did not finish within {} seconds. Check that its source is reachable, then run it again.",
-                        VALIDATION_TIMEOUT.as_secs()
-                    ))
-                })??;
+                // Spice stopping stops the validation, before anything is
+                // deleted or stored.
+                let shutdown = self.status.shutdown_token();
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return Err(not_applied(&SHUTTING_DOWN)),
+                    validated = tokio::time::timeout(
+                        VALIDATION_TIMEOUT,
+                        Arc::clone(&self).validate_component(component, &next),
+                    ) => {
+                        validated.map_err(|_| {
+                            not_applied(&format!(
+                                "validating it did not finish within {} seconds. Check that its source is reachable, then run it again.",
+                                VALIDATION_TIMEOUT.as_secs()
+                            ))
+                        })??;
+                    }
+                }
+            }
+            if self.status.is_shutdown() {
+                return Err(not_applied(&SHUTTING_DOWN));
             }
 
             // A dataset this statement drops, replaces, or points at another
@@ -1510,8 +1533,21 @@ impl Runtime {
             match store.replace(&defined, &definitions).await {
                 Ok(()) => {
                     *self.sql_components.defined.write().await = Some(definitions);
-                    Arc::clone(&self).apply_app_diff(Some(&applied), next).await;
-                    self.record_served().await;
+                    // Spice stopping stops applying the change, which is stored
+                    // and takes effect when Spice starts again: the client hears
+                    // so before the connections drain, rather than not at all.
+                    let shutdown = self.status.shutdown_token();
+                    let applying = async {
+                        Arc::clone(&self).apply_app_diff(Some(&applied), next).await;
+                        self.record_served().await;
+                    };
+                    tokio::select! {
+                        biased;
+                        () = applying => {}
+                        () = shutdown.cancelled() => {
+                            return Ok(format!("{message} {STORED_WHILE_SHUTTING_DOWN}"));
+                        }
+                    }
                     break (message, validate);
                 }
                 Err(e) => {
@@ -2028,26 +2064,34 @@ impl Runtime {
                 Some(ComponentStatus::Error(_))
             )
         };
+        // Whether the wait ended with the dataset registered or failed, rather
+        // than with Spice stopping.
         let registered = tokio::time::timeout(REGISTRATION_WAIT, async {
+            let shutdown = self.status.shutdown_token();
             if matches!(
                 self.status.wait_for_dataset_registered(&reference).await,
                 crate::status::WaitOutcome::ShuttingDown
             ) {
-                return;
+                return false;
             }
             // The status leaves `Initializing` as the load starts to register
             // the dataset, before its table is in the catalog: an accelerated
             // table is opened first, so a query in between would not find it.
             while !self.df.table_exists(&reference) && !failed() {
-                tokio::time::sleep(REGISTRATION_POLL).await;
+                tokio::select! {
+                    () = shutdown.cancelled() => return false,
+                    () = tokio::time::sleep(REGISTRATION_POLL) => {}
+                }
             }
+            true
         })
         .await;
         match (registered, self.status.get_dataset_status(&reference)) {
-            (Ok(()), Some(ComponentStatus::Error(_))) => format!(
+            (Ok(false), _) => format!("{message} {STORED_WHILE_SHUTTING_DOWN}"),
+            (Ok(true), Some(ComponentStatus::Error(_))) => format!(
                 "{message} It failed to load and is retrying; GET /v1/datasets?status=true reports why."
             ),
-            (Ok(()), _) => message,
+            (Ok(true), _) => message,
             (Err(_), _) => format!(
                 "{message} It is still loading; GET /v1/datasets?status=true reports its progress."
             ),

@@ -730,7 +730,7 @@ pub(crate) async fn cancel_active(
         CancelOutcome::NotCancellable => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "error": format!("Active SQL query '{query_id}' defines, changes, or removes a dataset or catalog, which cannot stop partway, so it runs to its end and cannot be cancelled."),
+                "error": format!("Active SQL query '{query_id}' defines, changes, or removes a dataset or catalog, which cannot stop partway, so it runs to its end and cannot be cancelled. Wait for its outcome, then undo the change with another statement if it is not wanted."),
             })),
         )
             .into_response(),
