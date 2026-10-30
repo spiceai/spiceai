@@ -8352,7 +8352,7 @@
       "type": "object",
       "properties": {
         "mysql_connection_string": {
-          "description": "Full MySQL DSN. Overrides other connection params if set.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
+          "description": "Full MySQL DSN. Overrides `host`, `tcp_port`, `user`, `pass` and `db` if set. Its `pool_min`, `pool_max` and `abs_conn_ttl` query settings are used unless the matching Spicepod parameter is set; setting both to different values is an error.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
           "type": "string",
           "examples": [
             "mysql://app:secret@db.internal:3306/analytics"
@@ -8409,6 +8409,11 @@
           "description": "The maximum number of connections created in the connection pool.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
           "type": "string",
           "default": "5"
+        },
+        "mysql_connection_max_lifetime": {
+          "description": "How long a pooled connection is used before it is closed and replaced, such as '5m'. Replacing connections makes the pool resolve the host again, so it spreads across the servers behind a load-balanced hostname such as a reader endpoint. Each connection's lifetime is extended by a random amount of up to a fifth of it, so connections opened together are not replaced together. A connection is not closed while a query is using it. '0s' keeps connections open indefinitely. Default: 5m.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
+          "type": "string",
+          "default": "5m"
         },
         "mysql_time_zone": {
           "description": "The time zone to use for the connection. Default is '+00:00' (UTC).\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
