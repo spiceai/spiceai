@@ -153,9 +153,11 @@ mod tests {
     #[test]
     fn a_filter_pattern_at_the_limit_is_accepted() {
         let pattern = format!("{}%", "a".repeat(MAX_FILTER_PATTERN_LEN - 1));
-        assert!(check_filter_pattern("table_name_filter_pattern", Some(&pattern)).is_ok());
-        assert!(check_filter_pattern("table_name_filter_pattern", Some("orders_%")).is_ok());
-        assert!(check_filter_pattern("table_name_filter_pattern", None).is_ok());
+        check_filter_pattern("table_name_filter_pattern", Some(&pattern))
+            .expect("a pattern at the limit was rejected");
+        check_filter_pattern("table_name_filter_pattern", Some("orders_%"))
+            .expect("a short pattern was rejected");
+        check_filter_pattern("table_name_filter_pattern", None).expect("no pattern was rejected");
     }
 
     #[test]
