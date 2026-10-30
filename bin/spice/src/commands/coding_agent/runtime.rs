@@ -523,12 +523,12 @@ async fn start_runtime(ctx: &RuntimeContext, files: &SessionFiles) -> Result<()>
         }
         Serving::Exited(status) => {
             remove_state(&files.state)?;
+            show_log_tail(&files.log);
             Err(CodingAgentRuntimeStartSnafu {
                 endpoint: ctx.http_endpoint().to_string(),
                 log: files.log.clone(),
                 detail: format!(
-                    "the runtime exited ({status}) before it started serving. Its last output:\n{}",
-                    log_tail(&files.log)
+                    "the runtime exited ({status}) before it started serving; its last output is above"
                 ),
             }
             .build())
@@ -536,13 +536,13 @@ async fn start_runtime(ctx: &RuntimeContext, files: &SessionFiles) -> Result<()>
         Serving::TimedOut => {
             process::stop(started.pid, SHUTDOWN_BUDGET).await;
             remove_state(&files.state)?;
+            show_log_tail(&files.log);
             Err(CodingAgentRuntimeStartSnafu {
                 endpoint: ctx.http_endpoint().to_string(),
                 log: files.log.clone(),
                 detail: format!(
-                    "the runtime did not answer `/health` within {}s, so it was stopped. Its last output:\n{}",
-                    HEALTH_BUDGET.as_secs(),
-                    log_tail(&files.log)
+                    "the runtime did not answer `/health` within {}s, so it was stopped; its last output is above",
+                    HEALTH_BUDGET.as_secs()
                 ),
             }
             .build())
@@ -595,7 +595,13 @@ async fn is_healthy(ctx: &RuntimeContext) -> bool {
     matches!(request.send().await, Ok(response) if response.status().is_success())
 }
 
-/// The end of the runtime's log, for an error that has to explain a failed start.
+/// Prints the end of the runtime's log, which explains a failed start, above the error that
+/// reports it: the runtime's lines keep their own breaks, and the error stays one line.
+fn show_log_tail(path: &Path) {
+    eprintln!("{}", log_tail(path));
+}
+
+/// The end of the runtime's log.
 fn log_tail(path: &Path) -> String {
     let Ok(mut file) = File::open(path) else {
         return String::from("(the log could not be read)");

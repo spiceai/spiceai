@@ -371,7 +371,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to start the Spice runtime at {endpoint}, so the coding agent was not started: {detail}\nThe full log is at '{}'. See: https://spiceai.org/docs/cli",
+        "Failed to start the Spice runtime at {endpoint}, so the coding agent was not started: {detail}. The full log is at '{}'. See: https://spiceai.org/docs/cli",
         log.display()
     ))]
     CodingAgentRuntimeStart {

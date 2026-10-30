@@ -2386,6 +2386,45 @@ Server((host, int(port)), Handler).serve_forever()
         assert!(!lab.agent_started("only"));
     }
 
+    /// A runtime that exits before it serves fails the session with one error
+    /// line that names the full log, below the runtime's last output.
+    #[test]
+    fn a_runtime_that_exits_before_serving_is_reported_on_one_line() {
+        let lab = Lab::new(Duration::ZERO);
+        write_executable(
+            &lab.spiced,
+            "#!/bin/sh\necho 'spiced: loading the Spicepod'\necho 'spiced: the Spicepod is not valid' >&2\nexit 3\n",
+        );
+        let port = free_address()
+            .rsplit_once(':')
+            .map(|(_, port)| port.to_string())
+            .expect("a port");
+        let endpoint = format!("http://127.0.0.1:{port}");
+
+        let status = lab.session("only", &endpoint).wait();
+        let output = lab.output("only");
+        assert!(!status.success(), "{output}");
+        assert!(!lab.agent_started("only"), "{output}");
+        let log = lab.home.join(format!(".spice/run/localhost_{port}.log"));
+        let error = format!(
+            "ERROR Failed to start the Spice runtime at {endpoint}, so the coding agent was not started: the runtime exited (exit status: 3) before it started serving; its last output is above. The full log is at '{}'. See: https://spiceai.org/docs/cli",
+            log.display()
+        );
+        let lines: Vec<&str> = output.lines().collect();
+        let error_at = lines
+            .iter()
+            .position(|line| *line == error)
+            .unwrap_or_else(|| panic!("no line is the whole error {error:?} in:\n{output}"));
+        let cause_at = lines
+            .iter()
+            .position(|line| *line == "spiced: the Spicepod is not valid")
+            .unwrap_or_else(|| panic!("the runtime's output is not shown in:\n{output}"));
+        assert!(
+            cause_at < error_at,
+            "the runtime's output comes first:\n{output}"
+        );
+    }
+
     /// Ctrl-C ends a session that is waiting for another to finish starting the
     /// runtime at once, not when the other session lets go.
     #[test]
