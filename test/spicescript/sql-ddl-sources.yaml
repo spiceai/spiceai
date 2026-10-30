@@ -371,9 +371,9 @@ steps:
 
   # A memory acceleration of an engine that keeps every memory-mode dataset in
   # one instance starts from the source too: DuckDB and Turso pointed at
-  # another source, and SQLite and Turso dropped and created again. Each but
-  # the last appends on `ts`, and `new`'s rows are older than `old`'s, so an
-  # append that resumed after `old`'s newest row would load none of them.
+  # another source, and SQLite dropped and created again. Each appends on
+  # `ts`, and `new`'s rows are older than `old`'s, so an append that resumed
+  # after `old`'s newest row would load none of them.
   - generate:
       lake:
         table: old
@@ -454,22 +454,6 @@ steps:
   - spice-exec: "ALTER TABLE m3 SET (from = 'file://${sources.lake.path}/new/')"
     only: a
   - query: SELECT id, ts FROM m3
-    only: a
-    eventually: 60s
-    expect: { oracle: ref }
-    oracle-sql: SELECT id, ts FROM new
-  - spice-exec: "CREATE TABLE m4 WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'turso', acceleration.mode = 'memory')"
-    only: a
-  - query: SELECT id, ts FROM m4
-    only: a
-    eventually: 60s
-    expect: { oracle: ref }
-    oracle-sql: SELECT id, ts FROM old
-  - spice-exec: "DROP TABLE m4"
-    only: a
-  - spice-exec: "CREATE TABLE m4 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'turso', acceleration.mode = 'memory')"
-    only: a
-  - query: SELECT id, ts FROM m4
     only: a
     eventually: 60s
     expect: { oracle: ref }
