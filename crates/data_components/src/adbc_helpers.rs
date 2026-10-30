@@ -34,10 +34,15 @@ use std::sync::Arc;
 
 use crate::{FieldMetadata, metadata_enriched_table_provider};
 
-/// Secrets shorter than this are not scrubbed: replacing every occurrence of a
-/// one- or two-character string would make the message unreadable without
-/// protecting anything meaningful.
-const MIN_SCRUBBED_SECRET_LEN: usize = 4;
+/// Values of secret-looking keys shorter than this are not collected: a short
+/// value under a key that merely contains `key` or `auth` is more likely a
+/// setting than a credential, and replacing it everywhere would make the
+/// message unreadable. Explicit passwords are always collected.
+const MIN_HEURISTIC_SECRET_LEN: usize = 4;
+
+/// Secrets shorter than this are only replaced where they stand alone (not
+/// inside a longer word), so a short password does not mangle the message.
+const MIN_UNBOUNDED_SECRET_LEN: usize = 4;
 
 /// Query-string and `driver_options` keys whose values are treated as secrets.
 const SECRET_KEY_MARKERS: &[&str] = &[
@@ -51,11 +56,22 @@ const SECRET_KEY_MARKERS: &[&str] = &[
     "credential",
 ];
 
+fn percent_decoded(value: &str) -> String {
+    percent_encoding::percent_decode_str(value)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
 /// The credential values an ADBC connection was configured with: the whole URI,
 /// the `password` parameter, the password (or token-only user) in the URI's
 /// userinfo, and the values of secret-looking query-string and
 /// `driver_options` keys. Each value is included both as written and
 /// percent-decoded, because a driver may echo either form.
+///
+/// Drivers do not all split a URI the way a URL parser does (`libpq` takes the
+/// userinfo up to the last `@` before the path even when the password holds a
+/// raw `?`, `#` or `\\`, and splits the query only on `&`), so the userinfo and
+/// query are collected under each reading.
 ///
 /// Pass the result to [`scrub_connection_secrets`] before a driver error is
 /// shown to the user or logged.
@@ -66,40 +82,40 @@ pub fn connection_secrets(
     driver_options: Option<&str>,
 ) -> Vec<String> {
     let mut secrets = Vec::new();
-    let mut push = |value: &str| {
-        for candidate in [
-            value.to_string(),
-            percent_encoding::percent_decode_str(value)
-                .decode_utf8_lossy()
-                .into_owned(),
-        ] {
-            if candidate.len() >= MIN_SCRUBBED_SECRET_LEN && !secrets.contains(&candidate) {
+    let mut push = |value: &str, min_len: usize| {
+        for candidate in [value.to_string(), percent_decoded(value)] {
+            if !candidate.is_empty() && candidate.len() >= min_len && !secrets.contains(&candidate)
+            {
                 secrets.push(candidate);
             }
         }
     };
 
-    push(uri);
+    push(uri, 1);
     if let Some(password) = password {
-        push(password);
+        push(password, 1);
     }
 
-    // Userinfo: everything before the last `@` of the authority that follows `://`.
+    // Userinfo: everything before the last `@` of the authority that follows
+    // `://`, with the authority ending at the path (driver reading) or at the
+    // first of `/ \\ ? #` (URL reading).
     if let Some(idx) = uri.find("://") {
         let after = &uri[idx + "://".len()..];
-        let authority_end = after.find(['/', '\\', '?', '#']).unwrap_or(after.len());
-        if let Some(at) = after[..authority_end].rfind('@') {
-            let userinfo = &after[..at];
-            match userinfo.split_once(':') {
-                Some((_user, pass)) => push(pass),
-                // A user with no password is usually a token.
-                None => push(userinfo),
+        for delimiters in [&['/'][..], &['/', '\\', '?', '#'][..]] {
+            let authority_end = after.find(delimiters).unwrap_or(after.len());
+            if let Some(at) = after[..authority_end].rfind('@') {
+                let userinfo = &after[..at];
+                match userinfo.split_once(':') {
+                    Some((_user, pass)) => push(pass, 1),
+                    // A user with no password is usually a token.
+                    None => push(userinfo, 1),
+                }
             }
         }
     }
 
     let is_secret_key = |key: &str| {
-        let key = key.trim().to_ascii_lowercase();
+        let key = percent_decoded(key.trim()).to_ascii_lowercase();
         SECRET_KEY_MARKERS.iter().any(|marker| key.contains(marker))
     };
     let query = uri
@@ -107,13 +123,13 @@ pub fn connection_secrets(
         .map(|(_, q)| q.split('#').next().unwrap_or_default());
     for pair in query
         .into_iter()
-        .flat_map(|q| q.split(['&', ';']))
+        .flat_map(|q| q.split('&').chain(q.split(['&', ';'])))
         .chain(driver_options.into_iter().flat_map(|o| o.split(';')))
     {
         if let Some((key, value)) = pair.split_once('=')
             && is_secret_key(key)
         {
-            push(value.trim());
+            push(value.trim(), MIN_HEURISTIC_SECRET_LEN);
         }
     }
 
@@ -123,10 +139,33 @@ pub fn connection_secrets(
 }
 
 /// `message` with every value from [`connection_secrets`] replaced by `***`.
+/// A secret shorter than four bytes is replaced only where it is not part of a
+/// longer alphanumeric word.
 #[must_use]
 pub fn scrub_connection_secrets(message: &str, secrets: &[String]) -> String {
     secrets.iter().fold(message.to_string(), |message, secret| {
-        message.replace(secret.as_str(), "***")
+        if secret.len() >= MIN_UNBOUNDED_SECRET_LEN {
+            return message.replace(secret.as_str(), "***");
+        }
+        let is_word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+        let mut out = String::with_capacity(message.len());
+        let mut last = 0;
+        for (start, _) in message.match_indices(secret.as_str()) {
+            if start < last {
+                continue;
+            }
+            let end = start + secret.len();
+            if is_word(message[..start].chars().next_back())
+                || is_word(message[end..].chars().next())
+            {
+                continue;
+            }
+            out.push_str(&message[last..start]);
+            out.push_str("***");
+            last = end;
+        }
+        out.push_str(&message[last..]);
+        out
     })
 }
 
@@ -431,6 +470,27 @@ mod scrub_tests {
         assert_eq!(
             scrub_connection_secrets("rejected tok@en123 and tok%40en123", &secrets),
             "rejected *** and ***"
+        );
+        // Delimiters a URL parser would stop at, but libpq keeps in the password.
+        for uri in [
+            "postgresql://alice:CANARY?SECRET%ZZ@localhost/db",
+            "postgresql://alice:CANARY#SECRET%ZZ@localhost/db",
+            "postgresql://alice:CANARY\\SECRET%ZZ@localhost/db",
+            "postgresql://localhost/db?password=CANARY;SECRET%ZZ",
+            "postgresql://localhost/db?pass%77ord=CANARY%ZZSECRET",
+        ] {
+            let secrets = connection_secrets(uri, None, None);
+            let start = uri.find("CANARY").expect("canary");
+            let echoed = &uri[start..uri[start..].find('@').map_or(uri.len(), |i| start + i)];
+            let scrubbed =
+                scrub_connection_secrets(&format!("invalid token: \"{echoed}\""), &secrets);
+            assert_eq!(scrubbed, "invalid token: \"***\"", "{uri}");
+        }
+        // A short password is scrubbed where it stands alone, not inside words.
+        let secrets = connection_secrets("postgresql://alice:%Z@localhost/db", None, None);
+        assert_eq!(
+            scrub_connection_secrets("invalid percent-encoded token: \"%Z\" (%Zeta)", &secrets),
+            "invalid percent-encoded token: \"***\" (%Zeta)"
         );
         let secrets = connection_secrets("file:test.db", None, None);
         assert_eq!(
