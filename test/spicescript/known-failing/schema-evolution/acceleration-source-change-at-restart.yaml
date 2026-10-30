@@ -1,0 +1,42 @@
+name: acceleration-source-change-at-restart
+description: >
+  A file acceleration answers from the source its dataset names after a
+  restart, also when the Spicepod pointed the dataset at another source while
+  Spice was stopped. Known failing: the acceleration's checkpoint marks it
+  loaded, and with no refresh interval no refresh runs at startup, so the rows
+  the earlier source loaded are served, and the dataset reads Ready.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  cayenne: cayenne-file
+  duckdb: duckdb-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: acceleration-source-change-at-restart
+  datasets:
+    - from: postgres:public.items_before
+      name: items
+      params: ${sources.src.params}
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE items_before (id integer PRIMARY KEY, name text NOT NULL);
+        INSERT INTO items_before VALUES (1, 'a'), (2, 'b');
+        CREATE TABLE items_after (id integer PRIMARY KEY, name text NOT NULL);
+        INSERT INTO items_after VALUES (20, 'y');
+  - start: {}
+  - query: SELECT id, name FROM items ORDER BY id
+    eventually: 60s
+    expect: { rows: [['1', 'a'], ['2', 'b']] }
+
+  # The Spicepod points the dataset at another table while Spice is stopped.
+  - restart:
+      patch: { datasets: { items: { from: 'postgres:public.items_after' } } }
+  - query: SELECT id, name FROM items ORDER BY id
+    eventually: 30s
+    expect: { rows: [['20', 'y']] }

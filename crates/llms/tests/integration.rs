@@ -29,6 +29,8 @@ mod gguf_hf_cache;
 mod list_models_errors;
 #[cfg(feature = "local_embed")]
 mod model2vec_hf_cache;
+#[cfg(feature = "local_llm")]
+mod safetensors_hf_cache;
 mod xai_errors;
 
 use std::{collections::HashSet, sync::LazyLock};
