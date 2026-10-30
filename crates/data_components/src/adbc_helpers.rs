@@ -40,7 +40,9 @@ pub const DUCKDB_DRIVER: &str = "duckdb";
 /// `DuckDB` exports this ADBC entry point instead of `AdbcDriverInit`.
 pub const DUCKDB_ADBC_ENTRYPOINT: &[u8] = b"duckdb_adbc_init";
 
-/// Match the `duckdb:` connector's read-only access and UTC timestamps by default.
+/// The settings every `DuckDB` database opens with, matching the `duckdb:`
+/// connector: read-only, so Spice never takes the write lock or upgrades the
+/// file, and a UTC session, so timestamps answer the same.
 pub const DUCKDB_DB_DEFAULTS: &[(&str, &str)] =
     &[("access_mode", "read_only"), ("TimeZone", "UTC")];
 
@@ -62,8 +64,10 @@ pub fn driver_entrypoint(driver_name: &str) -> Option<&'static [u8]> {
     (driver_name == DUCKDB_DRIVER).then_some(DUCKDB_ADBC_ENTRYPOINT)
 }
 
-/// Builds database options, preserving raw `DuckDB` keys because it rejects unknown keys.
-/// Uses `path` for `DuckDB`: 1.4.4 rejects `uri`, while both 1.4.4 and 1.5.5 accept `path`.
+/// Builds the list of ADBC database options from connector parameters.
+///
+/// For `DuckDB` the file is passed as `path` (1.4.4 rejects `uri`; 1.4.4 and
+/// 1.5.5 both accept `path`), followed by [`DUCKDB_DB_DEFAULTS`].
 pub fn build_db_options(
     driver_name: &str,
     uri: &str,
@@ -96,11 +100,7 @@ pub fn build_db_options(
                     continue;
                 }
                 opts.push((
-                    OptionDatabase::Other(if driver_name == DUCKDB_DRIVER {
-                        key.to_string()
-                    } else {
-                        normalize_driver_option_key(key)
-                    }),
+                    OptionDatabase::Other(normalize_driver_option_key(key)),
                     value.trim().into(),
                 ));
             } else {
@@ -110,11 +110,7 @@ pub fn build_db_options(
     }
     if driver_name == DUCKDB_DRIVER {
         for &(key, value) in DUCKDB_DB_DEFAULTS {
-            if !opts.iter().any(|(option, _)| {
-                matches!(option, OptionDatabase::Other(name) if name.eq_ignore_ascii_case(key))
-            }) {
-                opts.push((OptionDatabase::Other(key.to_string()), value.into()));
-            }
+            opts.push((OptionDatabase::Other(key.to_string()), value.into()));
         }
     }
     opts
@@ -374,57 +370,24 @@ mod tests {
     }
 
     #[test]
-    fn test_build_db_options_duckdb_raw_keys() {
+    fn test_build_db_options_duckdb_driver_options_keep_the_adbc_prefix() {
         assert_db_options_eq(
             build_db_options(
                 "duckdb",
                 "test.db",
                 None,
                 None,
-                Some("threads=2;adbc.custom=value"),
+                Some("access_mode=read_write;adbc.custom=value"),
             ),
             vec![
                 (OptionDatabase::Other("path".into()), "test.db"),
-                (OptionDatabase::Other("threads".into()), "2"),
+                (
+                    OptionDatabase::Other("adbc.access_mode".into()),
+                    "read_write",
+                ),
                 (OptionDatabase::Other("adbc.custom".into()), "value"),
                 (OptionDatabase::Other("access_mode".into()), "read_only"),
                 (OptionDatabase::Other("TimeZone".into()), "UTC"),
-            ],
-        );
-    }
-
-    #[test]
-    fn test_build_db_options_duckdb_access_mode_override() {
-        assert_db_options_eq(
-            build_db_options(
-                "duckdb",
-                "test.db",
-                None,
-                None,
-                Some("ACCESS_MODE=read_write"),
-            ),
-            vec![
-                (OptionDatabase::Other("path".into()), "test.db"),
-                (OptionDatabase::Other("ACCESS_MODE".into()), "read_write"),
-                (OptionDatabase::Other("TimeZone".into()), "UTC"),
-            ],
-        );
-    }
-
-    #[test]
-    fn test_build_db_options_duckdb_timezone_override() {
-        assert_db_options_eq(
-            build_db_options(
-                "duckdb",
-                "test.db",
-                None,
-                None,
-                Some("timezone=America/New_York"),
-            ),
-            vec![
-                (OptionDatabase::Other("path".into()), "test.db"),
-                (OptionDatabase::Other("timezone".into()), "America/New_York"),
-                (OptionDatabase::Other("access_mode".into()), "read_only"),
             ],
         );
     }
