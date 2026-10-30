@@ -9,8 +9,8 @@ description: >
   a store an earlier definition of its name left data in, a file or the one
   instance DuckDB or SQLite keeps every memory-mode dataset in, also under a
   name that differs only in case. A change that leaves the data where it is
-  keeps it, two names that differ only in case never share an engine's table,
-  and an instance creates its first acceleration file of each engine.
+  keeps it, two names that map to one engine table or folder keep their data
+  apart, and an instance creates its first acceleration file of each engine.
 
 sources:
   lake: { kind: files }
@@ -656,6 +656,57 @@ steps:
     only: a
     consistently: 10s
     expect: { same-as: k5-kept }
+
+  # Two names that map to one Cayenne data directory, `k6_t` and `k6.t`, keep
+  # their data apart, across a restart too: defining the second deletes none
+  # of the first's, also rows its source no longer holds.
+  - generate:
+      lake:
+        table: ev6
+        rows: 20
+        seed: 33
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: ts, sequence: 1000 }
+  - spice-exec: "CREATE TABLE k6_t WITH (from = 'file://${sources.lake.path}/ev6/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds', acceleration.refresh_check_interval = '1h')"
+    only: a
+  - query: SELECT count(*) AS n FROM k6_t
+    only: a
+    eventually: 60s
+    expect: { rows: [['20']] }
+  - generate:
+      lake:
+        table: ev6
+        rows: 5
+        seed: 34
+        format: csv
+        mode: replace
+        columns:
+          - { name: id, sequence: 5000 }
+          - { name: ts, sequence: 5000 }
+  - refresh: k6_t
+    only: a
+  - query: SELECT count(*) AS n FROM k6_t
+    only: a
+    expect: { rows: [['25']] }
+  - query: SELECT id, ts FROM k6_t
+    only: a
+    id: k6-kept
+    expect: {}
+  - spice-exec: "CREATE TABLE k6.t WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, ts FROM k6.t
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM new
+  - restart: {}
+    only: a
+  - query: SELECT id, ts FROM k6_t
+    only: a
+    eventually: 60s
+    expect: { same-as: k6-kept }
 
   # Two names that differ only in case would share one table in an engine
   # that does not keep such tables apart, so the statement that defines the

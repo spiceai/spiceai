@@ -1394,9 +1394,9 @@ impl Runtime {
                     .datasets
                     .iter()
                     .find(|dataset| same_dataset(&dataset.name, op.component_name()))
-                && let Some((other, engine)) = self.dataset_sharing_table(dataset, &next).await
+                && let Some((other, store)) = self.dataset_sharing_table(dataset, &next).await
             {
-                return Err(not_applied(&shares_table_with(&other, engine)));
+                return Err(not_applied(&shares_table_with(&other, &store)));
             }
             if let Some(component) = &validate {
                 tokio::time::timeout(
@@ -1885,16 +1885,15 @@ impl Runtime {
 
     /// Another dataset of `app` whose acceleration keeps its data in the table
     /// `dataset`'s would: one whose name differs from `dataset`'s only in case,
-    /// in the same store, of an engine that does not keep such tables apart.
-    /// Returns its name and the engine.
+    /// in the same store, of an engine that reads such names as one table.
+    /// Returns its name and the store.
     async fn dataset_sharing_table(
         self: &Arc<Self>,
         dataset: &Dataset,
         app: &Arc<App>,
-    ) -> Option<(String, Engine)> {
+    ) -> Option<(String, Store)> {
         let store = self.acceleration_store(dataset, app).await?;
-        let engine = store.engine();
-        if engine.keeps_case_variant_tables_apart() {
+        if !store.engine().reads_case_variant_names_as_one_table() {
             return None;
         }
         // The engine's table is named after the dataset as it registers.
@@ -1907,7 +1906,7 @@ impl Runtime {
                 continue;
             }
             if self.acceleration_store(other, app).await.as_ref() == Some(&store) {
-                return Some((other.name.clone(), engine));
+                return Some((other.name.clone(), store));
             }
         }
         None
@@ -2004,31 +2003,32 @@ struct ServeFailure {
 /// links resolved for the part of it that exists.
 async fn place(path: &std::path::Path) -> PathBuf {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut lexical = PathBuf::new();
-    for component in absolute.components() {
+    let components: Vec<_> = absolute.components().collect();
+    // The longest part that exists resolves as the file system resolves it,
+    // each link and each `..` in the order they are written, so `link/..` is
+    // the folder above where the link points. Only the rest, which does not
+    // exist yet, is resolved as written.
+    let mut end = components.len();
+    let mut resolved = loop {
+        if end == 0 {
+            break PathBuf::new();
+        }
+        let existing: PathBuf = components[..end].iter().collect();
+        if let Ok(existing) = tokio::fs::canonicalize(&existing).await {
+            break existing;
+        }
+        end -= 1;
+    };
+    for component in &components[end..] {
         match component {
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                lexical.pop();
+                resolved.pop();
             }
-            other => lexical.push(other),
+            other => resolved.push(other),
         }
     }
-    let mut existing = lexical.clone();
-    let mut missing = Vec::new();
-    loop {
-        if let Ok(mut resolved) = tokio::fs::canonicalize(&existing).await {
-            resolved.extend(missing.iter().rev());
-            return resolved;
-        }
-        let Some(name) = existing.file_name().map(std::ffi::OsStr::to_os_string) else {
-            return lexical;
-        };
-        missing.push(name);
-        if !existing.pop() {
-            return lexical;
-        }
-    }
+    resolved
 }
 
 /// Where an acceleration keeps a dataset's data beyond the dataset's table,
@@ -2054,11 +2054,28 @@ impl Store {
 
 /// Why a statement that defines a dataset is refused when `other`, whose name
 /// differs from the dataset's only in case, keeps its acceleration data in the
-/// same store of `engine`, which does not keep such tables apart.
-fn shares_table_with(other: &str, engine: Engine) -> String {
+/// same `store`, of an engine that reads the two names as one table.
+fn shares_table_with(other: &str, store: &Store) -> String {
     let shown = display_dataset_name(other);
+    let engine = store.engine();
+    let name = match engine {
+        Engine::DuckDB => "DuckDB".to_string(),
+        Engine::Sqlite => "SQLite".to_string(),
+        Engine::Turso => "Turso".to_string(),
+        other => format!("`{other}`"),
+    };
+    let (place, apart) = match store {
+        Store::Located { .. } => (
+            format!("the same {name} file"),
+            format!("set its own `acceleration.params.{engine}_file`"),
+        ),
+        Store::SharedMemory(_) => (
+            format!("the same {name} memory instance"),
+            "accelerate it in a file (`acceleration.mode = 'file'`)".to_string(),
+        ),
+    };
     format!(
-        "dataset {shown} keeps its acceleration data in the same `{engine}` store, which reads table names that differ only in case as one table, so the two datasets would share their data. Give this dataset a name that differs from {shown} by more than case, or keep its acceleration data in another store, such as a file of its own or the default engine, `{}`.",
+        "dataset {shown} keeps its acceleration data in {place}, and {name} reads table names that differ only in case as one table, so the two datasets cannot keep their data apart there. Give this dataset a name that differs from {shown} by more than case, or keep its data apart: {apart}, or use the `{}` engine.",
         Engine::default()
     )
 }
@@ -2594,19 +2611,30 @@ mod tests {
 
     /// A statement that would put a dataset's acceleration in the table of a
     /// dataset whose name differs only in case names that dataset, the
-    /// engine, and how to keep the two apart.
+    /// engine, and how to keep the two apart: a file of its own, or the
+    /// default engine, which is `cayenne` where it is built.
     #[cfg(not(windows))]
     #[test]
     fn a_dataset_that_would_share_a_table_names_the_other() {
         assert_eq!(
-            shares_table_with("\"Orders\"", Engine::Sqlite),
-            "dataset 'Orders' keeps its acceleration data in the same `sqlite` store, which reads table names that differ only in case as one table, so the two datasets would share their data. Give this dataset a name that differs from 'Orders' by more than case, or keep its acceleration data in another store, such as a file of its own or the default engine, `cayenne`."
+            shares_table_with(
+                "\"Orders\"",
+                &Store::Located {
+                    engine: Engine::Sqlite,
+                    location: "/data/accelerated_sqlite.db".to_string(),
+                }
+            ),
+            "dataset 'Orders' keeps its acceleration data in the same SQLite file, and SQLite reads table names that differ only in case as one table, so the two datasets cannot keep their data apart there. Give this dataset a name that differs from 'Orders' by more than case, or keep its data apart: set its own `acceleration.params.sqlite_file`, or use the `cayenne` engine."
+        );
+        assert_eq!(
+            shares_table_with("\"Orders\"", &Store::SharedMemory(Engine::DuckDB)),
+            "dataset 'Orders' keeps its acceleration data in the same DuckDB memory instance, and DuckDB reads table names that differ only in case as one table, so the two datasets cannot keep their data apart there. Give this dataset a name that differs from 'Orders' by more than case, or keep its data apart: accelerate it in a file (`acceleration.mode = 'file'`), or use the `cayenne` engine."
         );
     }
 
     /// Every spelling of one file or folder names one place: relative to the
     /// directory Spice runs in, with `.` and `..`, a trailing separator, or
-    /// through a link, whether it exists yet or not.
+    /// through a link, also one followed by `..`, whether it exists yet or not.
     #[cfg(unix)]
     #[tokio::test]
     async fn every_spelling_of_a_file_names_one_place() {
@@ -2618,6 +2646,12 @@ mod tests {
             .expect("file");
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&data, &link).expect("symlink");
+        // `uplink/..` is `data`, the folder above where the link points.
+        tokio::fs::create_dir(data.join("sub"))
+            .await
+            .expect("sub dir");
+        let uplink = dir.path().join("uplink");
+        std::os::unix::fs::symlink(data.join("sub"), &uplink).expect("symlink");
         let cwd = std::env::current_dir().expect("cwd");
         let relative = pathdiff(&data.join("a.db"), &cwd);
         let file = place(&data.join("a.db")).await;
@@ -2625,6 +2659,7 @@ mod tests {
             data.join("./a.db"),
             data.join("../data/a.db"),
             link.join("a.db"),
+            uplink.join("../a.db"),
             relative,
         ] {
             assert_eq!(place(&spelling).await, file, "{}", spelling.display());
