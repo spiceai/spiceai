@@ -27,9 +27,8 @@
 //! commit where the cache was just dropped on the prior write for cap-disabled
 //! keysets.
 //!
-//! Three lanes per N:
+//! Two lanes per N:
 //! - `cayenne_sqlite/N=...`
-//! - `cayenne_turso/N=...` (when built with `--features turso,duckdb-bench`)
 //! - `duckdb/N=...`
 //!
 //! Expected shape:

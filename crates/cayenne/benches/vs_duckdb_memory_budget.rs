@@ -317,7 +317,7 @@ fn bench_memory_budget(c: &mut Criterion) {
     write_parquet(&make_batch(schema(), 0, UPSERT_ROWS), &upsert_parquet);
 
     for &(budget_label, budget_bytes) in MEMORY_BUDGETS {
-        // All Cayenne metastore lanes (Sqlite, plus Turso when compiled in) —
+        // All Cayenne metastore lanes —
         // consistent with every other vs_duckdb_* bench, so memory-budget
         // numbers stay directly comparable across the paired suite.
         for &cay_lane in common::CAYENNE_LANES {

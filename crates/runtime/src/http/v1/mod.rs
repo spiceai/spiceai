@@ -428,6 +428,9 @@ enum SqlErrorKind {
     /// A cluster scheduler cannot yet reach executors that hold the data the
     /// query reads; a retry can succeed.
     Unavailable,
+    /// The request set `Cache-Control: only-if-cached` and no cached result was
+    /// servable, so the query was not run.
+    NotCached,
 }
 
 impl SqlErrorKind {
@@ -435,6 +438,7 @@ impl SqlErrorKind {
         match e {
             QueryError::QueryCancelled { .. } => Self::Cancellation,
             QueryError::QueryTimedOut { .. } => Self::Timeout,
+            QueryError::NotCached => Self::NotCached,
             QueryError::UnableToExecuteQuery { source }
             | QueryError::UnableToCreateMemoryStream { source }
             | QueryError::UnableToCollectResults { source }
@@ -475,7 +479,7 @@ fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
     tracing::debug!("Error executing query: {}", single_line(&message));
     let status = match kind {
         SqlErrorKind::Cancellation => StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
-        SqlErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        SqlErrorKind::Timeout | SqlErrorKind::NotCached => StatusCode::GATEWAY_TIMEOUT,
         // A refusal for want of memory is the runtime's own capacity condition,
         // not a malformed request: 4xx tells intermediaries the client is at
         // fault and the request should not be retried, so a load balancer keeps
