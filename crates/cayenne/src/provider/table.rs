@@ -29998,9 +29998,16 @@ impl CayenneTableProvider {
         };
         // Bytes the bake wrote: the files it kept are in its output but were
         // linked, not written.
-        let (files_kept, bytes_kept) = partition
-            .as_ref()
-            .map_or((0, 0), |partition| (partition.kept_files(), partition.kept_bytes));
+        let (files_rewritten, files_kept, bytes_kept) = partition.as_ref().map_or(
+            (selected_input_files, 0, 0),
+            |partition| {
+                (
+                    partition.rewritten_files(),
+                    partition.kept_files(),
+                    partition.kept_bytes,
+                )
+            },
+        );
         let written_bytes = merged_output_bytes.saturating_sub(bytes_kept);
         telemetry::cayenne::track_compaction_merged_bytes(
             written_bytes,
@@ -30015,7 +30022,7 @@ impl CayenneTableProvider {
             input_snapshots = selected.len(),
             input_files = selected_input_files,
             input_bytes = selected_input_bytes,
-            files_rewritten = selected_input_files.saturating_sub(files_kept),
+            files_rewritten,
             bytes_rewritten = total_input_bytes,
             files_kept,
             bytes_kept,

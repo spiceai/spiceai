@@ -84,7 +84,7 @@ struct Table {
     provider: CayenneTableProvider,
     catalog: Arc<dyn MetadataCatalog>,
     name: &'static str,
-    _tmp: TempDir,
+    tmp: TempDir,
 }
 
 async fn table(name: &'static str, rewrite_all: bool) -> Table {
@@ -104,7 +104,7 @@ async fn table(name: &'static str, rewrite_all: bool) -> Table {
         provider,
         catalog,
         name,
-        _tmp: tmp,
+        tmp,
     }
 }
 
@@ -113,7 +113,7 @@ async fn reopen(table: &Table) -> CayenneTableProvider {
     let ctx = SessionContext::new();
     let base_path = format!(
         "{}/data",
-        table._tmp.path().to_str().expect("utf-8 temp dir")
+        table.tmp.path().to_str().expect("utf-8 temp dir")
     );
     let provider = CayenneTableProviderBuilder::new(Arc::clone(&table.catalog), ctx.runtime_env())
         .create(CreateTableOptions {
