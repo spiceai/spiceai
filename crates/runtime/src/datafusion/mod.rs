@@ -5508,58 +5508,63 @@ impl DataFusion {
     ///
     /// The checkpoint goes first, and must go, as in a settings rebuild: one
     /// that outlived the table would mark the next definition's empty table
-    /// loaded. A checkpoint store that does not exist was never written, and a
-    /// file the engine never created holds nothing; any other failure to open
-    /// it fails the deletion. Returns whether a checkpoint was cleared: whether
+    /// loaded. A checkpoint store that does not exist was never written, and
+    /// files the engine never created hold nothing; any other failure to open
+    /// the store fails the deletion. Returns whether a checkpoint was cleared: whether
     /// an earlier load had marked data there loaded.
     pub(crate) async fn delete_acceleration_data(&self, dataset: &Dataset) -> Result<bool> {
         let Some(acceleration) = dataset.acceleration.as_ref().filter(|a| a.enabled) else {
             return Ok(false);
         };
-        if !dataset.is_file_accelerated() && !acceleration.engine.shares_memory_instance() {
+        let in_file = dataset.is_file_accelerated();
+        if !in_file && !acceleration.engine.shares_memory_instance() {
             return Ok(false);
         }
-        let checkpoint = match dataset_checkpointer(
-            dataset,
-            self.accelerator_engine_registry(),
-            OpenOption::OpenExisting,
-            SnapshotBehavior::Disabled,
-        )
-        .await
-        {
-            Ok(checkpoint) => Some(checkpoint),
-            // Nothing was ever written, so there is no checkpoint to clear.
-            Err(runtime_checkpoint_api::CheckpointError::NotFound { .. }) => None,
-            Err(_) if self.store_file_absent(dataset, acceleration).await => return Ok(false),
-            Err(source) => {
-                return Err(Error::AccelerationDataCheckpoint {
-                    dataset_name: dataset.name.to_string(),
-                    source: Box::new(source),
-                });
-            }
-        };
+        // Files the engine never created hold nothing, and opening them fails.
+        if in_file && self.store_files_absent(dataset, acceleration).await {
+            return Ok(false);
+        }
+        // A memory-mode dataset keeps no checkpoint, only its table.
         let mut cleared = false;
-        if let Some(checkpoint) = checkpoint {
-            cleared = checkpoint.exists().await;
-            checkpoint
-                .delete()
-                .await
-                .context(AccelerationDataCheckpointSnafu {
-                    dataset_name: dataset.name.to_string(),
-                })?;
+        if in_file {
+            let checkpoint = match dataset_checkpointer(
+                dataset,
+                self.accelerator_engine_registry(),
+                OpenOption::OpenExisting,
+                SnapshotBehavior::Disabled,
+            )
+            .await
+            {
+                Ok(checkpoint) => Some(checkpoint),
+                // Nothing was ever written, so there is no checkpoint to clear.
+                Err(runtime_checkpoint_api::CheckpointError::NotFound { .. }) => None,
+                Err(source) => {
+                    return Err(Error::AccelerationDataCheckpoint {
+                        dataset_name: dataset.name.to_string(),
+                        source: Box::new(source),
+                    });
+                }
+            };
+            if let Some(checkpoint) = checkpoint {
+                cleared = checkpoint.exists().await;
+                checkpoint
+                    .delete()
+                    .await
+                    .context(AccelerationDataCheckpointSnafu {
+                        dataset_name: dataset.name.to_string(),
+                    })?;
+            }
         }
         self.drop_acceleration_for_recreate(dataset, acceleration, None)
             .await?;
         Ok(cleared)
     }
 
-    /// Whether `dataset`'s engine keeps its data in a file, of the path the
-    /// accelerator resolves for it, that does not exist: one never created
-    /// holds nothing to delete, and opening it fails.
-    async fn store_file_absent(&self, dataset: &Dataset, acceleration: &Acceleration) -> bool {
-        if !dataset.is_file_accelerated() {
-            return false;
-        }
+    /// Whether none of the files and folders `dataset`'s accelerator keeps its
+    /// data in exists: ones never created hold nothing to delete, and opening
+    /// them fails. A store with any of them, such as Cayenne's metadata without
+    /// its data, is there.
+    async fn store_files_absent(&self, dataset: &Dataset, acceleration: &Acceleration) -> bool {
         let Some(accelerator) = self
             .accelerator_engine_registry()
             .get_accelerator_engine(acceleration.engine)
@@ -5567,10 +5572,25 @@ impl DataFusion {
         else {
             return false;
         };
-        let Ok(path) = accelerator.file_path(dataset) else {
-            return false;
+        let paths: Vec<std::path::PathBuf> = match accelerator.acceleration_layout(dataset) {
+            AccelerationLayout::File { path } => vec![path],
+            AccelerationLayout::Directories { dirs } => {
+                dirs.into_iter().map(|(dir, _)| dir).collect()
+            }
+            AccelerationLayout::None => match accelerator.file_path(dataset) {
+                Ok(path) => vec![path.into()],
+                Err(_) => Vec::new(),
+            },
         };
-        matches!(tokio::fs::try_exists(&path).await, Ok(false))
+        if paths.is_empty() {
+            return false;
+        }
+        for path in paths {
+            if !matches!(tokio::fs::try_exists(&path).await, Ok(false)) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Drops `source`'s accelerated table so the next create builds it again, empty,
