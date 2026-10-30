@@ -1643,6 +1643,22 @@ impl Output {
         (job.prompt, job.sampling, output)
     }
 
+    /// The reply's text the prompt wrote, for the grammar to be advanced over before the reply
+    /// goes on from where the prompt left it.
+    fn pending(&self) -> &str {
+        self.harmony.as_ref().map_or("", harmony::Reader::pending)
+    }
+
+    /// Starts the reply where the prompt left it when it `goes_on` from there, sending the
+    /// text the prompt began the opened message with first; otherwise from a header.
+    fn begin(&mut self, goes_on: bool) {
+        if let Some(reader) = self.harmony.as_mut() {
+            let begun = reader.begin(goes_on);
+            // A client that is gone is found at the next send, as it is for any other.
+            self.route(&begun);
+        }
+    }
+
     /// Whether generation has left any reasoning block, so `response_format` applies: in a
     /// Harmony reply, whether it is in its final message.
     fn in_content(&self) -> bool {
@@ -1991,16 +2007,24 @@ struct Picker<'v> {
     /// Whether each chain starts with the penalties, which then also hear of the tokens the
     /// other chain picks.
     penalized: bool,
+    /// Whether the grammar was advanced over all of the reply's text the prompt wrote, so the
+    /// reply goes on from where the prompt left it.
+    goes_on: bool,
 }
 
 impl<'v> Picker<'v> {
     /// `window` is how many generated tokens the penalties remember: the context's length
-    /// covers a whole reply.
+    /// covers a whole reply. The grammar is advanced over `pending`, the reply's text the
+    /// prompt wrote, when it allows each of its tokens in turn; on the first it does not, it
+    /// is built again at its root, and [`Picker::goes_on`] is false. Each token is checked
+    /// before the grammar is told of it, because llama.cpp aborts on a token a grammar
+    /// rejects.
     fn new(
         vocab: Vocab<'v>,
         sampling: &Sampling,
         eog: &[Token],
         window: u32,
+        pending: &str,
     ) -> std::result::Result<Self, String> {
         let frequency = sampling.frequency_penalty.unwrap_or(0.0);
         let presence = sampling.presence_penalty.unwrap_or(0.0);
@@ -2026,15 +2050,43 @@ impl<'v> Picker<'v> {
             samplers.extend(draw(sampling));
             Ok(Sampler::chain(samplers))
         };
+        let mut constrained = sampling
+            .grammar
+            .as_deref()
+            .map(|g| chain(Some(g)))
+            .transpose()?;
+        let mut goes_on = true;
+        if let (Some(grammar), Some(fed)) = (sampling.grammar.as_deref(), constrained.as_mut())
+            && !pending.is_empty()
+        {
+            // The grammar follows the penalties and the end-of-generation ban in its chain.
+            let at = i32::from(penalized) + i32::from(sampling.ban_eog);
+            let tokens = vocab
+                .tokenize(pending, false, true)
+                .map_err(|e| e.to_string())?;
+            goes_on = tokens.into_iter().all(|token| {
+                let allowed = fed.allows_at(at, token);
+                if allowed {
+                    fed.accept_at(at, token);
+                }
+                allowed
+            });
+            if !goes_on {
+                constrained = Some(chain(Some(grammar))?);
+            }
+        }
         Ok(Self {
             free: chain(None)?,
-            constrained: sampling
-                .grammar
-                .as_deref()
-                .map(|g| chain(Some(g)))
-                .transpose()?,
+            constrained,
             penalized,
+            goes_on,
         })
+    }
+
+    /// Whether the reply goes on from where the prompt left it: false only when the grammar
+    /// would not be advanced over the reply's text the prompt wrote.
+    fn goes_on(&self) -> bool {
+        self.goes_on
     }
 
     fn sample(&mut self, context: &Context<'_>, index: i32, in_content: bool) -> Token {
@@ -2079,7 +2131,14 @@ fn generate(
     let namespace = job.namespace.clone();
     let (prompt, sampling, mut out) = Output::new(job);
     let vocab = model.vocab();
-    let mut picker = Picker::new(vocab, &sampling, &out.ruled_out(eog), context.n_ctx())?;
+    let mut picker = Picker::new(
+        vocab,
+        &sampling,
+        &out.ruled_out(eog),
+        context.n_ctx(),
+        out.pending(),
+    )?;
+    out.begin(picker.goes_on());
     // `tokens` grows by every reply token decoded, so it is always what the cache holds.
     let (mut tokens, mut batch) =
         read_prompt(model, context, cache, (&prompt, &namespace), &out.stopping)?;
@@ -2121,7 +2180,14 @@ fn generate_mtp(
     let namespace = job.namespace.clone();
     let (prompt, sampling, mut out) = Output::new(job);
     let vocab = model.vocab();
-    let mut picker = Picker::new(vocab, &sampling, &out.ruled_out(eog), spec.target().n_ctx())?;
+    let mut picker = Picker::new(
+        vocab,
+        &sampling,
+        &out.ruled_out(eog),
+        spec.target().n_ctx(),
+        out.pending(),
+    )?;
+    out.begin(picker.goes_on());
     // `read_prompt` hands every decoded prompt batch to the head, which needs the target's
     // hidden state at each prompt position before `begin`; its cache keeps the positions the
     // target's reuses.
@@ -3370,6 +3436,10 @@ mod tests {
             .expect("the request is queued");
         let rx = receivers.into_iter().next().expect("one choice");
         let (prompt, sampling, mut out) = Output::new(queued.try_recv().expect("its job"));
+        // These cases leave the grammar nothing to be advanced over, which the decode thread
+        // would do before the reply starts.
+        assert_eq!(out.pending(), "", "{opens:?}");
+        out.begin(true);
         assert!(
             prompt.ends_with(&format!("<|end|><|start|>assistant{opens}")),
             "the generation prompt goes on with {opens:?}: {prompt:?}"

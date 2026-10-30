@@ -194,6 +194,17 @@ pub(crate) enum Opened {
     Call(String),
 }
 
+/// How a grammar goes on from where a prompt leaves the reply it holds.
+enum Continued {
+    /// From a rule of its own.
+    At(Opened),
+    /// Advanced over the reply's text the prompt wrote, if it allows that text, which only
+    /// the grammar can tell.
+    Fed,
+    /// Not at all: the grammar holds the whole reply, from its first header.
+    Restart,
+}
+
 /// Reads one reply.
 #[derive(Debug, Clone)]
 pub(crate) struct Reader {
@@ -204,6 +215,12 @@ pub(crate) struct Reader {
     route: Route,
     /// Where the grammar the reply is held to goes on from.
     opened: Opened,
+    /// The reply's text the prompt wrote, which the grammar is to be advanced over before the
+    /// reply goes on from it; empty when the grammar has a rule for where it goes on from.
+    pending: String,
+    /// The text the prompt wrote of the body of the reasoning or content message it opened,
+    /// which is the start of the reply's.
+    begun: String,
 }
 
 impl Reader {
@@ -217,6 +234,8 @@ impl Reader {
             held,
             route: Route::Header(String::new()),
             opened: Opened::Header,
+            pending: String::new(),
+            begun: String::new(),
         }
     }
 
@@ -231,69 +250,124 @@ impl Reader {
     /// text, and a call goes on from the arguments the prompt began. Each header is read
     /// from after its role, as the header after a stock prompt's `<|start|>assistant` is.
     ///
-    /// A reply held to a grammar goes on from where the prompt leaves it when the grammar
-    /// can go on from there too ([`Reader::opened`]). From a message the grammar does not
-    /// allow there, such as a final message before a required call, or from a final message
-    /// or call whose body the prompt already began, the grammar holds the whole reply from its
-    /// first header, so the reply is read from a header.
+    /// A reply held to a grammar goes on from where the prompt leaves it only where the
+    /// grammar can too: from a rule of the grammar's own ([`Reader::opened`]), or once the
+    /// grammar is advanced over the reply's text the prompt wrote ([`Reader::pending`]), which
+    /// [`Reader::begin`] is told the outcome of. From a message the grammar does not allow
+    /// there, such as a final message before a required call, the grammar holds the whole
+    /// reply from its first header, so the reply is read from a header.
     pub(crate) fn after(mut self, prompt: &str) -> Self {
         let Some(first) = prompt.find(START) else {
             return self;
         };
-        // Whether the text read next starts with a message's role, and whether the prompt
-        // wrote any of the body of the message it leaves open.
-        let (mut role, mut written) = (false, false);
+        // Whether the text read next starts with a message's role, and where the header of
+        // the message the prompt leaves open starts.
+        let (mut role, mut header_from, mut at) = (false, first, first);
         for (token, text) in self.markers.spell(&prompt[first..]) {
+            let next = at + text.len();
             match token {
                 Some(token) if self.marks(token, "") => {
                     role = token == self.markers.start;
-                    written = false;
+                    self.begun.clear();
                     if !matches!(self.mark(token), Mark::Next) {
                         // The message is closed, so the reply starts a new one.
                         self.route = Route::Header(String::new());
                     }
+                    if self.in_fresh_header() {
+                        header_from = next;
+                    }
                 }
                 _ => {
-                    let text = if std::mem::take(&mut role) {
-                        &text[word(text).len()..]
-                    } else {
-                        text
-                    };
-                    written |= !text.is_empty();
+                    let mut text = text;
+                    if std::mem::take(&mut role) {
+                        let role = word(text).len();
+                        text = &text[role..];
+                        if self.in_fresh_header() {
+                            header_from = at + role;
+                        }
+                    }
+                    if matches!(self.route, Route::Reasoning | Route::Content { .. }) {
+                        self.begun.push_str(text);
+                    }
                     self.text(text);
                 }
             }
+            at = next;
         }
         if self.held != Held::Nothing {
-            self.opened = self.continued(written);
-            if self.opened == Opened::Header {
-                self.route = Route::Header(String::new());
+            match self.continued() {
+                Continued::At(opened) => self.opened = opened,
+                Continued::Fed => self.pending = prompt[header_from..].to_string(),
+                Continued::Restart => self.restart(),
             }
         }
         self
     }
 
-    /// Where the grammar the reply is held to goes on from, as the prompt leaves the reply,
-    /// with `written` text in the open message's body: the first header when the grammar
-    /// cannot go on from the message the prompt opened.
-    fn continued(&self, written: bool) -> Opened {
+    /// Whether the reply is at the start of a message's header.
+    fn in_fresh_header(&self) -> bool {
+        matches!(&self.route, Route::Header(header) if header.is_empty())
+    }
+
+    /// How the grammar the reply is held to goes on from where the prompt leaves the reply.
+    fn continued(&self) -> Continued {
         let reply = self.held == Held::Reply;
         match &self.route {
-            Route::Header(header) if header == CHANNEL => Opened::Channel,
-            Route::Header(header) if header == "<|channel|>analysis" => Opened::AnalysisHeader,
-            Route::Header(header) if reply && header == "<|channel|>final" => Opened::FinalHeader,
-            Route::Reasoning => Opened::Analysis,
-            Route::Content { last: true } if reply && !written => Opened::Final,
-            Route::Call { name, arguments } if !reply && arguments.is_empty() => {
-                Opened::Call(name.clone())
+            Route::Header(header) if header.is_empty() => Continued::At(Opened::Header),
+            Route::Header(header) if header == CHANNEL => Continued::At(Opened::Channel),
+            Route::Header(header) if header == "<|channel|>analysis" => {
+                Continued::At(Opened::AnalysisHeader)
             }
-            _ => Opened::Header,
+            Route::Header(header) if reply && header == "<|channel|>final" => {
+                Continued::At(Opened::FinalHeader)
+            }
+            Route::Reasoning => Continued::At(Opened::Analysis),
+            Route::Content { last: true } if reply && self.begun.is_empty() => {
+                Continued::At(Opened::Final)
+            }
+            Route::Call { name, arguments } if !reply && arguments.is_empty() => {
+                Continued::At(Opened::Call(name.clone()))
+            }
+            // Any other header, a final message whose body the prompt began under a structured
+            // reply, or a call whose arguments it began under a required one: the grammar
+            // allows them as far as it allows their text.
+            Route::Header(_) => Continued::Fed,
+            Route::Content { last: true } if reply => Continued::Fed,
+            Route::Call { .. } if !reply => Continued::Fed,
+            // A preamble, a dropped call, a final message before a required call, or a call
+            // before a structured reply: the grammar allows none of them there.
+            _ => Continued::Restart,
         }
+    }
+
+    /// Starts the reply in a header, with nothing begun.
+    fn restart(&mut self) {
+        self.route = Route::Header(String::new());
+        self.pending.clear();
+        self.begun.clear();
     }
 
     /// Where the grammar the reply is held to goes on from, as [`Reader::after`] found it.
     pub(crate) fn opened(&self) -> &Opened {
         &self.opened
+    }
+
+    /// The reply's text the prompt wrote, which the grammar is to be advanced over before the
+    /// reply goes on from where the prompt left it; empty when there is none to advance over.
+    pub(crate) fn pending(&self) -> &str {
+        &self.pending
+    }
+
+    /// Starts the reply where the prompt left it when it `goes_on` from there, as it does
+    /// unless the grammar would not be advanced over [`Reader::pending`], and returns the text
+    /// the prompt began the opened message's body with, to send first. Otherwise the reply
+    /// starts in a header, where the grammar, built again at its root, holds it.
+    pub(crate) fn begin(&mut self, goes_on: bool) -> String {
+        if !goes_on {
+            self.restart();
+        }
+        self.pending.clear();
+        std::mem::take(&mut self.begun)
     }
 
     pub(crate) fn markers(&self) -> &Markers {
@@ -812,6 +886,54 @@ mod tests {
             after("<|start|>assistant<|channel|>final<|message|>", Held::Call),
             Route::Header(String::new())
         );
+    }
+
+    /// A body the prompt began, under a grammar, goes on only as far as the grammar allows its
+    /// text, which the decode thread tries: the reader keeps where the prompt left the reply,
+    /// hands over the reply's text the prompt wrote, and starts in a header if the grammar
+    /// would not take it. The text the prompt began a reasoning or content body with is sent
+    /// first.
+    #[test]
+    fn a_body_the_prompt_began_goes_on_as_far_as_the_grammar_allows_its_text() {
+        let prompt = "<|start|>user<|message|>Hi<|end|><|start|>assistant<|channel|>final<|message|>{\"answer\":\"Ly";
+        let reader = Reader::new(TEST_MARKERS, Vec::new(), Held::Reply).after(prompt);
+        assert_eq!(
+            (reader.route.clone(), reader.opened(), reader.pending()),
+            (
+                Route::Content { last: true },
+                &Opened::Header,
+                "<|channel|>final<|message|>{\"answer\":\"Ly"
+            )
+        );
+        let (mut taken, mut refused) = (reader.clone(), reader);
+        assert_eq!(taken.begin(true), "{\"answer\":\"Ly");
+        assert_eq!(
+            (taken.route, taken.pending),
+            (Route::Content { last: true }, String::new())
+        );
+        assert_eq!(refused.begin(false), "");
+        assert_eq!(refused.route, Route::Header(String::new()));
+        // a call's arguments the prompt began are the call's, not text to send
+        let mut call = Reader::new(TEST_MARKERS, vec!["f".to_string()], Held::Call)
+            .after("<|start|>assistant<|channel|>commentary to=functions.f<|message|>{\"a\":");
+        assert_eq!(
+            call.pending(),
+            "<|channel|>commentary to=functions.f<|message|>{\"a\":"
+        );
+        assert_eq!(call.begin(true), "");
+        assert_eq!(
+            call.route,
+            Route::Call {
+                name: "f".to_string(),
+                arguments: "{\"a\":".to_string()
+            }
+        );
+        // without a grammar the reply goes on from the prompt, and its begun text is sent
+        let mut free = Reader::new(TEST_MARKERS, Vec::new(), Held::Nothing)
+            .after("<|start|>assistant<|channel|>analysis<|message|>Think: ");
+        assert_eq!(free.pending(), "");
+        assert_eq!(free.begin(true), "Think: ");
+        assert_eq!(free.route, Route::Reasoning);
     }
 
     #[test]
