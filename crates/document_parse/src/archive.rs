@@ -25,6 +25,7 @@ limitations under the License.
 
 use bytes::Bytes;
 use snafu::ResultExt;
+use std::collections::VecDeque;
 use std::io::{Cursor, Read, Write};
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
@@ -132,6 +133,24 @@ pub(crate) fn ensure_text_within_limit(len: u64, format: DocumentType) -> Result
     Ok(())
 }
 
+/// Opens a zip archive, rejecting it when a local file header disagrees with
+/// its central directory entry, two entries share a name, or entries overlap.
+/// Such an archive can show different content to different zip readers ("zip
+/// cloaking", GHSA-m665-v7pm-7grj), so it is refused before any entry is read.
+pub(crate) fn open_consistent_archive(
+    raw: &Bytes,
+    format: DocumentType,
+) -> Result<ZipArchive<Cursor<Bytes>>> {
+    let mut archive = ZipArchive::new(Cursor::new(raw.clone()))
+        .boxed()
+        .context(InternalParsingSnafu { format })?;
+    archive
+        .validate_header_consistency()
+        .boxed()
+        .context(InternalParsingSnafu { format })?;
+    Ok(archive)
+}
+
 /// Magic number of the OLE compound file format, which Office uses for
 /// password-protected OOXML and the legacy binary formats (`.doc`, `.xls`).
 const COMPOUND_FILE_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
@@ -152,9 +171,7 @@ pub(crate) fn rebuild_package(raw: &Bytes, format: DocumentType, limits: Limits)
         .context(InternalParsingSnafu { format });
     }
 
-    let mut archive = ZipArchive::new(Cursor::new(raw.clone()))
-        .boxed()
-        .context(InternalParsingSnafu { format })?;
+    let mut archive = open_consistent_archive(raw, format)?;
     let mut budget = DecompressionBudget::new(format, limits);
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
@@ -167,7 +184,11 @@ pub(crate) fn rebuild_package(raw: &Bytes, format: DocumentType, limits: Limits)
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_owned();
+        let name = entry
+            .name()
+            .boxed()
+            .context(InternalParsingSnafu { format })?
+            .into_owned();
         let data = budget.read_entry(&name, entry)?;
         writer
             .start_file(name, options)
@@ -380,19 +401,16 @@ fn pdf_streams(raw: &[u8]) -> Vec<PdfStream> {
     const KEYWORD: &[u8] = b"stream";
     let mut streams = Vec::new();
     let mut from = 0;
-    // Lexical scans for strings/comments start after the last validated payload
+    // Strings and comments are lexed from the end of the last validated payload
     // so binary stream bytes (e.g. a `0x28` in an image) cannot look like `(`.
-    let mut lex_from = 0;
+    let mut lexer = PdfLexer::new(0);
     while let Some(rel) = find(&raw[from..], KEYWORD) {
         let pos = from + rel;
         from = pos + KEYWORD.len();
-        if !is_stream_keyword(raw, pos)
-            || in_comment_at(raw, pos)
-            || in_literal_string_at(raw, pos, lex_from)
-        {
+        if !is_stream_keyword(raw, pos) || lexer.covers(raw, pos) {
             continue;
         }
-        let Some(stream_info) = stream_before(raw, pos, lex_from) else {
+        let Some(stream_info) = stream_before(raw, &lexer) else {
             continue;
         };
         // Stream data begins after the end-of-line that follows the keyword.
@@ -410,7 +428,7 @@ fn pdf_streams(raw: &[u8]) -> Vec<PdfStream> {
         // Do not resume the keyword search inside this stream's payload, and
         // do not let that payload participate in later string detection.
         from = stream_payload_end(raw, data, stream_info.length);
-        lex_from = from;
+        lexer.restart(from);
     }
     streams
 }
@@ -486,15 +504,15 @@ struct StreamInfo {
 }
 
 /// The `/Filter` chain and `/Length` of the dictionary that ends just before
-/// the `stream` keyword at `keyword_pos`.
+/// the `stream` keyword `lexer` last reached (see [`PdfLexer::covers`]).
 ///
 /// `None` when `stream` is not preceded by a dictionary (content, not a stream
 /// object). When a dictionary is there but its chain cannot be determined, the
 /// filters are a single [`PdfFilter::Unbounded`] stage so the document fails
 /// closed.
-fn stream_before(raw: &[u8], keyword_pos: usize, lex_from: usize) -> Option<StreamInfo> {
-    let close = dict_closer_before(raw, keyword_pos)?;
-    let parsed = filters_of_dict(raw, close, lex_from).unwrap_or(ParsedDict {
+fn stream_before(raw: &[u8], lexer: &PdfLexer) -> Option<StreamInfo> {
+    let close = lexer.dict_closer(raw)?;
+    let parsed = filters_of_dict(raw, close, lexer).unwrap_or(ParsedDict {
         consumed: 0,
         filters: vec![PdfFilter::Unbounded],
         length: None,
@@ -576,86 +594,96 @@ fn parse_u64(data: &[u8]) -> Option<u64> {
     (digits > 0).then_some(value)
 }
 
-/// Index just past the `>>` that closes the dictionary before `keyword_pos`,
-/// after PDF whitespace and comments. `None` when no dictionary closer sits
-/// there, which is what distinguishes a real stream from the word `stream`.
-fn dict_closer_before(raw: &[u8], keyword_pos: usize) -> Option<usize> {
-    let mut i = keyword_pos;
-    loop {
-        while i > 0 && is_pdf_whitespace(raw[i - 1]) {
-            i -= 1;
-        }
-        // A `%` comment runs to the end of its line. Consume one only when it
-        // sits in the gap before `stream`: a `%` earlier on the dictionary's
-        // own line has the closing `>>` after it, and is not this gap.
-        if let Some(comment) = comment_open_before(raw, i) {
-            i = comment;
-            continue;
-        }
-        break;
-    }
-    (i >= 2 && &raw[i - 2..i] == b">>").then_some(i)
-}
-
-/// Start index of a `%` comment on the same line whose body covers `pos`.
+/// A forward scan of the bytes from the end of the last validated stream
+/// payload to the `stream` keyword being checked. Each byte is classified once,
+/// and what the dictionary lookup needs is kept as the scan goes, so finding
+/// every stream stays linear in the document's size however many `stream`
+/// words, comments, or `<<` bytes the document holds.
 ///
-/// Comment spans are decided from the start of the line forward with
-/// string-aware tokenization: literal strings (including a `%` inside
-/// `(100 % pure)` or `(% harmless)`) are skipped, and the first `%` outside a
-/// string owns the rest of the line. Bytes inside that span — including `>>`
-/// or a second `%` — are comment text, not dictionary syntax.
-fn comment_open_before(raw: &[u8], pos: usize) -> Option<usize> {
-    if pos == 0 {
-        return None;
-    }
-    let line_start = raw[..pos]
-        .iter()
-        .rposition(|&b| b == b'\n' || b == b'\r')
-        .map_or(0, |newline| newline + 1);
-    let mut i = line_start;
-    while i < pos {
-        match raw[i] {
-            b'(' => {
-                let len = skip_literal_string(&raw[i..])?;
-                i += len;
-            }
-            b'%' => return Some(i),
-            _ => i += 1,
-        }
-    }
-    None
+/// The scan starts outside any string or comment: at the start of the document
+/// or just past a validated payload, so binary stream bytes (e.g. a `0x28` in
+/// an image) never open a string. Literal strings and `%` comments are
+/// consumed as whole tokens. The first `%` outside a string owns the rest of
+/// its line, so `>>`, `(`, or a second `%` inside it is comment text. A `%`
+/// inside a string is string text, including one in a string opened on an
+/// earlier line, so it cannot hide the dictionary's `>>`. A string that never
+/// closes runs to the end of the document.
+struct PdfLexer {
+    /// Where the scan started.
+    start: usize,
+    /// Every byte before `cursor` is classified. A string or comment is
+    /// consumed whole, so `cursor` can sit past a position it covers.
+    cursor: usize,
+    /// Index just past the last byte before `cursor` that is neither PDF
+    /// whitespace nor comment text: where a dictionary's `>>` has to end for
+    /// the `stream` keyword after it to belong to that dictionary.
+    significant_end: usize,
+    /// Starts of the nearest [`MAX_DICT_CANDIDATES`] `<<` outside strings and
+    /// comments, oldest first: the candidate dictionary openers.
+    dict_openers: VecDeque<usize>,
 }
 
-/// Whether `at` sits inside a PDF literal string `(…)`, decided by a forward
-/// scan from `scan_from` that also skips `%` comments. `scan_from` is the end
-/// of the previous validated stream payload so binary content (e.g. a `0x28`
-/// image byte) is not treated as a string opener. Used so a Catalog string
-/// such as `(<< /Length 999999999 >>stream)` cannot invent a phantom stream.
-fn in_literal_string_at(raw: &[u8], at: usize, scan_from: usize) -> bool {
-    let mut i = scan_from.min(at);
-    while i < at {
-        match raw.get(i) {
-            Some(b'%') => {
-                i += 1;
-                while i < at && raw[i] != b'\n' && raw[i] != b'\r' {
-                    i += 1;
+impl PdfLexer {
+    fn new(start: usize) -> Self {
+        Self {
+            start,
+            cursor: start,
+            significant_end: start,
+            dict_openers: VecDeque::with_capacity(MAX_DICT_CANDIDATES),
+        }
+    }
+
+    /// Starts a new scan at `start`, the end of a validated stream payload.
+    fn restart(&mut self, start: usize) {
+        self.start = start;
+        self.cursor = start;
+        self.significant_end = start;
+        self.dict_openers.clear();
+    }
+
+    /// Whether `pos` sits inside a literal string or a `%` comment, scanning
+    /// forward to it. A `stream` there is text, not a keyword, so a Catalog
+    /// string such as `(<< /Length 999999999 >>stream)` cannot invent a
+    /// phantom stream. `pos` never decreases between calls on the same scan.
+    fn covers(&mut self, raw: &[u8], pos: usize) -> bool {
+        while self.cursor < pos {
+            let i = self.cursor;
+            match raw[i] {
+                b'%' => {
+                    self.cursor = raw[i..]
+                        .iter()
+                        .position(|&b| b == b'\n' || b == b'\r')
+                        .map_or(raw.len(), |offset| i + offset);
+                }
+                b'(' => {
+                    self.cursor = skip_literal_string(&raw[i..]).map_or(raw.len(), |len| i + len);
+                    self.significant_end = self.cursor;
+                }
+                byte => {
+                    if !is_pdf_whitespace(byte) {
+                        self.significant_end = i + 1;
+                    }
+                    if byte == b'<' && raw.get(i + 1) == Some(&b'<') {
+                        if self.dict_openers.len() == MAX_DICT_CANDIDATES {
+                            self.dict_openers.pop_front();
+                        }
+                        self.dict_openers.push_back(i);
+                    }
+                    self.cursor = i + 1;
                 }
             }
-            Some(b'(') => match skip_literal_string(&raw[i..]) {
-                Some(len) if i + len <= at => i += len,
-                // The string that starts here has not closed before `at`.
-                Some(_) | None => return true,
-            },
-            Some(_) => i += 1,
-            None => break,
         }
+        self.cursor > pos
     }
-    false
-}
 
-/// Whether `at` sits inside a `%` comment on its line.
-fn in_comment_at(raw: &[u8], at: usize) -> bool {
-    comment_open_before(raw, at).is_some()
+    /// Index just past the `>>` that closes the dictionary before the position
+    /// last passed to [`Self::covers`], after PDF whitespace and comments.
+    /// `None` when no dictionary closer sits there, which is what distinguishes
+    /// a real stream from the word `stream`.
+    fn dict_closer(&self, raw: &[u8]) -> Option<usize> {
+        let close = self.significant_end;
+        (close >= 2 && &raw[close - 2..close] == b">>").then_some(close)
+    }
 }
 
 /// How far back from a dictionary closer its opening `<<` is looked for.
@@ -664,9 +692,9 @@ fn in_comment_at(raw: &[u8], at: usize) -> bool {
 const DICT_LOOKBACK_BYTES: usize = 1024 * 1024;
 
 /// Cap on opening-`<<` candidates tried per stream, nearest first. The match is
-/// the candidate whose token parse ends exactly on the closer; the rest are
-/// `<<` bytes inside strings. Stopping here bounds the scan, and failing closed
-/// when none match is safe.
+/// the candidate whose token parse ends exactly on the closer; the rest open
+/// dictionaries nested inside it. Stopping here bounds the work per stream, and
+/// failing closed when none match is safe.
 const MAX_DICT_CANDIDATES: usize = 64;
 
 /// Deepest nesting of arrays/dictionaries accepted while skipping a value.
@@ -675,31 +703,20 @@ const MAX_DICT_CANDIDATES: usize = 64;
 const MAX_VALUE_DEPTH: usize = 32;
 
 /// The top-level `/Filter` chain and `/Length` of the dictionary that closes
-/// at `close`. `None` when no candidate opening parses as that dictionary.
-fn filters_of_dict(raw: &[u8], close: usize, lex_from: usize) -> Option<ParsedDict> {
-    let window_start = close.saturating_sub(DICT_LOOKBACK_BYTES).max(lex_from);
-    let mut tried = 0usize;
-    let mut j = close;
-    while j > window_start + 1 && tried < MAX_DICT_CANDIDATES {
-        j -= 1;
-        if raw[j] == b'<' && raw[j - 1] == b'<' {
-            let start = j - 1;
-            // A `<<` inside a `%` comment or a literal string is not a
-            // dictionary opener.
-            if comment_open_before(raw, start).is_some()
-                || in_literal_string_at(raw, start, lex_from)
-            {
-                continue;
-            }
-            tried += 1;
-            if let Some(parsed) = parse_dictionary(&raw[start..close], 0)
-                && parsed.consumed == close - start
-            {
-                return Some(parsed);
-            }
-        }
-    }
-    None
+/// at `close`, trying `lexer`'s `<<` openers nearest first. A `<<` inside a
+/// `%` comment or a literal string is not an opener, so it was never recorded.
+/// `None` when no candidate opening parses as that dictionary.
+fn filters_of_dict(raw: &[u8], close: usize, lexer: &PdfLexer) -> Option<ParsedDict> {
+    let window_start = close.saturating_sub(DICT_LOOKBACK_BYTES);
+    lexer
+        .dict_openers
+        .iter()
+        .rev()
+        .take_while(|&&start| start >= window_start)
+        .find_map(|&start| {
+            parse_dictionary(&raw[start..close], 0)
+                .filter(|parsed| parsed.consumed == close - start)
+        })
 }
 
 struct ParsedDict {
@@ -1132,7 +1149,11 @@ fn skip_ws(data: &[u8]) -> &[u8] {
 /// Test helper view of [`stream_before`]: just the filter chain.
 #[cfg(test)]
 fn filters_before(raw: &[u8], keyword_pos: usize) -> Option<Vec<PdfFilter>> {
-    stream_before(raw, keyword_pos, 0).map(|info| info.filters)
+    let mut lexer = PdfLexer::new(0);
+    if lexer.covers(raw, keyword_pos) {
+        return None;
+    }
+    stream_before(raw, &lexer).map(|info| info.filters)
 }
 
 /// A PDF name token (without its leading `/`), with `#XX` hex escapes decoded,
@@ -1458,7 +1479,7 @@ mod tests {
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index).expect("entry");
             assert_eq!(entry.compression(), CompressionMethod::Stored);
-            let name = entry.name().to_owned();
+            let name = entry.name().expect("entry name").into_owned();
             let mut data = Vec::new();
             entry.read_to_end(&mut data).expect("read entry");
             entries.push((name, data));
@@ -1720,6 +1741,66 @@ mod tests {
         );
     }
 
+    /// A literal string that opens on one line and holds a `%` on the next is
+    /// string text, not a comment, so the dictionary's `>>` after it still
+    /// closes the dictionary and the Flate bomb behind it is budgeted.
+    #[test]
+    fn rejects_a_bomb_behind_a_multiline_literal_holding_a_percent() {
+        let pdf = pdf_with_dict(
+            "/Filter /FlateDecode /Note (harmless\n% literal)",
+            &flate_bomb(),
+        );
+        assert_eq!(
+            pdf_too_large_reason(&pdf),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
+    }
+
+    /// Each byte is lexed once, so a document packed with what would cost a
+    /// rescan per occurrence if each check restarted at the last payload —
+    /// `stream` in comment lines or as a bare word, comment lines between a
+    /// dictionary and its `stream`, `<<` in a comment inside the dictionary —
+    /// is scanned in linear time, and the stream behind it is still found with
+    /// its filter. A per-occurrence rescan takes minutes at these sizes, which
+    /// trips the test timeout.
+    #[test]
+    fn finds_a_stream_behind_megabytes_of_comments_and_stream_words() {
+        let pdf = |before_dict: &[u8], in_dict: &[u8], gap: &[u8]| {
+            let mut pdf = b"%PDF-1.7\n".to_vec();
+            pdf.extend_from_slice(before_dict);
+            pdf.extend_from_slice(b"1 0 obj\n<< /Length 3 /Filter /FlateDecode");
+            pdf.extend_from_slice(in_dict);
+            pdf.extend_from_slice(b" >>\n");
+            pdf.extend_from_slice(gap);
+            pdf.extend_from_slice(b"stream\nabc\nendstream\nendobj\n");
+            pdf
+        };
+        let lt_comment = [b" % ".as_slice(), &b"<".repeat(500_000), b"\n"].concat();
+        let shapes = [
+            (
+                "stream in comment lines",
+                pdf(&b"% stream\n".repeat(200_000), b"", b""),
+            ),
+            (
+                "bare stream words",
+                pdf(&b"x stream\n".repeat(200_000), b"", b""),
+            ),
+            (
+                "comment lines before stream",
+                pdf(b"", b"", &b"%c\n".repeat(500_000)),
+            ),
+            ("<< inside a dictionary comment", pdf(b"", &lt_comment, b"")),
+        ];
+        for (shape, pdf) in shapes {
+            let data_start = pdf.len() - b"abc\nendstream\nendobj\n".len();
+            let found: Vec<(usize, Vec<PdfFilter>)> = pdf_streams(&pdf)
+                .into_iter()
+                .map(|stream| (stream.data_start, stream.filters))
+                .collect();
+            assert_eq!(found, vec![(data_start, vec![PdfFilter::Flate])], "{shape}");
+        }
+    }
+
     /// A comment between filter-array elements must not truncate the chain, so
     /// the second Flate stage of a nested bomb is still applied.
     #[test]
@@ -1809,7 +1890,7 @@ mod tests {
     }
 
     /// A comment body may contain `>>` without ending the comment. That text
-    /// must not stop `dict_closer_before` from walking back to the real closer.
+    /// must not be taken for the dictionary's closer.
     #[test]
     fn rejects_a_chain_with_closer_text_inside_the_comment() {
         let dict = b"<< /Filter [/FlateDecode /FlateDecode] >> % ignored >> ignored\n";

@@ -15,9 +15,8 @@
 //! row count, so the engine-to-engine delta and the cardinality sensitivity
 //! both show up in the Criterion report.
 //!
-//! Lanes (compile-time gated):
-//! - `cayenne`       — Cayenne with the SQLite metastore (default)
-//! - `cayenne_turso` — Cayenne with the Turso metastore (--features turso)
+//! Lanes:
+//! - `cayenne`       — Cayenne with the SQLite metastore
 //! - `duckdb`        — DuckDB file-mode
 
 #![allow(clippy::expect_used)]
@@ -80,9 +79,8 @@ fn bench_groupby(c: &mut Criterion) {
             let cayenne_sql = "SELECT name, COUNT(*), SUM(value) FROM t GROUP BY name";
             let duckdb_sql = "SELECT name, COUNT(*), SUM(value) FROM groupby_bench GROUP BY name";
 
-            // Plan capture uses the SQLite lane — Turso would emit the same
-            // DataFusion plan because the metastore only affects metadata I/O,
-            // not query planning.
+            // Plan capture uses the SQLite lane: the metastore only affects
+            // metadata I/O, not query planning.
             let plan_fixture =
                 Arc::new(rt.block_on(load_cayenne(Metastore::Sqlite, rows, effective_groups)));
             rt.block_on(capture_comparison_plans(

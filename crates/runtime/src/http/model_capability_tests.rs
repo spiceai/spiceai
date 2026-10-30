@@ -496,14 +496,12 @@ impl Path {
                 None => vec![],
             },
             Path::Decisions | Path::AiIf => decisions,
-            // A model with chat reranks through it, even one with native decisions.
-            Path::Rerank => {
-                if capabilities.has(Capability::Chat) {
-                    vec![chat]
-                } else {
-                    decisions
-                }
-            }
+            // A model with native decisions reranks through them, even one with chat.
+            Path::Rerank => match capabilities.decisions() {
+                Some(DecisionsBackend::Native) => decisions,
+                _ if capabilities.has(Capability::Chat) => vec![chat],
+                _ => decisions,
+            },
         }
     }
 }

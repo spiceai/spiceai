@@ -17,7 +17,8 @@ limitations under the License.
 //! A client for the parts of the Hugging Face Hub Spice reads, for model, dataset and space
 //! repositories alike (`{type}s` below is `models`, `datasets` or `spaces`).
 //!
-//! - `GET /api/{type}s/{repo}/revision/{revision}` resolves a branch or tag to a commit;
+//! - `GET /api/{type}s/{repo}/revision/{revision}` resolves a branch or tag to a commit, and
+//!   with `blobs=true` and `expand[]=siblings` describes every file at it, too;
 //! - `GET /api/{type}s/{repo}/tree/{commit}/{path}` lists files, 1,000 per page;
 //! - `POST /api/{type}s/{repo}/paths-info/{commit}` describes one path;
 //! - `GET /[{type}s/]{repo}/resolve/{commit}/{path}` reads a file (a model repository has no
@@ -389,11 +390,45 @@ impl TreeEntry {
     }
 }
 
+/// The revision endpoint's answer: the commit a revision names and, when asked for, every file
+/// at it.
 #[derive(Debug, Deserialize)]
 struct RevisionInfo {
     sha: String,
     #[serde(rename = "lastModified")]
     last_modified: DateTime<Utc>,
+    /// `None` when the files were not asked for, or the endpoint does not list them, as a mirror
+    /// may not.
+    siblings: Option<Vec<Sibling>>,
+}
+
+/// A file of a [`RevisionInfo`]. Its blob id and size are `None` when the endpoint does not
+/// describe blobs.
+#[derive(Debug, Deserialize)]
+struct Sibling {
+    rfilename: String,
+    #[serde(rename = "blobId")]
+    blob_id: Option<String>,
+    size: Option<u64>,
+    lfs: Option<SiblingLfs>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SiblingLfs {
+    sha256: String,
+}
+
+impl Sibling {
+    /// The file as the tree endpoint would describe it, `None` when its blob is not described.
+    fn into_entry(self) -> Option<TreeEntry> {
+        Some(TreeEntry {
+            kind: EntryKind::File,
+            path: self.rfilename,
+            size: self.size?,
+            oid: self.blob_id?,
+            lfs: self.lfs.map(|lfs| LfsInfo { oid: lfs.sha256 }),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -601,11 +636,74 @@ impl Hub {
             .map_err(|error| Arc::try_unwrap(error).unwrap_or_else(|shared| shared.duplicate()))
     }
 
+    /// Resolves `revision` (a branch, tag or commit) to a commit and describes every file at it,
+    /// in one request: [`Hub::commit`] and a recursive [`Hub::list`] in one. The files are
+    /// `None` when the endpoint does not describe them, as a mirror may not; [`Hub::list`]
+    /// lists them then.
+    ///
+    /// The request asks for the files' blobs and only the fields Spice reads, a combination
+    /// `huggingface_hub` never sends. An endpoint that refuses it with HTTP 400 is asked for the
+    /// revision alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the repository or revision does not exist, access is denied, or the
+    /// Hub cannot be reached.
+    pub(crate) async fn describe(
+        &self,
+        repo: &RepoId,
+        revision: &str,
+    ) -> Result<(Commit, Option<Arc<[TreeEntry]>>)> {
+        let info = match self.fetch_revision(repo, revision, true).await {
+            Ok(info) => info,
+            Err(Error::Status { status: 400, .. }) => {
+                self.fetch_revision(repo, revision, false).await?
+            }
+            Err(error) => return Err(error),
+        };
+        let entries = info.siblings.and_then(|siblings| {
+            siblings
+                .into_iter()
+                .map(Sibling::into_entry)
+                .collect::<Option<Vec<_>>>()
+                .map(Into::into)
+        });
+        let commit = Commit {
+            sha: info.sha,
+            date: info.last_modified,
+        };
+        Ok((commit, entries))
+    }
+
     async fn fetch_commit(&self, repo: &RepoId, revision: &str) -> Result<Commit> {
+        let info = self.fetch_revision(repo, revision, false).await?;
+        Ok(Commit {
+            sha: info.sha,
+            date: info.last_modified,
+        })
+    }
+
+    /// The revision endpoint's answer for `revision`, which lists every file at its commit when
+    /// `files` is set.
+    async fn fetch_revision(
+        &self,
+        repo: &RepoId,
+        revision: &str,
+        files: bool,
+    ) -> Result<RevisionInfo> {
         let mut url = self.api_url(repo, &["revision"], revision, "");
-        url.query_pairs_mut()
-            .append_pair("expand[]", "sha")
-            .append_pair("expand[]", "lastModified");
+        {
+            let mut query = url.query_pairs_mut();
+            if files {
+                query.append_pair("blobs", "true");
+            }
+            query
+                .append_pair("expand[]", "sha")
+                .append_pair("expand[]", "lastModified");
+            if files {
+                query.append_pair("expand[]", "siblings");
+            }
+        }
         let (_, body) = self
             .request_body(repo, Some(revision), Method::GET, url, None)
             .await?;
@@ -621,10 +719,7 @@ impl Hub {
                 message: format!("revision '{revision}' resolved to an invalid commit id"),
             }
         );
-        Ok(Commit {
-            sha: info.sha,
-            date: info.last_modified,
-        })
+        Ok(info)
     }
 
     /// Lists the entries under `path` at `commit`: every file and folder below it when
@@ -905,15 +1000,14 @@ impl Hub {
 
     /// `{endpoint}/[{type}s/]{repo}/resolve/{commit}/{path}`.
     /// The commit `revision` names now, read from the Hub's answer to a `HEAD` of `path` at
-    /// that revision. The Hub answers without sending the file, so this is one request where
-    /// [`Hub::commit`] and a listing are two. `None` when the answer does not say, as a
+    /// that revision, which leaves the file unread. `None` when the answer does not say, as a
     /// renamed repository's redirect does not.
     ///
     /// # Errors
     ///
     /// Returns an error if the repository, revision or file does not exist, access is denied,
     /// or the Hub cannot be reached.
-    pub async fn commit_of_file(
+    pub(crate) async fn commit_of_file(
         &self,
         repo: &RepoId,
         revision: &str,

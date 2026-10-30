@@ -17,6 +17,7 @@ limitations under the License.
 #include "spice_mtp.h"
 
 #include "common.h"
+#include "gguf.h"
 #include "speculative.h"
 
 #include <cstring>
@@ -62,14 +63,48 @@ template <typename F> spice_mtp_status guarded(spice_mtp * mtp, F && f) {
 
 }  // namespace
 
+extern "C" spice_draft_kind spice_dflash_kind(const char * path) {
+    if (path == nullptr) {
+        return SPICE_DRAFT_NONE;
+    }
+    try {
+        struct gguf_init_params params = {
+            /* .no_alloc = */ true,
+            /* .ctx      = */ nullptr,
+        };
+        struct gguf_context * gguf = gguf_init_from_file(path, params);
+        if (gguf == nullptr) {
+            return SPICE_DRAFT_NONE;
+        }
+        spice_draft_kind kind = SPICE_DRAFT_NONE;
+        const int64_t arch = gguf_find_key(gguf, "general.architecture");
+        if (arch >= 0 && gguf_get_kv_type(gguf, arch) == GGUF_TYPE_STRING &&
+            std::strcmp(gguf_get_val_str(gguf, arch), "dflash") == 0) {
+            // the Markov head is what makes a DFlash drafter a DSpark one
+            kind = gguf_find_tensor(gguf, "markov_w1.weight") >= 0 ? SPICE_DRAFT_DSPARK : SPICE_DRAFT_DFLASH;
+        }
+        gguf_free(gguf);
+        return kind;
+    } catch (...) {
+        return SPICE_DRAFT_NONE;
+    }
+}
+
 extern "C" spice_mtp * spice_mtp_init(struct llama_context * target, struct llama_context * draft,
-                                      int32_t n_max, int32_t n_min, float p_min) {
+                                      spice_draft_kind kind, int32_t n_max, int32_t n_min, float p_min) {
     if (target == nullptr || draft == nullptr || n_max <= 0 || n_min < 0 || n_min > n_max) {
         return nullptr;
     }
+    common_speculative_type type;
+    switch (kind) {
+        case SPICE_DRAFT_MTP:    type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP;    break;
+        case SPICE_DRAFT_DFLASH: type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH; break;
+        case SPICE_DRAFT_DSPARK: type = COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; break;
+        default: return nullptr;
+    }
     try {
         auto * mtp = new spice_mtp();
-        mtp->params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        mtp->params.types = { type };
         mtp->params.draft.ctx_tgt = target;
         mtp->params.draft.ctx_dft = draft;
         mtp->params.draft.n_max = n_max;

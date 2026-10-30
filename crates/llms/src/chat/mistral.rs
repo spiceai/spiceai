@@ -110,6 +110,8 @@ impl MistralLlama {
             context_length,
             paged_attention,
             reasoning,
+            // mistral.rs reads its ring from `RING_CONFIG`, which the caller wrote.
+            distributed: _,
         } = options;
         for weight in model_weights {
             if !weight.exists() {

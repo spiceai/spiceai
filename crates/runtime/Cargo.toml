@@ -470,7 +470,7 @@ vortex = []
 accelerator-cayenne = { path = "../accelerators/accelerator-cayenne" }
 
 [target.'cfg(not(windows))'.dependencies]
-cayenne = { path = "../cayenne", features = ["turso", "partition-table-provider"] }
+cayenne = { path = "../cayenne", features = ["partition-table-provider"] }
 vortex.workspace = true
 vortex-datafusion.workspace = true
 

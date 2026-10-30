@@ -1,0 +1,44 @@
+name: qualified-outer-reference
+description: >
+  A schema-qualified outer reference keeps its binding when an intermediate
+  subquery has a bare alias with the same table name. PostgreSQL resolves the
+  outer values 1 and 2, rather than the inner value 10.
+sources:
+  src: { kind: postgres }
+variants:
+  federated: {}
+  arrow: arrow
+  cayenne: cayenne-file
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: qualified-outer-reference
+  datasets:
+    - { from: 'postgres:schema_a.foo', name: schema_a.foo, params: '${sources.src.params}' }
+    - { from: 'postgres:public.bar', name: bar, params: '${sources.src.params}' }
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+steps:
+  - source-exec:
+      src: |
+        CREATE SCHEMA schema_a;
+        CREATE TABLE schema_a.foo (a bigint NOT NULL);
+        INSERT INTO schema_a.foo VALUES (1),(2);
+        CREATE TABLE bar (a bigint NOT NULL);
+        INSERT INTO bar VALUES (10);
+  - start: {}
+  - query: SELECT a FROM schema_a.foo ORDER BY a
+  - explain: SELECT a FROM schema_a.foo
+    contains: CayenneAccelerationExec
+    only: cayenne
+  # Control: a different inner alias cannot shadow the outer table name.
+  - query: SELECT (SELECT (SELECT schema_a.foo.a) FROM (SELECT a FROM bar) inner_foo) AS v FROM schema_a.foo ORDER BY v
+    only: federated
+  - query: SELECT (SELECT (SELECT schema_a.foo.a) FROM (SELECT a FROM bar) foo) AS v FROM schema_a.foo ORDER BY v
+    only: federated
+  # Unambiguous filter control for federation.
+  - query: SELECT schema_a.foo.a AS v FROM schema_a.foo WHERE EXISTS (SELECT 1 FROM (SELECT a FROM bar) inner_foo WHERE EXISTS (SELECT 1 WHERE schema_a.foo.a = 1)) ORDER BY v
+    only: federated
+  # The alias-capture predicate also exercises local Arrow and Cayenne planning.
+  - query: SELECT schema_a.foo.a AS v FROM schema_a.foo WHERE EXISTS (SELECT 1 FROM (SELECT a FROM bar) foo WHERE EXISTS (SELECT 1 WHERE schema_a.foo.a = 1)) ORDER BY v
