@@ -1374,3 +1374,57 @@ fn next_sql(first: &str, lines: &mut std::iter::Peekable<std::str::Lines<'_>>) -
     }
     sql.trim_end_matches(';').to_string()
 }
+
+async fn analyzed_plan(ctx: &SessionContext, sql: &str) -> String {
+    let state = ctx.state();
+    let plan = state
+        .create_logical_plan(sql)
+        .await
+        .unwrap_or_else(|error| panic!("`{sql}` plans: {error}"));
+    let plan = state
+        .optimize(&plan)
+        .unwrap_or_else(|error| panic!("`{sql}` optimizes: {error}"));
+    format!("{}", plan.display_indent())
+}
+
+fn names_a_checked_op(plan: &str) -> bool {
+    [
+        CHECKED_ADD_UDF_NAME,
+        CHECKED_SUB_UDF_NAME,
+        CHECKED_MUL_UDF_NAME,
+    ]
+    .iter()
+    .any(|name| plan.contains(name))
+}
+
+/// A table provider receives an `UPDATE`'s assignments and a `DELETE`'s
+/// filters, and one backed by another engine renders them as SQL there:
+/// `__spice_checked_add("b", 1)` is a function PostgreSQL does not have, so a
+/// write-through `UPDATE t SET b = b + 1` failed with "db error".
+#[tokio::test]
+async fn update_and_delete_keep_the_operators_for_the_table_provider() {
+    let ctx = checked_session();
+    for sql in [
+        "UPDATE t SET big = big + 1, i = i * 2 WHERE id - 1 = 2",
+        "DELETE FROM t WHERE big + 1 > 2 AND id * 2 < 8",
+    ] {
+        let plan = analyzed_plan(&ctx, sql).await;
+        assert!(
+            !names_a_checked_op(&plan),
+            "`{sql}` must keep `+` / `-` / `*`:\n{plan}"
+        );
+    }
+
+    // The rewrite still runs everywhere else in this session, the rows an
+    // `INSERT` selects included: DataFusion computes those itself.
+    for sql in [
+        "SELECT big + 1 FROM t",
+        "INSERT INTO t SELECT id + 10, big - 1, i * 2 FROM t",
+    ] {
+        let plan = analyzed_plan(&ctx, sql).await;
+        assert!(
+            names_a_checked_op(&plan),
+            "`{sql}` must use the checked kernels:\n{plan}"
+        );
+    }
+}

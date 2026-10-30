@@ -18,7 +18,8 @@ limitations under the License.
 //!
 //! Federation has already claimed remote subplans by this point, so remotes
 //! still see the original operators. The leftover local expressions cannot be
-//! folded by `SimplifyExpressions` with wrapping kernels.
+//! folded by `SimplifyExpressions` with wrapping kernels. `UPDATE` and
+//! `DELETE` are left alone: the table provider receives their expressions.
 
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ use datafusion::common::{DFSchema, Result};
 use datafusion::config::ConfigOptions;
 use datafusion::logical_expr::expr::BinaryExpr;
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
-use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan};
+use datafusion::logical_expr::{DmlStatement, Expr, ExprSchemable, LogicalPlan, WriteOp};
 use datafusion::optimizer::AnalyzerRule;
 
 use super::is_integer_arith_type;
@@ -46,6 +47,9 @@ impl CheckedIntegerOverflow {
 
 impl AnalyzerRule for CheckedIntegerOverflow {
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+        if hands_expressions_to_the_table(&plan) {
+            return Ok(plan);
+        }
         plan.transform_up_with_subqueries(|plan| {
             // Projection / Filter / Aggregate expressions are typed against
             // the input, not `plan.schema()` (the output). A binary plan
@@ -64,6 +68,22 @@ impl AnalyzerRule for CheckedIntegerOverflow {
     fn name(&self) -> &'static str {
         "checked_integer_overflow"
     }
+}
+
+/// `UPDATE` and `DELETE` pass their assignments and filters to the table
+/// provider, which renders them as SQL for its own engine when it is one
+/// (PostgreSQL under `write_through`, a `DuckDB` or `SQLite` accelerator).
+/// That engine has no `__spice_checked_*` function, so the statement would
+/// fail there; like a federated query, it keeps the original operators and
+/// the engine's own overflow rules.
+fn hands_expressions_to_the_table(plan: &LogicalPlan) -> bool {
+    matches!(
+        plan,
+        LogicalPlan::Dml(DmlStatement {
+            op: WriteOp::Update | WriteOp::Delete,
+            ..
+        })
+    )
 }
 
 fn expression_schema(plan: &LogicalPlan) -> Arc<DFSchema> {
