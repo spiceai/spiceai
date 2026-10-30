@@ -222,6 +222,7 @@ struct BakeInputFiles {
 struct BakeFilePartition {
     inputs: Vec<BakeInputFiles>,
     rewritten_bytes: u64,
+    kept_bytes: u64,
 }
 
 impl BakeFilePartition {
@@ -14988,9 +14989,10 @@ impl CayenneTableProvider {
     /// a multi-threaded test worker over the default 2 MiB stack. Issue #12436 records
     /// the same budget for neighbouring tests in this family; boxing keeps this rarely
     /// taken I/O arm off the parent frame for one allocation on a background path.
-    async fn snapshot_bytes_for_merge_budget(&self, snapshot_id: &str) -> Option<u64> {
+    /// Returns the bytes and the number of files.
+    async fn snapshot_bytes_for_merge_budget(&self, snapshot_id: &str) -> Option<(u64, usize)> {
         match self.list_snapshot_files_with_sizes(snapshot_id).await {
-            Ok(files) => Some(files.iter().map(|(_, sz)| *sz).sum()),
+            Ok(files) => Some((files.iter().map(|(_, sz)| *sz).sum(), files.len())),
             Err(error) => {
                 tracing::warn!(
                     target: "cayenne::compaction",
@@ -29473,6 +29475,7 @@ impl CayenneTableProvider {
         // blocked bake pays no listings.
         let max_pass_bytes = self.protected_merge_input_budget_bytes();
         let mut selected_input_bytes: u64 = 0;
+        let mut selected_input_files: usize = 0;
         // Why the prefix stopped short, for the skip log below. A budget stop is
         // expected steady state; a sizing failure is an I/O problem that must not
         // masquerade as one.
@@ -29502,7 +29505,8 @@ impl CayenneTableProvider {
             // and counting an unsizeable run as free would let an arbitrarily large
             // one in and defeat the bound. End the prefix instead; the next tick
             // retries once it can be sized.
-            let Some(candidate_bytes) = Box::pin(self.snapshot_bytes_for_merge_budget(id)).await
+            let Some((candidate_bytes, candidate_files)) =
+                Box::pin(self.snapshot_bytes_for_merge_budget(id)).await
             else {
                 stopped_early = Some("sizing_failed");
                 break;
@@ -29521,6 +29525,7 @@ impl CayenneTableProvider {
                 break;
             }
             selected_input_bytes = next;
+            selected_input_files += candidate_files;
             if files.is_empty() {
                 // Empty manifest ⟹ a CDC-published snapshot whose async manifest
                 // population has not landed yet — both compaction paths author the
@@ -29991,12 +29996,33 @@ impl CayenneTableProvider {
                 selected_input_bytes
             }
         };
+        // Bytes the bake wrote: the files it kept are in its output but were
+        // linked, not written.
+        let (files_kept, bytes_kept) = partition
+            .as_ref()
+            .map_or((0, 0), |partition| (partition.kept_files(), partition.kept_bytes));
+        let written_bytes = merged_output_bytes.saturating_sub(bytes_kept);
         telemetry::cayenne::track_compaction_merged_bytes(
-            merged_output_bytes,
+            written_bytes,
             &[
                 telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
                 telemetry::KeyValue::new("kind", "bake"),
             ],
+        );
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            input_snapshots = selected.len(),
+            input_files = selected_input_files,
+            input_bytes = selected_input_bytes,
+            files_rewritten = selected_input_files.saturating_sub(files_kept),
+            bytes_rewritten = total_input_bytes,
+            files_kept,
+            bytes_kept,
+            bytes_written = written_bytes,
+            rows_written = total_rows,
+            duration_ms = compaction_start.elapsed().as_millis(),
+            "Seq-prefix bake finished"
         );
 
         // The publication is complete in BOTH the catalog and this provider's
@@ -30038,7 +30064,7 @@ impl CayenneTableProvider {
             return None;
         }
         let mut inputs = Vec::with_capacity(selected.len());
-        let mut rewritten_bytes = 0_u64;
+        let (mut rewritten_bytes, mut kept_bytes) = (0_u64, 0_u64);
         for (snapshot_id, threshold) in selected {
             let captured = match self.capture_snapshot_files_under_fence(snapshot_id).await {
                 Ok(captured) => captured,
@@ -30085,6 +30111,7 @@ impl CayenneTableProvider {
                     rewrite.push(file.clone());
                     rewrite_names.push(name);
                 } else {
+                    kept_bytes = kept_bytes.saturating_add(file.object_meta.size);
                     keep_names.push(name);
                 }
             }
@@ -30103,6 +30130,7 @@ impl CayenneTableProvider {
         let partition = BakeFilePartition {
             inputs,
             rewritten_bytes,
+            kept_bytes,
         };
         (partition.kept_files() > 0).then_some(partition)
     }
