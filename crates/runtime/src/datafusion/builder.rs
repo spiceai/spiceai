@@ -357,6 +357,7 @@ pub struct DataFusionBuilder {
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     query_admission_semaphore: Option<Arc<Semaphore>>,
+    query_admission_limit: Option<usize>,
     task_history_enabled: bool,
     query_error_logging: QueryErrorLogging,
     output_preview: OutputPreview,
@@ -490,6 +491,7 @@ impl DataFusionBuilder {
             temp_directory: None,
             accelerated_refresh_semaphore: None,
             query_admission_semaphore: None,
+            query_admission_limit: None,
             task_history_enabled: true,
             query_error_logging: QueryErrorLogging::default(),
             output_preview: OutputPreview::Build,
@@ -683,6 +685,7 @@ impl DataFusionBuilder {
             }
         };
         self.query_admission_semaphore = permits.map(|n| Arc::new(Semaphore::new(n)));
+        self.query_admission_limit = permits;
         self
     }
 
@@ -1466,6 +1469,11 @@ impl DataFusionBuilder {
             ),
         )));
 
+        ctx.state_ref()
+            .write()
+            .config_mut()
+            .set_extension(Arc::new(super::PlansGeneration(0)));
+
         DataFusion {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
@@ -1476,6 +1484,7 @@ impl DataFusionBuilder {
             ddl_extension_store,
             datafusion_ref,
             caching,
+            plans_generation: TokioRwLock::new(0),
             results_cache_warmer: self.results_cache_warmer.unwrap_or_else(|| {
                 super::query::ResultsCacheWarmer::new_unloaded(
                     self.results_cache_warmup_store
@@ -1506,6 +1515,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             query_admission_semaphore: self.query_admission_semaphore,
+            query_admission_limit: self.query_admission_limit,
             task_history_enabled: self.task_history_enabled,
             query_error_logging: self.query_error_logging,
             task_history_captured_output: self.output_preview == OutputPreview::Build,

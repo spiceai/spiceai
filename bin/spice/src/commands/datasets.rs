@@ -17,7 +17,7 @@ limitations under the License.
 //! Datasets command implementation - lists datasets loaded by the runtime.
 
 use crate::context::RuntimeContext;
-use crate::error::{self, InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
+use crate::error::{self, InvalidResponseSnafu, Result};
 use crate::output::{OutputFormat, TableRow, write_json, write_table};
 use clap::Args;
 use runtime_api_types::v1::DatasetInfo;
@@ -73,12 +73,10 @@ pub async fn execute(ctx: &RuntimeContext, args: &DatasetsArgs) -> Result<()> {
         return Ok(());
     }
 
-    let response = ctx.get("/v1/datasets?status=true").await.map_err(|_| {
-        RuntimeUnavailableSnafu {
-            endpoint: ctx.http_endpoint().to_string(),
-        }
-        .build()
-    })?;
+    let response = ctx
+        .get("/v1/datasets?status=true")
+        .await
+        .map_err(|e| error::runtime_unreachable(ctx.http_endpoint(), &e))?;
 
     let response = error::check_response(response, ctx.http_endpoint()).await?;
 

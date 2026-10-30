@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::{Arc, LazyLock};
 
 use arrow_schema::DataType;
-use datafusion::common::DFSchema;
+use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::logical_expr::ExprSchemable as _;
 use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction, WindowFunction};
 use datafusion::logical_expr::{Cast, Expr, Operator, TryCast};
@@ -237,6 +237,9 @@ static DUCKDB_DIALECT: LazyLock<Arc<dyn Dialect>> = LazyLock::new(new_duckdb_dia
 /// [`datafusion_table_providers::util::supported_functions::ScalarCallSupport`]).
 #[must_use]
 pub fn duckdb_can_translate(call: &ScalarFunction, scope: Option<&DFSchema>) -> bool {
+    if call.func.name() == SUBSTR_NAME && !substr_positions_agree_in_duckdb(&call.args) {
+        return false;
+    }
     if call.func.name() == CONCAT_NAME
         && !duckdb::concat_arguments_are_renderable(&call.args, scope)
     {
@@ -294,13 +297,140 @@ pub fn duckdb_can_translate_window(call: &WindowFunction) -> bool {
 /// truncates; `duckdb::literal_is_renderable` refuses a binary literal,
 /// which the unparser spells in a form `DuckDB` reads as text; and
 /// [`divides_a_decimal`] refuses a `/` over a decimal, which `DuckDB` answers
-/// as a `DOUBLE`.
+/// as a `DOUBLE`; [`divides_by_a_possible_zero`] refuses a `/` or `%` whose
+/// divisor could be zero, which `DuckDB` answers as `NULL`; and
+/// [`like_escapes_alike_in_duckdb`] refuses a `LIKE` whose pattern could hold a
+/// backslash, which `DuckDB` reads literally.
 #[must_use]
 pub fn duckdb_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
     duckdb::literal_is_renderable(expr)
         && duckdb::cast_is_renderable(expr, scope)
         && integer_cast_is_renderable(expr, scope)
         && !divides_a_decimal(expr, scope)
+        && !divides_by_a_possible_zero(expr)
+        && like_escapes_alike_in_duckdb(expr)
+}
+
+/// `DataFusion`'s name for `substr`, which is also what `substring(...)` plans to.
+const SUBSTR_NAME: &str = "substr";
+
+/// The largest `SUBSTRING` offset and length `DuckDB` accepts; past it the
+/// query fails with `Substring offset outside of supported range`.
+const DUCKDB_SUBSTRING_MAX: i128 = u32::MAX as i128;
+
+/// Whether `DuckDB` answers this `substr(str, start[, length])` the way
+/// `DataFusion` does.
+///
+/// They agree on a start of 1 or more: both count characters from 1. Below
+/// that they part. `DataFusion` reads a start below 1 as a position before the
+/// string, so `substr('abcd', -2, 4)` is `'a'` (positions -2..1), while
+/// `DuckDB` counts a negative start from the end, so the same call answers
+/// `'cd'`. A negative length fails in `DataFusion` and is a backwards count in
+/// `DuckDB`. Measured on `DuckDB` v1.4.4. Only literal positions inside that
+/// agreement, and inside `DuckDB`'s own range, federate; a column position
+/// stays local, because it might be negative in some row.
+fn substr_positions_agree_in_duckdb(args: &[Expr]) -> bool {
+    let in_range = |position: Option<&Expr>, low: i128| {
+        position
+            .and_then(literal_value)
+            .as_ref()
+            .and_then(integer_value)
+            .is_some_and(|value| (low..=DUCKDB_SUBSTRING_MAX).contains(&value))
+    };
+    match args {
+        [_, start] => in_range(Some(start), 1),
+        [_, start, length] => in_range(Some(start), 1) && in_range(Some(length), 0),
+        _ => false,
+    }
+}
+
+/// Whether `expr` is a `/` or `%` whose divisor might be zero, which `DuckDB`
+/// and `DataFusion` answer differently.
+///
+/// `DataFusion` fails an integer `x / 0` and `x % 0` with a divide-by-zero
+/// error and answers a float `x / 0.0` with an infinity; `DuckDB` answers
+/// `NULL` for all of them. A filter `x / 0 > 1` then keeps no row where the
+/// local engine keeps every positive `x`, and `n / (k - 3)` returns rows
+/// where `DataFusion` fails the query (measured on `DuckDB` v1.4.4). Whether a
+/// divisor is zero is known only for a literal, so a `/` or `%` federates
+/// only when its divisor is a non-zero, finite integer or float literal. A
+/// signed `-1` is refused too: `i64::MIN / -1` overflows, and the two engines
+/// need not report it the same way. Truncation agrees, measured: `DuckDB`
+/// answers `-7 // 2 = -3` and `-7 % 2 = -1` as `DataFusion` does.
+#[must_use]
+pub(crate) fn divides_by_a_possible_zero(expr: &Expr) -> bool {
+    let Expr::BinaryExpr(binary) = expr else {
+        return false;
+    };
+    if !matches!(binary.op, Operator::Divide | Operator::Modulo) {
+        return false;
+    }
+    let Some(divisor) = literal_value(&binary.right) else {
+        return true;
+    };
+    if let Some(value) = integer_value(&divisor) {
+        return value == 0 || value == -1;
+    }
+    match divisor {
+        ScalarValue::Float32(Some(value)) => !value.is_finite() || value == 0.0,
+        ScalarValue::Float64(Some(value)) => !value.is_finite() || value == 0.0,
+        _ => true,
+    }
+}
+
+/// Whether `DuckDB` reads this `LIKE` or `ILIKE` pattern the way `DataFusion`
+/// does.
+///
+/// With no `ESCAPE` clause `DataFusion` treats a backslash as the escape
+/// character, so `'a%c' LIKE 'a\%c'` is `true`; `DuckDB` has no default escape
+/// and reads the backslash literally, answering `false`. A `LIKE` with an
+/// explicit `ESCAPE` is unparsed with it and agrees. One without federates
+/// only when its pattern is a string literal holding no backslash; any other
+/// pattern, a column included, stays local, because it might hold one.
+#[must_use]
+pub(crate) fn like_escapes_alike_in_duckdb(expr: &Expr) -> bool {
+    let Expr::Like(like) = expr else {
+        return true;
+    };
+    if like.escape_char.is_some() {
+        return true;
+    }
+    match literal_value(&like.pattern) {
+        Some(
+            ScalarValue::Utf8(Some(pattern))
+            | ScalarValue::LargeUtf8(Some(pattern))
+            | ScalarValue::Utf8View(Some(pattern)),
+        ) => !pattern.contains('\\'),
+        _ => false,
+    }
+}
+
+/// The value of `expr` when it is a literal, a negated literal, or a cast of
+/// one: the shapes a constant takes after type coercion. The cast is
+/// evaluated with `DataFusion`'s own rules, so the value is the one the
+/// engine would compute. `None` for anything else.
+fn literal_value(expr: &Expr) -> Option<ScalarValue> {
+    match expr {
+        Expr::Literal(value, _) => Some(value.clone()),
+        Expr::Negative(operand) => literal_value(operand)?.arithmetic_negate().ok(),
+        Expr::Cast(Cast { expr, field }) => literal_value(expr)?.cast_to(field.data_type()).ok(),
+        _ => None,
+    }
+}
+
+/// A non-null integer scalar's value, widened so every integer type fits.
+fn integer_value(value: &ScalarValue) -> Option<i128> {
+    match value {
+        ScalarValue::Int8(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int16(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int32(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int64(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt8(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt64(Some(v)) => Some(i128::from(*v)),
+        _ => None,
+    }
 }
 
 /// Whether `expr` is a `/` whose operands `DuckDB` or `SQLite` would evaluate
