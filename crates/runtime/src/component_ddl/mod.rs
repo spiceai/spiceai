@@ -1777,16 +1777,13 @@ impl Runtime {
             .await?;
         let location = match accelerator.acceleration_layout(&built) {
             runtime_acceleration::layout::AccelerationLayout::None => {
-                match accelerator.file_path(&built) {
-                    Ok(path) => path,
+                accelerator.file_path(&built).unwrap_or_else(|_| {
                     // An engine with no file of its own, PostgreSQL, keeps the data
                     // where its parameters point.
-                    Err(_) => {
-                        let mut params: Vec<_> = acceleration.params.iter().collect();
-                        params.sort();
-                        format!("{params:?}")
-                    }
-                }
+                    let mut params: Vec<_> = acceleration.params.iter().collect();
+                    params.sort();
+                    format!("{params:?}")
+                })
             }
             layout => format!("{layout:?}"),
         };
