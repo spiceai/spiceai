@@ -2448,6 +2448,28 @@ where
     }
 }
 
+/// A result stream dropped before its end, such as by a client that disconnects,
+/// is a cancelled query: record it as one rather than letting its task-history
+/// span close as a success.
+impl<S> Drop for QueryTrackerStream<S> {
+    fn drop(&mut self) {
+        let Some(tracker) = self.tracker.take() else {
+            return;
+        };
+        // The query's task-history row collects only events inside its span,
+        // and a stream can be dropped outside it.
+        let _span = self.inner_span.enter();
+        tracker
+            .schema(Arc::clone(&self.schema))
+            .rows_produced(self.num_records)
+            .finish_with_error(
+                &self.request_context,
+                "Query was cancelled before its results were fully read".to_string(),
+                ErrorCode::QueryExecutionError,
+            );
+    }
+}
+
 /// The task-history preview of a result batch: its first rows, as JSON.
 fn output_preview(batch: &RecordBatch) -> Cow<'static, str> {
     Cow::Owned(write_to_json_string(&[batch.slice(0, batch.num_rows().min(3))]).unwrap_or_default())
@@ -6031,6 +6053,119 @@ mod tests {
             &query_id,
         );
         assert!(guard_dropped.load(Ordering::SeqCst));
+    }
+
+    /// The task-history errors recorded while `consume` reads a tracked
+    /// two-batch stream and then drops it, each as `<span>: <message>`.
+    async fn task_history_errors_after<F, Fut>(consume: F) -> Vec<String>
+    where
+        F: FnOnce(SendableRecordBatchStream) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        #[derive(Clone, Default)]
+        struct TaskHistoryErrors(Arc<parking_lot::Mutex<Vec<String>>>);
+
+        impl<S> tracing_subscriber::Layer<S> for TaskHistoryErrors
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+                struct Message<'a>(&'a mut String);
+                impl tracing::field::Visit for Message<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            *self.0 = format!("{value:?}");
+                        }
+                    }
+                }
+                let metadata = event.metadata();
+                if metadata.target() == "task_history" && *metadata.level() == tracing::Level::ERROR
+                {
+                    let mut message = String::new();
+                    event.record(&mut Message(&mut message));
+                    let span = ctx.event_span(event).map_or("", |span| span.name());
+                    self.0.lock().push(format!("{span}: {message}"));
+                }
+            }
+        }
+
+        let errors = TaskHistoryErrors::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(errors.clone()));
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let batch = |value: i64| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![value])) as ArrayRef],
+            )
+            .expect("batch")
+        };
+        let tracker = QueryTracker {
+            task_history_enabled: true,
+            log_errors: spicepod::component::runtime::QueryErrorLogging::None,
+            captured_output_enabled: true,
+            schema: None,
+            query_duration_secs: None,
+            query_execution_duration_secs: None,
+            rows_produced: 0,
+            results_cache_hit: None,
+            is_accelerated: None,
+            error_message: None,
+            error_code: None,
+            query_duration_timer: tokio::time::Instant::now(),
+            query_execution_duration_timer: tokio::time::Instant::now(),
+            datasets: Arc::new(HashSet::new()),
+        };
+        let stream = attach_query_tracker_to_stream(
+            tracing::info_span!("sql_query"),
+            Arc::new(RequestContextBuilder::new(Protocol::Http).build()),
+            Some(tracker),
+            stream_from_batches(&schema, vec![batch(1), batch(2)]),
+        );
+        consume(stream).await;
+
+        errors.0.lock().clone()
+    }
+
+    /// Regression test for #15741: a client that disconnects drops the result
+    /// stream before its end, and the query's task-history row must record an
+    /// error rather than a success.
+    #[tokio::test]
+    async fn a_result_stream_dropped_before_its_end_records_a_cancellation() {
+        let errors = task_history_errors_after(|mut stream| async move {
+            stream.next().await.expect("first batch").expect("ok");
+            drop(stream);
+        })
+        .await;
+        assert_eq!(
+            errors,
+            ["sql_query: Query was cancelled before its results were fully read"]
+        );
+    }
+
+    /// A stream read to its end succeeded, and dropping it afterwards must not
+    /// record an error.
+    #[tokio::test]
+    async fn a_result_stream_read_to_its_end_records_no_error() {
+        let errors = task_history_errors_after(|mut stream| async move {
+            while let Some(batch) = stream.next().await {
+                batch.expect("ok");
+            }
+            drop(stream);
+        })
+        .await;
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     /// Collect all batches from a `SendableRecordBatchStream`.

@@ -1535,6 +1535,8 @@ pub struct DataFusion {
     // EXECUTE (not lightweight PREPARE/DEALLOCATE/SET) — i.e. query admission
     // control; `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
     query_admission_semaphore: Option<Arc<Semaphore>>,
+    // Permits in `query_admission_semaphore`; `None` when admission is unbounded.
+    query_admission_limit: Option<usize>,
     pub(crate) task_history_enabled: bool,
     /// Which failed queries are logged; `runtime.query.log_errors`.
     pub(crate) query_error_logging: QueryErrorLogging,
@@ -1781,6 +1783,12 @@ impl DataFusion {
     /// `acceleration_refresh_semaphore` for the read/query side.
     pub(crate) fn query_admission_semaphore(&self) -> Option<Arc<Semaphore>> {
         self.query_admission_semaphore.clone()
+    }
+
+    /// The number of permits in the query-admission semaphore; `None` when
+    /// admission is unbounded.
+    pub(crate) fn query_admission_limit(&self) -> Option<usize> {
+        self.query_admission_limit
     }
 
     #[must_use]
