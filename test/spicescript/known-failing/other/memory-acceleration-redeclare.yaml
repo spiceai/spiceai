@@ -1,0 +1,81 @@
+name: memory-acceleration-redeclare
+description: >
+  A memory acceleration with full refresh loads its source again once the
+  Spicepod points the dataset at another source, and once it removes the
+  dataset and declares it again. DuckDB and SQLite do. Known failing on Turso:
+  neither load starts, so every query fails with `Acceleration not ready;
+  loading initial data` while the dataset reads Refreshing.
+
+sources:
+  lake: { kind: files }
+
+variants:
+  duckdb: duckdb-memory
+  sqlite: sqlite-memory
+  turso: turso-memory
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: memory-acceleration-redeclare
+  datasets:
+    - from: file://${sources.lake.path}/x/
+      name: items
+      params: { file_format: csv }
+
+defaults:
+  run-variants: side-by-side
+  compare-variants: false
+  spiced-args: [--pods-watcher-enabled]
+
+steps:
+  - generate:
+      lake:
+        table: x
+        rows: 2
+        seed: 1
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+  - generate:
+      lake:
+        table: y
+        rows: 1
+        seed: 2
+        format: csv
+        columns:
+          - { name: id, sequence: 20 }
+  - generate:
+      lake:
+        table: z
+        rows: 1
+        seed: 3
+        format: csv
+        columns:
+          - { name: id, sequence: 30 }
+  - start: {}
+  - query: SELECT id FROM items ORDER BY id
+    eventually: 60s
+    expect: { rows: [['1'], ['2']] }
+
+  # The Spicepod points the dataset at another source while Spice runs.
+  - edit-spicepod: { datasets: { items: { from: 'file://${sources.lake.path}/y/' } } }
+  - query: SELECT id FROM items ORDER BY id
+    eventually: 30s
+    expect: { rows: [['20']] }
+
+  # The dataset is removed, then declared again from a third source.
+  - edit-spicepod: { spicepod: { datasets: [] } }
+  - query: SELECT id FROM items
+    expect-error: items
+    eventually: 30s
+  - edit-spicepod:
+      spicepod:
+        datasets:
+          - from: file://${sources.lake.path}/z/
+            name: items
+            params: { file_format: csv }
+            acceleration: { enabled: true, engine: '${variant.name}', mode: memory }
+  - query: SELECT id FROM items ORDER BY id
+    eventually: 30s
+    expect: { rows: [['30']] }

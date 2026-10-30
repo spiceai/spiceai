@@ -59,6 +59,24 @@
       "may-pass": true
     }
   ],
+  "memory-acceleration-redeclare": [
+    {
+      "run": "memory-acceleration-redeclare",
+      "who": "turso",
+      "key": "query: SELECT id FROM items ORDER BY id #2",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for items: Acceleration not ready; loading initial data for items",
+      "group": "other"
+    },
+    {
+      "run": "memory-acceleration-redeclare",
+      "who": "turso",
+      "key": "query: SELECT id FROM items ORDER BY id #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for items: Acceleration not ready; loading initial data for items",
+      "group": "other"
+    }
+  ],
   "on-zero-results-partial": [
     {
       "run": "on-zero-results-partial[action=use_source,contents=partial]",
