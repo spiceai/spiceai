@@ -120,6 +120,9 @@ pub(crate) struct SqlComponents {
     /// The warnings logged for the SQL-defined components a Spicepod declares
     /// too, so each is logged once while the Spicepod keeps declaring it.
     shadowed: parking_lot::Mutex<Vec<String>>,
+    /// The cause a Spicepod reload or a restart logged withholding datasets
+    /// for, so the first retry of the same failure does not log it again.
+    withheld_logged: parking_lot::Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for SqlComponents {
@@ -140,6 +143,7 @@ impl SqlComponents {
             instance_dir,
             withheld: parking_lot::Mutex::new(Vec::new()),
             shadowed: parking_lot::Mutex::new(Vec::new()),
+            withheld_logged: parking_lot::Mutex::new(None),
         }
     }
 
@@ -718,7 +722,9 @@ impl Runtime {
             return;
         };
         let next = plan::serve((**spicepod).clone(), defined);
-        let started = plan::started_datasets(&recorded.served, &next.datasets, defined);
+        let started = self
+            .started_datasets(&recorded.served, &next.datasets, defined, spicepod)
+            .await;
         let mut retired: Vec<Dataset> = recorded
             .served
             .into_iter()
@@ -765,6 +771,7 @@ impl Runtime {
                 .iter()
                 .map(|dataset| dataset.name.clone())
                 .collect();
+            *self.sql_components.withheld_logged.lock() = Some(cause.clone());
             tracing::warn!("{}", withheld_change(&ServeFailure { cause, unserved }));
         }
         *self.sql_components.withheld.lock() = withheld;
@@ -840,7 +847,10 @@ impl Runtime {
             })
             .cloned()
             .collect();
-        for started in plan::started_datasets(&current.datasets, &next.datasets, &defined) {
+        for started in self
+            .started_datasets(&current.datasets, &next.datasets, &defined, &next)
+            .await
+        {
             if !switched.contains(&started) {
                 switched.push(started);
             }
@@ -887,6 +897,7 @@ impl Runtime {
             .iter()
             .map(|dataset| dataset.name.clone())
             .collect();
+        *self.sql_components.withheld_logged.lock() = Some(cause.clone());
         tracing::warn!("{}", withheld_change(&ServeFailure { cause, unserved }));
         let next = without(&next, &withheld);
         self.sql_components.withheld.lock().extend(withheld);
@@ -1001,7 +1012,10 @@ impl Runtime {
                     // Reported once until it changes or the check succeeds.
                     if reported.as_deref() != Some(failure.cause.as_str()) {
                         if retried_only && !failure.unserved.is_empty() {
-                            tracing::warn!("{}", withheld_change(&failure));
+                            let logged = runtime.sql_components.withheld_logged.lock().take();
+                            if logged.as_deref() != Some(failure.cause.as_str()) {
+                                tracing::warn!("{}", withheld_change(&failure));
+                            }
                         } else {
                             tracing::warn!("{}", unapplied_change(shared.location(), &failure));
                         }
@@ -1082,11 +1096,10 @@ impl Runtime {
         // earlier definition left under their names.
         let mut retired = plan::retired_datasets(&spicepod, &known, &stored, None);
         let next = plan::serve((*spicepod).clone(), &stored);
-        for dataset in withheld.iter().cloned().chain(plan::started_datasets(
-            &served.datasets,
-            &next.datasets,
-            &stored,
-        )) {
+        let started = self
+            .started_datasets(&served.datasets, &next.datasets, &stored, &served)
+            .await;
+        for dataset in withheld.iter().cloned().chain(started) {
             if !retired.contains(&dataset) {
                 retired.push(dataset);
             }
@@ -1198,13 +1211,24 @@ impl Runtime {
                     Arc::clone(self)
                         .apply_app_diff(Some(&without_app), Arc::clone(served))
                         .await;
-                    let withheld = self
+                    let left = if self
                         .sql_components
                         .withheld()
                         .iter()
-                        .any(|old| same_dataset(&old.name, &dataset.name));
+                        .any(|old| same_dataset(&old.name, &dataset.name))
+                    {
+                        Undeleted::Withheld
+                    } else if served
+                        .datasets
+                        .iter()
+                        .any(|now| same_dataset(&now.name, &dataset.name))
+                    {
+                        Undeleted::Served
+                    } else {
+                        Undeleted::New
+                    };
                     return Err(ServeFailure {
-                        cause: undeleted_by_statement(&dataset.name, withheld, &e),
+                        cause: undeleted_by_statement(&dataset.name, left, &e),
                         unserved: Vec::new(),
                     });
                 }
@@ -1383,7 +1407,10 @@ impl Runtime {
             // under its name.
             let retired = plan::retired_datasets(&spicepod, &defined, &definitions, Some(&op));
             let mut retiring = retired.clone();
-            for started in plan::started_datasets(&served.datasets, &next.datasets, &definitions) {
+            for started in self
+                .started_datasets(&served.datasets, &next.datasets, &definitions, &served)
+                .await
+            {
                 if !retiring.contains(&started) {
                     retiring.push(started);
                 }
@@ -1716,6 +1743,96 @@ impl Runtime {
     /// that no longer serves. A failure is its whole chain on one line: its
     /// innermost error can be a bare code, such as `DuckDB`'s, whose layer
     /// above holds the text that names the file.
+    /// The store `dataset`'s acceleration keeps its data in beyond its table,
+    /// or `None` when there is none: no acceleration, or a memory one that
+    /// ends with its table. A store is where the accelerator keeps the data,
+    /// for the engine it resolves to, so a change that leaves the data where it
+    /// is, such as a tuning parameter or naming the default engine, leaves the
+    /// store.
+    async fn acceleration_store(
+        self: &Arc<Self>,
+        dataset: &Dataset,
+        app: &Arc<App>,
+    ) -> Option<Store> {
+        if !dataset.acceleration.as_ref().is_some_and(|a| a.enabled) {
+            return None;
+        }
+        let built = DatasetBuilder::try_from(dataset.clone())
+            .ok()?
+            .with_app(Arc::clone(app))
+            .with_runtime(Arc::clone(self))
+            .build()
+            .ok()?;
+        let acceleration = built.acceleration.as_ref()?;
+        let engine = acceleration.engine;
+        if !built.is_file_accelerated() {
+            return engine
+                .shares_memory_instance()
+                .then_some(Store::SharedMemory(engine));
+        }
+        let accelerator = self
+            .df
+            .accelerator_engine_registry()
+            .get_accelerator_engine(engine)
+            .await?;
+        let location = match accelerator.acceleration_layout(&built) {
+            runtime_acceleration::layout::AccelerationLayout::None => {
+                match accelerator.file_path(&built) {
+                    Ok(path) => path,
+                    // An engine with no file of its own, PostgreSQL, keeps the data
+                    // where its parameters point.
+                    Err(_) => {
+                        let mut params: Vec<_> = acceleration.params.iter().collect();
+                        params.sort();
+                        format!("{params:?}")
+                    }
+                }
+            }
+            layout => format!("{layout:?}"),
+        };
+        Some(Store::Located { engine, location })
+    }
+
+    /// The datasets of `after` whose names `defined` defines and whose
+    /// acceleration starts a store: one the dataset of the name in `before`,
+    /// if any, did not keep its data in, so what it holds under the name an
+    /// earlier definition left. Only a definition that changed starts one.
+    async fn started_datasets(
+        self: &Arc<Self>,
+        before: &[Dataset],
+        after: &[Dataset],
+        defined: &SqlDefinitions,
+        app: &Arc<App>,
+    ) -> Vec<Dataset> {
+        let mut started = Vec::new();
+        for now in after {
+            if !defined
+                .datasets
+                .iter()
+                .any(|sql| same_dataset(&sql.name, &now.name))
+            {
+                continue;
+            }
+            let earlier = before
+                .iter()
+                .find(|earlier| same_dataset(&earlier.name, &now.name));
+            if earlier == Some(now) {
+                continue;
+            }
+            let Some(store) = self.acceleration_store(now, app).await else {
+                continue;
+            };
+            let earlier_store = match earlier {
+                Some(earlier) => self.acceleration_store(earlier, app).await,
+                None => None,
+            };
+            if earlier_store.as_ref() != Some(&store) {
+                started.push(now.clone());
+            }
+        }
+        started
+    }
+
     async fn delete_acceleration_data(
         self: Arc<Self>,
         dataset: &Dataset,
@@ -1797,6 +1914,18 @@ struct ServeFailure {
     unserved: Vec<String>,
 }
 
+/// Where an acceleration keeps a dataset's data beyond the dataset's table,
+/// so that a later definition of the dataset's name finds it there.
+#[derive(Debug, PartialEq, Eq)]
+enum Store {
+    /// A file, folders, or another database of the engine's, where the
+    /// accelerator resolves them for the dataset.
+    Located { engine: Engine, location: String },
+    /// The one in-process instance the engine keeps every memory-mode dataset
+    /// in ([`Engine::shares_memory_instance`]).
+    SharedMemory(Engine),
+}
+
 /// What [`Runtime::retire`] serves when it cannot delete a retired dataset's
 /// acceleration data.
 #[derive(Clone, Copy, Debug)]
@@ -1861,7 +1990,7 @@ fn withholds(op: &ComponentDdlOp, failure: &ServeFailure) -> bool {
 /// applied.
 fn withheld_dataset(dataset: &str, cause: &str) -> String {
     format!(
-        "this instance does not serve dataset {} until it deletes the acceleration data an earlier definition of it left; Spice retries every {} seconds, so run the statement again once it has. Cause: {cause}",
+        "this instance does not serve dataset {} until it deletes the acceleration data stored under its name; Spice retries every {} seconds, so run the statement again once it has. Cause: {cause}",
         display_dataset_name(dataset),
         SQL_DEFINITIONS_CHECK_INTERVAL.as_secs()
     )
@@ -1885,17 +2014,31 @@ fn deletion_failed(dataset: &str, error: impl std::fmt::Display) -> String {
     )
 }
 
-/// Why a statement that retires `dataset` was not applied when its
-/// acceleration data could not be deleted, because of `error`: the dataset is
-/// left as it was, or, when this instance withholds it, still not served.
-fn undeleted_by_statement(dataset: &str, withheld: bool, error: impl std::fmt::Display) -> String {
-    if withheld {
-        withheld_dataset(dataset, &deletion_failed(dataset, error))
-    } else {
-        format!(
-            "the acceleration data of dataset {} could not be deleted, so the dataset is left as it was; run the statement again once the cause is fixed. Cause: {error}",
-            display_dataset_name(dataset)
-        )
+/// What a statement that could not delete a dataset's acceleration data
+/// left the dataset as.
+#[derive(Debug, Clone, Copy)]
+enum Undeleted {
+    /// Served before the statement, and still.
+    Served,
+    /// Not served: the statement defines the name anew.
+    New,
+    /// Withheld until a retry deletes its data.
+    Withheld,
+}
+
+/// Why a statement that retires `dataset`, or starts its store, was not
+/// applied when the acceleration data under its name could not be deleted,
+/// because of `error`, saying what the dataset is `left` as.
+fn undeleted_by_statement(dataset: &str, left: Undeleted, error: impl std::fmt::Display) -> String {
+    let shown = display_dataset_name(dataset);
+    match left {
+        Undeleted::Served => format!(
+            "the acceleration data of dataset {shown} could not be deleted, so the dataset is left as it was; run the statement again once the cause is fixed. Cause: {error}"
+        ),
+        Undeleted::New => format!(
+            "what the acceleration store of dataset {shown} holds under its name could not be deleted, so the dataset was not created; run the statement again once the cause is fixed. Cause: {error}"
+        ),
+        Undeleted::Withheld => withheld_dataset(dataset, &deletion_failed(dataset, error)),
     }
 }
 
@@ -2244,7 +2387,7 @@ mod tests {
                 "orders",
                 &deletion_failed("orders", "Permission denied (os error 13)")
             ),
-            "this instance does not serve dataset 'orders' until it deletes the acceleration data an earlier definition of it left; Spice retries every 10 seconds, so run the statement again once it has. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
+            "this instance does not serve dataset 'orders' until it deletes the acceleration data stored under its name; Spice retries every 10 seconds, so run the statement again once it has. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
         );
         let orders = Dataset::new("file:orders.csv", "orders");
         assert_eq!(
@@ -2271,17 +2414,30 @@ mod tests {
     }
 
     /// A statement whose dataset's acceleration data cannot be deleted says
-    /// that the dataset is left as it was, or, withheld, is still not served,
-    /// and when to run the statement again.
+    /// that the dataset is left as it was, that it was not created, or,
+    /// withheld, that it is still not served, and when to run the statement
+    /// again.
     #[test]
     fn a_statement_that_cannot_delete_the_data_says_what_is_served() {
         assert_eq!(
-            undeleted_by_statement("orders", false, "Permission denied (os error 13)"),
+            undeleted_by_statement(
+                "orders",
+                Undeleted::Served,
+                "Permission denied (os error 13)"
+            ),
             "the acceleration data of dataset 'orders' could not be deleted, so the dataset is left as it was; run the statement again once the cause is fixed. Cause: Permission denied (os error 13)"
         );
         assert_eq!(
-            undeleted_by_statement("orders", true, "Permission denied (os error 13)"),
-            "this instance does not serve dataset 'orders' until it deletes the acceleration data an earlier definition of it left; Spice retries every 10 seconds, so run the statement again once it has. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
+            undeleted_by_statement("orders", Undeleted::New, "Permission denied (os error 13)"),
+            "what the acceleration store of dataset 'orders' holds under its name could not be deleted, so the dataset was not created; run the statement again once the cause is fixed. Cause: Permission denied (os error 13)"
+        );
+        assert_eq!(
+            undeleted_by_statement(
+                "orders",
+                Undeleted::Withheld,
+                "Permission denied (os error 13)"
+            ),
+            "this instance does not serve dataset 'orders' until it deletes the acceleration data stored under its name; Spice retries every 10 seconds, so run the statement again once it has. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
         );
     }
 }

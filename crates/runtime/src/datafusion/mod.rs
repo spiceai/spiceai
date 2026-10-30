@@ -281,7 +281,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "The load checkpoint of dataset '{dataset_name}' could not be cleared. Cause: {source}"
+        "The acceleration store of dataset '{dataset_name}' could not be opened or cleared. Cause: {source}"
     ))]
     AccelerationDataCheckpoint {
         dataset_name: String,
@@ -5501,20 +5501,22 @@ impl DataFusion {
 
     /// Delete the acceleration data of `dataset`, which no longer serves: its
     /// engine table, checkpoint, and append cursor, so a dataset defined again
-    /// under its name loads from its source. An in-memory acceleration ended
-    /// with its table.
+    /// under its name loads from its source. That data outlives the table in a
+    /// file, another database, or the one in-process instance some engines keep
+    /// every memory-mode dataset in ([`Engine::shares_memory_instance`]); any
+    /// other in-memory acceleration ended with its table.
     ///
     /// The checkpoint goes first, and must go, as in a settings rebuild: one
     /// that outlived the table would mark the next definition's empty table
-    /// loaded. A checkpoint store that does not exist was never written; any
-    /// other failure to open it fails the deletion. Returns whether a
-    /// checkpoint was cleared: whether an earlier load had marked data there
-    /// loaded.
+    /// loaded. A checkpoint store that does not exist was never written, and a
+    /// file the engine never created holds nothing; any other failure to open
+    /// it fails the deletion. Returns whether a checkpoint was cleared: whether
+    /// an earlier load had marked data there loaded.
     pub(crate) async fn delete_acceleration_data(&self, dataset: &Dataset) -> Result<bool> {
         let Some(acceleration) = dataset.acceleration.as_ref().filter(|a| a.enabled) else {
             return Ok(false);
         };
-        if !dataset.is_file_accelerated() {
+        if !dataset.is_file_accelerated() && !acceleration.engine.shares_memory_instance() {
             return Ok(false);
         }
         let checkpoint = match dataset_checkpointer(
@@ -5528,6 +5530,7 @@ impl DataFusion {
             Ok(checkpoint) => Some(checkpoint),
             // Nothing was ever written, so there is no checkpoint to clear.
             Err(runtime_checkpoint_api::CheckpointError::NotFound { .. }) => None,
+            Err(_) if self.store_file_absent(dataset, acceleration).await => return Ok(false),
             Err(source) => {
                 return Err(Error::AccelerationDataCheckpoint {
                     dataset_name: dataset.name.to_string(),
@@ -5548,6 +5551,26 @@ impl DataFusion {
         self.drop_acceleration_for_recreate(dataset, acceleration, None)
             .await?;
         Ok(cleared)
+    }
+
+    /// Whether `dataset`'s engine keeps its data in a file, of the path the
+    /// accelerator resolves for it, that does not exist: one never created
+    /// holds nothing to delete, and opening it fails.
+    async fn store_file_absent(&self, dataset: &Dataset, acceleration: &Acceleration) -> bool {
+        if !dataset.is_file_accelerated() {
+            return false;
+        }
+        let Some(accelerator) = self
+            .accelerator_engine_registry()
+            .get_accelerator_engine(acceleration.engine)
+            .await
+        else {
+            return false;
+        };
+        let Ok(path) = accelerator.file_path(dataset) else {
+            return false;
+        };
+        matches!(tokio::fs::try_exists(&path).await, Ok(false))
     }
 
     /// Drops `source`'s accelerated table so the next create builds it again, empty,

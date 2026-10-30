@@ -35,6 +35,15 @@ impl Engine {
             other => *other,
         }
     }
+
+    /// Whether the engine keeps every memory-mode dataset in one in-process
+    /// instance, whose tables outlive the dataset that loaded them until Spice
+    /// stops: `DuckDB`, `SQLite`, and Turso share one connection pool in
+    /// memory mode, while Arrow and Cayenne end a memory table with its dataset.
+    #[must_use]
+    pub fn shares_memory_instance(&self) -> bool {
+        matches!(self, Engine::DuckDB | Engine::Sqlite | Engine::Turso)
+    }
 }
 
 /// The engine named by [`spicepod::acceleration::DEFAULT_ENGINE`]: the one an
