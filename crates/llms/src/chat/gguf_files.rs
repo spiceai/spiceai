@@ -747,6 +747,10 @@ mod tests {
             ),
             ("mtp-Qwen3.8-Flash-Next-Q8_0.gguf", Some("Q8_0")),
             ("gpt-oss-20b-MXFP4.gguf", Some("MXFP4")),
+            // a stem that is the tag alone
+            ("Q4_K_M.gguf", Some("Q4_K_M")),
+            ("UD-Q4_K_XL.gguf", Some("UD-Q4_K_XL")),
+            ("BF16-00001-of-00002.gguf", Some("BF16")),
             ("model.gguf", None),
         ] {
             assert_eq!(tag(file).as_deref(), want, "{file}");
@@ -918,6 +922,32 @@ mod tests {
         ])
     }
 
+    /// Weights named by their tag alone, beside heads named for the model, none of them
+    /// `Q8_0`: Copilot's case on #15590.
+    fn bare_tags() -> Vec<ListedFile> {
+        listing(&[
+            ("Q4_K_M.gguf", 4 * GB),
+            ("BF16.gguf", 16 * GB),
+            ("MTP/mtp-Model-Q4_K_M.gguf", GB / 10),
+            ("MTP/mtp-Model-BF16.gguf", GB / 5),
+        ])
+    }
+
+    #[test]
+    fn weights_named_by_their_tag_alone_draft_with_the_head_of_that_tag() {
+        let files = bare_tags();
+        for (name, weights, head) in [
+            ("Q4_K_M", "Q4_K_M.gguf", "MTP/mtp-Model-Q4_K_M.gguf"),
+            ("BF16", "BF16.gguf", "MTP/mtp-Model-BF16.gguf"),
+        ] {
+            let resolved = resolve(&files, &[name])
+                .unwrap_or_else(|e| panic!("'{name}' does not resolve: {e}"))
+                .unwrap_or_else(|| panic!("'{name}' names no weights"));
+            assert_eq!(resolved.weights, [weights], "{name}");
+            assert_eq!(resolved.draft, [head], "{name}");
+        }
+    }
+
     /// Two quantizations in one folder, which go by their tags.
     fn tags_in_one_folder() -> Vec<ListedFile> {
         listing(&[
@@ -1014,6 +1044,7 @@ mod tests {
                 folder_named_like_other_weights(),
             ),
             ("sharded_head", sharded_head()),
+            ("bare_tags", bare_tags()),
         ];
         let mut pinned_a_head = false;
         let mut pinned_a_sharded_head = false;
