@@ -136,7 +136,11 @@ impl BackendType {
 
 /// Test fixture that sets up a temporary directory and catalog
 pub struct TestFixture {
-    pub temp_dir: TempDir,
+    /// Shared with [`run_with_backend`], which keeps the directory until the
+    /// test's future completes: an `async move` body that names only some of
+    /// the fixture's fields captures only those, and would otherwise delete the
+    /// directory as soon as the future is built.
+    pub temp_dir: Arc<TempDir>,
     pub catalog: Arc<FixtureCatalog>,
     pub data_path: std::path::PathBuf,
     pub backend_type: BackendType,
@@ -145,7 +149,7 @@ pub struct TestFixture {
 impl TestFixture {
     /// Create a new test fixture with the specified backend
     pub async fn new(backend: BackendType) -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
+        let temp_dir = Arc::new(TempDir::new()?);
         let data_path = temp_dir.path().join("data");
         std::fs::create_dir_all(&data_path)?;
 
@@ -259,6 +263,7 @@ where
     Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
 {
     let fixture = TestFixture::new(backend).await?;
+    let _directory = Arc::clone(&fixture.temp_dir);
     test_fn(fixture).await
 }
 
