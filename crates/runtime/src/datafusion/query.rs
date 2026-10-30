@@ -6145,6 +6145,8 @@ mod tests {
             query_duration_timer: tokio::time::Instant::now(),
             query_execution_duration_timer: tokio::time::Instant::now(),
             datasets: Arc::new(HashSet::new()),
+            redacted_values: Arc::from(Vec::new()),
+            sql: None,
         };
         let stream = attach_query_tracker_to_stream(
             tracing::info_span!("sql_query"),
