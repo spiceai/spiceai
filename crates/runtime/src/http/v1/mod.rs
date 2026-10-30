@@ -398,7 +398,10 @@ fn redact_url_at(s: &str, embedded: bool) -> Option<(String, usize)> {
     }
 
     let rest = &s[authority_end..];
-    let url_len = rest.find(ends_url).unwrap_or(rest.len());
+    let mut url_len = rest.find(ends_url).unwrap_or(rest.len());
+    if embedded {
+        url_len = extend_over_quoted_secret(rest, url_len);
+    }
     let rest = &rest[..url_len];
     let (before_fragment, fragment) = rest.split_at(rest.find('#').unwrap_or(rest.len()));
     match before_fragment.split_once('?') {
@@ -423,6 +426,34 @@ fn redact_url_at(s: &str, embedded: bool) -> Option<(String, usize)> {
     }
     out.push_str(fragment);
     Some((out, authority_end + url_len))
+}
+
+/// In free text a quote ends a URL, but a secret query value can contain one
+/// (`?token=abc'def`). If the query pair that the quote cuts off is a secret,
+/// the URL is taken to run to the end of that pair (the next whitespace, `&`
+/// or `#`) so the whole value is replaced.
+fn extend_over_quoted_secret(rest: &str, url_len: usize) -> usize {
+    let Some(query_start) = rest[..url_len].find('?') else {
+        return url_len;
+    };
+    let region = &rest[..rest.find(char::is_whitespace).unwrap_or(rest.len())];
+    let mut pos = query_start + 1;
+    while pos < url_len {
+        let pair_end = region[pos..]
+            .find(['&', '#'])
+            .map_or(region.len(), |i| pos + i);
+        if pair_end > url_len {
+            return match region[pos..pair_end].split_once('=') {
+                Some((key, _)) if is_secret_query_key(key) => pair_end,
+                _ => url_len,
+            };
+        }
+        if region[pair_end..].starts_with('#') {
+            break;
+        }
+        pos = pair_end + 1;
+    }
+    url_len
 }
 
 /// `from` as the HTTP API reports it, without credentials.
@@ -1356,6 +1387,10 @@ mod tests {
             ("https://u:p@ss?SECRET@h/x", "https://h/x"),
             ("file://alice@report.csv", "file://alice@report.csv"),
             (
+                "https://alice:p'ass@h/x?token=abc'def",
+                "https://h/x?token=***",
+            ),
+            (
                 "https://h/f.csv?email=a@b.example",
                 "https://h/f.csv?email=a@b.example",
             ),
@@ -1371,6 +1406,11 @@ mod tests {
                 "bad url https://u:pa\tss@h/x and iceberg://https://u:S@h/y"
             ),
             "bad url https://h/x and iceberg://https://h/y"
+        );
+        // Apostrophes inside a password or a secret query value.
+        assert_eq!(
+            redact_message_credentials("GET 'https://alice:p'ass@h/x?token=abc'def&a=1' failed"),
+            "GET 'https://h/x?token=***&a=1' failed"
         );
     }
 
