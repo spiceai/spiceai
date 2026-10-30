@@ -171,11 +171,13 @@ async fn a_model_with_no_files_keeps_its_safetensors_offline() {
     )
     .await
     .expect_err("the safetensors shards are not in the cache");
-    assert!(
-        error
-            .to_string()
-            .contains("'model.safetensors.index.json' names 'model-00001-of-00001.safetensors'"),
-        "{error}"
+    // the shard the safetensors index names is what is missing, not a GGUF
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Failed to download model 'test' from Hugging Face repo '{REPO_ID}' (revision 'main'): `HF_HUB_OFFLINE` is set and the Hugging Face cache at '{}' does not hold 'model-00001-of-00001.safetensors', which 'model.safetensors.index.json' names. Run `hf download {REPO_ID} --revision main` while online, or unset `HF_HUB_OFFLINE`. See: https://spiceai.org/docs/components/models/huggingface",
+            cache.path().display()
+        )
     );
 }
 
