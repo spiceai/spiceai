@@ -255,30 +255,32 @@ fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn s
 /// `from` as the HTTP API reports it, without any `user[:password]@` part.
 ///
 /// A component source can carry credentials in its URL, either directly
-/// (`https://user:password@host/file.csv`) or after a connector prefix
-/// (`iceberg:https://user:password@host/v1/namespaces`). Any API key that can
-/// list components can read `from`, so the user name and password are removed
-/// before it is returned. A source without credentials is returned unchanged.
+/// (`https://user:password@host/file.csv`) or after a connector prefix with
+/// any delimiter the runtime accepts (`iceberg:https://...`,
+/// `iceberg/https://...`, `iceberg://https://...`). Any API key that can list
+/// components can read `from`, so the user name and password are removed
+/// before it is returned.
+///
+/// This is a string scan rather than a URL parse so that it fails closed: an
+/// authority that is not a valid URL (a bad port, an unknown scheme) still has
+/// its userinfo removed. Every `://` in the source starts an authority, which
+/// ends at the first `/`, `\`, `?` or `#`; everything up to the last `@` in it
+/// is dropped. A source without credentials is returned unchanged.
 pub(crate) fn redact_source_credentials(from: &str) -> String {
-    if let Some(redacted) = strip_url_userinfo(from) {
-        return redacted;
+    let mut out = String::with_capacity(from.len());
+    let mut rest = from;
+    while let Some(idx) = rest.find("://") {
+        let authority_start = idx + "://".len();
+        out.push_str(&rest[..authority_start]);
+        let after = &rest[authority_start..];
+        let authority_end = after.find(['/', '\\', '?', '#']).unwrap_or(after.len());
+        rest = match after[..authority_end].rfind('@') {
+            Some(at) => &after[at + 1..],
+            None => after,
+        };
     }
-    if let Some((prefix, rest)) = from.split_once(':')
-        && let Some(redacted) = strip_url_userinfo(rest)
-    {
-        return format!("{prefix}:{redacted}");
-    }
-    from.to_string()
-}
-
-fn strip_url_userinfo(source: &str) -> Option<String> {
-    let mut url = url::Url::parse(source).ok()?;
-    if url.username().is_empty() && url.password().is_none() {
-        return None;
-    }
-    url.set_username("").ok()?;
-    url.set_password(None).ok()?;
-    Some(url.to_string())
+    out.push_str(rest);
+    out
 }
 
 fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
@@ -1007,23 +1009,56 @@ mod tests {
         status::RuntimeStatus,
     };
 
-    /// A query the results cache refuses (e.g. one calling `random()` or
-    /// `now()`) reports `CacheDisabled`, which must emit no `X-Cache` or
-    /// `Results-Cache-Status` header rather than a misleading HIT/MISS.
     #[test]
     fn redact_source_credentials_removes_userinfo() {
-        assert_eq!(
-            redact_source_credentials("https://user:secret@files.example.com/data.csv"),
-            "https://files.example.com/data.csv"
-        );
-        assert_eq!(
-            redact_source_credentials("http://token@files.example.com:8080/data.csv"),
-            "http://files.example.com:8080/data.csv"
-        );
-        assert_eq!(
-            redact_source_credentials("iceberg:https://user:secret@catalog.example.com/v1/ns"),
-            "iceberg:https://catalog.example.com/v1/ns"
-        );
+        for (from, expected) in [
+            (
+                "https://user:secret@files.example.com/data.csv",
+                "https://files.example.com/data.csv",
+            ),
+            (
+                "http://token@files.example.com:8080/data.csv",
+                "http://files.example.com:8080/data.csv",
+            ),
+            (
+                "https://:secret@files.example.com",
+                "https://files.example.com",
+            ),
+            (
+                "postgres://user:secret@db.example.com:5432/app?sslmode=require",
+                "postgres://db.example.com:5432/app?sslmode=require",
+            ),
+            // `@` inside the password: everything up to the last `@` goes.
+            (
+                "https://user:p@ss@files.example.com/data.csv",
+                "https://files.example.com/data.csv",
+            ),
+            // Every delimiter `DatasetSpec::path` / `CatalogSpec::catalog_id` accept.
+            (
+                "iceberg:https://user:secret@catalog.example.com/v1/ns",
+                "iceberg:https://catalog.example.com/v1/ns",
+            ),
+            (
+                "iceberg/https://user:secret@catalog.example.com/v1/ns",
+                "iceberg/https://catalog.example.com/v1/ns",
+            ),
+            (
+                "iceberg://https://user:secret@catalog.example.com/v1/ns",
+                "iceberg://https://catalog.example.com/v1/ns",
+            ),
+            // Malformed authorities fail closed.
+            (
+                "https://user:secret@files.example.com:invalid/data.csv",
+                "https://files.example.com:invalid/data.csv",
+            ),
+            (
+                "iceberg:https://user:secret@catalog.example.com:bad/v1",
+                "iceberg:https://catalog.example.com:bad/v1",
+            ),
+            ("https://user:secret@", "https://"),
+        ] {
+            assert_eq!(redact_source_credentials(from), expected, "from: {from}");
+        }
     }
 
     #[test]
@@ -1031,15 +1066,24 @@ mod tests {
         for from in [
             "postgres:public.orders",
             "s3://bucket/path/trips.parquet",
+            "abfs://container/path/",
             "https://files.example.com/data.csv",
+            "https://files.example.com/users/@me/data.csv",
+            "https://files.example.com/data.csv?owner=a@example.com",
+            "https://files.example.com/data.csv#a@b",
+            "HTTPS://Files.Example.com:8443/Data.csv",
             "file:../data/orders.csv",
             "memory:store",
             "spice.ai:spiceai/quickstart/datasets/taxi_trips",
+            "",
         ] {
             assert_eq!(redact_source_credentials(from), from);
         }
     }
 
+    /// A query the results cache refuses (e.g. one calling `random()` or
+    /// `now()`) reports `CacheDisabled`, which must emit no `X-Cache` or
+    /// `Results-Cache-Status` header rather than a misleading HIT/MISS.
     #[test]
     fn disabled_results_cache_emits_no_cache_status_headers() {
         assert!(status_to_x_cache_value(CacheStatus::CacheDisabled).is_none());
