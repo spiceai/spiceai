@@ -3849,8 +3849,10 @@ mod tests {
 
         let pool =
             Arc::new(DuckDbConnectionPool::new_memory().expect("to create DuckDB connection pool"));
-        let stored = |pool: &DuckDbConnectionPool| -> Vec<String> {
-            let mut conn = pool.connect_sync().expect("to get connection from pool");
+        let stored = |pool: &Arc<DuckDbConnectionPool>| -> Vec<String> {
+            let mut conn = Arc::clone(pool)
+                .connect_sync()
+                .expect("to get connection from pool");
             let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("to get DuckDB connection");
             let mut stmt = duckdb_conn
                 .get_underlying_conn_mut()
@@ -3864,7 +3866,9 @@ mod tests {
                 .expect("to read the stored names")
         };
         {
-            let mut conn = pool.connect_sync().expect("to get connection from pool");
+            let mut conn = Arc::clone(&pool)
+                .connect_sync()
+                .expect("to get connection from pool");
             let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("to get DuckDB connection");
             duckdb_conn
                 .get_underlying_conn_mut()
