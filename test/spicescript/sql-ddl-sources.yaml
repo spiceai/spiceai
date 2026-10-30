@@ -859,14 +859,14 @@ steps:
         spicepod:
           views:
             - name: '"C6"'
-              sql: SELECT id, ts FROM "C1"
+              sql: SELECT id, ts FROM c4
               acceleration: { enabled: true, engine: sqlite, mode: file }
     only: a
   - query: SELECT id, ts FROM "C6"
     only: a
     eventually: 60s
     expect: { oracle: ref }
-    oracle-sql: SELECT id, ts FROM old
+    oracle-sql: SELECT id, ts FROM new
   - spice-exec: "CREATE TABLE c6 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'file')"
     only: a
     expect-error: "view 'C6' keeps its acceleration data in the same SQLite file"
@@ -874,7 +874,7 @@ steps:
     only: a
     consistently: 5s
     expect: { oracle: ref }
-    oracle-sql: SELECT id, ts FROM old
+    oracle-sql: SELECT id, ts FROM new
 
   # An instance that has written no acceleration file creates the first one
   # of each engine that keeps one.
