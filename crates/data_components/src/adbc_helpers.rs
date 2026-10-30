@@ -34,6 +34,102 @@ use std::sync::Arc;
 
 use crate::{FieldMetadata, metadata_enriched_table_provider};
 
+/// Secrets shorter than this are not scrubbed: replacing every occurrence of a
+/// one- or two-character string would make the message unreadable without
+/// protecting anything meaningful.
+const MIN_SCRUBBED_SECRET_LEN: usize = 4;
+
+/// Query-string and `driver_options` keys whose values are treated as secrets.
+const SECRET_KEY_MARKERS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "key",
+    "auth",
+    "credential",
+];
+
+/// The credential values an ADBC connection was configured with: the whole URI,
+/// the `password` parameter, the password (or token-only user) in the URI's
+/// userinfo, and the values of secret-looking query-string and
+/// `driver_options` keys. Each value is included both as written and
+/// percent-decoded, because a driver may echo either form.
+///
+/// Pass the result to [`scrub_connection_secrets`] before a driver error is
+/// shown to the user or logged.
+#[must_use]
+pub fn connection_secrets(
+    uri: &str,
+    password: Option<&str>,
+    driver_options: Option<&str>,
+) -> Vec<String> {
+    let mut secrets = Vec::new();
+    let mut push = |value: &str| {
+        for candidate in [
+            value.to_string(),
+            percent_encoding::percent_decode_str(value)
+                .decode_utf8_lossy()
+                .into_owned(),
+        ] {
+            if candidate.len() >= MIN_SCRUBBED_SECRET_LEN && !secrets.contains(&candidate) {
+                secrets.push(candidate);
+            }
+        }
+    };
+
+    push(uri);
+    if let Some(password) = password {
+        push(password);
+    }
+
+    // Userinfo: everything before the last `@` of the authority that follows `://`.
+    if let Some(idx) = uri.find("://") {
+        let after = &uri[idx + "://".len()..];
+        let authority_end = after.find(['/', '\\', '?', '#']).unwrap_or(after.len());
+        if let Some(at) = after[..authority_end].rfind('@') {
+            let userinfo = &after[..at];
+            match userinfo.split_once(':') {
+                Some((_user, pass)) => push(pass),
+                // A user with no password is usually a token.
+                None => push(userinfo),
+            }
+        }
+    }
+
+    let is_secret_key = |key: &str| {
+        let key = key.trim().to_ascii_lowercase();
+        SECRET_KEY_MARKERS.iter().any(|marker| key.contains(marker))
+    };
+    let query = uri
+        .split_once('?')
+        .map(|(_, q)| q.split('#').next().unwrap_or_default());
+    for pair in query
+        .into_iter()
+        .flat_map(|q| q.split(['&', ';']))
+        .chain(driver_options.into_iter().flat_map(|o| o.split(';')))
+    {
+        if let Some((key, value)) = pair.split_once('=')
+            && is_secret_key(key)
+        {
+            push(value.trim());
+        }
+    }
+
+    // Longest first, so a secret that contains another is replaced whole.
+    secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    secrets
+}
+
+/// `message` with every value from [`connection_secrets`] replaced by `***`.
+#[must_use]
+pub fn scrub_connection_secrets(message: &str, secrets: &[String]) -> String {
+    secrets.iter().fold(message.to_string(), |message, secret| {
+        message.replace(secret.as_str(), "***")
+    })
+}
+
 /// Builds the list of ADBC database options from connector parameters.
 pub fn build_db_options(
     uri: &str,
@@ -293,4 +389,53 @@ fn bigquery_information_schema_table(table_reference: &TableReference, view: &st
 
 fn bigquery_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    use super::*;
+
+    #[test]
+    fn scrub_connection_secrets_removes_uri_and_credentials() {
+        let uri = "postgresql://alice:CANARY%ZZTOKEN@db.example.com:5432/app?sslmode=require&access_token=tok-secret-1";
+        let secrets = connection_secrets(
+            uri,
+            Some("param-secret"),
+            Some("adbc.token=opt-secret;adbc.timeout=30"),
+        );
+        for message in [
+            format!("connect failed for {uri}"),
+            "invalid percent-encoded token: \"CANARY%ZZTOKEN\"".to_string(),
+            "auth failed for password param-secret".to_string(),
+            "bad token tok-secret-1 / opt-secret".to_string(),
+        ] {
+            let scrubbed = scrub_connection_secrets(&message, &secrets);
+            for secret in [
+                "CANARY",
+                "param-secret",
+                "tok-secret-1",
+                "opt-secret",
+                "alice:",
+            ] {
+                assert!(!scrubbed.contains(secret), "{secret} leaked: {scrubbed}");
+            }
+        }
+        // Non-secret query values and options are kept.
+        let message = "sslmode=require timeout 30 at db.example.com";
+        assert_eq!(scrub_connection_secrets(message, &secrets), message);
+    }
+
+    #[test]
+    fn scrub_connection_secrets_handles_token_user_and_decoded_forms() {
+        let secrets = connection_secrets("snowflake://tok%40en123@acct/db", None, None);
+        assert_eq!(
+            scrub_connection_secrets("rejected tok@en123 and tok%40en123", &secrets),
+            "rejected *** and ***"
+        );
+        let secrets = connection_secrets("file:test.db", None, None);
+        assert_eq!(
+            scrub_connection_secrets("cannot open test.db", &secrets),
+            "cannot open test.db"
+        );
+    }
 }

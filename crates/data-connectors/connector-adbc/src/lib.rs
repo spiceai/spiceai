@@ -19,6 +19,7 @@ use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::ManagedDriver;
 use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use async_trait::async_trait;
+use data_components::adbc_helpers::{connection_secrets, scrub_connection_secrets};
 use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use data_connector_api::ConnectorContext;
 use datafusion::common::TableReference;
@@ -75,18 +76,21 @@ pub enum Error {
         source: adbc_core::error::Error,
     },
 
-    #[snafu(display("Failed to create ADBC database (driver='{driver_location}'): {source}"))]
+    /// `message` is the driver's error with the connection's credentials
+    /// scrubbed; the raw error is not kept because drivers echo the URI.
+    #[snafu(display("Failed to create ADBC database (driver='{driver_location}'): {message}"))]
     UnableToCreateDatabase {
         driver_location: String,
-        source: adbc_core::error::Error,
+        message: String,
     },
 
+    /// `message` is the pool error with the connection's credentials scrubbed.
     #[snafu(display(
-        "Failed to create ADBC connection pool (driver='{driver_location}'): {source}"
+        "Failed to create ADBC connection pool (driver='{driver_location}'): {message}"
     ))]
     UnableToCreateConnectionPool {
         driver_location: String,
-        source: datafusion_table_providers::sql::db_connection_pool::Error,
+        message: String,
     },
 
     #[snafu(display(
@@ -365,6 +369,7 @@ impl AdbcFactory {
         let password = params.parameters.get("password").expose().ok();
         let driver_options = params.parameters.get("driver_options").expose().ok();
         let db_options = build_db_options(&uri_str, username, password, driver_options);
+        let secrets = connection_secrets(&uri_str, password, driver_options);
 
         let pool_identity =
             resolve_pool_identity(&driver_name_owned, &uri_str, &params).map_err(|e| {
@@ -456,12 +461,13 @@ impl AdbcFactory {
                 driver_location: driver_location.clone(),
             })?;
 
-            let db =
-                driver
-                    .new_database_with_opts(db_options)
-                    .context(UnableToCreateDatabaseSnafu {
-                        driver_location: driver_location.clone(),
-                    })?;
+            let db = driver.new_database_with_opts(db_options).map_err(|e| {
+                UnableToCreateDatabaseSnafu {
+                    driver_location: driver_location.clone(),
+                    message: scrub_connection_secrets(&e.to_string(), &secrets),
+                }
+                .build()
+            })?;
 
             let mut pool_builder = AdbcConnectionPoolBuilder::new(db)
                 .with_max_size(pool_size)
@@ -472,9 +478,13 @@ impl AdbcFactory {
                 pool_builder = pool_builder.with_conn_options(conn_opts);
             }
 
-            let pool = pool_builder
+            let pool = pool_builder.build().map_err(|e| {
+                UnableToCreateConnectionPoolSnafu {
+                    driver_location,
+                    message: scrub_connection_secrets(&e.to_string(), &secrets),
+                }
                 .build()
-                .context(UnableToCreateConnectionPoolSnafu { driver_location })?;
+            })?;
 
             Ok(Arc::new(pool))
         });
