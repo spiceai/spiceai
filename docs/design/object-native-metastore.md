@@ -285,9 +285,9 @@ commit as one record at an *acknowledgement point*: a CDC position to
 acknowledge (~2 s), a SQL `COMMIT`, a freshness bound, or a buffer size or age
 bound. The acknowledgement is sent only after the commit succeeds; losing the
 buffer loses only unacknowledged work, which the source replays. On a local
-directory each commit is fsync'd. At S3 Standard prices a dataset costs
-roughly \$17/day if every CDC burst commits (20/s), \$0.50/day at a 2 s
-cadence and \$0.02/day at 60 s. Milestone 1 keeps today's local visibility:
+directory each write is flushed before it returns. Committing every CDC burst
+would cost a dataset about 20 head writes per second; a 2 s cadence costs 0.5,
+and 60 s one a minute. Milestone 1 keeps today's local visibility:
 buffered writes are queryable on the writing node once applied.
 
 - *Option: publish at commit.* No read sees an uncommitted value, at the cost

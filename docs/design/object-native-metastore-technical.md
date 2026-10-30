@@ -183,15 +183,17 @@ one CAS ahead of its own. Across writers (Milestones 2 and 3), one CAS wins each
 version and the rest re-read and retry, so a dataset completes about one head
 replacement per round trip.
 
-**Local directories: two barriers per group commit.** A local create or CAS is
-durable across power loss: data and directory entries are synced before it
-returns, and a record references only objects whose syncs completed. Files are
-synced individually, and a barrier (one `F_FULLFSYNC` on macOS, `syncfs` on
-Linux) makes a batch durable, because a full flush per file does not scale. The objects a group references pass one barrier before the head
-that references them is written, and the head passes a second before anything is
-acknowledged. One shared barrier would let a power loss keep a head whose objects
-are gone: nothing acknowledged is lost, but the dataset fails to open until it is
-reset. The cost is two barriers per group, whatever its size.
+**Local directories: each durable write does its own full flush.** A local
+create or CAS is durable across power loss before it returns. It syncs its
+staged file, links or renames it into place, then syncs the directory, both with
+`sync_all`, which Rust's standard library implements with `F_FULLFSYNC` on
+macOS: two full flushes per write. A head is written only after every object it
+references has returned, so a power loss cannot keep a head whose objects are
+gone. A `file://` `runtime.state.location` uses the same writes. A prototype's
+durable local CAS measured P99 14.4 ms and P99.9 19.3 ms (n = 10,000; 3b06c85377,
+2026-10-28), less than an S3 PUT, so Cayenne has to perform well at object-store
+latency anyway. The cost is cut by committing less often, at acknowledgement
+points and with group commit, not by a faster flush.
 
 ```mermaid
 sequenceDiagram
@@ -235,7 +237,14 @@ Model: `commits-commit`, `commit-guards`, `commit-no-cas`, `commits-etag`, `comm
 Every record above the checkpoint that is no longer inline is in a batch the
 head lists, and that batch existed before the head stopped carrying the record.
 Records at or below the checkpoint's commit are in the checkpoint and may be reclaimed. Commit
-numbers are dense, so record `a + 1` follows record `a`.
+numbers are dense: each accepted CAS raises `commit` by exactly one, so record
+`a + 1` follows record `a`. Three rules rely on it. A writer resolving an
+uncertain write looks for its record at exactly n + 1, the commit after the
+version its CAS replaced, instead of searching. The batch index stores only each
+batch's last commit, because the next batch starts one later. And a reader can
+tell a lost record from one that never existed, because every number from the
+checkpoint to `commit` must be present. The model numbers commits densely; no
+run checks a sparse variant.
 
 - **Deterministic cut.** The batch starting at `a = first_inline` ends at
   `c = min(a + K − 1, largest c whose records a..c fit B)`. The cut depends only
@@ -1271,11 +1280,10 @@ import, and the remaining sources' positions are step 5.
 - **Change:** the catalog buffers changes and commits only at acknowledgement
   points (a CDC checkpoint, a refresh completing, a compaction or promotion
   finishing, a user write returning), answering reads from the buffer; group
-  commit; the source position in the same record as the data it covers; durable
-  local writes with two barriers per group commit; caching writes per
+  commit; the source position in the same record as the data it covers; caching writes per
   [Small writes](#small-writes).
 - **Code:** `crates/cayenne` and `object_store_occ` (commit triggers, group
-  commit, barriers); `accelerators/accelerator-cayenne/src/change_sink.rs`
+  commit); `accelerators/accelerator-cayenne/src/change_sink.rs`
   (caching writes).
 - **Exit:** commits per second and CDC freshness at P99 and P99.9 against the
   per-call baseline, interleaved, on Linux and macOS; a power-loss test on a local
@@ -1454,36 +1462,42 @@ Approaches considered and not adopted. Rejected alternatives to the decisions
 themselves are in the direction document, and the shadow log is the roadmap's
 "Replace, don't shadow".
 
-1. **A per-write publication id in the head.** Not included: the head's bytes
+1. **A shared flush per group of local writes:** a plain `fsync` per file,
+   then one `F_FULLFSYNC` (macOS) or `syncfs` (Linux) before the head and another
+   before the acknowledgement. A prototype built it and reverted it before any
+   measurement. Its power-loss safety rests on one full flush also flushing other
+   files' earlier writes from the drive cache, which nothing has shown, and no
+   power-loss test was run (unverified, code inspection only).
+2. **A per-write publication id in the head.** Not included: the head's bytes
    never repeat without it (model: `commits-etag-repeat`).
-2. **A checkpoint inside a batch**, with that batch still listed and readers
+3. **A checkpoint inside a batch**, with that batch still listed and readers
    skipping its records at or below the checkpoint. Not proposed: it complicates
    the decoder. Moving the checkpoint only to batch ends is a simplification, not a safety
    rule.
-3. **FlatBuffers**, as SlateDB's manifest uses: zero-copy reads do not help a
+4. **FlatBuffers**, as SlateDB's manifest uses: zero-copy reads do not help a
    head decoded once per poll.
-4. **Dense `seq`s, one per commit,** with an internal counter for coalescing.
+5. **Dense `seq`s, one per commit,** with an internal counter for coalescing.
    Not planned; no gain expected (code inspection only): files carry only
    per-file min/max `seq`, a mem-tier segment already carries one, and the
    allocator hands out blocks of 262,144 (`SEQ_RESERVE_BLOCK`). It would change
    the allocator and every stamping site. Option (b) of decision 3.4 is the
    closest step.
-5. **Other `seq` schemes** beyond decision 1.8's: maintenance drawing a fresh
+6. **Other `seq` schemes** beyond decision 1.8's: maintenance drawing a fresh
    `seq` (breaks the rule while the buffer holds lower ones; model:
    `seq-order-maintenance-draw`); packing a commit position and in-commit counter
    into the `i64` (a 2^20-per-commit limit, re-stamping after every commit);
    assigning `seq`s at `apply` from relative slots (PK keyset and deletion-index
    stamps rewritten after every commit); one shared counter object CASed per write
    (a round trip per write, one point of contention).
-6. **Blocking maintenance on keys an unresolved `Prepare` reserves,** instead of
+7. **Blocking maintenance on keys an unresolved `Prepare` reserves,** instead of
    the cutoff cap: it blocks compacting those files until the `Resolve`.
-7. **Stamping a `Prepare`'s actions with fresh `seq`s at `Resolve`:** it moves
+8. **Stamping a `Prepare`'s actions with fresh `seq`s at `Resolve`:** it moves
    buffered writes below them through the lost-race shift. The cap blocks no
    rewrite and re-stamps nothing.
-8. **Iceberg's form for clearing deletes** (`use-starting-sequence-number`,
+9. **Iceberg's form for clearing deletes** (`use-starting-sequence-number`,
    `remove-dangling-deletes`): it changes the `seq` on compaction outputs, which
    Cayenne's visibility code reads; `applied_through` adds a field instead.
-9. **The PK index as a separate object tagged with `as_of`:** GC removes records
+10. **The PK index as a separate object tagged with `as_of`:** GC removes records
    below the checkpoint regardless, so an older index could not be brought up to date,
    and one that misses keys can admit duplicate live rows.
 
