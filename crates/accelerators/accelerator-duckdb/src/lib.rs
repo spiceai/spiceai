@@ -1239,22 +1239,28 @@ impl DataAccelerator for DuckDBAccelerator {
                 // table), so dispatch on the actual object type, then drop every internal
                 // data table so the acceleration can be recreated cleanly with a new schema.
                 let escaped = table_name.replace('"', "\"\"");
+                let mut dropped = false;
                 if duckdb_view_exists(&tx, &table_name)? {
                     tx.execute(&format!("DROP VIEW IF EXISTS \"{escaped}\""), [])
                         .boxed()?;
+                    dropped = true;
                 } else if duckdb_table_exists(&tx, &table_name)? {
                     tx.execute(&format!("DROP TABLE IF EXISTS \"{escaped}\""), [])
                         .boxed()?;
+                    dropped = true;
                 }
                 for (internal_table, _) in list_internal_data_tables(&tx, &table_name)? {
                     let escaped_internal = internal_table.replace('"', "\"\"");
                     tx.execute(&format!("DROP TABLE IF EXISTS \"{escaped_internal}\""), [])
                         .boxed()?;
+                    dropped = true;
                 }
                 tx.commit().boxed()?;
-                tracing::info!(
-                    "Dropped DuckDB acceleration '{table_name}' (view/table + internal data tables) for schema recreation"
-                );
+                if dropped {
+                    tracing::info!(
+                        "Deleted the DuckDB acceleration data of dataset '{table_name}', so it loads again from its source."
+                    );
+                }
                 Ok(())
             },
         )

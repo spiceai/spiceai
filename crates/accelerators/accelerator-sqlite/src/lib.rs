@@ -234,26 +234,31 @@ impl SqliteAccelerator {
     }
 
     /// Returns an existing `SQLite` connection pool for the given dataset, or creates a new one if it doesn't exist.
+    /// A memory-mode dataset gets the one in-memory database that every memory-mode
+    /// dataset shares.
     /// # Errors
     ///
-    /// Returns the errors of the configuration it resolves first — the file path, the
-    /// acceleration block, the busy timeout — or a pool error when the database cannot be
+    /// Returns the errors of the configuration it resolves first — the acceleration
+    /// block, the file path, the busy timeout — or a pool error when the database cannot be
     /// opened.
     pub async fn get_shared_pool(
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<SqliteConnectionPool> {
-        let sqlite_file = self.sqlite_file_path(source)?;
-
         let acceleration = source.acceleration().context(AccelerationNotEnabledSnafu {
             dataset: source.name().to_string(),
         })?;
 
-        let mode = match acceleration.mode {
-            Mode::File | Mode::FileCreate | Mode::FileUpdate => {
-                datafusion_table_providers::sql::db_connection_pool::Mode::File
-            }
-            Mode::Memory => datafusion_table_providers::sql::db_connection_pool::Mode::Memory,
+        let (mode, sqlite_file) = match acceleration.mode {
+            Mode::File | Mode::FileCreate | Mode::FileUpdate => (
+                datafusion_table_providers::sql::db_connection_pool::Mode::File,
+                self.sqlite_file_path(source)?,
+            ),
+            // The in-memory database is found by its mode alone, and opens no file.
+            Mode::Memory => (
+                datafusion_table_providers::sql::db_connection_pool::Mode::Memory,
+                ":memory:".to_string(),
+            ),
         };
 
         let storage = if matches!(
@@ -728,16 +733,26 @@ impl DataAccelerator for SqliteAccelerator {
         };
         let table = table_name.to_string();
         let escaped = table.replace('"', "\"\"");
-        conn.conn
+        let dropped = conn
+            .conn
             .call(move |conn| {
-                conn.execute(&format!("DROP TABLE IF EXISTS \"{escaped}\""), [])?;
-                Ok::<(), rusqlite::Error>(())
+                let exists = conn
+                    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")?
+                    .query([table.as_str()])?
+                    .next()?
+                    .is_some();
+                if exists {
+                    conn.execute(&format!("DROP TABLE \"{escaped}\""), [])?;
+                }
+                Ok::<bool, rusqlite::Error>(exists)
             })
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-        tracing::info!(
-            "Dropped SQLite table '{table_name}' for schema recreation (file_update mode)"
-        );
+        if dropped {
+            tracing::info!(
+                "Deleted the SQLite acceleration data of dataset '{table_name}', so it loads again from its source."
+            );
+        }
         Ok(())
     }
 
