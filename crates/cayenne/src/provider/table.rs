@@ -11653,13 +11653,19 @@ impl CayenneTableProvider {
             "encode_permit_wait",
             encode_permit_wait_start,
         );
-        // A delta write may be granted fewer permits than shards; it encodes no
-        // wider than it paid for.
-        let encode_shards = encode_permits
-            .as_ref()
-            .map_or(shard_count, super::write_budget::EncodePermits::granted)
-            .min(shard_count)
-            .max(1);
+        // A delta write may be granted fewer permits than shards (it takes what is
+        // free rather than wait; see `write_budget::acquire_from`), and encodes no
+        // wider than it paid for. A maintenance write waits for its permits and
+        // keeps the fan-out it sized, as it always has: its permits are clamped to
+        // the maintenance slice, not its shards.
+        let encode_shards = match write_class {
+            super::delta_encoding::WriteClass::Delta => encode_permits
+                .as_ref()
+                .map_or(shard_count, super::write_budget::EncodePermits::granted)
+                .min(shard_count)
+                .max(1),
+            super::delta_encoding::WriteClass::Maintenance => shard_count,
+        };
 
         // Construct snapshot directory URL
         let snapshot_dir_url = Self::snapshot_dir_url(
