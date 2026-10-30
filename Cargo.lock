@@ -6514,6 +6514,7 @@ dependencies = [
  "delta_kernel_default_engine",
  "document_parse",
  "duckdb",
+ "duration-parse",
  "elasticsearch",
  "flate2",
  "flight_client",
@@ -7491,7 +7492,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=bd6e935eeb6abd9a84099d3ec4f6f1615b93d2db#bd6e935eeb6abd9a84099d3ec4f6f1615b93d2db"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=08947680db76482cb825861a188b5b1e6028457a#08947680db76482cb825861a188b5b1e6028457a"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -18946,6 +18947,7 @@ dependencies = [
  "datafusion-table-providers",
  "fundu",
  "futures",
+ "humantime",
  "insta",
  "object_store 0.13.2",
  "opentelemetry 0.32.0",
