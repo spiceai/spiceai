@@ -2930,10 +2930,11 @@ impl CayenneAccelerator {
     }
 
     /// The metastore holding `source`'s file-mode acceleration. An explicit
-    /// `cayenne_metastore: turso` keeps Turso. Otherwise a dataset stays on the
-    /// metastore it is already in, so turning `cayenne_vnext` on or off never
-    /// moves one; a dataset in neither goes to the object-native metastore when
-    /// `cayenne_vnext` is enabled and to SQLite when it is not.
+    /// `cayenne_metastore: turso` keeps Turso. With `cayenne_vnext` disabled every
+    /// dataset uses SQLite, as before the flag existed, and nothing is looked up.
+    /// With it enabled, a new dataset goes to the object-native metastore and a
+    /// dataset already in SQLite stays there, so enabling the flag never moves
+    /// one and disabling it again never returns one to a stale SQLite copy.
     async fn metastore_type_for(
         &self,
         source: &dyn AccelerationSource,
@@ -2947,52 +2948,40 @@ impl CayenneAccelerator {
             return Ok("turso");
         }
         // A `mode: memory` table keeps its metastore in RAM.
-        if !source.is_file_accelerated() {
+        if !source.is_file_accelerated() || !Self::vnext_enabled(source)? {
             return Ok("sqlite");
         }
         let table_name = source.name().to_string();
-        let vnext = Self::vnext_enabled(source)?;
-        // The local SQL metastore is read first: a dataset already there never
-        // waits on `runtime.state.location`, whatever the flag says.
         if path_exists(format!("{metadata_dir}/cayenne.db")).await
             && self
                 .catalog_holds(metadata_dir, "sqlite", source, &table_name)
                 .await?
         {
-            if vnext {
-                self.vnext_notice(&table_name, "stays on its existing SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled: existing datasets keep their metastore. To move it, delete its acceleration so it rebuilds from the source.");
-            }
+            self.vnext_notice(&table_name, "stays on its existing SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled: existing datasets keep their metastore. To move it, delete its acceleration so it rebuilds from the source.");
             return Ok("sqlite");
         }
-        let partitioned = source
+        if source
             .acceleration()
-            .is_some_and(|acceleration| !acceleration.partition_by.is_empty());
-        if vnext && !partitioned {
-            return Ok("object_native");
-        }
-        let in_native = self.native_catalog_exists(metadata_dir, source).await?
-            && self
-                .catalog_holds(metadata_dir, "object_native", source, &table_name)
-                .await?;
-        if in_native {
+            .is_some_and(|acceleration| !acceleration.partition_by.is_empty())
+        {
             // The object-native metastore does not hold partitioned tables yet.
-            // Moving the dataset to SQLite would serve a new, empty table and
-            // strand its rows, so it is refused instead.
+            // One already in it is refused rather than moved to a new, empty
+            // SQLite table that would strand its rows.
             ensure!(
-                !partitioned,
+                !(self.native_catalog_exists(metadata_dir, source).await?
+                    && self
+                        .catalog_holds(metadata_dir, "object_native", source, &table_name)
+                        .await?),
                 InvalidConfigurationSnafu {
                     detail: Arc::from(format!(
                         "Dataset '{table_name}' is in the object-native Cayenne metastore, which does not support `partition_by` yet. Remove `partition_by` to keep serving it, or delete its acceleration so it rebuilds on SQLite."
                     )),
                 }
             );
-            // Turning the flag off never moves a dataset out of it.
-            return Ok("object_native");
-        }
-        if vnext {
             self.vnext_notice(&table_name, "uses the SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled, because the new metastore does not support `partition_by` yet.");
+            return Ok("sqlite");
         }
-        Ok("sqlite")
+        Ok("object_native")
     }
 
     fn vnext_notice(&self, dataset: &str, outcome: &str) {

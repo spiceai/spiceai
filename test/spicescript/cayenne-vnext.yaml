@@ -2,9 +2,10 @@ name: cayenne-vnext
 description: >
   `runtime.params.cayenne_vnext: enabled` puts new Cayenne datasets on the
   object-native metastore and leaves existing ones where they are: a dataset
-  created before the flag stays on SQLite and says so, one added after it is
-  created in the object-native metastore, and turning the flag off again keeps
-  that dataset on the object-native metastore instead of rebuilding it. Every
+  created before the flag stays on SQLite and says so, and one added after it
+  is created in the object-native metastore. Turning the flag off is SQLite as
+  before the flag: that dataset rebuilds there from its source, and turning the
+  flag on again keeps it on SQLite rather than returning to its old copy. Every
   answer matches the PostgreSQL source throughout, and a value other than
   `enabled` or `disabled` stops the dataset with a message naming the param.
 
@@ -65,14 +66,24 @@ steps:
   - query: SELECT * FROM after_flag
     eventually: 60s
 
-  # The flag off: the dataset already in the object-native metastore stays there.
+  # The flag off: SQLite for every dataset, so after_flag rebuilds there.
   - restart:
       patch: { spicepod: { runtime: { params: { cayenne_vnext: disabled } } } }
-  - assert-log:
-      contains: ['Opened the Cayenne object-native metastore']
   - query: SELECT * FROM after_flag
     eventually: 60s
   - query: SELECT * FROM before_flag
+    eventually: 60s
+  - assert-log: { lacks: ['Opened the Cayenne object-native metastore'] }
+
+  # The flag on again: after_flag is now in SQLite and stays there, never back
+  # on its older object-native copy.
+  - source-exec: { src: "UPDATE after_flag SET v = 'after toggle' WHERE id % 5 = 0" }
+  - restart:
+      patch: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
+  - assert-log:
+      contains: ["Dataset 'after_flag' stays on its existing SQLite Cayenne metastore"]
+  - refresh: after_flag
+  - query: SELECT * FROM after_flag
     eventually: 60s
 
   # A value the flag does not take.
