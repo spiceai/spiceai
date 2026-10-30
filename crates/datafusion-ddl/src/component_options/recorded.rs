@@ -31,7 +31,7 @@ use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::{Dialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::keywords::{ALL_KEYWORDS, Keyword};
 use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::{
     ComponentKind, REDACTED, REDACTED_SQL, byte_offset, is_params_map, is_secret_reference,
@@ -115,7 +115,8 @@ pub fn unreadable_parts(text: &str) -> Vec<String> {
 
 /// The text inside each quote of `text`, to the quote that closes it or to the
 /// end of `text`: a `'`, `"`, or `` ` `` quote, in which a doubled quote stays
-/// inside, or a dollar quote, `$$` or `$tag$`, which the same tag closes.
+/// inside, as does a quote a backslash escapes in an escape string (`E'…'`),
+/// or a dollar quote, `$$` or `$tag$`, which the same tag closes.
 fn quoted_literals(text: &str) -> Vec<&str> {
     let mut literals = Vec::new();
     let mut rest = 0;
@@ -135,18 +136,8 @@ fn quoted_literals(text: &str) -> Vec<&str> {
             &opener[..1]
         };
         let from = start + close.len();
-        let mut end = text.len();
-        let mut at = from;
-        while let Some(found) = text[at..].find(close) {
-            let i = at + found;
-            // A doubled `'`, `"`, or `` ` `` is one quote inside the literal.
-            if close.len() == 1 && text[i + 1..].starts_with(close) {
-                at = i + 2;
-                continue;
-            }
-            end = i;
-            break;
-        }
+        let escapes = close == "'" && starts_escape_string(&text[..start]);
+        let end = literal_end(text, from, close, escapes);
         literals.push(&text[from..end]);
         rest = if end == text.len() {
             text.len()
@@ -155,6 +146,45 @@ fn quoted_literals(text: &str) -> Vec<&str> {
         };
     }
     literals
+}
+
+/// Whether `before`, the text before a `'`, ends with the `E` that makes the
+/// quote an escape string, `E'…'` or `e'…'`: an `E` that does not end a longer
+/// word.
+fn starts_escape_string(before: &str) -> bool {
+    let mut chars = before.chars().rev();
+    matches!(chars.next(), Some('E' | 'e'))
+        && !chars
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Where the literal that starts at `from` in `text` ends: at the `close` quote
+/// that ends it, or at the end of `text`. A doubled one-character quote stays
+/// inside, and so, in an escape string, does a character a backslash escapes.
+fn literal_end(text: &str, from: usize, close: &str, escapes: bool) -> usize {
+    let mut at = from;
+    loop {
+        let found = if escapes {
+            text[at..].find(['\\', '\''])
+        } else {
+            text[at..].find(close)
+        };
+        let Some(found) = found else {
+            return text.len();
+        };
+        let i = at + found;
+        if escapes && text[i..].starts_with('\\') {
+            at = i + 1 + text[i + 1..].chars().next().map_or(0, char::len_utf8);
+            continue;
+        }
+        // A doubled `'`, `"`, or `` ` `` is one quote inside the literal.
+        if close.len() == 1 && text[i + 1..].starts_with(close) {
+            at = i + 2;
+            continue;
+        }
+        return i;
+    }
 }
 
 /// `message`, an error a statement failed with or a result that repeats it,
@@ -248,12 +278,18 @@ pub fn recorded_call_arguments(arguments: &str) -> Option<(String, Vec<String>)>
     Some((value.to_string(), removed))
 }
 
-/// Take `removed` out of every string of `value`.
+/// Take `removed` out of every string, number, and object key of `value`. A
+/// number that held one is recorded as a string.
 fn redact_json_strings(value: &mut Value, removed: &[String]) {
     match value {
         Value::String(text) => {
             if let Cow::Owned(redacted) = redact_values(text, removed) {
                 *text = redacted;
+            }
+        }
+        Value::Number(number) => {
+            if let Cow::Owned(redacted) = redact_values(&number.to_string(), removed) {
+                *value = Value::String(redacted);
             }
         }
         Value::Array(items) => {
@@ -262,12 +298,30 @@ fn redact_json_strings(value: &mut Value, removed: &[String]) {
             }
         }
         Value::Object(map) => {
-            for item in map.values_mut() {
-                redact_json_strings(item, removed);
+            for (key, mut item) in std::mem::take(map) {
+                redact_json_strings(&mut item, removed);
+                let key = match redact_values(&key, removed) {
+                    Cow::Owned(redacted) => redacted,
+                    Cow::Borrowed(_) => key,
+                };
+                let key = unused_key(map, key);
+                map.insert(key, item);
             }
         }
         _ => {}
     }
+}
+
+/// `key`, or, when `map` holds it already, `key` with the first ` (n)` after it
+/// that `map` does not hold: two keys that redact alike stay two.
+fn unused_key(map: &Map<String, Value>, key: String) -> String {
+    if !map.contains_key(&key) {
+        return key;
+    }
+    (2_usize..)
+        .map(|n| format!("{key} ({n})"))
+        .find(|candidate| !map.contains_key(candidate))
+        .unwrap_or_default()
 }
 
 /// Record each statement in the strings of `value`, as

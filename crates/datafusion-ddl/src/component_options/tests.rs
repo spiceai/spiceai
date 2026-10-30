@@ -1289,6 +1289,19 @@ fn an_unreadable_statement_gives_up_each_literal_whole() {
         unreadable_parts("x = 'it''s ok"),
         ["it''s ok", "'it''s", "it''s"]
     );
+    // In an escape string, a quote a backslash escapes stays inside.
+    let cut_short = r"CREATE TABLE t WITH (from = 'x', pg_pass = E'zqy\'x qjx wkq";
+    let parts = unreadable_parts(cut_short);
+    assert_eq!(parts, [r"zqy\'x qjx wkq", "pg_pass", r"E'zqy\'x"]);
+    assert_eq!(
+        redact_values(&format!("refused: {cut_short}"), &parts),
+        "refused: CREATE TABLE t WITH (from = 'x', <redacted> = E'<redacted>"
+    );
+    // A word that ends in `E` does not start one.
+    assert_eq!(
+        unreadable_parts(r"x = THE'abcd\'efgh ij"),
+        [r"abcd\", r"THE'abcd\'efgh"]
+    );
 }
 
 /// Another argument of a call that repeats a value its statement gave up, such
@@ -1302,5 +1315,19 @@ fn a_calls_other_arguments_give_up_its_statements_values() {
     assert_eq!(
         recorded,
         r#"{"query":"CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = '<redacted>')","confirmation":"password <redacted>"}"#
+    );
+}
+
+/// A number or an object key of a call that repeats a value its statement gave
+/// up gives it up too; two keys that redact alike stay two.
+#[test]
+fn a_calls_numbers_and_keys_give_up_its_statements_values() {
+    let (recorded, _) = recorded_call_arguments(
+        r#"{"query":"CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = '918273645')","confirmation":918273645,"meta":{"pw 918273645":true,"pw <redacted>":false},"count":3}"#,
+    )
+    .expect("the call holds a statement that defines a component");
+    assert_eq!(
+        recorded,
+        r#"{"query":"CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = '<redacted>')","confirmation":"<redacted>","meta":{"pw <redacted>":true,"pw <redacted> (2)":false},"count":3}"#
     );
 }

@@ -328,6 +328,29 @@ steps:
       body: SELECT task, input, captured_output, error_message FROM runtime.task_history WHERE task IN ('tool_use::peer2__query', 'tool_use::peer__sql') AND (input LIKE '%t14%' OR error_message LIKE '%t15%') ORDER BY task
     expect: { status: 200, body-matches: 'TABLE t14[\s\S]*TABLE t15', body-lacks: ['leak-', 'zqx', 'qjv', 'wkp'] }
     eventually: 30s
+  # A call whose number and object key repeat the password its statement
+  # sets, and a statement cut short inside an escape string whose escaped
+  # quote comes before the rest of its password.
+  - http:
+      method: POST
+      path: /v1/tools/peer2__query
+      headers: { content-type: application/json }
+      body: '{"query": "CREATE TABLE t16 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''918273645'')", "confirmation": 918273645, "meta": {"pw 918273645": true}}'
+    expect: { body-contains: t16 }
+  - http:
+      method: POST
+      path: /v1/tools/peer__sql
+      headers: { content-type: application/json }
+      body: '{"query": "CREATE TABLE t17 WITH (from = ''postgres:public.t'', pg_pass = E''zqy\\''x qjx wkq"}'
+    expect: { body-contains: t17 }
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SELECT task, input, captured_output, error_message FROM runtime.task_history WHERE task IN ('tool_use::peer2__query', 'tool_use::peer__sql') AND (input LIKE '%t16%' OR error_message LIKE '%t17%') ORDER BY task
+    expect: { status: 200, body-matches: 'TABLE t16[\s\S]*TABLE t17', body-lacks: ['918273645', 'zqy', 'qjx', 'wkq'] }
+    eventually: 30s
   # Every row of task history, every column a value can reach.
   - http:
       method: POST
