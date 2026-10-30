@@ -453,7 +453,13 @@ async fn commit_fused(
             .iter()
             .filter_map(PreparedTxnCommit::catalog_publication)
             .collect();
-        match catalog.commit_publications(&publications).await {
+        // A transaction's COMMIT is acknowledged to the caller, so its metastore
+        // change commits now rather than waiting in a buffering catalog.
+        let committed = match catalog.commit_publications(&publications).await {
+            Ok(()) => catalog.commit_pending().await,
+            Err(e) => Err(e),
+        };
+        match committed {
             Ok(()) => {
                 // Durably committed — disarm each publish's abort cleanup so its
                 // `Drop` does not delete the now-live deletion-vector files.

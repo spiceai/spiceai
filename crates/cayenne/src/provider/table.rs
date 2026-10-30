@@ -36081,7 +36081,14 @@ impl CayenneTableProvider {
             // lifecycle; pass only the capture-scoped `write` guard to `inner`.
             let write = guards.write.take();
             let inner_start = Instant::now();
-            let result = self.checkpoint_mem_tier_inner(write).await;
+            // The checkpoint's metastore changes commit as one record, before
+            // `fire_slot_advancer` acknowledges the source.
+            let result =
+                crate::catalog::with_deferred_commits(self.checkpoint_mem_tier_inner(write)).await;
+            let result = match (result, self.catalog().commit_pending().await) {
+                (Ok(_), Err(error)) => Err(error.into()),
+                (result, _) => result,
+            };
             (
                 result,
                 capture_lock_ms,
@@ -37595,6 +37602,16 @@ impl CayenneTableProvider {
     /// up (memory mode). A no-op in file mode / when the runtime did not install
     /// a handle.
     pub(crate) async fn fire_slot_advancer(&self, durable_epoch: u64) {
+        // The source is acknowledged below, so the metastore changes this
+        // checkpoint made must be committed first. A failed commit acknowledges
+        // nothing: the source replays from its last acknowledged position.
+        if let Err(error) = self.catalog().commit_pending().await {
+            tracing::error!(
+                "Dataset '{}' could not commit its checkpoint to the metastore, so its source is not acknowledged and replays these changes after a restart: {error}",
+                self.table_name()
+            );
+            return;
+        }
         // Record the durable high-watermark (encoded `epoch + 1`, monotone via
         // `fetch_max`) so the `nothing_to_flush` path can RE-fire the advancer for
         // a source committer queued after this flush already drained its epoch —

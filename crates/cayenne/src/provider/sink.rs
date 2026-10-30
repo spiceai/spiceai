@@ -156,6 +156,24 @@ impl DataSink for CayenneDataSink {
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> DFResult<u64> {
+        let rows = self.write_all_uncommitted(data, context).await?;
+        // A write that returns has been acknowledged to its caller, so every
+        // metastore change it made must be committed first.
+        self.table
+            .catalog()
+            .commit_pending()
+            .await
+            .map_err(|source| datafusion_common::DataFusionError::External(Box::new(source)))?;
+        Ok(rows)
+    }
+}
+
+impl CayenneDataSink {
+    async fn write_all_uncommitted(
+        &self,
+        data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+    ) -> DFResult<u64> {
         self.table
             .ensure_publication_outcome_known()
             .map_err(datafusion_common::DataFusionError::from)?;

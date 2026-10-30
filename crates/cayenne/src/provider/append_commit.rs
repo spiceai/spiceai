@@ -182,7 +182,13 @@ async fn commit_metadata(
 ) -> std::result::Result<(), Failure> {
     for attempt in 1..=DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS {
         let publications: Vec<_> = prepared.catalog_publication().into_iter().collect();
-        match catalog.commit_publications(&publications).await {
+        // The append is acknowledged when this returns, so its metastore change
+        // commits now rather than waiting in a buffering catalog.
+        let committed = match catalog.commit_publications(&publications).await {
+            Ok(()) => catalog.commit_pending().await,
+            Err(error) => Err(error),
+        };
+        match committed {
             Ok(()) => {
                 prepared.mark_catalog_committed();
                 return Ok(());

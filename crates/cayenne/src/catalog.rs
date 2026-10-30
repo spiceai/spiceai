@@ -304,10 +304,31 @@ pub struct CatalogPublication {
     pub dirty_pk_bytes: Vec<Vec<u8>>,
 }
 
+tokio::task_local! {
+    static DEFERRED_COMMITS: ();
+}
+
+/// Run `work` with its metastore changes deferred: a catalog that buffers may
+/// commit them as one record at the next [`MetadataCatalog::commit_pending`],
+/// instead of one commit per change. The caller must call `commit_pending`
+/// before acknowledging anything that depends on them.
+pub async fn with_deferred_commits<F: std::future::Future>(work: F) -> F::Output {
+    DEFERRED_COMMITS.scope((), work).await
+}
+
+/// Whether the current task is inside [`with_deferred_commits`].
+#[must_use]
+pub fn commits_deferred() -> bool {
+    DEFERRED_COMMITS.try_with(|()| ()).is_ok()
+}
+
 /// Trait for metadata catalog operations.
 ///
 /// This trait provides the core operations needed to manage a Cayenne catalog,
 /// including table creation and file tracking.
+///
+/// A catalog may defer committing a change only inside [`with_deferred_commits`];
+/// everywhere else, a change is durable when its method returns.
 #[async_trait]
 pub trait MetadataCatalog: Send + Sync {
     /// Access backend-specific operations through a concrete catalog reference.
@@ -315,6 +336,12 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Commit every table publication together, or leave all tables unchanged.
     async fn commit_publications(&self, publications: &[CatalogPublication]) -> CatalogResult<()>;
+
+    /// Make every change accepted so far durable, before something that depends
+    /// on it is acknowledged: a source position, a returned write. A catalog that
+    /// makes each change durable as it is accepted returns at once. No default, so
+    /// every implementation (and every wrapper) answers it explicitly.
+    async fn commit_pending(&self) -> CatalogResult<()>;
 
     /// Page undelivered write-back markers by sequence and primary key.
     async fn list_pending_write_back(

@@ -3231,6 +3231,11 @@ created_at: row.get_string(5)?,
 
 #[async_trait]
 impl MetadataCatalog for CayenneCatalog {
+    async fn commit_pending(&self) -> CatalogResult<()> {
+        // Every SQL transaction commits before its method returns.
+        Ok(())
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

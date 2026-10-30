@@ -59,7 +59,18 @@ struct Inner {
     since_floor: Vec<(u64, Vec<Record>)>,
     /// The commit of the last checkpoint staged; its floor publishes with the next commit.
     staged_checkpoint: u64,
+    /// Changes accepted and visible on this node but not yet committed. They commit
+    /// as one record at the next acknowledgement point (`flush`), or when they reach
+    /// the size or age bound.
+    pending: Vec<Action>,
+    pending_bytes: usize,
+    pending_since: Option<std::time::Instant>,
 }
+
+/// Commit buffered changes once they are this large or this old, even before an
+/// acknowledgement point asks for them.
+const PENDING_MAX_BYTES: usize = 256 * 1024;
+const PENDING_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Head-log tuning for a native catalog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -279,6 +290,9 @@ impl ObjectNativeCatalog {
                     floor_state,
                     since_floor,
                     staged_checkpoint: 0,
+                    pending: Vec::new(),
+                    pending_bytes: 0,
+                    pending_since: None,
                 })),
             },
         })
@@ -417,9 +431,44 @@ impl Inner {
             }
         }
         let record = Record { actions };
-        // Validate on a private copy; only the successful head CAS publishes it.
+        // Validate on a private copy, so a refused change leaves the state as it was.
         let mut next = self.reader.state.clone();
         next.apply(&record).map_err(invalid)?;
+        self.reader.state = next;
+        self.pending_bytes += record.encoded_len();
+        self.pending.extend(record.actions);
+        let since = *self
+            .pending_since
+            .get_or_insert_with(std::time::Instant::now);
+        // Outside a deferred scope a change is durable when its method returns.
+        if !crate::catalog::commits_deferred()
+            || self.pending_bytes >= PENDING_MAX_BYTES
+            || since.elapsed() >= PENDING_MAX_AGE
+        {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    /// Commit every buffered change as one record. Nothing that depends on a
+    /// buffered change may be acknowledged before this returns `Ok`.
+    async fn flush(&mut self) -> CatalogResult<()> {
+        if self.poisoned {
+            return Err(invalid(
+                "catalog requires reopening after an uncertain or fenced commit",
+            ));
+        }
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let record = Record {
+            actions: std::mem::take(&mut self.pending),
+        };
+        self.pending_bytes = 0;
+        self.pending_since = None;
+        // Buffered changes are already applied on this node. If this record does
+        // not commit, they must never be acknowledged: the catalog refuses all
+        // further work until it is reopened from what did commit.
         self.poisoned = true;
         let attempt = self
             .writer
@@ -429,7 +478,6 @@ impl Inner {
         // Refuse subsequent mutations unless this exact attempt is accepted.
         match self.publish(&attempt).await? {
             Outcome::Accepted { commit } => {
-                self.reader.state = next;
                 self.poisoned = false;
                 self.since_floor.push((commit, vec![record]));
                 // The commit is acknowledged whatever happens to the checkpoint: a
@@ -484,6 +532,10 @@ impl Inner {
 impl MetadataCatalog for ObjectNativeCatalog {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    async fn commit_pending(&self) -> CatalogResult<()> {
+        self.inner.take().await.flush().await
     }
 
     async fn commit_publications(
@@ -583,7 +635,9 @@ impl MetadataCatalog for ObjectNativeCatalog {
         self.read().await?.reader.init().await
     }
     async fn shutdown(&self) -> CatalogResult<()> {
-        self.read().await?.reader.shutdown().await
+        let mut inner = self.inner.take().await;
+        inner.flush().await?;
+        inner.reader.shutdown().await
     }
     async fn list_table_names(&self) -> CatalogResult<Vec<String>> {
         self.read().await?.reader.list_table_names().await
@@ -1700,6 +1754,8 @@ impl ObjectNativeCatalog {
     /// # Errors
     /// Returns an error when the commit is not accepted.
     pub async fn set_sidecar_value(&self, key: &str, value: Option<Vec<u8>>) -> CatalogResult<()> {
+        // A saved position is an acknowledgement point: it commits in the same
+        // record as every buffered change it covers.
         let mut inner = self.inner.take().await;
         let clear = value.is_none();
         inner
@@ -1711,7 +1767,8 @@ impl ObjectNativeCatalog {
                     clear,
                 },
             ))])
-            .await
+            .await?;
+        inner.flush().await
     }
 
     pub(crate) async fn create_identified(

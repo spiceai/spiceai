@@ -536,3 +536,65 @@ async fn an_aborted_overwrite_leaves_the_provider_on_the_catalogs_snapshot_impl(
 }
 
 test_with_backends!(an_aborted_overwrite_leaves_the_provider_on_the_catalogs_snapshot_impl);
+
+/// Records the highest durable epoch a checkpoint reported.
+#[derive(Default)]
+struct RecordingSlotAdvancer {
+    durable: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl SlotAdvancer for RecordingSlotAdvancer {
+    async fn on_checkpoint_durable(&self, durable_epoch: u64) {
+        self.durable.fetch_max(durable_epoch, Ordering::SeqCst);
+    }
+}
+
+/// A checkpoint acknowledges its source only after the metastore changes it made
+/// are committed. Once the slot has advanced, a crash (no shutdown) followed by a
+/// reopen of the metastore from storage must still serve every checkpointed row:
+/// the source will not send them again.
+async fn a_checkpoint_commits_its_metastore_changes_before_acknowledging_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
+    const NAME: &str = "checkpoint_before_ack";
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            catalog,
+            memory_tier_options(&fixture, NAME, &id_value_schema()),
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    let advancer = Arc::new(RecordingSlotAdvancer::default());
+    table.install_slot_advancer(Arc::clone(&advancer) as Arc<dyn SlotAdvancer>);
+
+    cdc_apply(&table, id_value_batch(&[(1, 10), (2, 20)])?).await?;
+    table.checkpoint_mem_tier().await?;
+    assert!(
+        advancer.durable.load(Ordering::SeqCst) > 0,
+        "precondition: the checkpoint must acknowledge the source"
+    );
+
+    // Crash: the provider goes away without a shutdown, so nothing is flushed on
+    // the way out, and the metastore is reopened from what was committed.
+    drop(table);
+    let reopened_catalog = common::fixture_catalog(fixture.connection_string()).await?;
+    reopened_catalog.init().await?;
+    let reopened = Arc::new(
+        CayenneTableProviderBuilder::new(reopened_catalog, ctx.runtime_env())
+            .open(NAME)
+            .await?,
+    );
+    assert_eq!(
+        table_rows(&reopened).await?,
+        ["1,10", "2,20"],
+        "rows whose source was acknowledged must survive a crash"
+    );
+    Ok(())
+}
+
+test_with_backends!(a_checkpoint_commits_its_metastore_changes_before_acknowledging_impl);

@@ -33,8 +33,18 @@ use tempfile::TempDir;
 
 pub type FixtureCatalog = dyn MetadataCatalog;
 
+/// In-memory object stores for `CAYENNE_TEST_CATALOG=native`, one per fixture, so a
+/// test that reopens its catalog finds the same objects.
+static NATIVE_STORES: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, Arc<object_store::memory::InMemory>>>,
+> = std::sync::LazyLock::new(Default::default);
+
 /// Select a catalog only inside the integration harness. Reopens use the same
-/// durable object directory; the native branch never constructs a SQL catalog.
+/// object store; the native branches never construct a SQL catalog.
+///
+/// - `native`: an in-memory object store, so suite speed does not depend on fsync.
+/// - `native-durable`: an fsync'd local directory, for durable-write coverage.
+/// - `native-nosync`: the same directory without fsync, to measure what durability costs.
 pub async fn fixture_catalog(
     connection_string: String,
 ) -> Result<Arc<FixtureCatalog>, Box<dyn std::error::Error>> {
@@ -42,7 +52,7 @@ pub async fn fixture_catalog(
         Err(std::env::VarError::NotPresent) | Ok("sqlite") => {
             Ok(Arc::new(CayenneCatalog::new(connection_string)?))
         }
-        Ok(selection @ ("native" | "native-nosync")) => {
+        Ok(selection @ ("native" | "native-durable" | "native-nosync")) => {
             use cayenne::metastore::object_native::ObjectNativeCatalog;
             use object_store::{ObjectStore, ObjectStoreExt, path::Path};
             let database = connection_string
@@ -50,12 +60,20 @@ pub async fn fixture_catalog(
                 .ok_or("native harness requires a local SQLite fixture path")?;
             let directory = std::path::PathBuf::from(format!("{database}.native"));
             tokio::fs::create_dir_all(&directory).await?;
-            // `native-nosync` skips fsync, to measure what durability costs.
-            let store: Arc<dyn ObjectStore> = Arc::new(if selection == "native-nosync" {
-                object_store_occ::LocalConditionalPut::new(&directory)?
-            } else {
-                object_store_occ::LocalConditionalPut::new_durable(&directory)?
-            });
+            let store: Arc<dyn ObjectStore> = match selection {
+                "native" => Arc::clone(
+                    NATIVE_STORES
+                        .lock()
+                        .entry(database.to_string())
+                        .or_insert_with(|| Arc::new(object_store::memory::InMemory::new())),
+                ) as Arc<dyn ObjectStore>,
+                "native-nosync" => {
+                    Arc::new(object_store_occ::LocalConditionalPut::new(&directory)?)
+                }
+                _ => Arc::new(object_store_occ::LocalConditionalPut::new_durable(
+                    &directory,
+                )?),
+            };
             let prefix = Path::from("catalog");
             // Tiny batches and a checkpoint at every sealed batch, so the suites
             // seal, checkpoint and reopen from checkpoint roots constantly.

@@ -144,6 +144,11 @@ impl ShadowCatalog {
 
 #[async_trait]
 impl MetadataCatalog for ShadowCatalog {
+    async fn commit_pending(&self) -> CatalogResult<()> {
+        // Read-only: there is never anything pending.
+        Ok(())
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
