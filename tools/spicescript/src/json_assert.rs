@@ -284,12 +284,11 @@ fn number_failure(
 /// `7.0`), and containers compare member by member under the same rule.
 fn json_equal(got: &Value, want: &Value) -> bool {
     match (got, want) {
-        (Value::Number(a), Value::Number(b)) => match (a.as_i64(), b.as_i64()) {
+        (Value::Number(a), Value::Number(b)) => match (integer(a), integer(b)) {
             (Some(a), Some(b)) => a == b,
-            _ => match (a.as_u64(), b.as_u64()) {
-                (Some(a), Some(b)) => a == b,
-                _ => a.as_f64() == b.as_f64(),
-            },
+            (Some(int), None) => b.as_f64().is_some_and(|float| float_is(float, int)),
+            (None, Some(int)) => a.as_f64().is_some_and(|float| float_is(float, int)),
+            (None, None) => a.as_f64() == b.as_f64(),
         },
         (Value::Array(a), Value::Array(b)) => {
             a.len() == b.len() && a.iter().zip(b).all(|(x, y)| json_equal(x, y))
@@ -297,6 +296,31 @@ fn json_equal(got: &Value, want: &Value) -> bool {
         (Value::Object(a), Value::Object(b)) => objects_equal(a, b),
         _ => got == want,
     }
+}
+
+/// A JSON integer, signed or unsigned, without rounding.
+fn integer(number: &serde_json::Number) -> Option<i128> {
+    number
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| number.as_u64().map(i128::from))
+}
+
+/// Whether `float` is exactly the integer `int`. The integer is never rounded
+/// to a float: a float is converted only when it is a whole number within
+/// `i128`'s range, where that conversion is exact.
+fn float_is(float: f64, int: i128) -> bool {
+    // 2^127; `i128::MAX as f64` rounds up to it, so the upper bound is exclusive.
+    const LIMIT: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+    if float.fract() != 0.0 || !(-LIMIT..LIMIT).contains(&float) {
+        return false;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a whole number in [-2^127, 2^127) converts to i128 exactly"
+    )]
+    let whole = float as i128;
+    whole == int
 }
 
 fn objects_equal(a: &Map<String, Value>, b: &Map<String, Value>) -> bool {
@@ -504,6 +528,29 @@ mod tests {
             let value: Value = yaml::from_str(yaml).expect("yaml");
             let err = JsonAssertion::parse(value).expect_err("rejected");
             assert_eq!(err.to_string(), error, "{yaml}");
+        }
+    }
+
+    /// Mixed integer and float operands compare by exact value, in either
+    /// order: a float equals an integer only when it is that integer.
+    #[test]
+    fn numbers_compare_exactly_across_integer_and_float() {
+        let num = |text: &str| -> Value { serde_json::from_str(text).expect("number") };
+        for (a, b, equal) in [
+            ("7", "7.0", true),
+            ("-7", "-7.0", true),
+            ("7", "7.5", false),
+            ("9007199254740993", "9007199254740992.0", false),
+            ("9007199254740992", "9007199254740992.0", true),
+            ("-9007199254740993", "-9007199254740992.0", false),
+            ("18446744073709551615", "18446744073709551616.0", false),
+            ("18446744073709551615", "-1", false),
+            ("9223372036854775807", "9223372036854775808.0", false),
+            ("-9223372036854775808", "-9223372036854775808.0", true),
+            ("1", "1e300", false),
+        ] {
+            assert_eq!(json_equal(&num(a), &num(b)), equal, "{a} vs {b}");
+            assert_eq!(json_equal(&num(b), &num(a)), equal, "{b} vs {a}");
         }
     }
 
