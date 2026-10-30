@@ -243,6 +243,35 @@ mod test {
         let _ = both_agree("sink", None);
     }
 
+    /// Internal tables reach Cayenne through `InternalAccelerationSource`; that must
+    /// not relax Cayenne's refusal of a table with no source at all.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn cayenne_still_requires_a_source() {
+        let rt = crate::Runtime::builder().build().await;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
+        let Err(err) = rt
+            .accelerator_engine_registry()
+            .create_accelerator_table(
+                "no_source".into(),
+                schema,
+                None,
+                &crate::internal_table::internal_acceleration(),
+                Arc::new(RwLock::new(Secrets::new())),
+                None,
+                Arc::clone(&rt.df.ctx),
+            )
+            .await
+        else {
+            panic!("Cayenne created a table with no source");
+        };
+        assert!(
+            err.to_string()
+                .contains("Source required for Cayenne accelerator"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn test_cayenne_pk_conflict_detection_none_suppresses_auto_on_conflict() {
         let acceleration_settings = Acceleration {

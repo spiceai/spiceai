@@ -20,7 +20,9 @@ use std::sync::Arc;
 use arrow::datatypes::Schema;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool, TrackConsumersPool};
 use snafu::prelude::*;
+use std::num::NonZeroUsize;
 use tokio::sync::RwLock;
 
 use crate::Runtime;
@@ -68,6 +70,33 @@ pub enum Error {
     },
 }
 
+/// The most memory the internal tables together hold before their memory pool
+/// refuses an allocation.
+const INTERNAL_TABLE_MEMORY_MAX_BYTES: u64 = 1 << 30;
+
+/// The memory budget of the internal tables: a tenth of `total_memory`, at most
+/// [`INTERNAL_TABLE_MEMORY_MAX_BYTES`].
+#[must_use]
+pub(crate) fn internal_table_memory_bytes(total_memory: u64) -> u64 {
+    (total_memory / 10).min(INTERNAL_TABLE_MEMORY_MAX_BYTES)
+}
+
+/// The memory pool the internal tables are created with (see
+/// [`crate::datafusion::DataFusion::internal_table_context`]), separate from the
+/// query memory pool.
+pub(crate) fn internal_table_memory_pool(total_memory: u64) -> Arc<dyn MemoryPool> {
+    let Some(top_consumers) = NonZeroUsize::new(5) else {
+        unreachable!("5 is not zero");
+    };
+    // The runtime supports only 64-bit platforms, so the cast does not truncate.
+    #[expect(clippy::cast_possible_truncation)]
+    let bytes = internal_table_memory_bytes(total_memory) as usize;
+    Arc::new(TrackConsumersPool::new(
+        GreedyMemoryPool::new(bytes),
+        top_consumers,
+    ))
+}
+
 /// The acceleration of an internal table (`runtime.task_history`,
 /// `runtime.metrics`): Cayenne in memory, so nothing it holds is written to disk.
 #[must_use]
@@ -110,12 +139,18 @@ impl InternalAccelerationSource {
                 source: format!("internal table {name} must be accelerated in memory").into(),
             });
         }
-        let app = runtime.app().read().await.as_ref().map(Arc::clone).ok_or_else(|| {
-            Error::Internal {
-                code: "IT-IAS-GA".to_string(), // InternalTable - InternalAccelerationSource - GetApp
-                source: "No App instance found in Runtime".into(),
-            }
-        })?;
+        let app = runtime
+            .app()
+            .read()
+            .await
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                Error::Internal {
+                    code: "IT-IAS-GA".to_string(), // InternalTable - InternalAccelerationSource - GetApp
+                    source: "No App instance found in Runtime".into(),
+                }
+            })?;
         Ok(Self {
             app,
             name,
@@ -277,7 +312,7 @@ pub async fn create_internal_accelerated_table(
             &acceleration,
             secrets,
             Some(&source),
-            Arc::clone(&runtime.df.ctx),
+            runtime.df.internal_table_context(),
         )
         .await
         .context(UnableToCreateAcceleratedTableProviderSnafu)?;
@@ -303,4 +338,18 @@ pub async fn create_internal_accelerated_table(
         .context(UnableToBuildAcceleratedTableSnafu)?;
 
     Ok(Arc::new(accelerated_table))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::internal_table_memory_bytes;
+
+    #[test]
+    fn internal_tables_get_a_tenth_of_memory_up_to_one_gib() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(internal_table_memory_bytes(4 * GIB), 4 * GIB / 10);
+        assert_eq!(internal_table_memory_bytes(10 * GIB), GIB);
+        assert_eq!(internal_table_memory_bytes(256 * GIB), GIB);
+        assert_eq!(internal_table_memory_bytes(0), 0);
+    }
 }
