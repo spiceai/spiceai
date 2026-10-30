@@ -59,7 +59,8 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `commits-etag` | Explicit store-version CAS and delayed retry across head changes; I1–I3, I5 | Exhaustive/control 1; one writer, one original/retry pair |
 | `commits-storage` | Checkpoint parts/root before head publication, delayed GC, a query kept by retention, lagging reopen, late seal; I4, I7, I8 | Bound 2; samples 4 |
 | `transactions-txn` | Two datasets, one transaction, competing ordinary writes, reservations, commit/abort create race, helper Resolve, uncertain CAS, checkpoint/GC; one participant writes other keys while prepared so the Prepare can reach a checkpoint; I3–I6, I8 | Exhaustive 1 (two lease generations), controls 0 except owner restriction 1; samples 2, 3 (two outstanding handles per dataset) |
-| `intent-roll-forward*` | Proposed single-writer alternative to two-phase commit: one writer holding both datasets' leases commits A's actions, the source position and a pending intent for B in one A record, applies the intent to B under the transaction id, optionally marks it done in A; the next lease holder rolls pending intents forward. Maintenance on either head, delayed/duplicate CAS, lost responses resolved by attempt id, crash, pause and fencing; atomicity, at-most-once B apply, acknowledged/positioned transactions in both datasets at quiescence, I2, no retraction, B values in commit-point order, I5 | 1 or 2 source transactions on one key; one maintenance commit per dataset; one turnover and one crash (`two-takeovers`: two each); 2 copies per request; `disjoint-writer` adds one keyed write to another key of B |
+| `intent-roll-forward*` (single writer) | Proposed single-writer alternative to two-phase commit: one writer holding both datasets' leases commits A's actions, the source position and a pending intent for B in one A record, applies the intent to B under the transaction id, optionally marks it done in A; the next lease holder rolls pending intents forward. Maintenance on either head, delayed/duplicate CAS, lost responses resolved by attempt id, crash, pause and fencing; atomicity, at-most-once B apply, acknowledged/positioned transactions in both datasets at quiescence, I2, no retraction, B values in commit-point order, I5 | 1 or 2 source transactions on one key; one maintenance commit per dataset; one turnover and one crash (`two-takeovers`: two each); 2 copies per request; `disjoint-writer` adds one keyed write to another key of B |
+| `intent-roll-forward-partitioned*` | Optional capability: the same fast path with one exclusive writer per source partition over shared A and B heads. Each head records every partition's writer generation, so a partition turnover is a head commit on A and then on B; each transaction writes only its partition's key in both datasets; each partition writer commits its intent with its partition's source position in A, then applies it to B by transaction id; a lost CAS on either head is rebased after a footprint check of the winners against the intent's keys. Crash, pause, turnover and handoff are per partition; the partition's next owner rolls only that partition's intents forward before ingesting it, while the other partition keeps committing. Delayed/duplicate CAS and lost responses resolved by attempt id; atomicity, at-most-once B apply, acknowledged and per-partition positioned transactions in both datasets at quiescence, I2 per partition, per-key B values in commit-point order, no stale-generation commit accepted per partition (an older generation of a partition commits on either dataset after its next owner recorded its generation in both heads), I5 | Partitions p0 and p1; 1 source transaction per partition, or 2 in p0 (`without-done`: no done markers, so recovery always checks B by transaction id); one turnover and one crash in total, in either partition (`handoff`: the turnover may be a handoff by a live owner at any point between its protocol steps); 2 copies per request; no maintenance commits. `each-partition` samples one turnover and one crash per partition with 2 transactions in p0 |
 | `window-storage` | Canonical inline bytes, byte/count pressure, copy rule, cold replay, a running query, checkpoint/GC; I4, I7, I8 | Exhaustive 6 records; controls 5; samples 7, 9 |
 | `retention` / `retention-readers` | Readers never write and GC has no generations: removed objects deleted a fixed retention after GC observes the removal, which stays in durable state until the delete (timers restarted at takeover); never-committed uploads deleted once the head's store time is T_O past theirs; GC's empty commit on an idle head; fresh object names; a writer references only base-live objects or its own never-published uploads, while its base's store time is less than T_O minus a margin past the upload's; object timestamps that lag the writer's lower bound; deletes and commits that land arbitrarily late. `retention-readers` adds one query whose head GET responds late, and stops once the query settles. No dangling reference, rows or an error, and a query within the retention never fails | Exhaustive: 2 object names, 9 clock ticks, 6 head versions, retention 3, staleness 1, upload age 4, timestamp error 1, two sweeps, one takeover; the writer graph adds timestamp skew, the reader graph one query |
 | `retention-remote-gc` / `retention-readers-remote-gc` | GC on another node under its own lease: its empty commit is a CAS on the head version it read that can lose to the writer's commits (and they to it) and is retried; a second GC node takes the lease over, rebuilds the pending removals and restarts every timer, while the first node's issued deletes (removal deletes and selected orphan deletes) land later; the writer's takeover leaves GC's timers alone. Same properties as `retention` / `retention-readers` | As `retention` / `retention-readers`, with one GC lease takeover in place of the writer takeover; the reader graph stops at clock 7 |
@@ -170,6 +171,11 @@ as a separate maintenance process does.
 | `intent-roll-forward-second-writer-blind-rebase` | Same second writer, with the conflict ignored: the intent overwrites a write committed after the transaction's commit point; B values in commit-point order |
 | `intent-roll-forward-abort-recovery` | Recovery undoes A's actions and position instead of rolling forward: an acknowledged transaction can no longer be redelivered; acknowledged transactions in both datasets |
 | `intent-roll-forward-ingest-before-recovery` | A new owner ingests the next transaction before recovering a pending intent on the same key: the older intent then conflicts and is blocked; eventual atomicity |
+| `intent-roll-forward-partitioned-a-only-generation` | A partition's generation is recorded only in A's head, so its turnover never moves B: the previous owner's in-flight B apply lands after the next owner has acquired the partition; no stale-generation commit accepted per partition |
+| `intent-roll-forward-partitioned-cross-partition` | Partition 1's transactions also write partition 0's key, breaking the routing assumption: partition 0's intent finds an overlapping winner in B and is blocked with A committed and acknowledged; eventual atomicity |
+| `intent-roll-forward-partitioned-cross-partition-blind-rebase` | Same cross-partition key, rebased without the footprint check: partition 0's intent overwrites partition 1's write committed after it; B keyed values follow commit order |
+| `intent-roll-forward-partitioned-handoff-no-drain` | The next owner after a handoff ingests without rolling the partition's pending intents forward: an intent the old owner left in A at the handoff point never reaches B; eventual atomicity |
+| `intent-roll-forward-partitioned-ingest-before-recovery` | A partition's next owner ingests that partition's next transaction before rolling its pending intent forward: the older intent conflicts on the partition's key and is blocked; eventual atomicity |
 | `dataset-lifecycle-no-coverage` | Clear without coverage in the composed graph: I9 resurrected row |
 | `dataset-lifecycle-no-upload-age` | The orphan sweep takes an upload before it has aged, while the writer can still stage it: I4 |
 | `dataset-lifecycle-no-table-scope` | Dataset-wide comparison of independent allocators: valid child record refused (accepted rows still satisfy I9) |
@@ -470,6 +476,46 @@ second-writer controls show the last is required: a conflicting write either
 blocks roll-forward forever after A is acknowledged, or is overwritten out of
 commit order. That case needs two-phase commit.
 
+### Optional capabilities
+
+The `intent-roll-forward*` runs verify fast single-writer cross-dataset
+transactions and, in `intent-roll-forward-partitioned*`, fast partitioned
+cross-dataset transactions, where each source partition has its own exclusive
+writer over the same two dataset heads. No milestone requires either
+capability; two-phase commit remains the general path.
+
+In the partitioned graphs both partition writers race on both heads, so a
+writer's CAS loses to the other partition's records and to its turnovers and is
+rebased; one partition's writer crashes, pauses, is fenced or hands off while
+the other keeps committing, and its next owner rolls forward only that
+partition's intents. Every safety property holds in the exhaustive graphs and
+every witness is reached: both partitions' transactions pending in B at once
+and then complete, a crashed partition recovered while the other commits, a
+B CAS lost to the other partition and rebased, and a turnover fencing the old
+writer on B. The preconditions found, each removed by a control except where
+noted:
+
+1. All of the single-writer preconditions, per partition: the intent is in the
+   same A record as A's actions and the partition's source position; B's apply
+   is idempotent by transaction id; recovery only rolls forward.
+2. Each source transaction's keys belong to one partition, the same partition
+   in both datasets (`cross-partition`: blocked roll-forward).
+3. A lost CAS is rebased only after the winners' key footprints are checked
+   disjoint from the intent's (`cross-partition-blind-rebase`: overwrite out
+   of commit order).
+4. Each partition's generation is recorded in both heads and a turnover moves
+   both (`a-only-generation`: a fenced writer's B apply lands). A full run of
+   that control found no data property failing at bounds 1 and 2: the stale
+   apply is always an intent already in A, applied once by transaction id and
+   guarded by the footprint check. The B-recorded generation is what fences
+   the stale writer; it becomes necessary for data whenever B's actions
+   depend on more than the intent and B's head.
+5. A partition's next owner, after a failure or a handoff, applies the
+   partition's pending intents to B before ingesting that partition
+   (`ingest-before-recovery`, `handoff-no-drain`). A handoff needs no
+   coordination with the old owner beyond the turnover: the old owner may
+   stop with an intent pending, and the new owner drains it.
+
 ## Limits
 
 Not covered: real HTTP/object storage; ETag collision probabilities; canonical
@@ -483,13 +529,24 @@ request per dataset and reach all-three commit, all-three abort, helper resoluti
 after turnover, and checkpointed pending state at every seed. They do not reach
 Resolve batch eviction or a second outstanding handle per dataset. The original Milestone 1 graph retains its existing bounds. The new lifecycle siblings share its physical apply, rewrite, coverage and recovery helpers, and most compose one additional mechanism. Two combine them: `dataset-prepare-query-expiry` (prepared actions with queries bounded by retention, bound 3) and `dataset-prepare-query-expiry-byte-window` (prepared actions, query expiry and byte batches together, bound 5), where a query started during a prepared transaction must return its snapshot without the prepared rows. The prepared sibling abstracts the other participant and durable decision to a nondeterministic commit/abort; it does not recheck the existing multi-participant decision race. The child table stays unchanged in these siblings; parent/child allocation remains covered by the original graph. Their smaller action alphabets omit lease turnover, staging and the predecessor upload race. In the expiry sibling, terminal errors ignore late GET completions. Byte tokens stand for complete immutable action payloads: metadata-only records cost one symbolic byte and file/delete mutations two; the journal is an encoding dictionary and audit oracle, never a fallback for a missing batch. Store.root is a symbolic prefix descriptor rather than retained physical WAL; old-state recovery uses actual checkpoint pages and tail tokens. Pages include physical state and the checkpoint PK collection; recovery of protected states requires actual retained pages plus contiguous batch/window tokens.
 
-`intent-roll-forward*` has one key, at most two source transactions, one
-maintenance commit per dataset and at most two turnovers. It does not model
+The single-writer `intent-roll-forward*` runs have one key, at most two source
+transactions, one maintenance commit per dataset and at most two turnovers.
+Neither graph models
 A's checkpoint or log collection, which must retain a pending intent until B
 holds it; intent payload size; transactions over more than two datasets;
 lease expiry timing; a second writer's own retries; or re-planning B before A
 commits (a conflicting write that lands before A's commit also blocks, which
-is conservative). Its liveness is quiescence-based, not a fairness proof.
+is conservative). Liveness is quiescence-based, not a fairness proof.
+`intent-roll-forward-partitioned*` has two partitions with one key each, at
+most two transactions in one partition and one in the other, and one turnover
+and one crash in total; a turnover and a crash in each partition, with done
+markers, exceed the exhaustive budget and are only sampled. It has no
+maintenance commits (the other partition's records and turnovers are the
+lost-CAS winners), no other writer, done markers in the exhaustive graphs only
+with one transaction per partition, a handoff only between protocol steps, and no repartitioning:
+partitions are fixed, and a key never moves between partitions. Its
+stale-generation property is a ghost check against the newest owner's
+acquisition, not a consequence derived from the data properties.
 
 Existing focused models retain their original bounds and controls. Their narrow
 limits above still apply: in particular only the restart profile clears caller

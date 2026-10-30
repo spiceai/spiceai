@@ -10,6 +10,7 @@ mod concurrent;
 mod core;
 mod dataset_lifecycle;
 mod floors;
+mod intent_partitioned;
 mod intent_roll_forward;
 mod position_deletes;
 mod read_programs;
@@ -2135,6 +2136,56 @@ fn additional_runs() -> Vec<Run> {
             2,
             "eventual atomicity at quiescence",
         ),
+        // The same fast path run by one exclusive writer per source partition:
+        // an optional capability that no milestone requires.
+        (
+            "intent-roll-forward-partitioned-1-exhaust",
+            "intent-partitioned",
+            1,
+            "",
+        ),
+        (
+            "intent-roll-forward-partitioned-without-done-2-exhaust",
+            "intent-partitioned-without-done",
+            2,
+            "",
+        ),
+        (
+            "intent-roll-forward-partitioned-handoff-1-exhaust",
+            "intent-partitioned-handoff",
+            1,
+            "",
+        ),
+        (
+            "intent-roll-forward-partitioned-a-only-generation",
+            "intent-partitioned-a-only-generation",
+            1,
+            "no stale-generation commit accepted per partition",
+        ),
+        (
+            "intent-roll-forward-partitioned-cross-partition",
+            "intent-partitioned-cross-partition",
+            1,
+            "eventual atomicity at quiescence",
+        ),
+        (
+            "intent-roll-forward-partitioned-cross-partition-blind-rebase",
+            "intent-partitioned-cross-partition-blind-rebase",
+            1,
+            "B keyed values follow commit order",
+        ),
+        (
+            "intent-roll-forward-partitioned-handoff-no-drain",
+            "intent-partitioned-handoff-no-drain",
+            1,
+            "eventual atomicity at quiescence",
+        ),
+        (
+            "intent-roll-forward-partitioned-ingest-before-recovery",
+            "intent-partitioned-ingest-before-recovery",
+            2,
+            "eventual atomicity at quiescence",
+        ),
     ] {
         runs.push(Run {
             name,
@@ -2143,6 +2194,27 @@ fn additional_runs() -> Vec<Run> {
             bound,
             seed: None,
             failure,
+        });
+    }
+    // A turnover and a crash in each partition exceed the exhaustive budget;
+    // these runs sample that graph.
+    for (name, seed) in [
+        (
+            "intent-roll-forward-partitioned-each-partition-2-simulation-7",
+            7,
+        ),
+        (
+            "intent-roll-forward-partitioned-each-partition-2-simulation-42",
+            42,
+        ),
+    ] {
+        runs.push(Run {
+            name,
+            family: "intent-roll-forward",
+            mode: "intent-partitioned-each-partition",
+            bound: 2,
+            seed: Some(seed),
+            failure: "",
         });
     }
     runs
@@ -2480,9 +2552,15 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
             | "B CAS lost to maintenance and retried"
             | "lost response resolved by attempt id"
             | "paused writer's request fenced"
-            | "reader sees A before B" => true,
+            | "reader sees A before B"
+            | "both partitions commit concurrently and both complete"
+            | "partition crash recovered while the other commits"
+            | "B CAS lost to the other partition and rebased"
+            | "partition turnover fences its old writer on B" => true,
             "B CAS lost to disjoint writer and rebased" => run.mode.contains("disjoint-writer"),
-            "two transactions applied to both" => run.bound >= 2,
+            "two transactions applied to both"
+            | "two transactions of one partition applied to both" => run.bound >= 2,
+            "handoff drained before the new owner ingests" => run.mode.contains("handoff"),
             _ => false,
         };
     intent_required
@@ -2674,6 +2752,9 @@ pub fn run(name: &str) -> Result<(), String> {
                 .contains("symmetry")
                 .then_some(transactions::Protocol::representative),
         ),
+        "intent-roll-forward" if r.mode.contains("partitioned") => {
+            check(intent_partitioned::Protocol::new(r.mode, r.bound), r)
+        }
         "intent-roll-forward" => check(intent_roll_forward::Protocol::new(r.mode, r.bound), r),
         "window" => check(window::Protocol::new(r.mode, r.bound), r),
         "floors" => check(floors::Protocol::new(r.mode, r.bound), r),
