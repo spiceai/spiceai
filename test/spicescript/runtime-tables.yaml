@@ -4,7 +4,8 @@ description: >
   SQL surface. runtime.task_history and
   runtime.metrics report the column types users query (the Map of labels, the
   OTel resource and scope structs, nanosecond UTC timestamps, unsigned and
-  binary attribute fields); after 100 queries task_history holds exactly one
+  binary attribute fields); their memory is not taken from user queries' budget;
+  after 100 queries task_history holds exactly one
   row per query, with its labels readable by key, and metrics holds rows whose
   struct fields read back by name; and task_history deletes the rows older
   than its retention period at the next check, keeping the newer ones.
@@ -122,6 +123,21 @@ steps:
         - { pointer: /*/execution_duration_ms, type: number, above: -1 }
         - { pointer: /*/labels, type: object }
 
+  # A trace id the client pins is written onto rows already recorded under the
+  # generated one: they are replaced, not copied.
+  - http:
+      path: /v1/sql
+      headers: { content-type: text/plain, spice-trace-id: 0af7651916cd43dd8448eb211c80319c }
+      body: SELECT 1 AS pinned_q
+    expect: { status: 200 }
+  - query: >-
+      SELECT trace_id, count(*) AS n FROM runtime.task_history
+      WHERE task = 'sql_query' AND input = 'SELECT 1 AS pinned_q' GROUP BY trace_id
+    expect: { rows: [['0af7651916cd43dd8448eb211c80319c', '1']] }
+    eventually: 60s
+  - query: SELECT count(*) - count(DISTINCT span_id) AS duplicates FROM runtime.task_history
+    expect: { rows: [['0']] }
+
   # Metrics are exported every 30 s.
   - query: SELECT count(*) > 0 AS has_rows FROM runtime.metrics
     expect: { rows: [['true']] }
@@ -155,6 +171,24 @@ steps:
   - explain: SELECT * FROM runtime.metrics
     contains: [CayenneAccelerationExec]
   - assert-files: { lacks: ['\.spice/data', '(?i)\.(vortex|sqlite|db)$', '(?i)cayenne'] }
+
+  # The internal tables' memory is their own, not the query pool's: once task
+  # history's primary-key index outgrows `runtime.query.memory_limit`, a user
+  # query that fits the limit still runs.
+  - restart:
+      patch:
+        spicepod:
+          runtime:
+            query: { memory_limit: 16MiB }
+  - background: { id: burst, query: 'SELECT ${round} AS burst_q', concurrency: 16 }
+  - query: SELECT count(*) >= 200000 AS enough FROM runtime.task_history WHERE task = 'sql_query' AND input LIKE 'SELECT % AS burst_q'
+    expect: { rows: [['true']] }
+    eventually: 180s
+  - stop-background: { id: burst }
+  - wait-metric: { name: cayenne_pk_keyset_budget_used_bytes, above: 16777216, timeout: 30s }
+  - wait-metric: { name: query_memory_pool_used_bytes, below: 1048576, timeout: 30s }
+  - query: SELECT count(DISTINCT v) AS d FROM (SELECT value % 100000 AS v FROM generate_series(1, 1000000))
+    expect: { rows: [['100000']] }
 
   # Retention: with the shortest period and check interval allowed (60 s
   # each), a query's row is there at first and gone after the first check that
