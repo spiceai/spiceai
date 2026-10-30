@@ -595,8 +595,9 @@ impl LlamaCpp {
         let mut receivers = Vec::with_capacity(choices);
         for tools in matchers {
             let (events, rx) = mpsc::channel(STREAM_BUFFER);
-            let harmony =
-                markers.map(|markers| harmony::Reader::new(markers, nameable.clone(), held));
+            let harmony = markers.map(|markers| {
+                harmony::Reader::new(markers, nameable.clone(), held).after(&prompt)
+            });
             let job = Job {
                 reasoning: reasoning_parser(template, &prompt),
                 prompt: prompt.clone(),

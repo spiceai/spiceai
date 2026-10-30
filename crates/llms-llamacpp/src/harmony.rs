@@ -38,8 +38,12 @@ limitations under the License.
 use llama_cpp::{Token, Vocab};
 use mistralrs_core::{CalledFunction, ToolCallResponse, ToolCallType};
 
+const START: &str = "<|start|>";
 const CHANNEL: &str = "<|channel|>";
+const MESSAGE: &str = "<|message|>";
 const CONSTRAIN: &str = "<|constrain|>";
+/// The markers that close a message's body.
+const CLOSE: [&str; 3] = ["<|end|>", "<|return|>", "<|call|>"];
 
 /// The control tokens that mark a Harmony reply's messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,7 +155,8 @@ pub(crate) struct Reader {
 
 impl Reader {
     /// The chat template's generation prompt opens the reply's first message, so the reply
-    /// starts in its header.
+    /// starts in its header; [`Reader::after`] starts it where a prompt that goes further
+    /// leaves it.
     pub(crate) fn new(markers: Markers, tools: Vec<String>, held: Held) -> Self {
         Self {
             markers,
@@ -159,6 +164,43 @@ impl Reader {
             held,
             route: Route::Header(String::new()),
         }
+    }
+
+    /// Starts the reply where the rendered `prompt` leaves it. A stock gpt-oss template ends
+    /// its generation prompt at `<|start|>assistant`, in the header of the reply's first
+    /// message. A custom one may go on to name that message's channel, or to open its body,
+    /// as `<|start|>assistant<|channel|>final<|message|>` does, and the reply then goes on in
+    /// that header or body. The prompt is tokenized with the markers it spells as their
+    /// tokens, so its text marks what the model reads.
+    ///
+    /// A grammar holds a reply from its first header (`harmony_reply`, `harmony_call`), so a
+    /// reply held to one starts in a header whatever the prompt opened.
+    pub(crate) fn after(mut self, prompt: &str) -> Self {
+        if self.held != Held::Nothing {
+            return self;
+        }
+        let Some(at) = prompt.rfind(START) else {
+            return self;
+        };
+        // The reply's first header starts after the role, where a stock prompt ends.
+        let open = &prompt[at + START.len()..];
+        let open = &open[word(open).len()..];
+        self.route = match open.split_once(MESSAGE) {
+            None => Route::Header(open.to_string()),
+            // The prompt's last message is closed, so the reply starts a new one.
+            Some((_, body)) if CLOSE.iter().any(|close| body.contains(close)) => {
+                Route::Header(String::new())
+            }
+            Some((header, body)) => match route(header, &self.tools) {
+                // A call's arguments go on from what the prompt began.
+                Route::Call { name, .. } => Route::Call {
+                    name,
+                    arguments: body.to_string(),
+                },
+                route => route,
+            },
+        };
+        self
     }
 
     pub(crate) fn markers(&self) -> &Markers {
@@ -618,6 +660,36 @@ mod tests {
         }
         let free = Reader::new(TEST_MARKERS, Vec::new(), Held::Nothing);
         assert!(!free.in_grammar());
+    }
+
+    #[test]
+    fn a_reply_goes_on_from_the_message_its_prompt_opened() {
+        let after = |prompt: &str, held: Held| {
+            Reader::new(TEST_MARKERS, vec!["f".to_string()], held)
+                .after(prompt)
+                .route
+        };
+        // a prompt whose last message is closed leaves the reply to start a new one
+        assert_eq!(
+            after("<|start|>user<|message|>Hi<|end|>", Held::Nothing),
+            Route::Header(String::new())
+        );
+        // a call goes on from the arguments the prompt began
+        assert_eq!(
+            after(
+                "<|start|>assistant to=functions.f<|channel|>commentary json<|message|>{\"a\":",
+                Held::Nothing
+            ),
+            Route::Call {
+                name: "f".to_string(),
+                arguments: "{\"a\":".to_string()
+            }
+        );
+        // a grammar holds the reply from its first header
+        assert_eq!(
+            after("<|start|>assistant<|channel|>final<|message|>", Held::Reply),
+            Route::Header(String::new())
+        );
     }
 
     #[test]
