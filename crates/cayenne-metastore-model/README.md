@@ -731,8 +731,8 @@ implementations. Delivery and maintenance are covered in separate compositions.
 
 ## Measured manual suite
 
-On 2026-10-27, `EXHAUST=1 ... all` matched 251/251 declarations in 3368 s
-(about 56 minutes). Every checker uses one exploration thread.
+On 2026-10-29, `EXHAUST=1 ... all` matched 299/299 declarations in 1340 s
+(about 22 minutes) with the default 6 threads, peak RSS 4.3 GB.
 
 | Representative exhaustive profile | Bound | Visits / unique states | Wall s |
 |---|---:|---:|---:|
