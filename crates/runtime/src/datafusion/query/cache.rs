@@ -201,6 +201,9 @@ enum StalePolicy {
     Window(std::time::Duration),
     /// The request's `max-stale` has no value: only the provider age cap applies.
     AnyAge,
+    /// The request's `min-fresh`: the entry must stay within `item_ttl` for
+    /// this much longer, and is never served stale.
+    FreshFor(std::time::Duration),
 }
 
 fn stale_policy(
@@ -210,6 +213,7 @@ fn stale_policy(
     match cache_control {
         CacheControl::MaxStale(_, Some(duration)) => StalePolicy::Window(duration),
         CacheControl::MaxStale(_, None) => StalePolicy::AnyAge,
+        CacheControl::MinFresh(_, duration) => StalePolicy::FreshFor(duration),
         _ => match stale_while_revalidate_ttl {
             Some(duration) => StalePolicy::Window(duration),
             None => StalePolicy::FreshOnly,
@@ -230,6 +234,7 @@ fn max_age_for(
         StalePolicy::FreshOnly => ttl,
         StalePolicy::Window(stale_duration) => ttl.saturating_add(stale_duration),
         StalePolicy::AnyAge => max_servable_age,
+        StalePolicy::FreshFor(fresh_for) => ttl.saturating_sub(fresh_for),
     };
     requested.min(max_servable_age)
 }
@@ -263,7 +268,9 @@ fn apply_age_eligibility(
         tracing::debug!("Cache entry is past its eligible age, treating as cache miss");
         return false;
     }
-    if !matches!(policy, StalePolicy::FreshOnly) && entry.cached_result.is_stale(ttl, now) {
+    if matches!(policy, StalePolicy::Window(_) | StalePolicy::AnyAge)
+        && entry.cached_result.is_stale(ttl, now)
+    {
         tracing::debug!(
             "Cache entry is stale (beyond TTL), triggering background revalidation for stale-while-revalidate"
         );
@@ -569,6 +576,18 @@ impl Query {
             }
             response => response,
         };
+
+        if matches!(cache_control, CacheControl::OnlyIfCached(_)) {
+            let error = super::Error::NotCached;
+            if let Some(t) = tracker {
+                t.finish_with_error(
+                    &request_context,
+                    error.to_string(),
+                    ErrorCode::QueryPlanningError,
+                );
+            }
+            return Err(error);
+        }
 
         let request_raw_cache_key = match request_context.cache_control() {
             CacheControl::Cache(CacheKeyType::Default)
@@ -1837,6 +1856,81 @@ mod tests {
             StalePolicy::AnyAge,
             now,
         ));
+    }
+
+    #[test]
+    fn a_min_fresh_request_is_served_only_an_entry_fresh_for_that_much_longer() {
+        assert_eq!(
+            stale_policy(
+                CacheControl::MinFresh(CacheKeyType::Default, Duration::from_millis(600)),
+                Some(Duration::from_secs(10)),
+            ),
+            StalePolicy::FreshFor(Duration::from_millis(600))
+        );
+        let now = std::time::Instant::now();
+        let policy = StalePolicy::FreshFor(Duration::from_millis(600));
+        for (age_ms, servable) in [(300, true), (500, false), (1_500, false)] {
+            let mut entry =
+                dummy_servable_entry_cached_at(cached_ago(now, Duration::from_millis(age_ms)));
+            assert_eq!(
+                apply_age_eligibility(
+                    &mut entry,
+                    Duration::from_secs(1),
+                    Duration::from_secs(11),
+                    policy,
+                    now,
+                ),
+                servable,
+                "an entry {age_ms} ms old with a 1 s item_ttl and min-fresh of 600 ms"
+            );
+            assert!(!entry.revalidate);
+            assert_eq!(entry.cache_status, CacheStatus::CacheHit);
+        }
+    }
+
+    /// An `only-if-cached` request is answered from the cache or refused; it never
+    /// runs the query.
+    #[tokio::test]
+    async fn an_only_if_cached_request_fails_on_a_miss_and_is_served_a_hit() {
+        for (key_type, cache_key_type) in [
+            (
+                spicepod::component::caching::CacheKeyType::Plan,
+                CacheKeyType::Default,
+            ),
+            (
+                spicepod::component::caching::CacheKeyType::Sql,
+                CacheKeyType::Raw,
+            ),
+        ] {
+            let df = prepare_runtime(Some(SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                cache_key_type: key_type,
+                ..Default::default()
+            }))
+            .await;
+            let only_if_cached =
+                create_test_request_context(CacheControl::OnlyIfCached(cache_key_type), None);
+
+            let miss = Arc::clone(&only_if_cached)
+                .scope(QueryBuilder::new("SELECT 7", Arc::clone(&df)).build().run())
+                .await;
+            assert!(
+                matches!(miss, Err(super::super::Error::NotCached)),
+                "{key_type:?}: a miss must be refused, got {:?}",
+                miss.map(|result| result.cache_status)
+            );
+
+            let (status, value) =
+                create_test_request_context(CacheControl::Cache(cache_key_type), None)
+                    .scope(run_i64_query(&df, "SELECT 7", ResultsCacheMode::Default))
+                    .await;
+            assert_eq!((status, value), (CacheStatus::CacheMiss, 7));
+
+            let (status, value) = only_if_cached
+                .scope(run_i64_query(&df, "SELECT 7", ResultsCacheMode::Default))
+                .await;
+            assert_eq!((status, value), (CacheStatus::CacheHit, 7), "{key_type:?}");
+        }
     }
 
     #[test]

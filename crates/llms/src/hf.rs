@@ -50,8 +50,8 @@ pub async fn open_model(
 }
 
 /// Opens `paths` of `repo` (`org/name`), a repository of `kind`, at `revision` for
-/// `requester`, with `hub`'s settings. Only those paths are described, so the repository is
-/// never listed (see [`Snapshot::open_paths`]).
+/// `requester`, with `hub`'s settings. Only those paths are kept, and a warm load costs at most
+/// one request (see [`Snapshot::open_paths`]).
 ///
 /// # Errors
 ///
