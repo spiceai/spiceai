@@ -165,3 +165,105 @@ async fn a_fenced_catalog_stops_and_its_change_is_absent() {
         Some(b"1".to_vec())
     );
 }
+
+/// The source positions each committed record holds, oldest first, from the
+/// head's window (these tests commit too few records to seal a batch).
+async fn committed_positions(store: &Arc<dyn ObjectStore>) -> Vec<Vec<String>> {
+    use prost::Message;
+    let (reader, _) = Reader::open(Arc::clone(store), Path::from("catalog"))
+        .await
+        .expect("open the head log");
+    reader
+        .state()
+        .head
+        .window
+        .iter()
+        .map(|entry| {
+            let record = object_store_occ::headlog::Record::decode(entry.encoded.as_slice())
+                .expect("log record");
+            object_store_occ::headlog::Group::decode(record.payload)
+                .expect("group")
+                .payloads
+                .into_iter()
+                .flat_map(|payload| {
+                    cayenne_metastore_actions::Record::decode(payload)
+                        .expect("catalog record")
+                        .actions
+                })
+                .filter_map(|action| match action.kind {
+                    Some(cayenne_metastore_actions::Kind::AdvanceSourcePosition(position)) => {
+                        Some(position.source)
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+async fn create(catalog: &ObjectNativeCatalog, name: &str) -> String {
+    use cayenne::MetadataCatalog;
+    use cayenne::metadata::{CreateTableOptions, VortexConfig};
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+    ]));
+    catalog
+        .create_table(CreateTableOptions {
+            table_name: name.to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: format!("/tmp/unused/{name}"),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        })
+        .await
+        .expect("create table")
+}
+
+/// A dataset's buffered changes commit at its own acknowledgement point, in
+/// one record with its source position: another dataset's commit publishes only
+/// its own changes.
+#[tokio::test]
+async fn another_datasets_commit_leaves_a_datasets_buffered_changes_pending() {
+    use cayenne::MetadataCatalog;
+    let (_faults, store, catalog) = setup().await;
+    let orders = create(&catalog, "orders").await;
+    create(&catalog, "audit").await;
+    // orders stages its change and position for its acknowledgement point.
+    cayenne::catalog::with_deferred_commits(async {
+        catalog
+            .set_sidecar_value("spice_sys_checkpoint/orders", Some(b"data".to_vec()))
+            .await
+            .expect("stage orders' change");
+        catalog
+            .set_sidecar_value("spice_sys_applied_lsn/orders", Some(b"10".to_vec()))
+            .await
+            .expect("stage orders' position");
+    })
+    .await;
+    // audit commits on its own meanwhile.
+    catalog
+        .set_sidecar_value("spice_sys_applied_lsn/audit", Some(b"7".to_vec()))
+        .await
+        .expect("audit commits");
+    let records = committed_positions(&store).await;
+    assert_eq!(
+        records.last(),
+        Some(&vec!["spice_sys_applied_lsn/audit".to_string()]),
+        "audit's commit published orders' buffered changes: {records:?}"
+    );
+    catalog
+        .commit_pending_for(&orders)
+        .await
+        .expect("orders' acknowledgement point");
+    let records = committed_positions(&store).await;
+    assert_eq!(
+        records.last(),
+        Some(&vec![
+            "spice_sys_checkpoint/orders".to_string(),
+            "spice_sys_applied_lsn/orders".to_string()
+        ]),
+        "orders' change and position did not commit as one record: {records:?}"
+    );
+}

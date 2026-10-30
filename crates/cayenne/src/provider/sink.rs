@@ -159,9 +159,12 @@ impl DataSink for CayenneDataSink {
         let rows = self.write_all_uncommitted(data, context).await?;
         // A write that returns has been acknowledged to its caller, so every
         // metastore change it made must be committed first.
-        crate::catalog::commit_at_acknowledgement(self.table.catalog().as_ref())
-            .await
-            .map_err(|source| datafusion_common::DataFusionError::External(Box::new(source)))?;
+        crate::catalog::commit_at_acknowledgement_for(
+            self.table.catalog().as_ref(),
+            self.table.table_id(),
+        )
+        .await
+        .map_err(|source| datafusion_common::DataFusionError::External(Box::new(source)))?;
         Ok(rows)
     }
 }

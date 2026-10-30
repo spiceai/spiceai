@@ -356,6 +356,23 @@ pub async fn commit_at_acknowledgement(catalog: &dyn MetadataCatalog) -> Catalog
     catalog.commit_pending().await
 }
 
+/// [`commit_at_acknowledgement`] for a write to one table: other tables'
+/// pending changes stay pending, so they still commit with their own
+/// acknowledgement points.
+///
+/// # Errors
+///
+/// Returns the catalog's error when the commit is not accepted.
+pub async fn commit_at_acknowledgement_for(
+    catalog: &dyn MetadataCatalog,
+    table_id: &str,
+) -> CatalogResult<()> {
+    if DEFERRED_COMMITS.try_with(|scope| *scope) == Ok(CommitScope::SameRecord) {
+        return Ok(());
+    }
+    catalog.commit_pending_for(table_id).await
+}
+
 /// Trait for metadata catalog operations.
 ///
 /// This trait provides the core operations needed to manage a Cayenne catalog,
@@ -376,6 +393,11 @@ pub trait MetadataCatalog: Send + Sync {
     /// makes each change durable as it is accepted returns at once. No default, so
     /// every implementation (and every wrapper) answers it explicitly.
     async fn commit_pending(&self) -> CatalogResult<()>;
+
+    /// As [`Self::commit_pending`], for the changes to one table: what a
+    /// single dataset's acknowledgement depends on. Changes to other tables may
+    /// stay pending. No default, as for [`Self::commit_pending`].
+    async fn commit_pending_for(&self, table_id: &str) -> CatalogResult<()>;
 
     /// Page undelivered write-back markers by sequence and primary key.
     async fn list_pending_write_back(

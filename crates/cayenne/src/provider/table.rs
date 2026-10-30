@@ -36085,7 +36085,10 @@ impl CayenneTableProvider {
             // `fire_slot_advancer` acknowledges the source.
             let result =
                 crate::catalog::with_deferred_commits(self.checkpoint_mem_tier_inner(write)).await;
-            let result = match (result, self.catalog().commit_pending().await) {
+            let result = match (
+                result,
+                self.catalog().commit_pending_for(self.table_id()).await,
+            ) {
                 (Ok(_), Err(error)) => Err(error.into()),
                 (result, _) => result,
             };
@@ -37623,7 +37626,7 @@ impl CayenneTableProvider {
         // The source is acknowledged below, so the metastore changes this
         // checkpoint made must be committed first. A failed commit acknowledges
         // nothing: the source replays from its last acknowledged position.
-        if let Err(error) = self.catalog().commit_pending().await {
+        if let Err(error) = self.catalog().commit_pending_for(self.table_id()).await {
             tracing::error!(
                 "Dataset '{}' could not commit its checkpoint to the metastore, so its source is not acknowledged and replays these changes after a restart: {error}",
                 self.table_name()

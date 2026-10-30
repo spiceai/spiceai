@@ -3236,6 +3236,11 @@ impl MetadataCatalog for CayenneCatalog {
         Ok(())
     }
 
+    async fn commit_pending_for(&self, _table_id: &str) -> CatalogResult<()> {
+        // Every SQL transaction commits before its method returns.
+        Ok(())
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

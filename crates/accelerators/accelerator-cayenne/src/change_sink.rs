@@ -201,6 +201,7 @@ impl CayenneChangeSinkBackend {
             cayenne::catalog::with_same_record_commits(self.apply_cdc_groups(batch, options, ctx))
                 .await?;
         let catalog = Arc::clone(self.table.catalog());
+        let table_id = self.table.table_id().to_string();
         // A write kept in the in-memory tier is not durable yet; its checkpoint
         // records the position instead.
         let durable = write.durability == StorageDurability::Durable;
@@ -219,7 +220,7 @@ impl CayenneChangeSinkBackend {
             })
             .await?;
             catalog
-                .commit_pending()
+                .commit_pending_for(&table_id)
                 .await
                 .map_err(|error| DataFusionError::External(Box::new(error)))
         }));

@@ -176,6 +176,17 @@ impl PreparedResolvedAppend {
     }
 }
 
+/// Commit the publications' tables at the append's acknowledgement point.
+async fn commit_tables_at_acknowledgement(
+    catalog: &dyn MetadataCatalog,
+    publications: &[crate::catalog::CatalogPublication],
+) -> crate::catalog::CatalogResult<()> {
+    for publication in publications {
+        crate::catalog::commit_at_acknowledgement_for(catalog, &publication.table_id).await?;
+    }
+    Ok(())
+}
+
 async fn commit_metadata(
     catalog: &dyn MetadataCatalog,
     prepared: &mut PreparedOnConflictDeletionPublish,
@@ -185,7 +196,7 @@ async fn commit_metadata(
         // The append is acknowledged when this returns, so its metastore change
         // commits now rather than waiting in a buffering catalog.
         let committed = match catalog.commit_publications(&publications).await {
-            Ok(()) => crate::catalog::commit_at_acknowledgement(catalog).await,
+            Ok(()) => commit_tables_at_acknowledgement(catalog, &publications).await,
             Err(error) => Err(error),
         };
         match committed {

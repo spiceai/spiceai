@@ -60,12 +60,23 @@ struct Inner {
     since_floor: Vec<(u64, Vec<Record>)>,
     /// The commit of the last checkpoint staged; its floor publishes with the next commit.
     staged_checkpoint: u64,
-    /// Changes accepted and visible on this node but not yet committed. They commit
-    /// as one record at the next acknowledgement point (`flush`), or when they reach
-    /// the size or age bound.
-    pending: Vec<Action>,
-    pending_bytes: usize,
-    pending_since: Option<std::time::Instant>,
+    /// Changes accepted and visible on this node but not yet committed, one
+    /// buffer per set of tables they touch, oldest first. A buffer commits as one
+    /// record at an acknowledgement point for one of its tables, or when it
+    /// reaches the size or age bound; another table's commit never publishes it.
+    pending: Vec<Pending>,
+}
+
+/// Buffered changes for a set of tables. Actions on different tables commute,
+/// so buffers can commit in any order and the log still replays to the state
+/// this node applied. A record that touches several tables keeps them in one
+/// buffer, so it still commits whole.
+struct Pending {
+    /// Table ids, and `""` for changes no table owns.
+    tables: std::collections::BTreeSet<String>,
+    actions: Vec<Action>,
+    bytes: usize,
+    since: std::time::Instant,
 }
 
 /// Commit buffered changes once they are this large or this old, even before an
@@ -297,8 +308,6 @@ impl ObjectNativeCatalog {
                     since_floor,
                     staged_checkpoint: 0,
                     pending: Vec::new(),
-                    pending_bytes: 0,
-                    pending_since: None,
                 })),
             },
         })
@@ -455,19 +464,73 @@ impl Inner {
             );
             return Err(invalid(error));
         }
-        self.pending_bytes += record.encoded_len();
-        self.pending.extend(record.actions);
-        let since = *self
-            .pending_since
-            .get_or_insert_with(std::time::Instant::now);
-        // Outside a deferred scope a change is durable when its method returns.
-        if !crate::catalog::commits_deferred()
-            || self.pending_bytes >= PENDING_MAX_BYTES
-            || since.elapsed() >= PENDING_MAX_AGE
-        {
-            self.flush().await?;
+        let tables = self.tables_of(&record.actions);
+        let bytes = record.encoded_len();
+        // Merge every buffer this record shares a table with, oldest first.
+        let mut merged = Pending {
+            tables: tables.clone(),
+            actions: Vec::new(),
+            bytes: 0,
+            since: std::time::Instant::now(),
+        };
+        let mut kept = Vec::with_capacity(self.pending.len());
+        for buffer in std::mem::take(&mut self.pending) {
+            if buffer.tables.is_disjoint(&tables) {
+                kept.push(buffer);
+            } else {
+                merged.tables.extend(buffer.tables);
+                merged.actions.extend(buffer.actions);
+                merged.bytes += buffer.bytes;
+                merged.since = merged.since.min(buffer.since);
+            }
         }
+        merged.actions.extend(record.actions);
+        merged.bytes += bytes;
+        // Outside a deferred scope a change is durable when its method returns.
+        let due = !crate::catalog::commits_deferred()
+            || merged.bytes >= PENDING_MAX_BYTES
+            || merged.since.elapsed() >= PENDING_MAX_AGE;
+        self.pending = kept;
+        if due {
+            return self.publish_buffers(vec![merged]).await;
+        }
+        self.pending.push(merged);
         Ok(())
+    }
+
+    /// The tables `actions` change: each action's table, and for a source
+    /// position the table of the dataset its key names (`<store>/<dataset>`).
+    /// `""` stands for a change no table owns.
+    fn tables_of(&self, actions: &[Action]) -> std::collections::BTreeSet<String> {
+        actions
+            .iter()
+            .map(|action| match action.kind.as_ref() {
+                Some(Kind::AdvanceSourcePosition(position)) => position
+                    .source
+                    .split_once('/')
+                    .and_then(|(_, dataset)| {
+                        self.reader
+                            .state
+                            .tables
+                            .iter()
+                            .find(|(_, table)| table.name == dataset)
+                            .map(|(id, _)| id.clone())
+                    })
+                    .unwrap_or_default(),
+                _ => action.table_id().unwrap_or_default().to_string(),
+            })
+            .collect()
+    }
+
+    /// Commit the buffers touching `table_id` as one record, with the changes no
+    /// table owns: a position whose key names no table cannot wait for an
+    /// acknowledgement point of its own.
+    async fn flush_table(&mut self, table_id: &str) -> CatalogResult<()> {
+        let (due, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(|buffer| buffer.tables.contains(table_id) || buffer.tables.contains(""));
+        self.pending = kept;
+        self.publish_buffers(due).await
     }
 
     /// Commit every buffered change as one record. Nothing that depends on a
@@ -478,14 +541,26 @@ impl Inner {
                 "catalog requires reopening after an uncertain or fenced commit",
             ));
         }
-        if self.pending.is_empty() {
+        let buffers = std::mem::take(&mut self.pending);
+        self.publish_buffers(buffers).await
+    }
+
+    /// Commit `buffers`, oldest first, as one record.
+    async fn publish_buffers(&mut self, buffers: Vec<Pending>) -> CatalogResult<()> {
+        if self.poisoned {
+            return Err(invalid(
+                "catalog requires reopening after an uncertain or fenced commit",
+            ));
+        }
+        if buffers.is_empty() {
             return Ok(());
         }
         let record = Record {
-            actions: std::mem::take(&mut self.pending),
+            actions: buffers
+                .into_iter()
+                .flat_map(|buffer| buffer.actions)
+                .collect(),
         };
-        self.pending_bytes = 0;
-        self.pending_since = None;
         // Buffered changes are already applied on this node. If this record does
         // not commit, they must never be acknowledged: the catalog refuses all
         // further work until it is reopened from what did commit.
@@ -556,6 +631,10 @@ impl MetadataCatalog for ObjectNativeCatalog {
 
     async fn commit_pending(&self) -> CatalogResult<()> {
         self.inner.take().await.flush().await
+    }
+
+    async fn commit_pending_for(&self, table_id: &str) -> CatalogResult<()> {
+        self.inner.take().await.flush_table(table_id).await
     }
 
     async fn commit_publications(
