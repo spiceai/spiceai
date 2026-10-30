@@ -3268,6 +3268,103 @@ mod tests {
         );
     }
 
+    /// A gpt-oss-style template whose generation prompt goes on from `<|start|>assistant` with
+    /// `OPENS`, as a custom template may.
+    const HARMONY_OPENS: &str = "{% for m in messages %}<|start|>{{ m.role }}<|message|>{{ m.content }}<|end|>{% endfor %}<|start|>assistantOPENS";
+
+    /// What a Harmony model's `reply` sends when the template's generation prompt goes on from
+    /// `<|start|>assistant` with `opens`, for a request with the `response_format` type
+    /// `format`. The request is queued as the engine queues it, so the reply is read from
+    /// where the engine starts reading it.
+    fn harmony_reply_after(opens: &str, format: Option<&str>, reply: &str) -> Vec<String> {
+        let (jobs, queued) = std_mpsc::channel();
+        let llama = LlamaCpp {
+            decoder: DecodeThread {
+                model: "gpt-oss".to_string(),
+                jobs: Some(jobs),
+                stopping: Arc::default(),
+                freed: None,
+            },
+            model_name: "gpt-oss".to_string(),
+            template: Either::Left(HARMONY_OPENS.replace("OPENS", opens)),
+            special: SpecialTokens::default(),
+            harmony: Some(HARMONY_MARKERS),
+            reasoning_support: ReasoningSupport::default(),
+            counter: AtomicUsize::new(0),
+            reused_prompt_tokens: Arc::default(),
+        };
+        let mut req = serde_json::json!({
+            "model": "gpt-oss",
+            "messages": [{ "role": "user", "content": "What is the capital of France?" }],
+        });
+        if let Some(format) = format {
+            req["response_format"] = serde_json::json!({ "type": format });
+        }
+        let req: CreateChatCompletionRequest = serde_json::from_value(req).expect("a request");
+        let receivers = llama
+            .submit(&req, &CacheNamespace::Public)
+            .expect("the request is queued");
+        let rx = receivers.into_iter().next().expect("one choice");
+        let (prompt, sampling, mut out) = Output::new(queued.try_recv().expect("its job"));
+        assert!(
+            prompt.ends_with(&format!("<|end|><|start|>assistant{opens}")),
+            "the generation prompt goes on with {opens:?}: {prompt:?}"
+        );
+        // A grammar holds a structured reply from its first header.
+        assert_eq!(
+            sampling
+                .grammar
+                .is_some_and(|g| g.contains("root ::= analysis* <[2]> \"final\"")),
+            format.is_some()
+        );
+        let (finish, _) = generate_harmony(&mut out, reply);
+        assert_eq!(
+            finish,
+            Some(FinishReason::Stop),
+            "{reply:?} ends at `<|return|>`"
+        );
+        out.finish(FinishReason::Stop, 1)
+            .expect("the request succeeds");
+        joined(sent(rx))
+    }
+
+    /// A stock gpt-oss template ends its generation prompt at `<|start|>assistant`, so the
+    /// reply writes its first message's header. A custom one may go on to name that message's
+    /// channel or to open its body, as `<|start|>assistant<|channel|>final<|message|>` does,
+    /// and the reply goes on from there.
+    #[test]
+    fn a_harmony_reply_goes_on_from_where_the_generation_prompt_leaves_it() {
+        let rest = "Recall it.<|end|><|start|>assistant<|channel|>final<|message|>Paris<|return|>";
+        let read = [
+            ("", None, format!("<|channel|>analysis<|message|>{rest}")),
+            (
+                "<|channel|>final<|message|>",
+                None,
+                "Paris<|return|>".to_string(),
+            ),
+            ("<|channel|>analysis<|message|>", None, rest.to_string()),
+            ("<|channel|>analysis", None, format!("<|message|>{rest}")),
+            // what the grammar of a structured reply forces, whatever the prompt opened
+            (
+                "<|channel|>final<|message|>",
+                Some("json_object"),
+                "<|channel|>final<|message|>{\"capital\":\"Paris\"}<|return|>".to_string(),
+            ),
+        ]
+        .map(|(opens, format, reply)| harmony_reply_after(opens, format, &reply));
+        let answer = || vec!["r:Recall it.".to_string(), "c:Paris".to_string()];
+        assert_eq!(
+            read,
+            [
+                answer(),
+                vec!["c:Paris".to_string()],
+                answer(),
+                answer(),
+                vec!["c:{\"capital\":\"Paris\"}".to_string()],
+            ]
+        );
+    }
+
     #[test]
     fn a_harmony_call_ends_the_reply_with_its_arguments() {
         let (mut out, rx) = harmony_output(&["get_weather"], &[], None);
