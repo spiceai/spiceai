@@ -5,6 +5,7 @@
   "auth": 3,
   "builtins": 4,
   "cayenne-upgrade": 4,
+  "cayenne-vnext": 11,
   "cayenne-writes": 30,
   "cdc-chaos": 91,
   "clickhouse-literals": 8,

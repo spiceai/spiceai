@@ -2934,7 +2934,9 @@ impl CayenneAccelerator {
 
     fn vnext_notice(&self, dataset: &str, outcome: &str) {
         if self.vnext_notices.lock().insert(dataset.to_string()) {
-            tracing::info!("Dataset '{dataset}' {outcome}");
+            // The accelerator crate's own target is below the default log level;
+            // this line is for the operator, like the auto-tuned config line.
+            tracing::info!(target: "spiced::acceleration::cayenne", "Dataset '{dataset}' {outcome}");
         }
     }
 
