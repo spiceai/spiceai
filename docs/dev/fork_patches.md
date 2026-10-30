@@ -476,23 +476,24 @@ dependency pins unchanged.
 
 The federation pin adds [#95](https://github.com/spiceai/datafusion-federation/pull/95) on `109661c`: unnamed computed projection outputs retain their logical names when local table qualifiers are replaced with remote ones. Its test dependency pins match the DataFusion revision used here.
 
-The provider pin builds directly on `f103fe8`, adding [#101](https://github.com/spiceai/datafusion-table-providers/pull/101) for full source schemas in scan capability callbacks, [#102](https://github.com/spiceai/datafusion-table-providers/pull/102) for positional result nullability, and capability boundaries for nested DuckDB unions, unsupported MySQL FULL JOIN, computed MySQL HAVING predicates, and explicit NULL ordering that MySQL cannot preserve. Guards include `crates/data_components/src/function_support.rs::scan_filter_capability_uses_full_source_schema`, `test/spicescript/federated-result-columns.yaml`, and `test/spicescript/mysql-null-ordering.yaml`.
+The provider pin descends from `f103fe8`. Since `4a29207` ([#15580](https://github.com/spiceai/spiceai/pull/15580), which moved it for the `duckdb-rs` Brotli fix) it also carries table-providers #89, #90 and #93, described below. On top of those it adds [#101](https://github.com/spiceai/datafusion-table-providers/pull/101) for full source schemas in scan capability callbacks, [#102](https://github.com/spiceai/datafusion-table-providers/pull/102) for positional result nullability, and capability boundaries for nested DuckDB unions, unsupported MySQL FULL JOIN, computed MySQL HAVING predicates, and explicit NULL ordering that MySQL cannot preserve. Guards include `crates/data_components/src/function_support.rs::scan_filter_capability_uses_full_source_schema`, `test/spicescript/federated-result-columns.yaml`, and `test/spicescript/mysql-null-ordering.yaml`.
 
-The following upstream-branch changes remain excluded from this pin:
+Two of them have a known problem at this pin:
 
 - spiceai/datafusion-table-providers#89 cuts a `DuckDB` upsert into several
   `INSERT … ON CONFLICT DO UPDATE` statements in one transaction, so a later statement
   updates rows an earlier one inserted. `DuckDB` 1.4.4 then fails with `INTERNAL Error:
   Unaligned fetch in validity and main column data for update` and invalidates the
-  database until a restart (duckdb/duckdb#19688). In a release build of
-  `accelerator-duckdb`'s `insert_into`, an overwrite of one reused table whose record
-  batches repeat a key failed 604 of 1,000 times on #89 (every write after the first
-  failure reported the invalidated database), and 0 of 1,000 on `c5bcad1`, whose `DuckDB`
-  writer `f103fe8` leaves unchanged.
-- spiceai/datafusion-table-providers#90 accepts nested columns that only
-  spiceai/datafusion-federation#92 (not yet merged) can read back, so it has to move
-  together with that federation pin.
-- spiceai/datafusion-table-providers#93 sits on top of both.
+  database until a restart (duckdb/duckdb#19688). The 2026-10-29 nightly build of this
+  workspace failed this way on the 149th of 1,000 full refreshes of a dataset whose
+  refresh repeats a key across record batches, and every refresh and query after it
+  failed. `DuckDB` v1.4.5 removes that assertion (duckdb/duckdb#20804); the `spiceai-1.4.4`
+  `DuckDB` line this workspace builds does not have it
+  ([#14643](https://github.com/spiceai/spiceai/issues/14643)).
+- spiceai/datafusion-table-providers#90 lets a `SQLite` acceleration store a list of
+  structs, which only spiceai/datafusion-federation#92 (still open) can read back. On the
+  same nightly such a dataset loads, and a query that selects the column fails with
+  `Unsupported list item type: Struct(…)`; before #90 the dataset failed to load.
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
@@ -524,6 +525,9 @@ The following upstream-branch changes remain excluded from this pin:
 | `SQLite` interval rewrite shifts a timestamp through `datetime()` and a `DATE` through `date()`, chosen by the operand's type: `SQLiteRemoteTable`'s logical optimizer and `mark_federated_date_operands` mark each `DATE` operand on the typed plan, and `SQLiteIntervalVisitor` consumes the marker (table-providers PR #88) | The visitor chose `date()` whenever the interval had no positive intraday part, so `ts - INTERVAL '1 hour'` and `ts ± INTERVAL '1 day'` dropped the time of day: a projection answered midnight and a filter on the shifted timestamp kept rows the predicate excludes, on `SQLite` and Turso alike ([#14714](https://github.com/spiceai/spiceai/issues/14714)). Turso shares the visitor but builds its own federated table, so it must also install `SQLiteRemoteTable` and `mark_federated_date_operands` (`crates/data_components/src/turso.rs`): without the marking, every operand shifts through `datetime()`, and `d + INTERVAL '1 day' = DATE '2026-10-03'` stops matching | silent (wrong rows); build for the Turso wiring | `crates/runtime/tests/acceleration/sqlite_interval_arithmetic.rs::{sqlite_interval_arithmetic_keeps_the_time_of_day,turso_interval_arithmetic_keeps_the_time_of_day}`, which diff timestamp and date shifts, projected and filtered, against the unaccelerated source, assert that a projected shift reaches the engine as `datetime(` for a timestamp and `date(` for a date, and pin the rows of the report's projection and filter and of the date-literal comparison. Need the `sqlite` and `turso` runtime features |
 | `MySQLConnectionPool::new_with_pool_opts` hands the caller the pool options read from the connection parameters, on the `connection_string` path as well as the individual-parameter one, and builds the pool with what it returns ([table-providers PR #107](https://github.com/spiceai/datafusion-table-providers/pull/107), merged as `a48894d` on `spiceai-55`) | The MySQL dataset connector and catalog set the pool size and connection lifetime through it. If the signature is kept and the options are dropped on the URL path, a dataset given `mysql_connection_string` goes back to `mysql_async`'s 10/100 pool and to keeping its connections for the life of the process, so it stays on the server its hostname first resolved to. If the function is removed, the build fails | build; silent if the signature survives | `test/spicescript/mysql-connection-pool.yaml` (pool maximum and minimum with a connection string, connections replaced under a 2s lifetime, and kept under `0s` and the default), against MySQL's own process list and per-user connection totals. In the fork, `test_mysql_pool_opts_apply_to_connection_string`, which fails with "a second connection opened while the pool's only one was held" when `configure_pool` is ignored |
 | `MySQLConnectionPool::with_new_connection_observer` asks each new pooled connection which server it reached (`@@hostname`, `@@port`, and `@@aurora_server_id` where the server has it) before its first use, and reports it once per connection ([table-providers PR #108](https://github.com/spiceai/datafusion-table-providers/pull/108), merged as `0894768` on `spiceai-55`) | The MySQL connector and catalog log, at INFO once per server per 10 minutes, the server their new connections reached. If the method is kept and the reports stop, the line that names which server behind a load-balanced hostname a dataset is on disappears without an error. If the method is removed, the build fails | build; silent if the signature survives | `test/spicescript/mysql-connection-pool.yaml` (the INFO line for a dataset's connections, with the server MySQL itself reports). In the fork, `test_mysql_new_connection_observer`, which fails with no reports (`left: []`) when the observer does not report |
+| A `DuckDB` upsert is written as one `INSERT … ON CONFLICT DO UPDATE` statement per run of rows that repeats no key, so a key repeated within one write keeps its last copy ([table-providers PR #89](https://github.com/spiceai/datafusion-table-providers/pull/89)) | A refresh that repeats a key across record batches keeps whichever copy `DuckDB`'s parallel scan writes last ([#14643](https://github.com/spiceai/spiceai/issues/14643)). On the 2026-10-26 nightly, whose pin `f103fe8` predates the patch, 1,000 of 1,000 refreshes of such a dataset kept an earlier copy | silent (wrong rows) | **GAP** — see [Open gaps](#open-gaps) |
+| `SQLite` stores every nested column as the JSON text Arrow's encoder writes, and accepts a list or struct whose items it accepts, except `Duration` ([table-providers PR #90](https://github.com/spiceai/datafusion-table-providers/pull/90)) | A `SQLite` acceleration of a dataset with a list of structs fails to load with `The field '…' has an unsupported data type: List(Struct(…))`, as it did on the 2026-10-26 nightly | silent (load failure) | **GAP** — see [Open gaps](#open-gaps) |
+| A `DuckDB` filter compares a naive microsecond or nanosecond timestamp column with a timestamp or date literal as an integer at the literal's precision (`epoch_us`, `epoch_ns`), not through `TO_TIMESTAMP(EPOCH_MS(…) / 1000)` ([table-providers PR #93](https://github.com/spiceai/datafusion-table-providers/pull/93)) | The millisecond rewrite reads `00:00:00.000999` as `00:00:00`, so a `DELETE` on a `DuckDB` acceleration with a literal inside a millisecond removes rows the predicate does not select ([#13146](https://github.com/spiceai/spiceai/issues/13146)). `DELETE … WHERE ts < '2026-01-01 00:00:00.0005'` removed the `.000999` row too | silent (wrong data) | `crates/search/src/index/duckdb/sql.rs::a_naive_timestamp_filter_keeps_the_utc_normalization` pins the rendered `(epoch_us("ts")::HUGEINT * 1000) > …` form, and the absence of `EPOCH_MS`, for a naive microsecond column. `test/spicescript/duckdb-timestamp-deletes.yaml` covers the `DELETE` path end to end: it deletes from a `DuckDB` acceleration with `<`, `=`, `BETWEEN` and `>=` against literals inside a millisecond, in memory and file mode, and compares the rows left with what `PostgreSQL` holds after the same deletes. Neither covers a nanosecond column or a date literal: the unit test builds a microsecond column against a timestamp literal, and the scenario's `PostgreSQL` oracle has no nanosecond timestamp |
 
 ## arrow-adbc
 
@@ -847,7 +851,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**47 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**49 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -933,10 +937,19 @@ writing a test; each says what would unblock it:
    rather than guard it.
 12. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
    there is no behaviour of ours to assert on.
+13. `datafusion-table-providers` upsert split per run of unrepeated keys (table-providers
+   PR #89) — the write path it adds can invalidate `DuckDB` 1.4.4, so a guard that runs it
+   in CI could fail on that crash rather than on the patch until `DuckDB` carries
+   duckdb/duckdb#20804
+   ([#14643](https://github.com/spiceai/spiceai/issues/14643)). Once it does, a load of a
+   dataset that repeats a key across record batches, checking the last copy, closes it.
+14. `datafusion-table-providers` nested `SQLite` columns stored as JSON (table-providers
+   PR #90) — the read side is spiceai/datafusion-federation#92, still open. The federation
+   pin that takes it should add a `SQLite` round trip of a list of structs.
 
 **Reported late rather than wrongly.** The right answer, after an avoidable wait:
 
-13. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
+15. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
    `endpoint` is retried through the whole backoff budget before reporting, so a
    configuration error looks like a slow provider. What changes is *when* the
    error arrives, and asserting that is a timing test.
@@ -944,7 +957,7 @@ writing a test; each says what would unblock it:
 **Diagnostics only.** The query is unaffected; what is lost is the ability to see
 how it ran:
 
-14. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
+16. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
    upstream's; `EXPLAIN FORMAT TREE` is not carried) — plain `EXPLAIN` is guarded
    through the cluster harness, and `ANALYZE` is not issued through it by anything. Closing this needs the
    harness to submit the statement rather than build its text as a label.
@@ -955,7 +968,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-15. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+17. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `mistral.rs`/`candle` i-quant MoE kernels; `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `mistral.rs` `deepseek41` and `glm5-next` decode kernels (spiceai/mistral.rs#49), which
     no suite here trends yet — their evidence is the DGX Spark decode A/B in that PR;
@@ -972,7 +985,7 @@ without becoming a flaky timing test:
 **Unoptimised builds only.** No query answers anything differently; what is lost
 is stack headroom in a debug build (release builds were not measured):
 
-16. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
+18. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
     it keeps the unparser's opt-level-0 frame from growing with #233 and #234, which
     without it push the fork's `roundtrip_statement` past the 2 MiB default test
     thread (it needs 2,112 KiB without the refactor, 1,984 KiB with it). This repo's
