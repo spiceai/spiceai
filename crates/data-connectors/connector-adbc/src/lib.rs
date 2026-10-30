@@ -46,7 +46,13 @@ use data_connector_api::{
 use runtime_parameters::{ParameterSpec, Parameters};
 
 mod table_factory;
-use table_factory::{AdbcTableFactoryWithPolicy, dialect_for_driver};
+use table_factory::{AdbcTableFactoryWithPolicy, DUCKDB_DRIVER, dialect_for_driver};
+
+/// `DuckDB` exports this ADBC entry point instead of `AdbcDriverInit`.
+const DUCKDB_ADBC_ENTRYPOINT: &[u8] = b"duckdb_adbc_init";
+
+/// Match the `duckdb:` connector's read-only access and UTC timestamps by default.
+const DUCKDB_DB_DEFAULTS: &[(&str, &str)] = &[("access_mode", "read_only"), ("TimeZone", "UTC")];
 
 /// The factory this connector holds: the managed-driver ADBC factory, with the
 /// federation policy attached by its type. Named because it appears in the drop
@@ -368,7 +374,8 @@ impl AdbcFactory {
         let username = params.parameters.get("username").expose().ok();
         let password = params.parameters.get("password").expose().ok();
         let driver_options = params.parameters.get("driver_options").expose().ok();
-        let db_options = build_db_options(&uri_str, username, password, driver_options);
+        let db_options =
+            build_db_options(driver_name, &uri_str, username, password, driver_options);
 
         let pool_identity =
             resolve_pool_identity(&driver_name_owned, &uri_str, &params).map_err(|e| {
@@ -448,10 +455,11 @@ impl AdbcFactory {
         // background. The timeout bounds only the *await*, not the actual
         // blocking execution. Use driver-level/connect-level timeouts where
         // the driver supports them for stricter cancellation.
+        let entrypoint = driver_entrypoint(driver_name);
         let init_handle = tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
             let mut driver = ManagedDriver::load_from_name(
                 &driver_location,
-                None,
+                entrypoint,
                 AdbcVersion::V110,
                 LOAD_FLAG_DEFAULT,
                 None,
@@ -885,13 +893,24 @@ fn normalize_driver_option_key(key: &str) -> String {
     }
 }
 
+fn driver_entrypoint(driver_name: &str) -> Option<&'static [u8]> {
+    (driver_name == DUCKDB_DRIVER).then_some(DUCKDB_ADBC_ENTRYPOINT)
+}
+
+/// Uses `path` for `DuckDB`: 1.4.4 rejects `uri`, while both 1.4.4 and 1.5.5 accept `path`.
 pub(crate) fn build_db_options(
+    driver_name: &str,
     uri: &str,
     username: Option<&str>,
     password: Option<&str>,
     driver_options: Option<&str>,
 ) -> Vec<(OptionDatabase, adbc_core::options::OptionValue)> {
-    let mut opts = vec![(OptionDatabase::Uri, uri.into())];
+    let uri_option = if driver_name == DUCKDB_DRIVER {
+        OptionDatabase::Other("path".to_string())
+    } else {
+        OptionDatabase::Uri
+    };
+    let mut opts = vec![(uri_option, uri.into())];
     if let Some(u) = username {
         opts.push((OptionDatabase::Username, u.into()));
     }
@@ -911,11 +930,24 @@ pub(crate) fn build_db_options(
                     continue;
                 }
                 opts.push((
-                    OptionDatabase::Other(normalize_driver_option_key(key)),
+                    OptionDatabase::Other(if driver_name == DUCKDB_DRIVER {
+                        key.to_string()
+                    } else {
+                        normalize_driver_option_key(key)
+                    }),
                     value.trim().into(),
                 ));
             } else {
                 tracing::warn!("Ignoring malformed ADBC driver option (expected 'key=value')");
+            }
+        }
+    }
+    if driver_name == DUCKDB_DRIVER {
+        for &(key, value) in DUCKDB_DB_DEFAULTS {
+            if !opts.iter().any(|(option, _)| {
+                matches!(option, OptionDatabase::Other(name) if name.eq_ignore_ascii_case(key))
+            }) {
+                opts.push((OptionDatabase::Other(key.to_string()), value.into()));
             }
         }
     }
@@ -1481,8 +1513,101 @@ mod tests {
     }
 
     #[test]
+    fn test_driver_entrypoint() {
+        assert_eq!(
+            driver_entrypoint("duckdb"),
+            Some(b"duckdb_adbc_init".as_slice())
+        );
+        for driver in ["sqlite", "postgresql", "snowflake", "other"] {
+            assert_eq!(driver_entrypoint(driver), None, "driver: {driver}");
+        }
+    }
+
+    fn assert_db_options_eq(
+        actual: Vec<(OptionDatabase, adbc_core::options::OptionValue)>,
+        expected: Vec<(OptionDatabase, &str)>,
+    ) {
+        assert_eq!(actual.len(), expected.len());
+        for ((key, value), (expected_key, expected_value)) in actual.into_iter().zip(expected) {
+            assert_eq!(key, expected_key);
+            let adbc_core::options::OptionValue::String(value) = value else {
+                panic!("expected a string database option, got {value:?}");
+            };
+            assert_eq!(value, expected_value);
+        }
+    }
+
+    #[test]
+    fn test_build_db_options_duckdb_defaults() {
+        assert_db_options_eq(
+            build_db_options("duckdb", "test.db", None, None, None),
+            vec![
+                (OptionDatabase::Other("path".into()), "test.db"),
+                (OptionDatabase::Other("access_mode".into()), "read_only"),
+                (OptionDatabase::Other("TimeZone".into()), "UTC"),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_build_db_options_duckdb_raw_keys() {
+        assert_db_options_eq(
+            build_db_options(
+                "duckdb",
+                "test.db",
+                None,
+                None,
+                Some("threads=2;adbc.custom=value"),
+            ),
+            vec![
+                (OptionDatabase::Other("path".into()), "test.db"),
+                (OptionDatabase::Other("threads".into()), "2"),
+                (OptionDatabase::Other("adbc.custom".into()), "value"),
+                (OptionDatabase::Other("access_mode".into()), "read_only"),
+                (OptionDatabase::Other("TimeZone".into()), "UTC"),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_build_db_options_duckdb_access_mode_override() {
+        assert_db_options_eq(
+            build_db_options(
+                "duckdb",
+                "test.db",
+                None,
+                None,
+                Some("ACCESS_MODE=read_write"),
+            ),
+            vec![
+                (OptionDatabase::Other("path".into()), "test.db"),
+                (OptionDatabase::Other("ACCESS_MODE".into()), "read_write"),
+                (OptionDatabase::Other("TimeZone".into()), "UTC"),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_build_db_options_duckdb_timezone_override() {
+        assert_db_options_eq(
+            build_db_options(
+                "duckdb",
+                "test.db",
+                None,
+                None,
+                Some("timezone=America/New_York"),
+            ),
+            vec![
+                (OptionDatabase::Other("path".into()), "test.db"),
+                (OptionDatabase::Other("timezone".into()), "America/New_York"),
+                (OptionDatabase::Other("access_mode".into()), "read_only"),
+            ],
+        );
+    }
+
+    #[test]
     fn test_build_db_options_uri_only() {
-        let opts = build_db_options("file:test.db", None, None, None);
+        let opts = build_db_options("snowflake", "file:test.db", None, None, None);
         assert_eq!(opts.len(), 1);
         assert_eq!(opts[0].0, OptionDatabase::Uri);
         assert!(
@@ -1492,7 +1617,13 @@ mod tests {
 
     #[test]
     fn test_build_db_options_with_username_password() {
-        let opts = build_db_options("postgres://host/db", Some("admin"), Some("secret"), None);
+        let opts = build_db_options(
+            "postgresql",
+            "postgres://host/db",
+            Some("admin"),
+            Some("secret"),
+            None,
+        );
         assert_eq!(opts.len(), 3);
 
         assert_eq!(opts[0].0, OptionDatabase::Uri);
@@ -1509,7 +1640,7 @@ mod tests {
 
     #[test]
     fn test_build_db_options_username_only() {
-        let opts = build_db_options("sqlite:test.db", Some("user"), None, None);
+        let opts = build_db_options("sqlite", "sqlite:test.db", Some("user"), None, None);
         assert_eq!(opts.len(), 2);
         assert_eq!(opts[0].0, OptionDatabase::Uri);
         assert_eq!(opts[1].0, OptionDatabase::Username);
@@ -1519,6 +1650,7 @@ mod tests {
     #[test]
     fn test_build_db_options_with_driver_options_unprefixed() {
         let opts = build_db_options(
+            "snowflake",
             "uri://db",
             None,
             None,
@@ -1541,6 +1673,7 @@ mod tests {
     #[test]
     fn test_build_db_options_with_driver_options_prefixed() {
         let opts = build_db_options(
+            "snowflake",
             "uri://db",
             None,
             None,
@@ -1559,7 +1692,7 @@ mod tests {
 
     #[test]
     fn test_build_db_options_driver_options_trailing_semicolon() {
-        let opts = build_db_options("uri://db", None, None, Some("key=value;"));
+        let opts = build_db_options("snowflake", "uri://db", None, None, Some("key=value;"));
         assert_eq!(opts.len(), 2);
         assert_eq!(opts[1].0, OptionDatabase::Other("adbc.key".to_string()));
         assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "value"));
@@ -1568,6 +1701,7 @@ mod tests {
     #[test]
     fn test_build_db_options_driver_options_malformed_ignored() {
         let opts = build_db_options(
+            "snowflake",
             "uri://db",
             None,
             None,
@@ -1578,7 +1712,7 @@ mod tests {
 
     #[test]
     fn test_build_db_options_driver_options_empty_key_ignored() {
-        let opts = build_db_options("uri://db", None, None, Some("=value;good=ok"));
+        let opts = build_db_options("snowflake", "uri://db", None, None, Some("=value;good=ok"));
         assert_eq!(opts.len(), 2); // uri + good (empty key skipped)
         assert_eq!(opts[1].0, OptionDatabase::Other("adbc.good".to_string()));
     }
@@ -3488,6 +3622,19 @@ mod function_support_tests {
                 .analyzer(&scan_aggregate(&provider, expr)),
             Some(FederationAnalyzerForLogicalPlan::With(_))
         )
+    }
+
+    /// Regression test for #14492: `DuckDB` returns `DOUBLE` for decimal `avg`,
+    /// so the dataset route must evaluate it locally.
+    #[tokio::test]
+    async fn a_decimal_avg_stays_local_on_the_duckdb_dataset_route() {
+        use datafusion::functions_aggregate::expr_fn::avg;
+        use datafusion::prelude::cast;
+
+        assert!(
+            !federates_aggregate("duckdb", avg(cast(col("id"), DataType::Decimal128(10, 2)))).await
+        );
+        assert!(federates_aggregate("duckdb", avg(col("id"))).await);
     }
 
     /// `BigQuery` refuses exactly the filtered-aggregate shapes its dialect cannot

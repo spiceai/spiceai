@@ -30,6 +30,7 @@ use crate::docker::Container;
 
 pub mod clickhouse;
 pub mod document;
+pub mod duckdb;
 pub mod duckdb_cli;
 pub mod ducklake;
 pub mod files;
@@ -158,7 +159,7 @@ pub trait Source: Send + Sync {
     }
 }
 
-/// Starts a source of `kind`; `files`, `rustfs`, `iceberg` and `ducklake`
+/// Starts a source of `kind`; `files`, `rustfs`, `iceberg`, `duckdb` and `ducklake`
 /// sources keep their directories under `work`.
 pub async fn start(
     name: &str,
@@ -181,9 +182,10 @@ pub async fn start(
         "iceberg" => Box::new(iceberg::Iceberg::start(name, run_id, dir).await?),
         "clickhouse" => Box::new(clickhouse::ClickHouse::start(name, run_id, version).await?),
         "mock-http" => Box::new(mock_http::MockHttp::start().await?),
+        "duckdb" => Box::new(duckdb::DuckDb::start(dir).await?),
         "ducklake" => Box::new(ducklake::DuckLake::start(name, run_id, version, dir).await?),
         other => anyhow::bail!(
-            "unknown source kind '{other}'; expected kafka, mongodb, dynamodb, postgres, mysql, clickhouse, files, rustfs, iceberg, ducklake, mock-http or docker"
+            "unknown source kind '{other}'; expected kafka, mongodb, dynamodb, postgres, mysql, clickhouse, files, rustfs, iceberg, duckdb, ducklake, mock-http or docker"
         ),
     };
     Ok(source)

@@ -29,9 +29,10 @@ use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
 use datafusion_table_providers::util::supported_functions::FunctionSupport;
-use runtime_datafusion::dialect::new_bigquery_dialect;
+use runtime_datafusion::dialect::{new_bigquery_dialect, new_duckdb_dialect};
 use runtime_datafusion::function_support::{
-    deny_spice_functions_for_bigquery_table_providers, expression_support_for_engine,
+    deny_spice_functions_for_bigquery_table_providers,
+    deny_spice_functions_for_duckdb_table_providers, expression_support_for_engine,
 };
 use runtime_datafusion::optimizer_rule::{JsonGetNullCheckRewrite, RegexpMatchNullCheckRewrite};
 use runtime_udfs_api::deny_spice_functions_for_table_providers;
@@ -40,6 +41,9 @@ type BoxedError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The `BigQuery` driver, as ADBC spells it in the `driver` parameter.
 const BIGQUERY_DRIVER: &str = "bigquery";
+
+/// The `DuckDB` driver, as ADBC spells it in the `driver` parameter.
+pub(crate) const DUCKDB_DRIVER: &str = "duckdb";
 
 /// The unparser dialect for a driver.
 ///
@@ -51,6 +55,7 @@ const BIGQUERY_DRIVER: &str = "bigquery";
 pub(crate) fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
     match driver_name {
         BIGQUERY_DRIVER => Some(new_bigquery_dialect()),
+        DUCKDB_DRIVER => Some(new_duckdb_dialect()),
         _ => None,
     }
 }
@@ -58,13 +63,20 @@ pub(crate) fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + 
 /// The federation function-support policy for a driver. Defaults to denying
 /// every Spice function, which is correct for a driver whose dialect rewrites
 /// none of them, plus the per-expression gate for the engine behind the
-/// driver where one exists: a `duckdb`, `postgresql` or `mysql` driver reaches
-/// an engine that rounds a fractional-to-integer cast `DataFusion` truncates,
-/// and the cast has to stay local on this route as on the engine's own
-/// connector (issue #14482).
+/// driver where one exists: a `postgresql` or `mysql` driver reaches an engine
+/// that rounds a fractional-to-integer cast `DataFusion` truncates, and the
+/// cast has to stay local on this route as on the engine's own connector
+/// (issue #14482).
+///
+/// `BigQuery` and `DuckDB` install their dialects (see [`dialect_for_driver`]),
+/// so they take the policy written for that dialect: the functions it renders
+/// natively, the built-ins it must not be handed, and the expression gate,
+/// which for `DuckDB` also keeps a decimal `avg` local (issue #14492).
 fn function_support_for_driver(driver_name: &str) -> FunctionSupport {
-    if driver_name == BIGQUERY_DRIVER {
-        return deny_spice_functions_for_bigquery_table_providers();
+    match driver_name {
+        BIGQUERY_DRIVER => return deny_spice_functions_for_bigquery_table_providers(),
+        DUCKDB_DRIVER => return deny_spice_functions_for_duckdb_table_providers(),
+        _ => {}
     }
     let support = deny_spice_functions_for_table_providers();
     match expression_support_for_engine(driver_name) {

@@ -1,17 +1,35 @@
 name: federation-matrix
 description: >
   The pushdown corpus answers the same through Spice whichever database a
-  table federates to, PostgreSQL, MySQL or ClickHouse: each backend receives
+  table federates to, PostgreSQL, MySQL, ClickHouse or DuckDB: each backend receives
   the query rewritten in its own dialect, and every answer is checked against
   one reference, PostgreSQL holding the same generated rows, so one corpus in
-  one dialect covers every backend.
+  one dialect covers every backend. DuckDB is read through both the duckdb
+  connector and the ADBC connector with the DuckDB driver.
 
 sources:
   backend: { kind: '${matrix.backend}' }
   ref: { kind: postgres }
 
 matrix:
-  backend: [postgres, mysql, clickhouse]
+  backend: [postgres, mysql, clickhouse, duckdb]
+
+variants:
+  # Keep the existing instance name and ledger identity for other backends.
+  default: federated
+  adbc:
+    when: { backend: duckdb }
+    datasets:
+      t:
+        from: adbc:t
+        params:
+          $merge: '${sources.backend.adbc_params}'
+          duckdb_open: null
+      u:
+        from: adbc:u
+        params:
+          $merge: '${sources.backend.adbc_params}'
+          duckdb_open: null
 
 spicepod:
   version: v1

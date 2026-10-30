@@ -1,19 +1,33 @@
 name: federation-differential
 description: >
   A query corpus answers the same through Spice as on the source itself, for
-  PostgreSQL and MySQL, both federated (each query rewritten and pushed to the
-  source) and accelerated into Cayenne, and the two agree with each other.
+  PostgreSQL, MySQL and DuckDB, both federated (each query rewritten and pushed
+  to the source) and accelerated into Cayenne, and the variants agree with each
+  other. DuckDB is also read through ADBC with the DuckDB driver.
 
 sources:
   src: { kind: '${matrix.source}' }
 
 matrix:
-  source: [postgres, mysql]
+  source: [postgres, mysql, duckdb]
 
 variants:
   federated: {}
   cayenne:
     datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }
+  adbc:
+    when: { source: duckdb }
+    datasets:
+      t:
+        from: adbc:t
+        params:
+          $merge: '${sources.src.adbc_params}'
+          duckdb_open: null
+      u:
+        from: adbc:u
+        params:
+          $merge: '${sources.src.adbc_params}'
+          duckdb_open: null
 
 spicepod:
   version: v1
@@ -80,13 +94,36 @@ steps:
           SELECT n, 1 + (n * 13) % 220, ELT(1 + n % 3, 'red', 'blue', 'green') FROM seq;
     when: { source: mysql }
 
+  - source-exec:
+      src: |
+        CREATE TABLE t (
+          id integer PRIMARY KEY, i integer, big bigint, d numeric(10, 2), f double precision,
+          s varchar(32), dt date, ts timestamp, b boolean
+        );
+        CREATE TABLE u (id integer PRIMARY KEY, t_id integer, label varchar(16));
+        INSERT INTO t
+          SELECT n,
+                 CASE WHEN n % 11 = 0 THEN NULL ELSE (n * 37) % 101 - 50 END,
+                 n::bigint * 50000000,
+                 ((n * 7919) % 20001 - 10000) / 100.0,
+                 n * 0.25,
+                 ['apple', 'Apple', 'APPLE', 'banana', 'O''Brien', 'naïve', '', 'under_score', 'b', NULL][1 + n % 10],
+                 DATE '2024-01-01' + n::integer,
+                 TIMESTAMP '2024-01-01 00:00:00' + n * INTERVAL '90 minutes',
+                 n % 3 = 0
+          FROM generate_series(1, 200) AS seq(n);
+        INSERT INTO u
+          SELECT n, 1 + (n * 13) % 220, ['red', 'blue', 'green'][1 + n % 3]
+          FROM generate_series(1, 150) AS seq(n);
+    when: { source: duckdb }
+
   - start: {}
   - corpus: corpus/pushdown.sql
   # Each variant took the path it names: the federated one sent the query to
   # the source, the accelerated one read Cayenne.
   - explain: SELECT id FROM t WHERE i > 40
     contains: VirtualExecutionPlan
-    only: federated
+    only: [federated, adbc]
   - explain: SELECT id FROM t WHERE i > 40
     contains: CayenneAccelerationExec
     only: cayenne

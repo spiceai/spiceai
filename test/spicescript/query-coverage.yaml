@@ -3,15 +3,16 @@ description: >
   An extended corpus (window functions, CTEs, set operations, outer and self
   joins, grouping sets, casts, dates, strings, NULL semantics, aggregates,
   ordering, arithmetic, subqueries) answers through Spice as PostgreSQL
-  answers it over the same generated rows: federated to PostgreSQL and MySQL,
-  and accelerated into each engine.
+  answers it over the same generated rows: federated to PostgreSQL, MySQL
+  and DuckDB, and accelerated into each engine. DuckDB is also read through
+  ADBC with the DuckDB driver.
 
 sources:
   backend: { kind: '${matrix.backend}' }
   ref: { kind: postgres }
 
 matrix:
-  backend: [postgres, mysql]
+  backend: [postgres, mysql, duckdb]
 
 variants:
   federated: {}
@@ -19,6 +20,19 @@ variants:
   duckdb: duckdb-file
   sqlite: sqlite-file
   arrow: arrow
+  adbc:
+    when: { backend: duckdb }
+    datasets:
+      t:
+        from: adbc:t
+        params:
+          $merge: '${sources.backend.adbc_params}'
+          duckdb_open: null
+      u:
+        from: adbc:u
+        params:
+          $merge: '${sources.backend.adbc_params}'
+          duckdb_open: null
 
 spicepod:
   version: v1

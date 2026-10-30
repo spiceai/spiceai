@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 //! Runs statements through the `duckdb` CLI, for sources whose writer and
-//! oracle is `DuckDB` (Iceberg, `DuckLake`).
+//! oracle is `DuckDB` (Iceberg, `DuckLake`, `DuckDB` files).
 
 use std::process::Stdio;
 
@@ -34,6 +34,34 @@ pub async fn embedded(near: &std::path::Path, override_var: &str) -> Result<Stri
     if let Ok(binary) = std::env::var(override_var) {
         return Ok(binary);
     }
+    let version = embedded_version(near, override_var).await?;
+    let asset = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", _) => "duckdb_cli-osx-universal.zip",
+        ("linux", "aarch64") => "duckdb_cli-linux-arm64.zip",
+        ("linux", "x86_64") => "duckdb_cli-linux-amd64.zip",
+        (os, arch) => bail!("no DuckDB CLI download for {os}/{arch}; set {override_var}"),
+    };
+    download(&version, asset, "duckdb", override_var).await
+}
+
+/// The matching shared library, which also exports the `DuckDB` ADBC driver.
+/// `SPICESCRIPT_DUCKDB_LIBRARY` names a library to use instead.
+pub async fn embedded_library(near: &std::path::Path) -> Result<String> {
+    let override_var = "SPICESCRIPT_DUCKDB_LIBRARY";
+    if let Ok(library) = std::env::var(override_var) {
+        return Ok(std::fs::canonicalize(library)?.display().to_string());
+    }
+    let version = embedded_version(near, override_var).await?;
+    let (asset, library) = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", _) => ("libduckdb-osx-universal.zip", "libduckdb.dylib"),
+        ("linux", "aarch64") => ("libduckdb-linux-arm64.zip", "libduckdb.so"),
+        ("linux", "x86_64") => ("libduckdb-linux-amd64.zip", "libduckdb.so"),
+        (os, arch) => bail!("no DuckDB library download for {os}/{arch}; set {override_var}"),
+    };
+    download(&version, asset, library, override_var).await
+}
+
+async fn embedded_version(near: &std::path::Path, override_var: &str) -> Result<String> {
     let lock = near
         .ancestors()
         .map(|dir| dir.join("Cargo.lock"))
@@ -56,16 +84,17 @@ pub async fn embedded(near: &std::path::Path, override_var: &str) -> Result<Stri
                 lock.display()
             )
         })?;
+    Ok(version)
+}
+
+async fn download(version: &str, asset: &str, file: &str, override_var: &str) -> Result<String> {
+    // Matrix combinations can resolve the same release concurrently.
+    static DOWNLOAD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _download = DOWNLOAD.lock().await;
     let home = std::env::var("HOME").context("HOME is not set")?;
     let dir = std::path::PathBuf::from(home).join(format!(".cache/spicescript/duckdb-{version}"));
-    let binary = dir.join("duckdb");
+    let binary = dir.join(file);
     if !binary.is_file() {
-        let asset = match (std::env::consts::OS, std::env::consts::ARCH) {
-            ("macos", _) => "duckdb_cli-osx-universal.zip",
-            ("linux", "aarch64") => "duckdb_cli-linux-arm64.zip",
-            ("linux", _) => "duckdb_cli-linux-amd64.zip",
-            (os, arch) => bail!("no DuckDB CLI download for {os}/{arch}; set {override_var}"),
-        };
         tokio::fs::create_dir_all(&dir).await?;
         let zip = dir.join(asset);
         let url = format!("https://github.com/duckdb/duckdb/releases/download/v{version}/{asset}");
@@ -77,7 +106,7 @@ pub async fn embedded(near: &std::path::Path, override_var: &str) -> Result<Stri
             .await
             .context("Failed to run curl")?;
         if !status.success() {
-            bail!("Failed to download the DuckDB {version} CLI from {url}; set {override_var}");
+            bail!("Failed to download the DuckDB {version} {file} from {url}; set {override_var}");
         }
         let status = tokio::process::Command::new("unzip")
             .args(["-o", "-q"])
@@ -89,7 +118,7 @@ pub async fn embedded(near: &std::path::Path, override_var: &str) -> Result<Stri
             .context("Failed to run unzip")?;
         if !status.success() || !binary.is_file() {
             bail!(
-                "Failed to unpack the DuckDB {version} CLI from {}",
+                "Failed to unpack the DuckDB {version} {file} from {}",
                 zip.display()
             );
         }

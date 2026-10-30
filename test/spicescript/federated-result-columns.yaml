@@ -1,11 +1,28 @@
 name: federated-result-columns
 description: >
   Federated result columns keep their planned types and nullability by position,
-  including repeated names on the nullable side of an outer join.
+  including repeated names on the nullable side of an outer join, over
+  PostgreSQL, MySQL and DuckDB. DuckDB is read through both the duckdb
+  connector and ADBC with the DuckDB driver.
 sources:
   src: { kind: '${matrix.src}' }
 matrix:
-  src: [postgres, mysql]
+  src: [postgres, mysql, duckdb]
+variants:
+  default: federated
+  adbc:
+    when: { src: duckdb }
+    datasets:
+      t:
+        from: adbc:t
+        params:
+          $merge: '${sources.src.adbc_params}'
+          duckdb_open: null
+      u:
+        from: adbc:u
+        params:
+          $merge: '${sources.src.adbc_params}'
+          duckdb_open: null
 spicepod:
   version: v1
   kind: Spicepod
