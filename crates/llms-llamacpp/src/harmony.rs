@@ -708,6 +708,31 @@ mod tests {
             ),
             Route::Header(String::new())
         );
+        // `<|start|>` in a body the prompt opened is text there, as in a reply, so it starts
+        // no message: not in a call's arguments, nor in a final message
+        assert_eq!(
+            [
+                "<|start|>assistant to=functions.f<|channel|>commentary json<|message|>{\"note\":\"<|start|>x\",\"city\":",
+                "<|start|>assistant<|channel|>final<|message|>Answer: <|start|>",
+            ]
+            .map(|prompt| after(prompt, Held::Nothing)),
+            [
+                Route::Call {
+                    name: "f".to_string(),
+                    arguments: "{\"note\":\"<|start|>x\",\"city\":".to_string()
+                },
+                Route::Content { last: true }
+            ]
+        );
+        // a call the prompt made and its result are closed, so the reply starts in the header
+        // after the generation prompt's role
+        assert_eq!(
+            after(
+                "<|start|>user<|message|>Weather?<|end|><|start|>assistant to=functions.f<|channel|>commentary json<|message|>{\"a\":1}<|call|><|start|>functions.f to=assistant<|channel|>commentary<|message|>{\"t\":2}<|end|><|start|>assistant",
+                Held::Nothing
+            ),
+            Route::Header(String::new())
+        );
         // a grammar holds the reply from its first header
         assert_eq!(
             after("<|start|>assistant<|channel|>final<|message|>", Held::Reply),
