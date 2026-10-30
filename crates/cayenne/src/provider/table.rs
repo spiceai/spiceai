@@ -22943,6 +22943,10 @@ impl CayenneTableProvider {
                     "Hard-link of compaction file unavailable; copying"
                 );
                 tokio::fs::copy(&source, &destination).await?;
+                // A hard link shares data the source already made durable; a copy
+                // is new data, so it is synced before the caller syncs the
+                // directory and publishes the snapshot that references it.
+                tokio::fs::File::open(&destination).await?.sync_all().await?;
             }
         }
         Ok(())
