@@ -313,15 +313,19 @@ fn redact_json_strings(value: &mut Value, removed: &[String]) {
 }
 
 /// `key`, or, when `map` holds it already, `key` with the first ` (n)` after it
-/// that `map` does not hold: two keys that redact alike stay two.
+/// that `map` does not hold: two keys that redact alike stay two. Of more
+/// candidates than `map` has keys, one is free.
 fn unused_key(map: &Map<String, Value>, key: String) -> String {
     if !map.contains_key(&key) {
         return key;
     }
-    (2_usize..)
-        .map(|n| format!("{key} ({n})"))
-        .find(|candidate| !map.contains_key(candidate))
-        .unwrap_or_default()
+    for n in 2..=map.len() + 2 {
+        let candidate = format!("{key} ({n})");
+        if !map.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    key
 }
 
 /// Record each statement in the strings of `value`, as
