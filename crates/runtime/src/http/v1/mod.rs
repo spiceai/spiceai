@@ -361,10 +361,13 @@ fn redact_url_at(s: &str, embedded: bool) -> Option<(String, usize)> {
     // fragment. A password can hold a raw `?`, `#`, quote or tab, though
     // (`user:pa?ss@host`), and some drivers read it that way. So when the
     // region up to the path holds an `@` past that point, and the parsed
-    // authority is userinfo-like (has `@` or `:`) or is not a valid
-    // `host[:port]`, fail closed: remove everything up to the last `@`
-    // before the path. Only a space ends that region in free text, since URL
-    // parsers strip tabs and newlines.
+    // authority is userinfo-like, fail closed: remove everything up to the
+    // last `@` before the path. The parsed authority is userinfo-like when it
+    // has an `@`, is not a valid `host[:port]`, or has a `:` and the text up
+    // to that `@` is not a `key=value` query (`u:123?SECRET@h` is, but
+    // `h:8443?email=a@b.example` is a host, port and query). Only a space
+    // ends that region in free text, since URL parsers strip tabs and
+    // newlines.
     let after_start = &s[authority_start..];
     let strict_len = after_start
         .find(|c: char| matches!(c, '/' | '\\' | '?' | '#') || ends_url(c))
@@ -376,7 +379,10 @@ fn redact_url_at(s: &str, embedded: bool) -> Option<(String, usize)> {
     let last_at = after_start[..extended_len].rfind('@');
     let authority_len = match last_at {
         Some(at)
-            if at >= strict_len && (strict.contains(['@', ':']) || !is_host_and_port(strict)) =>
+            if at >= strict_len
+                && (strict.contains('@')
+                    || !is_host_and_port(strict)
+                    || (strict.contains(':') && !after_start[strict_len..at].contains('='))) =>
         {
             let host_len = after_start[at + 1..extended_len]
                 .find(|c: char| matches!(c, '?' | '#') || ends_url(c))
@@ -430,9 +436,10 @@ fn redact_url_at(s: &str, embedded: bool) -> Option<(String, usize)> {
 
 /// In free text a quote ends a URL, but a secret query value can contain one
 /// (`?token=abc'def`). If the query pair that the quote cuts off is a secret,
-/// the URL is taken to run to the end of that pair (the next whitespace, `&`
-/// or `#`) so the whole value is replaced.
-fn extend_over_quoted_secret(rest: &str, url_len: usize) -> usize {
+/// the URL is taken to run past that pair (to the next quote or whitespace),
+/// and the scan goes on so later secret pairs are replaced too. A quote that
+/// is the last character of a pair is taken as the closing quote.
+fn extend_over_quoted_secret(rest: &str, mut url_len: usize) -> usize {
     let Some(query_start) = rest[..url_len].find('?') else {
         return url_len;
     };
@@ -443,10 +450,14 @@ fn extend_over_quoted_secret(rest: &str, url_len: usize) -> usize {
             .find(['&', '#'])
             .map_or(region.len(), |i| pos + i);
         if pair_end > url_len {
-            return match region[pos..pair_end].split_once('=') {
-                Some((key, _)) if is_secret_query_key(key) => pair_end,
-                _ => url_len,
-            };
+            match region[pos..pair_end].split_once('=') {
+                Some((key, _)) if is_secret_query_key(key) && url_len + 1 < pair_end => {
+                    url_len = region[pair_end..]
+                        .find(ends_embedded_url)
+                        .map_or(region.len(), |i| pair_end + i);
+                }
+                _ => return url_len,
+            }
         }
         if region[pair_end..].starts_with('#') {
             break;
@@ -1394,6 +1405,11 @@ mod tests {
                 "https://h/f.csv?email=a@b.example",
                 "https://h/f.csv?email=a@b.example",
             ),
+            (
+                "https://h:8443?email=a@b.example",
+                "https://h:8443?email=a@b.example",
+            ),
+            ("https://u:123#SECRET@h/x", "https://h/x"),
         ] {
             assert_eq!(redact_source_credentials(from), want, "{from}");
         }
@@ -1411,6 +1427,20 @@ mod tests {
         assert_eq!(
             redact_message_credentials("GET 'https://alice:p'ass@h/x?token=abc'def&a=1' failed"),
             "GET 'https://h/x?token=***&a=1' failed"
+        );
+        // Secret pairs after a quoted secret value.
+        assert_eq!(
+            redact_message_credentials("GET 'https://h/x?token=abc'def&api_key=SECOND' failed"),
+            "GET 'https://h/x?token=***&api_key=***' failed"
+        );
+        assert_eq!(
+            redact_message_credentials("GET https://h/x?token=abc'def&a=1&api_key=SECOND failed"),
+            "GET https://h/x?token=***&a=1&api_key=*** failed"
+        );
+        // A host, port and query holding an `@` keeps its origin.
+        assert_eq!(
+            redact_message_credentials("GET https://h:8443?email=a@b.example failed"),
+            "GET https://h:8443?email=a@b.example failed"
         );
     }
 
