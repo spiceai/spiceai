@@ -9,6 +9,7 @@ sources:
 
 variants:
   federated: {}
+  cayenne: cayenne-file
   duckdb: duckdb
   duckdb-source:
     datasets:
