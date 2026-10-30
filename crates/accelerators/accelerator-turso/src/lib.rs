@@ -992,9 +992,7 @@ impl DataAccelerator for TursoAccelerator {
         conn.execute(&drop_sql, ())
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-        tracing::info!(
-            "Deleted the Turso acceleration data of dataset '{table_name}', so it loads again from its source."
-        );
+        tracing::info!("Deleted the Turso acceleration data of dataset '{table_name}'.");
         Ok(())
     }
 

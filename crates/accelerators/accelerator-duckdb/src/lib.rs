@@ -1230,7 +1230,10 @@ impl DataAccelerator for DuckDBAccelerator {
 
                 let mut conn = pool.connect_sync()?;
                 let duckdb_conn = DuckDB::duckdb_conn(&mut conn).boxed()?;
-                let tx = duckdb_conn.get_underlying_conn_mut().transaction().boxed()?;
+                let tx = duckdb_conn
+                    .get_underlying_conn_mut()
+                    .transaction()
+                    .boxed()?;
 
                 // DuckDB accelerations use one of two layouts: a base table with the
                 // logical name (append history), or a view with the logical name over
@@ -1258,7 +1261,7 @@ impl DataAccelerator for DuckDBAccelerator {
                 tx.commit().boxed()?;
                 if dropped {
                     tracing::info!(
-                        "Deleted the DuckDB acceleration data of dataset '{table_name}', so it loads again from its source."
+                        "Deleted the DuckDB acceleration data of dataset '{table_name}'."
                     );
                 }
                 Ok(())

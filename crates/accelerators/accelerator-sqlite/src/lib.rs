@@ -749,9 +749,7 @@ impl DataAccelerator for SqliteAccelerator {
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
         if dropped {
-            tracing::info!(
-                "Deleted the SQLite acceleration data of dataset '{table_name}', so it loads again from its source."
-            );
+            tracing::info!("Deleted the SQLite acceleration data of dataset '{table_name}'.");
         }
         Ok(())
     }
