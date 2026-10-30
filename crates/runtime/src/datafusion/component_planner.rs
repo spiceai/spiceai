@@ -109,10 +109,11 @@ fn refuse_reserved_name(name: &ObjectName) -> DFResult<()> {
             "Table '{reference}' is in a schema Spice reserves for its own tables. Choose another schema."
         )));
     }
-    if runtime_datafusion::is_catalog_acceleration_dataset_name(reference.table()) {
+    if let Some((prefix, tables)) =
+        runtime_datafusion::reserved_table_name_prefix(reference.table())
+    {
         return Err(DataFusionError::Plan(format!(
-            "Table '{reference}' has a name Spice reserves: a name that starts with `{}` belongs to the tables Spice keeps for accelerated catalogs. Choose another name.",
-            runtime_datafusion::CATALOG_ACCELERATION_DATASET_PREFIX
+            "Table '{reference}' has a name Spice reserves: a name that starts with `{prefix}` belongs to {tables}. Choose another name."
         )));
     }
     Ok(())

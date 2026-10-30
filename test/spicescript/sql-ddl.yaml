@@ -84,6 +84,12 @@ steps:
     expect-error: Spice reserves
   - spice-exec: "CREATE TABLE \"__Catalog_Accel_pg__public__t\" WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv')"
     expect-error: Spice reserves
+  # So do the names of a DuckDB acceleration's data tables and of the tables
+  # Spice keeps its own state in.
+  - spice-exec: "CREATE TABLE __data_orders_1793398974815 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv')"
+    expect-error: Spice reserves
+  - spice-exec: "CREATE TABLE spice_sys_dataset_checkpoint WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv')"
+    expect-error: Spice reserves
   # Kept across a restart, and gone for good once dropped.
   - restart: {}
   - query: SELECT id, region, amount FROM orders ORDER BY id
