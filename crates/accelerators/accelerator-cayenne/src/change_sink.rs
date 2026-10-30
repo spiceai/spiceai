@@ -113,6 +113,13 @@ impl SlotAdvancer for StorageFenceObserver {
     async fn on_checkpoint_durable(&self, durable_epoch: u64) {
         self.observer.on_durable(durable_epoch).await;
     }
+
+    async fn record_position(&self, durable_epoch: u64) -> std::result::Result<(), String> {
+        self.observer
+            .record_position(durable_epoch)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Bound only through write-transparent layers. Source acknowledgement is owned

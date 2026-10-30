@@ -1002,6 +1002,18 @@ struct SharedLsnCommitter {
     /// next start would then resume *past* changes the acceleration never durably
     /// received.
     watermark_notify: Arc<Notify>,
+    /// Writes this commit's position before the source is acknowledged, for an
+    /// accelerator that commits it with the data it covers. `None` in tests.
+    position: Option<PositionRecorder>,
+}
+
+/// A member's applied-position store and the source's write serialization, so a
+/// position recorded by a committer and one written by
+/// [`write_published_positions`] cannot land out of order.
+#[derive(Clone)]
+struct PositionRecorder {
+    store: Arc<dyn AppliedLsnStore>,
+    lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[async_trait]
@@ -1054,6 +1066,29 @@ impl CommitChange for SharedLsnCommitter {
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
+    }
+
+    fn record_position(
+        &self,
+    ) -> Option<futures::future::BoxFuture<'static, std::result::Result<(), CommitError>>> {
+        let recorder = self.position.clone()?;
+        let slot = Arc::clone(&self.slot);
+        let lsn = self.flush_to;
+        Some(Box::pin(async move {
+            let _serialized = recorder.lock.lock().await;
+            if lsn <= slot.recorded() {
+                return Ok(());
+            }
+            recorder
+                .store
+                .save(AppliedLsn { lsn })
+                .await
+                .map_err(|source| CommitError::UnableToCommitChange { source })?;
+            // The background writer now skips this position and anything older,
+            // so it cannot overwrite it with an earlier one.
+            slot.note_recorded(lsn);
+            Ok(())
+        }))
     }
 }
 
@@ -1203,6 +1238,7 @@ struct PendingPgEnvelope {
     dataset: String,
     /// Cloned from the member; see [`run_applied_lsn_writer`].
     watermark_notify: Arc<Notify>,
+    position: Option<PositionRecorder>,
     is_dataset_ready: bool,
     first_received_at: std::time::Instant,
 }
@@ -1238,6 +1274,7 @@ impl PendingPgEnvelope {
             // Same member (the `slot` pointer check above proves it), so both
             // sides carry the same notify; either may be kept.
             watermark_notify,
+            position,
             is_dataset_ready,
             first_received_at,
         } = other;
@@ -1250,6 +1287,7 @@ impl PendingPgEnvelope {
                 flush_to,
                 dataset,
                 watermark_notify,
+                position,
                 is_dataset_ready,
                 first_received_at,
             });
@@ -1274,6 +1312,7 @@ impl PendingPgEnvelope {
                 dataset: self.dataset,
                 source_commit_ts_ms,
                 watermark_notify: self.watermark_notify,
+                position: self.position,
             }),
             Box::new(self.rows),
             self.is_dataset_ready,
@@ -1829,7 +1868,7 @@ struct SharedSource {
     /// Serializes [`write_published_positions`] between the writer task and the
     /// pump's final write, so a pass that read an older position cannot land after
     /// a newer one.
-    position_write_lock: tokio::sync::Mutex<()>,
+    position_write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Positions published by members that have since detached, which the writer's
     /// member sweep can no longer reach. See [`OrphanedPosition`].
     orphaned_positions: Mutex<Vec<OrphanedPosition>>,
@@ -1882,7 +1921,7 @@ impl SharedSource {
             restart_requested: AtomicBool::new(false),
             dead: AtomicBool::new(false),
             watermark_notify: Arc::new(Notify::new()),
-            position_write_lock: tokio::sync::Mutex::new(()),
+            position_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             orphaned_positions: Mutex::new(Vec::new()),
             slot_created_fresh: AtomicBool::new(false),
             slot_generation: AtomicU64::new(0),
@@ -4645,6 +4684,10 @@ async fn deliver_commit(
             flush_to: boundary.end_lsn,
             dataset: member.dataset_name.clone(),
             watermark_notify: Arc::clone(&member.watermark_notify),
+            position: Some(PositionRecorder {
+                store: Arc::clone(&member.applied_lsn_store),
+                lock: Arc::clone(&source.position_write_lock),
+            }),
             is_dataset_ready: is_ready,
             first_received_at: std::time::Instant::now(),
         };
@@ -4743,6 +4786,7 @@ mod tests {
             ),
             slot: Arc::clone(slot),
             watermark_notify: Arc::new(Notify::new()),
+            position: None,
             flush_to,
             dataset: "ds".to_string(),
             is_dataset_ready: ready,
@@ -6683,6 +6727,7 @@ mod tests {
         let make = |flush_to, source_commit_ts_ms| SharedLsnCommitter {
             slot: Arc::clone(&slot),
             watermark_notify: Arc::clone(&notify),
+            position: None,
             flush_to,
             dataset: "customer".into(),
             source_commit_ts_ms,
@@ -6719,6 +6764,7 @@ mod tests {
         let make = || SharedLsnCommitter {
             slot: Arc::clone(&slot),
             watermark_notify: Arc::clone(&notify),
+            position: None,
             flush_to: 20,
             dataset: "customer".into(),
             source_commit_ts_ms: Some(2),
@@ -6751,6 +6797,7 @@ mod tests {
         let mut first = SharedLsnCommitter {
             slot: Arc::clone(&slot),
             watermark_notify: Arc::clone(&notify),
+            position: None,
             flush_to: u64::MAX - 1,
             dataset: "customer".into(),
             source_commit_ts_ms: Some(5),
@@ -6758,6 +6805,7 @@ mod tests {
         let last = SharedLsnCommitter {
             slot,
             watermark_notify: notify,
+            position: None,
             flush_to: u64::MAX,
             dataset: "customer".into(),
             source_commit_ts_ms: None,
@@ -6777,6 +6825,7 @@ mod tests {
         ack.register(&key("a"), false);
         let committer = SharedLsnCommitter {
             watermark_notify: Arc::new(Notify::new()),
+            position: None,
             slot: ack.slot(&key("a")).expect("slot registered"),
             flush_to: 42,
             dataset: "test".to_string(),

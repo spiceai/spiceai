@@ -18,9 +18,10 @@ limitations under the License.
 //!
 //! The runtime's bookkeeping for a dataset (a CDC connector's applied position, the
 //! dataset schema checkpoint) is committed through the same head log as the
-//! dataset's metadata, as keyed values in the catalog. Each write is its own commit,
-//! acknowledged only after the head CAS, so a value is durable before the caller
-//! moves on, as with the `SQLite` sidecar.
+//! dataset's metadata, as keyed values in the catalog. A write is durable before
+//! the caller moves on, as with the `SQLite` sidecar: on its own it is one commit,
+//! and inside a CDC checkpoint it joins the checkpoint's record, so a source
+//! position commits with the data it covers.
 
 use std::{
     sync::Arc,
@@ -36,8 +37,11 @@ use runtime_acceleration::{
     snapshot::SnapshotBehavior,
 };
 use runtime_checkpoint_api::{
-    BlobCheckpoint, BlobCheckpointStore, CheckpointError, debezium::DebeziumCheckpointStore,
-    kafka::KafkaCheckpointStore, mongodb::MongoCheckpointStore, mysql_binlog::MySqlBinlogStore,
+    BlobCheckpoint, BlobCheckpointStore, CheckpointError,
+    debezium::DebeziumCheckpointStore,
+    kafka::KafkaCheckpointStore,
+    mongodb::MongoCheckpointStore,
+    mysql_binlog::{MySqlBinlogCheckpoint, MySqlBinlogStore},
 };
 use serde_json::{Value, json};
 
@@ -144,7 +148,9 @@ impl AcceleratorSidecar for NativeSidecar {
     }
 
     fn mysql_binlog_store(&self) -> Result<Arc<dyn MySqlBinlogStore>, CheckpointError> {
-        Err(unsupported_sidecar(ENGINE, "mysql-binlog"))
+        Ok(Arc::new(NativeMySqlBinlogStore(
+            self.values("spice_sys_mysql_binlog"),
+        )))
     }
 
     fn mongo_checkpoint_store(&self) -> Result<Arc<dyn MongoCheckpointStore>, CheckpointError> {
@@ -190,6 +196,48 @@ impl BlobCheckpointStore for NativeBlobStore {
     async fn upsert(&self, data: &str) -> Result<(), CheckpointError> {
         self.0
             .set(Some(&json!({ "data": data, "updated_at": now_secs() })))
+            .await
+    }
+
+    async fn delete(&self) -> Result<(), CheckpointError> {
+        self.0.set(None).await
+    }
+}
+
+/// The `SQLite` `spice_sys_mysql_binlog` row's columns, as one JSON object.
+struct NativeMySqlBinlogStore(Values);
+
+#[async_trait]
+impl MySqlBinlogStore for NativeMySqlBinlogStore {
+    async fn get(&self) -> Option<MySqlBinlogCheckpoint> {
+        // An unreadable position is reported as absent; see the trait.
+        let value = self.0.get().await.ok()??;
+        let text = |field: &str| {
+            value
+                .get(field)
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        };
+        Some(MySqlBinlogCheckpoint {
+            binlog_file: text("binlog_file")?,
+            binlog_pos: value.get("binlog_pos").and_then(Value::as_u64)?,
+            schema_json: text("schema_json"),
+            gtid_executed: text("gtid_executed"),
+            cursor_type: text("cursor_type"),
+            updated_at: time_of(&value, "updated_at"),
+        })
+    }
+
+    async fn upsert(&self, checkpoint: &MySqlBinlogCheckpoint) -> Result<(), CheckpointError> {
+        self.0
+            .set(Some(&json!({
+                "binlog_file": checkpoint.binlog_file,
+                "binlog_pos": checkpoint.binlog_pos,
+                "schema_json": checkpoint.schema_json,
+                "gtid_executed": checkpoint.gtid_executed,
+                "cursor_type": checkpoint.cursor_type,
+                "updated_at": now_secs(),
+            })))
             .await
     }
 

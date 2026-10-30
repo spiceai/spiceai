@@ -7,6 +7,8 @@
 //! retain it and call [`Writer::resolve`]; never replace an undecided logical write.
 //! This prototype retains all immutable history. It deliberately implements no GC:
 //! opaque actions do not provide enough information to establish reachability.
+//! Checkpoints keep attempt evidence only for [`Writer::set_attempt_horizon`]:
+//! past it, resolution reports `Unresolved`, never `Rejected`.
 
 mod format;
 mod reader;
@@ -153,7 +155,14 @@ pub struct Writer {
     sealed: Option<u64>,
     /// At most one batch copy runs beside the writer, off the acknowledgement.
     sealing: Option<(u64, tokio::task::JoinHandle<Result<()>>)>,
+    /// How long checkpoints keep an accepted attempt id, on the head's store time.
+    attempt_horizon: std::time::Duration,
 }
+
+/// The attempt-evidence horizon a writer starts with. It must outlast every
+/// writer's resolution window; any value is safe, since evidence past it
+/// resolves as `Unresolved`.
+pub const DEFAULT_ATTEMPT_HORIZON: std::time::Duration = std::time::Duration::from_secs(3600);
 
 impl Writer {
     /// Acquire the head with a strictly larger generation.
@@ -199,6 +208,7 @@ impl Writer {
             sealing_error: None,
             sealed: None,
             sealing: None,
+            attempt_horizon: DEFAULT_ATTEMPT_HORIZON,
         })
     }
 
@@ -230,7 +240,14 @@ impl Writer {
             sealing_error: None,
             sealed: None,
             sealing: None,
+            attempt_horizon: DEFAULT_ATTEMPT_HORIZON,
         })
+    }
+
+    /// Keep accepted attempt ids in checkpoints for `horizon` of the head's
+    /// store time after the first checkpoint that lists them.
+    pub fn set_attempt_horizon(&mut self, horizon: std::time::Duration) {
+        self.attempt_horizon = horizon;
     }
 
     #[must_use]
@@ -644,7 +661,8 @@ impl Writer {
     }
 
     /// Stage a caller checkpoint and evidence; the NEXT commit publishes its floor.
-    /// All accepted attempt ids up to `at` are retained without an expiry horizon.
+    /// Accepted attempt ids up to `at` are kept until they are older than the
+    /// attempt horizon, measured on the head's store time.
     /// # Errors
     /// Returns an error for a non-boundary commit, a pending attempt, or storage failure.
     pub async fn publish_checkpoint(&mut self, at: u64, root: Bytes) -> Result<()> {
@@ -658,31 +676,53 @@ impl Writer {
         {
             return invalid("checkpoint must advance to a published batch boundary");
         }
-        let mut attempts = if head.floor > 0 {
-            load_checkpoint(self.store.as_ref(), &self.prefix, head)
+        // The head was last written at or after every commit up to `at`, so its
+        // store time bounds their acceptance from above.
+        let now = u64::try_from(
+            self.store
+                .head(&self.prefix.clone().join("head"))
                 .await?
-                .attempts
-        } else {
-            Vec::new()
-        };
-        attempts.extend(
-            reader::records_since(
-                self.store.as_ref(),
-                &self.prefix,
-                head,
-                head.floor,
-                reader::DEFAULT_READ_CONCURRENCY,
-            )
-            .await?
-            .into_iter()
-            .filter(|entry| entry.commit <= at)
-            .map(|entry| entry.record.attempt_id),
-        );
+                .last_modified
+                .timestamp_millis(),
+        )
+        .unwrap_or_default();
+        let horizon = u64::try_from(self.attempt_horizon.as_millis()).unwrap_or(u64::MAX);
+        let (mut attempts, mut seen_ms) = (Vec::new(), Vec::new());
+        if head.floor > 0 {
+            let previous = load_checkpoint(self.store.as_ref(), &self.prefix, head).await?;
+            // A checkpoint without times keeps all of its evidence, as if seen now.
+            let times = previous
+                .seen_ms
+                .iter()
+                .copied()
+                .chain(std::iter::repeat(now));
+            for (id, seen) in previous.attempts.into_iter().zip(times) {
+                if now.saturating_sub(seen) < horizon {
+                    attempts.push(id);
+                    seen_ms.push(seen);
+                }
+            }
+        }
+        for entry in reader::records_since(
+            self.store.as_ref(),
+            &self.prefix,
+            head,
+            head.floor,
+            reader::DEFAULT_READ_CONCURRENCY,
+        )
+        .await?
+        .into_iter()
+        .filter(|entry| entry.commit <= at)
+        {
+            attempts.push(entry.record.attempt_id);
+            seen_ms.push(now);
+        }
         let checkpoint = Checkpoint {
             root,
             attempts,
             incarnation: head.incarnation.clone(),
             commit: at,
+            seen_ms,
         };
         immutable(
             self.store.as_ref(),

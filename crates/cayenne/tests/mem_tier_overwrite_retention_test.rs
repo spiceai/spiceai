@@ -598,3 +598,119 @@ async fn a_checkpoint_commits_its_metastore_changes_before_acknowledging_impl(
 }
 
 test_with_backends!(a_checkpoint_commits_its_metastore_changes_before_acknowledging_impl);
+
+/// Saves the position a checkpoint covers through the object-native catalog, as
+/// a source's position store does, and records the epoch it acknowledges.
+struct PositionSavingAdvancer {
+    catalog: Arc<cayenne::metastore::object_native::ObjectNativeCatalog>,
+    durable: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl SlotAdvancer for PositionSavingAdvancer {
+    async fn on_checkpoint_durable(&self, durable_epoch: u64) {
+        self.durable.fetch_max(durable_epoch, Ordering::SeqCst);
+    }
+
+    async fn record_position(&self, durable_epoch: u64) -> Result<(), String> {
+        self.catalog
+            .set_sidecar_value("position", Some(durable_epoch.to_be_bytes().to_vec()))
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// The action kinds of each record committed after `after`, oldest first.
+async fn records_after(
+    store: &Arc<dyn object_store::ObjectStore>,
+    after: u64,
+) -> TestResult<Vec<Vec<&'static str>>> {
+    use prost::Message;
+    let (_, opened) = object_store_occ::headlog::Reader::open(
+        Arc::clone(store),
+        object_store::path::Path::from("catalog"),
+    )
+    .await?;
+    let mut records = Vec::new();
+    for entry in opened
+        .records
+        .into_iter()
+        .filter(|entry| entry.commit > after)
+    {
+        let mut kinds = Vec::new();
+        for payload in object_store_occ::headlog::Group::decode(entry.record.payload)?.payloads {
+            let record = cayenne_metastore_actions::Record::decode(payload)?;
+            kinds.extend(
+                record
+                    .actions
+                    .iter()
+                    .map(cayenne_metastore_actions::Action::name),
+            );
+        }
+        records.push(kinds);
+    }
+    Ok(records)
+}
+
+/// With the object-native metastore, a checkpoint commits the source position it
+/// covers in the same record as its data, before the source is acknowledged: no
+/// record holds a position without the data it covers.
+#[tokio::test]
+async fn an_object_native_checkpoint_commits_its_position_with_its_data() -> TestResult<()> {
+    const NAME: &str = "position_with_data";
+    let fixture = TestFixture::new(common::BackendType::Sqlite).await?;
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let catalog = Arc::new(
+        cayenne::metastore::object_native::ObjectNativeCatalog::create(
+            Arc::clone(&store),
+            object_store::path::Path::from("catalog"),
+        )
+        .await?,
+    );
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            memory_tier_options(&fixture, NAME, &id_value_schema()),
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    let advancer = Arc::new(PositionSavingAdvancer {
+        catalog: Arc::clone(&catalog),
+        durable: std::sync::atomic::AtomicU64::new(0),
+    });
+    table.install_slot_advancer(Arc::clone(&advancer) as Arc<dyn SlotAdvancer>);
+    let (reader, _) = object_store_occ::headlog::Reader::open(
+        Arc::clone(&store),
+        object_store::path::Path::from("catalog"),
+    )
+    .await?;
+    let before = reader.state().head.commit;
+
+    cdc_apply(&table, id_value_batch(&[(1, 10), (2, 20)])?).await?;
+    table.checkpoint_mem_tier().await?;
+    let durable = advancer.durable.load(Ordering::SeqCst);
+    assert!(
+        durable > 0,
+        "precondition: the checkpoint must acknowledge the source"
+    );
+
+    let records = records_after(&store, before).await?;
+    let with_position: Vec<_> = records
+        .iter()
+        .filter(|kinds| kinds.contains(&"AdvanceSourcePosition"))
+        .collect();
+    assert_eq!(with_position.len(), 1, "records: {records:?}");
+    assert!(
+        with_position[0]
+            .iter()
+            .any(|kind| *kind != "AdvanceSourcePosition"),
+        "the position must commit with the data it covers, records: {records:?}"
+    );
+    assert_eq!(
+        catalog.sidecar_value("position").await?,
+        Some(durable.to_be_bytes().to_vec())
+    );
+    Ok(())
+}

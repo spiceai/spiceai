@@ -1020,3 +1020,88 @@ async fn headlog_spills_large_records_and_verifies_them_on_read() {
         );
     }
 }
+
+#[derive(Clone, PartialEq, Message)]
+struct TestCheckpoint {
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    attempts: Vec<Vec<u8>>,
+    #[prost(uint64, repeated, tag = "5")]
+    seen_ms: Vec<u64>,
+}
+
+async fn checkpoint_attempts(backend: &Backend, floor: u64) -> usize {
+    let bytes = backend
+        .store
+        .get(
+            &backend
+                .prefix
+                .clone()
+                .join("checkpoints")
+                .join(format!("{floor:020}")),
+        )
+        .await
+        .expect("checkpoint")
+        .bytes()
+        .await
+        .expect("checkpoint bytes");
+    let checkpoint = TestCheckpoint::decode(bytes).expect("decode checkpoint");
+    assert_eq!(checkpoint.attempts.len(), checkpoint.seen_ms.len());
+    checkpoint.attempts.len()
+}
+
+/// Checkpoints drop attempt ids older than the horizon on the head's store
+/// time, and such an attempt then resolves as `Unresolved`, never `Rejected`.
+/// With the default horizon the same history keeps the evidence.
+#[tokio::test]
+async fn headlog_attempt_evidence_expires_after_the_horizon() {
+    for (horizon, expired) in [
+        (std::time::Duration::from_millis(50), true),
+        (object_store_occ::headlog::DEFAULT_ATTEMPT_HORIZON, false),
+    ] {
+        for backend in backends() {
+            let mut writer = writer(&backend).await;
+            writer.set_attempt_horizon(horizon);
+            let oldest = append(&mut writer, Bytes::from_static(b"oldest")).await;
+            for _ in 0..7 {
+                append(&mut writer, Bytes::from_static(b"early")).await;
+            }
+            let first = *writer.state().head.batches.last().expect("sealed batch");
+            writer
+                .publish_checkpoint(first, Bytes::from_static(b"first"))
+                .await
+                .expect("first checkpoint");
+            append(&mut writer, Bytes::from_static(b"publishes first")).await;
+            assert_eq!(checkpoint_attempts(&backend, first).await as u64, first);
+            assert_eq!(
+                writer.resolve(&oldest).await.expect("fresh evidence"),
+                Outcome::Accepted { commit: 1 }
+            );
+
+            // Store time passes the horizon before the next checkpoint.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            for _ in 0..8 {
+                append(&mut writer, Bytes::from_static(b"late")).await;
+            }
+            let second = *writer.state().head.batches.last().expect("sealed batch");
+            writer
+                .publish_checkpoint(second, Bytes::from_static(b"second"))
+                .await
+                .expect("second checkpoint");
+            append(&mut writer, Bytes::from_static(b"publishes second")).await;
+            let kept = checkpoint_attempts(&backend, second).await as u64;
+            if expired {
+                assert_eq!(kept, second - first, "only attempts after the first floor");
+                assert_eq!(
+                    writer.resolve(&oldest).await.expect("expired evidence"),
+                    Outcome::Unresolved
+                );
+            } else {
+                assert_eq!(kept, second);
+                assert_eq!(
+                    writer.resolve(&oldest).await.expect("retained evidence"),
+                    Outcome::Accepted { commit: 1 }
+                );
+            }
+        }
+    }
+}

@@ -177,12 +177,66 @@ impl DatasetState {
     ///
     /// Returns [`ApplyError`] when a guard fails; the state is then unchanged.
     pub fn apply(&mut self, record: &Record) -> Result<()> {
-        let mut next = self.clone();
+        // Keep the prior value of only what the record can change, so a failed
+        // guard restores it without copying the tables it does not touch.
+        let mut tables = BTreeMap::new();
+        let mut positions = BTreeMap::new();
+        let mut creates = false;
         for action in &record.actions {
-            next.apply_action(action)?;
+            if let Some(table_id) = action.table_id() {
+                tables
+                    .entry(table_id.to_string())
+                    .or_insert_with(|| self.tables.get(table_id).cloned());
+            }
+            match &action.kind {
+                Some(Kind::AdvanceSourcePosition(a)) => {
+                    let key = (a.source.clone(), a.partition.clone());
+                    let prior = self.positions.get(&key).cloned();
+                    positions.entry(key).or_insert(prior);
+                }
+                Some(Kind::CreateTable(_) | Kind::DropTable(_) | Kind::Unconverted(_)) => {
+                    creates = true;
+                }
+                _ => {}
+            }
         }
-        *self = next;
+        let unknown = creates.then(|| self.unknown.clone());
+        for action in &record.actions {
+            if let Err(error) = self.apply_action(action) {
+                for (table_id, prior) in tables {
+                    match prior {
+                        Some(table) => self.tables.insert(table_id, table),
+                        None => self.tables.remove(&table_id),
+                    };
+                }
+                for (key, prior) in positions {
+                    match prior {
+                        Some(position) => self.positions.insert(key, position),
+                        None => self.positions.remove(&key),
+                    };
+                }
+                if let Some(unknown) = unknown {
+                    self.unknown = unknown;
+                }
+                return Err(error);
+            }
+        }
         Ok(())
+    }
+
+    /// Applies every action of `record` in order, without keeping what it
+    /// changes: the cost is that of the actions alone, whatever the state's size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError`] when a guard fails. The state then holds the
+    /// actions before the failing one and no longer matches any committed
+    /// state: the caller must discard it and rebuild from the log.
+    pub fn apply_in_place(&mut self, record: &Record) -> Result<()> {
+        record
+            .actions
+            .iter()
+            .try_for_each(|action| self.apply_action(action))
     }
 
     #[expect(clippy::too_many_lines, reason = "one arm per action")]
@@ -677,5 +731,107 @@ fn map_differences<K: Ord + std::fmt::Debug, V: PartialEq + std::fmt::Debug>(
     }
     if shown > LIMIT {
         out.push(format!("{name}: {} more differences", shown - LIMIT));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::{
+        AddFiles, AdvanceSeq, AdvanceSourcePosition, CreateTable, TableRef, Unconverted,
+    };
+
+    /// The obviously atomic apply: every action on a copy, kept only if all apply.
+    fn reference_apply(state: &mut DatasetState, record: &Record) -> Result<()> {
+        let mut next = state.clone();
+        for action in &record.actions {
+            next.apply_action(action)?;
+        }
+        *state = next;
+        Ok(())
+    }
+
+    /// A small deterministic generator, so a failure names its seed.
+    struct Lcg(u64);
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    fn random_action(rng: &mut Lcg) -> Action {
+        let table_id = format!("t{}", rng.below(4));
+        let kind = match rng.below(7) {
+            0 => Kind::CreateTable(CreateTable {
+                table_id,
+                name: format!("n{}", rng.below(5)),
+                current_snapshot_id: "s".into(),
+                ..CreateTable::default()
+            }),
+            1 => Kind::DropTable(TableRef { table_id }),
+            2 | 3 => Kind::AddFiles(AddFiles {
+                table_id,
+                snapshot_id: "s".into(),
+                files: (0..=rng.below(3))
+                    .map(|_| FileEntry {
+                        path: format!("f{}", rng.below(12)),
+                        rows: 1,
+                        ..FileEntry::default()
+                    })
+                    .collect(),
+                upsert: rng.below(4) == 0,
+            }),
+            4 => Kind::AdvanceSeq(AdvanceSeq {
+                table_id,
+                to: i64::try_from(rng.below(40)).unwrap_or_default(),
+            }),
+            5 => Kind::AdvanceSourcePosition(AdvanceSourcePosition {
+                source: format!("src{}", rng.below(3)),
+                partition: String::new(),
+                position: vec![u8::try_from(rng.below(250)).unwrap_or_default()],
+                clear: rng.below(5) == 0,
+            }),
+            _ => Kind::Unconverted(Unconverted {
+                table_id,
+                method: "m".into(),
+            }),
+        };
+        Action::new(kind)
+    }
+
+    /// Applying in place restores what a refused record changed: after every
+    /// record, accepted or refused, the state equals the copy-based apply's.
+    #[test]
+    fn a_refused_record_leaves_the_state_as_the_copy_based_apply_does() {
+        let (mut refused, mut accepted) = (0, 0);
+        for seed in 0..200_u64 {
+            let mut rng = Lcg(seed);
+            let (mut state, mut expected) = (DatasetState::default(), DatasetState::default());
+            for step in 0..200 {
+                let record = Record {
+                    actions: (0..=rng.below(4))
+                        .map(|_| random_action(&mut rng))
+                        .collect(),
+                };
+                let got = state.apply(&record);
+                let want = reference_apply(&mut expected, &record);
+                assert_eq!(got, want, "seed {seed} step {step}: outcome");
+                assert_eq!(state, expected, "seed {seed} step {step}: state");
+                if want.is_ok() {
+                    accepted += 1;
+                } else {
+                    refused += 1;
+                }
+            }
+        }
+        // Both paths ran often: a generator that never fails a guard checks nothing.
+        assert!(
+            refused > 5_000 && accepted > 5_000,
+            "refused {refused}, accepted {accepted}"
+        );
     }
 }

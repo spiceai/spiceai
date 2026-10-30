@@ -53,8 +53,9 @@ struct Inner {
     writer: Writer,
     poisoned: bool,
     config: NativeCatalogConfig,
-    /// The state at the last checkpoint this catalog staged (or opened from), and
-    /// the records committed after it, from which the next checkpoint root is built.
+    /// The state with every record up to the last checkpoint this catalog
+    /// attempted (or opened from) applied, and the records committed after it,
+    /// from which the next checkpoint root is built.
     floor_state: DatasetState,
     since_floor: Vec<(u64, Vec<Record>)>,
     /// The commit of the last checkpoint staged; its floor publishes with the next commit.
@@ -80,6 +81,8 @@ pub struct NativeCatalogConfig {
     /// Sealed batches listed in the head before the catalog checkpoints at the
     /// newest one.
     pub checkpoint_after_batches: usize,
+    /// How long checkpoints keep the evidence that resolves an uncertain commit.
+    pub attempt_horizon: std::time::Duration,
 }
 
 impl Default for NativeCatalogConfig {
@@ -88,6 +91,7 @@ impl Default for NativeCatalogConfig {
             log: HeadLogConfig::default(),
             // Small for the prototype, so short CDC runs checkpoint.
             checkpoint_after_batches: 1,
+            attempt_horizon: object_store_occ::headlog::DEFAULT_ATTEMPT_HORIZON,
         }
     }
 }
@@ -246,9 +250,11 @@ impl ObjectNativeCatalog {
             .lease
             .checked_add(1)
             .ok_or_else(|| invalid("catalog lease exhausted"))?;
-        let writer = Writer::take_over(Arc::clone(&store), prefix.clone(), config.log, generation)
-            .await
-            .map_err(invalid)?;
+        let mut writer =
+            Writer::take_over(Arc::clone(&store), prefix.clone(), config.log, generation)
+                .await
+                .map_err(invalid)?;
+        writer.set_attempt_horizon(config.attempt_horizon);
         // Takeover fences the old writer. If it committed during replay,
         // rebuild from that fenced head before acknowledging the open.
         if writer.state().head.commit != reader.state().head.commit
@@ -350,19 +356,27 @@ impl Inner {
         if at <= floor || listed < self.config.checkpoint_after_batches {
             return Ok(());
         }
-        let mut root_state = self.floor_state.clone();
-        for (_, records) in self.since_floor.iter().filter(|(commit, _)| *commit <= at) {
-            for record in records {
-                root_state.apply(record).map_err(invalid)?;
+        // Fold the records up to `at` into the floor state in place. They leave
+        // `since_floor` even if the checkpoint does not land: the floor state now
+        // holds them, and a later checkpoint is at `at` or past it.
+        let folded = self
+            .since_floor
+            .partition_point(|(commit, _)| *commit <= at);
+        for (_, records) in self.since_floor.drain(..folded) {
+            for record in &records {
+                if let Err(error) = self.floor_state.apply_in_place(record) {
+                    // These records already applied to the live state from the
+                    // same floor, so the floor state no longer describes the log.
+                    self.poisoned = true;
+                    return Err(invalid(error));
+                }
             }
         }
-        let root = cayenne_metastore_actions::state_as_root(&root_state).encode_to_vec();
+        let root = cayenne_metastore_actions::state_as_root(&self.floor_state).encode_to_vec();
         self.writer
             .publish_checkpoint(at, root.into())
             .await
             .map_err(invalid)?;
-        self.floor_state = root_state;
-        self.since_floor.retain(|(commit, _)| *commit > at);
         self.staged_checkpoint = at;
         Ok(())
     }
@@ -431,10 +445,16 @@ impl Inner {
             }
         }
         let record = Record { actions };
-        // Validate on a private copy, so a refused change leaves the state as it was.
-        let mut next = self.reader.state.clone();
-        next.apply(&record).map_err(invalid)?;
-        self.reader.state = next;
+        // Applied without a copy of the state. A refused record is a guard this
+        // catalog's own checks should have caught, and leaves the state partly
+        // changed, so the catalog stops until it is reopened from the log.
+        if let Err(error) = self.reader.state.apply_in_place(&record) {
+            self.poisoned = true;
+            tracing::error!(
+                "Cayenne object-native metastore stopped accepting changes, so its datasets stop updating until spiced restarts: a change was refused: {error}"
+            );
+            return Err(invalid(error));
+        }
         self.pending_bytes += record.encoded_len();
         self.pending.extend(record.actions);
         let since = *self
@@ -1750,13 +1770,25 @@ impl ObjectNativeCatalog {
             .cloned())
     }
 
-    /// Set (`Some`) or remove (`None`) the bookkeeping value under `key`, in one commit.
+    /// Set (`Some`) or remove (`None`) the bookkeeping value under `key`. Setting
+    /// the value it already holds commits nothing.
     /// # Errors
     /// Returns an error when the commit is not accepted.
     pub async fn set_sidecar_value(&self, key: &str, value: Option<Vec<u8>>) -> CatalogResult<()> {
-        // A saved position is an acknowledgement point: it commits in the same
-        // record as every buffered change it covers.
+        // A saved position commits in the same record as every buffered change
+        // before it. Inside a deferred scope it joins the record the scope's
+        // `commit_pending` commits; otherwise it commits now.
         let mut inner = self.inner.take().await;
+        if !inner.poisoned
+            && inner
+                .reader
+                .state
+                .positions
+                .get(&(key.to_string(), String::new()))
+                == value.as_ref()
+        {
+            return Ok(());
+        }
         let clear = value.is_none();
         inner
             .commit(vec![Action::new(Kind::AdvanceSourcePosition(
@@ -1767,8 +1799,7 @@ impl ObjectNativeCatalog {
                     clear,
                 },
             ))])
-            .await?;
-        inner.flush().await
+            .await
     }
 
     pub(crate) async fn create_identified(

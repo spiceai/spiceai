@@ -161,6 +161,10 @@ pub(super) struct Checkpoint {
     pub incarnation: Vec<u8>,
     #[prost(uint64, tag = "4")]
     pub commit: u64,
+    /// For each of `attempts`, the head's store time (Unix milliseconds) at the
+    /// first checkpoint that listed it: no earlier than its acceptance.
+    #[prost(uint64, repeated, tag = "5")]
+    pub seen_ms: Vec<u64>,
 }
 
 /// A group commit payload containing the original caller payloads in queue order.

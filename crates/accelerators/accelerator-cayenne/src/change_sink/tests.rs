@@ -213,6 +213,13 @@ async fn rebuildable_transition_preserves_replayable_cdc_durability_fence() {
         async fn on_durable(&self, epoch: u64) {
             self.0.store(epoch, Ordering::SeqCst);
         }
+
+        async fn record_position(
+            &self,
+            _fence: u64,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
     }
     let ctx = SessionContext::new();
     let (table, _dir) = table(&ctx, 1).await;

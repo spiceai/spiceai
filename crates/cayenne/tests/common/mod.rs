@@ -83,6 +83,7 @@ pub async fn fixture_catalog(
                     ..object_store_occ::headlog::HeadLogConfig::default()
                 },
                 checkpoint_after_batches: 1,
+                ..cayenne::metastore::object_native::NativeCatalogConfig::default()
             };
             let catalog = match store.head(&prefix.clone().join("head")).await {
                 Ok(_) => {

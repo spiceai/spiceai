@@ -91,6 +91,19 @@ pub enum StorageDurability {
 #[async_trait]
 pub trait DurabilityObserver: Send + Sync {
     async fn on_durable(&self, fence: u64);
+
+    /// Write the newest source position at or below `fence` to the dataset's
+    /// position store, without acknowledging the source. A storage engine that
+    /// commits that position in the same record as the data it covers calls this
+    /// inside the commit, before [`Self::on_durable`].
+    ///
+    /// # Errors
+    ///
+    /// The position store refused the write; the caller must not acknowledge.
+    async fn record_position(
+        &self,
+        fence: u64,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 #[derive(Clone, Copy, Debug)]

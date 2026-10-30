@@ -37602,6 +37602,24 @@ impl CayenneTableProvider {
     /// up (memory mode). A no-op in file mode / when the runtime did not install
     /// a handle.
     pub(crate) async fn fire_slot_advancer(&self, durable_epoch: u64) {
+        let advancer = self.slot_advancer.lock().clone();
+        // The object-native metastore commits the source position in the same
+        // record as the data it covers: staged here, committed just below, and
+        // only then acknowledged at the source.
+        if let Some(advancer) = &advancer
+            && self
+                .catalog()
+                .as_any()
+                .is::<crate::metastore::object_native::ObjectNativeCatalog>()
+            && let Err(error) =
+                crate::catalog::with_deferred_commits(advancer.record_position(durable_epoch)).await
+        {
+            tracing::error!(
+                "Dataset '{}' could not record its source position with its checkpoint, so its source is not acknowledged and replays these changes after a restart: {error}",
+                self.table_name()
+            );
+            return;
+        }
         // The source is acknowledged below, so the metastore changes this
         // checkpoint made must be committed first. A failed commit acknowledges
         // nothing: the source replays from its last acknowledged position.
@@ -37636,7 +37654,6 @@ impl CayenneTableProvider {
                 self.table_metadata.table_name.clone(),
             )],
         );
-        let advancer = self.slot_advancer.lock().clone();
         if let Some(advancer) = advancer {
             self.trace_slot_advance(advancer.as_ref(), durable_epoch, "advance")
                 .await;
