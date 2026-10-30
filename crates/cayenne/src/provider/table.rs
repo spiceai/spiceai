@@ -2560,6 +2560,11 @@ pub struct CayenneTableProvider {
     /// first fire.
     #[cfg(test)]
     test_pre_bake_prune_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
+    /// Test-only seam fired when a seq-prefix bake's encode first pulls its input,
+    /// so after the write has taken its encode permits and before it encodes a
+    /// row. Lets a test hold a bake mid-encode. Consumed on first fire.
+    #[cfg(test)]
+    test_bake_input_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
     /// Test-only seam fired after a mem-tier checkpoint has built its deletion-index
     /// extension and before it takes the listing fence to publish it. Consumed on
     /// first fire.
@@ -4125,6 +4130,15 @@ fn protected_merge_input_budget_for_pool(
 /// or below the size-tier merge's trigger — see
 /// [`CayenneTableProvider::bake_keep_recent_snapshots`].
 const BAKE_KEEP_RECENT_SNAPSHOTS: usize = 3;
+
+/// On-disk bytes of protected snapshots one seq-prefix bake folds, beyond its
+/// first two: the prefix stops at the snapshot that would take it past this.
+///
+/// Stopping early only lowers the bake's cutoff, so the next bake takes the rest.
+/// The first two are always admitted, so a large earlier bake output at the head
+/// of the prefix cannot stop every later bake — and with it the only shrink of
+/// the deletion index.
+const BAKE_MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Default deletion-index size (count of live PK tombstones, `delete_len()`) at
 /// or above which a seq-prefix bake is worth triggering. The bake exists to
@@ -10566,6 +10580,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_pre_bake_prune_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_bake_input_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_pre_checkpoint_deletion_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_catalog_commit_hook: Arc::new(ParkingMutex::new(None)),
@@ -11467,6 +11483,7 @@ impl CayenneTableProvider {
             fan_out,
             encode_budget,
             routing,
+            max_shards,
         } = policy;
         // A range plan routes on its key column, whatever the policy asked for.
         let routing = if range.is_some() {
@@ -11503,12 +11520,10 @@ impl CayenneTableProvider {
         // shard permits from the process-global budget before sharding the
         // encode, held until the write completes. No-op (ungated) when no budget
         // is installed (unit tests, embedders). See `write_budget`.
-        let shard_count = self.snapshot_shard_count(
-            target_partitions,
-            target_size_bytes,
-            estimated_bytes,
-            fan_out,
-        );
+        let shard_count = self
+            .snapshot_shard_count(target_partitions, target_size_bytes, estimated_bytes, fan_out)
+            .min(max_shards.unwrap_or(usize::MAX))
+            .max(1);
         // `snapshot_write_concurrency` already clamps the fan-out to
         // `target_partitions`, so there is no second clamp here — one place owns
         // the rule. Permitting for that count is what keeps a
@@ -11530,7 +11545,7 @@ impl CayenneTableProvider {
         // deadlocks the demux against the permit holders (see `write_budget`
         // module docs; spiceai/spiceai#11818).
         let encode_permit_wait_start = Instant::now();
-        let _encode_permits = match encode_budget {
+        let encode_permits = match encode_budget {
             super::delta_encoding::EncodeBudgetUse::Shared => {
                 super::write_budget::acquire_encode_permits(
                     shard_count,
@@ -11546,6 +11561,13 @@ impl CayenneTableProvider {
             "encode_permit_wait",
             encode_permit_wait_start,
         );
+        // A delta write may be granted fewer permits than shards; it encodes no
+        // wider than it paid for.
+        let encode_shards = encode_permits
+            .as_ref()
+            .map_or(shard_count, super::write_budget::EncodePermits::granted)
+            .min(shard_count)
+            .max(1);
 
         // Construct snapshot directory URL
         let snapshot_dir_url = Self::snapshot_dir_url(
@@ -11598,6 +11620,9 @@ impl CayenneTableProvider {
                     config.range_bounds_estimated =
                         range.bounds_estimated && config.range_bounds.is_some();
                 }
+                // The range bounds beyond the last shard are dropped by the sink,
+                // so a narrower write keeps the ascending prefix of the split.
+                config.write_concurrency = config.write_concurrency.min(encode_shards);
                 config
             });
         let write_format = match super::delta_encoding::strategy_builder_for_level(encoding_level) {
@@ -13019,6 +13044,8 @@ impl CayenneTableProvider {
             test_pre_publish_hook: Arc::clone(&self.test_pre_publish_hook),
             #[cfg(test)]
             test_pre_bake_prune_publish_hook: Arc::clone(&self.test_pre_bake_prune_publish_hook),
+            #[cfg(test)]
+            test_bake_input_hook: Arc::clone(&self.test_bake_input_hook),
             #[cfg(test)]
             test_pre_checkpoint_deletion_publish_hook: Arc::clone(
                 &self.test_pre_checkpoint_deletion_publish_hook,
@@ -20821,12 +20848,16 @@ impl CayenneTableProvider {
         if self.context.has_cluster_by() || self.context.sort_columns_are_authoritative() {
             return None;
         }
-        let shards = self.snapshot_shard_count(
-            target_partitions,
-            target_size_bytes,
-            estimated_bytes,
-            EncodeFanOut::Sized,
-        );
+        // Split for the shards the bake's write will run (see
+        // `write_budget::bake_encode_shard_cap`).
+        let shards = self
+            .snapshot_shard_count(
+                target_partitions,
+                target_size_bytes,
+                estimated_bytes,
+                EncodeFanOut::Sized,
+            )
+            .min(super::write_budget::bake_encode_shard_cap().unwrap_or(usize::MAX));
         if shards < 2 {
             return None;
         }
@@ -29170,6 +29201,23 @@ impl CayenneTableProvider {
     }
 
     async fn bake_seq_prefix_protected_snapshots_tracked(&self) -> Result<bool> {
+        // One bake at a time in the process (see `compaction::bake_budget`). A
+        // table whose deletion index is over its memory ceiling waits its turn —
+        // the bake is its only shrink — and every other table bakes on a later
+        // tick.
+        let budget = super::compaction::bake_budget();
+        let _bake_permit = if self.deletion_index_over_memory_ceiling() {
+            budget.acquire_owned().await.ok()
+        } else if let Ok(permit) = budget.try_acquire_owned() {
+            Some(permit)
+        } else {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Skipping seq-prefix bake: another table's bake is running"
+            );
+            return Ok(false);
+        };
         // Boxed so the whole bake body lives on the heap rather than in the caller's
         // frame. This is one of the largest async fns in the crate, and its future is
         // inlined into every caller's — the compaction trigger, and the property tests
@@ -29343,28 +29391,30 @@ impl CayenneTableProvider {
                 stopped_early = Some("above_fence");
                 break;
             }
-            if let Some(budget) = max_pass_bytes {
-                // On-disk bytes, sized as the size-tier path sizes its candidates.
-                // An unknown size must NOT count as 0: the budget is a memory ceiling,
-                // and counting an unsizeable run as free would let an arbitrarily large
-                // one in and defeat the bound. End the prefix instead; the next tick
-                // retries once it can be sized.
-                let Some(candidate_bytes) =
-                    Box::pin(self.snapshot_bytes_for_merge_budget(id)).await
-                else {
-                    stopped_early = Some("sizing_failed");
-                    break;
-                };
-                let next = selected_input_bytes.saturating_add(candidate_bytes);
-                if next > budget {
-                    // Stop here. `cutoff` has only accumulated over already-selected
-                    // snapshots, so T matches the truncated set; the next tick bakes
-                    // the rest.
-                    stopped_early = Some("over_budget");
-                    break;
-                }
-                selected_input_bytes = next;
+            // On-disk bytes, sized as the size-tier path sizes its candidates.
+            // An unknown size must NOT count as 0: the budget is a memory ceiling,
+            // and counting an unsizeable run as free would let an arbitrarily large
+            // one in and defeat the bound. End the prefix instead; the next tick
+            // retries once it can be sized.
+            let Some(candidate_bytes) = Box::pin(self.snapshot_bytes_for_merge_budget(id)).await
+            else {
+                stopped_early = Some("sizing_failed");
+                break;
+            };
+            let next = selected_input_bytes.saturating_add(candidate_bytes);
+            if max_pass_bytes.is_some_and(|budget| next > budget) {
+                // Stop here. `cutoff` has only accumulated over already-selected
+                // snapshots, so T matches the truncated set; the next tick bakes
+                // the rest.
+                stopped_early = Some("over_budget");
+                break;
             }
+            if selected.len() >= 2 && next > BAKE_MAX_INPUT_BYTES {
+                // The same truncation, against the per-bake bound.
+                stopped_early = Some("over_bake_bytes");
+                break;
+            }
+            selected_input_bytes = next;
             if files.is_empty() {
                 // Empty manifest ⟹ a CDC-published snapshot whose async manifest
                 // population has not landed yet — both compaction paths author the
@@ -29497,6 +29547,8 @@ impl CayenneTableProvider {
         let bake_plan = Arc::clone(&merged_plan);
         let bake_position_deletes = self.holds_position_deletes();
         let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
+        #[cfg(test)]
+        let stream = self.gate_bake_input_for_test(stream);
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let is_s3 = self.table_metadata.path.starts_with("s3://");
@@ -29510,19 +29562,8 @@ impl CayenneTableProvider {
         // not apply; size the parallel-encode fan-out from the selected inputs'
         // on-disk bytes exactly as the size-tier path does. `is_position_based()`
         // is false here (gated above), so `keeps_positions_serial` is false.
-        let total_input_bytes = if max_pass_bytes.is_some() {
-            // Summed by the budget-bounded selection above.
-            selected_input_bytes
-        } else {
-            let mut bytes: u64 = 0;
-            for (snapshot_id, _) in &selected {
-                bytes += match self.list_snapshot_files_with_sizes(snapshot_id).await {
-                    Ok(files) => files.iter().map(|(_, sz)| *sz).sum(),
-                    Err(_) => 0,
-                };
-            }
-            bytes
-        };
+        // Summed by the selection above.
+        let total_input_bytes = selected_input_bytes;
         let (target_partitions, estimated_bytes) = subset_merge_write_shape(
             /* keeps_positions_serial */ false,
             state.config().target_partitions(),
@@ -29544,7 +29585,10 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 target_partitions,
                 estimated_bytes,
-                super::delta_encoding::WritePolicy::MAINTENANCE,
+                super::delta_encoding::WritePolicy {
+                    max_shards: super::write_budget::bake_encode_shard_cap(),
+                    ..super::delta_encoding::WritePolicy::MAINTENANCE
+                },
                 range_plan.as_ref().map(OverwriteRangePlan::partitioning),
             )
             .await;
@@ -31810,6 +31854,29 @@ impl CayenneTableProvider {
         if let Some(hook) = hook {
             hook().await;
         }
+    }
+
+    /// `stream`, firing (and consuming) the test-only bake input hook, if one is
+    /// installed, when the stream is first polled. See
+    /// [`Self::test_bake_input_hook`].
+    #[cfg(test)]
+    fn gate_bake_input_for_test(
+        &self,
+        stream: SendableRecordBatchStream,
+    ) -> SendableRecordBatchStream {
+        use futures::StreamExt as _;
+        let Some(hook) = self.test_bake_input_hook.lock().take() else {
+            return stream;
+        };
+        let schema = stream.schema();
+        let gate = futures::stream::once(hook())
+            .filter_map(|()| futures::future::ready(None::<DataFusionResult<RecordBatch>>));
+        Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                schema,
+                gate.chain(stream),
+            ),
+        )
     }
 
     /// Fire (and consume) the test-only hook between a checkpoint's deletion-index
@@ -83378,6 +83445,8 @@ mod tests {
     mod append_only_compaction;
 
     mod auto_deletion_mode;
+
+    mod bake_isolation;
 
     mod first_load_pk_filter;
 

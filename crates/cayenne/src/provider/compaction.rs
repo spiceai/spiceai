@@ -100,6 +100,22 @@ static WHOLE_TABLE_RECLAIM_BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
     ))
 });
 
+/// One seq-prefix bake at a time in the process.
+///
+/// A bake re-encodes a table's settled protected prefix — hundreds of megabytes
+/// and tens of seconds on a large table — and tables written alike reach their
+/// bake triggers together: two overlapping bakes measured 30 and 52 s while
+/// ingest halved and query P99 rose five-fold. The next table's bake runs on a
+/// later compaction tick instead. Separate from [`COMPACTION_BUDGET`], which a
+/// background pass already holds when it reaches the bake.
+static BAKE_BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
+
+/// The process-wide budget a seq-prefix bake draws on. See [`BAKE_BUDGET`].
+#[must_use]
+pub(crate) fn bake_budget() -> Arc<Semaphore> {
+    Arc::clone(&BAKE_BUDGET)
+}
+
 /// The process-wide budget an `auto` table's whole-table reclaim draws on. See
 /// [`WHOLE_TABLE_RECLAIM_BUDGET`].
 #[must_use]

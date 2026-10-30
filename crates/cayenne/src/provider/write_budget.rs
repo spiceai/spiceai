@@ -151,8 +151,51 @@ struct EncodeBudget {
 
 /// Permits held for one write's encode, released together on drop.
 pub(crate) struct EncodePermits {
-    _main: OwnedSemaphorePermit,
+    main: OwnedSemaphorePermit,
     _gate: Option<OwnedSemaphorePermit>,
+}
+
+impl EncodePermits {
+    /// Encode shards these permits pay for. A `Delta` write can be granted
+    /// fewer than it asked for (see [`acquire_from`]); the write must then
+    /// shard no wider than this.
+    pub(crate) fn granted(&self) -> usize {
+        self.main.num_permits()
+    }
+}
+
+/// Encode shards a seq-prefix bake may run: half of what the maintenance class
+/// may hold, at least one, or `None` when no budget is installed.
+///
+/// A bake re-encodes a protected prefix that can run to hundreds of megabytes
+/// and tens of seconds. Sized like any other maintenance write it held every
+/// maintenance permit for all of that time, which on a small host left the
+/// other tables' compaction nothing and their checkpoints only the reserve.
+pub(crate) fn bake_encode_shard_cap() -> Option<usize> {
+    let guard = GLOBAL_ENCODE_BUDGET.read();
+    let budget = guard.as_ref()?;
+    let total = budget.total.load(Ordering::Acquire);
+    Some((maintenance_gate_cap(total) / 2).max(1))
+}
+
+/// Up to `wanted` permits from `semaphore` without waiting for more than one:
+/// the largest count free right now, else the next single permit to come free.
+///
+/// Released permits go to queued waiters before they become free, so taking
+/// what is free never overtakes a write already waiting.
+async fn acquire_available(
+    semaphore: &Arc<Semaphore>,
+    wanted: usize,
+) -> Option<OwnedSemaphorePermit> {
+    for count in (1..=wanted.max(1)).rev() {
+        let Ok(count) = u32::try_from(count) else {
+            continue;
+        };
+        if let Ok(permit) = Arc::clone(semaphore).try_acquire_many_owned(count) {
+            return Some(permit);
+        }
+    }
+    Arc::clone(semaphore).acquire_many_owned(1).await.ok()
 }
 
 /// Process-wide encode budget, injected once at startup by the binary (sized to
@@ -421,14 +464,23 @@ async fn acquire_from(
             )
         }
     };
-    let main_count = gate
-        .as_ref()
-        .map_or_else(|| shards.clamp(1, total), |g| g.num_permits().max(1));
-    let main_count = u32::try_from(main_count).unwrap_or(u32::MAX);
-    let main = Arc::clone(&budget.semaphore)
-        .acquire_many_owned(main_count)
-        .await
-        .ok()?;
+    let main = match gate.as_ref() {
+        // A maintenance write already holds its slice of the gate, sized below
+        // the total, so it waits for the same count of main permits.
+        Some(gate) => {
+            let main_count = u32::try_from(gate.num_permits().max(1)).unwrap_or(u32::MAX);
+            Arc::clone(&budget.semaphore)
+                .acquire_many_owned(main_count)
+                .await
+                .ok()?
+        }
+        // A delta write takes what is free and shards no wider. Waiting for the
+        // whole request instead parked a checkpoint that asked for the budget's
+        // full width behind any maintenance write holding even one permit — a
+        // bake held its permits for tens of seconds — while its table's appends
+        // backed up behind the tier it could not flush.
+        None => acquire_available(&budget.semaphore, shards.clamp(1, total)).await?,
+    };
     let class_label = match class {
         WriteClass::Delta => "delta",
         WriteClass::Maintenance => "maintenance",
@@ -438,7 +490,7 @@ async fn acquire_from(
         &[telemetry::KeyValue::new("class", class_label)],
     );
     Some(EncodePermits {
-        _main: main,
+        main,
         _gate: gate,
     })
 }
