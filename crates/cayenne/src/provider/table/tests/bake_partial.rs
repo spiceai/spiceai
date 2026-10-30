@@ -334,3 +334,79 @@ fn a_bake_refuses_to_link_two_files_of_one_name() {
         Some("w2_p000_00000.vortex")
     );
 }
+
+/// Splitting a bake's inputs scans subsets of their files, which must leave
+/// every later capture of those snapshots reading all of their files.
+///
+/// The snapshot listing a capture reuses is keyed only by snapshot id and
+/// generation: a subset scan that stored its listing there left the next
+/// capture of the snapshot — a compaction that would then retire it, after a
+/// bake that did not commit — reading one file of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn splitting_a_bakes_inputs_leaves_their_listings_whole() {
+    let t = table("bake_partial_listing", false).await;
+    let mut model = Model::new();
+    write_checkpoints(&[&t.provider], &mut model, 0..4).await;
+
+    let mut selected: Vec<(String, i64)> = t
+        .provider
+        .protected_snapshots
+        .load()
+        .iter()
+        .map(|(id, threshold)| (id.clone(), *threshold))
+        .collect();
+    selected.sort();
+    let mut whole: Vec<(String, usize, u64)> = Vec::new();
+    let ctx = t.provider.create_compaction_session_context();
+    let state = ctx.state();
+    for (id, _) in &selected {
+        let files = t
+            .provider
+            .capture_snapshot_files_under_fence(id)
+            .await
+            .expect("capture")
+            .files
+            .len();
+        let plan = t
+            .provider
+            .create_snapshot_scan_plan(&state, id, None, &[], None)
+            .await
+            .expect("scan plan");
+        let rows = count_plan_rows(plan, state.task_ctx()).await.expect("scan");
+        whole.push((id.clone(), files, rows));
+    }
+
+    let pk_indices = t.provider.pk_column_indices.clone();
+    let partition = t
+        .provider
+        .bake_partition_input_files(&state, &selected, &pk_indices, &t.provider.pk_deletion_snapshot())
+        .await
+        .expect("the inputs split: older files hold no replayed key");
+    assert!(
+        partition.kept_files() > 0 && partition.rewritten_files() > 0,
+        "precondition: the split both keeps and rewrites files"
+    );
+
+    for (id, files, rows) in &whole {
+        let captured = t
+            .provider
+            .capture_snapshot_files_under_fence(id)
+            .await
+            .expect("capture after the split");
+        assert_eq!(
+            captured.files.len(),
+            *files,
+            "snapshot {id}: a capture after the split lists every file"
+        );
+        let plan = t
+            .provider
+            .create_snapshot_scan_plan(&state, id, None, &[], None)
+            .await
+            .expect("scan plan after the split");
+        assert_eq!(
+            count_plan_rows(plan, state.task_ctx()).await.expect("scan"),
+            *rows,
+            "snapshot {id}: a scan after the split reads every row"
+        );
+    }
+}

@@ -1052,6 +1052,10 @@ pub(crate) struct CapturedSnapshotFiles {
     /// this capture — every scan of one [`ScanView`] — instead of once per scan.
     /// See [`CayenneTableProvider::snapshot_files_with_stats`].
     with_statistics: Arc<OnceCell<SnapshotFilesWithStatistics>>,
+    /// Some of the snapshot's files rather than all of them (see
+    /// [`Self::subset`]). A listing built for it is never stored as the
+    /// snapshot's listing.
+    subset: bool,
 }
 
 impl CapturedSnapshotFiles {
@@ -1061,6 +1065,23 @@ impl CapturedSnapshotFiles {
             listing_epoch,
             files,
             with_statistics: Arc::default(),
+            subset: false,
+        }
+    }
+
+    /// `files`, some of this capture's files, under this capture's generations.
+    ///
+    /// `CayenneTableProvider::capture_warm_files` serves a snapshot's stored
+    /// listing to any later capture of that snapshot, so a scan of a subset that
+    /// stored its listing there would leave every later capture — a compaction
+    /// that then retires the snapshot among them — reading only the subset.
+    fn subset(&self, files: Vec<PartitionedFile>) -> Self {
+        Self {
+            dir_generation: self.dir_generation,
+            listing_epoch: self.listing_epoch,
+            files: Arc::new(files),
+            with_statistics: Arc::default(),
+            subset: true,
         }
     }
 }
@@ -30135,11 +30156,7 @@ impl CayenneTableProvider {
             inputs.push(BakeInputFiles {
                 snapshot_id: snapshot_id.clone(),
                 threshold: *threshold,
-                rewrite: CapturedSnapshotFiles::new(
-                    captured.dir_generation,
-                    captured.listing_epoch,
-                    Arc::new(rewrite),
-                ),
+                rewrite: captured.subset(rewrite),
                 rewrite_names,
                 keep_names,
             });
@@ -30166,11 +30183,7 @@ impl CayenneTableProvider {
         pk_indices: &[usize],
         deletion_snapshot: &PkDeletionSnapshot,
     ) -> DataFusionResult<bool> {
-        let one_file = CapturedSnapshotFiles::new(
-            captured.dir_generation,
-            captured.listing_epoch,
-            Arc::new(vec![file.clone()]),
-        );
+        let one_file = captured.subset(vec![file.clone()]);
         let projection = pk_indices.to_vec();
         let scan = self
             .scan_bake_files(state, snapshot_id, Some(&projection), &one_file)
@@ -41892,7 +41905,9 @@ impl CayenneTableProvider {
         #[cfg(test)]
         self.run_test_post_snapshot_list_hook().await;
         let mut stored = false;
-        if collect_stats && !truncated {
+        // A subset is not the snapshot's listing (see `CapturedSnapshotFiles::subset`).
+        let lists_whole_snapshot = request.captured_files.is_none_or(|captured| !captured.subset);
+        if collect_stats && !truncated && lists_whole_snapshot {
             let gen_after = self.current_dir_generation.load(Ordering::Acquire);
             let epoch_after = self.listing_cache_epoch.load(Ordering::Acquire);
             if gen_after == dir_generation && epoch_after == listing_epoch {
