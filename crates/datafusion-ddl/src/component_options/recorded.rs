@@ -122,11 +122,11 @@ fn quoted_literals(text: &str) -> Vec<&str> {
     while let Some(offset) = text[rest..].find(['\'', '"', '`', '$']) {
         let start = rest + offset;
         let opener = &text[start..];
-        let close = if opener.starts_with('$') {
-            let tag_len = opener[1..]
+        let close = if let Some(after) = opener.strip_prefix('$') {
+            let tag_len = after
                 .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .unwrap_or(opener.len() - 1);
-            if !opener[1 + tag_len..].starts_with('$') {
+                .unwrap_or(after.len());
+            if !after[tag_len..].starts_with('$') {
                 rest = start + 1;
                 continue;
             }
