@@ -302,7 +302,7 @@ datafusion-proto-common = "55.2.0"
 datafusion-pruning = "55.2.0"
 datafusion-spark = "55.2.0"
 datafusion-substrait = "55.2.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "5532daa3e9c4d793b8c03d258c4787ef2106c8a6" } # branch: lukim/mysql-async-0.37-after-connect
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "2eb4b4a17a6bdd665c65a1461a0515b2e75d7adf" } # branch: lukim/mysql-async-0.37-after-connect
 delta_kernel = { version = "0.27.1", features = ["arrow-59", "internal-api"] }
 delta_kernel_default_engine = { version = "0.27.1", default-features = false, features = [
     "arrow-59",

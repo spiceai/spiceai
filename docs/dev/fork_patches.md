@@ -118,7 +118,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion](#datafusion) | `7f887215833c82112d94188adb8855cda8a4e47e` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `300acfcfb51abfa9c477f57bff3e0529ec4f5f1a` | `spiceai-55` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `5532daa3e9c4d793b8c03d258c4787ef2106c8a6` | `lukim/mysql-async-0.37-after-connect` (TEMPORARY: spiceai/datafusion-table-providers#113) |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `2eb4b4a17a6bdd665c65a1461a0515b2e75d7adf` | `lukim/mysql-async-0.37-after-connect` (TEMPORARY: spiceai/datafusion-table-providers#113) |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `81faaf2187185b097710b9ee589bf039efdd74de` | `jeadie/render-zip-upgrade` |
 | [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
@@ -473,7 +473,7 @@ Between `bd6e935` and `0894768` (spiceai/datafusion-table-providers#107 and #108
 it adds only the two MySQL connection-pool rows below and their tests
 (`core/src/sql/db_connection_pool/mysqlpool.rs`, `core/tests/mysql/`), and leaves its own
 dependency pins unchanged.
-Between `0894768` and `5532daa` (spiceai/datafusion-table-providers#113), it moves `mysql_async`
+Between `0894768` and `2eb4b4a` (spiceai/datafusion-table-providers#113), it moves `mysql_async`
 to 0.37.1, the version this workspace pins, rewrites the new-connection observer row below
 and adds the test-connection row after it, with their tests (`mysqlpool.rs`,
 `core/tests/mysql/`, `core/tests/docker/`).
