@@ -2376,7 +2376,7 @@ mod tests {
 
     use arrow::{
         array::{
-            Int32Array, Int64Array, RecordBatch, StringArray, TimestampNanosecondArray,
+            ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, TimestampNanosecondArray,
             TimestampSecondArray, UInt64Array,
         },
         datatypes::{DataType, Field, Schema, TimeUnit},
@@ -2719,6 +2719,86 @@ mod tests {
             vec![1, 2, 3],
             "rows must be ordered by descending timestamp"
         );
+    }
+
+    /// A `primary_key` on a column whose name is not a bare SQL identifier --
+    /// `service.instance.id` (an OpenTelemetry attribute), `sentry-environment`,
+    /// `2xx_count` -- used to fail `CREATE TABLE` with `syntax error at or near
+    /// "."`, because the key clause wrote the name unquoted. Each name, alone and
+    /// in a composite key, creates the table, loads, and still rejects a repeated
+    /// key.
+    #[tokio::test]
+    async fn primary_key_on_column_names_that_are_not_bare_identifiers() {
+        let names = ["service.instance.id", "sentry-environment", "2xx_count"];
+        let mut cases: Vec<Vec<usize>> = (0..names.len()).map(|i| vec![i]).collect();
+        cases.push((0..names.len()).collect());
+
+        let schema = Arc::new(Schema::new(
+            names
+                .iter()
+                .map(|name| Field::new(*name, DataType::Utf8, false))
+                .collect::<Vec<_>>(),
+        ));
+        let batch = |row: &str| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                names
+                    .iter()
+                    .map(|name| {
+                        Arc::new(StringArray::from(vec![format!("{row}-{name}")])) as ArrayRef
+                    })
+                    .collect(),
+            )
+            .expect("to create RecordBatch")
+        };
+
+        for (case, key) in cases.into_iter().enumerate() {
+            let external_table = CreateExternalTable {
+                schema: ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
+                    .expect("to convert Arrow schema to DataFusion schema"),
+                name: TableReference::bare(format!("non_identifier_pk_{case}")),
+                locations: vec![],
+                file_type: String::new(),
+                table_partition_cols: vec![],
+                if_not_exists: true,
+                or_replace: false,
+                definition: None,
+                order_exprs: vec![],
+                unbounded: false,
+                options: HashMap::new(),
+                constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(key.clone())]),
+                column_defaults: HashMap::default(),
+                temporary: false,
+            };
+            let duckdb_accelerator = DuckDBAccelerator::new();
+            let table = super::create_table_provider(
+                &duckdb_accelerator.duckdb_factory,
+                &external_table,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("key {key:?}: table should be created: {e}"));
+
+            write_batches(&table, vec![batch("r1"), batch("r2")], InsertOp::Append)
+                .await
+                .unwrap_or_else(|e| panic!("key {key:?}: distinct keys should load: {e}"));
+            write_batches(&table, vec![batch("r1")], InsertOp::Append)
+                .await
+                .expect_err("a repeated primary key must still be rejected");
+
+            let ctx = SessionContext::new();
+            let plan = table
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("to create scan plan");
+            let rows: usize = collect(plan, ctx.task_ctx())
+                .await
+                .expect("to scan")
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum();
+            assert_eq!(rows, 2, "key {key:?}");
+        }
     }
 
     fn id_v_schema() -> Arc<Schema> {
