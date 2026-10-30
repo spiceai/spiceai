@@ -106,13 +106,6 @@ steps:
           - *acct
           - *other
           - { from: '${sources.src.from_prefix}t${sources.src.from_suffix}', name: added, params: '${sources.src.table_params}' }
-  # The list above replaces the variant's patch; keep the object-native metastore.
-  - edit-spicepod:
-      datasets:
-        t: { acceleration: { params: { cayenne_metastore: object_native } } }
-        acct: { acceleration: { params: { cayenne_metastore: object_native } } }
-        other: { acceleration: { params: { cayenne_metastore: object_native } } }
-    only: object-native
   - query: SELECT count(*) AS n FROM added
     expect: { rows: [['6000']] }
     eventually: 60s

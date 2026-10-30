@@ -11,7 +11,7 @@ variants:
   federated: {}
   duckdb: { datasets: { items: { acceleration: { enabled: true, engine: duckdb, refresh_mode: full } } } }
   cayenne: { datasets: { items: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } } }
-  cayenne-object-native: { datasets: { items: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, params: { cayenne_metastore: object_native } } } } }
+  cayenne-object-native: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } }, datasets: { items: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } } }
 
 spicepod:
   version: v1

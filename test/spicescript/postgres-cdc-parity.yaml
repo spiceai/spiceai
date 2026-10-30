@@ -20,15 +20,18 @@ variants:
   # instead of waiting for 32 MiB or 10 s, so the catalog commits (and the head
   # log seals and checkpoints) many times in a short run.
   object-native-key:
-    datasets: { '*': { acceleration: { params: { cayenne_metastore: object_native, cayenne_deletion_mode: key, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+    datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: key, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
   object-native-position:
-    datasets: { '*': { acceleration: { params: { cayenne_metastore: object_native, cayenne_deletion_mode: position, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+    datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: position, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
   # The object-native metastore in an S3-compatible store: its head log is kept
   # under `runtime.state.location`, in the location's `cayenne/v1/` folder, while
   # data files stay on local disk.
   object-native-rustfs:
     spicepod:
       runtime:
+        params: { cayenne_vnext: enabled }
         state:
           location: s3://${sources.lake.bucket}/state/
           params:
@@ -38,7 +41,7 @@ variants:
             s3_key: ${sources.lake.key}
             s3_secret: ${sources.lake.secret}
             allow_http: 'true'
-    datasets: { '*': { acceleration: { params: { cayenne_metastore: object_native, cayenne_deletion_mode: key, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
+    datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: key, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
   # The same flush cadence on SQLite, so the comparison isolates the metastore.
   sqlite-key-flush:
     datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: key, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }

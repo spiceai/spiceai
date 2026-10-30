@@ -34,7 +34,7 @@ sqlite-memory:
 
 # The prototype object-native Cayenne metastore, for every Cayenne dataset as written.
 object-native:
-  datasets: { '*': { acceleration: { params: { cayenne_metastore: object_native } } } }
+  spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
 
 turso-file:
   datasets: { '*': { acceleration: { enabled: true, engine: turso, mode: file } } }

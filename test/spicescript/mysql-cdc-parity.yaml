@@ -15,9 +15,11 @@ variants:
   # The prototype object-native metastore: a head log in a local directory, with
   # the binlog position kept in it, and no SQL metastore.
   object-native-key:
-    datasets: { '*': { acceleration: { params: { cayenne_metastore: object_native, cayenne_deletion_mode: key } } } }
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+    datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: key } } } }
   object-native-position:
-    datasets: { '*': { acceleration: { params: { cayenne_metastore: object_native, cayenne_deletion_mode: position } } } }
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+    datasets: { '*': { acceleration: { params: { cayenne_deletion_mode: position } } } }
   turso-key:
     datasets: { '*': { acceleration: { params: { cayenne_metastore: turso, cayenne_deletion_mode: key } } } }
   turso-position:

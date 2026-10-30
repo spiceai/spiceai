@@ -1,0 +1,83 @@
+name: cayenne-vnext
+description: >
+  `runtime.params.cayenne_vnext: enabled` puts new Cayenne datasets on the
+  object-native metastore and leaves existing ones where they are: a dataset
+  created before the flag stays on SQLite and says so, one added after it is
+  created in the object-native metastore, and turning the flag off again keeps
+  that dataset on the object-native metastore instead of rebuilding it. Every
+  answer matches the PostgreSQL source throughout, and a value other than
+  `enabled` or `disabled` stops the dataset with a message naming the param.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-vnext
+  datasets:
+    - from: postgres:public.before_flag
+      name: before_flag
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE before_flag (id integer PRIMARY KEY, v text);
+        INSERT INTO before_flag SELECT i, 'b' || i FROM generate_series(1, 2000) AS i;
+        CREATE TABLE after_flag (id integer PRIMARY KEY, v text);
+        INSERT INTO after_flag SELECT i, 'a' || i FROM generate_series(1, 3000) AS i;
+  - start: {}
+  - query: SELECT * FROM before_flag
+    eventually: 60s
+  - assert-log: { lacks: ['object-native metastore'] }
+
+  # The flag on, and a dataset added: the existing one stays on SQLite, the new
+  # one goes to the object-native metastore.
+  - restart:
+      patch:
+        spicepod:
+          runtime: { params: { cayenne_vnext: enabled } }
+          datasets:
+            - from: postgres:public.before_flag
+              name: before_flag
+              params: ${sources.src.params}
+              acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+            - from: postgres:public.after_flag
+              name: after_flag
+              params: ${sources.src.params}
+              acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+  - assert-log:
+      contains:
+        - "Dataset 'before_flag' stays on its existing SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled"
+        - 'Created the Cayenne object-native metastore'
+      lacks: ["Dataset 'after_flag' stays on"]
+  - query: SELECT * FROM before_flag
+    eventually: 60s
+  - query: SELECT * FROM after_flag
+    eventually: 60s
+  - source-exec: { src: "UPDATE after_flag SET v = 'changed' WHERE id % 7 = 0; DELETE FROM after_flag WHERE id > 2900" }
+  - refresh: after_flag
+  - query: SELECT * FROM after_flag
+    eventually: 60s
+
+  # The flag off: the dataset already in the object-native metastore stays there.
+  - restart:
+      patch: { spicepod: { runtime: { params: { cayenne_vnext: disabled } } } }
+  - assert-log:
+      contains: ['Opened the Cayenne object-native metastore']
+  - query: SELECT * FROM after_flag
+    eventually: 60s
+  - query: SELECT * FROM before_flag
+    eventually: 60s
+
+  # A value the flag does not take.
+  - restart:
+      ready: false
+      patch: { spicepod: { runtime: { params: { cayenne_vnext: 'yes' } } } }
+  - assert-status: { dataset: after_flag, status: Error, message-contains: "`runtime.params.cayenne_vnext` is 'yes'. Set it to 'enabled' or 'disabled'." }
+    eventually: 60s

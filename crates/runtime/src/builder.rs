@@ -61,6 +61,9 @@ pub use runtime_acceleration::CayenneWorkload;
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
 const CAYENNE_FOOTER_CACHE_MB_PARAM: &str = "cayenne_footer_cache_mb";
+/// Puts new file-mode Cayenne datasets on the object-native metastore; read by
+/// the Cayenne accelerator.
+const CAYENNE_VNEXT_PARAM: &str = "cayenne_vnext";
 const CAYENNE_SEGMENT_CACHE_MB_PARAM: &str = "cayenne_segment_cache_mb";
 const CAYENNE_SORT_MERGE_MIN_ROWS_PARAM: &str = "cayenne_sort_merge_min_rows";
 const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
@@ -101,6 +104,7 @@ const MAX_SORT_MERGE_MEMORY_POOL_FRACTION: f64 = 1.0;
 /// `runtime.params` keys with a `cayenne_` prefix that the runtime recognizes.
 const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_FOOTER_CACHE_MB_PARAM,
+    CAYENNE_VNEXT_PARAM,
     CAYENNE_SEGMENT_CACHE_MB_PARAM,
     CAYENNE_SORT_MERGE_MIN_ROWS_PARAM,
     CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,

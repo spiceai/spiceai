@@ -14,9 +14,10 @@ variants:
     datasets: { events: { acceleration: { params: { cayenne_cdc_durability: file } } } }
   # The prototype object-native Cayenne metastore, with each durability.
   object-native-memory-durability:
-    datasets: { events: { acceleration: { params: { cayenne_metastore: object_native } } } }
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
   object-native-file-durability:
-    datasets: { events: { acceleration: { params: { cayenne_metastore: object_native, cayenne_cdc_durability: file } } } }
+    spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+    datasets: { events: { acceleration: { params: { cayenne_cdc_durability: file } } } }
 
 spicepod:
   version: v1
