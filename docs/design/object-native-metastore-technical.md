@@ -274,7 +274,10 @@ A record holds a unique attempt id, persisted before the CAS is sent. Every
 failed CAS is ambiguous, `412 Precondition Failed` included: the `object_store`
 crate re-sends a conditional PUT after a 5xx, and the re-send fails its own
 condition. A writer resolves every failed CAS from the head before it retries or
-re-plans. There are three outcomes: **accepted**, **rejected**, **unresolved**.
+re-plans. Sending head CASes without the crate's retries would make a 412
+definite, but would not save a request: after any failed CAS the writer reads the
+head anyway to retry or re-plan, and record n + 1 is almost always inline in it.
+Timeouts would stay ambiguous, so resolution stays either way. There are three outcomes: **accepted**, **rejected**, **unresolved**.
 
 | Head found | Outcome |
 |---|---|
