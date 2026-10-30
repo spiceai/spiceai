@@ -202,6 +202,14 @@ struct BakeOutput<'a> {
     input_ids: &'a [String],
 }
 
+/// Whether a seq-prefix bake waits for the process-wide bake slot or skips when
+/// another table's bake holds it (see `compaction::bake_budget`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BakeSlotWait {
+    Wait,
+    Skip,
+}
+
 /// One seq-prefix bake input's files, split by whether the bake's deletion
 /// filter removes a row from them
 /// ([`CayenneTableProvider::bake_partition_input_files`]).
@@ -29289,11 +29297,41 @@ impl CayenneTableProvider {
 
     /// Exposed (hidden) for property tests that drive the seq-prefix bake directly
     /// (`mutation_property_test`); production only reaches it via
-    /// `run_compaction_trigger`.
+    /// `run_compaction_trigger`, through
+    /// [`Self::bake_seq_prefix_protected_snapshots_on_trigger`].
+    ///
+    /// An explicit bake waits for the process-wide bake slot (see
+    /// `compaction::bake_budget`) rather than skip: a caller that asks for a bake
+    /// gets one, and two callers baking different tables at once — two tests
+    /// running side by side in one process — run one after the other instead of
+    /// one of them seeing `Ok(false)`.
     #[doc(hidden)]
     pub async fn bake_seq_prefix_protected_snapshots(&self) -> Result<bool> {
+        self.bake_seq_prefix_protected_snapshots_accounted(BakeSlotWait::Wait)
+            .await
+    }
+
+    /// The compaction trigger's bake. It skips, returning `Ok(false)`, while
+    /// another table's bake holds the process-wide bake slot, so the background
+    /// pass goes on to its other work and the bake runs on a later tick — unless
+    /// the deletion index is over its memory ceiling, where the bake is its only
+    /// shrink and waits its turn.
+    pub(crate) async fn bake_seq_prefix_protected_snapshots_on_trigger(&self) -> Result<bool> {
+        let wait = if self.deletion_index_over_memory_ceiling() {
+            BakeSlotWait::Wait
+        } else {
+            BakeSlotWait::Skip
+        };
+        self.bake_seq_prefix_protected_snapshots_accounted(wait)
+            .await
+    }
+
+    async fn bake_seq_prefix_protected_snapshots_accounted(
+        &self,
+        slot: BakeSlotWait,
+    ) -> Result<bool> {
         let pass_start = std::time::Instant::now();
-        let result = self.bake_seq_prefix_protected_snapshots_tracked().await;
+        let result = self.bake_seq_prefix_protected_snapshots_tracked(slot).await;
 
         // Same accounting the size-tier merge does: count only passes that did
         // real work or attempted one and failed, so the pass count matches the
@@ -29339,13 +29377,13 @@ impl CayenneTableProvider {
         result
     }
 
-    async fn bake_seq_prefix_protected_snapshots_tracked(&self) -> Result<bool> {
-        // One bake at a time in the process (see `compaction::bake_budget`). A
-        // table whose deletion index is over its memory ceiling waits its turn —
-        // the bake is its only shrink — and every other table bakes on a later
-        // tick.
+    async fn bake_seq_prefix_protected_snapshots_tracked(
+        &self,
+        slot: BakeSlotWait,
+    ) -> Result<bool> {
+        // One bake at a time in the process (see `compaction::bake_budget`).
         let budget = super::compaction::bake_budget();
-        let _bake_permit = if self.deletion_index_over_memory_ceiling() {
+        let _bake_permit = if slot == BakeSlotWait::Wait {
             budget.acquire_owned().await.ok()
         } else if let Ok(permit) = budget.try_acquire_owned() {
             Some(permit)
@@ -45354,7 +45392,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                         "Forcing seq-prefix bake: deletion index over memory ceiling (OOM backstop, overriding apply back-pressure)",
                     );
                 }
-                match self.bake_seq_prefix_protected_snapshots().await {
+                match self.bake_seq_prefix_protected_snapshots_on_trigger().await {
                     // Fall through to the size-tier subset pass below (same tick —
                     // both serialize on `compaction_lock`) so the consolidated output
                     // is leveled and superseded predecessors are reclaimed. Without

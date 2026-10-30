@@ -215,8 +215,8 @@ async fn a_checkpoint_does_not_wait_for_another_tables_bake_to_encode() {
     );
 }
 
-/// While one table bakes, another table's bake declines rather than run
-/// alongside it, and runs once the first has finished.
+/// While one table bakes, another table's triggered bake declines rather than
+/// run alongside it, and runs once the first has finished.
 ///
 /// Two overlapping whole-prefix bakes on the evidence rig ran 30 and 52 s while
 /// ingest halved and query P99 rose five-fold.
@@ -239,7 +239,7 @@ async fn a_second_tables_bake_waits_for_the_first_to_finish() {
 
     let concurrent = tokio::time::timeout(
         Duration::from_secs(60),
-        second.bake_seq_prefix_protected_snapshots(),
+        second.bake_seq_prefix_protected_snapshots_on_trigger(),
     )
     .await
     .expect("the second bake returns within 60 s")
