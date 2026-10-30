@@ -522,9 +522,12 @@ fn a_bake_refuses_to_link_two_files_of_one_name() {
 /// every later capture of those snapshots reading all of their files.
 ///
 /// The snapshot listing a capture reuses is keyed only by snapshot id and
-/// generation: a subset scan that stored its listing there left the next
-/// capture of the snapshot — a compaction that would then retire it, after a
-/// bake that did not commit — reading one file of it.
+/// generation, and a scan whose session collects statistics stores its listing
+/// there. A subset scan that stored its listing would leave the next capture of
+/// the snapshot — a compaction that would then retire it, after a bake that did
+/// not commit — reading only the subset. The bake's own session collects no
+/// statistics, so it stores nothing; this test scans through a session that
+/// does, so the guard is what keeps the listings whole.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn splitting_a_bakes_inputs_leaves_their_listings_whole() {
     let t = table("bake_partial_listing", false).await;
@@ -540,7 +543,9 @@ async fn splitting_a_bakes_inputs_leaves_their_listings_whole() {
         .collect();
     selected.sort();
     let mut whole: Vec<(String, usize, u64)> = Vec::new();
-    let ctx = t.provider.create_compaction_session_context();
+    let ctx = t.provider.create_compaction_session_context_with_config(
+        util::session_state::session_config().with_collect_statistics(true),
+    );
     let state = ctx.state();
     for (id, _) in &selected {
         let files = t
