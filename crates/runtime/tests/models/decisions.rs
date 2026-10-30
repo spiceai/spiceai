@@ -55,7 +55,7 @@ struct Provider {
 
 /// A chat model of the Spicepod, which answers decisions through its chat evaluator.
 fn openai_chat(name: &str) -> Model {
-    let mut model = get_openai_model("gpt-4o-mini", name);
+    let mut model = get_openai_model("gpt-5.6-luna", name);
     // The text-to-SQL system prompt is for chat; a decision is asked with its own prompt.
     model.params.remove("system_prompt");
     model
