@@ -40,6 +40,9 @@ spicepod:
       acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
 
 defaults:
+  # Background writes draw random values, so each instance holds different rows;
+  # every instance is checked against the source instead.
+  compare-variants: false
   spiced-args: [--pods-watcher-enabled]
   cluster-partition-by: { '*': id }
   expect: { oracle: src }
@@ -103,6 +106,13 @@ steps:
           - *acct
           - *other
           - { from: '${sources.src.from_prefix}t${sources.src.from_suffix}', name: added, params: '${sources.src.table_params}' }
+  # The list above replaces the variant's patch; keep the object-native metastore.
+  - edit-spicepod:
+      datasets:
+        t: { acceleration: { params: { cayenne_metastore: object_native } } }
+        acct: { acceleration: { params: { cayenne_metastore: object_native } } }
+        other: { acceleration: { params: { cayenne_metastore: object_native } } }
+    only: object-native
   - query: SELECT count(*) AS n FROM added
     expect: { rows: [['6000']] }
     eventually: 60s

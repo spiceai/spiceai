@@ -33,6 +33,9 @@ spicepod:
       acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_check_interval: 1s }
 
 defaults:
+  # Background writes draw random values, so each instance holds different rows;
+  # every instance is checked against the source instead.
+  compare-variants: false
   # A cluster buckets each acceleration on this column (--cluster).
   cluster-partition-by: { '*': id }
 

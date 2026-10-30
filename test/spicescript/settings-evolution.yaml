@@ -90,16 +90,21 @@ steps:
   # Settings that define the stored rows: rebuilt from the source under full
   # refresh. Under change capture a rebuild would lose the changes recorded
   # outside the table, so a new partitioning is refused with a message naming
-  # the fix, and reverting it serves the existing rows again.
+  # the fix, and reverting it serves the existing rows again. The prototype
+  # object-native metastore does not take `partition_by` yet, so it skips the
+  # partitioning steps.
   - restart:
       ready: false
       patch: { datasets: { trips: { acceleration: { partition_by: ['bucket(4, id)'] } } } }
+    except: object-native
   - assert-status: { dataset: trips, status: Error, message-contains: "remove 'partition_by'" }
     eventually: 60s
     when: { refresh_mode: changes }
+    except: object-native
   - restart:
       patch: { datasets: { trips: { acceleration: { partition_by: null } } } }
     when: { refresh_mode: changes }
+    except: object-native
   - query: SELECT * FROM trips
     eventually: 60s
   - source-exec: { src: "UPDATE trips SET fare = 0 WHERE id % 97 = 4; INSERT INTO trips VALUES (10004, 'city 4', 39.99, 'partitioned'); DELETE FROM trips WHERE id = 40" }
@@ -130,9 +135,11 @@ steps:
       ready: false
       patch: { datasets: { trips: { acceleration: { partition_by: null } } } }
     when: { refresh_mode: full }
+    except: object-native
   - assert-status: { dataset: trips, status: Error, message-contains: partition_by }
     eventually: 60s
     when: { refresh_mode: full }
+    except: object-native
   - start-source: src
     when: { refresh_mode: full }
   - restart: {}

@@ -39,6 +39,9 @@ spicepod:
       acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
 
 defaults:
+  # Background writes draw random values, so each instance holds different rows;
+  # every instance is checked against the source instead.
+  compare-variants: false
   expect: { oracle: src }
 
 steps:
