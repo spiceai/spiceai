@@ -45,8 +45,10 @@ const MIN_HEURISTIC_SECRET_LEN: usize = 4;
 const MIN_UNBOUNDED_SECRET_LEN: usize = 4;
 
 /// Query-string and `driver_options` keys (after any `adbc.` style prefix)
-/// that hold a password, collected at any length.
-const PASSWORD_KEYS: &[&str] = &["password", "passwd", "pwd", "pass"];
+/// that name a credential outright, so their values are collected at any
+/// length. Keys that only contain `key` or `auth` keep the length cutoff.
+const CREDENTIAL_KEY_MARKERS: &[&str] =
+    &["password", "passwd", "pwd", "secret", "token", "credential"];
 
 /// Query-string and `driver_options` keys whose values are treated as secrets.
 const SECRET_KEY_MARKERS: &[&str] = &[
@@ -134,7 +136,11 @@ pub fn connection_secrets(
         };
         let key = normalized_key(key);
         let key = key.rsplit('.').next().unwrap_or_default();
-        if PASSWORD_KEYS.contains(&key) {
+        if key == "pass"
+            || CREDENTIAL_KEY_MARKERS
+                .iter()
+                .any(|marker| key.contains(marker))
+        {
             push(value.trim(), 1);
         } else if SECRET_KEY_MARKERS.iter().any(|marker| key.contains(marker)) {
             push(value.trim(), MIN_HEURISTIC_SECRET_LEN);
@@ -494,6 +500,19 @@ mod scrub_tests {
                 scrub_connection_secrets(&format!("invalid token: \"{echoed}\""), &secrets);
             assert_eq!(scrubbed, "invalid token: \"***\"", "{uri}");
         }
+        // Short explicit credentials, echoed on their own.
+        let secrets = connection_secrets(
+            "postgresql://localhost/db?token=t1",
+            Some("abc"),
+            Some("adbc.secret=s2;adbc.api_key=k3"),
+        );
+        assert_eq!(
+            scrub_connection_secrets(
+                "driver rejected password abc, token t1, secret s2, key k3",
+                &secrets
+            ),
+            "driver rejected password ***, token ***, secret ***, key k3"
+        );
         // A `#` that libpq keeps as data does not hide a later password.
         let uri = "postgresql://localhost/db?application_name=x#y&password=CANARY%ZZSECRET";
         let secrets = connection_secrets(uri, None, None);
