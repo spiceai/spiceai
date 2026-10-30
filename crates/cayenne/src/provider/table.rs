@@ -30194,19 +30194,31 @@ impl CayenneTableProvider {
             .iter()
             .map(|&index| scan_schema.index_of(schema.field(index).name()))
             .collect::<std::result::Result<Vec<usize>, _>>()?;
+        // The rows the file holds: the scan's exact row count — the sum of its
+        // files' footer row counts, a raw physical count, here one file's — when
+        // it reports one.
+        let footer_rows = match scan.partition_statistics(None)?.num_rows {
+            DFPrecision::Exact(rows) => Some(u64::try_from(rows).unwrap_or(u64::MAX)),
+            DFPrecision::Inexact(_) | DFPrecision::Absent => None,
+        };
         let filtered =
             self.apply_partial_deletion_filter(scan, &pk_in_scan, threshold, deletion_snapshot)?;
         let task_ctx = state.task_ctx();
         let surviving = count_plan_rows(filtered, Arc::clone(&task_ctx)).await?;
-        // A scan plan yields its rows once: a second execution of the plan the
-        // filter wraps comes back empty, so the file's rows are counted through a
-        // plan of their own.
-        let held = count_plan_rows(
-            self.scan_bake_files(state, snapshot_id, Some(&projection), &one_file)
-                .await?,
-            task_ctx,
-        )
-        .await?;
+        let held = match footer_rows {
+            Some(rows) => rows,
+            // Otherwise count them. A scan plan yields its rows once: a second
+            // execution of the plan the filter wraps comes back empty, so they are
+            // counted through a plan of their own.
+            None => {
+                count_plan_rows(
+                    self.scan_bake_files(state, snapshot_id, Some(&projection), &one_file)
+                        .await?,
+                    task_ctx,
+                )
+                .await?
+            }
+        };
         Ok(surviving != held)
     }
 
