@@ -16,11 +16,11 @@ limitations under the License.
 
 use crate::accelerated::refresh::Refresh;
 use crate::component::dataset::acceleration::OnConflictBehavior;
+use crate::datafusion::SPICE_RUNTIME_SCHEMA;
 use crate::dataupdate::UpdateType;
 use crate::internal_table::{create_internal_accelerated_table, internal_acceleration};
 use crate::{Runtime, status};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
-use crate::datafusion::SPICE_RUNTIME_SCHEMA;
 use arrow::array::{ArrayBuilder, MapBuilder, RecordBatch, StringArray, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow_schema::ArrowError;

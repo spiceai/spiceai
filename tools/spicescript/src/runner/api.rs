@@ -218,13 +218,7 @@ pub(super) async fn http_step(instance: &Instance, step: &HttpStep) -> Result<St
         let result = async {
             let (status, got, text) = instance
                 .spiced
-                .http(
-                    &step.method,
-                    &path,
-                    &headers,
-                    body.as_deref(),
-                    &step.key,
-                )
+                .http(&step.method, &path, &headers, body.as_deref(), &step.key)
                 .await?;
             let mut problems = Vec::new();
             if let Some(expected) = step.status

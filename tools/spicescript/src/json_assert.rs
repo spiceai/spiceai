@@ -107,7 +107,9 @@ impl JsonAssertion {
         };
         let pointer = match map.remove("pointer") {
             Some(Value::String(p)) => p,
-            Some(_) => bail!("`pointer` must be a string, such as /0/name or '' for the whole body"),
+            Some(_) => {
+                bail!("`pointer` must be a string, such as /0/name or '' for the whole body")
+            }
             None => bail!("each `json` assertion needs a `pointer`"),
         };
         ensure!(
@@ -145,7 +147,10 @@ impl JsonAssertion {
                 predicates.push(make(bound));
             }
         }
-        let count = map.remove("count").map(|v| LineCount::parse(&v)).transpose()?;
+        let count = map
+            .remove("count")
+            .map(|v| LineCount::parse(&v))
+            .transpose()?;
         let absent = match map.remove("exists") {
             None | Some(Value::Bool(true)) => false,
             Some(Value::Bool(false)) => true,
@@ -258,7 +263,12 @@ impl Predicate {
     }
 }
 
-fn number_failure(value: &Value, holds: impl Fn(f64) -> bool, what: &str, bound: f64) -> Option<String> {
+fn number_failure(
+    value: &Value,
+    holds: impl Fn(f64) -> bool,
+    what: &str,
+    bound: f64,
+) -> Option<String> {
     match value.as_f64() {
         Some(n) if holds(n) => None,
         Some(n) => Some(format!("{n} is not {what} {bound}")),
@@ -381,11 +391,17 @@ mod tests {
     #[test]
     fn every_reached_value_must_satisfy_the_predicates() {
         let body = rows();
-        assert_eq!(assertion("{ pointer: /*/task, equals: sql_query }").check(&body), None);
+        assert_eq!(
+            assertion("{ pointer: /*/task, equals: sql_query }").check(&body),
+            None
+        );
         assert_eq!(assertion("{ pointer: /*/n, equals: 7 }").check(&body), None);
         assert_eq!(
             assertion("{ pointer: /*/labels/protocol, equals: http }").check(&body),
-            Some("json '/*/labels/protocol': expected \"http\", got \"flight\" (1 of 2 values fail)".to_string())
+            Some(
+                "json '/*/labels/protocol': expected \"http\", got \"flight\" (1 of 2 values fail)"
+                    .to_string()
+            )
         );
         assert_eq!(
             assertion("{ pointer: /*/labels/protocol, equals: http, count: 1 }").check(&body),
@@ -407,40 +423,64 @@ mod tests {
             assertion("{ pointer: /*/nope, equals: 1 }").check(&body),
             Some("json '/*/nope' reached nothing".to_string())
         );
-        assert_eq!(assertion("{ pointer: /*/nope, exists: false }").check(&body), None);
+        assert_eq!(
+            assertion("{ pointer: /*/nope, exists: false }").check(&body),
+            None
+        );
         assert_eq!(
             assertion("{ pointer: /0/err, exists: false }").check(&body),
             Some("json '/0/err' should reach nothing, reached null".to_string())
         );
-        assert_eq!(assertion("{ pointer: /*/err, equals: null }").check(&body), None);
+        assert_eq!(
+            assertion("{ pointer: /*/err, equals: null }").check(&body),
+            None
+        );
     }
 
     #[test]
     fn types_lengths_ranges_and_patterns() {
         let body = rows();
-        assert_eq!(assertion("{ pointer: '', length: 2, type: array }").check(&body), None);
+        assert_eq!(
+            assertion("{ pointer: '', length: 2, type: array }").check(&body),
+            None
+        );
         assert_eq!(
             assertion("{ pointer: '', length: '>=3' }").check(&body),
             Some("json '': length 2, expected >= 3 (1 of 1 values fail)".to_string())
         );
-        assert_eq!(assertion("{ pointer: /0/n, type: integer }").check(&body), None);
+        assert_eq!(
+            assertion("{ pointer: /0/n, type: integer }").check(&body),
+            None
+        );
         assert_eq!(
             assertion("{ pointer: /*/ms, type: integer }").check(&body),
             Some("json '/*/ms': expected integer, got number 1.5 (2 of 2 values fail)".to_string())
         );
-        assert_eq!(assertion("{ pointer: /*/ms, above: 0, below: 2 }").check(&body), None);
+        assert_eq!(
+            assertion("{ pointer: /*/ms, above: 0, below: 2 }").check(&body),
+            None
+        );
         assert_eq!(
             assertion("{ pointer: /*/task, above: 0 }").check(&body),
             Some("json '/*/task': expected a number above 0, got string \"sql_query\" (2 of 2 values fail)".to_string())
         );
-        assert_eq!(assertion("{ pointer: /0/labels, matches: 'protocol' }").check(&body), None);
-        assert_eq!(assertion("{ pointer: /*/task, matches: '^sql_' }").check(&body), None);
+        assert_eq!(
+            assertion("{ pointer: /0/labels, matches: 'protocol' }").check(&body),
+            None
+        );
+        assert_eq!(
+            assertion("{ pointer: /*/task, matches: '^sql_' }").check(&body),
+            None
+        );
     }
 
     #[test]
     fn pointer_escapes_and_wildcard_over_objects() {
         let body = json!({ "a/b": { "x": 1, "y": 2 }, "t~": [] });
-        assert_eq!(assertion("{ pointer: /a~1b/*, above: 0 }").check(&body), None);
+        assert_eq!(
+            assertion("{ pointer: /a~1b/*, above: 0 }").check(&body),
+            None
+        );
         assert_eq!(assertion("{ pointer: /t~0, length: 0 }").check(&body), None);
     }
 
@@ -448,9 +488,18 @@ mod tests {
     fn rejects_malformed_assertions() {
         for (yaml, error) in [
             ("{ equals: 1 }", "each `json` assertion needs a `pointer`"),
-            ("{ pointer: a, equals: 1 }", "`pointer` 'a' must be empty or start with '/' (a JSON Pointer)"),
-            ("{ pointer: /a, exists: false, equals: 1 }", "`exists: false` takes no other predicate or `count`"),
-            ("{ pointer: /a, equal: 1 }", "unknown `json` assertion option `equal`"),
+            (
+                "{ pointer: a, equals: 1 }",
+                "`pointer` 'a' must be empty or start with '/' (a JSON Pointer)",
+            ),
+            (
+                "{ pointer: /a, exists: false, equals: 1 }",
+                "`exists: false` takes no other predicate or `count`",
+            ),
+            (
+                "{ pointer: /a, equal: 1 }",
+                "unknown `json` assertion option `equal`",
+            ),
         ] {
             let value: Value = yaml::from_str(yaml).expect("yaml");
             let err = JsonAssertion::parse(value).expect_err("rejected");
