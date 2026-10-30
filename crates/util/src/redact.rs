@@ -18,6 +18,7 @@ limitations under the License.
 //! error a source returned or a recorded result.
 
 use std::borrow::Cow;
+use std::fmt::Write as _;
 
 /// What a value taken out is replaced with.
 pub const REDACTED: &str = "<redacted>";
@@ -59,31 +60,38 @@ pub fn redact_values<'m>(message: &'m str, values: &[String]) -> Cow<'m, str> {
 
 /// `message` without `spellings`, as written and as JSON escapes them, with
 /// each JSON string in it redacted the same way once decoded, down to `depth`
-/// levels of JSON inside JSON.
+/// levels of JSON inside JSON. The JSON strings go first: taking a spelling
+/// out as written could cut into the escape of another value in a string,
+/// such as `u00e4` in `\u00e4`, so that the string no longer decodes.
 fn redact_spellings<'m>(message: &'m str, spellings: &[&str], depth: usize) -> Cow<'m, str> {
-    let replaced = replace_spellings(message, spellings);
-    if let Cow::Owned(decoded) = redact_json_strings(&replaced, spellings, depth) {
-        return Cow::Owned(decoded);
+    match redact_json_strings(message, spellings, depth) {
+        Cow::Owned(redacted) => Cow::Owned(replace_spellings(&redacted, spellings).into_owned()),
+        Cow::Borrowed(_) => replace_spellings(message, spellings),
     }
-    replaced
 }
 
 /// `message` with each of `spellings` it holds, as written or as JSON escapes
-/// it up to [`JSON_DEPTH`] times, replaced with [`REDACTED`].
+/// it up to [`JSON_DEPTH`] times, a letter outside ASCII as itself or as
+/// `\uXXXX`, replaced with [`REDACTED`].
 fn replace_spellings<'m>(message: &'m str, spellings: &[&str]) -> Cow<'m, str> {
     let mut present: Vec<Cow<'_, str>> = Vec::new();
     for &spelling in spellings {
         if message.contains(spelling) {
             present.push(Cow::Borrowed(spelling));
         }
-        let mut escaped = json_escaped(spelling);
-        for _ in 0..JSON_DEPTH {
-            let Some(current) = escaped else {
-                break;
-            };
-            escaped = json_escaped(&current);
-            if message.contains(current.as_str()) {
-                present.push(Cow::Owned(current));
+        for first in [json_escaped(spelling), ascii_escaped(spelling)]
+            .into_iter()
+            .flatten()
+        {
+            let mut escaped = Some(first);
+            for _ in 0..JSON_DEPTH {
+                let Some(current) = escaped else {
+                    break;
+                };
+                escaped = json_escaped(&current);
+                if message.contains(current.as_str()) {
+                    present.push(Cow::Owned(current));
+                }
             }
         }
     }
@@ -108,11 +116,35 @@ fn json_escaped(value: &str) -> Option<String> {
     (escaped != value).then(|| escaped.to_string())
 }
 
+/// `value` as an encoder that writes only ASCII, such as Python's
+/// `json.dumps`, writes it inside a JSON string: as [`json_escaped`] writes
+/// it, with each letter outside ASCII as `\uXXXX`. `None` when `value` is
+/// ASCII, so that both write it the same way.
+fn ascii_escaped(value: &str) -> Option<String> {
+    if value.is_ascii() {
+        return None;
+    }
+    let escaped = json_escaped(value);
+    let mut ascii = String::new();
+    for letter in escaped.as_deref().unwrap_or(value).chars() {
+        if letter.is_ascii() {
+            ascii.push(letter);
+        } else {
+            for unit in letter.encode_utf16(&mut [0; 2]) {
+                let _ = write!(ascii, "\\u{unit:04x}");
+            }
+        }
+    }
+    Some(ascii)
+}
+
 /// `text` with each JSON string in it that, decoded, holds one of `spellings`
 /// written again without it: the decoded string is redacted as
 /// [`redact_spellings`] redacts, one level less deep, so a value escaped by
 /// any encoder, or in JSON inside the string, is found. Unchanged when no
-/// JSON string in `text` holds one.
+/// JSON string in `text` holds one. A quote that pairs with another into a
+/// string that holds none may not open a string at all, as in plain text
+/// before JSON, so the scan goes on from the quote after it.
 fn redact_json_strings<'t>(text: &'t str, spellings: &[&str], depth: usize) -> Cow<'t, str> {
     if depth == 0 {
         return Cow::Borrowed(text);
@@ -136,8 +168,10 @@ fn redact_json_strings<'t>(text: &'t str, spellings: &[&str], depth: usize) -> C
                 &serde_json::to_string(&clean).unwrap_or_else(|_| format!("\"{REDACTED}\"")),
             );
             copied = end + 1;
+            from = end + 1;
+        } else {
+            from = start + 1;
         }
-        from = end + 1;
     }
     if copied == 0 {
         return Cow::Borrowed(text);
@@ -223,6 +257,54 @@ mod tests {
                 std::slice::from_ref(&password)
             ),
             r#"Error calling tool peer__sql: {"error": "refused: pg_pass = '<redacted>'"}"#
+        );
+    }
+
+    /// A value that is also part of another value's escape, such as `u00e4`
+    /// in Python's `\u00e4`, does not break the escape apart before the
+    /// other value is found: in a whole JSON string, also as .NET writes it
+    /// (`\u00E4`, which no spelling as written matches), and in one cut
+    /// short.
+    #[test]
+    fn a_value_inside_another_value_s_escape_leaves_none_of_it() {
+        let values = ["u00e4".to_string(), "leak-p\u{e4}ssword".to_string()];
+        assert_eq!(
+            redact_values(
+                r#"Error calling tool peer__sql: {"error": "refused: pg_db = 'u00e4', pg_pass = 'leak-p\u00e4ssword'"}"#,
+                &values
+            ),
+            r#"Error calling tool peer__sql: {"error": "refused: pg_db = '<redacted>', pg_pass = '<redacted>'"}"#
+        );
+        assert_eq!(
+            redact_values(
+                r#"{"error": "refused: pg_db = 'u00e4', pg_pass = 'leak-p\u00e4ssword' and more"#,
+                &values
+            ),
+            r#"{"error": "refused: pg_db = '<redacted>', pg_pass = '<redacted>' and more"#
+        );
+        let values = ["u00E4".to_string(), "leak-p\u{e4}ssword".to_string()];
+        assert_eq!(
+            redact_values(
+                r#"{"error": "refused: pg_db = 'u00E4', pg_pass = 'leak-p\u00E4ssword'"}"#,
+                &values
+            ),
+            r#"{"error": "refused: pg_db = '<redacted>', pg_pass = '<redacted>'"}"#
+        );
+    }
+
+    /// A quote in plain text before JSON, as an error that quotes the token
+    /// it stopped at writes one, does not hide the JSON string after it,
+    /// which here escapes the value as .NET does, so that only decoding the
+    /// string finds it.
+    #[test]
+    fn a_value_in_json_after_a_stray_quote_is_taken_out() {
+        let password = "p\u{e4}ssword".to_string();
+        assert_eq!(
+            redact_values(
+                r#"Unexpected token '"'; details: {"error": "pg_pass = 'p\u00E4ssword'"}"#,
+                std::slice::from_ref(&password)
+            ),
+            r#"Unexpected token '"'; details: {"error": "pg_pass = '<redacted>'"}"#
         );
     }
 

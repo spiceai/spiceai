@@ -51,6 +51,12 @@ spicepod:
       from: mcp:python3
       params:
         mcp_args: ${script.dir}/mcp/sql_peer.py sql json-result
+    # Another whose error puts the JSON document after a quoted quote, with
+    # its escapes in capitals.
+    - name: peer5
+      from: mcp:python3
+      params:
+        mcp_args: ${script.dir}/mcp/sql_peer.py sql json-after-quote
   models:
     - from: anthropic:claude-sonnet-4-6
       name: a
@@ -277,6 +283,28 @@ steps:
       headers: { content-type: text/plain }
       body: SELECT task, input, captured_output, error_message FROM runtime.task_history WHERE task IN ('tool_use::peer3__sql', 'tool_use::peer4__sql') ORDER BY task
     expect: { status: 200, body-matches: 'TABLE t10[\s\S]*TABLE t11', body-lacks: ['leak-'] }
+    eventually: 30s
+  # A value that is also part of the password's escape (`u00fc` in
+  # `\u00fc`), and a JSON document after plain text that quotes a quote.
+  - http:
+      method: POST
+      path: /v1/tools/peer3__sql
+      headers: { content-type: application/json }
+      body: '{"query": "CREATE TABLE t12 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''u00fc'', pg_pass = ''leak-overlap-ü'')"}'
+    expect: { body-contains: t12 }
+  - http:
+      method: POST
+      path: /v1/tools/peer5__sql
+      headers: { content-type: application/json }
+      body: '{"query": "CREATE TABLE t13 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-quote-ü'')"}'
+    expect: { body-contains: t13 }
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SELECT task, input, captured_output, error_message FROM runtime.task_history WHERE task IN ('tool_use::peer3__sql', 'tool_use::peer5__sql') AND (input LIKE '%t12%' OR input LIKE '%t13%') ORDER BY task
+    expect: { status: 200, body-matches: 'TABLE t12[\s\S]*TABLE t13', body-lacks: ['leak-'] }
     eventually: 30s
   # Every row of task history, every column a value can reach.
   - http:
