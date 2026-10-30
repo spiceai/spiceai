@@ -199,6 +199,18 @@ impl GtidSet {
         out
     }
 
+    /// The union of two executed sets: the sequences present in either.
+    #[must_use]
+    pub fn union(&self, other: &Self) -> Self {
+        let mut out = self.clone();
+        for (uuid, ranges) in &other.intervals {
+            let merged = out.intervals.entry(*uuid).or_default();
+            merged.extend_from_slice(ranges);
+            coalesce(merged);
+        }
+        out
+    }
+
     /// Whether `self` is a subset of `other`: every transaction in `self` is
     /// also in `other`.
     ///

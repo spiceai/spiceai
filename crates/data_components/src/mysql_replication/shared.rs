@@ -270,6 +270,15 @@ struct AckSlot {
     /// store before acknowledging it (see [`SharedPositionCommitter::record_position`]).
     /// The pump's own save never writes a position at or below it.
     recorded: Mutex<Option<BinlogPosition>>,
+    /// The GTID set a committer recorded with [`Self::recorded`] on a
+    /// GTID-positioning source. The pump's own save never writes a set it
+    /// contains.
+    recorded_gtid: Mutex<Option<GtidSet>>,
+    /// GTIDs of transactions delivered to this member and not yet committed,
+    /// in delivery (binlog) order. A position recorded before the commits below
+    /// it have run must still carry their GTIDs: their data is applied, and is
+    /// committed in the same record or an earlier one.
+    pending_gtids: Mutex<Vec<(BinlogPosition, uuid::Uuid, u64)>>,
 }
 
 impl AckSlot {
@@ -280,6 +289,8 @@ impl AckSlot {
             gtid: Mutex::new(gtid_seed),
             state: AtomicU8::new(LIVE | if snapshotting { SNAPSHOTTING } else { 0 }),
             recorded: Mutex::new(None),
+            recorded_gtid: Mutex::new(None),
+            pending_gtids: Mutex::new(Vec::new()),
         }
     }
 
@@ -308,6 +319,38 @@ impl AckSlot {
         if recorded.as_ref().is_none_or(|current| at > current) {
             *recorded = Some(at.clone());
         }
+    }
+    fn recorded_gtid(&self) -> Option<GtidSet> {
+        lock(&self.recorded_gtid).clone()
+    }
+    fn note_recorded_gtid(&self, set: GtidSet) {
+        let mut recorded = lock(&self.recorded_gtid);
+        let merged = match recorded.take() {
+            Some(current) => current.union(&set),
+            None => set,
+        };
+        *recorded = Some(merged);
+    }
+
+    /// Note a delivered transaction's GTID until the commit covering it folds it.
+    fn deliver_gtid(&self, at: &BinlogPosition, uuid: uuid::Uuid, gno: u64) {
+        lock(&self.pending_gtids).push((at.clone(), uuid, gno));
+    }
+    /// Drop the delivered GTIDs at or below a committed position: the commit
+    /// covering them has folded them into the executed set.
+    fn retire_pending_gtids(&self, upto: &BinlogPosition) {
+        lock(&self.pending_gtids).retain(|(at, _, _)| at > upto);
+    }
+    /// The executed set plus the GTIDs of every delivered transaction at or
+    /// below `upto`: what a position recorded at `upto` covers.
+    fn gtid_set_through(&self, upto: &BinlogPosition) -> GtidSet {
+        let mut set = self.gtid_snapshot();
+        for (at, uuid, gno) in lock(&self.pending_gtids).iter() {
+            if at <= upto {
+                set.add(*uuid, *gno);
+            }
+        }
+        set
     }
 
     /// Advance this member's committed floor (monotonic-max).
@@ -378,6 +421,7 @@ impl AckTable {
                 *lock(&slot.committed) = at.clone();
                 *lock(&slot.delivered) = at;
                 *lock(&slot.gtid) = gtid_seed;
+                lock(&slot.pending_gtids).clear();
                 slot.state.store(held, Ordering::Release);
             }
             None => {
@@ -497,9 +541,10 @@ struct SharedPositionCommitter {
     /// GTIDs must still be folded. Empty when the source is not GTID-positioning.
     gtids: Vec<(uuid::Uuid, u64)>,
     /// Writes this commit's position before the source is acknowledged, for an
-    /// accelerator that commits it with the data it covers. File+offset
-    /// positioning only: a GTID set recorded early would miss the GTIDs of the
-    /// earlier commits it covers, which are folded only when they commit.
+    /// accelerator that commits it with the data it covers. On a
+    /// GTID-positioning source the recorded set includes the GTIDs of the
+    /// delivered transactions at or below this position, which earlier commits
+    /// have not folded yet.
     recorder: Option<PositionRecorder>,
 }
 
@@ -509,15 +554,17 @@ struct PositionRecorder {
     store: Arc<dyn PositionStore>,
     writes: Arc<tokio::sync::Mutex<()>>,
     schema_json: Option<String>,
+    cursor_type: CursorType,
 }
 
 impl PositionRecorder {
-    fn for_member(member: &MemberHandle) -> Option<Self> {
-        (member.cursor_type == CursorType::File).then(|| Self {
+    fn for_member(member: &MemberHandle) -> Self {
+        Self {
             store: Arc::clone(&member.position_store),
             writes: Arc::clone(&member.position_writes),
             schema_json: member.checkpoint_schema_json.clone(),
-        })
+            cursor_type: member.cursor_type,
+        }
     }
 }
 
@@ -528,6 +575,7 @@ impl CommitChange for SharedPositionCommitter {
         for &(uuid, gno) in &self.gtids {
             self.slot.fold_gtid(uuid, gno);
         }
+        self.slot.retire_pending_gtids(&self.flush_to);
         crate::cdc::log_committer_progress(
             "mysql",
             &self.dataset,
@@ -577,7 +625,17 @@ impl CommitChange for SharedPositionCommitter {
         let position = self.flush_to.clone();
         Some(Box::pin(async move {
             let _serialized = recorder.writes.lock().await;
-            if slot.recorded().is_some_and(|recorded| recorded >= position) {
+            let gtid_set = (recorder.cursor_type == CursorType::Gtid)
+                .then(|| slot.gtid_set_through(&position));
+            let covered = match &gtid_set {
+                // After a failover the file+offset can stand still while the
+                // executed set grows, so the set decides.
+                Some(set) => slot
+                    .recorded_gtid()
+                    .is_some_and(|recorded| set.is_subset_of(&recorded)),
+                None => slot.recorded().is_some_and(|recorded| recorded >= position),
+            };
+            if covered {
                 return Ok(());
             }
             recorder
@@ -585,12 +643,15 @@ impl CommitChange for SharedPositionCommitter {
                 .save(&PersistedPosition {
                     position: position.clone(),
                     schema_json: recorder.schema_json,
-                    gtid_set: None,
-                    cursor_type: CursorType::File,
+                    gtid_set: gtid_set.as_ref().map(ToString::to_string),
+                    cursor_type: recorder.cursor_type,
                 })
                 .await
                 .map_err(|source| CommitError::UnableToCommitChange { source })?;
             slot.note_recorded(&position);
+            if let Some(set) = gtid_set {
+                slot.note_recorded_gtid(set);
+            }
             Ok(())
         }))
     }
@@ -2222,12 +2283,15 @@ async fn deliver_commit(
                 dataset: member.dataset_name.clone(),
                 source_commit_ts_ms: commit_ts,
                 gtids: gtid.into_iter().collect(),
-                recorder: PositionRecorder::for_member(member),
+                recorder: Some(PositionRecorder::for_member(member)),
             }),
             Box::new(rows),
             is_ready,
         );
         slot.deliver(commit_pos);
+        if let Some((uuid, gno)) = gtid {
+            slot.deliver_gtid(commit_pos, uuid, gno);
+        }
         match deliver_to_member(
             &member.metrics,
             &member.sender,
@@ -2314,12 +2378,15 @@ async fn handle_statement(
                         dataset: member.dataset_name.clone(),
                         source_commit_ts_ms: commit_ts,
                         gtids: gtid.into_iter().collect(),
-                        recorder: PositionRecorder::for_member(&member),
+                        recorder: Some(PositionRecorder::for_member(&member)),
                     }),
                     batch,
                     is_ready,
                 );
                 slot.deliver(&commit_pos);
+                if let Some((uuid, gno)) = gtid {
+                    slot.deliver_gtid(&commit_pos, uuid, gno);
+                }
                 match deliver_to_member(
                     &member.metrics,
                     &member.sender,
@@ -2673,11 +2740,15 @@ async fn persist_all(source: &Arc<SharedSource>, last: &mut HashMap<MemberKey, P
         }
         // A committer already recorded this position or a later one; writing
         // the slot's older committed position would move the store backwards.
-        if persisted.gtid_set.is_none()
-            && slot
+        let covered = match &persisted.gtid_set {
+            Some(_) => slot
+                .recorded_gtid()
+                .is_some_and(|recorded| slot.gtid_snapshot().is_subset_of(&recorded)),
+            None => slot
                 .recorded()
-                .is_some_and(|recorded| recorded >= persisted.position)
-        {
+                .is_some_and(|recorded| recorded >= persisted.position),
+        };
+        if covered {
             continue;
         }
         match member.position_store.save(&persisted).await {
@@ -2914,6 +2985,67 @@ mod tests {
         }
     }
 
+    /// A GTID position recorded with its data, before the commits below it
+    /// have run, carries every delivered GTID at or below it and none above:
+    /// those transactions' data is in the same record or an earlier one, and a
+    /// resume from the store must neither re-skip nor re-apply them.
+    #[tokio::test]
+    async fn a_gtid_position_recorded_before_earlier_commits_carries_their_gtids() {
+        let source_uuid = uuid::Uuid::from_u128(0x3e11_fa47_71ca_11e1_9e33_c80a_a942_9562);
+        let key = ("db".to_string(), "orders".to_string());
+        let test = source_with_member_positioned(&key, CursorType::Gtid);
+        let seed = GtidSet::parse(&format!("{source_uuid}:1-10")).expect("seed");
+        test.source
+            .ack
+            .register_with_gtid(&key, pos("binlog.000001", 100), seed, false);
+        test.source.ack.promote_ready_members();
+        let slot = test.source.ack.slot(&key).expect("member slot");
+        let recorder = PositionRecorder::for_member(&test.member);
+        let committer = |at: u64, gno: u64| SharedPositionCommitter {
+            slot: Arc::clone(&slot),
+            flush_to: pos("binlog.000001", at),
+            dataset: "orders".into(),
+            source_commit_ts_ms: None,
+            gtids: vec![(source_uuid, gno)],
+            recorder: Some(recorder.clone()),
+        };
+        // Three transactions delivered; none committed yet.
+        for (at, gno) in [(200, 11), (300, 12), (400, 13)] {
+            slot.deliver(&pos("binlog.000001", at));
+            slot.deliver_gtid(&pos("binlog.000001", at), source_uuid, gno);
+        }
+        committer(300, 12)
+            .record_position()
+            .expect("a GTID member records its position")
+            .await
+            .expect("record");
+        let saved = lock(&test.position_store.inner)
+            .clone()
+            .expect("a saved position");
+        assert_eq!(saved.cursor_type, CursorType::Gtid);
+        assert_eq!(saved.position, pos("binlog.000001", 300));
+        assert_eq!(
+            saved.gtid_set.as_deref(),
+            Some(format!("{source_uuid}:1-12").as_str()),
+            "the set covers the uncommitted transaction below the position and stops at it"
+        );
+
+        // Once the commit below runs, the pump's own save must not move the
+        // store back to an older executed set.
+        committer(200, 11).commit().await.expect("commit");
+        let mut last = HashMap::new();
+        persist_all(&test.source, &mut last).await;
+        assert_eq!(
+            lock(&test.position_store.inner)
+                .clone()
+                .expect("saved")
+                .gtid_set
+                .as_deref(),
+            Some(format!("{source_uuid}:1-12").as_str()),
+            "the pump replaced the recorded set with the older executed set"
+        );
+    }
+
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -2932,6 +3064,13 @@ mod tests {
     }
 
     fn source_with_member(member_key: &MemberKey) -> TestMember {
+        source_with_member_positioned(member_key, CursorType::File)
+    }
+
+    fn source_with_member_positioned(
+        member_key: &MemberKey,
+        cursor_type: CursorType,
+    ) -> TestMember {
         let params = test_params();
         let source = Arc::new(SharedSource {
             key: SourceKey {
@@ -2990,7 +3129,7 @@ mod tests {
             position_store: Arc::clone(&position_store) as Arc<dyn PositionStore>,
             position_writes: Arc::new(tokio::sync::Mutex::new(())),
             checkpoint_schema_json: None,
-            cursor_type: CursorType::File,
+            cursor_type,
             snapshot_mode: params.snapshot_mode,
         });
         lock(&source.members).insert(member_key.clone(), Arc::clone(&member));
