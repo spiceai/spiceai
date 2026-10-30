@@ -1873,7 +1873,10 @@ where
             json_actions(&actions)
         ));
     }
-    println!("WALKS {} seed={seed} count={count} max_steps={max_steps} good={good}", run.name);
+    println!(
+        "WALKS {} seed={seed} count={count} max_steps={max_steps} good={good}",
+        run.name
+    );
     good
 }
 
