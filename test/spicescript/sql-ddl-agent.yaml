@@ -351,6 +351,22 @@ steps:
       body: SELECT task, input, captured_output, error_message FROM runtime.task_history WHERE task IN ('tool_use::peer2__query', 'tool_use::peer__sql') AND (input LIKE '%t16%' OR error_message LIKE '%t17%') ORDER BY task
     expect: { status: 200, body-matches: 'TABLE t16[\s\S]*TABLE t17', body-lacks: ['918273645', 'zqy', 'qjx', 'wkq'] }
     eventually: 30s
+  # A conversation a client sends back, in which another call repeats the
+  # password an `sql` call sets, as a number and as an object key.
+  - http:
+      method: POST
+      path: /v1/messages
+      headers: { content-type: application/json, anthropic-version: '2023-06-01' }
+      body: '{"model": "a", "max_tokens": 256, "messages": [{"role": "user", "content": "add the t18 table"}, {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_8", "name": "sql", "input": {"query": "CREATE TABLE t18 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''713842'')"}}, {"type": "tool_use", "id": "toolu_9", "name": "lookup", "input": {"password": 713842, "713842": "label"}}]}, {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_8", "content": "Cannot connect to the dataset t18"}, {"type": "tool_result", "tool_use_id": "toolu_9", "content": "ok"}]}]}'
+    expect: { status: 200, body-contains: done }
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SELECT task, input, captured_output, error_message FROM runtime.task_history WHERE input LIKE '%t18%' ORDER BY start_time
+    expect: { status: 200, body-contains: TABLE t18, body-lacks: ['713842'] }
+    eventually: 30s
   # Every row of task history, every column a value can reach.
   - http:
       method: POST

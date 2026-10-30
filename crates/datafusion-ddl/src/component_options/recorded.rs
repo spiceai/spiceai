@@ -274,41 +274,50 @@ pub fn recorded_call_arguments(arguments: &str) -> Option<(String, Vec<String>)>
         return None;
     }
     // Another argument of the call can repeat a value a statement gave up.
-    redact_json_strings(&mut value, &removed);
+    redact_json_values(&mut value, &removed);
     Some((value.to_string(), removed))
 }
 
-/// Take `removed` out of every string, number, and object key of `value`. A
-/// number that held one is recorded as a string.
-fn redact_json_strings(value: &mut Value, removed: &[String]) {
+/// Take `removed` out of every string, number, and object key of `value`, a
+/// call's arguments or a whole conversation, and say whether anything changed.
+/// A number that held one is recorded as a string, and two keys that then read
+/// alike stay two.
+pub fn redact_json_values(value: &mut Value, removed: &[String]) -> bool {
     match value {
-        Value::String(text) => {
-            if let Cow::Owned(redacted) = redact_values(text, removed) {
+        Value::String(text) => match redact_values(text, removed) {
+            Cow::Owned(redacted) => {
                 *text = redacted;
+                true
             }
-        }
-        Value::Number(number) => {
-            if let Cow::Owned(redacted) = redact_values(&number.to_string(), removed) {
+            Cow::Borrowed(_) => false,
+        },
+        Value::Number(number) => match redact_values(&number.to_string(), removed) {
+            Cow::Owned(redacted) => {
                 *value = Value::String(redacted);
+                true
             }
-        }
-        Value::Array(items) => {
-            for item in items {
-                redact_json_strings(item, removed);
-            }
-        }
+            Cow::Borrowed(_) => false,
+        },
+        Value::Array(items) => items.iter_mut().fold(false, |changed, item| {
+            redact_json_values(item, removed) | changed
+        }),
         Value::Object(map) => {
+            let mut changed = false;
             for (key, mut item) in std::mem::take(map) {
-                redact_json_strings(&mut item, removed);
+                changed |= redact_json_values(&mut item, removed);
                 let key = match redact_values(&key, removed) {
-                    Cow::Owned(redacted) => redacted,
+                    Cow::Owned(redacted) => {
+                        changed = true;
+                        redacted
+                    }
                     Cow::Borrowed(_) => key,
                 };
                 let key = unused_key(map, key);
                 map.insert(key, item);
             }
+            changed
         }
-        _ => {}
+        _ => false,
     }
 }
 

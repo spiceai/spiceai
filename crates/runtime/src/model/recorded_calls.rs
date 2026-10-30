@@ -40,7 +40,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use datafusion_ddl::component_options::{
-    UNREADABLE_STATEMENT, may_define, recorded_call_arguments, redact_values, unreadable_parts,
+    UNREADABLE_STATEMENT, may_define, recorded_call_arguments, redact_json_values, unreadable_parts,
 };
 use runtime_tools::builtin::sql::{is_sql_tool, recorded_input, sql_tool_names};
 use serde::Serialize;
@@ -204,7 +204,7 @@ fn recorded_invocation(
 fn record_tool_calls(value: &mut Value, record: &Recorder<'_>) -> Option<Vec<String>> {
     let mut removed = Vec::new();
     let rewritten = rewrite_calls(value, record, &mut removed);
-    let redacted = !removed.is_empty() && redact_strings(value, &removed);
+    let redacted = !removed.is_empty() && redact_json_values(value, &removed);
     (rewritten || redacted).then_some(removed)
 }
 
@@ -275,25 +275,6 @@ fn as_sent(recorded: String, is_text: bool) -> Value {
         Value::String(recorded)
     } else {
         serde_json::from_str(&recorded).unwrap_or(Value::String(recorded))
-    }
-}
-
-fn redact_strings(value: &mut Value, values: &[String]) -> bool {
-    match value {
-        Value::String(text) => match redact_values(text, values) {
-            Cow::Owned(redacted) => {
-                *text = redacted;
-                true
-            }
-            Cow::Borrowed(_) => false,
-        },
-        Value::Array(items) => items.iter_mut().fold(false, |rewritten, item| {
-            redact_strings(item, values) | rewritten
-        }),
-        Value::Object(map) => map.values_mut().fold(false, |rewritten, item| {
-            redact_strings(item, values) | rewritten
-        }),
-        _ => false,
     }
 }
 
@@ -559,6 +540,25 @@ mod tests {
         assert!(
             removed.iter().any(|value| value == "hunter2"),
             "{removed:?}"
+        );
+    }
+
+    /// Another call of the conversation that repeats a value a statement gave
+    /// up, as a number or as an object key, gives it up too.
+    #[test]
+    fn a_conversations_numbers_and_keys_give_up_its_statements_values() {
+        let statement = "CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = '713842')";
+        let payload = json!({"messages": [{"role": "assistant", "content": [
+            {"type": "tool_use", "id": "m1", "name": "sql", "input": {"query": statement}},
+            {"type": "tool_use", "id": "m2", "name": "lookup",
+                "input": {"password": 713_842, "713842": "label"}},
+        ]}]});
+        let (recorded, _) = recorded_by_name(&payload.to_string()).expect("the payload changes");
+        let recorded: Value =
+            serde_json::from_str(&recorded).expect("the recorded payload is JSON");
+        assert_eq!(
+            recorded["messages"][0]["content"][1]["input"],
+            json!({"password": "<redacted>", "<redacted>": "label"})
         );
     }
 
