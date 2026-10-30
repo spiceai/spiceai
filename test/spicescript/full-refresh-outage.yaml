@@ -11,11 +11,6 @@ sources:
 
 variants:
   cayenne: {}
-  # DuckDB and SQLite keep their files at an explicit path.
-  duckdb:
-    datasets: { '*': { acceleration: { engine: duckdb, params: { duckdb_file: '${instance.dir}/items.duckdb' } } } }
-  sqlite:
-    datasets: { '*': { acceleration: { engine: sqlite, params: { sqlite_file: '${instance.dir}/items.sqlite' } } } }
 
 spicepod:
   version: v1

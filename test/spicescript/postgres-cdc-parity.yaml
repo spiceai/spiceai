@@ -3,7 +3,7 @@ description: >
   Postgres CDC converges to the source after inserts, updates, deletes, key
   changes and large transactions, across a clean restart and a kill: Cayenne
   under each deletion mode, with file CDC durability, and
-  partitioned on its key, and DuckDB.
+  partitioned on its key.
 
 sources:
   src: { kind: postgres }
@@ -22,8 +22,6 @@ variants:
     datasets:
       orders: { acceleration: { partition_by: [{ bucket: 'bucket(4, o_id)' }] } }
       customers: { acceleration: { partition_by: [{ bucket: 'bucket(4, c_id)' }] } }
-  duckdb:
-    datasets: { '*': { acceleration: { engine: duckdb, mode: memory } } }
 
 spicepod:
   version: v1

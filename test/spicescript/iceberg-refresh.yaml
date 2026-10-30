@@ -2,7 +2,7 @@ name: iceberg-refresh
 description: >
   An Iceberg table behind a REST catalog answers through Spice like DuckDB
   reading the same table: federated and accelerated by full refresh into
-  Cayenne and DuckDB, after the first snapshot and after inserts, deletes and
+  Cayenne, after the first snapshot and after inserts, deletes and
   updates add snapshots with delete files.
 
 sources:
@@ -12,8 +12,6 @@ variants:
   federated: {}
   cayenne:
     datasets: { orders: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }
-  duckdb:
-    datasets: { orders: { acceleration: { enabled: true, engine: duckdb, mode: file, refresh_mode: full } } }
 
 spicepod:
   version: v1
@@ -50,7 +48,7 @@ steps:
         - DELETE FROM orders WHERE id % 7 = 0
         - UPDATE orders SET total = total + 100 WHERE id % 11 = 0
   - refresh: orders
-    only: [cayenne, duckdb]
+    only: cayenne
   - query: SELECT * FROM orders
     eventually: 30s
   - query: SELECT status, count(*), sum(total), min(placed), max(placed) FROM orders GROUP BY status

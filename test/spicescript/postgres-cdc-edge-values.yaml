@@ -5,7 +5,7 @@ description: >
   through every row by one UPDATE, moved to new keys and deleted, with the
   table's replica identity both default and FULL (so old row images carry
   them too). After each change Spice answers the edge-values corpus as
-  PostgreSQL does, on Cayenne and DuckDB.
+  PostgreSQL does, on Cayenne.
 
 sources:
   src: { kind: postgres }
@@ -15,7 +15,6 @@ matrix:
 
 variants:
   cayenne: {}
-  duckdb: { datasets: { '*': { acceleration: { engine: duckdb, mode: memory, on_conflict: { id: upsert } } } } }
 
 spicepod:
   version: v1

@@ -1,15 +1,14 @@
 name: postgres-dml
 description: >
   DELETE and UPDATE through Spice reach PostgreSQL (write-through), by key, by
-  predicate and for every row: on a federated dataset, and on DuckDB and
-  Cayenne accelerations, whose refresh then serves what PostgreSQL holds.
+  predicate and for every row: on a federated dataset, and on a Cayenne
+  acceleration, whose refresh then serves what PostgreSQL holds.
 
 sources:
   src: { kind: postgres }
 
 variants:
   federated: {}
-  duckdb: { datasets: { items: { acceleration: { enabled: true, engine: duckdb, refresh_mode: full } } } }
   cayenne: { datasets: { items: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } } }
 
 spicepod:

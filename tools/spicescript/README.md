@@ -125,7 +125,7 @@ matrix:                              # every combination is a separate run: ${ma
 variants:                            # instances that must give identical answers
   federated: { datasets: { '*': { acceleration: null } } }
   cayenne: {}
-  duckdb: duckdb-file                # a shared variant from variants.yaml: DuckDB, file mode
+  memory: cayenne-memory             # a shared variant from variants.yaml: Cayenne, memory mode
 spicepod:                            # the spicepod, as YAML
   version: v1
   kind: Spicepod
@@ -176,7 +176,7 @@ A script has two axes, and they mean different things:
 | Select from the command line | `--matrix KEY=VALUE` | `--variant NAME` |
 
 Use the matrix when the sources themselves differ (PostgreSQL vs MySQL); use
-variants when the same sources are read in different ways (Cayenne vs Arrow),
+variants when the same sources are read in different ways (federated vs accelerated),
 so their answers can be compared with each other.
 
 A run is every `--spiced` binary crossed with every variant, separately for
@@ -198,7 +198,7 @@ the `variants.yaml` in the script's directory or the nearest directory above it
 ([`test/spicescript/variants.yaml`](../../test/spicescript/variants.yaml) for the
 suite): `federated` (the spicepod as written), and an engine and mode that set
 `acceleration: { enabled: true, engine, mode }` on every dataset, such as
-`cayenne-file`, `duckdb-memory` or `arrow`. A name the file does not define
+`cayenne-file` or `cayenne-memory`. A name the file does not define
 fails `--check`. A variant used by one script only is written in that script.
 
 `$merge: '${…}'` spreads a mapping placeholder into a mapping, with the

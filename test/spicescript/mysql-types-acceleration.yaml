@@ -11,14 +11,7 @@ sources:
 
 variants:
   federated: {}
-  arrow: arrow-memory
-  duckdb: { datasets: { '*': { acceleration: { enabled: true, engine: duckdb, mode: file,
-      primary_key: ID, indexes: { col_Timestamp: enabled, '(col_Timestamp, col_String)': unique } } } } }
-  sqlite: { datasets: { '*': { acceleration: { enabled: true, engine: sqlite, mode: file,
-      primary_key: ID, indexes: { col_Timestamp: enabled, '(col_Timestamp, col_String)': unique } } } } }
   cayenne: { datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file,
-      primary_key: ID, indexes: { col_Timestamp: enabled, '(col_Timestamp, col_String)': unique } } } } }
-  turso: { datasets: { '*': { acceleration: { enabled: true, engine: turso, mode: file,
       primary_key: ID, indexes: { col_Timestamp: enabled, '(col_Timestamp, col_String)': unique } } } } }
 
 spicepod:

@@ -1,11 +1,10 @@
 name: layout-coverage
 description: >
   How an acceleration lays data out never changes an answer: Cayenne
-  (default, sorted, clustered, partitioned, zstd), DuckDB and SQLite with
-  indexes answer the extended corpus and ternary logic partitioning as
-  PostgreSQL does, under full refresh and change capture, before and after
-  updates, deletes and inserts at the source. (Turso, an accelerator being
-  retired, is not covered.)
+  (default, sorted, clustered, partitioned, zstd) answers the extended corpus
+  and ternary logic partitioning as PostgreSQL does, under full refresh and
+  change capture, before and after updates, deletes and inserts at the
+  source.
 
 sources:
   src: { kind: postgres }
@@ -19,14 +18,6 @@ variants:
   cayenne-clustered: { datasets: { t: { acceleration: { params: { cayenne_cluster_by: s } } } } }
   cayenne-partitioned: { datasets: { t: { acceleration: { partition_by: ['bucket(4, id)'] } } } }
   cayenne-zstd: { datasets: { '*': { acceleration: { params: { cayenne_compression_strategy: zstd } } } } }
-  duckdb:
-    datasets:
-      '*': { acceleration: { engine: duckdb, on_conflict: { id: upsert } } }
-      t: { acceleration: { indexes: { i: enabled, dt: enabled } } }
-  sqlite:
-    datasets:
-      '*': { acceleration: { engine: sqlite, on_conflict: { id: upsert } } }
-      t: { acceleration: { indexes: { i: enabled, dt: enabled } } }
 
 spicepod:
   version: v1

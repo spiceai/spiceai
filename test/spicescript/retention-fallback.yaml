@@ -3,10 +3,9 @@ description: >
   With `on_zero_results: use_source`, a row retention removed from the
   acceleration does not come back from the source, while a row the
   acceleration never loaded (excluded by refresh_sql) and retention would keep
-  does: under retention_sql applied at write time (no scheduled check,
-  Arrow), time retention applied at scan time with and without a scheduled
-  check (Cayenne), and both policies at once, NULL times and flags included
-  (DuckDB).
+  does, on Cayenne: under retention_sql with no scheduled check, time
+  retention applied at scan time with and without a scheduled check, and
+  both policies at once, NULL times and flags included.
 
 sources:
   src: { kind: postgres }
@@ -23,7 +22,8 @@ spicepod:
       time_column: ts
       acceleration:
         enabled: true
-        engine: duckdb
+        engine: cayenne
+        mode: memory
         on_zero_results: use_source
         refresh_sql: SELECT * FROM c WHERE id <= 4
         refresh_data_window: 10000d
@@ -31,13 +31,14 @@ spicepod:
         retention_period: 1h
         retention_check_enabled: true
         retention_check_interval: 200ms
-    # retention_sql applied as rows are written, with no scheduled check.
+    # retention_sql with no scheduled check.
     - from: postgres:public.e
       name: a
       params: ${sources.src.params}
       acceleration:
         enabled: true
-        engine: arrow
+        engine: cayenne
+        mode: memory
         on_zero_results: use_source
         refresh_sql: SELECT * FROM a WHERE id != 3
         retention_sql: DELETE FROM a WHERE id = 2

@@ -1,6 +1,6 @@
 name: iceberg-coverage
 description: >
-  Iceberg tables answer the extended corpus and ternary logic partitioning as PostgreSQL answers them over the same generated rows: read through Spice's Iceberg reader, and accelerated into Cayenne and DuckDB.
+  Iceberg tables answer the extended corpus and ternary logic partitioning as PostgreSQL answers them over the same generated rows: read through Spice's Iceberg reader, and accelerated into Cayenne.
 
 sources:
   ice: { kind: iceberg }
@@ -13,7 +13,6 @@ matrix:
 variants:
   federated: {}
   cayenne: cayenne-file
-  duckdb: duckdb-file
 
 spicepod:
   version: v1

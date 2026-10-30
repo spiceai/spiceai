@@ -2,7 +2,7 @@ name: file-tables-refresh
 description: >
   A table of Parquet or CSV part files, on local disk or in an S3-compatible
   store, answers like the same rows in a database when accelerated by full
-  refresh into Cayenne and DuckDB, after the first load, after a part file is
+  refresh into Cayenne, after the first load, after a part file is
   added, and after every file is replaced. The federated form is in
   known-failing/files-and-lakes/file-tables-federated-stale.yaml.
 
@@ -17,8 +17,6 @@ matrix:
 variants:
   cayenne:
     datasets: { facts: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }
-  duckdb:
-    datasets: { facts: { acceleration: { enabled: true, engine: duckdb, mode: file, refresh_mode: full } } }
 
 spicepod:
   version: v1

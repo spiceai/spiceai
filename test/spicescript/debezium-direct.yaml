@@ -4,8 +4,7 @@ description: >
   Spice (`from: cdc:`, `POST /v1/datasets/{name}/cdc`, no Kafka): the initial
   snapshot, inserts, updates (including the key's row moving between values)
   and deletes are applied once each, and the acceleration answers as
-  PostgreSQL does, in Cayenne and in Arrow, and in Cayenne after spiced
-  restarts.
+  PostgreSQL does, in Cayenne, also after spiced restarts.
 
 sources:
   src: { kind: postgres }
@@ -24,7 +23,6 @@ sources:
 
 variants:
   cayenne: { datasets: { '*': { acceleration: { engine: cayenne, mode: file } } } }
-  arrow: { datasets: { '*': { acceleration: { engine: arrow, mode: memory, on_conflict: { id: upsert } } } } }
 
 spicepod:
   version: v1

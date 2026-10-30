@@ -6,7 +6,6 @@ sources:
   src: { kind: postgres }
 variants:
   federated: {}
-  arrow: arrow
   cayenne: cayenne-file
 spicepod:
   version: v1

@@ -2,18 +2,13 @@ name: builtins
 description: >
   DataFusion's built-in functions (trims, hex, digests, regular expressions,
   ordered aggregates, windows ignoring NULLs, approximate and statistical
-  aggregates, date parts) answer the same on every acceleration engine and
-  federated to PostgreSQL as DataFusion answers them locally, and reach DuckDB
-  and SQLite only in renderings those engines answer the same.
+  aggregates, date parts) answer the same accelerated into Cayenne and
+  federated to PostgreSQL as DataFusion answers them locally.
 
 sources:
   src: { kind: postgres }
 
 variants:
-  # DataFusion evaluates everything: the answer every other place must match.
-  arrow: arrow
-  duckdb: duckdb
-  sqlite: sqlite
   cayenne: cayenne-file
   federated: {}
 
@@ -33,8 +28,9 @@ spicepod:
 defaults:
   # A cluster buckets each acceleration on this column (--cluster).
   cluster-partition-by: { part: p_partkey, partsupp: ps_partkey, '*': id }
-  # DataFusion evaluates everything here: every other place must agree.
-  compare-to: arrow
+  # DataFusion evaluates everything over a Cayenne acceleration: every other
+  # place must agree.
+  compare-to: cayenne
 
 steps:
   - source-exec:

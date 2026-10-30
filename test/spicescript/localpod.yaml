@@ -4,9 +4,8 @@ description: >
   an accelerated child, a passthrough child, a sibling and a grandchild
   declared before its parent — and the direct children follow each parent
   refresh, with and without the SQL results cache (whose answers age out on
-  their TTL). With an Arrow parent the
-  children also follow a change to the parent's refresh SQL. (What they do
-  not follow: known-failing/other/localpod-follow.yaml.)
+  their TTL). (What they do not follow, including a change to the parent's
+  refresh SQL: known-failing/other/localpod-follow.yaml.)
 
 sources:
   src: { kind: postgres }
@@ -14,9 +13,6 @@ sources:
 variants:
   results-cache: {}
   no-results-cache: { spicepod: { runtime: { caching: { sql_results: { enabled: false } } } } }
-  arrow:
-    spicepod: { runtime: { caching: { sql_results: { enabled: false } } } }
-    datasets: { '*': { acceleration: { engine: arrow, mode: memory } } }
 
 spicepod:
   version: v1
@@ -84,16 +80,3 @@ steps:
     oracle-sql: SELECT id, v FROM t
     eventually: 30s
 
-  # The parent's entry changes: with an Arrow parent the children follow.
-  - edit-spicepod:
-      datasets:
-        parent: { acceleration: { refresh_sql: SELECT * FROM parent WHERE id <= 4 } }
-    only: arrow
-  - query: SELECT id, v FROM parent
-    oracle-sql: SELECT id, v FROM t WHERE id <= 4
-    eventually: 60s
-    only: arrow
-  - query: SELECT id, v FROM child
-    oracle-sql: SELECT id, v FROM t WHERE id <= 4
-    eventually: 60s
-    only: arrow

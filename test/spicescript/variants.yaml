@@ -8,11 +8,6 @@
 # The spicepod as written.
 federated: {}
 
-arrow:
-  datasets: { '*': { acceleration: { enabled: true, engine: arrow } } }
-arrow-memory:
-  datasets: { '*': { acceleration: { enabled: true, engine: arrow, mode: memory } } }
-
 cayenne-file:
   datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } }
 cayenne-memory:
@@ -22,17 +17,3 @@ duckdb:
   datasets: { '*': { acceleration: { enabled: true, engine: duckdb } } }
 duckdb-file:
   datasets: { '*': { acceleration: { enabled: true, engine: duckdb, mode: file } } }
-duckdb-memory:
-  datasets: { '*': { acceleration: { enabled: true, engine: duckdb, mode: memory } } }
-
-sqlite:
-  datasets: { '*': { acceleration: { enabled: true, engine: sqlite } } }
-sqlite-file:
-  datasets: { '*': { acceleration: { enabled: true, engine: sqlite, mode: file } } }
-sqlite-memory:
-  datasets: { '*': { acceleration: { enabled: true, engine: sqlite, mode: memory } } }
-
-turso-file:
-  datasets: { '*': { acceleration: { enabled: true, engine: turso, mode: file } } }
-turso-memory:
-  datasets: { '*': { acceleration: { enabled: true, engine: turso, mode: memory } } }

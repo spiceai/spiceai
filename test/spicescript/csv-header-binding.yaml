@@ -2,8 +2,8 @@ name: csv-header-binding
 description: >
   A headered CSV file binds its columns by header name, not by position:
   after the file is rewritten with the same rows and its columns in an order
-  that differs from the registered schema, federated reads and a full Arrow
-  refresh return each value under its own name, both over HTTP and from a
+  that differs from the registered schema, federated reads and a full
+  refresh into Cayenne return each value under its own name, both over HTTP and from a
   local `file://` directory. When a registered column is renamed in the
   header, a federated read returns NULL for it with one WARN, and a refresh
   fails so the accelerated copy keeps the last good rows; restoring the
@@ -26,14 +26,14 @@ spicepod:
     - from: ${sources.api.url}/events.csv
       name: csv_acc
       params: *http
-      acceleration: { enabled: true, engine: arrow, refresh_mode: full, refresh_retry_max_attempts: 1 }
+      acceleration: { enabled: true, engine: cayenne, mode: memory, refresh_mode: full, refresh_retry_max_attempts: 1 }
     - from: 'file://${sources.lake.path}/t/'
       name: file_fed
       params: { file_format: csv }
     - from: 'file://${sources.lake.path}/t/'
       name: file_acc
       params: { file_format: csv }
-      acceleration: { enabled: true, engine: arrow, refresh_mode: full, refresh_retry_max_attempts: 1 }
+      acceleration: { enabled: true, engine: cayenne, mode: memory, refresh_mode: full, refresh_retry_max_attempts: 1 }
 
 steps:
   # Registered schema: id, user_id, region, amount_cents.

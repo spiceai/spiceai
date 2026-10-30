@@ -2457,7 +2457,7 @@ steps:
             .join("../../test/spicescript/known-failing/cayenne");
         let shared = SharedVariants::find(&group).expect("the suite's variants file parses");
         let script = Script::parse_in(
-            "name: p\nspicepod: {}\nvariants: { federated: federated, cayenne: cayenne-file, arrow: arrow, own: { env: { A: b } } }\nsteps: [ { start: {} } ]",
+            "name: p\nspicepod: {}\nvariants: { federated: federated, cayenne: cayenne-file, memory: cayenne-memory, own: { env: { A: b } } }\nsteps: [ { start: {} } ]",
             &group,
             &shared,
         )
@@ -2468,8 +2468,8 @@ steps:
             serde_json::json!({ "acceleration": { "enabled": true, "engine": "cayenne", "mode": "file" } })
         );
         assert_eq!(
-            script.variants["arrow"].datasets["*"],
-            serde_json::json!({ "acceleration": { "enabled": true, "engine": "arrow" } })
+            script.variants["memory"].datasets["*"],
+            serde_json::json!({ "acceleration": { "enabled": true, "engine": "cayenne", "mode": "memory" } })
         );
         assert_eq!(script.variants["own"].env["A"], "b");
         let err = Script::parse_in(

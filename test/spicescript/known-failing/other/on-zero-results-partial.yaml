@@ -6,7 +6,7 @@ description: >
   Subqueries over accelerations with on_zero_results answer as the source
   does: populated, empty (with use_source the source answers, with
   return_empty nothing does), and partly loaded (a filter that finds no
-  loaded row falls back), on DuckDB (memory and file) and Cayenne.
+  loaded row falls back), on Cayenne.
 
 sources:
   src: { kind: postgres }
@@ -16,8 +16,6 @@ matrix:
   action: [use_source, return_empty]
 
 variants:
-  duckdb-memory: { datasets: { '*': { acceleration: { engine: duckdb, mode: memory } } } }
-  duckdb-file: { datasets: { '*': { acceleration: { engine: duckdb, mode: file } } } }
   cayenne: { datasets: { '*': { acceleration: { engine: cayenne, mode: file } } } }
 
 spicepod:

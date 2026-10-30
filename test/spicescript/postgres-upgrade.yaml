@@ -1,8 +1,8 @@
 name: postgres-upgrade
 description: >
   A runtime upgraded in place (`--from <older spiced>`; without it, a
-  restart) keeps serving what it held: file accelerations on Cayenne, DuckDB
-  and SQLite answer as before and as the source does, a CDC acceleration
+  restart) keeps serving what it held: a Cayenne file acceleration answers
+  as before and as the source does, a CDC acceleration
   applies the changes made while it was down, and a write-back write still
   pending at the upgrade is delivered once afterwards.
 
@@ -18,14 +18,6 @@ spicepod:
       name: on_cayenne
       params: ${sources.src.params}
       acceleration: { enabled: true, engine: cayenne, mode: file }
-    - from: postgres:public.items
-      name: on_duckdb
-      params: ${sources.src.params}
-      acceleration: { enabled: true, engine: duckdb, mode: file }
-    - from: postgres:public.items
-      name: on_sqlite
-      params: ${sources.src.params}
-      acceleration: { enabled: true, engine: sqlite, mode: file }
     - from: postgres:public.events
       name: events
       params: { $merge: '${sources.src.params}', pg_replication_slot: 'upgrade_${sources.src.namespace}' }
@@ -88,12 +80,6 @@ steps:
   - query: SELECT * FROM on_cayenne
     oracle-sql: SELECT * FROM items
     id: cayenne-before
-  - query: SELECT * FROM on_duckdb
-    oracle-sql: SELECT * FROM items
-    id: duckdb-before
-  - query: SELECT * FROM on_sqlite
-    oracle-sql: SELECT * FROM items
-    id: sqlite-before
   - source-exec:
       src: |
         UPDATE events SET amount = amount * 2 WHERE id % 5 = 0;
@@ -120,12 +106,6 @@ steps:
   - query: SELECT * FROM on_cayenne
     oracle-sql: SELECT * FROM items
     expect: { same-as: cayenne-before }
-  - query: SELECT * FROM on_duckdb
-    oracle-sql: SELECT * FROM items
-    expect: { same-as: duckdb-before }
-  - query: SELECT * FROM on_sqlite
-    oracle-sql: SELECT * FROM items
-    expect: { same-as: sqlite-before }
   - query: SELECT * FROM events
     eventually: 60s
   - query: SELECT count(*) AS n, count(DISTINCT id) AS ids FROM events

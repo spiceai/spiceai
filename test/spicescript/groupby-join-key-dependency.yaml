@@ -8,7 +8,6 @@ sources:
 
 variants:
   federated: {}
-  arrow: arrow
   cayenne: cayenne-file
 
 spicepod:

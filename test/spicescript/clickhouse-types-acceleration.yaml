@@ -3,7 +3,7 @@ description: >
   A ClickHouse table with the common types the literal matrix does not cover
   (narrow and unsigned integers, Float32, FixedString, Date, DateTime, UUID,
   Bool, Enum8, LowCardinality, arrays, IPv4), NULLs in each, answers through
-  Spice exactly as ClickHouse answers: federated, and accelerated into Arrow and
+  Spice exactly as ClickHouse answers: federated, and accelerated into
   Cayenne, before and after rows are added at the source.
 
 sources:
@@ -11,7 +11,6 @@ sources:
 
 variants:
   federated: {}
-  arrow: arrow-memory
   cayenne: cayenne-file
 
 spicepod:

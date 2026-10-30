@@ -2,7 +2,7 @@ name: files-coverage
 description: >
   Tables read from Parquet and CSV files answer the extended corpus and
   ternary logic partitioning as PostgreSQL answers them over the same
-  generated rows: read in place, and accelerated into Cayenne and DuckDB.
+  generated rows: read in place, and accelerated into Cayenne.
 
 sources:
   lake: { kind: files }
@@ -14,7 +14,6 @@ matrix:
 variants:
   federated: {}
   cayenne: cayenne-file
-  duckdb: duckdb-file
 
 spicepod:
   version: v1

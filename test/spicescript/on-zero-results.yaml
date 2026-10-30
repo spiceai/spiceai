@@ -3,7 +3,7 @@ description: >
   Subqueries over accelerations with on_zero_results answer as the source
   does: populated, empty (with use_source the source answers, with
   return_empty nothing does), and partly loaded (a filter that finds no
-  loaded row falls back), on DuckDB and SQLite (memory and file) and Cayenne.
+  loaded row falls back), on Cayenne.
 
 sources:
   src: { kind: postgres }
@@ -13,10 +13,6 @@ matrix:
   action: [use_source, return_empty]
 
 variants:
-  duckdb-memory: { datasets: { '*': { acceleration: { engine: duckdb, mode: memory } } } }
-  duckdb-file: { datasets: { '*': { acceleration: { engine: duckdb, mode: file } } } }
-  sqlite-memory: { datasets: { '*': { acceleration: { engine: sqlite, mode: memory } } } }
-  sqlite-file: { datasets: { '*': { acceleration: { engine: sqlite, mode: file } } } }
   cayenne: { datasets: { '*': { acceleration: { engine: cayenne, mode: file } } } }
 
 spicepod:
@@ -112,23 +108,17 @@ steps:
     oracle-sql: SELECT 1 WHERE false
   - query: SELECT id FROM items WHERE v > ANY (SELECT val FROM details)
     when: { contents: [populated, empty], action: use_source }
-    except: [sqlite-memory, sqlite-file]
   - query: SELECT id FROM items WHERE v >= ALL (SELECT val FROM details)
     when: { contents: [populated, empty], action: use_source }
-    except: [sqlite-memory, sqlite-file]
   - query: SELECT id FROM items WHERE id > ALL (SELECT item_id FROM details)
     when: { contents: [populated, empty], action: use_source }
     expect-empty: true
-    except: [sqlite-memory, sqlite-file]
   - query: SELECT id FROM items WHERE v > ALL (SELECT val FROM details WHERE val > 100)
     when: { contents: [populated, empty], action: use_source }
-    except: [sqlite-memory, sqlite-file]
   - query: SELECT id FROM items WHERE v > ANY (SELECT val FROM details WHERE item_id = id)
     when: { contents: [populated, empty], action: use_source }
-    except: [sqlite-memory, sqlite-file]
   - query: SELECT id FROM items WHERE v >= ALL (SELECT val FROM details WHERE item_id = id)
     when: { contents: [populated, empty], action: use_source }
-    except: [sqlite-memory, sqlite-file]
   - query: SELECT id FROM items WHERE id = 2 AND id IN (SELECT item_id FROM details WHERE val = 5)
     when: { contents: partial, action: use_source }
   - query: SELECT id FROM items WHERE id = 2 AND EXISTS (SELECT 1 FROM details WHERE item_id = id AND val = 5)

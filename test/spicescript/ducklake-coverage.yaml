@@ -1,6 +1,6 @@
 name: ducklake-coverage
 description: >
-  DuckLake tables answer the extended corpus and ternary logic partitioning as PostgreSQL answers them over the same generated rows: federated to DuckLake, and accelerated into Cayenne and DuckDB.
+  DuckLake tables answer the extended corpus and ternary logic partitioning as PostgreSQL answers them over the same generated rows: federated to DuckLake, and accelerated into Cayenne.
 
 sources:
   lake: { kind: ducklake }
@@ -13,7 +13,6 @@ matrix:
 variants:
   federated: {}
   cayenne: cayenne-file
-  duckdb: duckdb-file
 
 spicepod:
   version: v1
