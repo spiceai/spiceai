@@ -1219,56 +1219,30 @@ impl DataAccelerator for DuckDBAccelerator {
         source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::new(self.get_shared_pool(source).await?);
-        let table_name = table_name.to_owned();
-
-        tokio::task::spawn_blocking(
-            move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-                let write_gate = pool.write_gate();
-                let _write_guard = write_gate
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-                let mut conn = pool.connect_sync()?;
-                let duckdb_conn = DuckDB::duckdb_conn(&mut conn).boxed()?;
-                let tx = duckdb_conn
-                    .get_underlying_conn_mut()
-                    .transaction()
-                    .boxed()?;
-
-                // DuckDB accelerations use one of two layouts: a base table with the
-                // logical name (append history), or a view with the logical name over
-                // internal `__data_{name}_{unix_ms}` table(s) (the post-overwrite,
-                // full-refresh layout). `DROP TABLE` errors on a view (and `DROP VIEW` on a
-                // table), so dispatch on the actual object type, then drop every internal
-                // data table so the acceleration can be recreated cleanly with a new schema.
-                let escaped = table_name.replace('"', "\"\"");
-                let mut dropped = false;
-                if duckdb_view_exists(&tx, &table_name)? {
-                    tx.execute(&format!("DROP VIEW IF EXISTS \"{escaped}\""), [])
-                        .boxed()?;
-                    dropped = true;
-                } else if duckdb_table_exists(&tx, &table_name)? {
-                    tx.execute(&format!("DROP TABLE IF EXISTS \"{escaped}\""), [])
-                        .boxed()?;
-                    dropped = true;
+        // A load of the dataset that started just before it was unloaded can
+        // still be creating its table, and DuckDB refuses another writer of that
+        // catalog entry with a write-write conflict until the load commits it:
+        // the drop is tried again until then, for at most `DROP_CONFLICT_WAIT`.
+        let deadline = tokio::time::Instant::now() + DROP_CONFLICT_WAIT;
+        let mut delay = std::time::Duration::from_millis(20);
+        loop {
+            let pool = Arc::clone(&pool);
+            let table = table_name.to_owned();
+            let attempt =
+                tokio::task::spawn_blocking(move || drop_acceleration_tables(pool, &table))
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            match attempt {
+                Err(e)
+                    if is_write_write_conflict(e.as_ref())
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_millis(500));
                 }
-                for (internal_table, _) in list_internal_data_tables(&tx, &table_name)? {
-                    let escaped_internal = internal_table.replace('"', "\"\"");
-                    tx.execute(&format!("DROP TABLE IF EXISTS \"{escaped_internal}\""), [])
-                        .boxed()?;
-                    dropped = true;
-                }
-                tx.commit().boxed()?;
-                if dropped {
-                    tracing::info!(
-                        "Deleted the DuckDB acceleration data of dataset '{table_name}'."
-                    );
-                }
-                Ok(())
-            },
-        )
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+                other => return other,
+            }
+        }
     }
 
     async fn evolve_table_schema(
@@ -1379,6 +1353,71 @@ fn apply_changes_refresh_write_defaults(cmd: &mut CreateExternalTable, is_change
             "false".to_string(),
         );
     }
+}
+
+/// How long [`DuckDBAccelerator::drop_table`] waits for a write to the
+/// catalog entries it drops to commit.
+const DROP_CONFLICT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Drops the acceleration of `table_name` in `pool`'s `DuckDB` instance, in one
+/// transaction.
+fn drop_acceleration_tables(
+    pool: Arc<DuckDbConnectionPool>,
+    table_name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let write_gate = pool.write_gate();
+    let _write_guard = write_gate
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let mut conn = pool.connect_sync()?;
+    let duckdb_conn = DuckDB::duckdb_conn(&mut conn).boxed()?;
+    let tx = duckdb_conn
+        .get_underlying_conn_mut()
+        .transaction()
+        .boxed()?;
+
+    // DuckDB accelerations use one of two layouts: a base table with the
+    // logical name (append history), or a view with the logical name over
+    // internal `__data_{name}_{unix_ms}` table(s) (the post-overwrite,
+    // full-refresh layout). `DROP TABLE` errors on a view (and `DROP VIEW` on a
+    // table), so dispatch on the actual object type, then drop every internal
+    // data table so the acceleration can be recreated cleanly with a new schema.
+    let escaped = table_name.replace('"', "\"\"");
+    let mut dropped = false;
+    if duckdb_view_exists(&tx, table_name)? {
+        tx.execute(&format!("DROP VIEW IF EXISTS \"{escaped}\""), [])
+            .boxed()?;
+        dropped = true;
+    } else if duckdb_table_exists(&tx, table_name)? {
+        tx.execute(&format!("DROP TABLE IF EXISTS \"{escaped}\""), [])
+            .boxed()?;
+        dropped = true;
+    }
+    for (internal_table, _) in list_internal_data_tables(&tx, table_name)? {
+        let escaped_internal = internal_table.replace('"', "\"\"");
+        tx.execute(&format!("DROP TABLE IF EXISTS \"{escaped_internal}\""), [])
+            .boxed()?;
+        dropped = true;
+    }
+    tx.commit().boxed()?;
+    if dropped {
+        tracing::info!("Deleted the DuckDB acceleration data of dataset '{table_name}'.");
+    }
+    Ok(())
+}
+
+/// Whether `error` is `DuckDB` refusing a write to a catalog entry that another
+/// open transaction writes.
+fn is_write_write_conflict(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        if error.to_string().contains("write-write conflict") {
+            return true;
+        }
+        cause = error.source();
+    }
+    false
 }
 
 fn duckdb_table_exists(
