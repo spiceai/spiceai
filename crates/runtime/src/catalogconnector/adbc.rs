@@ -99,21 +99,17 @@ pub enum Error {
         source: adbc_core::error::Error,
     },
 
-    #[snafu(display(
-        "Failed to create ADBC database (driver='{driver_location}', uri='{uri}'): {source}"
-    ))]
+    #[snafu(display("Failed to create ADBC database (driver='{driver_location}'): {source}"))]
     UnableToCreateDatabase {
         driver_location: String,
-        uri: String,
         source: adbc_core::error::Error,
     },
 
     #[snafu(display(
-        "Failed to create ADBC connection pool (driver='{driver_location}', uri='{uri}'): {source}"
+        "Failed to create ADBC connection pool (driver='{driver_location}'): {source}"
     ))]
     UnableToCreateConnectionPool {
         driver_location: String,
-        uri: String,
         source: datafusion_table_providers::sql::db_connection_pool::Error,
     },
 
@@ -341,17 +337,13 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
                 .new_database_with_opts(db_options)
                 .context(UnableToCreateDatabaseSnafu {
                     driver_location: driver_location.clone(),
-                    uri: uri_str.clone(),
                 })?;
 
         let pool = AdbcConnectionPoolBuilder::new(db)
             .with_max_size(pool_size)
             .with_min_idle(pool_min_idle)
             .build()
-            .context(UnableToCreateConnectionPoolSnafu {
-                driver_location,
-                uri: uri_str,
-            })?;
+            .context(UnableToCreateConnectionPoolSnafu { driver_location })?;
 
         Ok((driver_name, Arc::new(pool)))
     })
