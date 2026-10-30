@@ -95,6 +95,19 @@ const SHUTTING_DOWN: &str = "Spice is shutting down. Run the statement again onc
 const STORED_WHILE_SHUTTING_DOWN: &str =
     "Spice is shutting down, so the change takes effect when it starts again.";
 
+/// The same, after the note that the definition's file may not outlive the
+/// container ([`Runtime::ephemeral_store_note`]).
+const STORED_IN_CONTAINER_WHILE_SHUTTING_DOWN: &str = "Spice is shutting down, so the change takes effect when it starts again, if that file is kept.";
+
+/// The error of a statement Spice refuses, `statement` not applied, because it
+/// is shutting down: retriable, as a client reads a 503 or `UNAVAILABLE`, since
+/// it can run once Spice has started again or on another instance.
+fn shutting_down(statement: &str) -> DataFusionError {
+    DataFusionError::External(crate::datafusion::error::SpiceExternalError::shutting_down(
+        format!("{statement} was not applied: {SHUTTING_DOWN}"),
+    ))
+}
+
 /// The status that holds the runtime not ready, as `ready_state: on_load`
 /// reads readiness, until the SQL definitions are read: until then, none of
 /// the datasets and catalogs they define is served.
@@ -232,11 +245,9 @@ impl std::fmt::Debug for RuntimeComponentDdl {
 
 impl RuntimeComponentDdl {
     fn runtime(&self) -> DFResult<Arc<Runtime>> {
-        self.runtime.upgrade().ok_or_else(|| {
-            DataFusionError::Execution(
-                "Spice is shutting down; the statement was not applied.".to_string(),
-            )
-        })
+        self.runtime
+            .upgrade()
+            .ok_or_else(|| shutting_down("The statement"))
     }
 }
 
@@ -364,10 +375,19 @@ impl RunningStatement {
                 tracing::info!("`{statement}` finished after its client disconnected: {message}");
             }
             Err(e) => {
+                // The cause without the statement's own label, which the line
+                // names already.
+                let cause = match e {
+                    DataFusionError::Execution(message) => message.clone(),
+                    DataFusionError::External(source) => source.to_string(),
+                    other => other.to_string(),
+                };
+                let cause = cause
+                    .strip_prefix(&format!("{statement} was not applied: "))
+                    .unwrap_or(&cause);
                 // A log is no place for a credential: the cause is logged
                 // without the values of the statement it may repeat.
-                let cause = e.to_string();
-                let cause = datafusion_ddl::component_options::redact_values(&cause, &self.values);
+                let cause = datafusion_ddl::component_options::redact_values(cause, &self.values);
                 let cause = util::single_line(&cause);
                 tracing::warn!(
                     "`{statement}` failed after its client disconnected, so it was not applied. Cause: {cause}"
@@ -1345,9 +1365,10 @@ impl Runtime {
                 op.component_name()
             ))
         };
+        let statement = format!("{} {}", op.label(), op.component_name());
         // A change Spice starts while it stops would be cut short.
         if self.status.is_shutdown() {
-            return Err(not_applied(&SHUTTING_DOWN));
+            return Err(shutting_down(&statement));
         }
         let store = self
             .sql_definitions_store()
@@ -1356,7 +1377,8 @@ impl Runtime {
 
         let serialized = self.apply_app_lock.lock().await;
         let mut attempt = 0;
-        let (message, validate) = loop {
+        // `stopped`: Spice stopped while the change, stored, was applied.
+        let (message, validate, stopped) = loop {
             attempt += 1;
             let Some(known) = self.sql_components.defined().await else {
                 let unread = self.sql_components.unread.lock().clone();
@@ -1440,7 +1462,7 @@ impl Runtime {
                 let shutdown = self.status.shutdown_token();
                 tokio::select! {
                     biased;
-                    () = shutdown.cancelled() => return Err(not_applied(&SHUTTING_DOWN)),
+                    () = shutdown.cancelled() => return Err(shutting_down(&statement)),
                     validated = tokio::time::timeout(
                         VALIDATION_TIMEOUT,
                         Arc::clone(&self).validate_component(component, &next),
@@ -1455,7 +1477,7 @@ impl Runtime {
                 }
             }
             if self.status.is_shutdown() {
-                return Err(not_applied(&SHUTTING_DOWN));
+                return Err(shutting_down(&statement));
             }
 
             // A dataset this statement drops, replaces, or points at another
@@ -1541,14 +1563,12 @@ impl Runtime {
                         Arc::clone(&self).apply_app_diff(Some(&applied), next).await;
                         self.record_served().await;
                     };
-                    tokio::select! {
+                    let stopped = tokio::select! {
                         biased;
-                        () = applying => {}
-                        () = shutdown.cancelled() => {
-                            return Ok(format!("{message} {STORED_WHILE_SHUTTING_DOWN}"));
-                        }
-                    }
-                    break (message, validate);
+                        () = applying => false,
+                        () = shutdown.cancelled() => true,
+                    };
+                    break (message, validate, stopped);
                 }
                 Err(e) => {
                     // What this statement retired is served again, from its source.
@@ -1594,19 +1614,30 @@ impl Runtime {
         };
         drop(serialized);
 
-        let message = match op {
+        let note = match op {
             ComponentDdlOp::CreateDataset { .. } | ComponentDdlOp::CreateCatalog { .. } => {
-                match self.ephemeral_store_note(&store, &op).await {
-                    Some(note) => format!("{message} {note}"),
-                    None => message,
-                }
+                self.ephemeral_store_note(&store, &op).await
             }
-            _ => message,
+            _ => None,
         };
+        // A change stored at shutdown takes effect when Spice starts again,
+        // where the definition's file outlives the container.
+        let shutdown_note = if note.is_some() {
+            STORED_IN_CONTAINER_WHILE_SHUTTING_DOWN
+        } else {
+            STORED_WHILE_SHUTTING_DOWN
+        };
+        let message = match note {
+            Some(note) => format!("{message} {note}"),
+            None => message,
+        };
+        if stopped {
+            return Ok(format!("{message} {shutdown_note}"));
+        }
         match validate {
-            Some(Component::Dataset(dataset)) => {
-                Ok(self.await_registration(&dataset, message).await)
-            }
+            Some(Component::Dataset(dataset)) => Ok(self
+                .await_registration(&dataset, message, shutdown_note)
+                .await),
             Some(Component::Catalog(catalog)) => Ok(self.catalog_outcome(&catalog.name, message)),
             None => Ok(message),
         }
@@ -2054,8 +2085,13 @@ impl Runtime {
     }
 
     /// Wait, within [`REGISTRATION_WAIT`], for `dataset` to register, and say
-    /// how the statement left it.
-    async fn await_registration(&self, dataset: &Dataset, message: String) -> String {
+    /// how the statement left it; `shutdown_note` when Spice stops first.
+    async fn await_registration(
+        &self,
+        dataset: &Dataset,
+        message: String,
+        shutdown_note: &str,
+    ) -> String {
         // The name the runtime registers the dataset, and its status, under.
         let reference = datafusion::common::TableReference::parse_str(&dataset.name);
         let failed = || {
@@ -2087,7 +2123,7 @@ impl Runtime {
         })
         .await;
         match (registered, self.status.get_dataset_status(&reference)) {
-            (Ok(false), _) => format!("{message} {STORED_WHILE_SHUTTING_DOWN}"),
+            (Ok(false), _) => format!("{message} {shutdown_note}"),
             (Ok(true), Some(ComponentStatus::Error(_))) => format!(
                 "{message} It failed to load and is retrying; GET /v1/datasets?status=true reports why."
             ),

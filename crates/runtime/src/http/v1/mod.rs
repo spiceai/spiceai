@@ -87,7 +87,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use runtime_auth::AuthPrincipalRef;
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
 
-use crate::datafusion::error::is_partitions_unavailable;
+use crate::datafusion::error::is_unavailable;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 #[cfg(feature = "openapi")]
 use utoipa::{
@@ -426,7 +426,7 @@ enum SqlErrorKind {
     /// is and answered with a retriable status.
     ResourcesExhausted,
     /// A cluster scheduler cannot yet reach executors that hold the data the
-    /// query reads; a retry can succeed.
+    /// query reads, or Spice is shutting down; a retry can succeed.
     Unavailable,
     /// The request set `Cache-Control: only-if-cached` and no cached result was
     /// servable, so the query was not run.
@@ -442,7 +442,7 @@ impl SqlErrorKind {
             QueryError::UnableToExecuteQuery { source }
             | QueryError::UnableToCreateMemoryStream { source }
             | QueryError::UnableToCollectResults { source }
-                if is_partitions_unavailable(source) =>
+                if is_unavailable(source) =>
             {
                 Self::Unavailable
             }
@@ -457,7 +457,7 @@ impl SqlErrorKind {
             Self::Timeout
         } else if ErrorCode::from(e) == ErrorCode::ResourcesExhausted {
             Self::ResourcesExhausted
-        } else if is_partitions_unavailable(e) {
+        } else if is_unavailable(e) {
             Self::Unavailable
         } else {
             Self::General
