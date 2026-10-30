@@ -779,6 +779,88 @@ async fn an_ordered_aggregate_emits_its_remaining_groups_once() {
     );
 }
 
+/// spiceai/datafusion#279 and #280. A join with a high fan-out yields many output
+/// batches per input batch without polling an input, so unless each output batch
+/// spends the cooperative budget, the task running it never yields: a cancelled
+/// or timed-out query cannot stop it, and on a single-threaded runtime nothing
+/// else runs. Each query here runs on a single-threaded runtime and must give its
+/// 100 ms read timeout a chance to fire. A sort-merge join sorts its inputs
+/// first, and that read yields, so its inputs are finite and share one key.
+#[test]
+fn every_join_yields_to_the_scheduler() {
+    let mut never_yielded = Vec::new();
+    for (operator, prefer_hash_join, sql) in [
+        (
+            "HashJoinExec",
+            true,
+            "SELECT max(a.value + b.value) FROM range(1, 10000) b JOIN range(1, 1000000000000) a ON a.value % 2 = b.value % 2",
+        ),
+        (
+            "SortMergeJoinExec",
+            false,
+            "SELECT max(a.value + b.value) FROM range(1, 20000) b JOIN range(1, 20000) a ON a.value / 1000000 = b.value / 1000000",
+        ),
+        (
+            "NestedLoopJoinExec",
+            true,
+            "SELECT max(a.value + b.value) FROM range(1, 10000) b JOIN range(1, 1000000000000) a ON a.value + b.value > 1",
+        ),
+        (
+            "CrossJoinExec",
+            true,
+            "SELECT max(a.value + b.value) FROM range(1, 10000) b CROSS JOIN range(1, 1000000000000) a",
+        ),
+    ] {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("runtime builds");
+            let result = runtime.block_on(async {
+                let ctx = spice_session(|config| {
+                    config.options_mut().optimizer.prefer_hash_join = prefer_hash_join;
+                    // One partition keeps repartition exchanges, which yield on their own, out
+                    // of the plan. A sort-merge join is planned only over several partitions.
+                    if prefer_hash_join {
+                        config.options_mut().execution.target_partitions = 1;
+                    }
+                });
+                let plan = ctx
+                    .sql(sql)
+                    .await
+                    .expect("query plans")
+                    .create_physical_plan()
+                    .await
+                    .expect("physical plan");
+                let shown = datafusion::physical_plan::displayable(plan.as_ref())
+                    .indent(false)
+                    .to_string();
+                assert!(
+                    shown.contains(operator),
+                    "{sql} is not planned with {operator}:\n{shown}"
+                );
+                let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())
+                    .expect("query executes");
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    futures::StreamExt::next(&mut stream),
+                )
+                .await
+                .is_err()
+            });
+            let _ = done.send(result);
+        });
+        if finished.recv_timeout(std::time::Duration::from_secs(30)) != Ok(true) {
+            never_yielded.push(operator);
+        }
+    }
+    assert!(
+        never_yielded.is_empty(),
+        "{never_yielded:?} never yielded, so their queries' read timeouts could not fire"
+    );
+}
+
 /// The SQL planner refuses a data type nested more than 64 array or struct
 /// levels deep, and still plans one at the limit.
 #[tokio::test(flavor = "multi_thread")]
