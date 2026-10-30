@@ -21,7 +21,7 @@
 # commit. `--json` prints machine-readable metrics for the eval harness.
 #
 # Usage:
-#   python3 .agents/skills/write-release-notes/scripts/check_ste.py docs/release_notes/v2.1.4.md
+#   python3 .agents/skills/write-release-notes/scripts/check_ste.py docs/release_notes/v2.1/v2.1.4.md
 #   python3 .agents/skills/write-release-notes/scripts/check_ste.py --json docs/release_notes/*.md
 
 from __future__ import annotations
