@@ -15,6 +15,12 @@ sources:
       --advertise-kafka-addr, 'internal://127.0.0.1:9092,external://127.0.0.1:${port.19092}']
     ready: rpk cluster health | grep -E 'Healthy:.+true'
 
+# The spicepod as written, and the same with the prototype object-native Cayenne
+# metastore in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
+
 spicepod:
   version: v1
   kind: Spicepod

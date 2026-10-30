@@ -486,6 +486,28 @@ impl CommitChange for MongoResumeTokenCommitter {
                 source: Box::new(error),
             })
     }
+
+    /// The same save as [`Self::commit`], for an accelerator that commits it with
+    /// the data it covers. `commit` then saves an unchanged token.
+    fn record_position(
+        &self,
+    ) -> Option<futures::future::BoxFuture<'static, Result<(), CommitError>>> {
+        let store = Arc::clone(&self.mongo_sys);
+        let metadata = MongoCheckpointMetadata {
+            resume_token_json: self.resume_token_json.clone(),
+            cluster_time_ts: self.cluster_time_ts,
+            schema_json: self.schema_json.clone(),
+            updated_at: None,
+        };
+        Some(Box::pin(async move {
+            store
+                .upsert(&metadata)
+                .await
+                .map_err(|error| CommitError::UnableToCommitChange {
+                    source: Box::new(error),
+                })
+        }))
+    }
 }
 
 async fn try_open_change_stream(

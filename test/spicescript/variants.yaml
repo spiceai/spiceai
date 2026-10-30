@@ -32,6 +32,10 @@ sqlite-file:
 sqlite-memory:
   datasets: { '*': { acceleration: { enabled: true, engine: sqlite, mode: memory } } }
 
+# The prototype object-native Cayenne metastore, for every Cayenne dataset as written.
+object-native:
+  datasets: { '*': { acceleration: { params: { cayenne_metastore: object_native } } } }
+
 turso-file:
   datasets: { '*': { acceleration: { enabled: true, engine: turso, mode: file } } }
 turso-memory:

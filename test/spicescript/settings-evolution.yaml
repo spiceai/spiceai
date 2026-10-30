@@ -14,6 +14,12 @@ sources:
 matrix:
   refresh_mode: [full, changes]
 
+# The spicepod as written, and the same with the prototype object-native Cayenne
+# metastore in place of SQLite.
+variants:
+  as-written: federated
+  object-native: object-native
+
 spicepod:
   version: v1
   kind: Spicepod

@@ -456,7 +456,7 @@ async fn commit_fused(
         // A transaction's COMMIT is acknowledged to the caller, so its metastore
         // change commits now rather than waiting in a buffering catalog.
         let committed = match catalog.commit_publications(&publications).await {
-            Ok(()) => catalog.commit_pending().await,
+            Ok(()) => crate::catalog::commit_at_acknowledgement(catalog).await,
             Err(e) => Err(e),
         };
         match committed {

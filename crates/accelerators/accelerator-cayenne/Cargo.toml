@@ -91,6 +91,10 @@ tempfile.workspace = true
 runtime-acceleration = { path = "../../runtime-acceleration", features = ["sqlite", "test-support"] }
 datafusion-table-providers = { workspace = true, features = ["sqlite"] }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+# Reads the object-native metastore's head log in tests.
+object_store_occ = { path = "../../object_store_occ" }
+cayenne-metastore-actions = { path = "../../cayenne-metastore-actions" }
+prost.workspace = true
 
 [lints]
 workspace = true

@@ -1215,6 +1215,17 @@ impl CommitChange for MessageBatchCommitter {
 
         Ok(())
     }
+
+    /// The offsets this batch acknowledges, saved by the dataset's offset hook
+    /// only. [`Self::commit`] runs the hook again, which keeps the higher offset
+    /// and so changes nothing, and then commits the offsets to Kafka.
+    fn record_position(
+        &self,
+    ) -> Option<futures::future::BoxFuture<'static, Result<(), CommitError>>> {
+        let hook = Arc::clone(self.offset_commit_hook.as_ref()?);
+        let offsets = self.offsets.clone();
+        Some(Box::pin(async move { hook.commit_offsets(&offsets).await }))
+    }
 }
 
 pub struct Kafka {

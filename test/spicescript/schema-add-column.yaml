@@ -16,6 +16,7 @@ matrix:
 
 variants:
   block: {}
+  object-native: object-native
   append-new-columns: { datasets: { t: { on_schema_change: append_new_columns } } }
   sync-all-columns: { datasets: { t: { on_schema_change: sync_all_columns } } }
 

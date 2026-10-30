@@ -9,6 +9,7 @@ sources:
 variants:
   file: {}
   memory: { datasets: { '*': { acceleration: { mode: memory } } } }
+  object-native: object-native
 spicepod:
   version: v1
   kind: Spicepod

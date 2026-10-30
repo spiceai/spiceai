@@ -18,6 +18,7 @@ variants:
   federated: {}
   cayenne: { datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
   cayenne-changes: { datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes } } } }
+  cayenne-changes-object-native: { datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, params: { cayenne_metastore: object_native } } } } }
 
 spicepod:
   version: v1

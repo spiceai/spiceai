@@ -28,6 +28,11 @@ variants:
   keep-partitioned: { when: { policy: keep, layout: partitioned }, datasets: { ev: { acceleration: { primary_key: id, partition_by: [region] } } } }
   none: { when: { policy: none, layout: plain }, datasets: {} }
   none-partitioned: { when: { policy: none, layout: partitioned }, datasets: { ev: { acceleration: { partition_by: [region] } } } }
+  # The prototype object-native Cayenne metastore, which does not take `partition_by` yet.
+  upsert-object-native: { when: { policy: upsert, layout: plain }, datasets: { ev: { acceleration: { primary_key: id, on_conflict: { id: upsert }, params: { cayenne_metastore: object_native } } } } }
+  drop-object-native: { when: { policy: drop, layout: plain }, datasets: { ev: { acceleration: { primary_key: id, on_conflict: { id: drop }, params: { cayenne_metastore: object_native } } } } }
+  keep-object-native: { when: { policy: keep, layout: plain }, datasets: { ev: { acceleration: { primary_key: id, params: { cayenne_metastore: object_native } } } } }
+  none-object-native: { when: { policy: none, layout: plain }, datasets: { ev: { acceleration: { params: { cayenne_metastore: object_native } } } } }
 
 spicepod:
   version: v1

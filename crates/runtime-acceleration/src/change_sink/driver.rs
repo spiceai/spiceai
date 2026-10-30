@@ -30,7 +30,8 @@ use super::batching::{AppendBurst, ApplyingGuard, CdcBurst, CdcIngress, Coalesci
 use super::source_policy::SchemaDecision;
 use super::{
     BackendWrite, ChangeBatch, ChangeCapabilities, ChangePayload, ChangeSinkBackend,
-    DurabilityObserver, Recovery, SchemaEvolutionSupport, StorageDurability, WriteOptions,
+    DurabilityObserver, PositionWrite, Recovery, SchemaEvolutionSupport, StorageDurability,
+    WriteOptions,
 };
 
 type SharedResult = std::result::Result<(), Arc<DataFusionError>>;
@@ -118,6 +119,8 @@ impl Submission {
 struct Reply {
     result: Option<oneshot::Sender<Result<WriteReceipt>>>,
     completion: Option<Completion>,
+    /// The input's source position, for a backend that commits it with the write.
+    position: Option<PositionWrite>,
 }
 
 impl Reply {
@@ -197,6 +200,20 @@ impl ChangePermit {
     /// # Errors
     /// Returns an error if admission closed after the capacity was reserved.
     pub fn submit(self, batch: ChangeBatch, options: WriteOptions) -> Result<Submission> {
+        self.submit_with_position(batch, options, None)
+    }
+
+    /// [`Self::submit`], with the input's source position: a backend that
+    /// commits it in the same record as the write runs it there.
+    ///
+    /// # Errors
+    /// Returns an error if admission closed after the capacity was reserved.
+    pub fn submit_with_position(
+        self,
+        batch: ChangeBatch,
+        options: WriteOptions,
+        position: Option<PositionWrite>,
+    ) -> Result<Submission> {
         let (result, receiver) = oneshot::channel();
         self.send(
             batch,
@@ -204,6 +221,7 @@ impl ChangePermit {
             Reply {
                 result: Some(result),
                 completion: None,
+                position,
             },
         )?;
         Ok(Submission {
@@ -354,6 +372,7 @@ impl ChangeSink {
             Reply {
                 result: None,
                 completion: Some(completion),
+                position: None,
             },
         )
     }
@@ -941,7 +960,15 @@ impl Owner {
             }
             return Ok(false);
         }
-        match self.backend.apply(batch, options, &self.context).await {
+        let positions = replies
+            .iter_mut()
+            .filter_map(|reply| reply.position.take())
+            .collect();
+        match self
+            .backend
+            .apply(batch, options, &self.context, positions)
+            .await
+        {
             Ok(write) => {
                 // Staging may overlap, but finalization cannot cross a failed
                 // predecessor. Dropping observers never drops this ownership.

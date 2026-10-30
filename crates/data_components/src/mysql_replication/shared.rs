@@ -266,6 +266,10 @@ struct AckSlot {
     /// intersection of these across members (see [`AckTable::resume_gtid`]).
     gtid: Mutex<GtidSet>,
     state: AtomicU8,
+    /// The furthest file+offset position a committer recorded in this member's
+    /// store before acknowledging it (see [`SharedPositionCommitter::record_position`]).
+    /// The pump's own save never writes a position at or below it.
+    recorded: Mutex<Option<BinlogPosition>>,
 }
 
 impl AckSlot {
@@ -275,6 +279,7 @@ impl AckSlot {
             delivered: Mutex::new(at),
             gtid: Mutex::new(gtid_seed),
             state: AtomicU8::new(LIVE | if snapshotting { SNAPSHOTTING } else { 0 }),
+            recorded: Mutex::new(None),
         }
     }
 
@@ -293,6 +298,16 @@ impl AckSlot {
     }
     fn gtid_snapshot(&self) -> GtidSet {
         lock(&self.gtid).clone()
+    }
+
+    fn recorded(&self) -> Option<BinlogPosition> {
+        lock(&self.recorded).clone()
+    }
+    fn note_recorded(&self, at: &BinlogPosition) {
+        let mut recorded = lock(&self.recorded);
+        if recorded.as_ref().is_none_or(|current| at > current) {
+            *recorded = Some(at.clone());
+        }
     }
 
     /// Advance this member's committed floor (monotonic-max).
@@ -481,6 +496,29 @@ struct SharedPositionCommitter {
     /// coalesce several transactions' commits into one, and every one of their
     /// GTIDs must still be folded. Empty when the source is not GTID-positioning.
     gtids: Vec<(uuid::Uuid, u64)>,
+    /// Writes this commit's position before the source is acknowledged, for an
+    /// accelerator that commits it with the data it covers. File+offset
+    /// positioning only: a GTID set recorded early would miss the GTIDs of the
+    /// earlier commits it covers, which are folded only when they commit.
+    recorder: Option<PositionRecorder>,
+}
+
+/// A member's position store and its write serialization.
+#[derive(Clone)]
+struct PositionRecorder {
+    store: Arc<dyn PositionStore>,
+    writes: Arc<tokio::sync::Mutex<()>>,
+    schema_json: Option<String>,
+}
+
+impl PositionRecorder {
+    fn for_member(member: &MemberHandle) -> Option<Self> {
+        (member.cursor_type == CursorType::File).then(|| Self {
+            store: Arc::clone(&member.position_store),
+            writes: Arc::clone(&member.position_writes),
+            schema_json: member.checkpoint_schema_json.clone(),
+        })
+    }
 }
 
 #[async_trait]
@@ -529,6 +567,32 @@ impl CommitChange for SharedPositionCommitter {
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
+    }
+
+    fn record_position(
+        &self,
+    ) -> Option<futures::future::BoxFuture<'static, std::result::Result<(), CommitError>>> {
+        let recorder = self.recorder.clone()?;
+        let slot = Arc::clone(&self.slot);
+        let position = self.flush_to.clone();
+        Some(Box::pin(async move {
+            let _serialized = recorder.writes.lock().await;
+            if slot.recorded().is_some_and(|recorded| recorded >= position) {
+                return Ok(());
+            }
+            recorder
+                .store
+                .save(&PersistedPosition {
+                    position: position.clone(),
+                    schema_json: recorder.schema_json,
+                    gtid_set: None,
+                    cursor_type: CursorType::File,
+                })
+                .await
+                .map_err(|source| CommitError::UnableToCommitChange { source })?;
+            slot.note_recorded(&position);
+            Ok(())
+        }))
     }
 }
 
@@ -625,6 +689,8 @@ struct MemberHandle {
     /// Durable per-dataset sidecar. The pump persists this member's committed
     /// position here on the checkpoint interval.
     position_store: Arc<dyn PositionStore>,
+    /// Serializes this member's position writes: the pump's and a committer's.
+    position_writes: Arc<tokio::sync::Mutex<()>>,
     /// Versioned checkpoint meta persisted alongside the position.
     checkpoint_schema_json: Option<String>,
     /// The cursor type this member persists (`Gtid` when the source is
@@ -944,6 +1010,7 @@ async fn attach_member(
             metrics: Arc::clone(&metrics),
             ready_lag: params.ready_lag,
             position_store: Arc::clone(&position_store),
+            position_writes: Arc::new(tokio::sync::Mutex::new(())),
             checkpoint_schema_json: checkpoint_schema_json.clone(),
             cursor_type,
             snapshot_mode: params.snapshot_mode,
@@ -2155,6 +2222,7 @@ async fn deliver_commit(
                 dataset: member.dataset_name.clone(),
                 source_commit_ts_ms: commit_ts,
                 gtids: gtid.into_iter().collect(),
+                recorder: PositionRecorder::for_member(member),
             }),
             Box::new(rows),
             is_ready,
@@ -2246,6 +2314,7 @@ async fn handle_statement(
                         dataset: member.dataset_name.clone(),
                         source_commit_ts_ms: commit_ts,
                         gtids: gtid.into_iter().collect(),
+                        recorder: PositionRecorder::for_member(&member),
                     }),
                     batch,
                     is_ready,
@@ -2596,9 +2665,19 @@ async fn persist_all(source: &Arc<SharedSource>, last: &mut HashMap<MemberKey, P
         if slot.has(SNAPSHOTTING) {
             continue;
         }
+        let _serialized = member.position_writes.lock().await;
         let persisted = persisted_for(&member, &slot);
         let identity: PersistIdentity = (persisted.position.clone(), persisted.gtid_set.clone());
         if last.get(&key) == Some(&identity) {
+            continue;
+        }
+        // A committer already recorded this position or a later one; writing
+        // the slot's older committed position would move the store backwards.
+        if persisted.gtid_set.is_none()
+            && slot
+                .recorded()
+                .is_some_and(|recorded| recorded >= persisted.position)
+        {
             continue;
         }
         match member.position_store.save(&persisted).await {
@@ -2909,6 +2988,7 @@ mod tests {
             metrics: MetricsCollector::new(),
             ready_lag: params.ready_lag,
             position_store: Arc::clone(&position_store) as Arc<dyn PositionStore>,
+            position_writes: Arc::new(tokio::sync::Mutex::new(())),
             checkpoint_schema_json: None,
             cursor_type: CursorType::File,
             snapshot_mode: params.snapshot_mode,
@@ -3425,6 +3505,7 @@ mod tests {
             dataset: "stock".into(),
             source_commit_ts_ms: None,
             gtids: Vec::new(),
+            recorder: None,
         }
         .commit()
         .await
@@ -3534,6 +3615,7 @@ mod tests {
             dataset: "orders".into(),
             source_commit_ts_ms: Some(1),
             gtids: vec![(uuid, 7)],
+            recorder: None,
         };
         committer.commit().await.expect("commit");
         assert_eq!(slot.committed(), pos("binlog.000001", 500));
@@ -3548,6 +3630,7 @@ mod tests {
             dataset: "orders".into(),
             source_commit_ts_ms: Some(1),
             gtids: vec![(uuid, 8)],
+            recorder: None,
         };
         let later = SharedPositionCommitter {
             slot: Arc::clone(&slot),
@@ -3555,6 +3638,7 @@ mod tests {
             dataset: "orders".into(),
             source_commit_ts_ms: Some(2),
             gtids: vec![(uuid, 9)],
+            recorder: None,
         };
         assert!(first.try_absorb(&later));
         assert_eq!(first.flush_to, pos("binlog.000001", 900));
@@ -3572,6 +3656,7 @@ mod tests {
             dataset: "customers".into(),
             source_commit_ts_ms: Some(3),
             gtids: Vec::new(),
+            recorder: None,
         };
         assert!(!first.try_absorb(&other));
         assert_eq!(

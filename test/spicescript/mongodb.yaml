@@ -23,6 +23,8 @@ variants:
   cayenne: { datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
   cayenne-changes:
     datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: _id } } }
+  cayenne-changes-object-native:
+    datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: _id, params: { cayenne_metastore: object_native } } } }
 
 spicepod:
   version: v1

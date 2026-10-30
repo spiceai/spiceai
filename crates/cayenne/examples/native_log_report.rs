@@ -60,7 +60,12 @@ impl Counts {
         let mut names = Vec::new();
         for payload in Group::decode(record.payload).expect("group").payloads {
             let record = cayenne_metastore_actions::Record::decode(payload).expect("record");
-            names.extend(record.actions.iter().map(cayenne_metastore_actions::Action::name));
+            names.extend(
+                record
+                    .actions
+                    .iter()
+                    .map(cayenne_metastore_actions::Action::name),
+            );
         }
         if names.contains(&"AdvanceSourcePosition") {
             if names.iter().all(|name| *name == "AdvanceSourcePosition") {
@@ -76,11 +81,7 @@ impl Counts {
 }
 
 async fn listed(store: &Arc<dyn ObjectStore>, prefix: &Path) -> Vec<object_store::ObjectMeta> {
-    let mut objects: Vec<_> = store
-        .list(Some(prefix))
-        .try_collect()
-        .await
-        .expect("list");
+    let mut objects: Vec<_> = store.list(Some(prefix)).try_collect().await.expect("list");
     objects.sort_by(|a, b| a.location.cmp(&b.location));
     objects
 }
@@ -99,7 +100,13 @@ async fn main() {
     // window holds the commits not yet sealed.
     let mut counts = Counts::default();
     for meta in listed(&store, &prefix.clone().join("wal")).await {
-        let bytes = store.get(&meta.location).await.expect("batch").bytes().await.expect("bytes");
+        let bytes = store
+            .get(&meta.location)
+            .await
+            .expect("batch")
+            .bytes()
+            .await
+            .expect("bytes");
         for encoded in Batch::decode(bytes).expect("batch").records {
             counts.add(&encoded);
         }

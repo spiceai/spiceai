@@ -185,7 +185,7 @@ async fn commit_metadata(
         // The append is acknowledged when this returns, so its metastore change
         // commits now rather than waiting in a buffering catalog.
         let committed = match catalog.commit_publications(&publications).await {
-            Ok(()) => catalog.commit_pending().await,
+            Ok(()) => crate::catalog::commit_at_acknowledgement(catalog).await,
             Err(error) => Err(error),
         };
         match committed {

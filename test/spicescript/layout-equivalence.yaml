@@ -16,6 +16,7 @@ matrix:
 
 variants:
   baseline: {}
+  object-native: object-native
   sorted:
     datasets: { facts: { acceleration: { params: { cayenne_sort_columns: 'grp,ts' } } } }
   sharded:

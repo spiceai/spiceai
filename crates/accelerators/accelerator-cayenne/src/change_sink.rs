@@ -51,8 +51,8 @@ use runtime_acceleration::change_sink::provider::{
 };
 use runtime_acceleration::change_sink::{
     BackendWrite, ChangeBatch, ChangeCapabilities, ChangePayload, ChangeSinkBackend,
-    ChangeSinkContext, DurabilityObserver, Recovery, ReplacementSupport, SchemaEvolutionSupport,
-    StorageDurability, WriteOptions, replaced_scope_filters,
+    ChangeSinkContext, DurabilityObserver, PositionWrite, Recovery, ReplacementSupport,
+    SchemaEvolutionSupport, StorageDurability, WriteOptions, replaced_scope_filters,
 };
 use runtime_table_partition::provider::PartitionTableProvider;
 use spice_table::{LayerWalk, find_concrete};
@@ -173,7 +173,60 @@ impl CayenneChangeSinkBackend {
         Ok(())
     }
 
+    /// Apply a CDC batch. With the object-native metastore, an upsert or delete
+    /// batch's metastore changes and its inputs' source positions commit as one
+    /// record, once the write is durable and before the source is acknowledged.
+    /// A truncate replaces files, so its batch keeps one commit per change, and
+    /// the committers save positions afterwards, as with every other metastore.
     async fn apply_cdc(
+        &self,
+        batch: CdcBatch,
+        options: WriteOptions,
+        ctx: &SessionContext,
+        positions: Vec<PositionWrite>,
+    ) -> Result<BackendWrite> {
+        let same_record = !positions.is_empty()
+            && self
+                .table
+                .catalog()
+                .as_any()
+                .is::<cayenne::metastore::object_native::ObjectNativeCatalog>()
+            && !group_into_sub_batches(&batch)
+                .iter()
+                .any(|(op, _)| matches!(op, ChangeOperationType::Truncate));
+        if !same_record {
+            return self.apply_cdc_groups(batch, options, ctx).await;
+        }
+        let mut write =
+            cayenne::catalog::with_same_record_commits(self.apply_cdc_groups(batch, options, ctx))
+                .await?;
+        let catalog = Arc::clone(self.table.catalog());
+        // A write kept in the in-memory tier is not durable yet; its checkpoint
+        // records the position instead.
+        let durable = write.durability == StorageDurability::Durable;
+        let finalizer = write.finalizer.take();
+        write.finalizer = Some(Box::pin(async move {
+            cayenne::catalog::with_same_record_commits(async move {
+                if let Some(finalizer) = finalizer {
+                    finalizer.await?;
+                }
+                if durable {
+                    for position in positions {
+                        position.await.map_err(DataFusionError::External)?;
+                    }
+                }
+                Ok::<(), DataFusionError>(())
+            })
+            .await?;
+            catalog
+                .commit_pending()
+                .await
+                .map_err(|error| DataFusionError::External(Box::new(error)))
+        }));
+        Ok(write)
+    }
+
+    async fn apply_cdc_groups(
         &self,
         batch: CdcBatch,
         options: WriteOptions,
@@ -414,12 +467,13 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
         batch: ChangeBatch,
         options: WriteOptions,
         ctx: &SessionContext,
+        positions: Vec<PositionWrite>,
     ) -> Result<BackendWrite> {
         let replacement_filters = replaced_scope_filters(batch.replaced_scopes());
         match batch.into_payload() {
             ChangePayload::Cdc(rows) => {
                 let batch = rows.into_built().map_err(before_mutation)?;
-                self.apply_cdc(batch, options, ctx).await
+                self.apply_cdc(batch, options, ctx, positions).await
             }
             ChangePayload::Rows {
                 schema,

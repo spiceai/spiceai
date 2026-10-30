@@ -304,8 +304,19 @@ pub struct CatalogPublication {
     pub dirty_pk_bytes: Vec<Vec<u8>>,
 }
 
+/// How the metastore changes of the current task commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitScope {
+    /// Buffered until the scope's owner calls [`MetadataCatalog::commit_pending`].
+    Deferred,
+    /// As `Deferred`, and a write path's own acknowledgement point
+    /// ([`commit_at_acknowledgement`]) also waits for the owner, so the whole
+    /// scope, including what the owner adds last, commits as one record.
+    SameRecord,
+}
+
 tokio::task_local! {
-    static DEFERRED_COMMITS: ();
+    static DEFERRED_COMMITS: CommitScope;
 }
 
 /// Run `work` with its metastore changes deferred: a catalog that buffers may
@@ -313,13 +324,36 @@ tokio::task_local! {
 /// instead of one commit per change. The caller must call `commit_pending`
 /// before acknowledging anything that depends on them.
 pub async fn with_deferred_commits<F: std::future::Future>(work: F) -> F::Output {
-    DEFERRED_COMMITS.scope((), work).await
+    DEFERRED_COMMITS.scope(CommitScope::Deferred, work).await
 }
 
-/// Whether the current task is inside [`with_deferred_commits`].
+/// [`with_deferred_commits`], where a write path inside `work` that would commit
+/// at its own acknowledgement point leaves that to the caller, so everything
+/// `work` changes commits in the caller's one record. Use it only where the
+/// caller acknowledges nothing until its `commit_pending` returns, and where
+/// nothing inside `work` deletes an object after one of its own commits.
+pub async fn with_same_record_commits<F: std::future::Future>(work: F) -> F::Output {
+    DEFERRED_COMMITS.scope(CommitScope::SameRecord, work).await
+}
+
+/// Whether the current task is inside [`with_deferred_commits`] or
+/// [`with_same_record_commits`].
 #[must_use]
 pub fn commits_deferred() -> bool {
-    DEFERRED_COMMITS.try_with(|()| ()).is_ok()
+    DEFERRED_COMMITS.try_with(|_| ()).is_ok()
+}
+
+/// Commit a write path's metastore changes at its acknowledgement point, unless
+/// the task is inside [`with_same_record_commits`], whose owner commits them.
+///
+/// # Errors
+///
+/// Returns the catalog's error when the commit is not accepted.
+pub async fn commit_at_acknowledgement(catalog: &dyn MetadataCatalog) -> CatalogResult<()> {
+    if DEFERRED_COMMITS.try_with(|scope| *scope) == Ok(CommitScope::SameRecord) {
+        return Ok(());
+    }
+    catalog.commit_pending().await
 }
 
 /// Trait for metadata catalog operations.

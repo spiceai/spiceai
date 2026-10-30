@@ -1770,6 +1770,105 @@ impl ObjectNativeCatalog {
             .cloned())
     }
 
+    /// The counters kept under `key` by [`Self::advance_sidecar_counters`], by name.
+    /// # Errors
+    /// Returns an error when the catalog must be reopened.
+    pub async fn sidecar_counters(&self, key: &str) -> CatalogResult<Vec<(String, i64)>> {
+        let inner = self.read().await?;
+        let start = (key.to_string(), "\0".to_string());
+        inner
+            .reader
+            .state
+            .positions
+            .range(start..)
+            .take_while(|((source, _), _)| source == key)
+            .map(|((_, name), value)| {
+                let bytes: [u8; 8] = value.as_slice().try_into().map_err(|_| {
+                    invalid(format!("counter '{name}' under '{key}' is not 8 bytes"))
+                })?;
+                Ok((name.clone(), i64::from_be_bytes(bytes)))
+            })
+            .collect()
+    }
+
+    /// Move each named counter under `key` up to its given value, keeping the
+    /// larger of the stored and given values, in one commit (or in the enclosing
+    /// deferred record). Names must not be empty: the empty name is the value of
+    /// [`Self::set_sidecar_value`].
+    /// # Errors
+    /// Returns an error when a name is empty or the commit is not accepted.
+    pub async fn advance_sidecar_counters(
+        &self,
+        key: &str,
+        counters: &[(String, i64)],
+    ) -> CatalogResult<()> {
+        self.set_sidecar_value_and_counters(key, None, counters)
+            .await
+    }
+
+    /// [`Self::set_sidecar_value`] (when `value` is `Some`) and
+    /// [`Self::advance_sidecar_counters`] in the same commit.
+    /// # Errors
+    /// Returns an error when a counter name is empty or the commit is not accepted.
+    pub async fn set_sidecar_value_and_counters(
+        &self,
+        key: &str,
+        value: Option<Option<Vec<u8>>>,
+        counters: &[(String, i64)],
+    ) -> CatalogResult<()> {
+        let mut highest = std::collections::BTreeMap::<&str, i64>::new();
+        for (name, count) in counters {
+            if name.is_empty() {
+                return Err(invalid(format!("a counter under '{key}' has no name")));
+            }
+            let entry = highest.entry(name.as_str()).or_insert(*count);
+            *entry = (*entry).max(*count);
+        }
+        let mut inner = self.inner.take().await;
+        let mut actions = Vec::new();
+        if let Some(value) = value
+            && inner
+                .reader
+                .state
+                .positions
+                .get(&(key.to_string(), String::new()))
+                != value.as_ref()
+        {
+            actions.push(Action::new(Kind::AdvanceSourcePosition(
+                proto::AdvanceSourcePosition {
+                    source: key.to_string(),
+                    partition: String::new(),
+                    clear: value.is_none(),
+                    position: value.unwrap_or_default(),
+                },
+            )));
+        }
+        for (name, count) in highest {
+            let stored = inner
+                .reader
+                .state
+                .positions
+                .get(&(key.to_string(), name.to_string()))
+                .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_slice()).ok())
+                .map(i64::from_be_bytes);
+            if stored.is_some_and(|stored| stored >= count) {
+                continue;
+            }
+            actions.push(Action::new(Kind::AdvanceSourcePosition(
+                proto::AdvanceSourcePosition {
+                    source: key.to_string(),
+                    partition: name.to_string(),
+                    position: count.to_be_bytes().to_vec(),
+                    clear: false,
+                },
+            )));
+        }
+        if actions.is_empty() && !inner.poisoned {
+            return Ok(());
+        }
+        inner.commit(actions).await
+    }
+
     /// Set (`Some`) or remove (`None`) the bookkeeping value under `key`. Setting
     /// the value it already holds commits nothing.
     /// # Errors

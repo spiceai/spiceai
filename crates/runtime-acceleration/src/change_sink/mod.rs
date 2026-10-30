@@ -86,6 +86,13 @@ pub enum StorageDurability {
     NotPromised,
 }
 
+/// Writes a source position to the dataset's position store without
+/// acknowledging the source. A backend whose storage commits the position with
+/// the write it follows runs it inside that commit; any other drops it, and the
+/// source's committer saves the position after the write, as before.
+pub type PositionWrite =
+    BoxFuture<'static, std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>>;
+
 /// Receives durable storage fences, including idle checkpoint progress.
 /// Implementations must preserve ordering when notifying a source.
 #[async_trait]
@@ -175,11 +182,13 @@ pub trait ChangeSinkBackend: Send + Sync {
 
     fn capabilities(&self) -> ChangeCapabilities;
 
+    /// `positions` are the source positions of the inputs in `batch`, in order.
     async fn apply(
         &self,
         batch: ChangeBatch,
         options: WriteOptions,
         context: &SessionContext,
+        positions: Vec<PositionWrite>,
     ) -> Result<BackendWrite>;
 
     fn set_durability_observer(&self, observer: Arc<dyn DurabilityObserver>);

@@ -649,3 +649,155 @@ async fn cache_replacements_by_key_match_the_scope_delete() {
         "a kind of write never occurred: {seen:?}"
     );
 }
+
+/// The action names of each object-native commit after `after`, oldest first.
+async fn object_native_records_after(
+    store: &Arc<dyn object_store::ObjectStore>,
+    after: u64,
+) -> Vec<Vec<&'static str>> {
+    use prost::Message;
+    let (_, opened) = object_store_occ::headlog::Reader::open(
+        Arc::clone(store),
+        object_store::path::Path::from("catalog"),
+    )
+    .await
+    .expect("open head log");
+    opened
+        .records
+        .into_iter()
+        .filter(|entry| entry.commit > after)
+        .map(|entry| {
+            object_store_occ::headlog::Group::decode(entry.record.payload)
+                .expect("group")
+                .payloads
+                .into_iter()
+                .flat_map(|payload| {
+                    cayenne_metastore_actions::Record::decode(payload)
+                        .expect("record")
+                        .actions
+                        .iter()
+                        .map(cayenne_metastore_actions::Action::name)
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// With the object-native metastore, a durable CDC write and its input's source
+/// position commit as one record, so no record holds a position without the
+/// data it covers, and the position is never saved before the data.
+#[tokio::test]
+async fn an_object_native_durable_cdc_write_commits_its_position_with_its_data() {
+    use arrow::{
+        array::{ListArray, StructArray},
+        buffer::OffsetBuffer,
+    };
+    use cayenne::metastore::object_native::ObjectNativeCatalog;
+
+    let ctx = SessionContext::new();
+    let dir = tempfile::tempdir().expect("table directory");
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let catalog = Arc::new(
+        ObjectNativeCatalog::create(
+            Arc::clone(&store),
+            object_store::path::Path::from("catalog"),
+        )
+        .await
+        .expect("object-native catalog"),
+    );
+    let table = Arc::new(
+        CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+        )
+        .create(CreateTableOptions {
+            table_name: "positions".into(),
+            schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            primary_key: vec!["id".into()],
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec!["id".into()]))),
+            base_path: dir.path().join("data").to_string_lossy().into_owned(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                cdc_durability: CdcDurability::File,
+                deletion_mode: DeletionMode::Key,
+                compaction_background_interval_ms: 0,
+                ..VortexConfig::default()
+            },
+        })
+        .await
+        .expect("create table"),
+    );
+    let backend = CayenneChangeSinkBackend::try_new(ChangeSinkContext::new(
+        TableReference::bare("positions"),
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    ))
+    .expect("native backend");
+    let sink = ChangeSink::new(backend, ctx, &Handle::current(), 2);
+    let keys = ListArray::try_new(
+        Arc::new(Field::new("item", DataType::Utf8, false)),
+        OffsetBuffer::new(vec![0_i32, 1, 2].into()),
+        Arc::new(StringArray::from(vec!["id", "id"])),
+        None,
+    )
+    .expect("keys");
+    let record = RecordBatch::try_new(
+        Arc::new(data_components::cdc::changes_schema(&table.schema())),
+        vec![
+            Arc::new(StringArray::from(vec!["c", "c"])),
+            Arc::new(keys),
+            Arc::new(StructArray::from(batch(&table, vec![1, 2]))),
+        ],
+    )
+    .expect("source changes");
+    let (reader, _) = object_store_occ::headlog::Reader::open(
+        Arc::clone(&store),
+        object_store::path::Path::from("catalog"),
+    )
+    .await
+    .expect("open head log");
+    let before = reader.state().head.commit;
+
+    let saver = Arc::clone(&catalog);
+    let position: runtime_acceleration::change_sink::PositionWrite = Box::pin(async move {
+        saver
+            .set_sidecar_value("position", Some(b"lsn 7".to_vec()))
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+    });
+    let receipt = sink
+        .reserve()
+        .await
+        .expect("capacity")
+        .submit_with_position(
+            ChangeBatch::cdc(CdcBatch::try_new(record).expect("CDC batch")),
+            WriteOptions {
+                recovery: Recovery::Durable,
+                ..WriteOptions::default()
+            },
+            Some(position),
+        )
+        .expect("admit CDC")
+        .wait()
+        .await
+        .expect("CDC receipt");
+    receipt.published().await.expect("CDC publication");
+    assert_eq!(receipt.durability, StorageDurability::Durable);
+
+    let records = object_native_records_after(&store, before).await;
+    let with_position: Vec<_> = records
+        .iter()
+        .filter(|kinds| kinds.contains(&"AdvanceSourcePosition"))
+        .collect();
+    assert_eq!(with_position.len(), 1, "records: {records:?}");
+    assert!(
+        with_position[0]
+            .iter()
+            .any(|kind| *kind != "AdvanceSourcePosition" && *kind != "AdvanceSeq"),
+        "the position must commit with the data it covers, records: {records:?}"
+    );
+    assert_eq!(
+        catalog.sidecar_value("position").await.expect("read"),
+        Some(b"lsn 7".to_vec())
+    );
+}
