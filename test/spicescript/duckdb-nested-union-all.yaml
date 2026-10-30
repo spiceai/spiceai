@@ -1,14 +1,17 @@
 name: duckdb-nested-union-all
 description: >
   A UNION ALL whose second branch is itself a UNION ALL returns every row of
-  every branch from a DuckDB acceleration, as it does from Cayenne.
+  every branch from a DuckDB acceleration and from a DuckDB source, as it does
+  from Cayenne.
 
 sources:
   src: { kind: postgres }
+  dk: { kind: duckdb }
 
 variants:
   cayenne: cayenne-file
   duckdb: duckdb-file
+  duckdb-source: { datasets: { u: { from: 'duckdb:u', params: '${sources.dk.params}' } } }
 
 spicepod:
   version: v1
@@ -26,6 +29,8 @@ defaults:
 steps:
   - source-exec:
       src: CREATE TABLE u (id int PRIMARY KEY, v int); INSERT INTO u SELECT i, i % 7 FROM generate_series(1, 150) i;
+  - source-exec:
+      dk: CREATE TABLE u (id int PRIMARY KEY, v int); INSERT INTO u SELECT i, i % 7 FROM range(1, 151) t(i);
   - start: {}
   # Controls: a flat UNION ALL, and the nested one under ORDER BY.
   - query: SELECT id FROM u WHERE id <= 1 UNION ALL SELECT id FROM u WHERE id BETWEEN 2 AND 3 UNION ALL SELECT id FROM u WHERE id BETWEEN 4 AND 7 UNION ALL SELECT id FROM u WHERE id BETWEEN 8 AND 15
@@ -41,3 +46,7 @@ steps:
   - explain: SELECT id FROM u WHERE id <= 3 UNION ALL SELECT id FROM (SELECT id FROM u WHERE id BETWEEN 4 AND 7 UNION ALL SELECT id FROM u WHERE id BETWEEN 8 AND 15) b
     contains: [UnionExec, VirtualExecutionPlan]
     only: duckdb
+  # The DuckDB source answered the query rather than Spice reading its rows.
+  - explain: SELECT id FROM u WHERE id <= 3 UNION ALL SELECT id FROM (SELECT id FROM u WHERE id BETWEEN 4 AND 7 UNION ALL SELECT id FROM u WHERE id BETWEEN 8 AND 15) b
+    contains: [VirtualExecutionPlan]
+    only: duckdb-source

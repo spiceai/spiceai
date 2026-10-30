@@ -2,16 +2,19 @@ name: unparse-pruned-aggregate
 description: >
   Aggregates keep their rows when an outer query reads none of their output
   columns: one row for a global aggregate, including over empty input, and one
-  per group for GROUP BY. Federated PostgreSQL and MySQL and DuckDB and Cayenne
-  accelerations agree with PostgreSQL, including for nested and empty inputs.
+  per group for GROUP BY. Federated PostgreSQL, MySQL and DuckDB, and DuckDB and
+  Cayenne accelerations, agree with PostgreSQL, including for nested and empty
+  inputs.
 
 sources:
   pg: { kind: postgres }
   my: { kind: mysql }
+  dk: { kind: duckdb }
 
 variants:
   postgres: {}
   mysql: { datasets: { e: { from: 'mysql:e', params: '${sources.my.params}' } } }
+  duckdb-source: { datasets: { e: { from: 'duckdb:e', params: '${sources.dk.params}' } } }
   duckdb: { datasets: { e: { acceleration: { enabled: true, engine: duckdb, mode: file } } } }
   cayenne: { datasets: { e: { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
 
@@ -33,6 +36,8 @@ steps:
       pg: CREATE TABLE e (id int PRIMARY KEY, v int); INSERT INTO e SELECT i, i % 3 FROM generate_series(1, 11) i;
   - source-exec:
       my: CREATE TABLE e (id int PRIMARY KEY, v int); INSERT INTO e VALUES (1,1),(2,2),(3,0),(4,1),(5,2),(6,0),(7,1),(8,2),(9,0),(10,1),(11,2);
+  - source-exec:
+      dk: CREATE TABLE e (id int PRIMARY KEY, v int); INSERT INTO e SELECT i, i % 3 FROM range(1, 12) t(i);
   - start: {}
   # Control: an aggregate whose output is read.
   - query: SELECT count(*) AS n, max(m) AS top FROM (SELECT max(id) AS m FROM e) x
