@@ -6,19 +6,19 @@ Spice.ai acknowledges the following open source projects for making this project
 
 ## Rust Crates
 
-- accelerator-cayenne 2.4.0,  ../../../LICENSE
+- accelerator-cayenne 2.4.1,  ../../../LICENSE
   <br/>
 
-- accelerator-duckdb 2.4.0,  ../../../LICENSE
+- accelerator-duckdb 2.4.1,  ../../../LICENSE
   <br/>
 
-- accelerator-postgres 2.4.0,  ../../../LICENSE
+- accelerator-postgres 2.4.1,  ../../../LICENSE
   <br/>
 
-- accelerator-sqlite 2.4.0,  ../../../LICENSE
+- accelerator-sqlite 2.4.1,  ../../../LICENSE
   <br/>
 
-- accelerator-turso 2.4.0,  ../../../LICENSE
+- accelerator-turso 2.4.1,  ../../../LICENSE
   <br/>
 
 - adbc_core 0.24.0, Apache-2.0 
@@ -123,7 +123,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - aws-credential-types 1.3.0, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-lc-rs 1.18.1, (Apache-2.0 OR ISC) AND ISC 
+- aws-lc-rs 1.18.2, (Apache-2.0 OR ISC) AND ISC 
   <br/>https://github.com/aws/aws-lc-rs
 
 - aws-runtime 1.7.5, Apache-2.0 
@@ -270,6 +270,9 @@ Spice.ai acknowledges the following open source projects for making this project
 - calamine 0.28.0, MIT 
   <br/>https://github.com/tafia/calamine
 
+- calamine 0.37.0, MIT 
+  <br/>https://github.com/tafia/calamine
+
 - cbc 0.1.2, Apache-2.0 OR MIT 
   <br/>https://github.com/RustCrypto/block-modes
 
@@ -285,7 +288,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - charset 0.1.5, Apache-2.0 OR MIT 
   <br/>https://github.com/hsivonen/charset
 
-- chbench-driver 2.4.0,  ../../LICENSE
+- chbench-driver 2.4.1,  ../../LICENSE
   <br/>
 
 - chdb-rust 1.3.1, Apache-2.0 
@@ -312,7 +315,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - clickhouse-rs 1.1.0-alpha.1, MIT 
   <br/>https://github.com/suharev7/clickhouse-rs
 
-- cloud-connect-crypto 2.4.0, Apache-2.0 
+- cloud-connect-crypto 2.4.1, Apache-2.0 
   <br/>
 
 - cmac 0.7.2, Apache-2.0 OR MIT 
@@ -321,112 +324,112 @@ Spice.ai acknowledges the following open source projects for making this project
 - comfy-table 7.1.4, MIT 
   <br/>https://github.com/nukesor/comfy-table
 
-- connector-abfs 2.4.0,  ../../../LICENSE
+- connector-abfs 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-adbc 2.4.0,  ../../../LICENSE
+- connector-adbc 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-clickhouse 2.4.0,  ../../../LICENSE
+- connector-clickhouse 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-cosmosdb 2.4.0,  ../../../LICENSE
+- connector-cosmosdb 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-databricks 2.4.0,  ../../../LICENSE
+- connector-databricks 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-delta-lake 2.4.0,  ../../../LICENSE
+- connector-delta-lake 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-dremio 2.4.0,  ../../../LICENSE
+- connector-dremio 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-duckdb 2.4.0,  ../../../LICENSE
+- connector-duckdb 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-ducklake 2.4.0,  ../../../LICENSE
+- connector-ducklake 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-dynamodb 2.4.0,  ../../../LICENSE
+- connector-dynamodb 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-elasticsearch 2.4.0,  ../../../LICENSE
+- connector-elasticsearch 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-flightsql 2.4.0,  ../../../LICENSE
+- connector-flightsql 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-ftp 2.4.0,  ../../../LICENSE
+- connector-ftp 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-gcs 2.4.0,  ../../../LICENSE
+- connector-gcs 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-git 2.4.0,  ../../../LICENSE
+- connector-git 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-github 2.4.0,  ../../../LICENSE
+- connector-github 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-glue 2.4.0,  ../../../LICENSE
+- connector-glue 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-graphql 2.4.0,  ../../../LICENSE
+- connector-graphql 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-huggingface 2.4.0,  ../../../LICENSE
+- connector-huggingface 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-imap 2.4.0,  ../../../LICENSE
+- connector-imap 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-kafka 2.4.0,  ../../../LICENSE
+- connector-kafka 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-mongodb 2.4.0,  ../../../LICENSE
+- connector-mongodb 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-mssql 2.4.0,  ../../../LICENSE
+- connector-mssql 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-mysql 2.4.0,  ../../../LICENSE
+- connector-mysql 2.4.1,  ../../../LICENSE
   <br/>
 
 - connector-nfs 1.11.0-unstable, Apache-2.0 
   <br/>
 
-- connector-odbc 2.4.0,  ../../../LICENSE
+- connector-odbc 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-oracle 2.4.0,  ../../../LICENSE
+- connector-oracle 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-postgres 2.4.0,  ../../../LICENSE
+- connector-postgres 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-postgres-common 2.4.0,  ../../../LICENSE
+- connector-postgres-common 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-scylladb 2.4.0,  ../../../LICENSE
+- connector-scylladb 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-sftp 2.4.0,  ../../../LICENSE
+- connector-sftp 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-sharepoint 2.4.0,  ../../../LICENSE
+- connector-sharepoint 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-smb 2.4.0,  ../../../LICENSE
+- connector-smb 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-snowflake 2.4.0,  ../../../LICENSE
+- connector-snowflake 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-spark 2.4.0,  ../../../LICENSE
+- connector-spark 2.4.1,  ../../../LICENSE
   <br/>
 
-- connector-spiceai 2.4.0,  ../../../LICENSE
+- connector-spiceai 2.4.1,  ../../../LICENSE
   <br/>
 
 - core_maths 0.1.1, MIT 
@@ -558,13 +561,13 @@ Spice.ai acknowledges the following open source projects for making this project
 - dotenv 0.15.0, MIT 
   <br/>https://github.com/dotenv-rs/dotenv
 
-- dotenv 2.4.0, Apache-2.0 
+- dotenv 2.4.1, Apache-2.0 
   <br/>
 
 - duckdb 1.4.4, MIT 
   <br/>https://github.com/duckdb/duckdb-rs
 
-- duration-parse 2.4.0, Apache-2.0 
+- duration-parse 2.4.1, Apache-2.0 
   <br/>
 
 - dyn-clone 1.0.20, Apache-2.0 OR MIT 
@@ -579,7 +582,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - either 1.16.0, Apache-2.0 OR MIT 
   <br/>https://github.com/rayon-rs/either
 
-- elasticsearch 2.4.0,  ../../LICENSE
+- elasticsearch 2.4.1,  ../../LICENSE
   <br/>
 
 - encoding_rs 0.8.35, (Apache-2.0 OR MIT) AND BSD-3-Clause 
@@ -906,6 +909,9 @@ Spice.ai acknowledges the following open source projects for making this project
 - opendal 0.58.2, Apache-2.0 
   <br/>https://github.com/apache/opendal
 
+- opendal-http-transport-reqwest 0.58.2, Apache-2.0 
+  <br/>https://github.com/apache/opendal
+
 - opentelemetry 0.32.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry
 
@@ -948,7 +954,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - pdf-inspector 0.1.8, MIT 
   <br/>https://github.com/firecrawl/pdf-inspector
 
-- pdf-parse 2.4.0,  ../../LICENSE
+- pdf-parse 2.4.1,  ../../LICENSE
   <br/>
 
 - pem 3.0.6, MIT 
@@ -1083,19 +1089,19 @@ Spice.ai acknowledges the following open source projects for making this project
 - rstest 0.26.1, Apache-2.0 OR MIT 
   <br/>https://github.com/la10736/rstest
 
-- runtime-checkpoint-duckdb 2.4.0,  ../../LICENSE
+- runtime-checkpoint-duckdb 2.4.1,  ../../LICENSE
   <br/>
 
-- runtime-checkpoint-postgres 2.4.0,  ../../LICENSE
+- runtime-checkpoint-postgres 2.4.1,  ../../LICENSE
   <br/>
 
-- runtime-checkpoint-sqlite 2.4.0,  ../../LICENSE
+- runtime-checkpoint-sqlite 2.4.1,  ../../LICENSE
   <br/>
 
-- runtime-checkpoint-turso 2.4.0,  ../../LICENSE
+- runtime-checkpoint-turso 2.4.1,  ../../LICENSE
   <br/>
 
-- runtime-drasi 2.4.0,  ../../LICENSE
+- runtime-drasi 2.4.1,  ../../LICENSE
   <br/>
 
 - rusqlite 0.40.1, MIT 
@@ -1110,7 +1116,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - rustc-hash 2.1.2, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/rustc-hash
 
-- rustls 0.23.45, Apache-2.0 OR ISC OR MIT 
+- rustls 0.23.46, Apache-2.0 OR ISC OR MIT 
   <br/>https://github.com/rustls/rustls
 
 - rustls-native-certs 0.8.4, Apache-2.0 OR ISC OR MIT 
@@ -1149,6 +1155,9 @@ Spice.ai acknowledges the following open source projects for making this project
 - serde-value 0.7.0, MIT 
   <br/>https://github.com/arcnmx/serde-value
 
+- serde_bytes 0.11.19, Apache-2.0 OR MIT 
+  <br/>https://github.com/serde-rs/bytes
+
 - serde_json 1.0.150, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/json
 
@@ -1185,8 +1194,11 @@ Spice.ai acknowledges the following open source projects for making this project
 - spark-connect-rs 0.0.1-beta.4, Apache-2.0 
   <br/>https://github.com/sjrusso8/spark-connect-rs
 
-- spicepod-validator 2.4.0,  ../../LICENSE
+- spicepod-validator 2.4.1,  ../../LICENSE
   <br/>
+
+- sse-stream 0.2.6, Apache-2.0 OR MIT 
+  <br/>https://github.com/4t145/sse-stream/
 
 - ssh2 0.9.5, Apache-2.0 OR MIT 
   <br/>https://github.com/alexcrichton/ssh2-rs
@@ -1359,6 +1371,9 @@ Spice.ai acknowledges the following open source projects for making this project
 - type1-encoding-parser 0.1.1, MIT 
   <br/>https://github.com/jrmuizel/type1-encoding-parser
 
+- typetag 0.2.22, Apache-2.0 OR MIT 
+  <br/>https://github.com/dtolnay/typetag
+
 - unicode-normalization 0.1.25, Apache-2.0 OR MIT 
   <br/>https://github.com/unicode-rs/unicode-normalization
 
@@ -1416,19 +1431,19 @@ Spice.ai acknowledges the following open source projects for making this project
 - wasm-bindgen-test 0.3.72, Apache-2.0 OR MIT 
   <br/>https://github.com/wasm-bindgen/wasm-bindgen
 
-- wasmtime 47.0.3, Apache-2.0 WITH LLVM-exception 
+- wasmtime 48.0.7, Apache-2.0 WITH LLVM-exception 
   <br/>https://github.com/bytecodealliance/wasmtime
 
 - wat 1.251.0, Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT 
   <br/>https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wat
 
-- webpki-root-certs 1.0.10, CDLA-Permissive-2.0 
+- webpki-root-certs 1.0.11, CDLA-Permissive-2.0 
   <br/>https://github.com/rustls/webpki-roots
 
 - webpki-roots 0.26.11, CDLA-Permissive-2.0 
   <br/>https://github.com/rustls/webpki-roots
 
-- webpki-roots 1.0.10, CDLA-Permissive-2.0 
+- webpki-roots 1.0.11, CDLA-Permissive-2.0 
   <br/>https://github.com/rustls/webpki-roots
 
 - weezl 0.1.12, Apache-2.0 OR MIT 
@@ -1470,12 +1485,12 @@ Spice.ai acknowledges the following open source projects for making this project
 - zip 6.0.0, MIT 
   <br/>https://github.com/zip-rs/zip2.git
 
-- zip 7.2.0, MIT 
-  <br/>https://github.com/zip-rs/zip2.git
-
-- zip 8.6.0, MIT 
+- zip 9.1.2, MIT 
   <br/>https://github.com/zip-rs/zip2
 
 - zstd 0.13.3, MIT 
+  <br/>https://github.com/gyscos/zstd-rs
+
+- zstd 0.14.3, BSD-3-Clause 
   <br/>https://github.com/gyscos/zstd-rs
 
