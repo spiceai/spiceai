@@ -252,6 +252,35 @@ fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn s
     Ok(String::from_utf8(w.into_inner()?)?)
 }
 
+/// `from` as the HTTP API reports it, without any `user[:password]@` part.
+///
+/// A component source can carry credentials in its URL, either directly
+/// (`https://user:password@host/file.csv`) or after a connector prefix
+/// (`iceberg:https://user:password@host/v1/namespaces`). Any API key that can
+/// list components can read `from`, so the user name and password are removed
+/// before it is returned. A source without credentials is returned unchanged.
+pub(crate) fn redact_source_credentials(from: &str) -> String {
+    if let Some(redacted) = strip_url_userinfo(from) {
+        return redacted;
+    }
+    if let Some((prefix, rest)) = from.split_once(':')
+        && let Some(redacted) = strip_url_userinfo(rest)
+    {
+        return format!("{prefix}:{redacted}");
+    }
+    from.to_string()
+}
+
+fn strip_url_userinfo(source: &str) -> Option<String> {
+    let mut url = url::Url::parse(source).ok()?;
+    if url.username().is_empty() && url.password().is_none() {
+        return None;
+    }
+    url.set_username("").ok()?;
+    url.set_password(None).ok()?;
+    Some(url.to_string())
+}
+
 fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
     // First check the runtime status which tracks the actual component state
     // (Initializing, Refreshing, Ready, Error, etc.)
@@ -981,6 +1010,36 @@ mod tests {
     /// A query the results cache refuses (e.g. one calling `random()` or
     /// `now()`) reports `CacheDisabled`, which must emit no `X-Cache` or
     /// `Results-Cache-Status` header rather than a misleading HIT/MISS.
+    #[test]
+    fn redact_source_credentials_removes_userinfo() {
+        assert_eq!(
+            redact_source_credentials("https://user:secret@files.example.com/data.csv"),
+            "https://files.example.com/data.csv"
+        );
+        assert_eq!(
+            redact_source_credentials("http://token@files.example.com:8080/data.csv"),
+            "http://files.example.com:8080/data.csv"
+        );
+        assert_eq!(
+            redact_source_credentials("iceberg:https://user:secret@catalog.example.com/v1/ns"),
+            "iceberg:https://catalog.example.com/v1/ns"
+        );
+    }
+
+    #[test]
+    fn redact_source_credentials_keeps_sources_without_credentials() {
+        for from in [
+            "postgres:public.orders",
+            "s3://bucket/path/trips.parquet",
+            "https://files.example.com/data.csv",
+            "file:../data/orders.csv",
+            "memory:store",
+            "spice.ai:spiceai/quickstart/datasets/taxi_trips",
+        ] {
+            assert_eq!(redact_source_credentials(from), from);
+        }
+    }
+
     #[test]
     fn disabled_results_cache_emits_no_cache_status_headers() {
         assert!(status_to_x_cache_value(CacheStatus::CacheDisabled).is_none());
