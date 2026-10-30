@@ -617,11 +617,11 @@ mod tests {
         else {
             panic!("expected a compression ratio error, got {error:?}");
         };
-        // The padding cannot be decoded before at least as many bytes have been received
-        // for it, so it lets the body decode past the floor to at least the ratio times
-        // the padding, but never past the ratio times what was received by more than the
-        // block that crossed it. How far past the padding's share a refusal lands depends
-        // on how far reads run ahead of the decoder, which depends on scheduling.
+        // Incompressible padding is received byte for byte, so it carries the body past the
+        // floor to at least the ratio times the padding, but never past the ratio times what
+        // was received by more than the block that crossed it. Where between those the
+        // refusal lands depends on the zlib the encoder links and on how much each socket
+        // read delivers, so the test bounds only these.
         const { assert!(PADDING * MAX_COMPRESSION_RATIO > RATIO_CHECK_FLOOR_BYTES) };
         assert!(
             decoded > PADDING * MAX_COMPRESSION_RATIO,
