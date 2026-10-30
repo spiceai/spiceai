@@ -19,6 +19,7 @@ use crate::parameters::ConnectorContext;
 use data_components::cdc::{AccelerationContents, ChangesStream};
 use data_components::csv_header_projection::HeaderProjectedCsvFormat;
 use data_components::file_schema_drift::{FileSchemaDriftGuard, FileSchemaDriftLayer};
+use data_components::fresh_file_listing::FreshFileListingLayer;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -266,13 +267,16 @@ impl ListingTableTemplate {
             Arc::new(LocationPruningListingTable::new(
                 table,
                 Arc::clone(&self.object_store),
-                table_path,
+                table_path.clone(),
                 Arc::clone(&self.schema),
                 self.extension.as_str(),
             ))
         } else {
             table
         };
+        // A file dataset is read as its files are at query time, not as they were
+        // listed at its first scan.
+        let table = FreshFileListingLayer::over(table, vec![table_path]);
         match self.schema_drift_guard() {
             Some(guard) => FileSchemaDriftLayer::over(table, guard),
             None => table,
