@@ -298,6 +298,8 @@ pub(crate) struct TestBakeFiles {
     /// `(files rewritten, files kept)` by the last committed bake that split
     /// its inputs, or `None` when it rewrote every file unsplit.
     pub(crate) last: Option<(usize, usize)>,
+    /// In place of [`BAKE_LINK_MIN_FILE_BYTES`].
+    pub(crate) link_min_file_bytes: Option<u64>,
 }
 
 /// An on-conflict deletion update with the deletion index it extends to, built
@@ -4257,6 +4259,20 @@ fn protected_merge_input_budget_for_pool(
 /// or below the size-tier merge's trigger — see
 /// [`CayenneTableProvider::bake_keep_recent_snapshots`].
 const BAKE_KEEP_RECENT_SNAPSHOTS: usize = 3;
+
+/// Size below which a seq-prefix bake rewrites an input file even when it
+/// removes no row from it, rather than link it into its output.
+///
+/// A bake's output is one large protected snapshot that the size-tier merge
+/// leaves alone, so a small file linked into it stays a file of its own for as
+/// long as the snapshot lives, and every scan opens it. The full rewrite folded
+/// the settled prefix's small checkpoint files into a few large ones; on the rig
+/// the first bakes of a partial bake linked 104-372 checkpoint files of about
+/// 30-90 KB each into their outputs instead (4-10 MB in all), while the files a
+/// bake writes are about 10 MB. Rewriting the small ones costs little and keeps
+/// the consolidation; a file of a megabyte or more is already worth reading as
+/// it is.
+const BAKE_LINK_MIN_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Triggered seq-prefix bakes a table skips in a row, while other tables hold
 /// the process-wide bake slot, before its next one waits for the slot (see
@@ -30167,6 +30183,14 @@ impl CayenneTableProvider {
         {
             return None;
         }
+        #[cfg(test)]
+        let link_min_file_bytes = self
+            .test_bake_files
+            .lock()
+            .link_min_file_bytes
+            .unwrap_or(BAKE_LINK_MIN_FILE_BYTES);
+        #[cfg(not(test))]
+        let link_min_file_bytes = BAKE_LINK_MIN_FILE_BYTES;
         let mut inputs = Vec::with_capacity(selected.len());
         let (mut rewritten_bytes, mut kept_bytes) = (0_u64, 0_u64);
         for (snapshot_id, threshold) in selected {
@@ -30187,7 +30211,10 @@ impl CayenneTableProvider {
             let (mut rewrite_names, mut keep_names) = (Vec::new(), Vec::new());
             for file in captured.files.iter() {
                 let name = file.object_meta.location.filename()?.to_string();
-                let holds = match Box::pin(self.bake_file_holds_deleted_rows(
+                // A small file is rewritten whatever it holds (see
+                // `BAKE_LINK_MIN_FILE_BYTES`), so it needs no check.
+                let holds = file.object_meta.size < link_min_file_bytes
+                    || match Box::pin(self.bake_file_holds_deleted_rows(
                     state,
                     snapshot_id,
                     &captured,
@@ -30198,18 +30225,18 @@ impl CayenneTableProvider {
                 ))
                 .await
                 {
-                    Ok(holds) => holds,
-                    Err(error) => {
-                        tracing::debug!(
-                            target: "cayenne::compaction",
-                            table = self.table_name(),
-                            file = name.as_str(),
-                            %error,
-                            "Seq-prefix bake rewrites a file it could not check for deleted rows"
-                        );
-                        true
-                    }
-                };
+                        Ok(holds) => holds,
+                        Err(error) => {
+                            tracing::debug!(
+                                target: "cayenne::compaction",
+                                table = self.table_name(),
+                                file = name.as_str(),
+                                %error,
+                                "Seq-prefix bake rewrites a file it could not check for deleted rows"
+                            );
+                            true
+                        }
+                    };
                 if holds {
                     rewritten_bytes = rewritten_bytes.saturating_add(file.object_meta.size);
                     rewrite.push(file.clone());

@@ -122,7 +122,13 @@ async fn table_keyed(name: &'static str, key: Key, rewrite_all: bool) -> Table {
     )
     .await;
     provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
-    provider.test_bake_files.lock().rewrite_all = rewrite_all;
+    {
+        let mut knobs = provider.test_bake_files.lock();
+        knobs.rewrite_all = rewrite_all;
+        // These tables' files are a few hundred kilobytes, under the size a bake
+        // links by default; link any file, so the tests exercise linking.
+        knobs.link_min_file_bytes = Some(0);
+    }
     Table {
         provider,
         catalog,
@@ -659,5 +665,46 @@ async fn a_bake_input_files_row_count_comes_exact_from_its_footer() {
     assert!(
         checked > 0,
         "precondition: the table has input files to check"
+    );
+}
+
+/// A bake rewrites a small input file even when it removes no row from it,
+/// rather than link it: a bake's output is a large snapshot no merge revisits,
+/// so a linked small file would stay a file of its own for good. With the
+/// default size every input file of this table is small, so the bake rewrites
+/// them all and links none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bake_rewrites_small_files_it_could_keep() {
+    let t = table("bake_partial_small_files", false).await;
+    t.provider.test_bake_files.lock().link_min_file_bytes = None;
+    let mut model = Model::new();
+    write_checkpoints(&t, &mut model, 0..6).await;
+    let mut largest: u64 = 0;
+    for id in t.provider.protected_snapshots.load().keys() {
+        for file in t
+            .provider
+            .capture_snapshot_files_under_fence(id)
+            .await
+            .expect("capture")
+            .files
+            .iter()
+        {
+            largest = largest.max(file.object_meta.size);
+        }
+    }
+    assert!(
+        largest < BAKE_LINK_MIN_FILE_BYTES,
+        "precondition: every input file ({largest} bytes at most) is under the link size"
+    );
+    bake(&t.provider, "default link size").await;
+    assert_eq!(
+        t.provider.test_bake_files.lock().last,
+        None,
+        "the bake rewrote every input file and linked none"
+    );
+    assert_rows(
+        &rows_of(&t.provider, t.name).await,
+        &model,
+        "after a bake that rewrote every small file",
     );
 }
