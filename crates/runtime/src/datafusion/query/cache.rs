@@ -1462,6 +1462,7 @@ impl Query {
         // Get optional dedicated refresh runtime, fall back to current runtime if not configured
         let refresh_runtime = df.refresh_runtime().cloned();
         let deadline = tokio::time::Instant::from_std(claim.expires_at);
+        let cancel_token = background_context.cancellation_token().clone();
 
         // Build the background task
         let background_task = async move {
@@ -1555,6 +1556,10 @@ impl Query {
                     cache_key = cache_key_u64,
                     "Background revalidation did not finish before its deadline, cancelled"
                 );
+                // The query runs in its own task on the query runtime, so dropping the wait
+                // for it leaves that task queued for admission or planning; cancelling the
+                // context's token ends it too.
+                cancel_token.cancel();
                 record_revalidation_outcome(RevalidationOutcome::TimedOut);
             }
 
