@@ -256,22 +256,33 @@ fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn s
 /// (including none) before the authority, e.g. `https:user:pass@host`.
 const SPECIAL_URL_SCHEMES: &[&str] = &["http", "https", "ws", "wss", "ftp"];
 
-/// Schemes where the userinfo names a storage container, not a credential
-/// (`abfss://container@account.dfs.core.windows.net/path`).
-const CONTAINER_USERINFO_SCHEMES: &[&str] = &["abfs", "abfss", "wasb", "wasbs"];
+/// Schemes where the part before `@` is not a credential: a storage
+/// container (`abfss://container@account.dfs.core.windows.net/path`), or a
+/// file name (`file://alice@report.csv`).
+const NON_CREDENTIAL_USERINFO_SCHEMES: &[&str] = &["abfs", "abfss", "wasb", "wasbs", "file"];
 
-/// Query keys whose values are credentials (passwords, tokens, API keys,
-/// signed-URL signatures). Matched as a case-insensitive substring.
-const SECRET_QUERY_KEY_MARKERS: &[&str] = &[
+/// Query keys whose values are credentials, compared with case and
+/// punctuation removed (`api_key` and `apiKey` are both `apikey`).
+const SECRET_QUERY_KEYS: &[&str] = &["key", "sig", "auth", "pwd", "pass"];
+
+/// Endings of query keys whose values are credentials (`password`,
+/// `client_secret`, `access_token`, `X-Amz-Signature`, `x-goog-credential`),
+/// compared the same way. `sort_key` and `monkey` do not match.
+const SECRET_QUERY_KEY_ENDINGS: &[&str] = &[
     "password",
     "passwd",
-    "pwd",
     "secret",
     "token",
-    "key",
-    "auth",
-    "credential",
+    "apikey",
+    "accesskey",
+    "secretkey",
+    "privatekey",
+    "accountkey",
+    "sharedkey",
     "signature",
+    "credential",
+    "credentials",
+    "authorization",
 ];
 
 const REDACTED: &str = "***";
@@ -286,19 +297,14 @@ fn ends_embedded_url(c: char) -> bool {
 }
 
 fn is_secret_query_key(key: &str) -> bool {
-    let key = percent_encoding::percent_decode_str(key)
+    let key: String = percent_encoding::percent_decode_str(key)
         .decode_utf8_lossy()
-        .to_ascii_lowercase();
-    if key == "sig" {
-        return true;
-    }
-    // `author` is not `auth`; `authorization` still is.
-    let key = if key.contains("authoriz") {
-        key
-    } else {
-        key.replace("author", "")
-    };
-    SECRET_QUERY_KEY_MARKERS.iter().any(|m| key.contains(m))
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    SECRET_QUERY_KEYS.contains(&key.as_str())
+        || SECRET_QUERY_KEY_ENDINGS.iter().any(|e| key.ends_with(e))
 }
 
 /// Whether `authority` (no userinfo) is a plausible `host[:port]`, i.e. its
@@ -342,31 +348,42 @@ fn redact_url_at(s: &str, embedded: bool) -> Option<(String, usize)> {
     };
     let ends_url = |c: char| embedded && ends_embedded_url(c);
 
-    // The authority as a URL parser would read it, ending at the path, query
-    // or fragment. When that has no `@` but is not a valid `host[:port]`,
-    // the password itself contains `?`, `#` or a quote (`user:pa?ss@host`);
-    // extend the authority to the last `@` before the path so it is still
-    // removed.
+    // A connector prefix written with `://` (`iceberg://https://u:p@h/...`):
+    // redact the inner URL.
+    if let Some((inner, len)) = redact_url_at(&s[authority_start..], embedded) {
+        return Some((
+            format!("{}{inner}", &s[..authority_start]),
+            authority_start + len,
+        ));
+    }
+
+    // The authority as a URL parser would read it ends at the path, query or
+    // fragment. A password can hold a raw `?`, `#`, quote or tab, though
+    // (`user:pa?ss@host`), and some drivers read it that way. So when the
+    // region up to the path holds an `@` past that point, and the parsed
+    // authority is userinfo-like (has `@` or `:`) or is not a valid
+    // `host[:port]`, fail closed: remove everything up to the last `@`
+    // before the path. Only a space ends that region in free text, since URL
+    // parsers strip tabs and newlines.
     let after_start = &s[authority_start..];
     let strict_len = after_start
         .find(|c: char| matches!(c, '/' | '\\' | '?' | '#') || ends_url(c))
         .unwrap_or(after_start.len());
     let strict = &after_start[..strict_len];
-    let authority_len = if strict.contains('@') || is_host_and_port(strict) {
-        strict_len
-    } else {
-        let extended_len = after_start
-            .find(|c: char| matches!(c, '/' | '\\') || (embedded && c.is_whitespace()))
-            .unwrap_or(after_start.len());
-        match after_start[..extended_len].rfind('@') {
-            Some(at) => {
-                let host_len = after_start[at + 1..extended_len]
-                    .find(|c: char| matches!(c, '?' | '#') || ends_url(c))
-                    .unwrap_or(extended_len - at - 1);
-                at + 1 + host_len
-            }
-            None => strict_len,
+    let extended_len = after_start
+        .find(|c: char| matches!(c, '/' | '\\') || (embedded && c == ' '))
+        .unwrap_or(after_start.len());
+    let last_at = after_start[..extended_len].rfind('@');
+    let authority_len = match last_at {
+        Some(at)
+            if at >= strict_len && (strict.contains(['@', ':']) || !is_host_and_port(strict)) =>
+        {
+            let host_len = after_start[at + 1..extended_len]
+                .find(|c: char| matches!(c, '?' | '#') || ends_url(c))
+                .unwrap_or(extended_len - at - 1);
+            at + 1 + host_len
         }
+        _ => strict_len,
     };
     let authority_end = authority_start + authority_len;
     let authority = &s[authority_start..authority_end];
@@ -374,7 +391,7 @@ fn redact_url_at(s: &str, embedded: bool) -> Option<(String, usize)> {
     let mut out = String::with_capacity(s.len());
     out.push_str(&s[..authority_start]);
     match authority.rfind('@') {
-        Some(at) if !CONTAINER_USERINFO_SCHEMES.contains(&scheme.as_str()) => {
+        Some(at) if !NON_CREDENTIAL_USERINFO_SCHEMES.contains(&scheme.as_str()) => {
             out.push_str(&authority[at + 1..]);
         }
         _ => out.push_str(authority),
@@ -1324,6 +1341,21 @@ mod tests {
                 "https://h/f.csv?author=alice",
             ),
             (
+                "https://h/f.csv?monkey=banana&sort_key=date",
+                "https://h/f.csv?monkey=banana&sort_key=date",
+            ),
+            (
+                "https://h/f.csv?api_key=K&X-Amz-Signature=S",
+                "https://h/f.csv?api_key=***&X-Amz-Signature=***",
+            ),
+            (
+                "iceberg://https://u:S@h/x?token=T",
+                "iceberg://https://h/x?token=***",
+            ),
+            ("https://u:123?SECRET@h/x", "https://h/x"),
+            ("https://u:p@ss?SECRET@h/x", "https://h/x"),
+            ("file://alice@report.csv", "file://alice@report.csv"),
+            (
                 "https://h/f.csv?email=a@b.example",
                 "https://h/f.csv?email=a@b.example",
             ),
@@ -1333,6 +1365,12 @@ mod tests {
         assert_eq!(
             redact_message_credentials("bad url 'https://u:pa?ss@h/f.csv': invalid port"),
             "bad url 'https://h/f.csv': invalid port"
+        );
+        assert_eq!(
+            redact_message_credentials(
+                "bad url https://u:pa\tss@h/x and iceberg://https://u:S@h/y"
+            ),
+            "bad url https://h/x and iceberg://https://h/y"
         );
     }
 
