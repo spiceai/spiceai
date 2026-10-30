@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use stateright::{Checker, Expectation, Model};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 mod action_compatibility;
 mod commits;
@@ -9,11 +10,15 @@ mod concurrent;
 mod core;
 mod dataset_lifecycle;
 mod floors;
+mod intent_partitioned;
+mod intent_roll_forward;
 mod position_deletes;
 mod read_programs;
+mod replicas;
 mod retention;
 mod seq_order;
 mod source_positions;
+mod standby;
 mod state_rules;
 mod transactions;
 mod window;
@@ -28,6 +33,9 @@ pub struct Run {
     seed: Option<u64>,
     failure: &'static str,
 }
+/// Checker threads unless `MODEL_THREADS` says otherwise. Results do not depend
+/// on it; past about six, the shared state set gains little.
+const DEFAULT_THREADS: usize = 6;
 /// All runs of the design, including safeguard-removal controls.
 #[must_use]
 pub fn runs() -> Vec<Run> {
@@ -153,6 +161,54 @@ pub fn runs() -> Vec<Run> {
             failure: "I10 source append prefix exactly once",
         },
         Run {
+            name: "standby",
+            family: "standby",
+            mode: "standby",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "standby-three",
+            family: "standby",
+            mode: "standby-three",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "standby-early-safety",
+            family: "standby",
+            mode: "standby-early-safety",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "standby-no-generation",
+            family: "standby",
+            mode: "standby-no-generation",
+            bound: 0,
+            seed: None,
+            failure: "no stale-generation commit accepted",
+        },
+        Run {
+            name: "standby-early-acquire",
+            family: "standby",
+            mode: "standby-early",
+            bound: 0,
+            seed: None,
+            failure: "lease exclusive until expiry",
+        },
+        Run {
+            name: "standby-no-renew",
+            family: "standby",
+            mode: "standby-no-renew",
+            bound: 0,
+            seed: None,
+            failure: "healthy holder keeps its lease",
+        },
+        Run {
             name: "commits-restart-turnover",
             family: "commits",
             mode: "commit-restart",
@@ -217,6 +273,14 @@ pub fn runs() -> Vec<Run> {
             failure: "",
         },
         Run {
+            name: "retention-readers",
+            family: "retention",
+            mode: "retention-readers",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
             name: "retention-no-age-check",
             family: "retention",
             mode: "retention-no-age-check",
@@ -233,17 +297,25 @@ pub fn runs() -> Vec<Run> {
             failure: "committed state references only present objects",
         },
         Run {
-            name: "retention-no-head-move",
+            name: "retention-writer-clock",
             family: "retention",
-            mode: "retention-no-head-move",
+            mode: "retention-writer-clock",
             bound: 0,
             seed: None,
             failure: "committed state references only present objects",
         },
         Run {
-            name: "retention-no-recheck",
+            name: "retention-list-date",
             family: "retention",
-            mode: "retention-no-recheck",
+            mode: "retention-list-date",
+            bound: 0,
+            seed: None,
+            failure: "committed state references only present objects",
+        },
+        Run {
+            name: "retention-reref-published",
+            family: "retention",
+            mode: "retention-reref-published",
             bound: 0,
             seed: None,
             failure: "committed state references only present objects",
@@ -257,36 +329,228 @@ pub fn runs() -> Vec<Run> {
             failure: "committed state references only present objects",
         },
         Run {
-            name: "retention-no-retention",
+            name: "retention-readers-no-retention",
             family: "retention",
-            mode: "retention-no-retention",
+            mode: "retention-readers-no-retention",
             bound: 0,
             seed: None,
             failure: "a query within the retention never fails",
         },
         Run {
-            name: "retention-stale-start",
+            name: "retention-readers-stale-start",
             family: "retention",
-            mode: "retention-stale-start",
+            mode: "retention-readers-stale-start",
             bound: 0,
             seed: None,
             failure: "a query within the retention never fails",
         },
         Run {
-            name: "retention-keep-timestamps",
+            name: "retention-readers-keep-timestamps",
             family: "retention",
-            mode: "retention-keep-timestamps",
+            mode: "retention-readers-keep-timestamps",
             bound: 0,
             seed: None,
             failure: "a query within the retention never fails",
         },
         Run {
-            name: "retention-missing-as-empty",
+            name: "retention-readers-volatile-removals",
             family: "retention",
-            mode: "retention-missing-as-empty",
+            mode: "retention-readers-volatile-removals",
+            bound: 0,
+            seed: None,
+            failure: "a query within the retention never fails",
+        },
+        Run {
+            name: "retention-readers-sweep-removed",
+            family: "retention",
+            mode: "retention-readers-sweep-removed",
+            bound: 0,
+            seed: None,
+            failure: "a query within the retention never fails",
+        },
+        Run {
+            name: "retention-readers-response-time",
+            family: "retention",
+            mode: "retention-readers-response-time",
+            bound: 0,
+            seed: None,
+            failure: "a query within the retention never fails",
+        },
+        Run {
+            name: "retention-readers-missing-as-empty",
+            family: "retention",
+            mode: "retention-readers-missing-as-empty",
             bound: 0,
             seed: None,
             failure: "rows or an error",
+        },
+        Run {
+            name: "retention-remote-gc",
+            family: "retention",
+            mode: "retention-remote-gc",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "retention-readers-remote-gc",
+            family: "retention",
+            mode: "retention-readers-remote-gc",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "retention-readers-checkpoint",
+            family: "retention",
+            mode: "retention-readers-checkpoint",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "retention-readers-remote-gc-checkpoint",
+            family: "retention",
+            mode: "retention-readers-remote-gc-checkpoint",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "retention-readers-remote-gc-checkpoint-root-omits",
+            family: "retention",
+            mode: "retention-readers-remote-gc-checkpoint-root-omits",
+            bound: 0,
+            seed: None,
+            failure: "a query within the retention never fails",
+        },
+        Run {
+            name: "retention-remote-gc-blind-commit",
+            family: "retention",
+            mode: "retention-remote-gc-blind-commit",
+            bound: 0,
+            seed: None,
+            failure: "committed state references only present objects",
+        },
+        Run {
+            name: "retention-readers-remote-gc-keep-timestamps",
+            family: "retention",
+            mode: "retention-readers-remote-gc-keep-timestamps",
+            bound: 0,
+            seed: None,
+            failure: "a query within the retention never fails",
+        },
+        Run {
+            name: "retention-readers-checkpoint-root-omits",
+            family: "retention",
+            mode: "retention-readers-checkpoint-root-omits",
+            bound: 0,
+            seed: None,
+            failure: "a query within the retention never fails",
+        },
+        Run {
+            name: "retention-readers-checkpoint-tail-only",
+            family: "retention",
+            mode: "retention-readers-checkpoint-tail-only",
+            bound: 0,
+            seed: None,
+            failure: "a query within the retention never fails",
+        },
+        Run {
+            name: "naming",
+            family: "state-rules",
+            mode: "identity-design",
+            bound: 3,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "replicas",
+            family: "replicas",
+            mode: "replicas",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "replicas-readers",
+            family: "replicas",
+            mode: "replicas-readers",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "replicas-readers-source-404-only",
+            family: "replicas",
+            mode: "replicas-readers-source-404-only",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "replicas-readers-adoption-all-present",
+            family: "replicas",
+            mode: "replicas-readers-adoption-all-present",
+            bound: 0,
+            seed: None,
+            failure: "an adopted head references only objects in the replica",
+        },
+        Run {
+            name: "replicas-readers-no-frontier",
+            family: "replicas",
+            mode: "replicas-readers-no-frontier",
+            bound: 0,
+            seed: None,
+            failure: "a head confirmed current references only objects in the replica",
+        },
+        Run {
+            name: "replicas-readers-adopt-lower",
+            family: "replicas",
+            mode: "replicas-readers-adopt-lower",
+            bound: 0,
+            seed: None,
+            failure: "a reader never adopts a lower head",
+        },
+        Run {
+            name: "replicas-readers-replica-time",
+            family: "replicas",
+            mode: "replicas-readers-replica-time",
+            bound: 0,
+            seed: None,
+            failure: "a query within the protection window never fails",
+        },
+        Run {
+            name: "replicas-readers-missing-as-empty",
+            family: "replicas",
+            mode: "replicas-readers-missing-as-empty",
+            bound: 0,
+            seed: None,
+            failure: "rows or an error",
+        },
+        Run {
+            name: "replicas-orphan-head-age",
+            family: "replicas",
+            mode: "replicas-orphan-head-age",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "replicas-eu-age-only",
+            family: "replicas",
+            mode: "replicas-eu-age-only",
+            bound: 0,
+            seed: None,
+            failure: "replica GC never deletes an object the source head references",
+        },
+        Run {
+            name: "replicas-eu-orphan-no-source-check",
+            family: "replicas",
+            mode: "replicas-eu-orphan-no-source-check",
+            bound: 0,
+            seed: None,
+            failure: "replica GC never deletes an object the source head references",
         },
         Run {
             name: "naming",
@@ -463,6 +727,22 @@ pub fn runs() -> Vec<Run> {
             bound: 2,
             seed: None,
             failure: "I2 acknowledged logical write exactly once",
+        },
+        Run {
+            name: "commits-retry-expiry",
+            family: "commits",
+            mode: "commit-retry-expiry",
+            bound: 2,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "commits-retry-expiry-no-horizon",
+            family: "commits",
+            mode: "commit-retry-expiry-no-horizon",
+            bound: 2,
+            seed: None,
+            failure: "logical write never applied twice",
         },
         Run {
             name: "commits-etag",
@@ -1422,9 +1702,16 @@ fn concurrent_maintenance_runs() -> Vec<Run> {
             "",
         ),
         (
-            "remote-maintenance-minimal-no-publication-fence",
+            "remote-maintenance-no-retry-lease-check",
             "remote-maintenance",
-            "minimal-no-publication-fence",
+            "two-maintainers-no-retry-lease-check",
+            3,
+            "I3 remote maintenance publication fenced",
+        ),
+        (
+            "remote-maintenance-minimal-lease-outside-head",
+            "remote-maintenance",
+            "minimal-publication-fence-lease-outside-head",
             3,
             "I3 remote maintenance publication fenced",
         ),
@@ -1690,6 +1977,31 @@ fn additional_runs() -> Vec<Run> {
             "I9 lifecycle logical rows",
         ),
         ("dataset-query-expiry", "expiry", 2, ""),
+        // Queries during prepared transactions, with and without byte batches.
+        (
+            "dataset-prepare-query-expiry",
+            "prepare-cutoff-cap-expiry",
+            3,
+            "",
+        ),
+        (
+            "dataset-prepare-query-expiry-missing-as-empty",
+            "prepare-cutoff-cap-expiry-missing-as-empty",
+            3,
+            "snapshot rows or error",
+        ),
+        (
+            "dataset-prepare-query-expiry-byte-window",
+            "prepare-cutoff-cap-expiry-byte-window-metadata-prefix",
+            5,
+            "",
+        ),
+        (
+            "dataset-prepare-query-expiry-byte-window-no-query-batch",
+            "prepare-cutoff-cap-expiry-byte-window-metadata-prefix-no-query-batch",
+            5,
+            "I7 byte lifecycle query recovery",
+        ),
         (
             "dataset-query-expiry-missing-as-empty",
             "expiry-missing-as-empty",
@@ -1769,6 +2081,140 @@ fn additional_runs() -> Vec<Run> {
             bound,
             seed: None,
             failure,
+        });
+    }
+    // One writer holding both datasets' leases commits a source transaction
+    // to A with a pending intent for B, then applies the intent to B.
+    for (name, mode, bound, failure) in [
+        ("intent-roll-forward-1-exhaust", "intent", 1, ""),
+        ("intent-roll-forward-2-exhaust", "intent", 2, ""),
+        (
+            "intent-roll-forward-two-takeovers-2-exhaust",
+            "intent-two-takeovers",
+            2,
+            "",
+        ),
+        (
+            "intent-roll-forward-disjoint-writer-1-exhaust",
+            "intent-disjoint-writer",
+            1,
+            "",
+        ),
+        (
+            "intent-roll-forward-no-intent",
+            "intent-no-intent",
+            1,
+            "eventual atomicity at quiescence",
+        ),
+        (
+            "intent-roll-forward-no-idempotency",
+            "intent-no-idempotency",
+            1,
+            "B applies each transaction at most once",
+        ),
+        (
+            "intent-roll-forward-second-writer",
+            "intent-second-writer",
+            1,
+            "eventual atomicity at quiescence",
+        ),
+        (
+            "intent-roll-forward-second-writer-blind-rebase",
+            "intent-second-writer-blind-rebase",
+            1,
+            "B keyed values follow commit order",
+        ),
+        (
+            "intent-roll-forward-abort-recovery",
+            "intent-abort-recovery",
+            1,
+            "acknowledged transactions in both datasets at quiescence",
+        ),
+        (
+            "intent-roll-forward-ingest-before-recovery",
+            "intent-ingest-before-recovery",
+            2,
+            "eventual atomicity at quiescence",
+        ),
+        // The same fast path run by one exclusive writer per source partition:
+        // an optional capability that no milestone requires.
+        (
+            "intent-roll-forward-partitioned-1-exhaust",
+            "intent-partitioned",
+            1,
+            "",
+        ),
+        (
+            "intent-roll-forward-partitioned-without-done-2-exhaust",
+            "intent-partitioned-without-done",
+            2,
+            "",
+        ),
+        (
+            "intent-roll-forward-partitioned-handoff-1-exhaust",
+            "intent-partitioned-handoff",
+            1,
+            "",
+        ),
+        (
+            "intent-roll-forward-partitioned-a-only-generation",
+            "intent-partitioned-a-only-generation",
+            1,
+            "no stale-generation commit accepted per partition",
+        ),
+        (
+            "intent-roll-forward-partitioned-cross-partition",
+            "intent-partitioned-cross-partition",
+            1,
+            "eventual atomicity at quiescence",
+        ),
+        (
+            "intent-roll-forward-partitioned-cross-partition-blind-rebase",
+            "intent-partitioned-cross-partition-blind-rebase",
+            1,
+            "B keyed values follow commit order",
+        ),
+        (
+            "intent-roll-forward-partitioned-handoff-no-drain",
+            "intent-partitioned-handoff-no-drain",
+            1,
+            "eventual atomicity at quiescence",
+        ),
+        (
+            "intent-roll-forward-partitioned-ingest-before-recovery",
+            "intent-partitioned-ingest-before-recovery",
+            2,
+            "eventual atomicity at quiescence",
+        ),
+    ] {
+        runs.push(Run {
+            name,
+            family: "intent-roll-forward",
+            mode,
+            bound,
+            seed: None,
+            failure,
+        });
+    }
+    // A turnover and a crash in each partition exceed the exhaustive budget;
+    // these runs sample that graph.
+    for (name, seed) in [
+        (
+            "intent-roll-forward-partitioned-each-partition-2-simulation-7",
+            7,
+        ),
+        (
+            "intent-roll-forward-partitioned-each-partition-2-simulation-42",
+            42,
+        ),
+    ] {
+        runs.push(Run {
+            name,
+            family: "intent-roll-forward",
+            mode: "intent-partitioned-each-partition",
+            bound: 2,
+            seed: Some(seed),
+            failure: "",
         });
     }
     runs
@@ -1887,14 +2333,59 @@ where
 {
     let mut state = initial.clone();
     for action in actions {
-        let mut enabled = vec![];
-        model.actions(&state, &mut enabled);
-        if !enabled.contains(action) {
+        let mut listed = vec![];
+        model.actions(&state, &mut listed);
+        if !listed.contains(action) {
             return None;
         }
         state = model.next_state(&state, action.clone())?;
     }
     Some(state)
+}
+/// Set while a simulation run is checked. Models list candidate actions and
+/// reject the disabled ones in `next_state`, which the exhaustive checkers
+/// handle at no extra cost. Stateright's simulation checker records a
+/// rejected pick in the path, so a reported path cannot be reconstructed; it
+/// gets only the enabled actions.
+static SIMULATING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn prune_for_simulation<M: Model>(
+    model: &M,
+    state: &M::State,
+    actions: &mut Vec<M::Action>,
+) where
+    M::Action: Clone,
+{
+    if SIMULATING.load(Ordering::Relaxed) {
+        actions.retain(|action| model.next_state(state, action.clone()).is_some());
+    }
+}
+
+struct Simulating;
+impl Simulating {
+    fn start(on: bool) -> Self {
+        SIMULATING.store(on, Ordering::Relaxed);
+        Self
+    }
+}
+impl Drop for Simulating {
+    fn drop(&mut self) {
+        SIMULATING.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Whether any listed action has a next state. Models list candidate actions and
+/// reject the disabled ones in `next_state`, so the list alone can be non-empty
+/// at a terminal state.
+fn has_next<M: Model>(model: &M, state: &M::State) -> bool
+where
+    M::Action: Clone,
+{
+    let mut listed = vec![];
+    model.actions(state, &mut listed);
+    listed
+        .into_iter()
+        .any(|action| model.next_state(state, action).is_some())
 }
 fn minimize<M: Model>(
     model: &M,
@@ -1948,6 +2439,7 @@ where
         return walk(&model, &run, &spec);
     }
     println!("START {}", run.name);
+    let _simulating = Simulating::start(run.seed.is_some());
     let start = Instant::now();
     // A timed-out Stateright broker is closed too. Terminate rather than using
     // broker closure as evidence that the search exhausted its graph.
@@ -1962,12 +2454,36 @@ where
             std::process::exit(1);
         }
     });
+    // A control is done once its expected failure and every witness it must
+    // reach are found; exhausting the rest of its graph checks nothing more.
+    let targets = if run.failure.is_empty() || run.seed.is_some() {
+        std::collections::BTreeSet::default()
+    } else {
+        model
+            .properties()
+            .iter()
+            .filter(|p| {
+                p.name == run.failure
+                    || p.expectation == Expectation::Sometimes
+                        && required_witness(&run, p.name, &p.expectation)
+            })
+            .map(|p| p.name)
+            .collect()
+    };
+    let finish = if targets.is_empty() {
+        stateright::HasDiscoveries::AnyOf(targets)
+    } else {
+        stateright::HasDiscoveries::AllOf(targets)
+    };
     let builder = model
         .checker()
-        .threads(1)
-        .finish_when(stateright::HasDiscoveries::AnyOf(
-            std::collections::BTreeSet::default(),
-        ));
+        .threads(
+            std::env::var("MODEL_THREADS")
+                .ok()
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(DEFAULT_THREADS),
+        )
+        .finish_when(finish);
     let builder = if let Some(f) = representative {
         builder.symmetry_fn(f)
     } else {
@@ -2001,6 +2517,192 @@ where
     let joined = watchdog.join().is_ok();
     result && joined
 }
+/// Whether a run must reach the `sometimes` property `name`.
+fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
+    let symmetry_required = run.mode.contains("symmetry")
+        && run.failure.is_empty()
+        && matches!(
+            name,
+            "both participants commit"
+                | "both participants abort"
+                | "all three participants commit"
+                | "all three participants abort"
+                | "checkpoint rebuilds unresolved Prepare"
+                | "identical retry accepted"
+        );
+    let composed_required = run.family == "lifecycle-composed"
+        && match name {
+            "prepared commit visible"
+            | "prepared abort discarded"
+            | "maintenance while prepared"
+            | "ordinary write while prepared"
+            | "prepared delete commits"
+            | "prepared upsert commits"
+            | "two actions prepared together"
+            | "abort after maintenance"
+            | "GC while prepared" => run.mode.contains("prepare"),
+            "checkpoint retains prepared actions" => {
+                run.mode.contains("prepare") && !run.mode.contains("byte-window")
+            }
+            "byte checkpoint retains prepared actions" => {
+                run.mode.contains("prepare") && run.mode.contains("byte-window")
+            }
+            "query while prepared returns its snapshot" => {
+                run.mode.contains("prepare") && run.mode.contains("expiry")
+            }
+            "higher cutoff while prepared" => run.mode == "prepare-no-cutoff-cap",
+            "warm subset rewrite" | "cold promotion" => true,
+            "row object collected" => {
+                run.failure.is_empty() && !run.mode.contains("no-sealed-floor")
+            }
+            "missing delayed object errors" => {
+                run.mode.contains("expiry") && !run.mode.contains("missing-as-empty")
+            }
+            "expired delayed read completes" | "object deleted during dispatched read" => {
+                run.mode.contains("expiry")
+            }
+            "query replay batch retained"
+            | "checkpoint page collected"
+            | "byte budget evicts records"
+            | "count budget evicts records" => run.mode == "byte-window-metadata-prefix",
+            _ => false,
+        };
+    let read_required = run.failure.is_empty()
+        && match (run.family, name) {
+            (
+                "read-programs",
+                "two read-dependent writers and blind commit"
+                | "conflict replans statement"
+                | "independent loser retries",
+            ) => run.mode.contains("full"),
+            _ => false,
+        };
+    let widened_required = run.failure.is_empty()
+        && run.mode.contains("widened")
+        && match (run.family, name) {
+            ("read-programs", "all three writers commit") => run.bound >= 3,
+            ("read-programs", "writer commits two statements") => {
+                run.bound >= 2 && !run.mode.contains("transaction")
+            }
+            ("read-programs", "conflict replans statement" | "independent loser retries") => {
+                run.bound >= 2
+            }
+            (
+                "read-delivery",
+                "lost response resolved by head read" | "delayed duplicate of accepted request",
+            ) => true,
+            _ => false,
+        };
+    // The remote-GC and checkpoint retention graphs must reach every witness,
+    // including the lost GC commit, the stale delete and the root rebuild.
+    let remote_retention_required = run.family == "retention"
+        && run.failure.is_empty()
+        && (run.mode.contains("remote-gc") || run.mode.contains("checkpoint"))
+        && *expectation == Expectation::Sometimes;
+    let standby_required =
+        run.family == "standby" && run.failure.is_empty() && *expectation == Expectation::Sometimes;
+    let promotion_required = run.family == "cold-promotion"
+        && run.failure.is_empty()
+        && *expectation == Expectation::Sometimes;
+    let delivery_required = run.family == "read-delivery"
+        && (run.failure.is_empty()
+            && matches!(
+                name,
+                "lost response resolved by head read" | "delayed duplicate of accepted request"
+            )
+            || run.mode.contains("no-resolve-before-replan")
+                && name == "unknown relative update applied twice");
+    let added_required = run.failure.is_empty()
+        && run.seed.is_none()
+        && match (run.family, name) {
+            (
+                "remote-maintenance",
+                "writer retries original stamps then commits" | "maintenance retries guards",
+            )
+            | ("position-deletes", "compaction remaps winning position delete") => true,
+            ("remote-maintenance", "covered clear retries and publishes") => {
+                run.mode.contains("clear-retry")
+            }
+            ("remote-maintenance", "checkpoint published") => !run.mode.contains("clear-retry"),
+            (
+                "remote-maintenance",
+                "two tables acknowledged together"
+                | "maintenance lease fenced"
+                | "cold promotion publishes",
+            ) => !run.mode.contains("minimal") && !run.mode.contains("clear-retry"),
+            (
+                "remote-maintenance",
+                "maintenance while Prepare unresolved" | "Prepare committed" | "Prepare aborted",
+            ) => run.mode.contains("prepare"),
+            (
+                "remote-maintenance",
+                "overlapping maintenance planned" | "maintenance replans invalid guards",
+            ) => run.mode.contains("no-file-set-lease"),
+            ("read-programs", "winner commits between transaction statements") => {
+                run.mode.contains("transaction-widened") && run.bound >= 2
+            }
+            (
+                "read-programs",
+                "transaction reads its own writes" | "transaction commits two nonempty statements",
+            ) => run.mode.contains("transaction-widened"),
+            ("position-deletes", "position delete remapped after compaction") => {
+                !run.mode.contains("already-dropped")
+            }
+            ("position-deletes", "already deleted target consumed") => {
+                run.mode == "already-dropped"
+            }
+            _ => false,
+        };
+    let intent_required = run.family == "intent-roll-forward"
+        && run.failure.is_empty()
+        && run.seed.is_none()
+        && match name {
+            "crash between A and B then recovery completes B"
+            | "B CAS lost to maintenance and retried"
+            | "lost response resolved by attempt id"
+            | "paused writer's request fenced"
+            | "reader sees A before B"
+            | "both partitions commit concurrently and both complete"
+            | "partition crash recovered while the other commits"
+            | "B CAS lost to the other partition and rebased"
+            | "partition turnover fences its old writer on B" => true,
+            "B CAS lost to disjoint writer and rebased" => run.mode.contains("disjoint-writer"),
+            "two transactions applied to both"
+            | "two transactions of one partition applied to both" => run.bound >= 2,
+            "handoff drained before the new owner ingests" => run.mode.contains("handoff"),
+            _ => false,
+        };
+    intent_required
+        || added_required
+        || standby_required
+        || remote_retention_required
+        || promotion_required
+        || delivery_required
+        || widened_required
+        || read_required
+        || symmetry_required
+        || composed_required
+        || run.seed.is_none()
+            && match run.name {
+                "dataset-lifecycle"
+                | "source-positions"
+                | "retention"
+                | "replicas"
+                | "replicas-readers"
+                | "replicas-readers-source-404-only"
+                | "replicas-orphan-head-age"
+                | "unknown-action-refusal" => *expectation == Expectation::Sometimes,
+                "commits-retry-expiry" => name == "unresolved past evidence horizon",
+                "replicas-eu-orphan-no-source-check" => {
+                    name == "writer commits an upload the replica already deleted"
+                }
+                "commits-restart-turnover" => matches!(
+                    name,
+                    "restart and lease turnover" | "persisted attempt restored"
+                ),
+                _ => false,
+            }
+}
 fn output<M: Model, C: Checker<M>>(c: &C, run: &Run, start: Instant) -> bool
 where
     M::State: Clone + PartialEq + std::fmt::Debug,
@@ -2029,146 +2731,7 @@ where
     let mut expected_found = run.failure.is_empty();
     for p in c.model().properties() {
         let found = discoveries.get(p.name);
-        let symmetry_required = run.mode.contains("symmetry")
-            && run.failure.is_empty()
-            && matches!(
-                p.name,
-                "both participants commit"
-                    | "both participants abort"
-                    | "all three participants commit"
-                    | "all three participants abort"
-                    | "checkpoint rebuilds unresolved Prepare"
-                    | "identical retry accepted"
-            );
-        let composed_required = run.family == "lifecycle-composed"
-            && match p.name {
-                "prepared commit visible"
-                | "prepared abort discarded"
-                | "maintenance while prepared"
-                | "ordinary write while prepared"
-                | "prepared delete commits"
-                | "prepared upsert commits"
-                | "two actions prepared together"
-                | "abort after maintenance"
-                | "checkpoint retains prepared actions"
-                | "GC while prepared" => run.mode.contains("prepare"),
-                "higher cutoff while prepared" => run.mode == "prepare-no-cutoff-cap",
-                "warm subset rewrite" | "cold promotion" => true,
-                "row object collected" => {
-                    run.failure.is_empty() && !run.mode.contains("no-sealed-floor")
-                }
-                "missing delayed object errors" => {
-                    run.mode.contains("expiry") && !run.mode.contains("missing-as-empty")
-                }
-                "expired delayed read completes" | "object deleted during dispatched read" => {
-                    run.mode.contains("expiry")
-                }
-                "query replay batch retained"
-                | "checkpoint page collected"
-                | "byte budget evicts records"
-                | "count budget evicts records" => run.mode == "byte-window-metadata-prefix",
-                _ => false,
-            };
-        let read_required = run.failure.is_empty()
-            && match (run.family, p.name) {
-                (
-                    "read-programs",
-                    "two read-dependent writers and blind commit"
-                    | "conflict replans statement"
-                    | "independent loser retries",
-                ) => run.mode.contains("full"),
-                _ => false,
-            };
-        let widened_required = run.failure.is_empty()
-            && run.mode.contains("widened")
-            && match (run.family, p.name) {
-                ("read-programs", "all three writers commit") => run.bound >= 3,
-                ("read-programs", "writer commits two statements") => {
-                    run.bound >= 2 && !run.mode.contains("transaction")
-                }
-                ("read-programs", "conflict replans statement" | "independent loser retries") => {
-                    run.bound >= 2
-                }
-                (
-                    "read-delivery",
-                    "lost response resolved by head read" | "delayed duplicate of accepted request",
-                ) => true,
-                _ => false,
-            };
-        let promotion_required = run.family == "cold-promotion"
-            && run.failure.is_empty()
-            && p.expectation == Expectation::Sometimes;
-        let delivery_required = run.family == "read-delivery"
-            && (run.failure.is_empty()
-                && matches!(
-                    p.name,
-                    "lost response resolved by head read" | "delayed duplicate of accepted request"
-                )
-                || run.mode.contains("no-resolve-before-replan")
-                    && p.name == "unknown relative update applied twice");
-        let added_required = run.failure.is_empty()
-            && run.seed.is_none()
-            && match (run.family, p.name) {
-                (
-                    "remote-maintenance",
-                    "writer retries original stamps then commits" | "maintenance retries guards",
-                )
-                | ("position-deletes", "compaction remaps winning position delete") => true,
-                ("remote-maintenance", "covered clear retries and publishes") => {
-                    run.mode.contains("clear-retry")
-                }
-                ("remote-maintenance", "checkpoint published") => !run.mode.contains("clear-retry"),
-                (
-                    "remote-maintenance",
-                    "two tables acknowledged together"
-                    | "maintenance lease fenced"
-                    | "cold promotion publishes",
-                ) => !run.mode.contains("minimal") && !run.mode.contains("clear-retry"),
-                (
-                    "remote-maintenance",
-                    "maintenance while Prepare unresolved"
-                    | "Prepare committed"
-                    | "Prepare aborted",
-                ) => run.mode.contains("prepare"),
-                (
-                    "remote-maintenance",
-                    "overlapping maintenance planned" | "maintenance replans invalid guards",
-                ) => run.mode.contains("no-file-set-lease"),
-                ("read-programs", "winner commits between transaction statements") => {
-                    run.mode.contains("transaction-widened") && run.bound >= 2
-                }
-                (
-                    "read-programs",
-                    "transaction reads its own writes"
-                    | "transaction commits two nonempty statements",
-                ) => run.mode.contains("transaction-widened"),
-                ("position-deletes", "position delete remapped after compaction") => {
-                    !run.mode.contains("already-dropped")
-                }
-                ("position-deletes", "already deleted target consumed") => {
-                    run.mode == "already-dropped"
-                }
-                _ => false,
-            };
-        let required = added_required
-            || promotion_required
-            || delivery_required
-            || widened_required
-            || read_required
-            || symmetry_required
-            || composed_required
-            || run.seed.is_none()
-                && match run.name {
-                    "dataset-lifecycle"
-                    | "source-positions"
-                    | "retention"
-                    | "unknown-action-refusal" => p.expectation == Expectation::Sometimes,
-                    "commits-restart-turnover" => matches!(
-                        p.name,
-                        "restart and lease turnover" | "persisted attempt restored"
-                    ),
-                    _ => false,
-                };
+        let required = required_witness(run, p.name, &p.expectation);
         if required && found.is_none() {
             good = false;
             println!("MISSING_REQUIRED_WITNESS {}", p.name);
@@ -2176,7 +2739,7 @@ where
         let status = match (&p.expectation, found.is_some()) {
             (Expectation::Always | Expectation::Eventually, true) => "FAIL",
             (Expectation::Always | Expectation::Eventually, false)
-                if run.seed.is_none() && complete =>
+                if run.seed.is_none() && complete && run.failure.is_empty() =>
             {
                 "HOLDS"
             }
@@ -2209,9 +2772,7 @@ where
                 )
             };
             let valid = replay(c.model(), initial, &action).is_some_and(|state| {
-                let mut enabled = vec![];
-                c.model().actions(&state, &mut enabled);
-                if p.expectation == Expectation::Eventually && !enabled.is_empty() {
+                if p.expectation == Expectation::Eventually && has_next(c.model(), &state) {
                     return false;
                 }
                 (p.condition)(c.model(), &state) == (p.expectation == Expectation::Sometimes)
@@ -2243,6 +2804,9 @@ where
                 || run.name.starts_with("dataset-lifecycle")
                 || run.name.starts_with("source-")
                 || run.family == "retention"
+                || run.family == "standby"
+                || run.family == "intent-roll-forward"
+                || run.family == "replicas"
                 || run.mode.contains("restart")
                 || run.family == "action-compatibility")
                 && p.expectation != Expectation::Sometimes
@@ -2295,8 +2859,10 @@ pub fn run(name: &str) -> Result<(), String> {
         ),
         "dataset-lifecycle" => check(dataset_lifecycle::Protocol::new(r.mode, r.bound), r),
         "source-positions" => check(source_positions::Protocol::new(r.mode, r.bound), r),
+        "standby" => check(standby::Protocol::new(r.mode), r),
         "action-compatibility" => check(action_compatibility::Protocol::new(r.mode), r),
         "retention" => check(retention::Protocol::new(r.mode), r),
+        "replicas" => check(replicas::Protocol::new(r.mode), r),
         "commits" => check(commits::Protocol::new(r.mode, r.bound), r),
         "transactions" => check_with_symmetry(
             transactions::Protocol::new(r.mode, r.bound),
@@ -2305,6 +2871,10 @@ pub fn run(name: &str) -> Result<(), String> {
                 .contains("symmetry")
                 .then_some(transactions::Protocol::representative),
         ),
+        "intent-roll-forward" if r.mode.contains("partitioned") => {
+            check(intent_partitioned::Protocol::new(r.mode, r.bound), r)
+        }
+        "intent-roll-forward" => check(intent_roll_forward::Protocol::new(r.mode, r.bound), r),
         "window" => check(window::Protocol::new(r.mode, r.bound), r),
         "floors" => check(floors::Protocol::new(r.mode, r.bound), r),
         "concurrent" => check(concurrent::Protocol::new(r.mode, r.bound), r),

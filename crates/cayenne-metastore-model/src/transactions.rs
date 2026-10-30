@@ -141,7 +141,7 @@ impl Protocol {
         self.actions(state, &mut actions);
         actions.iter().all(|action| {
             let Some(next) = self.next_state(state, action.clone()) else {
-                return false;
+                return true;
             };
             [[0, 1], [0, 2], [1, 2]].into_iter().all(|pair| {
                 let from = Self::project(state, pair);
@@ -317,7 +317,7 @@ impl Model for Protocol {
         if state.deadline && state.deciders & 2 == 0 {
             action.push(Decide(2));
         }
-        action.retain(|updated| self.next_state(state, updated.clone()).is_some());
+        crate::prune_for_simulation(self, state, action);
     }
     fn next_state(&self, state: &State, action: Action) -> Option<State> {
         use Action::{

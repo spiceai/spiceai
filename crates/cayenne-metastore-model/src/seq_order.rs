@@ -229,7 +229,7 @@ impl Model for Protocol {
         if state.maintenance.is_some() {
             actions.push(Action::CommitMaintenance);
         }
-        actions.retain(|a| self.next_state(state, a.clone()).is_some());
+        crate::prune_for_simulation(self, state, actions);
     }
     fn next_state(&self, state: &State, action: Action) -> Option<State> {
         let mut next = state.clone();

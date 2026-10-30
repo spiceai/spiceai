@@ -100,7 +100,7 @@ impl Model for Protocol {
         if state.scan && !state.deleted {
             action.push(Delete);
         }
-        action.retain(|action| self.next_state(state, action.clone()).is_some());
+        crate::prune_for_simulation(self, state, action);
     }
     fn next_state(&self, state: &State, action: Action) -> Option<State> {
         use Action::{Append, Create, Delete, Floor, Observe, Poll, Query, Read, Scan};

@@ -67,7 +67,7 @@ impl Model for Protocol {
         if state.query.is_none() {
             action.push(Action::Query);
         }
-        action.retain(|action| self.next_state(state, action.clone()).is_some());
+        crate::prune_for_simulation(self, state, action);
     }
     fn next_state(&self, state: &State, action: Action) -> Option<State> {
         let mut next = state.clone();

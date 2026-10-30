@@ -19,7 +19,7 @@ nice -n 10 cargo run --release -p cayenne-metastore-model -- run seq-order-two-w
 EXHAUST=1 nice -n 10 cargo run --release -p cayenne-metastore-model -- run seq-order-no-shift
 ```
 
-Every checker uses one thread. Controls require `EXHAUST=1` and exhaust their graph. A wrong outcome, missing
+Checkers use 6 threads by default; set `MODEL_THREADS` to change it. Results do not depend on the thread count, and the binary uses mimalloc, because cloning states dominates checking. Models list candidate actions and reject disabled ones in `next_state`, so each successor is computed once; simulation runs, whose checker cannot replay a rejected pick, list only enabled actions. Controls require `EXHAUST=1`. A control stops once it has found its expected failure and every witness it must reach; its other safety properties print `NOT_FOUND`, not `HOLDS`, because the rest of its graph is not explored. A wrong outcome, missing
 required control failure, invalid witness, or checker timeout makes the command fail.
 A sampled run reports `NOT_FOUND`, which does not establish exhaustive safety.
 New exhaustive safe graphs require their essential reachability witnesses; missing
@@ -45,6 +45,7 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `dataset-lifecycle` | One dataset (parent and child), buffered per-table upserts/deletes, acknowledgement commits, arbitrary warm subsets, promotion-only cold rewrites, coverage, commit naming, checkpoint PK collection and tail recovery, log collection that keeps running queries' states, removal retirement, two queries within retention, takeover, a fresh-named upload, orphan collection and a late fenced upload; I4/I7/I8/I9 | Exhaustive 2 total accepted records, 2 total buffered operations, 2 keys per table, 2 initial files in each of 2 tier placements, one checkpoint, one takeover and one upload; samples 4 records, seeds 7, 42, 20261024 |
 | `dataset-prepare-*` | Lifecycle file/deletion state and prepared keyed deletes/upserts, external decision and logged Resolve; I4/I6/I8/I9; cutoff cap with ordinary-write reservations | 6 accepted records, 2 buffered operations on parent table, 1 arbitrary warm subset, 1 cold promotion, 1 standalone clear, 1 checkpoint; no lease/staging actions |
 | `dataset-query-expiry*` | Lifecycle maintenance/checkpoint/log collection with a query whose retention expires, delayed GET and GC selection/deletion; rows or error | 2 accepted records, 2 clock advances, 1 query, scan in key/file order |
+| `dataset-prepare-query-expiry*` | Prepared actions, maintenance and checkpoint/log collection with a query that may start during a prepared transaction and whose retention expires; the `-byte-window` sibling adds byte batches, sealing and floor publication | 3 accepted records (5 with the byte window's 2-record metadata prefix), 2 clock advances, 1 query |
 | `dataset-byte-window-metadata-prefix*` | Lifecycle actions in shared byte-window Store, delayed sealing, aligned floors, checkpoint PK pages and retention of every running query's state | 5 total records including 2 initial metadata records, 2 buffered operations, 2 warm rewrites, 1 promotion, 1 metadata removal, 2 checkpoint pages, 1 storage collection; early-floor controls use 3 total records |
 | `source-positions` | Numbered append stream, buffered/grouped data and positions, ambiguous CAS, identical retry, acknowledgement, crash reacquisition, takeover, redelivery and skip; I10/I2 | 2 source changes, 4 attempt identities, 1 crash and 1 external takeover, up to 2 generation advances |
 | `commits-restart-turnover` | Existing commit composition plus volatile buffer/handle clearing, persist-before-send receipts, restore, delayed requests and takeover; I1–I5 and existing replay checks | 1 logical writer, 2 attempt identities, original/retry delivery, 1 restart, up to 3 lease generations; no checkpoint/filler actions |
@@ -52,11 +53,19 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `transactions-three-participants` | Three identical participant heads; Prepare/decision/Resolve, ordinary writes, checkpoint/GC and uncertain CAS; full participant values sorted by derived `Ord` for symmetry | Exhaustive symmetry bound 0; original bound-1 samples unchanged |
 | `commits-commit` | Two writers, delayed original/retry deliveries, exact-base CAS, lease takeover, folded checkpoint; I1–I5, I8 | Exhaustive bound 2: K=2, two attempts per writer, up to three leases; samples bound 4: K=3 |
 | `commits-retry` | Unavailable head read, fresh-id retry, delayed deliveries and acknowledgement; exactly-once logical write, I5 | Exhaustive/control 2; one writer, two attempts |
+| `commits-retry-expiry` | The retry graph plus a head store clock that advances with every head write, including takeovers, and checkpoints that drop attempt ids older than the evidence horizon; resolution consults only retained evidence, and an attempt past the horizon resolves unresolved and is reported as commit outcome unknown, never retried; I2/I5, no double apply, unknown never retried | Exhaustive/control 2; one writer, two attempts, horizon 2 store-time units, up to three leases |
+| `standby` / `standby-three` | Two or three instances of one Spicepod on one location: a lease object with an expiry on a discrete clock, renewal by the holder, crash, restart, pause and resume, acquisition only after expiry, and takeover by a head commit that raises the generation; only the generation in the head fences writers; the ingester commits source changes by exact-head CAS and then acknowledges them; standbys serve head reads. No change applied twice or acknowledged without commit, no stale-generation commit accepted, one committing instance per head generation, lease exclusivity, no lease loss by a healthy holder, and an ingester again within the lease duration of a holder failure | Exhaustive: lease duration 3 ticks, 2 source changes, 1 crash, 1 pause, at most 4 lease epochs; a running holder renews and a running standby acquires or takes over before the next tick |
+| `standby-early-safety` | The standby graph with acquisition allowed before expiry; checks only the safety properties, which do not depend on lease timing | Same bounds |
 | `commits-etag` | Explicit store-version CAS and delayed retry across head changes; I1–I3, I5 | Exhaustive/control 1; one writer, one original/retry pair |
 | `commits-storage` | Checkpoint parts/root before head publication, delayed GC, a query kept by retention, lagging reopen, late seal; I4, I7, I8 | Bound 2; samples 4 |
 | `transactions-txn` | Two datasets, one transaction, competing ordinary writes, reservations, commit/abort create race, helper Resolve, uncertain CAS, checkpoint/GC; one participant writes other keys while prepared so the Prepare can reach a checkpoint; I3–I6, I8 | Exhaustive 1 (two lease generations), controls 0 except owner restriction 1; samples 2, 3 (two outstanding handles per dataset) |
+| `intent-roll-forward*` (single writer) | Proposed single-writer alternative to two-phase commit: one writer holding both datasets' leases commits A's actions, the source position and a pending intent for B in one A record, applies the intent to B under the transaction id, optionally marks it done in A; the next lease holder rolls pending intents forward. Maintenance on either head, delayed/duplicate CAS, lost responses resolved by attempt id, crash, pause and fencing; atomicity, at-most-once B apply, acknowledged/positioned transactions in both datasets at quiescence, I2, no retraction, B values in commit-point order, I5 | 1 or 2 source transactions on one key; one maintenance commit per dataset; one turnover and one crash (`two-takeovers`: two each); 2 copies per request; `disjoint-writer` adds one keyed write to another key of B |
+| `intent-roll-forward-partitioned*` | Optional capability: the same fast path with one exclusive writer per source partition over shared A and B heads. Each head records every partition's writer generation, so a partition turnover is a head commit on A and then on B; each transaction writes only its partition's key in both datasets; each partition writer commits its intent with its partition's source position in A, then applies it to B by transaction id; a lost CAS on either head is rebased after a footprint check of the winners against the intent's keys. Crash, pause, turnover and handoff are per partition; the partition's next owner rolls only that partition's intents forward before ingesting it, while the other partition keeps committing. Delayed/duplicate CAS and lost responses resolved by attempt id; atomicity, at-most-once B apply, acknowledged and per-partition positioned transactions in both datasets at quiescence, I2 per partition, per-key B values in commit-point order, no stale-generation commit accepted per partition (an older generation of a partition commits on either dataset after its next owner recorded its generation in both heads), I5 | Partitions p0 and p1; 1 source transaction per partition, or 2 in p0 (`without-done`: no done markers, so recovery always checks B by transaction id); one turnover and one crash in total, in either partition (`handoff`: the turnover may be a handoff by a live owner at any point between its protocol steps); 2 copies per request; no maintenance commits. `each-partition` samples one turnover and one crash per partition with 2 transactions in p0 |
 | `window-storage` | Canonical inline bytes, byte/count pressure, copy rule, cold replay, a running query, checkpoint/GC; I4, I7, I8 | Exhaustive 6 records; controls 5; samples 7, 9 |
-| `retention` | Readers never write and GC has no generations: removed objects deleted a fixed retention after GC observes the removal (restarted at takeover); never-committed uploads deleted once old by the store's clock, after a head move and a recheck; fresh object names; a writer references only base-live objects or its own young uploads, with a margin for clock error; commits that land arbitrarily late; one reader query from a recently confirmed state; no dangling reference, rows or an error, and a query within the retention never fails | Exhaustive: 2 object names, 9 clock ticks, 6 head versions, retention 3, staleness 1, upload age 4, writer clock error 1, one takeover, one query |
+| `retention` / `retention-readers` | Readers never write and GC has no generations: removed objects deleted a fixed retention after GC observes the removal, which stays in durable state until the delete (timers restarted at takeover); never-committed uploads deleted once the head's store time is T_O past theirs; GC's empty commit on an idle head; fresh object names; a writer references only base-live objects or its own never-published uploads, while its base's store time is less than T_O minus a margin past the upload's; object timestamps that lag the writer's lower bound; deletes and commits that land arbitrarily late. `retention-readers` adds one query whose head GET responds late, and stops once the query settles. No dangling reference, rows or an error, and a query within the retention never fails | Exhaustive: 2 object names, 9 clock ticks, 6 head versions, retention 3, staleness 1, upload age 4, timestamp error 1, two sweeps, one takeover; the writer graph adds timestamp skew, the reader graph one query |
+| `retention-remote-gc` / `retention-readers-remote-gc` | GC on another node under its own lease: its empty commit is a CAS on the head version it read that can lose to the writer's commits (and they to it) and is retried; a second GC node takes the lease over, rebuilds the pending removals and restarts every timer, while the first node's issued deletes (removal deletes and selected orphan deletes) land later; the writer's takeover leaves GC's timers alone. Same properties as `retention` / `retention-readers` | As `retention` / `retention-readers`, with one GC lease takeover in place of the writer takeover; the reader graph stops at clock 7 |
+| `retention-readers-checkpoint` / `retention-readers-remote-gc-checkpoint` | Removals durable only as records after the floor and as the checkpoint root's pending-removals list: one checkpoint moves the floor, writes every removal not yet deleted into the root and drops the records below the floor; a takeover (the writer's with GC in process, or the GC lease takeover) rebuilds the pending set from the root with the later records applied and restarts every timer. Same properties as `retention-readers` | As `retention-readers` with one checkpoint; clock 7, or 6 with remote GC |
+| `replicas` / `replicas-readers` | Regional read-only replicas: writers and the source GC use only the source location; one-way replication copies objects and head versions to the replica one at a time in any order, with no delete replication and nothing committed to the replica; the replica head key holds whichever version arrived last. A replica reader adopts only a newer replicated head whose newly referenced objects are present in the replica, confirms it with a conditional GET on the source head timed from the request, starts a query from a head confirmed within S and reads only the replica. The source GC deletes a removed object T after its removal and an aged never-committed upload, after which the writer cannot commit it. The replica GC deletes a copy T after it reads the removal in the replica head, and a copy no replicated head mentions once the source returns 404. Checks that a head confirmed current references only replica objects, no lower head is adopted, a query within T - S never fails, rows or an error, and the replica GC never deletes an object the source head references | Exhaustive: 5 head versions, 8 clock ticks, retention 3, staleness 1, upload age 4; the GC graph has 2 objects and no reader, the reader graph 1 object and one query and stops once it settles; `replicas-orphan-head-age` keeps 4 versions |
 | `window-txn` | Transaction resolution composed with explicit delayed byte-batch sealing and eviction; I3–I6, I8 | Exhaustive 0; samples 2, 3 |
 | `concurrent-txn-overlap`, `concurrent-txn-disjoint` | Two transaction identities, overlapping/disjoint footprints, ordinary writer, rejected and late Prepare, opposite reservations, cleanup, checkpointed pending ids; I4, I6, I8 | Exhaustive/control 0; samples 1, 2 |
 | `concurrent-floor-aligned` | Published floor at batch boundaries, reader reopen, a query kept by retention and delayed deletion; I4, I7, I8 | Exhaustive 6 records; samples 7, 9 |
@@ -69,6 +78,32 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 `commit-guards` and its three controls use one writer, one attempt, an original/retry
 pair, three lease generations, and no checkpoint/filler actions. They isolate
 CAS, lease and identical-byte obligations at exhaustive bound 1.
+
+`commits-retry-expiry` adds a store clock to the retry graph: every head write,
+including the commit that raises the lease generation at a takeover, advances
+it, and each accepted position keeps the store time it landed at. A checkpoint
+may at any time drop the attempt ids of positions at least the horizon older
+than the head. Resolution looks up the attempt's exact position in retained
+evidence: a retained id decides accepted or rejected, and a dropped one yields
+unresolved even though the head has moved, so the writer reports the commit
+outcome unknown and never retries. The control instead classifies a moved head
+without evidence as rejection, retries a fresh id, and applies the logical write
+twice.
+
+`standby` models instances of one Spicepod on one location with relative
+time: each lease holds a count of ticks left, so the clock needs no bound.
+Ticks wait for urgent steps: a running holder renews before its lease runs
+out, a running instance acquires an expired lease, and a new holder commits its
+takeover. These are the timing assumptions availability rests on; safety needs
+none of them. Acquisition is a conditional write on the lease object; the
+takeover is a CAS on the head that requires a lower generation and raises it;
+ingest commits are exact-head CASs, so a writer whose generation is no longer in
+the head fails and steps down. An in-flight commit survives pause and step-down,
+which is how a resumed writer reaches the head with a stale base. Availability
+counts ticks since the latest holder failure during which some instance runs and
+none ingests; it reaches the lease duration and never exceeds it. Ingest CAS
+responses are never lost here; uncertain outcomes are covered by `commits-*` and
+`source-positions`.
 
 `commits-retry` and `commits-no-resolve-before-retry` extend the commit
 composition with an unavailable head read: safe classification stays unresolved;
@@ -99,11 +134,12 @@ as a separate maintenance process does.
 
 | Control suffix | Removed safeguard and required downstream failure |
 |---|---|
-| `remote-maintenance-minimal-no-publication-fence` | Check lease only before publication: an expired unit still publishes; I3 |
+| `remote-maintenance-minimal-lease-outside-head` | The lease turnover writes only a separate lease object, so the publication CAS cannot see it: an expired unit still publishes; I3 |
+| `remote-maintenance-no-retry-lease-check` | A retry after a lost CAS rebases without checking the unit's generation in the new head: an expired unit publishes; I3 |
 | `remote-maintenance-no-stable-high-water` / minimal pair | Maintenance advances high water over a buffered operation: its original stamps are refused |
 | `remote-maintenance-no-committed-cutoff` / minimal pair | Apply through an allocator value that includes uncommitted deletes: later covered clearing resurrects an old row |
 | `remote-maintenance-no-file-set-lease` / minimal pair | Overlapping plans with input guards retained: holds; leases avoid redundant work, not required for safety in this graph |
-| `remote-maintenance-no-guard-revalidation` / minimal pair | Skip retry guard validation but retain full file-set exclusion and publication fencing: holds in this graph |
+| `remote-maintenance-no-guard-revalidation` / minimal pair | Skip the retry's input, coverage and cap guards but keep its lease check and full file-set exclusion: holds in this graph |
 | `remote-maintenance-no-file-set-lease-no-guard-revalidation` / minimal pair | Remove both exclusions: two replacements of the same input leave duplicate live rows |
 | `read-transaction-*-no-union-footprint` | Validate only s2: stale s1 actions violate whole-transaction program replay |
 | `read-transaction-*-no-overlay-read-keys` | Omit s2 lookup keys already written by s1: holds because the union still includes s1 written keys |
@@ -123,22 +159,51 @@ as a separate maintenance process does.
 | `dataset-query-expiry-missing-as-empty` | Missing GET contributes no rows to the lifecycle scan: wrong snapshot result |
 | `dataset-query-expiry-no-delete-selection` | Selection honors an expired query but deletion recomputes candidates without it; rows or error remains the required outcome |
 | `dataset-query-expiry-no-log-expiry` | Log retention includes expired queries: safety-preserving excess retention |
+| `dataset-prepare-query-expiry-missing-as-empty` | Missing GET contributes no rows while a transaction is prepared: wrong snapshot result |
+| `dataset-prepare-query-expiry-byte-window-no-query-batch` | Storage collection ignores the running query's batches with prepared actions and query expiry also present: I7 byte query recovery |
 | `dataset-byte-window-metadata-prefix-no-query-batch` | Drop an old batch needed by a running query's state: I7 |
 | `dataset-byte-window-metadata-prefix-no-sealed-floor` | Complete checkpoint and floor cross an unsealed batch: current recovery can succeed while an intermediate protected state is lost; I7 |
 | `dataset-byte-window-metadata-prefix-no-sealed-floor-without-readers` | Same early floor with no query registration: checks the separate complete-checkpoint case |
 | `transactions-two-participants-symmetry-no-create-once` | Decision overwrite still finds participant disagreement with symmetry enabled |
+| `intent-roll-forward-no-intent` | A's record omits the intent: a turnover after A commits finds nothing to roll forward, while the position in A skips redelivery; eventual atomicity |
+| `intent-roll-forward-no-idempotency` | Apply to B without checking the transaction id: the previous owner's apply landed before turnover and recovery applies it again; at-most-once B apply |
+| `intent-roll-forward-second-writer` | A second writer commits a keyed write to a key the intent writes: the intent's B actions no longer rebase, so roll-forward is blocked with A already committed and acknowledged; eventual atomicity |
+| `intent-roll-forward-second-writer-blind-rebase` | Same second writer, with the conflict ignored: the intent overwrites a write committed after the transaction's commit point; B values in commit-point order |
+| `intent-roll-forward-abort-recovery` | Recovery undoes A's actions and position instead of rolling forward: an acknowledged transaction can no longer be redelivered; acknowledged transactions in both datasets |
+| `intent-roll-forward-ingest-before-recovery` | A new owner ingests the next transaction before recovering a pending intent on the same key: the older intent then conflicts and is blocked; eventual atomicity |
+| `intent-roll-forward-partitioned-a-only-generation` | A partition's generation is recorded only in A's head, so its turnover never moves B: the previous owner's in-flight B apply lands after the next owner has acquired the partition; no stale-generation commit accepted per partition |
+| `intent-roll-forward-partitioned-cross-partition` | Partition 1's transactions also write partition 0's key, breaking the routing assumption: partition 0's intent finds an overlapping winner in B and is blocked with A committed and acknowledged; eventual atomicity |
+| `intent-roll-forward-partitioned-cross-partition-blind-rebase` | Same cross-partition key, rebased without the footprint check: partition 0's intent overwrites partition 1's write committed after it; B keyed values follow commit order |
+| `intent-roll-forward-partitioned-handoff-no-drain` | The next owner after a handoff ingests without rolling the partition's pending intents forward: an intent the old owner left in A at the handoff point never reaches B; eventual atomicity |
+| `intent-roll-forward-partitioned-ingest-before-recovery` | A partition's next owner ingests that partition's next transaction before rolling its pending intent forward: the older intent conflicts on the partition's key and is blocked; eventual atomicity |
 | `dataset-lifecycle-no-coverage` | Clear without coverage in the composed graph: I9 resurrected row |
 | `dataset-lifecycle-no-upload-age` | The orphan sweep takes an upload before it has aged, while the writer can still stage it: I4 |
 | `dataset-lifecycle-no-table-scope` | Dataset-wide comparison of independent allocators: valid child record refused (accepted rows still satisfy I9) |
 | `dataset-lifecycle-no-commit-number` | Name maintenance states by mutation high water: I8 one name has different physical states |
 | `dataset-lifecycle-no-query-log-retention` | Reclaim metadata history below the floor despite an older running query: I7 reconstruction fails even with data files present |
 | `dataset-lifecycle-no-index-checkpoint` | Omit PK collection refresh in checkpoint recovery: I8 |
-| `retention-no-age-check` / `-no-margin` | The writer references an old upload, or checks its age without allowing for clock error: a committed state references a deleted object |
-| `retention-no-head-move` / `-no-recheck` | GC deletes orphans without waiting for the head to move, or without re-reading it: a late commit lands referencing a deleted object |
+| `retention-no-age-check` / `-no-margin` | The writer references an old upload, or checks its age without allowing for timestamp error: a committed state references a deleted object |
+| `retention-writer-clock` | The writer ages its upload on its own clock while the store's clock jumps ahead: GC deletes it after the head move and the commit lands |
+| `retention-list-date` | GC ages uploads by the LIST's time instead of the head's: a commit based on an older head lands after the delete |
+| `retention-reref-published` | A writer references its own upload again after publishing and removing it: GC's delete of the removed object lands under the new commit |
 | `retention-reuse-found` | The writer reuses an object it finds present instead of a fresh name: a committed state references a deleted object |
-| `retention-no-retention` / `-stale-start` | Retention zero, or a query starts from a state confirmed longer ago than the staleness bound: a query within the retention fails |
-| `retention-keep-timestamps` | A takeover keeps removal times from the predecessor's clock: a query within the retention fails |
-| `retention-missing-as-empty` | A missing object reads as empty: wrong rows instead of an error |
+| `retention-readers-no-retention` / `-stale-start` | Retention zero, or a query starts from a state confirmed longer ago than the staleness bound: a query within the retention fails |
+| `retention-readers-keep-timestamps` | A takeover keeps removal times from the predecessor's clock: a query within the retention fails |
+| `retention-readers-volatile-removals` | Removals live only in GC's memory: after a takeover the orphan sweep deletes a recently removed object a query still reads |
+| `retention-readers-sweep-removed` | The orphan sweep ignores recorded removals: it deletes a recently removed, old upload a query still reads |
+| `retention-readers-response-time` | A head confirmation is timed from its response instead of its request: a late response admits a query whose objects are already deleted |
+| `retention-readers-missing-as-empty` | A missing object reads as empty: wrong rows instead of an error |
+| `retention-remote-gc-blind-commit` | GC's empty commit is an unconditional write of the head it read: it lands over the writer's removal and resurrects the object, whose removal timer then deletes it under the committed state |
+| `retention-readers-remote-gc-keep-timestamps` | The new GC node keeps the old node's removal times, read on a clock one tick ahead: a query within the retention fails |
+| `retention-readers-checkpoint-root-omits` / `retention-readers-remote-gc-checkpoint-root-omits` | The checkpoint root omits the pending removals: after the takeover the removal is forgotten and the orphan sweep deletes an object a query still reads |
+| `retention-readers-checkpoint-tail-only` | The takeover rebuilds pending removals from the records after the floor only: the same failure |
+| `replicas-readers-adoption-all-present` | Checks the stronger property that an adopted head references only objects present in the replica: it fails under the incremental frontier check (see below), not a removed safeguard |
+| `replicas-readers-no-frontier` | The reader adopts a replicated head without checking its new objects are in the replica: a head confirmed current references a missing object |
+| `replicas-readers-adopt-lower` | The reader adopts whatever the replica head shows: after an out-of-order arrival it adopts a lower head |
+| `replicas-readers-replica-time` | Freshness taken from the replica head's own `LastModified` instead of a source confirmation: a head that arrived long after the source moved on starts a query whose object the replica GC already deleted |
+| `replicas-readers-missing-as-empty` | A missing replica object reads as empty: wrong rows instead of an error |
+| `replicas-eu-age-only` | The replica GC deletes copies by age alone, without a removal record or source check: it deletes an object the source head references |
+| `replicas-eu-orphan-no-source-check` | The replica GC deletes a copy no replicated head mentions once the replica's clock is T_O past it, without a source HEAD: it deletes an object the source head references, both after an unreplicated commit and before the writer's commit of an upload on an idle head (a required witness) |
 | `source-ack-before-acceptance` | Acknowledge buffered changes before CAS acceptance: I2 |
 | `source-position-before-data` | Separate offset record lands first: logged prefix lacks rows (I10) |
 | `source-position-after-data` | Separate data record lands first, crash/redelivery appends it again: I10 |
@@ -161,6 +226,10 @@ as a separate maintenance process does.
 | `commit-no-lease` | Rebase a stale owner's condition without its lease check: I3 |
 | `commit-no-identical` | Retry different bytes with the original condition: I5 |
 | `commits-no-resolve-before-retry` | Treat an unreadable head as rejection and retry a fresh id: I2 acknowledged logical write exactly once |
+| `commits-retry-expiry-no-horizon` | Treat no retained evidence past the horizon as rejection and retry a fresh id: logical write never applied twice (I5 also fails) |
+| `standby-no-generation` | Takeover acquires the lease object and reads the head without raising its generation: a paused writer resumes and its stale-generation commit is accepted; two instances also commit under one head generation |
+| `standby-early-acquire` | A standby acquires before expiry while the holder renews: two instances hold unexpired leases (and a healthy holder loses its lease). `standby-early-safety` shows the generation in the head still prevents stale commits and double application |
+| `standby-no-renew` | The holder never renews: a healthy holder loses its lease; availability also fails when the standby pauses |
 | `commits-etag-repeat` | Reuse an earlier store tag for a later head: I1 unique accepted position |
 | `seq-order-maintenance-draw` | Maintenance draws ahead of the buffer and publishes first, then permits the lower buffered record: I9 resurrected row after a later compaction |
 | `seq-order-no-shift` | Independent CAS loser retries its unchanged lower sequences: I9 resurrected row after compaction |
@@ -232,22 +301,85 @@ not model stale asynchronous rewrite publication.
 The PK index refreshes as a checkpoint collection.
 The graph does not model asynchronous index construction or real index bytes.
 
-`retention` is the only reader and garbage-collection protocol. Readers never
-write: a query starts from a state confirmed current within the staleness bound S,
-and every object it needs survives at least T - S, because each was live at that
-confirmation and GC deletes a removed object only T after observing its removal.
-Every read returns the referenced object or fails the query. Uploads that never
-committed are collected by age instead of by generation: GC selects unreferenced
-objects at least T_O old by the store's clock, waits for the head to move (its own
-empty commit when the dataset is idle), re-reads the head and keeps anything a late
-commit referenced. A commit sent before the objects were old was conditioned on an
-older head and fails; one sent after fails the writer's age check, which allows for
-the writer's clock error. Every object has a fresh name, so nothing is reused by
-finding it present. No clock is compared across machines: GC's upload age uses the
-store's clock, removal timers are GC's local durations and restart at takeover, and
-the writer measures a local duration. Other graphs abstract this contract: a query
-is protected from its start until it expires, and the orphan sweep takes only an
-upload that has aged, which the writer can no longer reference.
+`retention` and `retention-readers` are the only single-location reader and
+garbage-collection protocol. Readers never write: a query starts from a head confirmed within the
+staleness bound S of when its GET was sent, and every object it needs survives at
+least T - S, because each was live at that confirmation and GC deletes a removed
+object only T after observing its removal. The removal stays recorded in durable
+state until the delete, so a new GC after a takeover still knows it, and the
+orphan sweep skips it. Every read returns the referenced object or fails the query.
+Uploads that never committed are collected by age instead of by generation, and
+every age is a difference of two store timestamps: GC deletes an unreferenced
+upload once the head it read is T_O past the upload's `LastModified`, and the
+writer refuses its own upload once its CAS base is T_O minus a margin past a lower
+bound on that upload's time. A commit landing after GC's read is based on that head
+or a newer one, so the writer would have refused it. GC's empty commit lets an idle
+head's time advance; it is needed for progress, not for safety. A writer references
+an upload of its own only until it is published; after that, only while it is live
+in the base. Every object has a fresh name, so nothing is reused by finding it
+present. Removal timers are GC's local durations and restart at takeover; no
+other clock is compared across machines. The graph is split in two to stay
+tractable: the writer graph checks references with timestamp skew, and the reader
+graph adds one query with a late GET response and stops once that query settles.
+Other graphs abstract this contract: a query is protected from its start until it
+expires, and the orphan sweep takes only an upload that has aged, which the writer
+can no longer reference.
+
+The remote-GC siblings move GC to another node. Its empty commit is a CAS on the
+head version GC read, so it loses to any commit that lands first and is retried
+from the new head; the writer's commits likewise lose to it. A blind empty commit
+overwrites the head GC read and can resurrect an object the writer removed in
+between, whose removal timer then deletes it under the committed state. A second
+GC node takes over the GC lease, rebuilds the pending removals from durable state
+and restarts every timer on its own clock; the first node's issued deletes land
+afterwards and are harmless, because each was already safe when it was decided.
+GC observing a removal is modelled at the commit that records it, the earliest it
+can happen. The checkpoint siblings make removals durable only as records after
+the floor and as each checkpoint root's pending-removals list. A checkpoint writes
+every removal whose object is not yet deleted into the root and drops the records
+below the floor; a takeover rebuilds the pending set from the root with the later
+records applied. A root that omits pending removals, or a rebuild from the records
+after the floor alone, forgets a removal, and the orphan sweep then deletes an
+object a query still reads. The reader graphs of these siblings stop the clock
+earlier (7, or 6 with both) to stay tractable.
+
+`replicas` and `replicas-readers` add a read-only replica location. Nothing commits
+to the replica and source deletes do not replicate, so only the replica GC removes a
+copy. Replication copies each object and each head version independently, so a head
+can arrive before its objects and a newer head before an older one; the replica head
+key then regresses to the older version. A reader adopts a head only if it is newer
+than the one it holds and every object it newly references answers a HEAD in the
+replica; it waits otherwise. A replica alone cannot show its lag, so freshness is a
+conditional GET on the source head, timed from when it was sent. A head confirmed
+current was live at the source at that time, so every object it references was
+neither removed nor deleted there, and the replica GC has no removal or 404 to act
+on: the query is protected for T - S from its start, as in the retention graph.
+Replication lag does not shorten that window; it consumes S instead, because a
+reader whose replicated head is behind the source cannot confirm it and cannot start
+a query until a newer head and its objects arrive. The replica GC starts a removal's
+timer when it reads the removal in the replica head, which is no earlier than the
+removal at the source, and sweeps a copy no replicated head mentions only once the
+source returns 404, which is permanent because names are never reused. An orphan the
+source has not swept may still be committed, so the replica's own clock cannot age
+it: on an idle head the writer commits an upload the replica's clock calls old.
+
+The model also checks two simplifications. `replicas-readers-source-404-only`
+deletes any copy the source returns 404 for, with no removal timers: queries stay
+protected, because the source deletes a removed object only T after its removal.
+`replicas-orphan-head-age` sweeps an unmentioned copy once the replica head's
+`LastModified` is T_O past it, the source sweep's rule applied to the replicated
+head: the writer's base is at least as new as any replicated head, so it would refuse
+that upload, and no HEAD to the source is needed.
+
+The design's frontier check covers only newly referenced objects, and
+`replicas-readers-adoption-all-present` shows it does not ensure every object of an
+adopted head is in the replica. The reader adopts v1 holding o; v3, which removes o,
+arrives before v2; the replica GC deletes o T after reading the removal; v2 arrives,
+the replica head regresses to it, and the reader adopts v2, which carries o from v1
+and so is not checked. The head is already superseded at the source, so it can never
+be confirmed and no query reads it: the checked guarantee is that a head confirmed
+current references only replica objects. HEADing every referenced object at adoption
+would restore the stronger property at one request per object.
 
 ## Composition boundaries and liveness
 
@@ -267,8 +399,8 @@ logical buffer operations without physical sequence comparisons. A metadata page
 staged from the writer's own fresh-named upload exercises staged references and
 delayed retirement alongside the row files. `Age` marks an upload past the age
 limit, after which the writer cannot stage it and the orphan sweep may take it; the
-retention graph checks that the writer's age check and GC's head move give exactly
-that. A fenced predecessor may finish an upload after the orphan sweep; nothing
+retention graphs check that the writer's age check and GC's head-relative age
+give exactly that. A fenced predecessor may finish an upload after the orphan sweep; nothing
 references it, and a later sweep collects it.
 
 The small exhaustive bound reaches warm subset compaction, cold promotion,
@@ -298,12 +430,91 @@ can finish old requests throughout. Full request bytes remain only as network re
 retained acceptance evidence; absence remains unresolved, and it cannot resend
 using a lost condition or payload. This checks identity retention, not a real
 receipt serialization/reconstruction format or eventual completion of unresolved
-operations. New `Issue` actions denote the current owner after a lease change; this
-profile does not model process ownership election. Source restarts explicitly
+operations. New `Issue` actions denote the current owner after a lease change;
+ownership election is modeled separately by `standby`. Source restarts explicitly
 acquire a new generation, reconcile buffered positions with the logged prefix,
 and re-read redelivery from the source acknowledgement. Stream payloads are unique
 append numbers so duplicates and gaps are observable. There is no backfill, multiple
-source partitions, evidence-retention expiry or real connector integration.
+source partitions, evidence-retention expiry (see `commits-retry-expiry`) or real connector integration.
+
+## Single-writer cross-dataset intents
+
+`intent-roll-forward*` checks a proposal, not an accepted design: when one
+writer holds the writer leases of both datasets a source transaction touches,
+it skips Prepare and the decision object. A's record carries A's actions, the
+source position and a pending intent (B's actions, the transaction id and the B
+position they were planned against); the writer acknowledges the source once
+that record is accepted. It then applies the intent to B under the transaction
+id and may record the intent done in A. Each lease turnover is a head update
+on A and then on B, so a paused or fenced predecessor's requests lose their
+CAS. The next owner, holding both leases, scans A for intents without a done
+marker and applies each one B does not already hold, before ingesting anything
+else. It only rolls forward.
+
+B's CAS can lose to maintenance, which changes no keyed value; the writer
+re-reads B, checks the transaction id and re-plans on the new head. A loss to a
+keyed write on a key the intent writes is a conflict that cannot be rebased.
+Responses are never trusted: the writer reads the head and looks for its attempt
+id (epoch and base position) at the base position, resends an identical request
+while the outcome is unknown, and a request whose base is behind the head can no
+longer land. Readers see each dataset at its own snapshot, so A before B is
+visible and checked as a witness. The commit-order oracle orders B's writers by
+commit point: A's acceptance for a source transaction, its own CAS for the
+second writer.
+
+Atomicity, the acknowledged transactions and the source position are checked
+at quiescence: the latest owner is alive with both leases and no protocol step
+is enabled (crashes, turnovers, maintenance and the second writer are
+environment events and may still be pending). Safety holds in every exhaustive
+graph, including two turnovers and two crashes over two transactions. Under
+these preconditions the fast path is safe in the graph: the intent is in the
+same record as A's actions and the position; B's apply is idempotent by
+transaction id; turnover fences both heads; recovery completes before new
+ingest and only rolls forward; and no other writer commits a keyed write to
+the keys an intent writes between planning and applying it. The two
+second-writer controls show the last is required: a conflicting write either
+blocks roll-forward forever after A is acknowledged, or is overwritten out of
+commit order. That case needs two-phase commit.
+
+### Optional capabilities
+
+The `intent-roll-forward*` runs verify fast single-writer cross-dataset
+transactions and, in `intent-roll-forward-partitioned*`, fast partitioned
+cross-dataset transactions, where each source partition has its own exclusive
+writer over the same two dataset heads. No milestone requires either
+capability; two-phase commit remains the general path.
+
+In the partitioned graphs both partition writers race on both heads, so a
+writer's CAS loses to the other partition's records and to its turnovers and is
+rebased; one partition's writer crashes, pauses, is fenced or hands off while
+the other keeps committing, and its next owner rolls forward only that
+partition's intents. Every safety property holds in the exhaustive graphs and
+every witness is reached: both partitions' transactions pending in B at once
+and then complete, a crashed partition recovered while the other commits, a
+B CAS lost to the other partition and rebased, and a turnover fencing the old
+writer on B. The preconditions found, each removed by a control except where
+noted:
+
+1. All of the single-writer preconditions, per partition: the intent is in the
+   same A record as A's actions and the partition's source position; B's apply
+   is idempotent by transaction id; recovery only rolls forward.
+2. Each source transaction's keys belong to one partition, the same partition
+   in both datasets (`cross-partition`: blocked roll-forward).
+3. A lost CAS is rebased only after the winners' key footprints are checked
+   disjoint from the intent's (`cross-partition-blind-rebase`: overwrite out
+   of commit order).
+4. Each partition's generation is recorded in both heads and a turnover moves
+   both (`a-only-generation`: a fenced writer's B apply lands). A full run of
+   that control found no data property failing at bounds 1 and 2: the stale
+   apply is always an intent already in A, applied once by transaction id and
+   guarded by the footprint check. The B-recorded generation is what fences
+   the stale writer; it becomes necessary for data whenever B's actions
+   depend on more than the intent and B's head.
+5. A partition's next owner, after a failure or a handoff, applies the
+   partition's pending intents to B before ingesting that partition
+   (`ingest-before-recovery`, `handoff-no-drain`). A handoff needs no
+   coordination with the old owner beyond the turnover: the old owner may
+   stop with an intent pending, and the new owner drains it.
 
 ## Limits
 
@@ -316,13 +527,53 @@ or unbounded safety and liveness. The three-participant symmetry run exhausts bo
 not three concurrent transactions. Its bound-one samples have one outstanding
 request per dataset and reach all-three commit, all-three abort, helper resolution
 after turnover, and checkpointed pending state at every seed. They do not reach
-Resolve batch eviction or a second outstanding handle per dataset. The original Milestone 1 graph retains its existing bounds. The new lifecycle siblings share its physical apply, rewrite, coverage and recovery helpers, but each composes one additional mechanism; there is no graph combining prepared actions, expiry and bytes simultaneously. The prepared sibling abstracts the other participant and durable decision to a nondeterministic commit/abort; it does not recheck the existing multi-participant decision race. The child table stays unchanged in these siblings; parent/child allocation remains covered by the original graph. Their smaller action alphabets omit lease turnover, staging and the predecessor upload race. In the expiry sibling, terminal errors ignore late GET completions. Byte tokens stand for complete immutable action payloads: metadata-only records cost one symbolic byte and file/delete mutations two; the journal is an encoding dictionary and audit oracle, never a fallback for a missing batch. Store.root is a symbolic prefix descriptor rather than retained physical WAL; old-state recovery uses actual checkpoint pages and tail tokens. Pages include physical state and the checkpoint PK collection; recovery of protected states requires actual retained pages plus contiguous batch/window tokens.
+Resolve batch eviction or a second outstanding handle per dataset. The original Milestone 1 graph retains its existing bounds. The new lifecycle siblings share its physical apply, rewrite, coverage and recovery helpers, and most compose one additional mechanism. Two combine them: `dataset-prepare-query-expiry` (prepared actions with queries bounded by retention, bound 3) and `dataset-prepare-query-expiry-byte-window` (prepared actions, query expiry and byte batches together, bound 5), where a query started during a prepared transaction must return its snapshot without the prepared rows. The prepared sibling abstracts the other participant and durable decision to a nondeterministic commit/abort; it does not recheck the existing multi-participant decision race. The child table stays unchanged in these siblings; parent/child allocation remains covered by the original graph. Their smaller action alphabets omit lease turnover, staging and the predecessor upload race. In the expiry sibling, terminal errors ignore late GET completions. Byte tokens stand for complete immutable action payloads: metadata-only records cost one symbolic byte and file/delete mutations two; the journal is an encoding dictionary and audit oracle, never a fallback for a missing batch. Store.root is a symbolic prefix descriptor rather than retained physical WAL; old-state recovery uses actual checkpoint pages and tail tokens. Pages include physical state and the checkpoint PK collection; recovery of protected states requires actual retained pages plus contiguous batch/window tokens.
+
+The single-writer `intent-roll-forward*` runs have one key, at most two source
+transactions, one maintenance commit per dataset and at most two turnovers.
+Neither graph models
+A's checkpoint or log collection, which must retain a pending intent until B
+holds it; intent payload size; transactions over more than two datasets;
+lease expiry timing; a second writer's own retries; or re-planning B before A
+commits (a conflicting write that lands before A's commit also blocks, which
+is conservative). Liveness is quiescence-based, not a fairness proof.
+`intent-roll-forward-partitioned*` has two partitions with one key each, at
+most two transactions in one partition and one in the other, and one turnover
+and one crash in total; a turnover and a crash in each partition, with done
+markers, exceed the exhaustive budget and are only sampled. It has no
+maintenance commits (the other partition's records and turnovers are the
+lost-CAS winners), no other writer, done markers in the exhaustive graphs only
+with one transaction per partition, a handoff only between protocol steps, and no repartitioning:
+partitions are fixed, and a key never moves between partitions. Its
+stale-generation property is a ghost check against the newest owner's
+acquisition, not a consequence derived from the data properties.
 
 Existing focused models retain their original bounds and controls. Their narrow
 limits above still apply: in particular only the restart profile clears caller
-state, and the retention graph has one writer and one GC; GC on another node and
-several writers are not modelled. Evidence expiry is not modeled;
-unavailable reads may stay unresolved indefinitely. Results are symbolic protocol
+state, and the retention graphs have one writer at a time: several concurrent
+writers are not modelled, and with remote GC the writer takes over only in the
+in-process graph. Remote GC has two GC nodes and one lease takeover; after it the
+old node issues nothing new (deletes it already decided and its pending empty
+commit still land), GC has one empty commit in flight at a time, and two GC
+nodes both sweeping concurrently are not modelled. Only one checkpoint is taken,
+records below the floor are not kept for readers, and the checkpoint writer knows
+which removed objects are already deleted. Evidence expiry is modeled only in the
+single-writer retry graph (`commits-retry-expiry`), with one horizon value and
+symbolic store times; it is not composed with checkpoint bytes, transactions or
+source positions, and an unresolved attempt stays unresolved: the model does not
+check how the caller recovers the logical write. `standby` has one dataset, one
+source partition, at most one crash and one pause, never-lost ingest CAS
+responses, a single global clock (no clock drift between instances or against
+the lease object), and no retention, checkpoints or GC; its availability bound
+holds only under the urgent-step timing assumptions above. The replica graphs have one source writer that
+commits atomically, one source GC, one replica GC whose timers are never lost, and
+one reader with one query; the reader graph has one object. They abstract the
+writer's in-flight commits and timestamp skew to the retention graph's age rule, and
+copies to atomic steps that read the source. Readers read the replica head key, so a
+regressed key can hide an arrived newer head until the next source commit
+replicates; reading the highest-numbered replicated version would avoid that, and
+neither is checked for liveness. Reclaiming every copy the source deleted is a
+reachable witness, not a bounded-growth property under fairness. Results are symbolic protocol
 evidence, not observations of the Spice engine or a storage provider.
 
 All checkers use a 540-second watchdog. Incomplete budget probes establish no
@@ -480,8 +731,8 @@ implementations. Delivery and maintenance are covered in separate compositions.
 
 ## Measured manual suite
 
-On 2026-10-27, `EXHAUST=1 ... all` matched 251/251 declarations in 3368 s
-(about 56 minutes). Every checker uses one exploration thread.
+On 2026-10-29, `EXHAUST=1 ... all` matched 299/299 declarations in 1340 s
+(about 22 minutes) with the default 6 threads, peak RSS 4.3 GB.
 
 | Representative exhaustive profile | Bound | Visits / unique states | Wall s |
 |---|---:|---:|---:|
@@ -515,11 +766,12 @@ retain every originally drawn stamp. The graph counts physical live rows and
 compares every committed prefix with the logical oracle, replay and checkpoint
 plus tail (including PK keys). Both tables can be acknowledged together.
 
-Leases exclude overlapping file sets until release or turnover. A publication
-atomically enforces its unit generation; this is a fencing assumption, not a
-separate lease GET followed by an unfenced CAS. With live-input guards retained,
-overlapping unleased plans remain safe. With full lease exclusion and fencing,
-skipping retry guard revalidation also remains safe in the finite graph. Removing
+Leases exclude overlapping file sets until release or turnover. A turnover
+records the unit's new generation in the head, so a plan from the old generation
+loses its CAS, and its retry finds the new generation and re-plans. The
+publication itself reads nothing else. With live-input guards retained,
+overlapping unleased plans remain safe. With full lease exclusion and the retry's
+lease check, skipping the other retry guards also remains safe in the finite graph. Removing
 both leaves two output copies. The two-safeguard diagnostic names both removals.
 `remote-maintenance-clear-retry` isolates a delete, cold rewrite, warm rewrite and
 an unrelated child-table commit. It requires the same nonempty covered clear to

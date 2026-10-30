@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+mimalloc = { version = "0.1.48" }
 stateright = { workspace = true }
 
 [lints]

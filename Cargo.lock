@@ -3857,6 +3857,7 @@ dependencies = [
 name = "cayenne-metastore-model"
 version = "2.5.0-unstable"
 dependencies = [
+ "mimalloc",
  "stateright",
 ]
 
