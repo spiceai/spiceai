@@ -549,3 +549,65 @@ async fn a_sort_over_aggregate_output_slices_charges_each_slice_for_its_own_rows
         panic!("row {index} is {got}, expected {want}: groups must sort by their sum, descending");
     }
 }
+
+/// The SQL planner refuses a data type nested more than 64 array or struct
+/// levels deep, and still plans one at the limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cast_to_a_type_nested_past_the_limit_is_refused() {
+    let ctx = spice_session(|_| {});
+    assert_eq!(
+        answer(
+            &ctx,
+            &format!("SELECT CAST(NULL AS INT{}) IS NULL", "[]".repeat(64))
+        )
+        .await,
+        Ok(owned(&["true"]))
+    );
+    let error = answer(
+        &ctx,
+        &format!("SELECT CAST(NULL AS INT{}) IS NULL", "[]".repeat(65)),
+    )
+    .await
+    .expect_err("65 levels exceed the limit");
+    assert!(
+        error.contains("SQL data type nesting depth exceeds the maximum of 64"),
+        "{error}"
+    );
+}
+
+/// Array and struct levels count toward the same limit: a type alternating
+/// `ARRAY<…>` and `STRUCT<…>` plans at 64 levels and is refused at 65.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cast_to_a_mixed_array_and_struct_type_past_the_limit_is_refused() {
+    // PostgreSQL, the dialect Spice sessions default to, has no `STRUCT<…>` type syntax.
+    let ctx = spice_session(|config| {
+        config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::Generic;
+    });
+    let nested = |levels: usize| {
+        (0..levels).fold("INT".to_string(), |inner, level| {
+            if level % 2 == 0 {
+                format!("ARRAY<{inner}>")
+            } else {
+                format!("STRUCT<a {inner}>")
+            }
+        })
+    };
+    assert_eq!(
+        answer(
+            &ctx,
+            &format!("SELECT CAST(NULL AS {}) IS NULL", nested(64))
+        )
+        .await,
+        Ok(owned(&["true"]))
+    );
+    let error = answer(
+        &ctx,
+        &format!("SELECT CAST(NULL AS {}) IS NULL", nested(65)),
+    )
+    .await
+    .expect_err("65 levels exceed the limit");
+    assert!(
+        error.contains("SQL data type nesting depth exceeds the maximum of 64"),
+        "{error}"
+    );
+}
