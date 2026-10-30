@@ -934,6 +934,26 @@ mod tests {
         ])
     }
 
+    /// A tag's `UD-` prefix, in any case, is dropped to find the head of its plain tag when the
+    /// repository has no `Q8_0` head: Copilot's case on #15590.
+    #[test]
+    fn a_ud_tag_in_any_case_drafts_with_the_head_of_its_plain_tag() {
+        for weights in [
+            "Model-UD-Q4_K_XL.gguf",
+            "Model-ud-Q4_K_XL.gguf",
+            "Model-Ud-Q4_K_XL.gguf",
+        ] {
+            let files = listing(&[(weights, 4 * GB), ("MTP/mtp-Model-Q4_K_XL.gguf", GB / 10)]);
+            let qs = quantizations(&files);
+            assert_eq!(qs.len(), 1, "{weights}");
+            assert_eq!(
+                draft_head(&files, &qs[0]),
+                ["MTP/mtp-Model-Q4_K_XL.gguf"],
+                "{weights}"
+            );
+        }
+    }
+
     #[test]
     fn weights_named_by_their_tag_alone_draft_with_the_head_of_that_tag() {
         let files = bare_tags();
