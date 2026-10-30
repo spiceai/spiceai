@@ -2730,8 +2730,9 @@ mod tests {
     #[tokio::test]
     async fn primary_key_on_column_names_that_are_not_bare_identifiers() {
         let names = ["service.instance.id", "sentry-environment", "2xx_count"];
-        let mut cases: Vec<Vec<usize>> = (0..names.len()).map(|i| vec![i]).collect();
-        cases.push((0..names.len()).collect());
+        let cases = (0..names.len())
+            .map(|i| vec![i])
+            .chain(std::iter::once((0..names.len()).collect::<Vec<usize>>()));
 
         let schema = Arc::new(Schema::new(
             names
@@ -2752,7 +2753,7 @@ mod tests {
             .expect("to create RecordBatch")
         };
 
-        for (case, key) in cases.into_iter().enumerate() {
+        for (case, key) in cases.enumerate() {
             let external_table = CreateExternalTable {
                 schema: ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
                     .expect("to convert Arrow schema to DataFusion schema"),
