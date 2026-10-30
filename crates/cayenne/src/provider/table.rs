@@ -29427,7 +29427,10 @@ impl CayenneTableProvider {
         } else if let Ok(permit) = budget.try_acquire_owned() {
             Some(permit)
         } else {
-            let skips = self.bake_slot_skips.fetch_add(1, Ordering::Relaxed) + 1;
+            let skips = self
+                .bake_slot_skips
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
