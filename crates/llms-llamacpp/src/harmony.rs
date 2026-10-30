@@ -685,6 +685,25 @@ mod tests {
                 arguments: "{\"a\":".to_string()
             }
         );
+        // as in a generated call, `<|end|>` in arguments that are not yet complete JSON is
+        // text, and once they are complete it closes the call
+        assert_eq!(
+            after(
+                "<|start|>assistant to=functions.f<|channel|>commentary json<|message|>{\"note\":\"<|end|>\",\"city\":",
+                Held::Nothing
+            ),
+            Route::Call {
+                name: "f".to_string(),
+                arguments: "{\"note\":\"<|end|>\",\"city\":".to_string()
+            }
+        );
+        assert_eq!(
+            after(
+                "<|start|>assistant to=functions.f<|channel|>commentary json<|message|>{\"a\":1}<|end|>",
+                Held::Nothing
+            ),
+            Route::Header(String::new())
+        );
         // a grammar holds the reply from its first header
         assert_eq!(
             after("<|start|>assistant<|channel|>final<|message|>", Held::Reply),
