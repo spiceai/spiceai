@@ -252,34 +252,159 @@ fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn s
     Ok(String::from_utf8(w.into_inner()?)?)
 }
 
-/// `from` as the HTTP API reports it, without any `user[:password]@` part.
+/// Schemes whose URLs WHATWG parsers accept with any number of `/` or `\`
+/// (including none) before the authority, e.g. `https:user:pass@host`.
+const SPECIAL_URL_SCHEMES: &[&str] = &["http", "https", "ws", "wss", "ftp"];
+
+/// Schemes where the userinfo names a storage container, not a credential
+/// (`abfss://container@account.dfs.core.windows.net/path`).
+const CONTAINER_USERINFO_SCHEMES: &[&str] = &["abfs", "abfss", "wasb", "wasbs"];
+
+/// Query keys whose values are credentials (passwords, tokens, API keys,
+/// signed-URL signatures). Matched as a case-insensitive substring.
+const SECRET_QUERY_KEY_MARKERS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "key",
+    "auth",
+    "credential",
+    "signature",
+];
+
+const REDACTED: &str = "***";
+
+fn is_scheme_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')
+}
+
+/// Characters that end a URL embedded in free text.
+fn ends_embedded_url(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>')
+}
+
+fn is_secret_query_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "sig" || SECRET_QUERY_KEY_MARKERS.iter().any(|m| key.contains(m))
+}
+
+/// If `s` starts with a URL that has an authority, `s`'s URL prefix with the
+/// userinfo removed and secret query values replaced, plus how many bytes of
+/// `s` that prefix covers. `None` when `s` does not start with such a URL.
+///
+/// This is a string scan, not a URL parse, so it also fails closed for URLs a
+/// parser would reject (a bad port, an unknown scheme).
+fn redact_url_at(s: &str) -> Option<(String, usize)> {
+    let colon = s.find(':')?;
+    let scheme = &s[..colon];
+    if !scheme.starts_with(|c: char| c.is_ascii_alphabetic()) || !scheme.chars().all(is_scheme_char)
+    {
+        return None;
+    }
+    let scheme = scheme.to_ascii_lowercase();
+    let after_colon = &s[colon + 1..];
+    let authority_start = if SPECIAL_URL_SCHEMES.contains(&scheme.as_str()) {
+        colon + 1 + (after_colon.len() - after_colon.trim_start_matches(['/', '\\']).len())
+    } else if after_colon.starts_with("//") {
+        colon + 1 + "//".len()
+    } else {
+        return None;
+    };
+
+    let authority_len = s[authority_start..]
+        .find(|c: char| matches!(c, '/' | '\\' | '?' | '#') || ends_embedded_url(c))
+        .unwrap_or(s.len() - authority_start);
+    let authority_end = authority_start + authority_len;
+    let authority = &s[authority_start..authority_end];
+
+    let mut out = String::with_capacity(s.len());
+    out.push_str(&s[..authority_start]);
+    match authority.rfind('@') {
+        Some(at) if !CONTAINER_USERINFO_SCHEMES.contains(&scheme.as_str()) => {
+            out.push_str(&authority[at + 1..]);
+        }
+        _ => out.push_str(authority),
+    }
+
+    let rest = &s[authority_end..];
+    let url_len = rest.find(ends_embedded_url).unwrap_or(rest.len());
+    let rest = &rest[..url_len];
+    let (before_fragment, fragment) = rest.split_at(rest.find('#').unwrap_or(rest.len()));
+    match before_fragment.split_once('?') {
+        Some((path, query)) => {
+            out.push_str(path);
+            out.push('?');
+            for (i, pair) in query.split('&').enumerate() {
+                if i > 0 {
+                    out.push('&');
+                }
+                match pair.split_once('=') {
+                    Some((key, _)) if is_secret_query_key(key) => {
+                        out.push_str(key);
+                        out.push('=');
+                        out.push_str(REDACTED);
+                    }
+                    _ => out.push_str(pair),
+                }
+            }
+        }
+        None => out.push_str(before_fragment),
+    }
+    out.push_str(fragment);
+    Some((out, authority_end + url_len))
+}
+
+/// `from` as the HTTP API reports it, without credentials.
 ///
 /// A component source can carry credentials in its URL, either directly
 /// (`https://user:password@host/file.csv`) or after a connector prefix with
 /// any delimiter the runtime accepts (`iceberg:https://...`,
 /// `iceberg/https://...`, `iceberg://https://...`). Any API key that can list
-/// components can read `from`, so the user name and password are removed
-/// before it is returned.
-///
-/// This is a string scan rather than a URL parse so that it fails closed: an
-/// authority that is not a valid URL (a bad port, an unknown scheme) still has
-/// its userinfo removed. Every `://` in the source starts an authority, which
-/// ends at the first `/`, `\`, `?` or `#`; everything up to the last `@` in it
-/// is dropped. A source without credentials is returned unchanged.
+/// components can read `from`, so the `user[:password]@` part and the values of
+/// secret-looking query keys (`token`, `api_key`, `sig`, ...) are removed
+/// before it is returned. Only the URL at the start of `from`, or right after
+/// its connector prefix, is redacted; a `://` later in a path is left alone. A
+/// source without credentials is returned unchanged.
+#[must_use]
 pub(crate) fn redact_source_credentials(from: &str) -> String {
-    let mut out = String::with_capacity(from.len());
-    let mut rest = from;
-    while let Some(idx) = rest.find("://") {
-        let authority_start = idx + "://".len();
-        out.push_str(&rest[..authority_start]);
-        let after = &rest[authority_start..];
-        let authority_end = after.find(['/', '\\', '?', '#']).unwrap_or(after.len());
-        rest = match after[..authority_end].rfind('@') {
-            Some(at) => &after[at + 1..],
-            None => after,
-        };
+    if let Some((redacted, len)) = redact_url_at(from) {
+        let redacted = format!("{redacted}{}", &from[len..]);
+        if redacted != from {
+            return redacted;
+        }
     }
-    out.push_str(rest);
+    if let Some((pos, delimiter_len)) = runtime_component::find_first_delimiter(from) {
+        let start = pos + delimiter_len;
+        if let Some((redacted, len)) = redact_url_at(&from[start..]) {
+            return format!("{}{redacted}{}", &from[..start], &from[start + len..]);
+        }
+    }
+    from.to_string()
+}
+
+/// `message` with every URL in it redacted as [`redact_source_credentials`]
+/// would. Used for status error messages, which connectors often build from
+/// the source URL.
+#[must_use]
+pub(crate) fn redact_message_credentials(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    let mut prev: Option<char> = None;
+    while let Some(c) = rest.chars().next() {
+        if prev.is_none_or(|p| !is_scheme_char(p))
+            && let Some((redacted, len)) = redact_url_at(rest)
+        {
+            out.push_str(&redacted);
+            prev = redacted.chars().last();
+            rest = &rest[len..];
+            continue;
+        }
+        out.push(c);
+        prev = Some(c);
+        rest = &rest[c.len_utf8()..];
+    }
     out
 }
 
@@ -1033,6 +1158,19 @@ mod tests {
                 "https://user:p@ss@files.example.com/data.csv",
                 "https://files.example.com/data.csv",
             ),
+            // Forms WHATWG parsers accept for special schemes.
+            (
+                "https:///user:secret@files.example.com/data.csv",
+                "https:///files.example.com/data.csv",
+            ),
+            (
+                "https:user:secret@files.example.com/data.csv",
+                "https:files.example.com/data.csv",
+            ),
+            (
+                "HTTPS:\\\\user:secret@files.example.com/data.csv",
+                "HTTPS:\\\\files.example.com/data.csv",
+            ),
             // Every delimiter `DatasetSpec::path` / `CatalogSpec::catalog_id` accept.
             (
                 "iceberg:https://user:secret@catalog.example.com/v1/ns",
@@ -1056,6 +1194,19 @@ mod tests {
                 "iceberg:https://catalog.example.com:bad/v1",
             ),
             ("https://user:secret@", "https://"),
+            // Secret query values.
+            (
+                "https://files.example.com/data.csv?api_key=secret&format=csv",
+                "https://files.example.com/data.csv?api_key=***&format=csv",
+            ),
+            (
+                "https://acct.blob.example.com/c/data.csv?sv=2024&sig=abc%2Fdef#frag",
+                "https://acct.blob.example.com/c/data.csv?sv=2024&sig=***#frag",
+            ),
+            (
+                "iceberg:https://user:pw@catalog.example.com/v1?Token=abc",
+                "iceberg:https://catalog.example.com/v1?Token=***",
+            ),
         ] {
             assert_eq!(redact_source_credentials(from), expected, "from: {from}");
         }
@@ -1066,19 +1217,40 @@ mod tests {
         for from in [
             "postgres:public.orders",
             "s3://bucket/path/trips.parquet",
+            "s3://bucket/reports/https://alice@example.csv",
             "abfs://container/path/",
+            "abfss://container@account.dfs.core.windows.net/data.csv",
             "https://files.example.com/data.csv",
             "https://files.example.com/users/@me/data.csv",
             "https://files.example.com/data.csv?owner=a@example.com",
             "https://files.example.com/data.csv#a@b",
             "HTTPS://Files.Example.com:8443/Data.csv",
             "file:../data/orders.csv",
+            "file:///home/me/a@b/orders.csv",
             "memory:store",
             "spice.ai:spiceai/quickstart/datasets/taxi_trips",
             "",
         ] {
             assert_eq!(redact_source_credentials(from), from);
         }
+    }
+
+    #[test]
+    fn redact_message_credentials_redacts_embedded_urls() {
+        assert_eq!(
+            redact_message_credentials(
+                "Cannot setup the dataset d (https). https://alice:SECRET@example.com:bad/data.csv is not a valid URL."
+            ),
+            "Cannot setup the dataset d (https). https://example.com:bad/data.csv is not a valid URL."
+        );
+        assert_eq!(
+            redact_message_credentials(
+                "Error performing HEAD https://u:SECRET@h/x.csv?token=T0K in 4s; retry 'postgresql://a:B@db/app'"
+            ),
+            "Error performing HEAD https://h/x.csv?token=*** in 4s; retry 'postgresql://db/app'"
+        );
+        let plain = "Unable to authenticate with datasource credentials: user@example.com";
+        assert_eq!(redact_message_credentials(plain), plain);
     }
 
     /// A query the results cache refuses (e.g. one calling `random()` or

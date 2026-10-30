@@ -39,7 +39,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use super::{Format, convert_entry_to_csv, dataset_status, redact_source_credentials};
+use super::{
+    Format, convert_entry_to_csv, dataset_status, redact_message_credentials,
+    redact_source_credentials,
+};
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams, utoipa::ToSchema))]
@@ -295,7 +298,7 @@ fn dataset_infos(
             });
             let error_message = status
                 .as_ref()
-                .and_then(|s| s.error_message().map(String::from));
+                .and_then(|s| s.error_message().map(redact_message_credentials));
             let (last_refresh, next_refresh) = if include_status {
                 dataset_freshness(df, d, &datasets_by_name)
             } else {
