@@ -165,7 +165,7 @@
       "who": "variants",
       "key": "query: SELECT id, regexp_count(s, 'a*') AS c FROM rx ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"c\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"3\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"c\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"3\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -173,7 +173,7 @@
       "who": "variants",
       "key": "query: SELECT id, regexp_count(s, 'a|\\b') AS c FROM rx ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"c\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"c\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -181,7 +181,7 @@
       "who": "variants",
       "key": "query: SELECT id, regexp_count(s, '\\d') AS c FROM rx ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"c\", row_number: 18, expected: \"\\\"1\\\"\", actual: \"\\\"0\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"c\", row_number: 18, expected: \"\\\"1\\\"\", actual: \"\\\"0\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -189,7 +189,7 @@
       "who": "variants",
       "key": "query: SELECT id, regexp_like(s, '\\d') AS v FROM rx ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 18, expected: \"\\\"true\\\"\", actual: \"\\\"false\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"v\", row_number: 18, expected: \"\\\"true\\\"\", actual: \"\\\"false\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -197,7 +197,7 @@
       "who": "variants",
       "key": "query: SELECT id, regexp_like(s, '\\ba') AS v FROM rx ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"true\\\"\", actual: \"\\\"false\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"true\\\"\", actual: \"\\\"false\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -205,7 +205,7 @@
       "who": "variants",
       "key": "query: SELECT id, regexp_like(s, '(?i)k') AS v FROM rx ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 19, expected: \"\\\"true\\\"\", actual: \"\\\"false\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"v\", row_number: 19, expected: \"\\\"true\\\"\", actual: \"\\\"false\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -213,7 +213,7 @@
       "who": "variants",
       "key": "query: SELECT id, regexp_replace(s, '\\d', 'X') AS v FROM rx ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 18, expected: \"\\\"xyX\\\"\", actual: \"\\\"xy\u0661\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"v\", row_number: 18, expected: \"\\\"xyX\\\"\", actual: \"\\\"xy١\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -221,7 +221,7 @@
       "who": "variants",
       "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '$2$1') AS v FROM rx ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"ba\\\"\", actual: \"\\\"$2$1\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"ba\\\"\", actual: \"\\\"$2$1\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -229,7 +229,7 @@
       "who": "variants",
       "key": "query: SELECT id, regexp_replace(s, 'a*', 'X', 'g') AS v FROM rx ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"XbX\\\"\", actual: \"\\\"XXbX\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"XbX\\\"\", actual: \"\\\"XXbX\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -237,7 +237,7 @@
       "who": "variants",
       "key": "query: SELECT id FROM rx WHERE regexp_like(s, '\\d') ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: RowCountMismatch { expected: 2, actual: 1 }",
+      "signature": "federated vs cayenne: RowCountMismatch { expected: 2, actual: 1 }",
       "group": "federation-postgres"
     },
     {
@@ -245,7 +245,7 @@
       "who": "variants",
       "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '\\0-\\2\\1') AS v FROM rx ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"ab-ba\\\"\", actual: \"\\\"\\\\\\\\\\\\\\\\0-ba\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"ab-ba\\\"\", actual: \"\\\"\\\\\\\\\\\\\\\\0-ba\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -253,7 +253,7 @@
       "who": "variants",
       "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '\\10') AS v FROM rx ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"\\\"\", actual: \"\\\"a0\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"\\\"\", actual: \"\\\"a0\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -261,15 +261,15 @@
       "who": "variants",
       "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '\\\\1') AS v FROM rx ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"a\\\"\", actual: \"\\\"\\\\\\\\\\\\\\\\1\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"a\\\"\", actual: \"\\\"\\\\\\\\\\\\\\\\1\\\"\" }",
       "group": "federation-postgres"
     },
     {
       "run": "builtins",
       "who": "variants",
-      "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '\\1\u0661') AS v FROM rx ORDER BY id",
+      "key": "query: SELECT id, regexp_replace(s, '(a)(b)', '\\1١') AS v FROM rx ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"\\\"\", actual: \"\\\"a\u0661\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"\\\"\", actual: \"\\\"a١\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -277,7 +277,7 @@
       "who": "variants",
       "key": "query: SELECT nth_value(customer, 2 ORDER BY customer) AS n FROM cust WHERE region = 'eu'",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"carol\\\"\", actual: \"\\\"\u00c5ngstr\u00f6m\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"carol\\\"\", actual: \"\\\"Ångström\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -285,7 +285,7 @@
       "who": "variants",
       "key": "query: SELECT id, concat(customer, '-', region) AS c FROM cust ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"c\", row_number: 5, expected: \"None\", actual: \"\\\"bob-\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"c\", row_number: 5, expected: \"None\", actual: \"\\\"bob-\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -293,7 +293,7 @@
       "who": "variants",
       "key": "query: SELECT id, concat(customer, CAST(NULL AS VARCHAR)) AS c FROM cust ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"c\", row_number: 1, expected: \"None\", actual: \"\\\"carol\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"c\", row_number: 1, expected: \"None\", actual: \"\\\"carol\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -301,7 +301,7 @@
       "who": "variants",
       "key": "query: SELECT id, concat(CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR)) AS c FROM cust ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"c\", row_number: 1, expected: \"None\", actual: \"\\\"\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"c\", row_number: 1, expected: \"None\", actual: \"\\\"\\\"\" }",
       "group": "federation-postgres"
     },
     {
@@ -309,7 +309,7 @@
       "who": "variants",
       "key": "query: SELECT id, concat('', region) AS c FROM cust ORDER BY id",
       "kind": "wrong-answer",
-      "signature": "federated vs arrow: DataMismatch { column: \"c\", row_number: 5, expected: \"None\", actual: \"\\\"\\\"\" }",
+      "signature": "federated vs cayenne: DataMismatch { column: \"c\", row_number: 5, expected: \"None\", actual: \"\\\"\\\"\" }",
       "group": "federation-postgres"
     }
   ],
@@ -1178,7 +1178,7 @@
     {
       "run": "mysql-literals",
       "who": "federated",
-      "key": "query: SELECT id FROM m WHERE s IN ('a''b\"c_d%e', 'na\u00efve') ORDER BY id",
+      "key": "query: SELECT id FROM m WHERE s IN ('a''b\"c_d%e', 'naïve') ORDER BY id",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 1 }",
       "group": "federation-mysql"
@@ -1186,7 +1186,7 @@
     {
       "run": "mysql-literals",
       "who": "federated",
-      "key": "query: SELECT id FROM m WHERE s BETWEEN 'a''b\"c_d%e' AND 'na\u00efve' ORDER BY id",
+      "key": "query: SELECT id FROM m WHERE s BETWEEN 'a''b\"c_d%e' AND 'naïve' ORDER BY id",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 2, actual: 1 }",
       "group": "federation-mysql"
@@ -1775,7 +1775,7 @@
       "who": "federated",
       "key": "query: SELECT id, concat(s, '-', id) AS c1, s || '!' AS c2 FROM t WHERE id < 40",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"c2\", row_number: 1, expected: \"\\\"na\u00efve!\\\"\", actual: \"\\\"0\\\"\" }",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"c2\", row_number: 1, expected: \"\\\"naïve!\\\"\", actual: \"\\\"0\\\"\" }",
       "group": "federation-mysql"
     },
     {
@@ -2061,7 +2061,7 @@
     {
       "run": "surface",
       "who": "federated",
-      "key": "query: SELECT id, starts_with(s, 'Ga') AS sw, ends_with(s, '\u00e9') AS ew FROM ev WHERE s IS NOT NULL",
+      "key": "query: SELECT id, starts_with(s, 'Ga') AS sw, ends_with(s, 'é') AS ew FROM ev WHERE s IS NOT NULL",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nERROR: function ends_with(text, unknown) does not exist\\nHINT: No function matches the given name and argument types. You might need to add explicit type ",
       "group": "federation-postgres"
