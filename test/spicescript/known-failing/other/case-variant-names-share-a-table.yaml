@@ -1,0 +1,69 @@
+name: case-variant-names-share-a-table
+description: >
+  Two datasets whose names differ only in case, one of them quoted in the
+  Spicepod, each answer their own source's rows when one engine accelerates
+  both in one file. Known failing: SQLite and Turso read the two names as one
+  table, so both datasets keep their data in it, and the one declared second
+  loads over the first's rows.
+
+sources:
+  lake: { kind: files }
+
+variants:
+  sqlite: sqlite-file
+  turso: turso-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: case-variant-names-share-a-table
+  datasets:
+    - from: file://${sources.lake.path}/upper/
+      name: '"Mixed"'
+      params: { file_format: csv }
+
+defaults:
+  compare-variants: false
+  spiced-args: [--pods-watcher-enabled]
+
+steps:
+  - generate:
+      lake:
+        table: upper
+        rows: 2
+        seed: 1
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+  - generate:
+      lake:
+        table: lower
+        rows: 1
+        seed: 2
+        format: csv
+        columns:
+          - { name: id, sequence: 7 }
+  - start: {}
+  - query: SELECT id FROM "Mixed" ORDER BY id
+    eventually: 60s
+    expect: { rows: [['1'], ['2']] }
+
+  # `mixed` is declared once `"Mixed"` has loaded, so the order they load in
+  # is the same on every run.
+  - edit-spicepod:
+      spicepod:
+        datasets:
+          - from: file://${sources.lake.path}/upper/
+            name: '"Mixed"'
+            params: { file_format: csv }
+            acceleration: { enabled: true, engine: '${variant.name}', mode: file }
+          - from: file://${sources.lake.path}/lower/
+            name: mixed
+            params: { file_format: csv }
+            acceleration: { enabled: true, engine: '${variant.name}', mode: file }
+  - query: SELECT id FROM mixed ORDER BY id
+    eventually: 60s
+    expect: { rows: [['7']] }
+  - query: SELECT id FROM "Mixed" ORDER BY id
+    eventually: 30s
+    expect: { rows: [['1'], ['2']] }

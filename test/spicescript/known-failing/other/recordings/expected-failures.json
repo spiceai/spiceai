@@ -1,4 +1,22 @@
 {
+  "case-variant-names-share-a-table": [
+    {
+      "run": "case-variant-names-share-a-table",
+      "who": "sqlite",
+      "key": "query: SELECT id FROM \"Mixed\" ORDER BY id #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 2, actual: 1 }",
+      "group": "other"
+    },
+    {
+      "run": "case-variant-names-share-a-table",
+      "who": "turso",
+      "key": "query: SELECT id FROM \"Mixed\" ORDER BY id #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 2, actual: 1 }",
+      "group": "other"
+    }
+  ],
   "localpod-follow": [
     {
       "run": "localpod-follow",
