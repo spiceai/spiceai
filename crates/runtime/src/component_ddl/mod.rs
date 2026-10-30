@@ -1801,19 +1801,20 @@ impl Runtime {
             .get_accelerator_engine(engine)
             .await?;
         let location = match accelerator.acceleration_layout(&built) {
-            AccelerationLayout::None => match accelerator.file_path(&built) {
-                Ok(path) => place(std::path::Path::new(&path))
-                    .await
-                    .display()
-                    .to_string(),
-                // An engine with no file of its own, PostgreSQL, keeps the data
-                // where its parameters point.
-                Err(_) => {
+            AccelerationLayout::None => {
+                if let Ok(path) = accelerator.file_path(&built) {
+                    place(std::path::Path::new(&path))
+                        .await
+                        .display()
+                        .to_string()
+                } else {
+                    // An engine with no file of its own, PostgreSQL, keeps the
+                    // data where its parameters point.
                     let mut params: Vec<_> = acceleration.params.iter().collect();
                     params.sort();
                     format!("{params:?}")
                 }
-            },
+            }
             AccelerationLayout::File { path } => format!(
                 "{:?}",
                 AccelerationLayout::File {
