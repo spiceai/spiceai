@@ -585,6 +585,9 @@ impl LlamaCpp {
             harmony::Held::Nothing
         };
         let prompt = self.prompt(&req.messages, reasoning, tools)?;
+        // Every choice's reply starts where the prompt leaves it, so the prompt is read once.
+        let reader =
+            markers.map(|markers| harmony::Reader::new(markers, nameable, held).after(&prompt));
         let stop = match &req.stop {
             Some(StopConfiguration::String(s)) => vec![s.clone()],
             Some(StopConfiguration::StringArray(s)) => s.clone(),
@@ -595,9 +598,7 @@ impl LlamaCpp {
         let mut receivers = Vec::with_capacity(choices);
         for tools in matchers {
             let (events, rx) = mpsc::channel(STREAM_BUFFER);
-            let harmony = markers.map(|markers| {
-                harmony::Reader::new(markers, nameable.clone(), held).after(&prompt)
-            });
+            let harmony = reader.clone();
             let job = Job {
                 reasoning: reasoning_parser(template, &prompt),
                 prompt: prompt.clone(),

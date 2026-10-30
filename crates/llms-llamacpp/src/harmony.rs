@@ -94,7 +94,8 @@ impl Markers {
     }
 
     /// `text` as the markers it spells, each as its token with its text, and the text between
-    /// them, as a prompt tokenized with its markers as tokens holds it.
+    /// them, as a prompt tokenized with its markers as tokens holds it. Every marker starts
+    /// with `<|`, so the text is scanned once, for those two bytes.
     fn spell<'t>(&self, text: &'t str) -> Vec<(Option<Token>, &'t str)> {
         let spelled = [
             (START, self.start),
@@ -106,17 +107,23 @@ impl Markers {
             (CONSTRAIN, self.constrain),
         ];
         let mut out = Vec::new();
-        let mut rest = text;
-        while !rest.is_empty() {
-            let (token, len) =
-                if let Some((s, token)) = spelled.iter().find(|(s, _)| rest.starts_with(s)) {
-                    (Some(*token), s.len())
-                } else {
-                    let next = spelled.iter().filter_map(|(s, _)| rest.find(s)).min();
-                    (None, next.unwrap_or(rest.len()))
-                };
-            out.push((token, &rest[..len]));
-            rest = &rest[len..];
+        // The text before `from` is spelled; a marker may start at `at` or after it.
+        let (mut from, mut at) = (0, 0);
+        while let Some(found) = text[at..].find("<|") {
+            let i = at + found;
+            if let Some((s, token)) = spelled.iter().find(|(s, _)| text[i..].starts_with(s)) {
+                if from < i {
+                    out.push((None, &text[from..i]));
+                }
+                out.push((Some(*token), &text[i..i + s.len()]));
+                from = i + s.len();
+                at = from;
+            } else {
+                at = i + "<|".len();
+            }
+        }
+        if from < text.len() {
+            out.push((None, &text[from..]));
         }
         out
     }
@@ -169,7 +176,7 @@ pub(crate) enum Held {
 }
 
 /// Reads one reply.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Reader {
     markers: Markers,
     /// The tools a call may name.
@@ -196,10 +203,11 @@ impl Reader {
     /// message. A custom one may go on to name that message's channel, or to open its body,
     /// as `<|start|>assistant<|channel|>final<|message|>` does, and the reply then goes on in
     /// that header or body. The prompt is tokenized with the markers it spells as their
-    /// tokens, so its text marks what the model reads, and the rest of its open message is
-    /// read here as a reply is: a marker marks only where it would in a reply, so `<|end|>`
-    /// inside a call's unfinished JSON arguments is text, and a call goes on from the
-    /// arguments the prompt began.
+    /// tokens, so its text marks what the model reads, and the whole prompt is read here as
+    /// a reply is, from its first `<|start|>`: a marker marks only where it would in a reply,
+    /// so `<|start|>` in a body, or `<|end|>` inside a call's unfinished JSON arguments, is
+    /// text, and a call goes on from the arguments the prompt began. Each header is read
+    /// from after its role, as the header after a stock prompt's `<|start|>assistant` is.
     ///
     /// A grammar holds a reply from its first header (`harmony_reply`, `harmony_call`), so a
     /// reply held to one starts in a header whatever the prompt opened.
@@ -207,20 +215,26 @@ impl Reader {
         if self.held != Held::Nothing {
             return self;
         }
-        let Some(at) = prompt.rfind(START) else {
+        let Some(first) = prompt.find(START) else {
             return self;
         };
-        // The reply's first header starts after the role, where a stock prompt ends.
-        let open = &prompt[at + START.len()..];
-        for (token, text) in self.markers.spell(&open[word(open).len()..]) {
+        // Whether the text read next starts with a message's role.
+        let mut role = false;
+        for (token, text) in self.markers.spell(&prompt[first..]) {
             match token {
                 Some(token) if self.marks(token, "") => {
+                    role = token == self.markers.start;
                     if !matches!(self.mark(token), Mark::Next) {
-                        // The prompt's last message is closed, so the reply starts a new one.
+                        // The message is closed, so the reply starts a new one.
                         self.route = Route::Header(String::new());
                     }
                 }
                 _ => {
+                    let text = if std::mem::take(&mut role) {
+                        &text[word(text).len()..]
+                    } else {
+                        text
+                    };
                     self.text(text);
                 }
             }
