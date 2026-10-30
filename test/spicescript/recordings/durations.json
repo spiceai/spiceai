@@ -1,4 +1,5 @@
 {
+  "append-embeddings": 13,
   "append-kill": 7,
   "append-time-column": 8,
   "append-time-partition": 4,
@@ -80,6 +81,7 @@
   "mysql-cdc-parity": 43,
   "mysql-cdc-shared-binlog": 41,
   "mysql-cdc-upgrade": 12,
+  "mysql-connection-pool": 65,
   "mysql-join-capabilities": 11,
   "mysql-literals": 12,
   "mysql-null-ordering": 11,
@@ -127,6 +129,7 @@
   "search-hybrid": 6,
   "served-while-source-down": 48,
   "settings-evolution": 54,
+  "slow-refresh-warning": 52,
   "slt-strings": 8,
   "source-down-at-start": 36,
   "sql-explain-protocols": 1,

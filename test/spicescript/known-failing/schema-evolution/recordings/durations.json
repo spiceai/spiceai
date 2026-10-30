@@ -1,4 +1,5 @@
 {
+  "acceleration-source-change-at-restart": 65,
   "schema-add-column-full-refresh": 63,
   "schema-frozen-status": 41,
   "schema-widen": 75
