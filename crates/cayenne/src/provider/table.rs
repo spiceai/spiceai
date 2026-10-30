@@ -244,7 +244,10 @@ struct BakeFilePartition {
 
 impl BakeFilePartition {
     fn rewritten_files(&self) -> usize {
-        self.inputs.iter().map(|input| input.rewrite_names.len()).sum()
+        self.inputs
+            .iter()
+            .map(|input| input.rewrite_names.len())
+            .sum()
     }
 
     fn kept_files(&self) -> usize {
@@ -11669,7 +11672,12 @@ impl CayenneTableProvider {
         // encode, held until the write completes. No-op (ungated) when no budget
         // is installed (unit tests, embedders). See `write_budget`.
         let shard_count = self
-            .snapshot_shard_count(target_partitions, target_size_bytes, estimated_bytes, fan_out)
+            .snapshot_shard_count(
+                target_partitions,
+                target_size_bytes,
+                estimated_bytes,
+                fan_out,
+            )
             .min(max_shards.unwrap_or(usize::MAX))
             .max(1);
         // `snapshot_write_concurrency` already clamps the fan-out to
@@ -23003,7 +23011,10 @@ impl CayenneTableProvider {
                 // A hard link shares data the source already made durable; a copy
                 // is new data, so it is synced before the caller syncs the
                 // directory and publishes the snapshot that references it.
-                tokio::fs::File::open(&destination).await?.sync_all().await?;
+                tokio::fs::File::open(&destination)
+                    .await?
+                    .sync_all()
+                    .await?;
             }
         }
         Ok(())
@@ -29860,12 +29871,13 @@ impl CayenneTableProvider {
             state.config().target_partitions(),
             total_input_bytes,
         );
-        let (range_inputs, range_subsets) = partition
-            .as_ref()
-            .map_or_else(|| (selected.clone(), None), |partition| {
+        let (range_inputs, range_subsets) = partition.as_ref().map_or_else(
+            || (selected.clone(), None),
+            |partition| {
                 let (inputs, subsets) = partition.rewrite_inputs();
                 (inputs, Some(subsets))
-            });
+            },
+        );
         // Boxed for the reason `snapshot_bytes_for_merge_budget` is.
         let range_plan = Box::pin(self.bake_range_plan(
             &state,
@@ -29914,7 +29926,8 @@ impl CayenneTableProvider {
         }
 
         if let Some(partition) = &partition
-            && let Err(error) = Box::pin(self.link_bake_kept_files(&new_snapshot_id, partition)).await
+            && let Err(error) =
+                Box::pin(self.link_bake_kept_files(&new_snapshot_id, partition)).await
         {
             self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                 .await;
@@ -30144,16 +30157,16 @@ impl CayenneTableProvider {
         };
         // Bytes the bake wrote: the files it kept are in its output but were
         // linked, not written.
-        let (files_rewritten, files_kept, bytes_kept) = partition.as_ref().map_or(
-            (selected_input_files, 0, 0),
-            |partition| {
-                (
-                    partition.rewritten_files(),
-                    partition.kept_files(),
-                    partition.kept_bytes,
-                )
-            },
-        );
+        let (files_rewritten, files_kept, bytes_kept) =
+            partition
+                .as_ref()
+                .map_or((selected_input_files, 0, 0), |partition| {
+                    (
+                        partition.rewritten_files(),
+                        partition.kept_files(),
+                        partition.kept_bytes,
+                    )
+                });
         let written_bytes = merged_output_bytes.saturating_sub(bytes_kept);
         telemetry::cayenne::track_compaction_merged_bytes(
             written_bytes,
@@ -30354,13 +30367,8 @@ impl CayenneTableProvider {
             .iter()
             .map(|&index| scan_schema.index_of(schema.field(index).name()))
             .collect::<std::result::Result<Vec<usize>, _>>()?;
-        // The rows the file holds: the scan's exact row count — the sum of its
-        // files' footer row counts, a raw physical count, here one file's — when
-        // it reports one.
-        let footer_rows = match scan.partition_statistics(None)?.num_rows {
-            DFPrecision::Exact(rows) => Some(u64::try_from(rows).unwrap_or(u64::MAX)),
-            DFPrecision::Inexact(_) | DFPrecision::Absent => None,
-        };
+        // The rows the file holds: its footer's row count, when exact.
+        let footer_rows = self.bake_file_row_count(state, snapshot_id, file).await?;
         let filtered =
             self.apply_partial_deletion_filter(scan, &pk_in_scan, threshold, deletion_snapshot)?;
         let task_ctx = state.task_ctx();
@@ -30380,6 +30388,40 @@ impl CayenneTableProvider {
             }
         };
         Ok(surviving != held)
+    }
+
+    /// The rows `file` of `snapshot_id` holds, from its footer statistics — the
+    /// raw physical row count the `COUNT(*)` fold also trusts — or `None` when
+    /// they report no exact count.
+    ///
+    /// Read through the file-statistics cache the scan path fills, not off the
+    /// bake's key scan: that scan collects no statistics, so it reports none.
+    async fn bake_file_row_count(
+        &self,
+        state: &dyn Session,
+        snapshot_id: &str,
+        file: &PartitionedFile,
+    ) -> DataFusionResult<Option<u64>> {
+        let table_url = ListingTableUrl::parse(Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            snapshot_id,
+        ))?;
+        let store = state.runtime_env().object_store(&table_url)?;
+        let statistics = self
+            .collect_scan_file_statistics(
+                state,
+                snapshot_id,
+                &store,
+                self.context.file_format().as_ref(),
+                file,
+                &self.table_schema(),
+            )
+            .await?;
+        Ok(match statistics.num_rows {
+            DFPrecision::Exact(rows) => Some(u64::try_from(rows).unwrap_or(u64::MAX)),
+            DFPrecision::Inexact(_) | DFPrecision::Absent => None,
+        })
     }
 
     /// A scan of `files`, a capture of some of `snapshot_id`'s files, read as
@@ -30471,10 +30513,7 @@ impl CayenneTableProvider {
             .iter()
             .flat_map(|input| {
                 let dir = self.snapshot_dir_path_for(&input.snapshot_id);
-                input
-                    .rewrite_names
-                    .iter()
-                    .map(move |name| dir.join(name))
+                input.rewrite_names.iter().map(move |name| dir.join(name))
             })
             .collect();
         if !paths.is_empty() {
@@ -42078,7 +42117,9 @@ impl CayenneTableProvider {
         self.run_test_post_snapshot_list_hook().await;
         let mut stored = false;
         // A subset is not the snapshot's listing (see `CapturedSnapshotFiles::subset`).
-        let lists_whole_snapshot = request.captured_files.is_none_or(|captured| !captured.subset);
+        let lists_whole_snapshot = request
+            .captured_files
+            .is_none_or(|captured| !captured.subset);
         if collect_stats && !truncated && lists_whole_snapshot {
             let gen_after = self.current_dir_generation.load(Ordering::Acquire);
             let epoch_after = self.listing_cache_epoch.load(Ordering::Acquire);

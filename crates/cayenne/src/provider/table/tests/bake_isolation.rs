@@ -59,7 +59,9 @@ fn pad_batch(schema: &SchemaRef, keys: &[i64]) -> RecordBatch {
         Arc::clone(schema),
         vec![
             Arc::new(Int64Array::from(keys.to_vec())),
-            Arc::new(StringArray::from_iter_values(keys.iter().map(|id| pad(*id)))),
+            Arc::new(StringArray::from_iter_values(
+                keys.iter().map(|id| pad(*id)),
+            )),
         ],
     )
     .expect("pad batch")
@@ -135,10 +137,7 @@ async fn bakeable_table(name: &str) -> (CayenneTableProvider, Arc<dyn MetadataCa
 /// waits for `release`.
 fn hold_bake_mid_encode(
     provider: &CayenneTableProvider,
-) -> (
-    tokio::sync::oneshot::Receiver<()>,
-    Arc<tokio::sync::Notify>,
-) {
+) -> (tokio::sync::oneshot::Receiver<()>, Arc<tokio::sync::Notify>) {
     let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
     let release = Arc::new(tokio::sync::Notify::new());
     let release_in_hook = Arc::clone(&release);
@@ -183,14 +182,14 @@ async fn a_checkpoint_does_not_wait_for_another_tables_bake_to_encode() {
         .await
         .expect("the bake reaches its encode within 60 s")
         .expect("the bake hook fired");
-    let held = crate::provider::write_budget::encode_budget_snapshot()
-        .expect("budget installed");
+    let held = crate::provider::write_budget::encode_budget_snapshot().expect("budget installed");
     assert!(
         held.available < held.total,
         "precondition: the bake holds encode permits mid-encode ({held:?})"
     );
 
-    let checkpoint = tokio::time::timeout(Duration::from_secs(20), writer.checkpoint_mem_tier()).await;
+    let checkpoint =
+        tokio::time::timeout(Duration::from_secs(20), writer.checkpoint_mem_tier()).await;
     release.notify_one();
     let flushed = checkpoint
         .unwrap_or_else(|_| {
@@ -292,8 +291,7 @@ async fn a_bake_encodes_on_half_the_maintenance_permits() {
         .await
         .expect("the bake reaches its encode within 60 s")
         .expect("the bake hook fired");
-    let held = crate::provider::write_budget::encode_budget_snapshot()
-        .expect("budget installed");
+    let held = crate::provider::write_budget::encode_budget_snapshot().expect("budget installed");
     release.notify_one();
     assert!(
         bake.await.expect("bake task").expect("bake"),
@@ -340,7 +338,11 @@ async fn a_table_that_keeps_finding_the_slot_taken_waits_its_turn() {
     let starved = Arc::new(starved);
     let mut turn = tokio::spawn({
         let starved = Arc::clone(&starved);
-        async move { starved.bake_seq_prefix_protected_snapshots_on_trigger().await }
+        async move {
+            starved
+                .bake_seq_prefix_protected_snapshots_on_trigger()
+                .await
+        }
     });
     // The slot is still held, so a bake that returns here skipped a fourth time.
     if let Ok(early) = tokio::time::timeout(Duration::from_secs(2), &mut turn).await {

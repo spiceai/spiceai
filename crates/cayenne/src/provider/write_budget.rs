@@ -489,10 +489,7 @@ async fn acquire_from(
         wait_start.elapsed(),
         &[telemetry::KeyValue::new("class", class_label)],
     );
-    Some(EncodePermits {
-        main,
-        _gate: gate,
-    })
+    Some(EncodePermits { main, _gate: gate })
 }
 
 #[cfg(test)]
