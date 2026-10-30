@@ -15,25 +15,21 @@ limitations under the License.
 */
 
 use crate::embeddings::{
-    Error, FailedToInstantiateEmbeddingModelSnafu, FailedWithHFApiSnafu, Result,
-    candle::ModelConfig,
+    Error, FailedToInstantiateEmbeddingModelSnafu, Result, candle::ModelConfig,
 };
+use crate::hf::{SAFETENSORS_INDEX, read_shards};
 use async_openai::types::embeddings::EmbeddingInput;
-use hf_hub::{
-    Repo, RepoType,
-    api::tokio::{ApiBuilder, ApiRepo},
-};
+use huggingface_hub::{DownloadError, Snapshot};
 use serde::Deserialize;
 use snafu::ResultExt;
 use std::{
     collections::HashMap,
     fs,
     path::{self, Path, PathBuf},
-    sync::Arc,
 };
-use tei_backend::{Pool, download_safetensors};
+use tei_backend::Pool;
 use tei_core::{
-    download::{ST_CONFIG_NAMES, download_artifacts},
+    download::ST_CONFIG_NAMES,
     tokenization::{EncodingInput, Tokenization},
 };
 
@@ -170,105 +166,82 @@ pub(crate) fn inputs_from_openai(input: &EmbeddingInput) -> Vec<EncodingInput> {
     }
 }
 
-/// Builds a `HuggingFace` API client, honouring `HF_HUB_CACHE` and applying `hf_token`
-/// only when it actually carries a value.
+/// Downloads the files the TEI backend loads an embedding or reranker model from into the
+/// Hugging Face cache, and returns the snapshot directory that holds them. One listing of the
+/// repository picks them, as `text-embeddings-inference` would: `config.json` and
+/// `tokenizer.json`; the Sentence Transformers configs the repository has
+/// (`1_Pooling/config.json`, `config_sentence_transformers.json`, and the first of
+/// [`ST_CONFIG_NAMES`]); and the weights: `model.safetensors`, else the shards
+/// `model.safetensors.index.json` names, else `pytorch_model.bin`.
 ///
-/// `ApiBuilder::with_token` *overwrites* the builder's token, and `ApiBuilder::new`
-/// pre-populates it from the Hub's own credential file (`~/.cache/huggingface/token`,
-/// written by `huggingface-cli login`). Passing `None` through therefore discards a
-/// credential the machine already has, leaving every download anonymous and at the
-/// mercy of the Hub's unauthenticated access rules. An empty string is worse than
-/// `None`: it is sent as an empty bearer token and rejected with 401. So both are
-/// treated as "no token supplied — keep whatever the Hub cache provided".
-fn hf_api_builder(hf_token: Option<&str>) -> ApiBuilder {
-    let mut builder = ApiBuilder::new().with_progress(false);
-
-    if let Some(token) = hf_token.map(str::trim).filter(|t| !t.is_empty()) {
-        builder = builder.with_token(Some(token.to_string()));
+/// # Errors
+///
+/// Returns an error if the repository lacks `config.json`, `tokenizer.json` or weights, or a
+/// download fails.
+pub(crate) async fn download_hf_artifacts(snapshot: &Snapshot) -> Result<PathBuf, DownloadError> {
+    let (files, weights) = tei_files(|path| snapshot.file(path).is_some())
+        .map_err(|missing| DownloadError::missing(snapshot, missing))?;
+    let mut paths: Vec<String> = files.iter().map(ToString::to_string).collect();
+    match weights {
+        TeiWeights::Safetensors => {}
+        TeiWeights::ShardedSafetensors => paths.extend(read_shards(snapshot).await?),
+        TeiWeights::Pickle => tracing::warn!(
+            "{} has no safetensors weights in Hugging Face repo '{}', so it loads 'pytorch_model.bin', which is significantly slower.",
+            snapshot.requester().capitalized(),
+            snapshot.repo()
+        ),
     }
+    let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+    snapshot.download(&paths).await?;
+    Ok(snapshot.dir())
+}
 
-    if let Ok(cache_dir) = std::env::var("HF_HUB_CACHE") {
-        let cache_path: PathBuf = cache_dir.into();
-        if cache_path.exists() {
-            tracing::debug!("Using HF_HUB_CACHE directory {:?}", cache_path);
-            builder = builder.with_cache_dir(cache_path);
-        } else {
-            tracing::debug!(
-                "HF_HUB_CACHE directory {:?} does not exist, ignoring.",
-                cache_path
-            );
+/// The weights the TEI backend loads from a model's directory.
+#[derive(Debug, PartialEq, Eq)]
+enum TeiWeights {
+    /// `model.safetensors`.
+    Safetensors,
+    /// `model.safetensors.index.json` and the shards it names.
+    ShardedSafetensors,
+    /// `pytorch_model.bin`, which loads significantly slower.
+    Pickle,
+}
+
+/// The files the TEI backend reads that a repository holds, chosen as
+/// `text-embeddings-inference` chooses them, with `has` saying whether the repository holds a
+/// path; or, when the repository lacks something the backend needs, what it lacks.
+fn tei_files(has: impl Fn(&str) -> bool) -> Result<(Vec<&'static str>, TeiWeights), String> {
+    let mut paths = Vec::new();
+    for required in ["config.json", "tokenizer.json"] {
+        if !has(required) {
+            return Err(format!("'{required}'"));
+        }
+        paths.push(required);
+    }
+    for optional in ["1_Pooling/config.json", "config_sentence_transformers.json"] {
+        if has(optional) {
+            paths.push(optional);
         }
     }
-
-    builder
-}
-
-fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<&str>) -> Result<ApiRepo> {
-    let api = hf_api_builder(hf_token)
-        .build()
-        .boxed()
-        .context(FailedToInstantiateEmbeddingModelSnafu)?;
-
-    let repo = if let Some(revision) = revision {
-        Repo::with_revision(model_id.to_string(), RepoType::Model, revision.to_string())
-    } else {
-        Repo::new(model_id.to_string(), RepoType::Model)
-    };
-    let api_repo = api.repo(repo);
-
-    Ok(api_repo)
-}
-
-pub async fn download_hf_file(
-    repo_id: &str,
-    revision: Option<&str>,
-    repo_type_opt: Option<&str>,
-    file: &str,
-    hf_token: Option<&str>,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let api = hf_api_builder(hf_token).build().boxed()?;
-
-    let repo_type = match repo_type_opt {
-        Some("datasets") => RepoType::Dataset,
-        Some("spaces") => RepoType::Space,
-        _ => RepoType::Model,
-    };
-
-    let repo = if let Some(revision) = revision {
-        Repo::with_revision(repo_id.to_string(), repo_type, revision.to_string())
-    } else {
-        Repo::new(repo_id.to_string(), repo_type)
-    };
-    api.repo(repo).get(file).await.boxed()
-}
-
-/// For a given `HuggingFace` repo, download the needed files to create a `CandleEmbedding`.
-pub(crate) async fn download_hf_artifacts(
-    model_id: &str,
-    revision: Option<&str>,
-    hf_token: Option<&str>,
-) -> Result<PathBuf> {
-    let api_repo = Arc::new(get_api(model_id, revision, hf_token)?);
-    let repo_url = api_repo.url("");
-
-    tracing::trace!("Downloading artifacts for {repo_url}");
-    let root_dir = download_artifacts(&api_repo, true)
-        .await
-        .context(FailedWithHFApiSnafu)?;
-
-    // Fallback to `pytorch_model.bin` if no safetensors.
-    // Supported by text-embedding-inference, but must be kept in sync manually (if new weight formats).
-    if download_safetensors(Arc::clone(&api_repo)).await.is_err() {
-        tracing::warn!(
-            "safetensors weights not found; falling back to `pytorch_model.bin`. Model loading is significantly slower."
-        );
-        api_repo
-            .get("pytorch_model.bin")
-            .await
-            .context(FailedWithHFApiSnafu)?;
+    if let Some(st_config) = ST_CONFIG_NAMES.iter().find(|name| has(name)) {
+        paths.push(*st_config);
     }
-
-    Ok(root_dir)
+    let weights = if has("model.safetensors") {
+        paths.push("model.safetensors");
+        TeiWeights::Safetensors
+    } else if has(SAFETENSORS_INDEX) {
+        paths.push(SAFETENSORS_INDEX);
+        TeiWeights::ShardedSafetensors
+    } else if has("pytorch_model.bin") {
+        paths.push("pytorch_model.bin");
+        TeiWeights::Pickle
+    } else {
+        return Err(
+            "weights the model can load ('model.safetensors', 'model.safetensors.index.json' or 'pytorch_model.bin')"
+                .to_string(),
+        );
+    };
+    Ok((paths, weights))
 }
 
 /// For a local repo of model artifacts, attempt to find a relevant `sentence_transformers` config file, and extract the `max_seq_length` from it.
@@ -381,10 +354,83 @@ pub(crate) fn pool_from_str(p: &str) -> Option<Pool> {
 
 #[cfg(test)]
 mod tests {
-    use super::load_tokenizer;
+    use super::{TeiWeights, load_tokenizer, tei_files};
     use tempfile::tempdir;
     use tokenizers::models::bpe::BPE;
     use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+
+    /// The files `text-embeddings-inference` would read, from what a repository holds.
+    #[test]
+    fn tei_files_are_chosen_as_text_embeddings_inference_chooses_them() {
+        let repo = |names: &'static [&'static str]| move |path: &str| names.contains(&path);
+        // A Sentence Transformers repository: its configs and its single safetensors file, not
+        // its pickle, ONNX export or other legacy configs.
+        assert_eq!(
+            tei_files(repo(&[
+                "config.json",
+                "tokenizer.json",
+                "1_Pooling/config.json",
+                "config_sentence_transformers.json",
+                "sentence_roberta_config.json",
+                "sentence_bert_config.json",
+                "modules.json",
+                "model.safetensors",
+                "pytorch_model.bin",
+                "onnx/model.onnx",
+            ])),
+            Ok((
+                vec![
+                    "config.json",
+                    "tokenizer.json",
+                    "1_Pooling/config.json",
+                    "config_sentence_transformers.json",
+                    "sentence_bert_config.json",
+                    "model.safetensors",
+                ],
+                TeiWeights::Safetensors
+            ))
+        );
+        // A legacy config is read when it is the only one; sharded safetensors come before a
+        // pickle.
+        assert_eq!(
+            tei_files(repo(&[
+                "config.json",
+                "tokenizer.json",
+                "sentence_xlnet_config.json",
+                "model.safetensors.index.json",
+                "pytorch_model.bin",
+            ])),
+            Ok((
+                vec![
+                    "config.json",
+                    "tokenizer.json",
+                    "sentence_xlnet_config.json",
+                    "model.safetensors.index.json",
+                ],
+                TeiWeights::ShardedSafetensors
+            ))
+        );
+        assert_eq!(
+            tei_files(repo(&[
+                "config.json",
+                "tokenizer.json",
+                "pytorch_model.bin"
+            ])),
+            Ok((
+                vec!["config.json", "tokenizer.json", "pytorch_model.bin"],
+                TeiWeights::Pickle
+            ))
+        );
+        // What a repository lacks, worded to follow "the repo has no".
+        assert_eq!(
+            tei_files(repo(&["config.json", "model.safetensors"])),
+            Err("'tokenizer.json'".to_string())
+        );
+        assert_eq!(
+            tei_files(repo(&["config.json", "tokenizer.json", "onnx/model.onnx"])),
+            Err("weights the model can load ('model.safetensors', 'model.safetensors.index.json' or 'pytorch_model.bin')".to_string())
+        );
+    }
 
     // Regression test for #13415: a tokenizer.json that bakes in a fixed-length padding and
     // truncation must not keep them. TEI owns padding/masking; a leaked fixed padding pads every

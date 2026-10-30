@@ -21,6 +21,7 @@ pub(crate) mod get_sql_info;
 pub(crate) mod get_table_types;
 pub(crate) mod get_tables;
 pub(crate) mod get_xdbc_type_info;
+pub(crate) mod prepared_statement_handle;
 pub(crate) mod prepared_statement_query;
 pub(crate) mod prepared_statement_update;
 pub(crate) mod statement_query;
@@ -30,9 +31,18 @@ mod substrait_consumer;
 
 use std::sync::{Arc, OnceLock};
 
-use arrow_flight::FlightData;
+use arrow_flight::{FlightData, error::FlightError};
 use arrow_schema::SchemaRef;
 use arrow_tools::map_entries;
+use tonic::Status;
+
+/// Passes `message` through unless it is a compressed batch that declares too large a
+/// decompressed size for its body (see `arrow_tools::ipc::check_declared_decompressed_size`).
+pub(crate) fn within_decompression_bound(message: FlightData) -> Result<FlightData, FlightError> {
+    arrow_tools::ipc::check_declared_decompressed_size(&message.data_header, &message.data_body)
+        .map_err(|error| FlightError::Tonic(Box::new(Status::invalid_argument(error))))?;
+    Ok(message)
+}
 
 /// Keeps a `DoPut` stream decodable when a client declares a `MAP`'s `entries` field nullable.
 ///

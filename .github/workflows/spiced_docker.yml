@@ -3,14 +3,47 @@ name: spiced_docker
 on:
   release:
     types:
-      # 'published' fires when a release (including a pre-release / RC) is
-      # first published, so RC tags still get pushed to DockerHub / GHCR even
-      # though they aren't marked as "latest" on GitHub.
-      - published
       # 'edited' fires when an existing release is edited — we use this to
       # re-run the workflow when a release is flipped to 'latest' so the
       # :latest tag can be updated without re-publishing all images.
+      #
+      # 'published' is deliberately absent. Publishing a release candidate
+      # creates its tag in the same second, so the event arrives hours before
+      # build_and_release has attached the binaries the images are built
+      # from, and every download 404s. Release candidates are built by
+      # build_and_release instead, through workflow_call below, once its
+      # `publish` jobs have uploaded them.
       - edited
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Git tag to source binaries from (for example v1.4.0-rc.1)
+        required: true
+        type: string
+      publish:
+        description: Publish the Docker images to registries
+        required: false
+        type: boolean
+        default: false
+      tag_latest:
+        description: "Tag as 'latest': auto (only if the GitHub release is marked 'latest'), 'true', or 'false'"
+        required: false
+        type: string
+        default: auto
+      target:
+        description: "Build docker images for specific target(s): all, amd64, or arm64"
+        required: false
+        type: string
+        default: all
+      # Declared only here, so a direct dispatch reads it as empty. A called
+      # run inherits its caller's event name, which is `workflow_dispatch`
+      # when build_and_release is dispatched on a tag, so the event name
+      # alone cannot tell a call from a manual run.
+      allow_cuda:
+        description: Allow the CUDA image (needs a CUDA binary on the release)
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       release_tag:
@@ -46,10 +79,8 @@ jobs:
   setup:
     # Run on:
     #   - workflow_dispatch (manual runs)
-    #   - release 'published' ONLY for stable releases (vX.Y.Z) or RC tags
-    #     (vX.Y.Z-rc.N / vX.Y.Z-rc-N). Other pre-releases (nightly, beta,
-    #     alpha, dev, etc.) are intentionally excluded so they never get
-    #     published to DockerHub / GHCR via this workflow.
+    #   - workflow_call from build_and_release, for release-candidate tags
+    #     (vX.Y.Z-rc.N), after the binaries are attached to the release
     #   - release 'edited' only when the release is flipped to 'latest', so the
     #     ':latest' tag can be moved without re-publishing on every edit.
     #
@@ -59,11 +90,6 @@ jobs:
     if: >-
       ${{
         github.event_name != 'release'
-        || (
-          github.event.action == 'published'
-          && !github.event.release.draft
-          && contains(github.event.release.tag_name, '-rc.')
-        )
         || (
           github.event.action == 'edited'
           && !github.event.release.draft
@@ -87,21 +113,38 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          # `inputs` holds the workflow_dispatch and the workflow_call inputs
+          # alike. A called workflow sees its caller's event, so anything that
+          # is neither 'release' nor 'workflow_dispatch' is the call.
+          INPUT_TARGET: ${{ inputs.target }}
+          INPUT_PUBLISH: ${{ inputs.publish && 'true' || 'false' }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_TAG_LATEST: ${{ inputs.tag_latest }}
+          INPUT_ALLOW_CUDA: ${{ inputs.allow_cuda }}
+          RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
 
           event_name="${{ github.event_name }}"
-          if [ "$event_name" = "workflow_dispatch" ]; then
-            target_input="${{ github.event.inputs.target }}"
-            publish_flag="${{ github.event.inputs.publish || 'false' }}"
-            release_tag_input="${{ github.event.inputs.release_tag }}"
-            allow_cuda=true
-          else
+          if [ "$event_name" = "release" ]; then
             # For release events, CUDA is not built (nightly-only)
             target_input="all"
             publish_flag="true"
-            release_tag_input="${{ github.event.release.tag_name }}"
+            release_tag_input="${RELEASE_TAG_NAME}"
             allow_cuda=false
+          else
+            target_input="${INPUT_TARGET}"
+            publish_flag="${INPUT_PUBLISH}"
+            release_tag_input="${INPUT_RELEASE_TAG}"
+            # CUDA images are nightly-only. A direct dispatch may build one;
+            # a call builds one only when its caller asks.
+            if [ -n "${INPUT_ALLOW_CUDA}" ]; then
+              allow_cuda="${INPUT_ALLOW_CUDA}"
+            elif [ "$event_name" = "workflow_dispatch" ]; then
+              allow_cuda=true
+            else
+              allow_cuda=false
+            fi
           fi
 
           target_input="${target_input:-all}"
@@ -165,17 +208,35 @@ jobs:
               ;;
           esac
 
+          # A release can be marked 'latest' before build_and_release has
+          # attached its binaries, and Dockerfile-release would 404 on them.
+          # build_and_release builds the images itself once its `publish` jobs
+          # attach them, so skip the images until both Linux binaries are
+          # there. Both, not just the missing one: the publish job would
+          # otherwise push the version and 'latest' tags for one architecture.
+          # A failed lookup still fails the run.
+          if [ "$event_name" = "release" ]; then
+            assets=$(gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" --json assets -q '.assets[].name')
+            for arch in x86_64 aarch64; do
+              if ! grep -qxF "spiced_linux_${arch}.tar.gz" <<<"$assets"; then
+                echo "::notice::${release_tag} has no spiced_linux_${arch}.tar.gz yet, so no images are built here; build_and_release builds them once it attaches the binaries."
+                run_amd64=false
+                run_arm64=false
+              fi
+            done
+          fi
+
           # Determine if this release should be tagged as 'latest'.
           #
           # Rule: ONLY apply the ':latest' Docker tag when the GitHub release
           # itself is marked as the repository's "latest" release. We no
           # longer infer this from the version string — RCs, stable releases
           # published out-of-order, etc. all respect GitHub's latest flag.
-          if [ "$event_name" = "workflow_dispatch" ]; then
-            tag_latest_input="${{ github.event.inputs.tag_latest }}"
-          else
+          if [ "$event_name" = "release" ]; then
             # For release events, use 'auto' detection
             tag_latest_input="auto"
+          else
+            tag_latest_input="${INPUT_TAG_LATEST:-auto}"
           fi
 
           if [ "$tag_latest_input" = "auto" ]; then
@@ -262,6 +323,7 @@ jobs:
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             BINARY_VARIANT=${{ env.BINARY_VARIANT }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            APT_CACHE_BUST=${{ github.run_id }}-${{ github.run_attempt }}
             GITHUB_REPOSITORY=${{ github.repository }}
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
@@ -343,6 +405,7 @@ jobs:
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             BINARY_VARIANT=${{ env.BINARY_VARIANT }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            APT_CACHE_BUST=${{ github.run_id }}-${{ github.run_attempt }}
             GITHUB_REPOSITORY=${{ github.repository }}
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
@@ -406,6 +469,7 @@ jobs:
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             CUDA_COMPUTE_CAP=${{ env.CUDA_COMPUTE_CAP }}
             GITHUB_REPOSITORY=${{ github.repository }}
+            APT_CACHE_BUST=${{ github.run_id }}-${{ github.run_attempt }}
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Validate CUDA image

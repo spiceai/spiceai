@@ -33,7 +33,7 @@ use params::{
     voyage::VoyageRerankerParams,
 };
 use runtime_parameters_typed::{ParamsError, TypedParams};
-use runtime_secrets::{Secrets, get_params_with_secrets};
+use runtime_secrets::{Secrets, get_params_with_secrets, secret_sources_from_templates};
 use secrecy::ExposeSecret;
 use snafu::{OptionExt, ResultExt, Snafu};
 use spicepod::component::rerankers::{Reranker, RerankerPrefix};
@@ -95,6 +95,14 @@ fn params_err(name: &str, e: ParamsError) -> Error {
             param_key: user_key,
             reason,
         },
+        ParamsError::InvalidSecretValue {
+            user_key,
+            secret_source,
+        } => Error::InvalidParam {
+            name: name.to_string(),
+            param_key: user_key,
+            reason: format!("invalid value from {secret_source}; expected a valid value"),
+        },
         ParamsError::UnknownParameter {
             user_key,
             supported,
@@ -129,6 +137,7 @@ pub async fn try_to_rerank_model(
         })
         .collect();
     let params = get_params_with_secrets(Arc::clone(&secrets), &string_params).await;
+    let secret_sources = secret_sources_from_templates(&string_params);
 
     let prefix = component.get_prefix().context(UnknownSourceSnafu {
         from: component.from.clone(),
@@ -140,9 +149,14 @@ pub async fn try_to_rerank_model(
 
     let reranker: Arc<dyn Rerank> = match prefix {
         RerankerPrefix::Cohere => {
-            let typed = CohereRerankerParams::try_from_params(&component_name, params, &secrets)
-                .await
-                .map_err(|e| params_err(&component.name, e))?;
+            let typed = CohereRerankerParams::try_from_params_with_secret_sources(
+                &component_name,
+                params,
+                &secrets,
+                &secret_sources,
+            )
+            .await
+            .map_err(|e| params_err(&component.name, e))?;
             let mut c =
                 CohereReranker::try_new(component.name.clone(), typed.api_key.expose_secret())
                     .context(BuildFailedSnafu {
@@ -155,9 +169,14 @@ pub async fn try_to_rerank_model(
             Arc::new(c)
         }
         RerankerPrefix::Voyage => {
-            let typed = VoyageRerankerParams::try_from_params(&component_name, params, &secrets)
-                .await
-                .map_err(|e| params_err(&component.name, e))?;
+            let typed = VoyageRerankerParams::try_from_params_with_secret_sources(
+                &component_name,
+                params,
+                &secrets,
+                &secret_sources,
+            )
+            .await
+            .map_err(|e| params_err(&component.name, e))?;
             let mut v =
                 VoyageReranker::try_new(component.name.clone(), typed.api_key.expose_secret())
                     .context(BuildFailedSnafu {
@@ -170,9 +189,14 @@ pub async fn try_to_rerank_model(
             Arc::new(v)
         }
         RerankerPrefix::Jina => {
-            let typed = JinaRerankerParams::try_from_params(&component_name, params, &secrets)
-                .await
-                .map_err(|e| params_err(&component.name, e))?;
+            let typed = JinaRerankerParams::try_from_params_with_secret_sources(
+                &component_name,
+                params,
+                &secrets,
+                &secret_sources,
+            )
+            .await
+            .map_err(|e| params_err(&component.name, e))?;
             let mut j =
                 JinaReranker::try_new(component.name.clone(), typed.api_key.expose_secret())
                     .context(BuildFailedSnafu {
@@ -188,9 +212,14 @@ pub async fn try_to_rerank_model(
             // For HTTP BYO the `from` *is* the endpoint URL. Model id +
             // auth header are both optional (some self-hosted services pin
             // the model and auth upstream).
-            let typed = HttpRerankerParams::try_from_params(&component_name, params, &secrets)
-                .await
-                .map_err(|e| params_err(&component.name, e))?;
+            let typed = HttpRerankerParams::try_from_params_with_secret_sources(
+                &component_name,
+                params,
+                &secrets,
+                &secret_sources,
+            )
+            .await
+            .map_err(|e| params_err(&component.name, e))?;
             let endpoint = model_id;
             let mut h = HttpReranker::try_new(component.name.clone(), endpoint).context(
                 BuildFailedSnafu {
@@ -211,17 +240,29 @@ pub async fn try_to_rerank_model(
             // `org/model:revision`; recover the two halves before the repo id
             // reaches the Hub (same convention as embeddings/models).
             let (repo_id, revision) = spicepod::component::model::split_hf_model_id(&model_id);
-            let typed =
-                HuggingFaceRerankerParams::try_from_params(&component_name, params, &secrets)
-                    .await
-                    .map_err(|e| params_err(&component.name, e))?;
-            let hf_token = typed.hf_token.as_ref().map(ExposeSecret::expose_secret);
+            // Parsing loads an `hf_token` the Spicepod does not set from the secret stores.
+            let token_in_spicepod = ["hf_token", "api_key"]
+                .iter()
+                .any(|key| params.contains_key(*key));
+            let typed = HuggingFaceRerankerParams::try_from_params_with_secret_sources(
+                &component_name,
+                params,
+                &secrets,
+                &secret_sources,
+            )
+            .await
+            .map_err(|e| params_err(&component.name, e))?;
+            let hub = llms::hf::HubParams {
+                token: typed.hf_token.as_ref(),
+                token_in_spicepod,
+                endpoint: typed.hf_endpoint.as_deref(),
+            };
             let truncation = typed.truncate.unwrap_or_default().direction();
             let r = TeiRerank::from_hf(
                 component.name.clone(),
                 repo_id,
                 revision,
-                hf_token,
+                hub,
                 typed.max_seq_length,
                 truncation,
             )
@@ -233,9 +274,14 @@ pub async fn try_to_rerank_model(
         }
         #[cfg(feature = "models")]
         RerankerPrefix::File => {
-            let typed = FileRerankerParams::try_from_params(&component_name, params, &secrets)
-                .await
-                .map_err(|e| params_err(&component.name, e))?;
+            let typed = FileRerankerParams::try_from_params_with_secret_sources(
+                &component_name,
+                params,
+                &secrets,
+                &secret_sources,
+            )
+            .await
+            .map_err(|e| params_err(&component.name, e))?;
             let truncation = typed.truncate.unwrap_or_default().direction();
             let r = TeiRerank::from_dir(
                 component.name.clone(),

@@ -1,0 +1,116 @@
+name: postgres-write-back-roundtrip
+description: >
+  Writes made through spiced reach Postgres exactly once and the accelerated copy
+  agrees with the source, across a clean restart and a kill straight after an
+  acknowledged write, in both write-back and write-through modes.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  write-back: {}
+  write-through:
+    datasets: { accounts: { acceleration: { write_mode: write_through } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-write-back-roundtrip
+  datasets:
+    - from: postgres:public.accounts
+      name: accounts
+      access: read_write
+      replication: { enabled: true }
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        write_mode: write_back
+        primary_key: id
+
+defaults:
+  expect: { oracle: src }
+
+# `write_back` accepts writes only as a `BEGIN; …; COMMIT;` body, and only
+# INSERT and UPDATE; `write_through` takes plain statements. Each write is
+# therefore given once per mode, and rows are deleted at the source.
+#
+# The source is the oracle for every row, but a write applied twice would be
+# applied twice on both sides and still agree, so the running total is also
+# checked against a literal computed from the operations themselves.
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE accounts (
+          id         bigint PRIMARY KEY,
+          owner      text NOT NULL,
+          balance    numeric(12, 2) NOT NULL,
+          updated_at timestamptz
+        );
+        INSERT INTO accounts
+          SELECT i, 'owner ' || i, i * 1.50, TIMESTAMPTZ '2025-01-01 00:00:00+00' + i * INTERVAL '1 hour'
+          FROM generate_series(1, 100) AS i;
+
+  - start: {}
+  - query: SELECT * FROM accounts
+    eventually: 60s
+  - query: SELECT sum(balance) FROM accounts
+    expect: { rows: [["7575.00"]] }
+
+  - spice-exec: "BEGIN; INSERT INTO accounts VALUES (101, 'spice', 100.00, TIMESTAMPTZ '2025-02-01 00:00:00+00'), (102, 'spice', 200.00, NULL); COMMIT;"
+    only: write-back
+  - spice-exec: "INSERT INTO accounts VALUES (101, 'spice', 100.00, TIMESTAMPTZ '2025-02-01 00:00:00+00'), (102, 'spice', 200.00, NULL)"
+    only: write-through
+  - query: SELECT * FROM accounts
+    eventually: 30s
+  - query: SELECT sum(balance) FROM accounts
+    expect: { rows: [["7875.00"]] }
+
+  # Changes at the source flow back into the acceleration.
+  - source-exec:
+      src:
+        - DELETE FROM accounts WHERE id % 13 = 0
+        - UPDATE accounts SET owner = 'changed at source' WHERE id <= 10
+  - query: SELECT * FROM accounts
+    eventually: 30s
+  - query: SELECT count(*), sum(balance) FROM accounts
+    eventually: 30s
+    expect: { rows: [["95", "7329.00"]] }
+
+  - restart: {}
+  - spice-exec: "BEGIN; UPDATE accounts SET balance = 250.00 WHERE id = 101; COMMIT;"
+    only: write-back
+  - spice-exec: UPDATE accounts SET balance = 250.00 WHERE id = 101
+    only: write-through
+  - query: SELECT * FROM accounts
+    eventually: 30s
+  - query: SELECT count(*), sum(balance) FROM accounts
+    eventually: 30s
+    expect: { rows: [["95", "7479.00"]] }
+
+  # An acknowledged write must survive a kill that lands before it is delivered.
+  - spice-exec: "BEGIN; UPDATE accounts SET balance = 201.00 WHERE id = 102; COMMIT;"
+    only: write-back
+  - spice-exec: UPDATE accounts SET balance = 201.00 WHERE id = 102
+    only: write-through
+  - kill-spiced: {}
+  - start: {}
+  - query: SELECT * FROM accounts
+    eventually: 60s
+  - query: SELECT count(*), count(DISTINCT id), sum(balance) FROM accounts
+    eventually: 30s
+    expect: { rows: [["95", "95", "7480.00"]] }
+
+  # An update computed from the row's own value. Write-through cannot send
+  # this to Postgres today (known-failing/write-back/postgres-write-through-expressions.yaml).
+  - spice-exec: "BEGIN; UPDATE accounts SET balance = balance + 10 WHERE id % 7 = 0; COMMIT;"
+    only: write-back
+  - query: SELECT * FROM accounts
+    eventually: 30s
+    only: write-back
+  - query: SELECT count(*), sum(balance) FROM accounts
+    eventually: 30s
+    expect: { rows: [["95", "7610.00"]] }
+    only: write-back

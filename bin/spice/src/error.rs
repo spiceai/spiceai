@@ -129,6 +129,19 @@ pub enum Error {
     #[snafu(display("The Spice runtime is unavailable at {endpoint}. Is it running?"))]
     RuntimeUnavailable { endpoint: String },
 
+    /// The runtime answered, but its TLS certificate was not trusted. `remedy` is the step
+    /// that fixes this particular failure: the CA flag only for an unknown issuer.
+    #[snafu(display("TLS certificate verification failed for {endpoint}: {reason}. {remedy}"))]
+    TlsVerificationFailed {
+        endpoint: String,
+        reason: String,
+        remedy: &'static str,
+    },
+
+    /// The `--tls-root-certificate-file` could not be read or holds no certificate
+    #[snafu(display("Could not load the TLS root certificate file '{path}': {message}"))]
+    TlsRootCertificate { path: String, message: String },
+
     /// Unauthorized access to the runtime API (401 — credentials missing/invalid)
     #[snafu(display(
         "unauthorized: invalid or missing Spice API key. Run `spice login` or set SPICE_API_KEY."
@@ -394,6 +407,93 @@ impl Error {
             Self::Interrupted => Self::INTERRUPTED_EXIT_CODE,
             _ => Self::FAILURE_EXIT_CODE,
         }
+    }
+}
+
+/// The error for a runtime request that got no HTTP response.
+///
+/// A request that fails because the runtime's certificate is not trusted is reported as a
+/// certificate failure, with the flag that fixes it: the runtime is up and answering, so
+/// "Is it running?" would send the user looking in the wrong place. Anything else is
+/// reported as the runtime being unavailable at `endpoint`.
+#[must_use]
+pub fn runtime_unreachable(endpoint: &str, err: &Error) -> Error {
+    if let Error::ConnectionFailed { source, .. } = err
+        && let Some(cert_error) = invalid_certificate(source)
+    {
+        return TlsVerificationFailedSnafu {
+            endpoint: endpoint.to_string(),
+            reason: describe_certificate_error(cert_error),
+            remedy: certificate_error_remedy(cert_error),
+        }
+        .build();
+    }
+
+    RuntimeUnavailableSnafu {
+        endpoint: endpoint.to_string(),
+    }
+    .build()
+}
+
+/// The certificate error a failed request carries, if the TLS handshake rejected the
+/// server's certificate.
+///
+/// The rustls error sits inside an `io::Error` whose `source()` skips the wrapped error
+/// itself, so each `io::Error` in the chain is opened with `get_ref` as well.
+fn invalid_certificate(err: &reqwest::Error) -> Option<&rustls::CertificateError> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(link) = current {
+        if let Some(rustls::Error::InvalidCertificate(cert_error)) =
+            link.downcast_ref::<rustls::Error>()
+        {
+            return Some(cert_error);
+        }
+        current = link
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .map(|inner| inner as &(dyn std::error::Error + 'static))
+            .or_else(|| link.source());
+    }
+    None
+}
+
+fn describe_certificate_error(err: &rustls::CertificateError) -> String {
+    match err {
+        rustls::CertificateError::UnknownIssuer => "unknown issuer".to_string(),
+        rustls::CertificateError::Expired | rustls::CertificateError::ExpiredContext { .. } => {
+            "certificate expired".to_string()
+        }
+        rustls::CertificateError::NotValidYet
+        | rustls::CertificateError::NotValidYetContext { .. } => {
+            "certificate is not valid yet".to_string()
+        }
+        rustls::CertificateError::NotValidForName
+        | rustls::CertificateError::NotValidForNameContext { .. } => {
+            "certificate is not valid for this host".to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+/// What to do about a rejected certificate. `--tls-root-certificate-file` only helps when the
+/// issuer is unknown; for a certificate that is expired or issued for another name, passing a
+/// CA changes nothing, so the user is pointed at the endpoint and the certificate instead.
+fn certificate_error_remedy(err: &rustls::CertificateError) -> &'static str {
+    match err {
+        rustls::CertificateError::UnknownIssuer => {
+            "Pass --tls-root-certificate-file with the CA certificate that issued the runtime's certificate."
+        }
+        rustls::CertificateError::Expired
+        | rustls::CertificateError::ExpiredContext { .. }
+        | rustls::CertificateError::NotValidYet
+        | rustls::CertificateError::NotValidYetContext { .. } => {
+            "Check the validity dates of the runtime's certificate and the local clock."
+        }
+        rustls::CertificateError::NotValidForName
+        | rustls::CertificateError::NotValidForNameContext { .. } => {
+            "Connect with a host name the runtime's certificate covers (--http-endpoint), or reissue the certificate for this host."
+        }
+        _ => "Check the endpoint and the runtime's certificate.",
     }
 }
 

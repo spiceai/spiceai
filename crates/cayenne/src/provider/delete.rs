@@ -57,4 +57,5 @@ pub(crate) use filter_exec::{
 pub(crate) use vector_io::{
     DeletionIdentifier, DeletionVectorWriteResult, DeletionVectorWriteSpec, DeletionVectorWriter,
     MissingKeyDeletionVector, cleanup_uncommitted_delete_paths, detect_deletion_type_and_read,
+    remove_dropped_deletion_vector_files,
 };

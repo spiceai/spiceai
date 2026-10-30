@@ -1,0 +1,37 @@
+[package]
+description = "Safe bindings to llama.cpp, built from the spiceai/llama.cpp fork, for Spice's local GGUF engine"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+links = "llama"
+name = "llama-cpp"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+# One integration test binary: see docs/dev/integration_test_layout.md.
+autotests = false
+
+[dependencies]
+llama-cpp-src = { git = "https://github.com/spiceai/llama.cpp", rev = "a337bb5ce3590beb8763494b4381fe830bac0bc8" } # branch: spiceai-b11803 (the merge of spiceai/llama.cpp#8)
+snafu.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+bindgen = "0.72.1"
+cc = "1.2.63"
+cmake = "0.1.58"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[features]
+# The GPU backend llama.cpp is built with; without either, it runs on the CPU.
+cuda = []
+metal = []
+
+[lints]
+workspace = true

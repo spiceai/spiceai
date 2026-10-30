@@ -1,0 +1,160 @@
+name: postgres-cdc-shared-slot
+description: >
+  Datasets that name the same PostgreSQL replication slot share one replication
+  connection, beside a dataset on its own slot, and each follows its own table
+  (a partitioned one among them) as PostgreSQL applies changes: across a clean
+  restart with changes made while Spice was down (every member rejoining sees
+  them, whatever order they rejoin in, and a quiet member resumes rather than
+  re-reading its table), and after the slot is dropped underneath the running
+  stream.
+
+sources:
+  src: { kind: postgres }
+
+# The rejoin order after a restart is not fixed; repeat to vary it.
+matrix:
+  run: [1, 2, 3]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-cdc-shared-slot
+  datasets:
+    - from: postgres:public.ta
+      name: a
+      params:
+        $merge: ${sources.src.params}
+        pg_replication_slot: shared_${sources.src.namespace}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+    - from: postgres:public.tb
+      name: b
+      params:
+        $merge: ${sources.src.params}
+        pg_replication_slot: shared_${sources.src.namespace}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+    - from: postgres:public.tp
+      name: p
+      params:
+        $merge: ${sources.src.params}
+        pg_replication_slot: shared_${sources.src.namespace}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: '(id, at)' }
+    - from: postgres:public.tc
+      name: c
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE ta (id int PRIMARY KEY, v text);
+        CREATE TABLE tb (id int PRIMARY KEY, v text);
+        CREATE TABLE tc (id int PRIMARY KEY, v text);
+        CREATE TABLE tp (id int, at date NOT NULL, v text, PRIMARY KEY (id, at)) PARTITION BY RANGE (at);
+        CREATE TABLE tp_2024 PARTITION OF tp FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+        CREATE TABLE tp_2025 PARTITION OF tp FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+        INSERT INTO ta SELECT i, 'a' || i FROM generate_series(1, 200) i;
+        INSERT INTO tb SELECT i, 'b' || i FROM generate_series(1, 200) i;
+        INSERT INTO tc SELECT i, 'c' || i FROM generate_series(1, 200) i;
+        INSERT INTO tp SELECT i, DATE '2024-06-01' + i, 'p' || i FROM generate_series(1, 300) i;
+  - start: {}
+  - query: SELECT * FROM a
+    oracle-sql: SELECT * FROM ta
+    eventually: 60s
+  - query: SELECT * FROM b
+    oracle-sql: SELECT * FROM tb
+    eventually: 60s
+  - query: SELECT * FROM p
+    oracle-sql: SELECT * FROM tp
+    eventually: 60s
+  - query: SELECT * FROM c
+    oracle-sql: SELECT * FROM tc
+    eventually: 60s
+  # One shared slot for a, b and p; one of its own for c.
+  - source-query: { src: "SELECT count(*), count(*) FILTER (WHERE slot_name = 'shared_' || current_database()) FROM pg_replication_slots WHERE database = current_database()" }
+    expect: { rows: [["2", "1"]] }
+
+  # Changes in one transaction across tables, and in the partitioned table
+  # across partitions.
+  - source-exec:
+      src: |
+        BEGIN;
+        UPDATE ta SET v = 'a-upd' WHERE id % 10 = 0;
+        DELETE FROM tb WHERE id > 190;
+        INSERT INTO tc VALUES (201, 'c-new');
+        UPDATE tp SET at = at + 200 WHERE id BETWEEN 1 AND 20;
+        DELETE FROM tp WHERE id > 290;
+        COMMIT;
+  - query: SELECT * FROM a
+    oracle-sql: SELECT * FROM ta
+    eventually: 30s
+  - query: SELECT * FROM b
+    oracle-sql: SELECT * FROM tb
+    eventually: 30s
+  - query: SELECT * FROM p
+    oracle-sql: SELECT * FROM tp
+    eventually: 30s
+  - query: SELECT * FROM c
+    oracle-sql: SELECT * FROM tc
+    eventually: 30s
+
+  # A clean restart with changes made while Spice was down, to every member but
+  # b, which stays quiet.
+  - stop: {}
+  - source-exec:
+      src: |
+        INSERT INTO ta VALUES (300, 'while down');
+        UPDATE ta SET v = 'down-upd' WHERE id = 1;
+        UPDATE tp SET v = 'down' WHERE id = 50;
+        DELETE FROM tc WHERE id = 7;
+  - start: {}
+  - query: SELECT * FROM a
+    oracle-sql: SELECT * FROM ta
+    eventually: 60s
+  - query: SELECT * FROM b
+    oracle-sql: SELECT * FROM tb
+    eventually: 60s
+  - query: SELECT * FROM p
+    oracle-sql: SELECT * FROM tp
+    eventually: 60s
+  - query: SELECT * FROM c
+    oracle-sql: SELECT * FROM tc
+    eventually: 60s
+  # The members resumed from the slot rather than re-reading their tables.
+  - assert-log: { lacks: 'rebuilt from the source before changes are applied' }
+
+  # The shared slot is dropped underneath the running stream; the stream is
+  # re-established and later changes still arrive, without a restart.
+  - source-exec:
+      src: |
+        DO $$
+        DECLARE attempt int := 0;
+        BEGIN
+          LOOP
+            PERFORM pg_terminate_backend(active_pid) FROM pg_replication_slots
+              WHERE slot_name = 'shared_' || current_database() AND active_pid IS NOT NULL;
+            BEGIN
+              PERFORM pg_drop_replication_slot('shared_' || current_database());
+              EXIT;
+            EXCEPTION WHEN object_in_use THEN
+              attempt := attempt + 1;
+              IF attempt > 200 THEN RAISE; END IF;
+              PERFORM pg_sleep(0.05);
+            END;
+          END LOOP;
+        END $$;
+  - source-exec: { src: "UPDATE ta SET v = 'after slot loss' WHERE id <= 3; DELETE FROM tb WHERE id = 100; UPDATE tp SET v = 'after' WHERE id = 60" }
+  - query: SELECT * FROM a
+    oracle-sql: SELECT * FROM ta
+    eventually: 90s
+  - query: SELECT * FROM b
+    oracle-sql: SELECT * FROM tb
+    eventually: 90s
+  - query: SELECT * FROM p
+    oracle-sql: SELECT * FROM tp
+    eventually: 90s
+  - query: SELECT * FROM c
+    oracle-sql: SELECT * FROM tc
+    eventually: 30s

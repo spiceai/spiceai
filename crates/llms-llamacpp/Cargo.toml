@@ -1,0 +1,44 @@
+[package]
+description = "Serves single-node GGUF models with llama.cpp; spiced links it behind its llamacpp feature"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "llms-llamacpp"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+# One integration test binary: see docs/dev/integration_test_layout.md.
+autotests = false
+
+[dependencies]
+async-openai.workspace = true
+async-trait.workspace = true
+either = "1.15.0"
+futures.workspace = true
+indexmap.workspace = true
+llama-cpp = { path = "../llama-cpp" }
+llms = { path = "../llms", default-features = false, features = ["local_llm"] }
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c", package = "mistralrs-core" } # branch: spiceai (spiceai/mistral.rs#55: candle zip 9.1; includes #52 tool-call parser, #53, #54)
+rand.workspace = true
+runtime-request-context = { path = "../runtime-request-context" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["fs", "rt", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[features]
+# The GPU backend llama.cpp is built with; without either, it runs on the CPU.
+cuda = ["llama-cpp/cuda"]
+metal = ["llama-cpp/metal"]
+
+[lints]
+workspace = true

@@ -61,6 +61,7 @@ pub mod ducklake;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
 pub mod federation;
+pub mod file_schema_drift;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
@@ -113,6 +114,7 @@ pub mod pk_filter_expr;
 pub mod rate_limit;
 
 pub mod cdc;
+pub mod csv_header_projection;
 pub mod delete;
 pub mod http;
 pub mod index_maintenance;

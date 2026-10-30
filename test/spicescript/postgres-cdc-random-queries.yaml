@@ -1,0 +1,115 @@
+name: postgres-cdc-random-queries
+description: >
+  Random queries (as in random-queries.yaml) over PostgreSQL CDC accelerations
+  after rounds of randomized changes at the source (updates to values and to
+  NULL, deletes, inserts and key changes, in single statements and in one
+  transaction) answer as PostgreSQL answers over the same rows, on Cayenne
+  and DuckDB.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  cayenne: {}
+  duckdb: { datasets: { '*': { acceleration: { engine: duckdb, mode: memory, on_conflict: { id: upsert } } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-cdc-random-queries
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+    - from: postgres:public.u
+      name: u
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  compare-variants: false
+
+# `avoid` keeps clear of the defects random-queries.yaml lists, and of
+# `decimal-int` (a decimal times an integer in a Cayenne filter,
+# known-failing/cayenne/cayenne-decimal-int-filter.yaml).
+#
+# Each instance reads its own database, which is also its oracle, so the
+# changes may use random(): every instance is checked against the rows its own
+# source ended up with.
+steps:
+  - generate:
+      src:
+        table: t
+        rows: 400
+        seed: 31
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: i, int: [-50, 50], nulls: 0.1 }
+          - { name: big, bigint: [0, 10000000000] }
+          - { name: d, decimal: { range: [-100, 100], scale: 2 } }
+          - { name: f, float: [0, 50] }
+          - { name: s, choice: [apple, Apple, APPLE, banana, "O'Brien", naïve, '', under_score, b], nulls: 0.1 }
+          - { name: dt, date: ['2024-01-01', '2024-12-31'] }
+          - { name: ts, timestamp: ['2024-01-01', '2024-12-31'] }
+          - { name: b, bool: 0.33 }
+  - generate:
+      src:
+        table: u
+        rows: 150
+        seed: 32
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: t_id, int: [1, 440] }
+          - { name: label, choice: [red, blue, green] }
+  - start: {}
+  - query: SELECT count(*) AS n, sum(i) AS si, sum(d) AS sd, count(s) AS ns FROM t
+    eventually: 60s
+    expect: { oracle: src }
+  - query: SELECT count(*) AS n, sum(t_id) AS st, count(DISTINCT label) AS nl FROM u
+    eventually: 60s
+    expect: { oracle: src }
+  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 11, queries: 200, depth: 2, oracle: src, avoid: [decimal-int] }
+
+  # Round 1: single statements.
+  - source-exec:
+      src:
+        - SELECT setseed(0.11)
+        - UPDATE t SET i = CASE WHEN random() < 0.2 THEN NULL ELSE (random() * 100)::int - 50 END WHERE random() < 0.3
+        - UPDATE t SET s = (ARRAY['apple', 'Apple', 'banana', '', 'naïve', NULL])[1 + (random() * 5)::int], d = round((random() * 200 - 100)::numeric, 2) WHERE random() < 0.25
+        - DELETE FROM t WHERE random() < 0.1
+        - INSERT INTO t (id, i, big, d, f, s, dt, ts, b) SELECT g, (random() * 100)::int - 50, (random() * 1e10)::bigint, round((random() * 200 - 100)::numeric, 2), random() * 50, 'new', DATE '2024-06-01' + g % 30, TIMESTAMP '2024-06-01' + g * INTERVAL '1 hour', random() < 0.5 FROM generate_series(1001, 1100) g
+        - UPDATE u SET t_id = 1 + (random() * 1099)::int WHERE random() < 0.3
+        - DELETE FROM u WHERE random() < 0.1
+  - query: SELECT count(*) AS n, sum(i) AS si, sum(d) AS sd, count(s) AS ns FROM t
+    eventually: 60s
+    expect: { oracle: src }
+  - query: SELECT count(*) AS n, sum(t_id) AS st, count(DISTINCT label) AS nl FROM u
+    eventually: 60s
+    expect: { oracle: src }
+  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 12, queries: 200, depth: 2, oracle: src, avoid: [decimal-int] }
+
+  # Round 2: key changes and a transaction mixing every kind of change.
+  - source-exec:
+      src:
+        - SELECT setseed(0.12)
+        - UPDATE u SET id = id + 1000 WHERE id % 9 = 0
+        - UPDATE t SET id = id + 5000 WHERE id % 13 = 0
+        - |
+          BEGIN;
+          UPDATE t SET f = random() * 50, b = NOT b WHERE random() < 0.4;
+          DELETE FROM t WHERE id IN (SELECT id FROM t WHERE random() < 0.05);
+          INSERT INTO u (id, t_id, label) SELECT g, 1 + (random() * 1099)::int, (ARRAY['red', 'blue', 'green'])[1 + (random() * 2)::int] FROM generate_series(2001, 2100) g;
+          UPDATE t SET ts = ts + INTERVAL '1 day', dt = dt - 1 WHERE random() < 0.3;
+          COMMIT;
+  - query: SELECT count(*) AS n, sum(i) AS si, sum(d) AS sd, count(s) AS ns FROM t
+    eventually: 60s
+    expect: { oracle: src }
+  - query: SELECT count(*) AS n, sum(t_id) AS st, count(DISTINCT label) AS nl FROM u
+    eventually: 60s
+    expect: { oracle: src }
+  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 13, queries: 200, depth: 2, oracle: src, avoid: [decimal-int] }

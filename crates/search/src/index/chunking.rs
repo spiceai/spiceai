@@ -210,6 +210,10 @@ impl Index for ChunkedSearchIndex {
         self.inner.write_complete_failure_is_fatal()
     }
 
+    fn requires_rebuild(&self) -> bool {
+        self.inner.requires_rebuild()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1286,6 +1290,10 @@ impl Index for ChunkedVectorIndex {
 
     fn write_complete_failure_is_fatal(&self) -> bool {
         self.inner.write_complete_failure_is_fatal()
+    }
+
+    fn requires_rebuild(&self) -> bool {
+        self.inner.requires_rebuild()
     }
 
     fn as_any(&self) -> &dyn Any {

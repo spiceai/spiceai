@@ -1,0 +1,82 @@
+name: mysql-types-acceleration
+description: >
+  A MySQL table with every common type (bit, unsigned, time, blob, set, JSON
+  among them), NULLs in each, answers through Spice exactly as MySQL answers:
+  federated, and accelerated by full and append refresh into every engine with
+  a `refresh_sql` filter (keyed and indexed where the engine supports it), and
+  after rows are appended at the source. The log reports no errors.
+
+sources:
+  src: { kind: mysql }
+
+variants:
+  federated: {}
+  arrow: arrow-memory
+  duckdb: { datasets: { '*': { acceleration: { enabled: true, engine: duckdb, mode: file,
+      primary_key: ID, indexes: { col_Timestamp: enabled, '(col_Timestamp, col_String)': unique } } } } }
+  sqlite: { datasets: { '*': { acceleration: { enabled: true, engine: sqlite, mode: file,
+      primary_key: ID, indexes: { col_Timestamp: enabled, '(col_Timestamp, col_String)': unique } } } } }
+  cayenne: { datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file,
+      primary_key: ID, indexes: { col_Timestamp: enabled, '(col_Timestamp, col_String)': unique } } } } }
+  turso: { datasets: { '*': { acceleration: { enabled: true, engine: turso, mode: file,
+      primary_key: ID, indexes: { col_Timestamp: enabled, '(col_Timestamp, col_String)': unique } } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mysql-types-acceleration
+  datasets:
+    - from: mysql:test_mysql_table
+      name: full_t
+      params: ${sources.src.params}
+      acceleration:
+        enabled: false
+        refresh_sql: SELECT * FROM full_t WHERE col_Bit IS NULL OR col_Bit != 0
+    - from: mysql:test_mysql_table
+      name: append_t
+      params: ${sources.src.params}
+      time_column: col_Timestamp
+      acceleration:
+        enabled: false
+        refresh_mode: append
+        refresh_check_interval: 2s
+        refresh_sql: SELECT * FROM append_t WHERE col_Bit IS NULL OR col_Bit != 0
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': ID }
+  # Every answer also comes back over HTTP as JSON, the same as over Flight.
+  also-http: true
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: { file: ../scripts/setup-data-mysql.sql }
+  - start: {}
+
+  - query: SELECT * FROM full_t
+    oracle-sql: SELECT * FROM test_mysql_table
+    only: federated
+  - query: SELECT * FROM full_t
+    oracle-sql: SELECT * FROM test_mysql_table WHERE col_Bit IS NULL OR col_Bit != 0
+    except: federated
+  - query: SELECT * FROM append_t
+    oracle-sql: SELECT * FROM test_mysql_table WHERE col_Bit IS NULL OR col_Bit != 0
+    eventually: 30s
+    except: federated
+
+  - source-exec:
+      src: >
+        INSERT INTO test_mysql_table (col_Bit, col_Long, col_String, col_Timestamp, col_Set, col_Json)
+        VALUES (1, 11, 'appended', '2030-01-01 00:00:00', 'apple,cherry', '{"k": [1, null]}'),
+               (0, 10, 'filtered out', '2030-01-01 00:00:01', NULL, NULL)
+  - query: SELECT * FROM append_t
+    oracle-sql: SELECT * FROM test_mysql_table WHERE col_Bit IS NULL OR col_Bit != 0
+    eventually: 30s
+    except: federated
+  - query: SELECT * FROM append_t
+    oracle-sql: SELECT * FROM test_mysql_table
+    only: federated
+
+  - assert-log: { clean: true }

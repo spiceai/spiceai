@@ -41,6 +41,7 @@ order = [
     "shared-utility",
     "accelerator",
     "connector",
+    "model-engine",
     "runtime",
     "extension-utility",
     "extension",
@@ -70,6 +71,7 @@ forbid = [
     ["runtime", "connector"],
     ["runtime", "accelerator"],
     ["connector", "accelerator"],
+    ["runtime", "model-engine"],
 ]
 
 # Dependency-ownership rules, checked IN ADDITION to the tier rule. The tier check
@@ -153,6 +155,9 @@ tier = "foundation"
 
 # Per-crate overrides win over rules.
 [override]
+# Local model engines register through `llms::register_local_chat_engine!` and only the
+# binaries link them, as with connectors and accelerators: `runtime` must not depend on one.
+llms-llamacpp = "model-engine"
 runtime = "runtime"
 # Config-only component specs (DatasetSpec/CatalogSpec/ViewSpec + their config
 # submodules) carved out of the `runtime` crate body. It names nothing from
@@ -249,8 +254,10 @@ event_stream = "foundation"
 flight_client = "foundation"
 google-genai = "foundation"
 hash-index = "foundation"
+http-body-limit = "foundation"
 key-index = "foundation"
 libnfs = "foundation"
+llama-cpp = "foundation"
 ns_lookup = "foundation"
 object_store_occ = "foundation"
 object_store_spawn = "foundation"

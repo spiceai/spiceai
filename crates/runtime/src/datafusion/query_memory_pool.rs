@@ -172,7 +172,13 @@ impl Display for GreedyPoolWithSpillHeadroom {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::{AsArray, Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema};
+    use datafusion::datasource::MemTable;
+    use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
     use datafusion::execution::memory_pool::MemoryConsumer;
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion::prelude::{SessionConfig, SessionContext};
 
     fn pool(size: usize) -> Arc<dyn MemoryPool> {
         Arc::new(GreedyPoolWithSpillHeadroom::new(size))
@@ -274,5 +280,62 @@ mod tests {
             .try_grow(1024)
             .expect("spillable aggregate must still grow while unspillable holds the cap");
         assert_eq!(memory.reserved(), cap + 1024);
+    }
+
+    /// A sort over a grouped aggregate's output fits a pool sized for its rows.
+    /// The aggregate hands its groups on as slices of one batch, and the sort
+    /// charged every slice for the whole batch until spiceai/datafusion#266, so
+    /// sorting a million groups needed many times their 16 MiB. At 1000
+    /// warehouses CH-benCHmark Q10 failed on every run that way, three of its
+    /// sorters holding 12.9, 12.4 and 7.1 GB. With spilling disabled, a sort
+    /// charged per batch runs out of this pool after a handful of slices.
+    #[tokio::test]
+    async fn a_sort_over_a_grouped_aggregate_is_charged_for_its_rows() {
+        let groups: i64 = 1 << 20;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(0..2 * groups))],
+        )
+        .expect("build the input batch");
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("build the table");
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(tracked_query_memory_pool(
+                160 * 1024 * 1024,
+                NonZeroUsize::new(5).expect("non-zero"),
+            ))
+            .with_disk_manager_builder(
+                DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+            )
+            .build_arc()
+            .expect("build the runtime");
+        // One partition: one aggregate emitting one batch, and one sort.
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::new().with_target_partitions(1),
+            runtime,
+        );
+        ctx.register_table("t", Arc::new(table))
+            .expect("register the table");
+
+        let sorted = ctx
+            .sql(&format!(
+                "SELECT v % {groups} AS g, sum(v) AS s FROM t GROUP BY g ORDER BY s DESC"
+            ))
+            .await
+            .expect("plan the query")
+            .collect()
+            .await
+            .expect("sort the groups without running out of memory");
+
+        // Group g sums g and g + groups, so the sums run from 3·groups − 2
+        // (the last group) down to groups (group 0), one per group.
+        let mut expected = 3 * groups - 2;
+        for batch in &sorted {
+            for sum in batch.column(1).as_primitive::<Int64Type>().values() {
+                assert_eq!(*sum, expected);
+                expected -= 2;
+            }
+        }
+        assert_eq!(expected, groups - 2, "every group's sum, in order");
     }
 }

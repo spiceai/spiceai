@@ -1,0 +1,1081 @@
+{
+  "cayenne-decimal-int-filter": [
+    {
+      "run": "cayenne-decimal-int-filter",
+      "who": "partitioned",
+      "key": "query: SELECT count(*) AS n FROM t WHERE d * 2 > 10",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to bind the Vortex filter to the file's type: Other error: incompatible types for arithmetic operation: decimal(10,2)? decimal(20,0)?\": code: 'Client specified an invalid argument', message: \"Failed",
+      "group": "cayenne",
+      "labels": [
+        "decimal-int"
+      ]
+    },
+    {
+      "run": "cayenne-decimal-int-filter",
+      "who": "partitioned",
+      "key": "query: SELECT count(*) AS n FROM t WHERE d + 1 > 10",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to bind the Vortex filter to the file's type: Other error: incompatible types for arithmetic operation: decimal(10,2)? decimal(20,0)?\": code: 'Client specified an invalid argument', message: \"Failed",
+      "group": "cayenne",
+      "labels": [
+        "decimal-int"
+      ]
+    },
+    {
+      "run": "cayenne-decimal-int-filter",
+      "who": "partitioned",
+      "key": "query: SELECT count(*) AS n FROM t WHERE d * big > 10",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to bind the Vortex filter to the file's type: Other error: incompatible types for arithmetic operation: decimal(10,2)? decimal(20,0)?\": code: 'Client specified an invalid argument', message: \"Failed",
+      "group": "cayenne",
+      "labels": [
+        "decimal-int"
+      ]
+    }
+  ],
+  "cayenne-file-durability-date-key": [
+    {
+      "run": "cayenne-file-durability-date-key",
+      "who": "file",
+      "key": "query: SELECT count(*) AS n FROM p",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"990\\\"\", actual: \"\\\"1000\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-file-durability-date-key",
+      "who": "file",
+      "key": "query: SELECT * FROM p",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 990, actual: 1000 }",
+      "group": "cayenne"
+    }
+  ],
+  "cayenne-partition-key-move": [
+    {
+      "run": "cayenne-partition-key-move",
+      "who": "cdc",
+      "key": "query: SELECT id, region, v FROM ev ORDER BY id, region",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 3, actual: 4 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-partition-key-move",
+      "who": "write",
+      "key": "query: SELECT id, region, v FROM ev ORDER BY id, region",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 3, actual: 4 }",
+      "group": "cayenne"
+    }
+  ],
+  "cayenne-partitioned-append-key-only": [
+    {
+      "run": "cayenne-partitioned-append-key-only",
+      "who": "partitioned",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.unknown\",\"type\":\"unknown\"},\"error_message\":\"Failed to setup the dataset e (postgres). Failed to create an accelerated table for the dataset e. Append mode requires either `time_column",
+      "group": "cayenne"
+    }
+  ],
+  "cayenne-torn-reads": [
+    {
+      "run": "cayenne-torn-reads",
+      "who": "file",
+      "key": "stop-background: read-changes",
+      "kind": "other",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected",
+      "signature": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+    },
+    {
+      "run": "cayenne-torn-reads",
+      "who": "file",
+      "key": "stop-background: read-refresh",
+      "kind": "other",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected",
+      "signature": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+    },
+    {
+      "run": "cayenne-torn-reads",
+      "who": "file",
+      "key": "stop-background: read-join",
+      "kind": "other",
+      "signature": "<n> of <m> iterations failed; first: invariant broken: n = below expected Some(\"1000\")",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+    },
+    {
+      "run": "cayenne-torn-reads",
+      "who": "file",
+      "key": "query: SELECT count(*) AS n FROM by_changes",
+      "kind": "wrong-answer",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\"",
+      "signature": "answer differs from the expected one: DataMismatch \\{ column: \"n\""
+    },
+    {
+      "run": "cayenne-torn-reads",
+      "who": "memory",
+      "key": "stop-background: read-changes",
+      "kind": "other",
+      "signature": "<n> of <m> iterations failed; first: invariant broken: n = above expected Some(\"1000\")",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+    },
+    {
+      "run": "cayenne-torn-reads",
+      "who": "memory",
+      "key": "stop-background: read-refresh",
+      "kind": "other",
+      "signature": "<n> of <m> iterations failed; first: invariant broken: total = above expected Some(\"100000\")",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+    },
+    {
+      "run": "cayenne-torn-reads",
+      "who": "memory",
+      "key": "stop-background: read-join",
+      "kind": "other",
+      "signature": "<n> of <m> iterations failed; first: invariant broken: n = above expected Some(\"1000\")",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+    },
+    {
+      "run": "cayenne-torn-reads",
+      "who": "memory",
+      "key": "query: SELECT count(*) AS n FROM by_changes",
+      "kind": "wrong-answer",
+      "signature": "stopped matching after <duration> (29 attempts): answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"1000\\\"\", actual: \"\\\"1001\\\"\" }",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\""
+    },
+    {
+      "run": "cayenne-torn-reads",
+      "who": "partitioned",
+      "key": "stop-background: read-changes",
+      "kind": "other",
+      "signature": "<n> of <m> iterations failed; first: invariant broken: n = above expected Some(\"1000\")",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+    },
+    {
+      "run": "cayenne-torn-reads",
+      "who": "partitioned",
+      "key": "stop-background: read-refresh",
+      "kind": "other",
+      "signature": "<n> of <m> iterations failed; first: invariant broken: n = above expected Some(\"1000\")",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+    },
+    {
+      "run": "cayenne-torn-reads",
+      "who": "partitioned",
+      "key": "stop-background: read-join",
+      "kind": "other",
+      "signature": "<n> of <m> iterations failed; first: invariant broken: n = below expected Some(\"1000\")",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+    },
+    {
+      "run": "cayenne-torn-reads",
+      "who": "partitioned",
+      "key": "query: SELECT count(*) AS n FROM by_changes",
+      "kind": "wrong-answer",
+      "signature": "stopped matching after <duration> (3 attempts): answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"1000\\\"\", actual: \"\\\"1002\\\"\" }",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\""
+    }
+  ],
+  "cayenne-writes-known": [
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=upsert]",
+      "who": "upsert-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #4",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 8, actual: 9 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=upsert]",
+      "who": "upsert-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #5",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 8, actual: 9 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=upsert]",
+      "who": "upsert-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #6",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 8, actual: 9 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=upsert]",
+      "who": "upsert-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #7",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 8, actual: 9 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=upsert]",
+      "who": "upsert-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #8",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 7, actual: 8 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=upsert]",
+      "who": "upsert-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #9",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"id\", row_number: 3, expected: \"\\\"3\\\"\", actual: \"\\\"4\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=upsert]",
+      "who": "upsert-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #10",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"id\", row_number: 3, expected: \"\\\"3\\\"\", actual: \"\\\"4\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=upsert]",
+      "who": "upsert-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #11",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1003, expected: \"\\\"3\\\"\", actual: \"\\\"4\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=upsert]",
+      "who": "upsert-partitioned",
+      "key": "query: SELECT count(*) AS n, sum(id) AS s, count(DISTINCT region) AS r FROM ev",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"s\", row_number: 1, expected: \"\\\"1500536\\\"\", actual: \"\\\"1500540\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=upsert]",
+      "who": "upsert-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #12",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1005, expected: \"\\\"3\\\"\", actual: \"\\\"4\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=upsert]",
+      "who": "upsert-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #13",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 511, actual: 512 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=drop]",
+      "who": "drop-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #4",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 8, actual: 9 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=drop]",
+      "who": "drop-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #5",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 8, actual: 9 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=drop]",
+      "who": "drop-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #6",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 8, actual: 9 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=drop]",
+      "who": "drop-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #7",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 8, actual: 9 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=drop]",
+      "who": "drop-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #8",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 7, actual: 8 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=drop]",
+      "who": "drop-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #9",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"id\", row_number: 3, expected: \"\\\"3\\\"\", actual: \"\\\"4\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=drop]",
+      "who": "drop-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #10",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"id\", row_number: 3, expected: \"\\\"3\\\"\", actual: \"\\\"4\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=drop]",
+      "who": "drop-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #11",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1003, expected: \"\\\"3\\\"\", actual: \"\\\"4\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=drop]",
+      "who": "drop-partitioned",
+      "key": "query: SELECT count(*) AS n, sum(id) AS s, count(DISTINCT region) AS r FROM ev",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"s\", row_number: 1, expected: \"\\\"1500536\\\"\", actual: \"\\\"1500540\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=drop]",
+      "who": "drop-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #12",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1005, expected: \"\\\"3\\\"\", actual: \"\\\"4\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=drop]",
+      "who": "drop-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #13",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 511, actual: 512 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=keep]",
+      "who": "keep-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #4",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 8, actual: 9 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=keep]",
+      "who": "keep-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #5",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 8, actual: 9 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=keep]",
+      "who": "keep-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #6",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 8, actual: 9 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=keep]",
+      "who": "keep-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #7",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 8, actual: 9 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=keep]",
+      "who": "keep-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #8",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 7, actual: 8 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=keep]",
+      "who": "keep-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #9",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"id\", row_number: 3, expected: \"\\\"3\\\"\", actual: \"\\\"4\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=keep]",
+      "who": "keep-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #10",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"id\", row_number: 3, expected: \"\\\"3\\\"\", actual: \"\\\"4\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=keep]",
+      "who": "keep-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #11",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1003, expected: \"\\\"3\\\"\", actual: \"\\\"4\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=keep]",
+      "who": "keep-partitioned",
+      "key": "query: SELECT count(*) AS n, sum(id) AS s, count(DISTINCT region) AS r FROM ev",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"s\", row_number: 1, expected: \"\\\"1500536\\\"\", actual: \"\\\"1500540\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=keep]",
+      "who": "keep-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #12",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1005, expected: \"\\\"3\\\"\", actual: \"\\\"4\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=keep]",
+      "who": "keep-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #13",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 511, actual: 512 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=none]",
+      "who": "none-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #9",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 11, actual: 15 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=none]",
+      "who": "none-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #10",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 11, actual: 15 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=none]",
+      "who": "none-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #11",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1011, actual: 1018 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=none]",
+      "who": "none-partitioned",
+      "key": "query: SELECT count(*) AS n, sum(id) AS s, count(DISTINCT region) AS r FROM ev",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"1011\\\"\", actual: \"\\\"1018\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=none]",
+      "who": "none-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #12",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1014, actual: 1021 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=none]",
+      "who": "none-partitioned",
+      "key": "spice-exec: DELETE FROM ev WHERE id > 1000 AND id % 2 = 0",
+      "kind": "error",
+      "signature": "Spice rejected the statement: 400 Bad Request: External error: External error: Failed to convert filter to Vortex expression. Filter: id@0 % 2 = 0",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=none]",
+      "who": "none-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #13",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 514, actual: 1021 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=none]",
+      "who": "none-partitioned",
+      "key": "spice-exec: DELETE FROM ev",
+      "kind": "error",
+      "signature": "Spice rejected the statement: 400 Bad Request: External error: Internal error in table 'ev_p<id>': Position-based deletion without primary key is not yet supported for delete-all operations",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=none]",
+      "who": "none-partitioned",
+      "key": "query: SELECT count(*) AS n FROM ev",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"0\\\"\", actual: \"\\\"1021\\\"\" }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=none]",
+      "who": "none-partitioned",
+      "key": "query: SELECT id, region, name, v, f, ts FROM ev #14",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1, actual: 1022 }",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=memory,policy=upsert]",
+      "who": "upsert-partitioned",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ev (postgres). Unable to create dataset acceleration: Acceleration creation failed: Invalid Cayenne accel",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=memory,policy=drop]",
+      "who": "drop-partitioned",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ev (postgres). Unable to create dataset acceleration: Acceleration creation failed: Invalid Cayenne accel",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=memory,policy=keep]",
+      "who": "keep-partitioned",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ev (postgres). Unable to create dataset acceleration: Acceleration creation failed: Invalid Cayenne accel",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-writes-known[layout=partitioned,mode=memory,policy=none]",
+      "who": "none-partitioned",
+      "key": "start: {}",
+      "kind": "error",
+      "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ev (postgres). Unable to create dataset acceleration: Acceleration creation failed: Invalid Cayenne accel",
+      "group": "cayenne"
+    }
+  ],
+  "maintained-aggregates-served": [
+    {
+      "run": "maintained-aggregates-served",
+      "who": "changes",
+      "key": "query: SELECT customer_id, MIN(amount) AS min_a, MAX(amount) AS max_a, SUM(amount) AS sum_a, COUNT(*) AS cnt FROM orders GROUP BY customer_id",
+      "kind": "other",
+      "signature": "the plan lacks `MaintainedAggregateExec`: +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------",
+      "group": "cayenne"
+    },
+    {
+      "run": "maintained-aggregates-served",
+      "who": "changes",
+      "key": "query: SELECT customer_id, MAX(amount) AS max_a FROM orders GROUP BY customer_id",
+      "kind": "other",
+      "signature": "the plan lacks `MaintainedAggregateExec`: +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------",
+      "group": "cayenne"
+    },
+    {
+      "run": "maintained-aggregates-served",
+      "who": "changes",
+      "key": "query: SELECT customer_id, AVG(amount) AS avg_a FROM orders GROUP BY customer_id",
+      "kind": "other",
+      "signature": "the plan lacks `MaintainedAggregateExec`: +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------",
+      "group": "cayenne"
+    },
+    {
+      "run": "maintained-aggregates-served",
+      "who": "changes",
+      "key": "query: SELECT customer_id, MIN(amount) AS min_a, MAX(amount) AS max_a, SUM(amount) AS sum_a, COUNT(*) AS cnt FROM orders GROUP BY customer_id #2",
+      "kind": "other",
+      "signature": "the plan lacks `MaintainedAggregateExec`: +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------",
+      "group": "cayenne"
+    },
+    {
+      "run": "maintained-aggregates-served",
+      "who": "changes",
+      "key": "query: SELECT customer_id, MAX(amount) AS max_a FROM orders GROUP BY customer_id #2",
+      "kind": "other",
+      "signature": "the plan lacks `MaintainedAggregateExec`: +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------",
+      "group": "cayenne"
+    },
+    {
+      "run": "maintained-aggregates-served",
+      "who": "changes",
+      "key": "query: SELECT customer_id, AVG(amount) AS avg_a FROM orders GROUP BY customer_id #2",
+      "kind": "other",
+      "signature": "the plan lacks `MaintainedAggregateExec`: +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------",
+      "group": "cayenne"
+    },
+    {
+      "run": "maintained-aggregates-served",
+      "who": "full",
+      "key": "query: SELECT customer_id, MIN(amount) AS min_a, MAX(amount) AS max_a, SUM(amount) AS sum_a, COUNT(*) AS cnt FROM orders GROUP BY customer_id",
+      "kind": "other",
+      "signature": "the plan lacks `MaintainedAggregateExec`: +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------",
+      "group": "cayenne"
+    },
+    {
+      "run": "maintained-aggregates-served",
+      "who": "full",
+      "key": "query: SELECT customer_id, MAX(amount) AS max_a FROM orders GROUP BY customer_id",
+      "kind": "other",
+      "signature": "the plan lacks `MaintainedAggregateExec`: +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------",
+      "group": "cayenne"
+    },
+    {
+      "run": "maintained-aggregates-served",
+      "who": "full",
+      "key": "query: SELECT customer_id, AVG(amount) AS avg_a FROM orders GROUP BY customer_id",
+      "kind": "other",
+      "signature": "the plan lacks `MaintainedAggregateExec`: +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------",
+      "group": "cayenne"
+    },
+    {
+      "run": "maintained-aggregates-served",
+      "who": "full",
+      "key": "query: SELECT region, SUM(amount) AS sum_a, COUNT(*) AS cnt FROM orders WHERE amount > 50 GROUP BY region",
+      "kind": "other",
+      "signature": "the plan lacks `MaintainedAggregateExec`: +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------",
+      "group": "cayenne"
+    },
+    {
+      "run": "maintained-aggregates-served",
+      "who": "full",
+      "key": "query: SELECT customer_id, MIN(amount) AS min_a, MAX(amount) AS max_a, SUM(amount) AS sum_a, COUNT(*) AS cnt FROM orders GROUP BY customer_id #2",
+      "kind": "other",
+      "signature": "the plan lacks `MaintainedAggregateExec`: +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------",
+      "group": "cayenne"
+    },
+    {
+      "run": "maintained-aggregates-served",
+      "who": "full",
+      "key": "query: SELECT customer_id, MAX(amount) AS max_a FROM orders GROUP BY customer_id #2",
+      "kind": "other",
+      "signature": "the plan lacks `MaintainedAggregateExec`: +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------",
+      "group": "cayenne"
+    },
+    {
+      "run": "maintained-aggregates-served",
+      "who": "full",
+      "key": "query: SELECT customer_id, AVG(amount) AS avg_a FROM orders GROUP BY customer_id #2",
+      "kind": "other",
+      "signature": "the plan lacks `MaintainedAggregateExec`: +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------",
+      "group": "cayenne"
+    },
+    {
+      "run": "maintained-aggregates-served",
+      "who": "full",
+      "key": "query: SELECT region, SUM(amount) AS sum_a, COUNT(*) AS cnt FROM orders WHERE amount > 50 GROUP BY region #2",
+      "kind": "other",
+      "signature": "the plan lacks `MaintainedAggregateExec`: +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------",
+      "group": "cayenne"
+    }
+  ],
+  "memory-limit-spill": [
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-64mib",
+      "key": "query: SELECT count(*) AS n, sum(k) AS sk FROM big",
+      "kind": "error",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'",
+      "signature": "code: 'Some resource has been exhausted'"
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-64mib",
+      "key": "query: SELECT id, s FROM big ORDER BY s DESC, id LIMIT 20",
+      "kind": "error",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'",
+      "signature": "code: 'Some resource has been exhausted'"
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-64mib",
+      "key": "query: SELECT s, id FROM (SELECT s, id, row_number() OVER (ORDER BY s, id) AS r FROM big) t WHERE r % 200000 = 0 ORDER BY r",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Additional allocation failed for ExternalSorterMerge[<n>]",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'"
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-64mib",
+      "key": "query: SELECT count(*) AS groups, sum(c) AS rows FROM (SELECT k, count(*) AS c FROM big GROUP BY k) t",
+      "kind": "error",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'",
+      "signature": "code: 'Some resource has been exhausted'"
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-64mib",
+      "key": "query: SELECT count(DISTINCT k) AS dk, count(DISTINCT s) AS ds FROM big",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Additional allocation failed for AggregateStream[<n>]",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'"
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-64mib",
+      "key": "query: SELECT g, count(DISTINCT k) AS dk, max(s) AS ms FROM big GROUP BY g ORDER BY g",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Failed to scan dataset big (cayenne): Out of query memory. Reading one batch of it needs 1.19 MiB, which fits the 64.00 MiB query memory pool on its own but not alongside the 62.85 MiB other queries are holdin",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'"
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-64mib",
+      "key": "query: SELECT count(*) AS n, count(DISTINCT d.label) AS labels FROM big b JOIN dim d ON b.k = d.id",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Failed to scan dataset big (cayenne): Out of query memory. Reading one batch of it needs 1.00 MiB, which fits the 64.00 MiB query memory pool on its own but not alongside the 63.07 MiB other queries are holdin",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'"
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-64mib",
+      "key": "query: SELECT d.id, count(*) AS n FROM dim d JOIN big b ON b.k = d.id GROUP BY d.id ORDER BY n DESC, d.id LIMIT 10",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Additional allocation failed for ExternalSorterMerge[<n>]",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'"
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-64mib",
+      "key": "query: SELECT g, max(rk) AS top FROM (SELECT g, rank() OVER (PARTITION BY g ORDER BY v DESC, id) AS rk FROM big) t GROUP BY g ORDER BY g",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Additional allocation failed for ExternalSorterMerge[<n>]",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'"
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-256mib",
+      "key": "query: SELECT count(*) AS n, sum(k) AS sk FROM big",
+      "kind": "error",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'",
+      "signature": "code: 'Some resource has been exhausted'"
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-256mib",
+      "key": "query: SELECT id, s FROM big ORDER BY s DESC, id LIMIT 20",
+      "kind": "error",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'",
+      "signature": "code: 'Some resource has been exhausted'"
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-256mib",
+      "key": "query: SELECT s, id FROM (SELECT s, id, row_number() OVER (ORDER BY s, id) AS r FROM big) t WHERE r % 200000 = 0 ORDER BY r",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Additional allocation failed for ExternalSorterMerge[<n>]",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'"
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-256mib",
+      "key": "query: SELECT count(*) AS groups, sum(c) AS rows FROM (SELECT k, count(*) AS c FROM big GROUP BY k) t",
+      "kind": "error",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'",
+      "signature": "code: 'Some resource has been exhausted'"
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-256mib",
+      "key": "query: SELECT count(DISTINCT k) AS dk, count(DISTINCT s) AS ds FROM big",
+      "kind": "error",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'",
+      "signature": "code: 'Some resource has been exhausted'"
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-256mib",
+      "key": "query: SELECT g, count(DISTINCT k) AS dk, max(s) AS ms FROM big GROUP BY g ORDER BY g",
+      "kind": "error",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'",
+      "signature": "code: 'Some resource has been exhausted'"
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-256mib",
+      "key": "query: SELECT count(*) AS n, count(DISTINCT d.label) AS labels FROM big b JOIN dim d ON b.k = d.id",
+      "kind": "error",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'",
+      "signature": "code: 'Some resource has been exhausted'"
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-256mib",
+      "key": "query: SELECT d.id, count(*) AS n FROM dim d JOIN big b ON b.k = d.id GROUP BY d.id ORDER BY n DESC, d.id LIMIT 10",
+      "kind": "error",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'",
+      "signature": "code: 'Some resource has been exhausted'"
+    },
+    {
+      "run": "memory-limit-spill",
+      "who": "cayenne-256mib",
+      "key": "query: SELECT g, max(rk) AS top FROM (SELECT g, rank() OVER (PARTITION BY g ORDER BY v DESC, id) AS rk FROM big) t GROUP BY g ORDER BY g",
+      "kind": "error",
+      "group": "cayenne",
+      "may-pass": true,
+      "pattern": "code: 'Some resource has been exhausted'",
+      "signature": "code: 'Some resource has been exhausted'"
+    }
+  ],
+  "postgres-cdc-kill-during-compaction": [
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=1]",
+      "who": "default",
+      "key": "query: SELECT count(*), count(DISTINCT o_id), sum(v), sum(grp), count(note) FROM orders",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=1]",
+      "who": "default",
+      "key": "query: SELECT * FROM orders WHERE o_id % 997 = 0",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=1]",
+      "who": "default",
+      "key": "query: SELECT grp, count(*), sum(v) FROM orders GROUP BY grp",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=1]",
+      "who": "default",
+      "key": "query: SELECT count(*), sum(v), sum(grp) FROM orders #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=2]",
+      "who": "default",
+      "key": "query: SELECT count(*), count(DISTINCT o_id), sum(v), sum(grp), count(note) FROM orders",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=2]",
+      "who": "default",
+      "key": "query: SELECT * FROM orders WHERE o_id % 997 = 0",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=2]",
+      "who": "default",
+      "key": "query: SELECT grp, count(*), sum(v) FROM orders GROUP BY grp",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=2]",
+      "who": "default",
+      "key": "query: SELECT count(*), sum(v), sum(grp) FROM orders #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=3]",
+      "who": "default",
+      "key": "query: SELECT count(*), count(DISTINCT o_id), sum(v), sum(grp), count(note) FROM orders",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=3]",
+      "who": "default",
+      "key": "query: SELECT * FROM orders WHERE o_id % 997 = 0",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=3]",
+      "who": "default",
+      "key": "query: SELECT grp, count(*), sum(v) FROM orders GROUP BY grp",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=3]",
+      "who": "default",
+      "key": "query: SELECT count(*), sum(v), sum(grp) FROM orders #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=4]",
+      "who": "default",
+      "key": "query: SELECT count(*), count(DISTINCT o_id), sum(v), sum(grp), count(note) FROM orders",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=4]",
+      "who": "default",
+      "key": "query: SELECT * FROM orders WHERE o_id % 997 = 0",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=4]",
+      "who": "default",
+      "key": "query: SELECT grp, count(*), sum(v) FROM orders GROUP BY grp",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=4]",
+      "who": "default",
+      "key": "query: SELECT count(*), sum(v), sum(grp) FROM orders #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=5]",
+      "who": "default",
+      "key": "query: SELECT count(*), count(DISTINCT o_id), sum(v), sum(grp), count(note) FROM orders",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=5]",
+      "who": "default",
+      "key": "query: SELECT * FROM orders WHERE o_id % 997 = 0",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=5]",
+      "who": "default",
+      "key": "query: SELECT grp, count(*), sum(v) FROM orders GROUP BY grp",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=5]",
+      "who": "default",
+      "key": "query: SELECT count(*), sum(v), sum(grp) FROM orders #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    }
+  ]
+}
