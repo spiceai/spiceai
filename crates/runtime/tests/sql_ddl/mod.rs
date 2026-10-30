@@ -526,6 +526,80 @@ async fn a_withheld_dataset_stays_unserved_until_its_data_is_deleted() {
         .await;
 }
 
+/// A statement that would move a dataset to a store whose leftovers cannot be
+/// cleared is refused, and the dataset answers its rows throughout: the store
+/// a statement starts is cleared before the dataset served under the name is
+/// unloaded, so the refusal leaves it as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_statement_refused_for_its_new_store_leaves_the_dataset_served() {
+    test_request_context()
+        .scope(async {
+            let fixture = Fixture::new();
+            let rt = start(&fixture).await;
+            message(
+                &rt,
+                &format!(
+                    "CREATE TABLE m1 WITH (from = 'file:{}', file_format = 'csv', \
+                     \"acceleration.engine\" = 'duckdb', \"acceleration.mode\" = 'memory')",
+                    fixture.orders_csv.display()
+                ),
+            )
+            .await;
+            let select = "SELECT id FROM m1 ORDER BY id";
+            let rows = "+----+\n| id |\n+----+\n| 1  |\n| 2  |\n| 3  |\n+----+";
+            eventually(&rt, select, rows)
+                .await
+                .unwrap_or_else(|last| panic!("m1 loads its source; served:\n{last}"));
+
+            // The file the new definition names is no DuckDB database, so what
+            // it holds under the name cannot be deleted.
+            let duckdb_file = fixture.instance_dir.with_file_name("m1.duckdb");
+            std::fs::write(&duckdb_file, b"not a DuckDB database").expect("write the file");
+            let alter = format!(
+                "ALTER TABLE m1 SET (\"acceleration.mode\" = 'file', \
+                 \"acceleration.params.duckdb_file\" = '{}')",
+                duckdb_file.display()
+            );
+            let refused_at = std::sync::Mutex::new(None::<tokio::time::Instant>);
+            let (refusal, missed) = tokio::join!(
+                async {
+                    let e = error(&rt, &alter).await;
+                    *refused_at.lock().expect("lock") = Some(tokio::time::Instant::now());
+                    e
+                },
+                async {
+                    // Read while the statement runs and for 3 seconds after.
+                    let mut missed = Vec::new();
+                    loop {
+                        let answered = match run(&rt, select).await {
+                            Ok(batches) => arrow::util::pretty::pretty_format_batches(&batches)
+                                .map_or_else(|e| e.to_string(), |t| t.to_string()),
+                            Err(e) => e,
+                        };
+                        if answered != rows {
+                            missed.push(answered);
+                        }
+                        let done = refused_at.lock().expect("lock").is_some_and(|at| {
+                            at.elapsed() > Duration::from_secs(3)
+                        });
+                        if done {
+                            return missed;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
+            );
+            assert!(
+                refusal.contains(
+                    "ALTER TABLE m1 was not applied: what the acceleration store of dataset 'm1' holds under its name could not be deleted, so the dataset is left as it was"
+                ),
+                "the statement is refused; got: {refusal}"
+            );
+            assert_eq!(missed, Vec::<String>::new(), "m1 answers its rows throughout");
+        })
+        .await;
+}
+
 /// `CREATE TABLE` returns once the dataset is registered, so a query right
 /// after it finds the table: an accelerated dataset answers with its rows, or,
 /// while its acceleration loads, says so. It is never missing.

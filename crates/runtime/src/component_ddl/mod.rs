@@ -46,6 +46,7 @@ use datafusion_ddl::component_options::{
     ComponentKind, ConnectorParameters, OptionValue, create_statement,
 };
 use runtime_acceleration::Engine;
+use runtime_acceleration::layout::AccelerationLayout;
 use runtime_auth::AuthRequestContext;
 use runtime_parameters::{ParameterKey, ParameterSpec, Parameters};
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -1406,16 +1407,13 @@ impl Runtime {
             // there. So does what the store a definition starts to use holds
             // under its name.
             let retired = plan::retired_datasets(&spicepod, &defined, &definitions, Some(&op));
-            let mut retiring = retired.clone();
-            for started in self
+            let started: Vec<Dataset> = self
                 .started_datasets(&served.datasets, &next.datasets, &definitions, &served)
                 .await
-            {
-                if !retiring.contains(&started) {
-                    retiring.push(started);
-                }
-            }
-            if !retiring.is_empty() {
+                .into_iter()
+                .filter(|started| !retired.contains(started))
+                .collect();
+            if !retired.is_empty() || !started.is_empty() {
                 // Checked again just before data is deleted: a change another
                 // instance stored since is found here, before anything is
                 // deleted, rather than by the write below, after.
@@ -1433,12 +1431,43 @@ impl Runtime {
                     }));
                 }
             }
+            // A started store is another than the one the dataset served under
+            // the name keeps its data in, so it is cleared while that dataset
+            // serves: a failure leaves it as it was.
+            for dataset in &started {
+                if let Err(e) = Arc::clone(&self)
+                    .delete_acceleration_data(dataset, &served)
+                    .await
+                {
+                    let left = if self
+                        .sql_components
+                        .withheld()
+                        .iter()
+                        .any(|old| same_dataset(&old.name, &dataset.name))
+                    {
+                        Undeleted::Withheld
+                    } else if served
+                        .datasets
+                        .iter()
+                        .any(|now| same_dataset(&now.name, &dataset.name))
+                    {
+                        Undeleted::Started
+                    } else {
+                        Undeleted::New
+                    };
+                    return Err(not_applied(&undeleted_by_statement(
+                        &dataset.name,
+                        left,
+                        &e,
+                    )));
+                }
+            }
             let applied = self
                 .retire(
                     &spicepod,
                     &served,
                     &definitions,
-                    &retiring,
+                    &retired,
                     OnUndeleted::ServeEarlier,
                 )
                 .await
@@ -1453,7 +1482,7 @@ impl Runtime {
                 }
                 Err(e) => {
                     // What this statement retired is served again, from its source.
-                    if !retiring.is_empty() {
+                    if !retired.is_empty() {
                         Arc::clone(&self)
                             .apply_app_diff(Some(&applied), Arc::clone(&served))
                             .await;
@@ -1739,16 +1768,12 @@ impl Runtime {
         }
     }
 
-    /// Delete the acceleration data of `dataset`, a definition `app` served and
-    /// that no longer serves. A failure is its whole chain on one line: its
-    /// innermost error can be a bare code, such as `DuckDB`'s, whose layer
-    /// above holds the text that names the file.
     /// The store `dataset`'s acceleration keeps its data in beyond its table,
     /// or `None` when there is none: no acceleration, or a memory one that
     /// ends with its table. A store is where the accelerator keeps the data,
     /// for the engine it resolves to, so a change that leaves the data where it
-    /// is, such as a tuning parameter or naming the default engine, leaves the
-    /// store.
+    /// is, such as a tuning parameter, naming the default engine, or another
+    /// spelling of the same file, leaves the store.
     async fn acceleration_store(
         self: &Arc<Self>,
         dataset: &Dataset,
@@ -1776,16 +1801,32 @@ impl Runtime {
             .get_accelerator_engine(engine)
             .await?;
         let location = match accelerator.acceleration_layout(&built) {
-            runtime_acceleration::layout::AccelerationLayout::None => {
-                accelerator.file_path(&built).unwrap_or_else(|_| {
-                    // An engine with no file of its own, PostgreSQL, keeps the data
-                    // where its parameters point.
+            AccelerationLayout::None => match accelerator.file_path(&built) {
+                Ok(path) => place(std::path::Path::new(&path))
+                    .await
+                    .display()
+                    .to_string(),
+                // An engine with no file of its own, PostgreSQL, keeps the data
+                // where its parameters point.
+                Err(_) => {
                     let mut params: Vec<_> = acceleration.params.iter().collect();
                     params.sort();
                     format!("{params:?}")
-                })
+                }
+            },
+            AccelerationLayout::File { path } => format!(
+                "{:?}",
+                AccelerationLayout::File {
+                    path: place(&path).await
+                }
+            ),
+            AccelerationLayout::Directories { dirs } => {
+                let mut placed = Vec::with_capacity(dirs.len());
+                for (dir, prefix) in dirs {
+                    placed.push((place(&dir).await, prefix));
+                }
+                format!("{:?}", AccelerationLayout::Directories { dirs: placed })
             }
-            layout => format!("{layout:?}"),
         };
         Some(Store::Located { engine, location })
     }
@@ -1830,6 +1871,10 @@ impl Runtime {
         started
     }
 
+    /// Delete the acceleration data of `dataset`, a definition `app` served and
+    /// that no longer serves. A failure is its whole chain on one line: its
+    /// innermost error can be a bare code, such as `DuckDB`'s, whose layer
+    /// above holds the text that names the file.
     async fn delete_acceleration_data(
         self: Arc<Self>,
         dataset: &Dataset,
@@ -1909,6 +1954,39 @@ struct ServeFailure {
     /// It serves the rest of the change. Empty when it serves its earlier
     /// definitions instead.
     unserved: Vec<String>,
+}
+
+/// The place `path` names, so that every spelling of one file or folder
+/// gives the same path: relative to the directory Spice runs in, as an
+/// engine opens it, with `.` and `..` resolved, no trailing separator, and
+/// links resolved for the part of it that exists.
+async fn place(path: &std::path::Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut lexical = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                lexical.pop();
+            }
+            other => lexical.push(other),
+        }
+    }
+    let mut existing = lexical.clone();
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut resolved) = tokio::fs::canonicalize(&existing).await {
+            resolved.extend(missing.iter().rev());
+            return resolved;
+        }
+        let Some(name) = existing.file_name().map(std::ffi::OsStr::to_os_string) else {
+            return lexical;
+        };
+        missing.push(name);
+        if !existing.pop() {
+            return lexical;
+        }
+    }
 }
 
 /// Where an acceleration keeps a dataset's data beyond the dataset's table,
@@ -2017,6 +2095,9 @@ fn deletion_failed(dataset: &str, error: impl std::fmt::Display) -> String {
 enum Undeleted {
     /// Served before the statement, and still.
     Served,
+    /// Served before the statement from its own store, and still: what the
+    /// store the statement starts holds under its name stays.
+    Started,
     /// Not served: the statement defines the name anew.
     New,
     /// Withheld until a retry deletes its data.
@@ -2031,6 +2112,9 @@ fn undeleted_by_statement(dataset: &str, left: Undeleted, error: impl std::fmt::
     match left {
         Undeleted::Served => format!(
             "the acceleration data of dataset {shown} could not be deleted, so the dataset is left as it was; run the statement again once the cause is fixed. Cause: {error}"
+        ),
+        Undeleted::Started => format!(
+            "what the acceleration store of dataset {shown} holds under its name could not be deleted, so the dataset is left as it was; run the statement again once the cause is fixed. Cause: {error}"
         ),
         Undeleted::New => format!(
             "what the acceleration store of dataset {shown} holds under its name could not be deleted, so the dataset was not created; run the statement again once the cause is fixed. Cause: {error}"
@@ -2425,6 +2509,14 @@ mod tests {
             "the acceleration data of dataset 'orders' could not be deleted, so the dataset is left as it was; run the statement again once the cause is fixed. Cause: Permission denied (os error 13)"
         );
         assert_eq!(
+            undeleted_by_statement(
+                "orders",
+                Undeleted::Started,
+                "Permission denied (os error 13)"
+            ),
+            "what the acceleration store of dataset 'orders' holds under its name could not be deleted, so the dataset is left as it was; run the statement again once the cause is fixed. Cause: Permission denied (os error 13)"
+        );
+        assert_eq!(
             undeleted_by_statement("orders", Undeleted::New, "Permission denied (os error 13)"),
             "what the acceleration store of dataset 'orders' holds under its name could not be deleted, so the dataset was not created; run the statement again once the cause is fixed. Cause: Permission denied (os error 13)"
         );
@@ -2436,5 +2528,51 @@ mod tests {
             ),
             "this instance does not serve dataset 'orders' until it deletes the acceleration data stored under its name; Spice retries every 10 seconds, so run the statement again once it has. Cause: the acceleration data of dataset 'orders' could not be deleted. Cause: Permission denied (os error 13)"
         );
+    }
+
+    /// Every spelling of one file or folder names one place: relative to the
+    /// directory Spice runs in, with `.` and `..`, a trailing separator, or
+    /// through a link, whether it exists yet or not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_spelling_of_a_file_names_one_place() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data = dir.path().join("data");
+        tokio::fs::create_dir(&data).await.expect("data dir");
+        tokio::fs::write(data.join("a.db"), b"")
+            .await
+            .expect("file");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&data, &link).expect("symlink");
+        let cwd = std::env::current_dir().expect("cwd");
+        let relative = pathdiff(&data.join("a.db"), &cwd);
+        let file = place(&data.join("a.db")).await;
+        for spelling in [
+            data.join("./a.db"),
+            data.join("../data/a.db"),
+            link.join("a.db"),
+            relative,
+        ] {
+            assert_eq!(place(&spelling).await, file, "{}", spelling.display());
+        }
+        let folder = place(&data).await;
+        assert_eq!(place(&dir.path().join("data/")).await, folder);
+        assert_eq!(place(&link).await, folder);
+        // Not created yet: the part that exists resolves, the rest is kept.
+        let missing = place(&data.join("new/b.db")).await;
+        assert_eq!(missing, folder.join("new").join("b.db"));
+        assert_eq!(place(&link.join("./new/../new/b.db")).await, missing);
+        assert_ne!(place(&data.join("b.db")).await, file);
+    }
+
+    /// `path` relative to `base`, both absolute.
+    #[cfg(unix)]
+    fn pathdiff(path: &std::path::Path, base: &std::path::Path) -> PathBuf {
+        let path: Vec<_> = path.components().collect();
+        let base: Vec<_> = base.components().collect();
+        let common = path.iter().zip(&base).take_while(|(a, b)| a == b).count();
+        let mut relative: PathBuf = base[common..].iter().map(|_| "..").collect();
+        relative.extend(&path[common..]);
+        relative
     }
 }

@@ -525,6 +525,137 @@ steps:
     consistently: 10s
     expect: { same-as: k2-kept }
 
+  # Another spelling of the file or folder the acceleration already keeps its
+  # data in leaves it there, so the data is kept too: DuckDB's file relative to
+  # the directory Spice runs in, and SQLite's file and Cayenne's folder with
+  # `./`.
+  - generate:
+      lake:
+        table: ev3
+        rows: 20
+        seed: 27
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: ts, sequence: 1000 }
+    mirror: ref
+  - generate:
+      lake:
+        table: ev4
+        rows: 20
+        seed: 28
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: ts, sequence: 1000 }
+    mirror: ref
+  - generate:
+      lake:
+        table: ev5
+        rows: 20
+        seed: 29
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: ts, sequence: 1000 }
+    mirror: ref
+  - spice-exec: "CREATE TABLE k3 WITH (from = 'file://${sources.lake.path}/ev3/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'duckdb', acceleration.mode = 'file', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds', acceleration.refresh_check_interval = '1h')"
+    only: a
+  - spice-exec: "CREATE TABLE k4 WITH (from = 'file://${sources.lake.path}/ev4/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'file', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds', acceleration.refresh_check_interval = '1h')"
+    only: a
+  - spice-exec: "CREATE TABLE k5 WITH (from = 'file://${sources.lake.path}/ev5/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds', acceleration.refresh_check_interval = '1h')"
+    only: a
+  - query: SELECT id, ts FROM k3
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM ev3
+  - query: SELECT id, ts FROM k4
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM ev4
+  - query: SELECT id, ts FROM k5
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM ev5
+  - generate:
+      lake:
+        table: ev3
+        rows: 5
+        seed: 30
+        format: csv
+        mode: replace
+        columns:
+          - { name: id, sequence: 5000 }
+          - { name: ts, sequence: 5000 }
+  - generate:
+      lake:
+        table: ev4
+        rows: 5
+        seed: 31
+        format: csv
+        mode: replace
+        columns:
+          - { name: id, sequence: 5000 }
+          - { name: ts, sequence: 5000 }
+  - generate:
+      lake:
+        table: ev5
+        rows: 5
+        seed: 32
+        format: csv
+        mode: replace
+        columns:
+          - { name: id, sequence: 5000 }
+          - { name: ts, sequence: 5000 }
+  - refresh: k3
+    only: a
+  - refresh: k4
+    only: a
+  - refresh: k5
+    only: a
+  - query: SELECT count(*) AS n FROM k3
+    only: a
+    expect: { rows: [['25']] }
+  - query: SELECT id, ts FROM k3
+    only: a
+    id: k3-kept
+    expect: {}
+  - query: SELECT count(*) AS n FROM k4
+    only: a
+    expect: { rows: [['25']] }
+  - query: SELECT id, ts FROM k4
+    only: a
+    id: k4-kept
+    expect: {}
+  - query: SELECT count(*) AS n FROM k5
+    only: a
+    expect: { rows: [['25']] }
+  - query: SELECT id, ts FROM k5
+    only: a
+    id: k5-kept
+    expect: {}
+  - spice-exec: "ALTER TABLE k3 SET (acceleration.params.duckdb_file = '.spice/data/accelerated_duckdb.db')"
+    only: a
+  - spice-exec: "ALTER TABLE k4 SET (acceleration.params.sqlite_file = './.spice/data/accelerated_sqlite.db')"
+    only: a
+  - spice-exec: "ALTER TABLE k5 SET (acceleration.params.cayenne_file_path = './.spice/data')"
+    only: a
+  - query: SELECT id, ts FROM k3
+    only: a
+    consistently: 10s
+    expect: { same-as: k3-kept }
+  - query: SELECT id, ts FROM k4
+    only: a
+    consistently: 10s
+    expect: { same-as: k4-kept }
+  - query: SELECT id, ts FROM k5
+    only: a
+    consistently: 10s
+    expect: { same-as: k5-kept }
+
   # An instance that has written no acceleration file creates the first one
   # of each engine that keeps one.
   - spice-exec: "CREATE TABLE e1 WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'duckdb', acceleration.mode = 'file')"
