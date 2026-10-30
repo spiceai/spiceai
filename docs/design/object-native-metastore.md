@@ -188,12 +188,15 @@ Its GC then roots in the destination instead of the local metastore.
 datalake location keep working. Folding the tier into compaction, and
 retiring its settings, waits for re-bootstrap, compatibility and recovery to
 be shown. Retiring the settings is a user-facing change, so it goes through the
-same Enhancement review as the flag below.
+same Enhancement review as the rest of the
+[user-facing surface](#user-facing-surface-proposal-for-the-enhancement).
 
-**One gap this closes.** The tier's GC has no reader pins, so a query still
-reading cold files when GC sweeps them fails. A Cayenne integration test that
-forces that interleaving reproduces it, and reader pins (decision 1.10) remove
-it.
+**One gap this narrows.** The tier's GC deletes an object a short grace period
+(5 minutes by default) after it becomes unreferenced, so a query still reading
+cold files then fails. A Cayenne integration test that forces that
+interleaving reproduces it. Under decision 1.10 the same failure needs a query
+to outlive the retention, about an hour, and it is always an error, never rows
+from part of a snapshot.
 
 ## Milestones
 
@@ -221,7 +224,7 @@ destination, is the prerequisite for everything else.
 - SQLite and Turso replaced everywhere, by one implementation for object-store
 and local-directory destinations.
 - A replacement instance that recovers from the bucket without a reload.
-- Query replicas that read the same state directly.
+- State any instance can read directly, which Milestone 2's replicas build on.
 - No metastore choice and no metastore knobs.
 
 **Limits it leaves:**
@@ -272,8 +275,8 @@ row correct with neither.
   - *Durable resume.* Source positions commit with the state they cover
     (decision 1.9), so the new holder resumes from the head, not from the old
     holder's disk.
-  - *Shared reads.* Standby replicas already answer queries from committed
-    state.
+  - *Shared reads.* Any instance can already read committed state from the
+    destination, so standbys answer queries from it.
 
   What each source needs on top:
   - *Consume only while holding the lease.* A PostgreSQL replication slot
@@ -406,19 +409,19 @@ One writer per dataset holds a lease; any number of readers.
 
 **What the user sees.** Nothing new to configure. A restarted or replacement
 instance pointed at the same bucket recovers the acceleration without a full
-reload. Query replicas read the same state directly instead of importing
-snapshots.
+reload. Running several instances on one destination (replicas and
+standbys) comes with Milestone 2, also with nothing new to configure.
 
 **What it removes:**
 
-- SQLite and Turso as metastores, and the `turso` feature. Replacing them is the
-goal of this work, but the old storage is removed only after the new path has
+- SQLite and Turso as metastores (the `turso` build feature goes earlier, with
+the accelerator deprecation). Replacing them is the goal of this work, but the old storage is removed only after the new path has
 proven its durability, re-bootstrap and operating behavior.
 - **Running a database inside every instance:** its locking, tuning and
   upkeep, such as busy timeouts, write queueing, checkpointing and vacuum.
-- **Copying acceleration state between instances.** Replicas and replacement
-  instances read the destination directly instead of importing a metastore
-  slice.
+- **Copying acceleration state between instances.** A replacement instance
+  reads the destination directly instead of importing a metastore slice, and
+  so do Milestone 2's replicas.
 - **A metastore round trip on every write.** Writes commit once per
   acknowledgement point.
 - **A separate small-write tier inside the database,** once its replacement is
@@ -579,7 +582,7 @@ from, and the GC design does.
 **1.8 Two numbers: commit numbers name states, `seq`s order mutations.** Every
 accepted record gets the next commit number, data commits and maintenance
 alike, and a commit number names the dataset state after it: snapshot tokens,
-checkpoints and reader pins use it. Cayenne's sequence numbers stay as they
+checkpoints and the floor use it. Cayenne's sequence numbers stay as they
 are, drawn per write operation per table and stamped while buffering. Within
 each table, every `seq` in a record is above every `seq` in earlier records,
 so `seq` order is commit order, every existing `seq` comparison keeps its
@@ -609,66 +612,84 @@ running alongside live CDC needs one more rule: a live change after the
 backfill's snapshot position wins over backfilled data.
 *Details in:* [Source positions and backfill](object-native-metastore-technical.md#source-positions-and-backfill).
 
-**1.10 GC deletes from the log, and reader pins are low-water marks.** GC is
-one protocol with fencing, staging and reader pins, and correctness never
-depends on a grace period.
+**1.10 GC keeps removed files for a fixed retention, collects uploads by age,
+and readers never write.** Every read returns the object it references or fails
+the query, so GC's timing decides only which long queries can fail, never which
+rows a query returns.
 
 - *Files that were once live* are deleted from what the records say left: a
-  file leaves the state at the record that removes it, and GC deletes it once
-  the floor and every reader pin are past that record. No LIST is needed, as
-  Delta Lake deletes from its `remove` actions and Iceberg from expired
-  snapshots.
-- *Uploads that never committed* are found by listing generations: each
-  upload goes into its writer's generation, which in Milestone 1 is the writer's
-  lease generation, and after a takeover the new owner sweeps its
-  predecessor's. A fenced writer's late upload can leak until a later sweep,
-  which costs space, never correctness.
-- *Each reading node keeps one pin,* a lease it renews, holding for each
-  dataset the oldest commit its queries and open transactions still read. A
-  new query needs no write, and a node that dies releases its pin by letting
-  it lapse; SlateDB's readers keep their checkpoints alive the same way. A
-  long query keeps everything removed since it started, like PostgreSQL's
-  xmin horizon. Pins never block maintenance; they only delay deleting its
-  inputs.
-- *Milestone 2* adds explicit generation closes, because GC on one node cannot see
-  another node's uploads in flight.
+  file leaves the state at the record that removes it, and GC deletes it a
+  fixed retention T (about an hour) after it observes that record. No LIST is
+  needed, as Delta Lake deletes from its `remove` actions and Iceberg from
+  expired snapshots.
+- *The removal stays recorded* in durable state until GC deletes the file, so
+  a new GC after a takeover still knows it, and the sweep of uploads that never
+  committed skips it.
+- *Readers write nothing.* A query starts from a state confirmed current within
+  the staleness bound S, counted from when the confirming request was sent, so
+  every file it needs survives at least T − S. A
+  query that outlives that may fail, with an error saying to rerun it; it never
+  gets other rows. A read-only node needs only read access to the location.
+- *Uploads that never committed* are collected by age on the store's clock.
+  Every object has a fresh name. A writer references only objects live in its
+  commit's base and its own uploads it has never published, and refuses an
+  upload once its base's store time is an age limit (about a day) past the
+  upload's. GC deletes an unreferenced upload once the head it read is that
+  age limit past the upload's `LastModified`. A commit that lands after GC's
+  read is based on that head or a newer one, so the writer would have refused
+  the upload. On an idle dataset, GC makes an empty commit so the head's time
+  advances.
+- *No clock is compared across machines.* Upload ages are differences of two
+  store timestamps; GC times removals on its own clock; a takeover restarts
+  the removal timers.
+- *Long uploads* that cannot commit within the age limit are split across
+  several commits. If that ever binds, a `PREPARE_UPLOAD` record can protect a
+  long upload's objects by reference until it commits or a `RELEASE_UPLOAD`
+  drops them.
+
+The protocol model checks this in two graphs, one for references and one for
+queries: with any rule removed, a committed state references a deleted file, or
+a query within the retention fails.
 
 *Details in:* [Checkpoints and garbage collection](object-native-metastore-technical.md#checkpoints-and-garbage-collection).
 
-- *Alternative: retention by age,* as Delta Lake's `VACUUM` and Iceberg's
-  orphan cleanup use. Correctness would rest on a time bound, and the datalake
-  tier's GC shows it failing. Rejected.
-- *Alternative: a pin per query, or one anchored at the oldest query.* A pin
-  per query costs a write each time a query starts on a new commit, and a pin
-  anchored at the oldest query alone does not protect files a newer query
-  reads; the model finds the loss. Rejected.
+- *Alternative: leased reader pins,* a low-water commit each reading node
+  writes and renews, as SlateDB's readers keep their checkpoints alive.
+  Rejected: a pin only moves the time bound, since a reader paused past its
+  lease fails anyway, and it buys only queries longer than the retention. In
+  exchange every reader needs write access to the location, a lease with
+  renewal writes, and a write-then-recheck before its first read, and GC must
+  list pins. Delta Lake (`VACUUM`, 7 days by default), Iceberg (snapshot expiry
+  and orphan cleanup by age) and Hudi (the cleaner keeps the last N commits)
+  all protect readers with a retention bound, and none has readers register.
+- *Alternative: object generations,* where each upload goes into its writer's
+  generation and GC lists only generations no live writer uses. Rejected: it
+  avoids listing the whole prefix, but needs explicit generation closes once
+  writers run on several nodes, an interlock and an admission guard for reused
+  content addresses, and repeated sweeps to catch late uploads. The age rule
+  and fresh names need none of them.
+- *Alternative: the writer ages uploads on its own clock, and GC waits for the
+  head to move and rechecks.* Rejected: it compares the writer's clock with the
+  store's, so a store clock that runs ahead lets GC delete an upload the writer
+  still thinks young. Measuring both ages against the head removes the clock
+  comparison, and the head move and the recheck with it.
+- *Alternative: GC times candidates on its own clock from the first LIST that
+  saw them.* Rejected: GC would have to remember its listings, and a restart
+  would start every wait again.
 
 ## User-facing surface (proposal for the Enhancement)
 
 The surface change needs its own Enhancement with PM and UX/DX sign-off before
 it is built. This is the proposal that Enhancement would review.
 
-**Rollout shape.** The replacement is the goal of the work, but the existing
-storage is removed only after the new path is proven. Until then the new path is
-an opt-in experiment, enabled runtime-wide, not a new `acceleration.mode` value.
-`mode` is meant to disappear entirely, so adding a value to it would only grow
-what has to be deprecated. Once the new path is proven it becomes the default,
-and the flag and `mode` both retire.
-
-The flag is `runtime.experimental_cayenne_metastore`, which takes `enabled` or
-`disabled` (the default). The name says what it is: an experiment that changes
-Cayenne's metastore. It is not under `runtime.state`, because that block names
-where the runtime keeps its shared state, and Cayenne's data may later live in
-other locations as well (see
-[multiple data locations](object-native-metastore-technical.md#future-multiple-data-locations)).
-An enum rather than a boolean follows the Spicepod convention against boolean
-settings.
-
-- *Alternatives considered:* `runtime.state.object_native`, which reads as a
-  property of the runtime-state location rather than of Cayenne; a
-  `runtime.params.object_native_metastore` key; a comma-separated
-  `runtime.params.experiments` list; and a new `runtime.experiments` list
-  field.
+**Rollout shape.** The new path is developed behind a feature flag, off by
+default, so nothing changes for users until they opt in. Once the new path is
+proven, it becomes the default, and the flag is removed together with the
+surface it makes obsolete: the metastore backend choice, the separate metadata
+directory, the small-write inlining settings and, for Cayenne, snapshots (a
+reader opens the destination directly). The flag's name and shape, and
+each deprecation and its timing, are defined and reviewed in the Enhancement,
+not here.
 
 **Location: reuse `runtime.state.location` rather than add
 `runtime.object_store`.** Spicepods already have one root for shared runtime
@@ -687,13 +708,12 @@ configure the same thing.
 ```yaml
 runtime:
   state:
-    location: s3://my-bucket/spice          # existing field; Cayenne uses <location>/cayenne/v1/
-  experimental_cayenne_metastore: enabled   # runtime-wide opt-in during rollout; default disabled
+    location: s3://my-bucket/spice   # existing field; Cayenne uses <location>/cayenne/v1/
 datasets:
   - from: postgres:public.orders
     name: orders
     acceleration:
-      enabled: true                         # no mode value: the runtime-wide experiment decides the path
+      enabled: true
 ```
 
 **Questions for the review:**
@@ -710,13 +730,19 @@ not a per-dataset choice. Deprecating `mode` can be decided and scheduled
 separately from the metastore work.
 - **The layout of data files.** Data files live in the destination (see
 [What we are building](#what-we-are-building)), under each dataset's
-`data/<generation>/` folder with their current file names
-([layout](object-native-metastore-technical.md#layout)). A file keeps the
-generation it was written in for life: ending a generation never copies or
-moves a file, and GC only deletes files no protected state references. The open
-question is whether today's per-dataset
-overrides, such as S3 Express, stay. An override must still be an object
-store that every instance can read.
+`data/` folder with their current file names
+([layout](object-native-metastore-technical.md#layout)). A file never moves or
+is renamed, and GC deletes a removed file only after the retention (decision
+1.10).
+- **Data locations separate from the catalog.** By default the catalog and the
+data share one location. The format lets the catalog reference data in other
+locations, each with its own permissions, storage class or region (see
+[multiple data locations](object-native-metastore-technical.md#future-multiple-data-locations));
+today's per-dataset overrides, such as S3 Express, would become one. The
+surface for configuring them, and when it ships, belong to a separate
+Enhancement on object-native data; this one covers the metadata. Every data
+location must be an object store that every instance needing its files can
+read.
 
 ---
 
@@ -830,8 +856,24 @@ the check is coarser, and any commit to a table the write read is a conflict.
 
 ## Multi-region
 
-- **Write in one region, read in others:** supported. A replica exposes only a
-  readable frontier whose full dependency closure it has confirmed present.
+- **Replication: data in any direction, state one way.** Data objects are
+  immutable with fresh names, so they can be replicated freely. The state
+  location has exactly one writable copy: a conditional write is atomic only
+  within one bucket, so two writable copies would let two writers both hold
+  the lease and the merge drop acknowledged commits. It may replicate one way to
+  a copy nothing writes; failing over to that copy is not supported.
+- **Write in one region, read in others:** supported, with writers, the lease
+  and GC on the source, in two patterns:
+  - *one state location and replicated data:* readers poll the source head and
+    read files from the nearest replica, falling back to the source for a file
+    not yet replicated. Query bytes cross regions once, by replication;
+  - *one-way replicated state:* regional readers also poll their replica. A
+    replica exposes only a readable frontier, a head whose newly referenced
+    objects it has confirmed present, and a reader never adopts a lower head.
+    Freshness adds the replication lag.
+- **Versioned buckets** (which replication requires): GC deletes without a
+  version id so the delete marker replicates, and noncurrent versions are then
+  removed.
 - **Writers in several regions over disjoint keys:** supported, against one
   bucket (paying cross-region latency per commit), or with a log per region (a
   possible future improvement).
@@ -850,12 +892,18 @@ as discrete changes, each shipping on its own, and each with an exit proof:
 2. Cayenne's catalog changes expressed as actions, with the SQL metastore
    still authoritative and a differential check that both agree.
 3. A shadow log written alongside the SQL metastore, on real workloads.
-4. Data files in the destination, and read replicas that open from the shadow.
+4. Data files in the destination, and readers that open from the shadow in
+   tests and the benchmark harness.
 5. The object-native metastore as the authority for new datasets, behind the
-   flag.
-6. Existing datasets re-bootstrap from their sources; metastore contents are
-   not migrated.
-7. On by default.
+   flag. Its records can reference data files still on local disk until step
+   4's placement lands, so the metadata work does not wait on the data work;
+   until then, recovery is limited to that disk.
+6. Existing datasets keep the metastore they are on; moving one means deleting
+   its acceleration so it re-bootstraps from its source. Metastore contents are
+   not migrated, and nothing switches automatically.
+7. On by default, once a second instance on the same destination can no
+   longer race the writer: either read-only support or detection that
+   refuses it.
 8. Removal of the SQL metastore.
 
 The format is in real use from step 3, first as a follower; the default

@@ -33,7 +33,7 @@ direction.
 | Density | Dense: one more per accepted record | Sparse: a buffer lost in a crash leaves a gap |
 | Scope | Per dataset, which has one head | Per table: the parent table and each partition child have their own allocator |
 | Assigned by | The CAS that accepts the record | Cayenne's allocator, while buffering, as today |
-| Used for | Naming states: snapshot tokens, checkpoints, batches, the floor, reader pins, and when a file was removed | Visibility: a delete hides rows at or below its `seq`; compaction and bake cutoffs |
+| Used for | Naming states: snapshot tokens, checkpoints, batches, the floor, and when a file was removed | Visibility: a delete hides rows at or below its `seq`; compaction and bake cutoffs |
 
 "Commit n" names both the n-th accepted record and the dataset state after
 it. [Commit numbers and sequence numbers](#commit-numbers-and-sequence-numbers)
@@ -65,11 +65,10 @@ objects that records reference.
 | **Batches** | Immutable objects holding the records that left the window, many per object. | Cold opens fetch a few objects in parallel instead of one object per commit: 12 requests and 175–186 ms at a 128-record tail, against 3.9 s for a serial walk of per-commit objects (measured). |
 | **The batch index in the head** | Lists each batch's range. | The byte budget makes batch lengths vary, so their names cannot be computed. Readers fetch exactly what the head lists, in parallel, without a LIST. A missing listed batch is an error, never an empty range (model). |
 | **The copy rule** | When a batch is sealed, by whom, and when the head may drop its records. | Each part is needed: a cut that depends on the observed head, sealing before a batch is final, dropping before the batch exists, or a listed range that does not match the dropped records each lose or corrupt records for lagging readers (model). |
-| **Floor and checkpoint in the head** | Where readers start, and what GC may reclaim. | Readers and GC learn both from the same atomic object as the commits. GC that uses a checkpoint the head does not name loses pinned snapshots (model). |
+| **Floor and checkpoint in the head** | Where readers start, and what GC may reclaim. | Readers and GC learn both from the same atomic object as the commits. GC that uses a checkpoint the head does not name loses a running query's state (model). |
 | **Lease generation in the head** | The current owner's generation. | A new owner's CAS makes every older writer's next CAS fail, and the generation tells the older writer, once it re-reads, that it must stop rather than retry (model). |
-| **Deletion from the log** | GC deletes a file once every protected state is past the record that removed it. | No LIST and no time bound for what was once live; the records already say what left (model). |
-| **Object generations** | Every upload goes into its writer's generation; a sweep for uploads that never committed lists only generations no live writer uses. | A delayed or fenced writer's upload is either found by the sweep or never referenced: a record may reference an older generation's object only if it is still reachable (model). |
-| **Reader pins as low-water marks** | Each reading node holds, per dataset, the oldest commit its queries still read. | GC never deletes what a running query reads, with no time bound, and a new query needs no write (model). |
+| **Deletion from the log, after a retention** | GC deletes a file a fixed retention T after the record that removed it; the removal stays in durable state until then. | No LIST for what was once live; the records already say what left. A query that starts from a recent state can read for the retention, with no reader write, and a new GC after a takeover still knows every pending removal (model). |
+| **Uploads collected by age on the store's clock** | Every object has a fresh name; GC deletes an unreferenced upload once the head's `LastModified` is T_O past the upload's. | A delayed or fenced writer's upload is either collected or never referenced: a writer references only its own unpublished uploads, aged against the head its commit is based on, so a commit that lands after GC read the head would have been refused. No machine's clock is involved (model). |
 | **Identical retry** | Resolves a lost CAS response. | The retry carries the same bytes and condition, so success is acceptance and failure proves rejection, with no extra record to write (model). |
 | **Group commit** | Folds queued commits into the next CAS. | A writer can have one useful CAS in flight, because each CAS needs the version the previous one produced. Group commit gives the throughput instead. |
 
@@ -97,7 +96,7 @@ WAL's way of resolving uncertain writes, and changes where the records live:
 | Uncertain writes | A receipt saved before sending; retry the exact attempt; resolve by ancestry | The attempt id saved before sending; retry the identical CAS; resolve from the head |
 | Checkpoint | Pages and a manifest, then its own head CAS | A root and pages, then named by the next commit's CAS |
 | Ownership | None in the WAL; whole-head OCC rejects a stale base. `object_store_occ::lease` provides leases | `object_store_occ::lease`, with its generation carried in the head |
-| Garbage collection | None | Deletion from the log, a sweep for uploads that never committed, reader pins |
+| Garbage collection | None | Deletion from the log after a retention; uploads that never committed collected by age |
 | Contents | Key/value mutations | Cayenne file actions |
 
 A prototype with the WAL's layout, a head pointing to a chain of per-commit
@@ -124,10 +123,10 @@ covers the mechanisms its column names.
 | I1 | Each head version is followed by at most one accepted record, so each commit number is given to exactly one record. | `commits-*`, `commit-guards` |
 | I2 | Nothing is acknowledged (a source position, a SQL `COMMIT`) unless the record covering it is accepted. | `commits-commit`, `commits-retry`, `commits-restart-*`, `source-*` |
 | I3 | No record from a lease generation older than the head's is accepted. | `commits-commit`, `commit-guards`, `transactions-txn` |
-| I4 | No object referenced by a protected state, by an unresolved `Prepare`, or by a live reader pin's states is deleted. A referenced object that is missing is an error, never an empty result. | `commits-storage`, `window-storage`, `transactions-txn`, `generations`, `removal-*`, `dataset-lifecycle`, `pin-expiry-*`, `dataset-prepare-*`, `dataset-pin-expiry-*` |
+| I4 | No object referenced by the current state or by an unresolved `Prepare` is deleted, and none that a state within the retention references. A referenced object that is missing is an error, never an empty result. | `retention*`, `commits-storage`, `window-storage`, `transactions-txn`, `dataset-lifecycle`, `dataset-prepare-*`, `dataset-query-expiry-*` |
 | I5 | Resolution of an uncertain write never reports *accepted* for a rejected attempt or *rejected* for an accepted one; *unresolved* is always allowed. | `commits-*` |
 | I6 | A cross-dataset transaction is accepted in all participants or in none, and the state at each `(dataset, commit)` depends only on the records up to that commit. | `transactions-*`, `window-txn`, `concurrent-txn-*`, `dataset-prepare-*` |
-| I7 | A pinned state stays readable while its pin is live: every state from the pin's low-water mark on. | `commits-storage`, `window-storage`, `concurrent-floor-aligned`, `pins-*`, `removal-*`, `pin-expiry-*`, `transaction-begin-pin-*`, `dataset-lifecycle`, `dataset-pin-expiry-*`, `dataset-byte-window-*` |
+| I7 | A query that starts from a state confirmed current within the staleness bound S reads that state for at least the retention T minus S; after that it gets its rows or an error. | `retention*`, `commits-storage`, `window-storage`, `concurrent-floor-aligned`, `dataset-lifecycle`, `dataset-query-expiry-*`, `dataset-byte-window-*` |
 | I8 | Replay is deterministic: applying the same records gives the same state, a commit number names exactly one state, and a checkpoint at commit n equals replaying the records up to n, derived collections such as the PK index included. | `commits-*`, `window-*`, `naming-*`, `pk-index-*`, `dataset-lifecycle`, `dataset-prepare-*`, `dataset-byte-window-*` |
 | I9 | Per key within a table, visibility follows commit order: a later accepted write to a key wins, and a delete hides exactly the earlier versions of its keys. | `seq-order-*`, `table-seq-*`, `delete-coverage-*`, `dataset-lifecycle`, `dataset-prepare-*` |
 | I10 | A source position becomes durable only together with the state it covers. | `source-*` |
@@ -151,7 +150,10 @@ The protocol also needs a version to **never repeat**: once the head moves
 from version V, no later write may produce V's ETag again, or a delayed CAS
 conditioned on V could apply. The head's bytes never repeat, because its
 commit number, the lease generation and the floor only grow, and the model shows that this is
-enough. What remains is a store whose ETag can repeat for different bytes; the
+enough, and it is required, not a precaution: an S3-compatible store whose
+ETag is a content hash was observed to return the same ETag for rewritten
+identical bytes and then accept a delayed CAS conditioned on the first
+version. What remains is a store whose ETag can repeat for different bytes; the
 local store had that defect and it was fixed in `object_store_occ`
 (`d735f39a6a`).
 
@@ -169,8 +171,15 @@ local create becomes:
 
   A record may reference only objects whose directory syncs have completed.
 
-  *Cost:* this is mandatory, not optional. A durable local create measured
-  8.0 ms P50 and 11.6 ms P99 on macOS, below a remote object-store commit.
+  *Cost:* this is mandatory, not optional. A durable local create or CAS
+  measured about 8 ms P50 and 14–15 ms P99 on macOS (APFS, `F_FULLFSYNC`),
+  below a remote object-store commit.
+
+  *Concurrency:* uploads and the head CAS must proceed independently; only
+  writes to one path need ordering. A local store that funnels every put
+  through one writer makes each commit wait behind unrelated uploads: a
+  prototype measured head CAS P99 rising from 12 ms to 175 ms with 16
+  concurrent 1 MiB uploads, and to 909 ms behind four 64 MiB uploads.
 - **The head log:** the head, its window, batches and the copy rule; commit,
   identical retry and resolution; an "advance after my own commit" call, so a
   writer keeps its state in memory instead of rebuilding a snapshot per
@@ -186,27 +195,32 @@ local create becomes:
     wal/…
   datasets/<slug>-<dataset_id>/
     head                                   # mutable, CAS only: commit number, window, batch index, floor, lease generation
-    wal/<first commit>                     # batches: immutable records first..last, in order
-    checkpoints/<commit>                   # checkpoint root: table entries and the pages of each collection
-    objects/<generation>/<kind>/<blake3>   # pages, manifests, deletion-vector lists, stats, PK index, …
-    data/<generation>/<table_id>/<write_id>_<ordinal>.vortex
-    data/<generation>/<table_id>/delete_<uuidv7>.arrow
+    wal/<first commit>-<lease>             # batches: immutable records first..last, in order
+    checkpoints/<commit>-<lease>           # checkpoint root: table entries and the pages of each collection
+    objects/<kind>/<lease>-<counter>       # pages, manifests, deletion-vector lists, stats, PK index, …
+    data/<table_id>/<write_id>_<ordinal>.vortex
+    data/<table_id>/delete_<uuidv7>.arrow
     leases/writer.json                     # object_store_occ::lease records
     leases/gc.json
-  readers/<node_id>.json                   # one reader pin per reading node, a low-water commit per dataset
   transactions/<id>/intent.json            # cross-dataset transactions
   transactions/<id>/decision.json          # create-if-absent
 ```
 
 Commit numbers in object names are zero-padded to 20 digits, so lexical order
-is numeric order.
+is numeric order. **Every object has a fresh name**, never reused: `<lease>` is
+the lease generation of the writer that created it, so two owners never
+produce the same name, and the head or a record names each object (see
+[Checkpoints and garbage collection](#checkpoints-and-garbage-collection)).
+References carry the object's BLAKE3 digest, which checks its bytes; the digest
+is not its name.
 
 How it lines up with what exists:
 
 - **`object_store_occ` WAL:** the same `head` object and the same `wal/`
-  folder for records, but holding batches named by their first commit instead of
-  one object per commit named by a random id. References carry a BLAKE3
-  digest, as the WAL's `Reference { id, digest }` does, and the head carries a
+  folder for records, but holding batches named by their first commit and
+  their sealer's lease generation instead of one object per commit named by a
+  random id. References carry a BLAKE3 digest, as the WAL's
+  `Reference { id, digest }` does, and the head carries a
   `format` and an `incarnation`, as the WAL's head does.
 - **`object_store_occ::lease`:** leases are its `LeaseRecord` JSON objects,
   in a `leases/` folder, as snapshot writers' leases are in
@@ -222,8 +236,7 @@ How it lines up with what exists:
   apart, and dropping one is one prefix.
 - **What goes away:** the per-snapshot directory (`<table_id>/<snapshot_id>/`),
   and the `_staging/<id>/_wal.json` staging WAL that moves files into it. A
-  file becomes visible when a record references it, so files never move. The
-  generation takes the snapshot directory's place in the path.
+  file becomes visible when a record references it, so files never move.
 - **The root folder.** `cayenne/v1/` sits beside the other features' folders
   in `runtime.state.location` (`results-cache/`, `rate-control/`, `cluster/`,
   `snapshots/`). The name is part of the user-facing on-disk layout, so it is
@@ -273,7 +286,7 @@ flowchart LR
 
 **The log and checkpoints use Protocol Buffers**, through `prost`, which the
 workspace already depends on. That covers the head, records, batches,
-checkpoint roots and small pages. Leases, reader pins and transaction objects
+checkpoint roots and small pages. Leases and transaction objects
 stay JSON, as `object_store_occ`'s are: they are small, never compared byte for
 byte, and readable when debugging. Large collections in a checkpoint (file
 lists, deletion-vector lists, the PK index) are columnar pages in Arrow IPC, as
@@ -331,12 +344,10 @@ internal byte budget H (on the order of 128 KiB), holding:
 | `incarnation` | A random id fixed when the dataset is created. | A dataset recreated under the same name never mixes with the old one's objects or attempts. |
 | `commit` | The commit number of the newest accepted record. | Names the current state. Readers, recovery and GC compare commit numbers. |
 | `window` | The newest accepted records, ending at `commit`, oldest first, in full. Its first record's number, `w_first`, is derived: `commit` minus the window's length, plus one. | One-request polls, two-round-trip commits, and records leave in batches rather than one copy per commit. |
-| `batches` | The last commit number of each sealed batch, in order, covering `floor + 1 .. w_first - 1`. Each batch starts after the previous one ends, and its name is derived from its first commit. | Variable-length batches cannot be named by arithmetic, and readers fetch only what is listed. |
-| `floor` | The commit number of the newest published checkpoint. | Readers start from it, and GC deletes nothing a state at or after it needs. Without it, recovery and pinned reads break (model). |
-| `lease` | The lease generation of the current owner. In Milestone 1 it also names the generation the owner uploads into. | A stale owner learns from it that it must stop, and a takeover changes the head even when nothing is committed. |
+| `batches` | The last commit number of each sealed batch and its sealer's lease generation, in order, covering `floor + 1 .. w_first - 1`. Each batch starts after the previous one ends, and its name is derived from its first commit and that generation. | Variable-length batches cannot be named by arithmetic, and readers fetch only what is listed. A small number per entry is all a fresh name costs. |
+| `floor` | The commit number of the newest published checkpoint, and the lease generation that wrote its root. | Readers start from it. Without it, recovery and running queries' reads break (model). |
+| `lease` | The lease generation of the current owner. Object names include it. | A stale owner learns from it that it must stop, and a takeover changes the head even when nothing is committed. Names from different owners never collide. |
 
-Milestone 2 adds `open_generation` and a closed watermark, when writers on several
-nodes upload at once (see [Checkpoints and garbage collection](#checkpoints-and-garbage-collection)).
 The per-table `seq` high-water marks live in the table entries of the dataset
 state, not in the head.
 
@@ -366,13 +377,13 @@ document, decision 1.2), independent of how `seq`s are stamped.
 A writer holds the dataset state at commit n, the head version V that carries
 it, and V's ETag. A commit:
 
-1. Uploads new objects into its own generation, in parallel. Small payloads
+1. Uploads new objects, each under a fresh name, in parallel. Small payloads
    skip this step and travel inside the record (see
    [Small writes](#small-writes-and-the-inline-tier)).
 2. Evaluates the record's guards locally against the state at V, including
-   the `seq` rule and admission: an object of another generation may be
-   referenced only if reachable in that state. Because the CAS succeeds only
-   on V, this is exactly the state before the record.
+   the `seq` rule and the age check: the record references only objects live
+   at V and the writer's own uploads younger than the age limit. Because the
+   CAS succeeds only on V, this is exactly the state before the record.
 3. If the window would exceed its byte or count budget, ensures the oldest
    final batch exists, then drops its records from the window and appends its
    range to `batches` (see [The copy rule](#the-copy-rule)).
@@ -395,8 +406,8 @@ sequenceDiagram
         Note over M: queryable on this node, not yet committed
     end
     Note over W: commit trigger: a CDC position waiting to be acked (~2 s), a SQL COMMIT, or a freshness bound. Nothing is acknowledged yet
-    W->>S: PUT data/<gen>/… and objects/<gen>/… (create-if-absent, parallel)
-    W->>W: guards and admission against the state at head version V
+    W->>S: PUT data/… and objects/… (fresh names, parallel)
+    W->>W: guards and the age check against the state at head version V
     opt window full
         W->>S: ensure wal/<a> exists (usually already sealed)
     end
@@ -426,7 +437,8 @@ lists, and that batch existed before the head stopped carrying the record.
 Records at or below the floor are in the checkpoint and may be reclaimed.
 
 Records are identified by commit number, which is dense, so record `a + 1` is
-the one after record `a`. A batch is named by its first record's commit number.
+the one after record `a`. A batch is named by its first record's commit number
+and its sealer's lease generation, both in its index entry.
 
 - **Deterministic cut.** The batch starting at `a = w_first` ends at
   `c = min(a + K − 1, largest c whose records a..c fit the batch budget B)`.
@@ -443,8 +455,13 @@ the one after record `a`. A batch is named by its first record's commit number.
   Otherwise a reader behind the window finds neither the record nor its
   batch, or the index and the batch disagree.
 - **Feasible budgets.** The largest record R must fit a batch (R ≤ B), and the
-  head must hold a full batch plus one more record (H ≥ B + R). Otherwise the
-  record that makes a batch final may not fit beside it. The cut, R, B, H and
+  head must hold a full batch plus one more record beside everything else it
+  carries: H ≥ B + R + M, where M bounds the head's content outside the window
+  (its fields, record envelopes, and the batch index at its largest before a
+  checkpoint trims it). Otherwise the record that makes a batch final may not
+  fit beside it. H ≥ B + R alone is not enough: a prototype at H = 300,
+  B = 200, R = 100 could not fit the third 100-byte record once the head's
+  other content was counted. The cut, R, B, H and
   K are protocol constants, not head fields.
 - **One canonical encoding.** Every sealer must produce identical bytes, so the
   record and batch encodings are versioned with `format`, and a sealer copies
@@ -523,8 +540,9 @@ Three more rules:
   message, which is the role the SQLite `user_version` gate plays today.
   Skipping an action would silently drop rows.
 - **A lost upload response is resolved by reading the object back,** never
-  assumed absent. An object already present at the expected path with the
-  expected digest counts as uploaded.
+  assumed absent. The writer's own upload, present at its fresh name with the
+  expected digest, counts as uploaded, and its age still counts from the
+  first attempt.
 - **A referenced object that is missing is an error, never an empty result.**
   If a record or checkpoint names an object (data file, deletion vector, page)
   that cannot be read, opening or scanning fails with a corruption error. Today
@@ -542,6 +560,16 @@ it to stop. This is the pattern `object_store_occ::lease` already documents: a
 holder checks its generation inside its own conditional writes of the state it
 guards. Nothing about ownership is checked at replay. The old writer's
 unflushed buffer is discarded, since it was never acknowledged.
+
+**Every committer carries the generation, background tasks included.**
+Statistics, compaction, cold promotion and every other background task commit
+through the writer's handle, so the head CAS fences them like ingest. A
+writer's handle is closed when its session ends (a dataset reloaded or
+recreated in the same process), even if a background task still holds it;
+otherwise a task that outlives its session commits after the new session has
+written. Today's SQL metastore accepts exactly that late write, from a
+dropped provider's post-write maintenance loop persisting table statistics: a
+prototype reproduced it 3 times out of 3.
 
 **Safety comes from the head, not from the lease's timing.** Recording a new
 generation in the head fences every older writer whatever its lease says, so
@@ -584,6 +612,10 @@ multipart uploads, on S3 Express, or on GCS or Azure.
   means nothing changed. A 200 carries every record still in the window,
   inline. A node that is further behind fetches the listed batches it needs,
   in parallel.
+- **Freshness counts from when the GET was sent.** A head is confirmed as of
+  the moment its request left, not when the response arrived, so a response
+  that stalls cannot make an old head look fresh (model:
+  `retention-readers-response-time` fails).
 - **Datasets in use refresh in the background.** A dataset queried within the
   last one or two refresh intervals is refreshed ahead of its queries, so they
   rarely wait. Refreshing early is always safe: a newer committed head never
@@ -595,9 +627,9 @@ multipart uploads, on S3 Express, or on GCS or Azure.
   Standard).
 - **Cold open:** GET the head, then in parallel the checkpoint root named by
   `floor` and the batches covering `floor + 1 .. w_first − 1`, then apply the
-  window. Two dependent steps, regardless of the tail length. Writing the
-  reader pin, and loading pages when a scan first needs them, come after
-  these and are not counted.
+  window. Two dependent steps, regardless of the tail length. Loading pages
+  when a scan first needs them comes after these and is not counted. A
+  reader writes nothing.
 - A listed batch that is missing above the floor is an error, never an empty
   range. A reader below the floor reopens from the checkpoint.
 - Readers never consult anything but the head and what it lists. A late
@@ -663,7 +695,11 @@ commit n (`checkpoints/<n>`) consists of:
   - per table, a list of **pages** for each large collection (live files,
   deletion vectors, write-back markers, the PK index), each with its key range
   and BLAKE3 digest;
-  - recent attempt ids, the retained evidence for resolving uncertain writes.
+  - recent attempt ids, the retained evidence for resolving uncertain writes;
+  - the **pending removals**: each object a record removed that GC has not yet
+    deleted, with the commit that removed it. Together with the removals in
+    later records, they tell a new GC after a takeover what is still waiting
+    out the retention, and the orphan sweep skips them.
 - **Pages**: sorted, size-bounded (~1–4 MiB), immutable chunks of one
 collection, such as live files or deletion vectors, stored as objects. The
 `object_store_occ` WAL splits its checkpoints into pages the same way.
@@ -708,8 +744,11 @@ flowchart LR
 **Reconstruction:**
 
 1. GET the head.
-2. In parallel, GET the checkpoint root named by `floor` and every listed
-   batch.
+2. In parallel, with bounded concurrency, GET the checkpoint root named by
+   `floor` and every listed batch. An unbounded fan-out saturated an
+   S3-compatible test server (1,025 GETs at once: P99 6.2 s, against 28 ms on
+   a local directory); the checkpoint cadence keeps the batch count, and so
+   the fan-out, small.
 3. Apply the batches' records, then the window's, in commit order.
 4. Load pages lazily, per collection, when they are first needed: live files
    when a scan plans, deletion vectors when the deletion index builds.
@@ -747,15 +786,15 @@ in-memory state and never fetch from the metastore's storage.
 never splits a batch:
 
 1. Re-emit only the pages whose key range changed since the previous
-   checkpoint, into the writer's generation.
-2. Reference the unchanged pages by digest.
-3. Write the root with create-if-absent at `checkpoints/<n>`, after all its
-   pages.
+   checkpoint, under fresh names.
+2. Reference the unchanged pages by name and digest; they are live in the
+   previous checkpoint.
+3. Write the root at `checkpoints/<n>-<lease>`, after all its pages.
 4. The next commit's CAS sets `floor` to n, and trims the batch index below
    it. A checkpoint therefore costs no CAS of its own when the writer writes
    it; a separate maintenance process needs its own.
 
-A checkpoint's name determines its contents: two checkpoints at the same
+A checkpoint's commit determines its contents: two checkpoints at the same
 commit are identical, because `apply` is deterministic and a commit number
 names one state (model: `naming` holds; without the commit number,
 `naming-no-commit-number` fails).
@@ -778,8 +817,8 @@ out the two numbers. Commit numbers name states; `seq`s decide visibility.
 **Commit numbers.** The CAS that accepts a record gives it the next commit
 number, whatever the record holds: a data commit, a compaction, a schema
 change, a `Resolve`. The head's `commit` is the newest record's number, and
-snapshot tokens, checkpoint names, batch names, the floor and reader pins are
-all commit numbers.
+snapshot tokens and the floor are commit numbers, and so is the commit part
+of checkpoint and batch names.
 
 - *Why states need their own number.* A compaction draws no `seq`, and a
   schema change touches no rows, yet each changes the state. Named by `seq`,
@@ -955,8 +994,8 @@ Tables that go away have one line.
   same file cannot both take effect.
 - **Derived or rebuilt:** rebuilt on open from the root's pages plus the tail.
   There is no dead-row backlog: a removed file leaves the collection at the
-  record that removes it, and GC deletes the physical file once every
-  protected state is past that record.
+  record that removes it, and GC deletes the physical file the retention T
+  after that record.
 
 ### `cayenne_snapshot_sequence`
 
@@ -1122,7 +1161,7 @@ metastore (direction document, "Relationship to the datalake tier"):
 | Record of which files are live   | Local metastore                                                                                                 | The destination                                                 |
 | After losing the instance's disk | The S3 files remain, but nothing says which are live                                                            | Recovered from the destination alone                            |
 | Readers                          | The owning instance only                                                                                        | Any instance                                                    |
-| GC of S3 objects                 | Root in the local metastore; deletes objects unreferenced for a grace period (5 min by default), no reader pins | Generations and reader pins; no timing assumption (decision 1.10) |
+| GC of S3 objects                 | Root in the local metastore; deletes objects unreferenced for a grace period (5 min by default)                 | Deletion from the log after a retention; uploads collected by age on the store's clock (decision 1.10) |
 | Requirements                     | A primary key, `changes` or `append` refresh, no partitioned tables                                             | None of these                                                   |
 | Settings                         | Location, promotion thresholds, file size, check and GC intervals                                               | The destination                                                 |
 
@@ -1190,7 +1229,7 @@ so those round trips are acceptable.
   decision 1.3).
 - **Accepting a `Prepare`.** A `Prepare` is accepted iff its CAS succeeds and
   its full guard set held at its base: the participant's own guards (inputs
-  live, lease generation, admission), plus **no unresolved `Prepare` whose
+  live, lease generation, the age check), plus **no unresolved `Prepare` whose
   footprint intersects this one's**. The commit decision requires every
   participant's accepted `Prepare`.
 - **The reservation.** `Resolve` applies the decision without re-running
@@ -1221,16 +1260,12 @@ so those round trips are acceptable.
 - **Concurrent transactions** need no further rule. Transactions acquiring
   participants in opposite orders resolve by abort, not by a global
   acquisition order. Ordered acquisition or backoff only improves progress.
-- **GC.** An unresolved `Prepare`'s referenced objects count as reachable, so
-  GC treats it as a retained root. A sweep after the `Prepare` therefore
-  cannot delete them, and `Resolve` adds no new references, so it needs no
-  admission check of its own.
-- **A transaction's begin snapshot is pinned.** A transaction that reads at its
-  begin commit and commits later is part of its node's reader pin until it
-  commits or aborts, like a running query. Advancing the pin past an open
-  transaction's begin commit lets GC delete part of that snapshot (model:
-  `transaction-begin-pin-ignore-transactions` fails; `transaction-begin-pin`
-  holds).
+- **GC.** An unresolved `Prepare`'s referenced objects count as referenced,
+  so GC treats it as a retained root. A sweep after the `Prepare` therefore
+  cannot delete them, and `Resolve` adds no new references.
+- **A transaction's begin snapshot is kept by the retention,** like a running
+  query's. A transaction that reads at its begin commit and stays open longer
+  than the retention may fail with an error, and is retried.
 - **Ownership changes.** A lease change after an accepted `Prepare` does not
   invalidate it, because the outcome is decided outside the dataset. The new
   owner inherits every unresolved `Prepare` in its state, resolves each from
@@ -1240,7 +1275,7 @@ so those round trips are acceptable.
   safely. The deadline bounds how long a dead coordinator can hold a
   reservation.
 - **Checkpoints** carry unresolved `Prepare`s as part of the state.
-- **Model-checked** with lease turnover, generation closes, GC, checkpoint
+- **Model-checked** with lease turnover, GC, checkpoint
   recovery, `Prepare` and `Resolve` records leaving the window into batches,
   and concurrent transactions. Removing the reservation or the matching check
   breaks prefix determinism (I6); removing the roots loses a referenced object
@@ -1305,168 +1340,163 @@ decision 1.9).
 
 The owner checkpoints when the tail passes internal bounds, or before the
 batch index would push the head past its budget. GC removes batches,
-checkpoints and objects that no protected state needs. Fencing, staging
-protection, reader pins and GC are **one protocol**. A timing assumption in any
-part of it breaks the rest, as the rc.3 sweep race and the datalake tier's GC
-showed: a scan planned before a promotion rewrote its cold file fails once GC
-sweeps that file.
+checkpoints and objects that no state within the retention needs, and uploads
+that never committed. **Readers never write.** The only protection a running
+query gets is a fixed retention, T, and that is safe only because every read
+returns the referenced object or fails the query. A late delete can fail a
+query; it can never change its rows. The rc.3 testing showed the failure this
+rules out: a published snapshot whose files were gone read as empty.
 
 GC has two halves, as Delta Lake's `VACUUM` of removed files and Iceberg's
 snapshot expiry are separate from orphan-file cleanup:
 
-- **Files that were once live** are deleted from what the records say left:
-  no LIST and no age threshold.
+- **Objects that were once live** are deleted T after GC observes the record
+  that removed them. The records say what left, so no LIST is needed.
 - **Uploads that never committed** (a failed commit, a crash, a fenced writer,
-  an abandoned `Prepare`) are found by listing a generation that no live
-  writer uploads into.
+  a partial checkpoint) are found by a paged LIST and deleted once they are
+  old by the store's clock, measured against the head.
 
-**The protected low point.** GC protects every state from
-`P = min(floor, every live reader pin's low-water mark)` onward. It keeps:
+Both halves are checked in two graphs (model: `retention` for references and
+`retention-readers` for queries, exhaustive, with a negative control per rule).
 
-- the newest checkpoint at or below P, and every batch above it, because a
-  pinned state is rebuilt from them, not only read from its data files
-  (`dataset-lifecycle-no-pin-log-retention` keeps the data but loses the
-  pinned state's metadata);
-- every object any state from P onward references, and every object of an
+**Removed objects: a fixed retention.** An object leaves the live state at the
+record that removes it. GC keeps:
+
+- every object the current state references, and every object of an
   unresolved `Prepare`;
-- everything newer than the head GC read.
+- every object removed less than T ago, timed on GC's own clock from when it
+  observed the removal (`retention-no-retention` fails);
+- the checkpoint the head names as `floor`, and every batch above it. A
+  checkpoint or batch that a floor move supersedes is a removal like any
+  other, kept for T, so a reader that has just read the head can still open
+  what it names (`dataset-lifecycle-no-query-log-retention` keeps the data but
+  loses a running query's metadata).
 
-**Deleting from the log.** A data file or object leaves the live state at the
-record that removes it, commit r. The states from r on no longer reference it
-(data-file names are unique and never reused; content-addressed metadata
-objects can be referenced again only through the retirement interlock below
-and the admission guard), so once
-P ≥ r it is garbage. GC reads the removals from the records between the
-previous P and the new one, which the writer already holds in memory in
-Milestone 1. Checkpoint pages work the same way: a page leaves when no retained
-checkpoint lists it.
+A removal stays recorded until GC deletes the object: in the records after the
+floor, and in each checkpoint root's pending removals. A takeover learns them
+from there and restarts the timer for everything waiting to be deleted, so no
+clock is compared across machines (`retention-readers-keep-timestamps`, which
+keeps the predecessor's times from a clock one tick apart, fails; so does
+`retention-readers-volatile-removals`, where removals live only in GC's
+memory and the orphan sweep takes one a query still reads).
 
-- **The retirement interlock.** Content-addressed objects can be reused: a
-  writer that finds an object already present at its address counts it as
-  uploaded. An object GC has selected for deletion must not be reused until
-  its deletion completes, and selection must skip any object a planned record
-  or an upload awaiting its commit will reference. Otherwise a commit can
-  reference an object a moment before its deletion lands. In Milestone 1, GC runs
-  in the writer's process, so this is an in-memory set (model: `removal-reuse`
-  fails without it, `removal-serialized` holds with it).
-- **Pins are honored.** Deleting a removed file without waiting for P to pass
-  its removal loses it for a pinned query (`removal-serialized-no-pins`).
+**What a query is guaranteed.**
 
-**Uploads that never committed.** Every upload goes into its writer's
-generation: `objects/<generation>/…` and `data/<generation>/…`.
+- A query starts from a state confirmed current within the staleness bound S,
+  counted from when the confirming GET was sent. The poll already gives this;
+  a query on a staler dataset first re-reads the head, one conditional GET.
+- Every object that state references was live at the confirmation, so its
+  removal came later, and GC deletes it no earlier than T after that. The
+  query can read for at least T − S (`retention-readers` holds;
+  `retention-readers-stale-start` fails).
+- **Rows or an error, never other rows.** Each read returns the referenced
+  immutable object or fails the query; a missing object is never empty
+  (`retention-readers-missing-as-empty` and `dataset-query-expiry-missing-as-empty`
+  fail). A query error is final: a read that completes after it cannot turn
+  the query back into a result.
+- **A query that outlives the retention may fail**, with an error that says to
+  rerun it. T is an internal constant, about an hour; queries and read
+  transactions on accelerated datasets rarely run that long. The rule is the
+  same on the writer and on every other node.
+- **Maintenance is never blocked.** Compaction commits whenever it is ready.
+  The retention only delays deleting its inputs.
 
-- **A file keeps its generation for life.** Ending a generation never copies,
-  moves or renames a file; a long-lived file stays in an old generation's
-  folder until it is removed.
-- **The live writer cleans up after itself.** It deletes its own failed
-  uploads, once no retained state or planned record needs them. An upload
-  waiting for its commit counts as in flight, not only one whose response is
-  outstanding: sweeping the writer's own generation without excluding those
-  deletes an object a commit is about to reference
-  (`removal-serialized-own-sweep`).
-- **Milestone 1: the generation is the writer's lease generation.** A takeover
-  ends the predecessor's generation, so no `CloseGeneration` record is needed.
-  The new owner sweeps each predecessor generation: it LISTs the folders and
-  deletes what no protected state, pin or unresolved `Prepare` references.
-  The model checks that this is safe while a fenced predecessor may still be
-  uploading (`removal-serialized`).
-- **A late upload can still leak.** A fenced writer can finish an upload after
-  the sweep, and nothing will ever reference it, because its commits fail. So
-  a predecessor generation is swept again at later takeovers and on a slow
-  schedule. The leak is bounded by the uploads in flight when that writer was
-  fenced, and cleaning it up is liveness, never safety. Assuming uploads
-  eventually finish, predecessor generations are revisited, and selected
-  deletions complete, every unreferenced completed upload is eventually
-  collected (`orphan-repeated-sweep` holds; with one sweep,
-  `orphan-single-sweep` ends with the late upload present forever).
-- **The admission guard.** A record may reference an object of another
-  generation only if that object is **reachable in the state immediately
-  before the record**, which the writer checks against the head version its
-  CAS is conditioned on. In Milestone 1 this holds by construction, since a writer
-  uploads only into its own generation and takes older objects only from
-  state, and it is still checked.
-  - *Reachable at the writer's base* is not enough when the base can be older
-    than the version replaced. The model found a schedule where the
-    referenced object is removed after the writer read its base, then swept,
-    and the record is still accepted. Checking against the CAS's own base
-    rules it out.
-- **Milestone 2: generations close explicitly.** With writers on several nodes,
-  GC cannot see another node's uploads in flight. Generations then close with
-  a `CloseGeneration{g}` record, which moves the head's closed watermark, and
-  GC sweeps only closed generations (model: `generations`).
-- **Per-attempt naming was considered and rejected.** It removes the reuse race
-  too, but it gives up deduplication across commits.
+**Uploads that never committed: age on the store's clock.**
 
-**Reader pins are low-water marks, held as leases.** Each reading node has one
-pin, `readers/<node_id>.json`, holding for each dataset it reads the low-water
-mark L: the oldest commit any of its running queries or open transactions
-still reads, never above the node's current commit.
+- **Every object has a fresh name.** Data files already do
+  (`<write_id>_<ordinal>`). Batches, checkpoint roots and pages are named by
+  what identifies them plus the lease generation of the writer that created
+  them, and the head or a record names each one. A writer never reuses an
+  object because it finds one at an address (`retention-reuse-found` fails).
+  Unchanged checkpoint pages are reused by reference, because they are live in
+  the checkpoint that names them. A retried commit, identical or after a lost
+  race, references the same uploads; only a retry past the age limit
+  re-uploads.
+- **Every age is a difference of two store timestamps.** No machine's clock
+  is compared with the store's (`retention-writer-clock`, where the writer
+  ages its upload on its own monotonic clock while the store's clock runs
+  ahead, fails).
+- **What a record may reference.** Objects live in the state its CAS is
+  conditioned on, or the writer's own uploads that it has never published.
+  Once a record publishes an upload, the writer may reference it again only
+  while it is live in the base (`retention-reref-published`, which lets a
+  writer reference its upload again after removing it, fails: GC's delete of
+  the removed object lands under the new commit).
+- **The writer's age check.** The writer refuses its own upload once the store
+  time of its CAS base is T_O minus a margin past a lower bound on the
+  upload's `LastModified`, and uploads it again under a new name. The base's
+  store time is the `Date` of the response that gave the writer that head (a
+  GET, or its own CAS). The lower bound is the newest store time the writer
+  saw before starting the upload, such as that base's time or any response's
+  `Date`. The margin covers one-second timestamps and skew between the store's
+  servers (`retention-no-age-check` and `retention-no-margin` fail).
+- **GC's age test uses the head.** GC deletes a listed object that the head it
+  read does not reference, that no pending removal names, and whose
+  `LastModified` is at least T_O before the head's. A commit that lands after
+  that read is based on that head or a newer one, so its base's store time is
+  at least the head's, and the writer's check would have refused the upload.
+  A commit that landed before the read is in the head, and GC keeps what it
+  references. Neither a head move nor a recheck is needed for safety
+  (`retention-list-date`, which ages by the LIST's `Date` instead of the
+  head's, fails: a commit based on an older head lands after the delete).
+- **An idle dataset.** If the head has not moved since the uploads were
+  listed, they never age against it; GC then makes an empty commit to advance
+  the head's time. This is for progress only.
+- **Deletes and commits may land late.** A store can apply a request much
+  later than it was sent, for example after a paused process resumes. The age
+  check ties the commit to its base, not to when it was sent, so a late commit
+  either fails its CAS or was refused.
+- **One store, one clock.** In Milestone 1 every object, data files included,
+  lives in the dataset's one location, so both timestamps come from the same
+  store. On a local directory, file modification times and the head's are the
+  same machine's.
+- **The LIST is paged.** GC works one page at a time: read the head, select,
+  delete.
+- **Versioned buckets.** Deletes leave noncurrent versions; see
+  [Multi-region](#multi-region) for how GC removes them and keeps replicas in
+  step.
+- **Cost.** Orphan cleanup LISTs the dataset's prefix on a slow schedule, as
+  Delta Lake's `VACUUM` and Iceberg's `remove_orphan_files` do. Removed
+  objects are still deleted from the log, without a LIST.
+- **Long uploads.** An upload that takes longer than T_O minus the margin to
+  commit is refused and uploaded again. T_O is about a day (Iceberg's orphan
+  cleanup defaults to three), and large loads commit in several records.
+  *Mitigation if this binds:* a `PREPARE_UPLOAD` record names a long upload's
+  objects, so they are protected by reference until its commit or a
+  `RELEASE_UPLOAD` drops them, and a takeover releases a dead writer's. It is
+  not part of Milestone 1.
+- **A fenced writer's late upload** is never referenced, because its commits
+  fail, and a later sweep collects it once it is old.
 
-- **Writing it.** A node writes L before its first read of a dataset, then
-  re-reads the head. If the floor has passed L, part of that state may already
-  be gone, so the node reopens at the current state instead. Without that
-  recheck, GC's delete can land under a read
-  (`pins-low-water-no-recheck`).
-- **New queries need no write.** They start at the node's current commit,
-  which is at or above L.
-- **Renewal moves L forward,** to the oldest commit still read, never past a
-  running query (`pins-low-water-past-active`). Renewal is one conditional
-  write per node per renewal interval, whatever the query rate or the number
-  of datasets.
-- **One mark per dataset, not one per query or a range.** A pin anchored at
-  the oldest query alone does not protect a newer query's files: a file added
-  after the oldest query's commit and removed before the floor advanced is in
-  neither. The low-water mark covers every state from the oldest active
-  query's commit on (`pins-low-water` holds). A pin listing each query's commit would protect only those states, at the cost of
-  a write whenever a query starts at a new commit.
-- **The cost.** A long query keeps everything removed since it started, like
-  PostgreSQL's xmin horizon.
-- **Pins never block maintenance.** Compaction commits whenever it is ready,
-  and clearing deletes in the current state is fine, because a pinned older
-  state reads its own deletion-vector collection. A pin only delays deleting
-  the inputs.
-- *Why a lease rather than a pin with no expiry:* a reader that dies without
-  releasing its pin would otherwise hold its objects forever, and nothing in
-  the store can tell a dead reader from a slow one. The cost is the renewal
-  writes, and that a reader paused past its lease must restart its query. A
-  reader whose pin lapsed re-reads the head before reading on; if the floor has
-  passed its state it fails the query with an error; otherwise it re-pins with
-  the same write-then-recheck as a first pin before relying on retention. A
-  query never moves to a newer state partway through its result.
-- **Rows or an error, never other rows.** A pin can lapse, and GC can delete an
-  object, between a read's head check and its GET completing. Every object
-  read therefore returns the referenced immutable object or fails the query.
-  Treating a missing object as empty returns part of a snapshot
-  (`pin-expiry-missing-as-empty` fails; `pin-expiry` holds). The model also
-  shows that the recheck after a lapse is not what keeps results correct: with
-  it removed, missing-object errors alone still give rows or an error
-  (`pin-expiry-no-lapse-recheck` holds). The recheck fails a doomed query early
-  and restores retention for one that can continue. A query error is final: a
-  GET that completes after it cannot turn the query back into a result.
-  Composed with compaction, checkpoints and log retention, the same holds
-  (`dataset-pin-expiry` holds; `dataset-pin-expiry-missing-as-empty` fails).
-- *Why not retention by age:* Delta Lake's `VACUUM` keeps files for a
-  retention period (7 days by default) and warns that "concurrent readers can
-  fail" if it is too short
-  ([Delta utilities](https://docs.delta.io/latest/delta-utility.html));
-  Iceberg's `expireSnapshots` deletes files no unexpired snapshot references
-  ([Iceberg maintenance](https://iceberg.apache.org/docs/latest/maintenance/)).
-  Neither tracks readers, so correctness rests on a time bound, which this
-  design avoids (and which the datalake tier's GC shows failing).
-- *SlateDB keeps readers' state alive the same way:* its `DbReader` creates a
-  checkpoint with a lifetime and "will refresh the checkpoint's expiry time
-  once half the lifetime has passed"; its GC removes expired checkpoints
-  ([RFC 0004](https://github.com/slatedb/slatedb/blob/main/rfcs/0004-checkpoints.md)).
+**Why not leased reader pins.** A pin per reading node, a low-water commit it
+renews as SlateDB's `DbReader` refreshes its checkpoint's expiry
+([RFC 0004](https://github.com/slatedb/slatedb/blob/main/rfcs/0004-checkpoints.md)),
+protects a query of any length. It costs every reader write access to the
+store, a lease with renewal writes, a write-then-recheck before the first
+read, and GC listing pins. A lease is also a time bound: a reader paused past
+it fails its query. Delta Lake (`VACUUM` keeps removed files 7 days by
+default, [Delta utilities](https://docs.delta.io/latest/delta-utility.html)),
+Iceberg (snapshot expiry and orphan cleanup by age,
+[Iceberg maintenance](https://iceberg.apache.org/docs/latest/maintenance/))
+and Hudi (the cleaner keeps the last N commits) protect readers with a
+retention bound, and none has readers register.
+
+**Why not generations.** Listing only the generations no live writer uses
+avoids listing the whole prefix, but it needs explicit generation closes once
+writers run on several nodes, a retirement interlock and an admission guard
+for content-addressed reuse, and repeated sweeps to catch late uploads. Age on
+the store's clock and fresh names need none of them.
 
 **The floor.** The head's `floor` is the newest published checkpoint.
 
-- GC advances the floor first (by the next commit's CAS, or its own), then
-  lists reader pins, then deletes.
+- GC advances the floor first (by the next commit's CAS, or its own); the
+  checkpoint and batches it supersedes are then removals kept for T.
 - GC uses only a checkpoint the head names. A written but unpublished root is
-  not a floor: the model loses pinned snapshots when it is.
+  not a floor: the model loses a running query's state when it is.
 - GC never retires the newest checkpoint. A checkpoint's pages are written
   before its root, and a root is used only once the head names it. A crash
-  between them leaves an unused partial checkpoint, which GC removes.
+  between them leaves an unused partial checkpoint, an upload that never
+  committed, which the orphan sweep removes.
 - Evidence of an attempt's outcome is kept by retaining recent attempt ids in
   checkpoint roots, so an attempt accepted before its batch was reclaimed
   still resolves as accepted. That evidence has an explicit **retention
@@ -1478,12 +1508,15 @@ still reads, never above the node's current commit.
 
 | Schedule | Handled by |
 |---|---|
-| GC lists reader pins, a node then pins an older state, and GC deletes | **Pin, then recheck.** GC advances the floor before it lists pins; a node rechecks the floor after writing its pin and reopens at the current state if the floor passed it. |
-| A writer's upload is deleted by GC, and the writer then publishes a record referencing it | **The retirement interlock and the admission guard.** GC never selects an object a planned record will reference, and a record may reference another generation's object only if it is reachable just before the record. |
+| A query starts on a state, an object it needs is removed, and GC deletes it | **The retention.** The removal came after the query's confirmation, and GC waits T after it, so the query has at least T − S. Past that, it fails with an error, never other rows. |
+| A writer's upload is deleted by GC, and the writer then publishes a record referencing it | **The age check against the base.** GC deletes only uploads T_O older than the head it read; any commit landing later is based on that head or a newer one, so the writer refused the upload. |
+| A writer removes its own upload, GC deletes it after T, and the writer references it again before the delete lands | **Publication ends the writer's claim.** After a record publishes an upload, the writer references it only while it is live in the base. |
+| GC takes over, or its sweep runs, while a removed object is waiting out the retention | **Pending removals are durable.** The checkpoint root and the later records list them, and the sweep skips them. |
+| A head GET's response arrives long after the request | **Freshness counts from the request.** The confirmation is as old as the request, so a stalled response cannot extend a query's protection. |
 | A CAS dispatched long ago finally reaches the store | **The ETag never repeats.** Its condition names a head version that was replaced, so it fails. |
-| A sealer creates a batch long after GC deleted it | **Readers consult only what the head lists.** The batch is below the floor and unlisted, so no reader reads it; it leaks until the next sweep. Its bytes equal the original's anyway (deterministic cut). |
-| A GC process loses its lease, and a delete it issued earlier completes after the new owner has moved on | **Garbage is permanent, so a late delete is harmless.** An object GC selected is unreachable from every state from P on, and no record can reference it again: removed names are never reused, and the interlock and admission guard stop reuse of selected objects. The lease only saves duplicate work. |
-| A fenced writer finishes an upload after its predecessor generation was swept | **A bounded leak, collected by a later sweep.** Nothing references it, because the writer's commits fail. |
+| A sealer creates a batch long after GC deleted it | **Readers consult only what the head lists.** The batch is unlisted, so no reader reads it; it is an upload that never committed, and a later sweep collects it. |
+| A GC process loses its lease, and a delete it issued earlier completes after the new owner has moved on | **Garbage is permanent, so a late delete is harmless.** An object GC selected is unreachable from every state within the retention, and no record can reference it again: names are fresh, and the age check refuses old uploads. The lease only saves duplicate work. |
+| A fenced writer finishes an upload after a sweep | **A bounded leak, collected by a later sweep.** Nothing references it, because the writer's commits fail. |
 
 **Lessons taken from `slatedb-txn-obj` (0.17.0, read in full but not run):**
 
@@ -1495,16 +1528,16 @@ still reads, never above the node's current commit.
 - a file can be listed and then be gone by the time it is read: GC deleted it
   in between (SlateDB issue #1215).
 
-Object generations, reader pins and acceptance guards beyond writer fencing are
-not in it; those are ours.
+Collection by age on the store's clock, and acceptance guards beyond writer
+fencing, are not in it; those are ours.
 
-**Milestone 1's form.** GC runs in the writer's process, so the retirement
-interlock and staging protection are in-memory sets, generations end at
-takeovers, and the floor moves with the writer's next commit. Cross-process
-races still exist, because a fenced former writer's delayed requests can land
-after failover, so the admission guard and the predecessor sweep are needed
-from day one. Putting the generation in object paths from the start avoids a
-layout change when Milestone 2 adds remote GC and maintenance.
+**Milestone 1's form.** GC runs in the writer's process, so an idle head's
+empty commit is the writer's, staging protection is an in-memory set, and the
+floor moves with the writer's next commit. Cross-process races still exist,
+because a fenced former writer's delayed requests can land after failover, so
+the age check on the store's clock is needed from day one. In Milestone 2, GC
+on another node makes its own empty commits, so it holds the GC lease
+(`leases/gc.json`); nothing in the layout changes.
 
 ## Small writes and the inline tier
 
@@ -1537,6 +1570,13 @@ replacement is measured (direction document, decision 1.5).
   still in the window. That is bandwidth, not requests (in-region transfer is
   free on S3), and it is what bounds H. Readers and recovery reproduce the
   inline bytes exactly in the protocol model.
+- **The per-record bound decides what stays inline, not H.** A record above
+  about R/2 is stored as an object and the window carries its reference, so a
+  few large records cannot keep the head near its budget. In a prototype at
+  H = 128 KiB, 28 KiB inline records sealed a batch every two commits
+  (1.5 creates and 1 GET per commit, against 0.05 creates at 1 KiB). A busy
+  CDC table's 2 s window is often tens of KB to MBs, so for those tables the
+  rows go to files and only small tables' commits stay inline.
 - **Retirement is conditional.** The SQL inline tier is removed only once this
   replacement meets the bar measured against it (see [roadmap step 5](#step-5-the-object-native-metastore-as-authority-for-new-datasets)),
   including the caching workload below. Its removal would also remove the
@@ -1585,9 +1625,10 @@ replacement is measured (direction document, decision 1.5).
 
 ## Existing datasets
 
-An existing dataset is not migrated. Once the flag is enabled, it is
-re-bootstrapped: loaded again from its source into a new object-native
-dataset, as [roadmap step 6](#step-6-existing-datasets-re-bootstrap)
+An existing dataset is neither migrated nor switched automatically. It keeps
+the metastore it is on, and a setting that names a different one is an error;
+moving it means deleting its acceleration so it loads from its source as a new
+dataset does, as [roadmap step 6](#step-6-existing-datasets-keep-their-metastore)
 describes. Migrating metastore contents, if it is ever needed, is separate
 work.
 
@@ -1605,7 +1646,7 @@ Milestone 1 is single-writer, but nothing in its format assumes it:
 | Domain per dataset                                           | Writers in different datasets never contend                                            |
 | Snapshot tokens are opaque in the snapshot type | A future several-heads-per-dataset improvement can generalize a token to one commit number per head |
 | Within a table, `seq` order is commit order from Milestone 1 | Milestone 3 adds writers without changing what any `seq` comparison means |
-| Objects named by generation; GC's floor in the head | Remote GC and distributed maintenance need no layout change |
+| GC by retention and by age on the store's clock; pending removals and the floor in the head's state | Remote GC needs no layout change, only the GC lease for its empty commits |
 | Snapshot tokens are vectors; cross-dataset outcomes are logged `Resolve` records | Atomic cross-dataset reads can be added later |
 
 Two traps to avoid:
@@ -1641,8 +1682,19 @@ A maintenance record that loses a race re-validates against the new head
 cap, its lease) and retries, or re-plans. The ingest writer that loses
 retries its unchanged actions with their original `seq`s. Leases over file
 sets avoid duplicate work; correctness rests on the publication-time guards
-and on a fence that the head CAS itself enforces. Checking a separately
-stored lease and then sending an unfenced CAS is not enough.
+and on a fence that the head CAS itself enforces:
+
+- **A lease turnover writes the head.** The maintenance unit's generation is
+  recorded in the dataset's state, so taking over a unit is a commit, and a
+  plan from the old generation loses its CAS
+  (`remote-maintenance-minimal-lease-outside-head`, where the turnover writes
+  only a separate lease object, fails I3).
+- **A retry checks the generation in the head it lost to** before rebasing,
+  and an expired unit re-plans instead
+  (`remote-maintenance-no-retry-lease-check` fails I3; with the file-set lease
+  also gone, two maintainers rewrite one input into duplicate live rows).
+- The publication itself reads nothing but the head. Checking a separately
+  stored lease and then sending an unfenced CAS is not enough.
 
 *Model-checked* (`remote-maintenance*`): one ingest writer buffering keyed
 upserts and deletes on two tables, racing one or two maintenance nodes that
@@ -1657,7 +1709,7 @@ inadmissible (the guard refuses it; rows stay correct); taking
 resurrects a deleted row; checking the lease only before sending publishes a
 stale plan (I3). Without file-set leases, or without guard re-validation, it
 still holds; without both, two outputs of one input leave two live rows. The
-graph has no upload failures, GC, pins or unknown outcomes.
+graph has no upload failures, GC, readers or unknown outcomes.
 
 Milestone 3 adds concurrent ingest writers, and everything else in this
 section.
@@ -1969,15 +2021,78 @@ writers' files, and the PK and deletion indexes merge state they did not write.
 
 ### Multi-region
 
-- **Write in one region, read in others:** supported. Replicated buckets do not
-preserve object order, so a replica may receive a record before the objects it
-references.
-  - A replica therefore exposes only a **readable frontier**: the highest commit
-    whose entire dependency closure (every record, page and object it needs)
-    it has confirmed present.
-  - Content hashes verify an object's identity; they do not show that
-    replication is complete.
-  - A referenced object missing *below* the frontier is still an error.
+**Replication: data in any direction, state one way.**
+
+- **Data objects can be replicated freely.** Every object is immutable and has
+  a fresh name, so a copy is either absent or exactly the object referenced.
+- **The state location has exactly one writable copy.** Commits and the lease
+  are conditional writes on one head object, and a conditional write is atomic
+  only within one bucket. With two-way replication (S3's replica modification
+  sync), each bucket accepts its own conditional write: two writers both hold
+  the lease and both commit, and the replication merge keeps one head and
+  drops the other's acknowledged commits. So the state location replicates
+  only one way, to a copy that nothing writes.
+- **Failover to a state replica is not supported.** Its newest head may name
+  objects that never arrived, writes acknowledged after its newest complete
+  head are lost to it, and a lease cannot fence writers across two buckets.
+  Restoring from a replica would be a separate feature: recover from the newest
+  complete head (CDC resumes from that head's source position, so nothing is
+  applied twice or skipped) and retire the old bucket.
+
+**Write in one region, read in others: two patterns.** Writers, the lease and
+GC always use the source.
+
+1. **One state location, replicated data.** Readers in each region poll the
+   head in the state location and read data files from the nearest replica.
+   - *Cost and efficiency:* the bytes that dominate a query cross regions once,
+     through replication, rather than on every query. A poll is a small
+     conditional GET, usually answered as unchanged.
+   - *A file not yet replicated,* two choices, open for the Enhancement review
+     (a per-region intent or one default):
+     - *wait for replication:* the regional reader advances to a head only once
+       every file it newly references is present in the replica, the readable
+       frontier of pattern 2 applied to data. No query reads across regions; a
+       commit becomes queryable in the region only after its files replicate;
+     - *read from the source:* the reader advances with the source head, and a
+       404 at the replica falls back to the source. Freshest, with cross-region
+       reads for recent files.
+   - Either way, a file missing from both is an error, never an empty result.
+   - *Retention:* unchanged, because readers confirm against the source head.
+2. **One-way replicated state, for per-region readers.** Regional readers read
+   the head and everything else from their region's replica, so a poll stays in
+   the region too. Replication does not preserve object order, so:
+   - a replica exposes only a **readable frontier**: a reader adopts a head only
+     after confirming that the objects it newly references are present (a HEAD
+     request per new batch, page or file, usually a few per commit), and
+     otherwise keeps its current head and retries;
+   - a reader never adopts a head with a lower commit number than the one it
+     holds. Whether S3 keeps replicated versions of one key in order is not
+     documented, so the reader does not rely on it;
+   - a referenced object missing *below* the frontier is still an error;
+   - *freshness* adds the replication lag, and the lag counts toward the
+     reader's staleness bound S, so a regional query is protected for T − S
+     minus that lag;
+   - the replica alone cannot show its lag: a readable frontier proves the
+     objects are present, not that the head is recent. A regional reader
+     therefore confirms its head with a conditional GET on the source head
+     (`If-None-Match` the replica copy's ETag, usually a small 304), timed from
+     when that request was sent, while everything else stays in the region.
+     *Open:* whether replicated objects keep their ETags under every
+     encryption mode, or the head carries its commit number for this check.
+
+**Versioned buckets.** S3 replication requires versioning on both buckets, and
+a user may enable versioning without replication. On a versioned bucket every
+head update leaves a noncurrent version, and a delete without a version id only
+adds a delete marker. A delete by version id is never replicated, and delete
+markers replicate only when the rule enables it. So on a versioned bucket:
+
+- GC deletes without a version id, so the marker can replicate and the
+  replica's copy is removed too;
+- the noncurrent versions (old heads, deleted objects) and expired delete
+  markers are then removed. *Open:* GC removes them itself by version id once
+  the source reports the version replicated, or the docs require a lifecycle
+  rule. The first asks nothing of the user and is preferred.
+- On an unversioned bucket nothing changes.
 - **Writers in several regions over disjoint keys:** supported, either against
 one bucket (paying cross-region latency per commit) or with a log per region
 (a possible future improvement).
@@ -2013,7 +2128,7 @@ flowchart LR
     S2 --> S3["3 · shadow log"]
     S3 --> S4["4 · readers from<br/>the shadow"]
     S4 --> S5["5 · authority for<br/>new datasets (flag)"]
-    S5 --> S6["6 · existing datasets<br/>re-bootstrap"]
+    S5 --> S6["6 · existing datasets<br/>keep their metastore"]
     S6 --> S7["7 · default on"]
     S7 --> S8["8 · remove the<br/>SQL metastore"]
 ```
@@ -2030,8 +2145,9 @@ A library change, with no Cayenne or runtime change.
   - the head log: head, window, batch index, floor, lease generation, the copy
     rule, identical retry and resolution, a conditional poll, a parallel cold
     open, and "advance after my own commit";
-  - GC: deletion from the log with the retirement interlock, generations and
-    the predecessor sweep, the admission guard, and low-water reader pins;
+  - GC: deletion from the log after the retention, and collection of uploads
+    that never committed by age on the store's clock, and pending removals in
+    checkpoint roots;
   - `WalStateStore` moves onto the head log. Its API, receipts and whole-head
     OCC stay as they are; its records move from `wal/<uuid>` chains into the
     window and batches.
@@ -2042,8 +2158,8 @@ A library change, with no Cayenne or runtime change.
 - **Exit proof:**
   - the WAL's existing suites pass on the head log, on every CI leg;
   - a deterministic simulation that replays the protocol model's schedules
-    (delayed CAS completion, lost responses, lease turnover, pin
-    registration, late uploads after a sweep) against the real storage code,
+    (delayed CAS completion, lost responses, lease turnover, uploads past the
+    age limit, late uploads after a sweep) against the real storage code,
     compared with a serial reference;
   - commit and poll latency at P99 and P99.9 on S3 Standard, S3 Express,
     RustFS and a fsync'd local directory, and a check that each store enforces
@@ -2065,8 +2181,10 @@ A library change, with no Cayenne or runtime change.
   - source positions are written in the same SQL transaction as the state they
     cover, where the connector's store allows it (they already share the
     database);
-  - reader pins for the datalake tier's GC, closing the gap in
-    [Checkpoints and garbage collection](#checkpoints-and-garbage-collection).
+  - for the datalake tier's GC, a cold file that is missing reads as an error,
+    never as empty, so a scan that outlives its grace period fails instead of
+    returning partial rows (see
+    [Checkpoints and garbage collection](#checkpoints-and-garbage-collection)).
 - **Exit proof:** a differential test. After every commit in the
   `mutation_model_test` histories and the compaction, cold-tier and CDC
   suites, the state built by `apply` equals the state read back from SQL:
@@ -2102,35 +2220,36 @@ A library change, with no Cayenne or runtime change.
 ### Step 4: data files in the destination, and readers from the shadow
 
 - **Change:**
-  - New data and deletion files are written under the dataset's
-    `data/<generation>/` folder in the destination, with local disk as a
+  - New data and deletion files are written under the dataset's `data/`
+    folder in the destination, with local disk as a
     cache. Cayenne already builds scan URLs for an `s3://` table path
     (`snapshot_dir_url`), so this is mainly placement and the cache.
-  - A read-only instance opens a dataset from the shadow's head and polls it,
-    instead of importing a metastore slice. It registers its reader pins in
-    the shadow's head, and the writer's GC, still driven by the SQL
-    metastore, keeps every file those pins protect. Without that, a replica
-    query whose files GC removed fails: an error, never wrong rows, but a
-    failure the step 4 benchmark would show.
-  - Both change user-visible behavior: where files live, and how a replica
-    starts. They are specified in the Enhancement before they ship.
+  - A reader opens a dataset from the shadow's head and polls it, instead of
+    importing a metastore slice. Like the shadow, it is reached through the
+    Cayenne builder in tests and the benchmark harness; running replicas from
+    a Spicepod is Milestone 2's replicated ingestion. The writer's GC, still
+    driven by the SQL metastore, keeps removed files for the retention, so a
+    reader's query within it never loses a file. One that outlives it fails:
+    an error, never wrong rows. The reader writes nothing.
+  - Where files live is user-visible, so it is specified in the Enhancement
+    before it ships.
 - **Why before authority:** readers are the cheaper half to get wrong. A
-  reader bug shows up as a wrong or failed query on a replica while the writer
+  reader bug shows up as a wrong or failed query on the reader while the writer
   and its SQL metastore are untouched, and every reader exercises the cold
   open and the poll.
 - **Exit proof:**
-  - `spiced` with a writer and a read replica on one bucket: `testoperator
-    run bench … --validate` gives the same answers on both;
-  - replica visibility lag at P99 and P99.9 at the chosen staleness bound,
+  - a writer and a reader on one bucket in the benchmark harness give the
+    same answers over the `mutation_model_test` histories and a CH-benCH run;
+  - reader visibility lag at P99 and P99.9 at the chosen staleness bound,
     and head reads per node against the number of datasets in use;
-  - replica start time against today's slice import.
+  - reader open time against today's slice import.
 
 ### Step 5: the object-native metastore as authority for new datasets
 
 - **Change:** an `ObjectCatalog` implements `MetadataCatalog` over the dataset
   state and the head log, and SQL is not written for those datasets. It is
-  chosen by `runtime.experimental_cayenne_metastore: enabled`, once the
-  Enhancement is signed off. It adds what a shadow never needed:
+  chosen by the feature flag the Enhancement defines, once it is signed
+  off. It adds what a shadow never needed:
   - the lease, fencing and failover;
   - resolution of uncertain writes, reported as "commit outcome unknown";
   - commits at acknowledgement points, with group commit;
@@ -2139,15 +2258,35 @@ A library change, with no Cayenne or runtime change.
   - source positions in the same record as their state.
 
   It lands in three parts, each behind the same flag: a local-directory
-  destination on one node; object stores with failover; then GC with reader
-  pins.
+  destination on one node; object stores with failover; then GC with the
+  retention and collection by age.
+- **Data placement is not a prerequisite.** Until step 4's placement lands,
+  records may reference data files where they are today, on the writer's
+  local disk. This decouples the metadata work from the data work, and is
+  temporary:
+  - Such references name an instance-local location in the location registry
+    (see [multiple data locations](#future-multiple-data-locations)), bound to
+    the writing instance's identity, so they are never mistaken for files in
+    the state location.
+  - Recovery is limited to that disk: a restart on the same disk continues from
+    the head, while another instance that opens the dataset finds references it
+    cannot read and reloads from the source. It never serves the dataset
+    without those files (a missing referenced file is an error, never an empty
+    snapshot).
+  - Files are still durable on local disk before the record that references
+    them commits, and GC deletes them as it would any other location's.
+  - The default (step 7) waits for data in the destination wherever the
+    destination is an object store; on a local-directory destination the two
+    are the same disk.
 - **Exit proof:**
   - a process kill at every storage step, injected lost responses, and a
     power-loss simulation for the local directory;
   - a model-based differential test over seeded histories, extending
     `crates/cayenne/tests/mutation_model_test.rs`;
-  - `spiced` with CDC and append Spicepods across restart, and failover to a
-    new instance on the same bucket, with `--validate`;
+  - `spiced` with CDC and append Spicepods across restart with `--validate`;
+    once data is in the destination, failover to a new instance on the same
+    bucket, and before that, a new instance reloading from the source instead
+    of serving the dataset;
   - `testoperator run bench` and `run htap` against the SQL metastore: query
     P99, and freshness P99 and P99.9, with no regression at any query or scale
     factor.
@@ -2155,35 +2294,53 @@ A library change, with no Cayenne or runtime change.
   tier is measured against it, including the rc.3 caching workload (direction
   document, decision 1.5).
 
-### Step 6: existing datasets re-bootstrap
+### Step 6: existing datasets keep their metastore
 
-- **Change:** with the flag enabled, a dataset still on the SQL metastore is
-  re-bootstrapped: loaded again from its source into a new object-native
-  dataset, as a full refresh or a CDC snapshot does today. Its SQL metastore
-  and files stay untouched, and keep serving queries, until the new dataset is
-  ready; then they are removed. Metastore contents are not migrated.
+- **Change:** no automatic switch, and no one-time upgrade path to build and
+  test. A dataset keeps the metastore its acceleration is already on, detected
+  from what is on disk, and the flag decides only for datasets that have no
+  acceleration yet. A flag that names a different metastore from the one an
+  existing acceleration uses is an error naming the dataset and the fix:
+  delete the acceleration, and it re-bootstraps from its source as a new
+  dataset does today. Metastore contents are not migrated.
 - **Datasets that cannot re-bootstrap** (an acceleration holding data its
   source no longer has) are out of scope here: what their users do is a
   separate decision, and this work does not keep supporting the old
   metastore for them.
-- **Exit proof:** every test Spicepod's datasets re-bootstrapped with
-  `--validate` before and after, and a recovery from the destination alone on
-  a fresh instance without the original data directory.
+- **Exit proof:** the mismatch error in both directions; every test
+  Spicepod's datasets deleted and re-bootstrapped with `--validate` before and
+  after; and, once data is in the destination, a recovery from the destination
+  alone on a fresh instance without the original data directory.
 
 ### Step 7: on by default
 
-- **Change:** `enabled` becomes the default; `disabled` keeps the SQL
-  metastore for a stated number of releases. This is a user-facing change, in
-  the same Enhancement.
-- **Exit proof:** the full benchmark suite (TPC-H, TPC-DS, ClickBench,
-  CH-benCH) against the previous release, with no regression at any query or
-  scale factor.
+- **Change:** the object-native metastore becomes the default; the flag can
+  still select the SQL metastore for a stated number of releases. This is a
+  user-facing change, in the same Enhancement.
+- **Prerequisite: no racing writers.** Fencing keeps state correct when two
+  instances write one destination, but each new writer fences the other, and
+  both consume the source. That is tolerable while the path is opt-in; as a
+  default it would turn a common mistake (two instances started on one
+  destination) into an outage. Before this step, one of these ships:
+  - read-only support, so a second instance serves queries without writing
+    (Milestone 2's replicated ingestion, or a read-only instance before it);
+  - or detection and prevention: an instance that finds another live writer
+    for a dataset in the head does not take over, and reports it with an
+    error naming the dataset and the other instance, unless it is told it
+    replaces that writer.
+- **Exit proof:**
+  - `spiced` started twice on one destination: no source is consumed by
+    both, no commit is lost, and the second instance either serves reads or
+    reports the conflict;
+  - the full benchmark suite (TPC-H, TPC-DS, ClickBench, CH-benCH) against
+    the previous release, with no regression at any query or scale factor.
 
 ### Step 8: remove the SQL metastore
 
-- **Change:** remove the SQLite and Turso metastore backends,
-  `MetastoreBackend` and the `turso` feature, the SQL inline tier, the flag,
-  and `mode`.
+- **Change:** remove the SQLite metastore backend, `MetastoreBackend`, the
+  SQL inline tier, the flag and the surface it made obsolete. The Turso
+  metastore and the `turso` build feature go earlier, with the accelerator
+  deprecation.
 - **Gate:** re-bootstrap, compatibility and recovery have been shown in
   production releases; the local-directory destination covers
   on-prem deployments without object storage; the inline tier's replacement
@@ -2209,8 +2366,8 @@ writes last.
 **Model-checked together.** `dataset-lifecycle` composes Milestone 1 for a
 dataset with a parent and a child table: per-table `seq`, commit numbers,
 delete coverage with cold promotion, the PK index in checkpoints, deletion from
-the log with the retirement interlock, low-water pins with two queries, and a
-takeover whose sweep races a late upload. It holds exhaustively at two
+the log after the retention with two running queries, fresh-named uploads
+collected by age, and a takeover whose sweep races a late upload. It holds exhaustively at two
 accepted records, and removing each safeguard fails inside the composed graph.
 Larger bounds are sampled only. Every graph that holds keyed rows also checks
 that each key has at most one live row, counting physical rows across warm and
@@ -2226,21 +2383,23 @@ Three siblings compose it further, each exhaustive at its own bound:
   parent table while writes, compaction, promotion, checkpoints and GC
   continue, then `Resolve{commit}` or `Resolve{abort}`. This found the
   late-delete resurrection that the cutoff cap closes;
-- **with pin expiry** (`dataset-pin-expiry-*`): a query whose pin lapses while
-  its reads are in flight gets its snapshot's rows or an error;
+- **with query expiry** (`dataset-query-expiry-*`): a query whose retention
+  runs out while its reads are in flight gets its snapshot's rows or an error;
 - **with the byte window** (`dataset-byte-window-*`): records leaving the window
-  into batches, checkpoints and the floor, where deleting a batch a pinned
-  state needs, or publishing a floor over history an older pin needs, loses
-  that state.
+  into batches, checkpoints and the floor, where deleting a batch a running
+  query's state needs, or publishing a floor over history an older query
+  needs, loses that state.
 
 Transactions with three participants hold exhaustively at bound 0 with
 symmetry reduction (35.2M unique states, 323 s); bound 1 is sampled only, and
 is estimated at about 10^10 states even with reduction.
 
 **Still open for the protocol model:**
-- one graph joining transactions, pin expiry and the byte window;
-- remote maintenance joined with upload failures, GC, pins and unknown
+- one graph joining transactions, query expiry and the byte window;
+- remote maintenance joined with upload failures, GC, readers and unknown
   outcomes;
+- the retention with GC on another node and with several writers (the
+  `retention` graph has one writer and one GC);
 - transactions joined with maintenance, `Prepare` and unknown outcomes, and
   lookups whose keys depend on earlier reads;
 - position deletes across chains of compactions, with mapping retention;
@@ -2267,8 +2426,11 @@ region).
   statistics beside its files, and has its own part of the PK index.
 - **A file reference carries a location id.** A `u32`, encoded as a varint so
   small ids cost one byte; an absent id means 0, the state location, so
-  Milestone 1 records need no change. Paths inside a location stay
-  `obj/<gen>/<hash>`.
+  Milestone 1 records need no change. Paths inside a location keep the state
+  location's fresh-name layout.
+- **Upload age crosses stores.** A file's `LastModified` comes from its
+  location's clock and the head's from the state location's, so the age
+  margin must also cover skew between the two stores' clocks.
 - **The registry is committed state.** Each id maps to the location's
   identity (its canonical URL) and a state: active, draining or retired.
   Credentials are not stored; a node resolves them from its Spicepod by URL.
@@ -2277,8 +2439,8 @@ region).
 - **Placement is recorded, never recomputed.** The writer chooses a location
   and the reference records it. Readers follow the reference, so a change in
   placement policy never changes how an existing file is found.
-- **GC runs per location**, with the generation scheme in each, and orphan
-  sweeps list each location separately.
+- **GC runs per location:** removed objects by the retention, and the orphan
+  sweep lists each location separately.
 
 **When the configuration changes:**
 - *Adding a location:* a commit registers it before the first upload to it.
@@ -2290,7 +2452,7 @@ region).
   record that adds a reference to a draining location, so a node still on the
   old configuration during a rolling change cannot place new files there.
   Maintenance moves its live files with ordinary rewrite records. It becomes
-  retired once no live file references it and the low-water mark L has passed
+  retired once no live file references it and the retention has passed since
   the last commit that did; GC then empties it.
 - *A location missing from the configuration, or unreachable, while files
   still reference it:* startup checks the committed registry against the
