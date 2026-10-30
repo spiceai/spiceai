@@ -213,7 +213,12 @@ pub(super) async fn http_step(instance: &Instance, step: &HttpStep) -> Result<St
         .map(|(k, v)| Ok((k.clone(), instance.sql(v)?)))
         .collect::<Result<Vec<_>>>()?;
     let body = step.body.as_deref().map(|b| instance.sql(b)).transpose()?;
-    let path = with_query(&step.path, &step.query);
+    let query = step
+        .query
+        .iter()
+        .map(|(k, v)| Ok((k.clone(), instance.sql(v)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let path = with_query(&step.path, &query);
     loop {
         let result = async {
             let (status, got, text) = instance
