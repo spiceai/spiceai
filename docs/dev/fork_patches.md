@@ -107,7 +107,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | Fork | Pinned revision | Branch |
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `6e4119ac2007c6647702a1817505d6849b07e0e0` | `spiceai-24` |
-| [arrow-rs](#arrow-rs) | `2124b9e85c8c4f50fdacfa23d75cbad6a4db9086` | `spiceai-59` |
+| [arrow-rs](#arrow-rs) | `59e8042f0b2f7075cc6f0db4bd9f7df42001138d` | `phillip/type-string-nesting-depth` (TEMPORARY: spiceai/arrow-rs#34) |
 | [async-openai](#async-openai) | `307eaf407cbf71afa967f3008250ba96c79626b7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `829b57522e601ea169b04e2d4a375c3abe3ed58c` | `spiceai` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
@@ -367,7 +367,8 @@ path (`parquet/src/util/push_buffers.rs` and its callers), in the page decoder
 (`parquet/src/parquet_thrift.rs`,
 `parquet/src/file/metadata/thrift/mod.rs`,
 `parquet/src/file/page_index/offset_index.rs`), in
-`arrow-buffer/src/buffer/immutable.rs`, in the cast kernel
+`arrow-buffer/src/buffer/immutable.rs`, in the type-string parser
+(`arrow-schema/src/datatype_parse.rs`), in the cast kernel
 (`arrow-cast/src/cast/mod.rs`), and in the Flight SQL client
 (`arrow-flight/src/sql/client.rs`).
 
@@ -383,6 +384,7 @@ path (`parquet/src/util/push_buffers.rs` and its callers), in the page decoder
 | `FlightSqlServiceClient::do_get_flight_data` — a `DoGet` that returns the raw `FlightData` stream with the client's headers and bearer token applied, as `do_get` applies them | The Flight SQL connector can no longer replace a schema message before arrow decodes it. A server that declares a `MAP`'s `entries` field nullable (which arrow 59 refuses at decode) fails every read of that table with `The nullable should be set to false for the map entries field`, naming no column. Going through `inner_mut()` instead would drop the `traceparent` and bearer token, which are private to the client | build (the method) | `crates/data_components/src/flightsql.rs::tests::query_to_stream_corrects_a_servers_nullable_map_entries_declaration` |
 | Thrift list lengths in Parquet metadata are bounded by the bytes left in the input: `list_capacity` refuses a declared count the remaining bytes cannot encode, and caps the reservation where the input length is unknown ([spiceai/arrow-rs#32](https://github.com/spiceai/arrow-rs/pull/32)) | Every footer list (`schema`, `row_groups`, `key_value_metadata`, `column_orders`) and the offset index's `page_locations` decodes into a `Vec` sized from the element count in its Thrift list header. A file of a few bytes can declare `i32::MAX` elements, so the reader reserves room for all of them before reading one — during schema inference at dataset initialization, and again on every refresh of that dataset | not silent (memory exhaustion takes the runtime down) | `crates/data-connector-api/src/listing/connector.rs::an_oversized_footer_list_length_is_a_parquet_error_and_not_an_allocation` |
 | `schema_from_array_helper` refuses a footer schema nested more than 100 levels below its root ([spiceai/arrow-rs#33](https://github.com/spiceai/arrow-rs/pull/33)) | The footer's flat schema element list is rebuilt into a tree by recursing once per nesting level, with no bound. A Parquet file of a few KiB that declares a few hundred nested levels overflows the stack during schema inference at dataset initialization, and again on every refresh of that dataset | not silent (stack overflow aborts the runtime) | `crates/data-connector-api/src/listing/connector.rs::a_footer_schema_nested_past_the_depth_limit_is_a_parquet_error` |
+| The type-string parser (`DataType::from_str`) refuses a type nested more than 64 levels deep ([spiceai/arrow-rs#34](https://github.com/spiceai/arrow-rs/pull/34)) | The parser recurses once per nesting level with no bound. `arrow_cast` and `arrow_try_cast` parse their type argument at planning time, and the SQL text check bounds only a type string written as a literal in the query. A type string that reaches the parser any other way (a declared column type, or a value bound to a query parameter) is parsed unbounded, and a deep one overflows the stack | not silent (stack overflow aborts the runtime) | `crates/runtime-query-engine/src/sql_depth_guard.rs::tests::arrow_type_string_past_the_parser_depth_limit_is_a_parse_error` |
 
 ## datafusion-ballista
 
