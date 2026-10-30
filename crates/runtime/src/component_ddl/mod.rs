@@ -38,10 +38,13 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use app::{App, AppBuilder};
+use arrow::array::{Array, AsArray, RecordBatch};
 use async_trait::async_trait;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::logical_expr::LogicalPlan;
 use datafusion_ddl::component_ddl::OptionsChange;
-use datafusion_ddl::component_ddl::{ComponentDdlHandler, ComponentDdlOp};
+use datafusion_ddl::component_ddl::{ComponentDdlHandler, ComponentDdlNode, ComponentDdlOp};
 use datafusion_ddl::component_options::{
     ComponentKind, ConnectorParameters, OptionValue, create_statement,
 };
@@ -266,55 +269,11 @@ impl ComponentDdlHandler for RuntimeComponentDdl {
     }
 
     async fn apply(&self, op: ComponentDdlOp) -> DFResult<String> {
+        // A change takes several steps that must all run: the query runs the
+        // statement to its end once it starts (see [`RunningStatement`]), so a
+        // client that leaves does not stop it partway.
         let runtime = self.runtime()?;
-        let statement = format!("{} {}", op.label(), op.component_name());
-        // What a record any API key reads leaves out of the statement's error.
-        let values = statement_values(&op);
-        // The statement's record in task history, which is written when the
-        // last handle to it is dropped.
-        let record = tracing::Span::current();
-        let (reply, outcome) = tokio::sync::oneshot::channel();
-        // On a task of its own: a change takes several steps that must all
-        // run, and a statement that is dropped, as by a client that
-        // disconnects or a query timeout, must not stop it partway. Its record
-        // stays open until the change is done, so it holds the change's real
-        // duration and outcome.
-        tokio::spawn(async move {
-            let result = runtime.apply_component_ddl(op).await;
-            if let Err(unsent) = reply.send(result) {
-                match unsent {
-                    Ok(message) => tracing::info!(
-                        "`{statement}` finished after its client disconnected: {message}"
-                    ),
-                    Err(e) => {
-                        // Any API key reads task history, and a log is no place
-                        // for a credential either: the cause is recorded
-                        // without the values of the statement it may repeat.
-                        let cause = e.to_string();
-                        let cause =
-                            datafusion_ddl::component_options::redact_values(&cause, &values);
-                        let cause = util::single_line(&cause);
-                        tracing::warn!(
-                            "`{statement}` failed after its client disconnected, so it was not applied. Cause: {cause}"
-                        );
-                        tracing::error!(
-                            target: "task_history",
-                            parent: &record,
-                            "`{statement}` failed after its client disconnected, so it was not applied. Cause: {cause}"
-                        );
-                    }
-                }
-                // A record ends when it is last exited, which the statement's
-                // client did when it left: exited now, it ends with the change.
-                drop(record.enter());
-            }
-            drop(record);
-        });
-        outcome.await.map_err(|_| {
-            DataFusionError::Execution(
-                "The statement stopped before it finished; the Spice log says why.".to_string(),
-            )
-        })?
+        runtime.apply_component_ddl(op).await
     }
 
     async fn create_statement(&self, kind: ComponentKind, name: &str) -> DFResult<Option<String>> {
@@ -341,6 +300,69 @@ impl ComponentDdlHandler for RuntimeComponentDdl {
                 };
                 let shown = ShownParameters::of_catalog(&runtime, catalog).await;
                 create_statement(catalog, &|path| shown.shows(path)).map(Some)
+            }
+        }
+    }
+}
+
+/// A statement that defines, changes, or removes a dataset or catalog, as its
+/// query runs it: to its end once it starts, whether or not its client stays,
+/// since a change cannot stop partway.
+pub(crate) struct RunningStatement {
+    /// The statement as logs name it: `CREATE TABLE orders`.
+    statement: String,
+    /// What a log line leaves out of the statement's error: see
+    /// [`statement_values`].
+    values: Vec<String>,
+}
+
+impl RunningStatement {
+    /// The statement `plan` runs that defines, changes, or removes a dataset
+    /// or catalog, when it runs one: `EXPLAIN` shows one without running it.
+    pub(crate) fn of(plan: &LogicalPlan) -> Option<Self> {
+        if matches!(plan, LogicalPlan::Explain(_)) {
+            return None;
+        }
+        let mut found = None;
+        plan.apply(|node| {
+            if let LogicalPlan::Extension(extension) = node
+                && let Some(ddl) = extension.node.as_any().downcast_ref::<ComponentDdlNode>()
+            {
+                found = Some(Self {
+                    statement: format!("{} {}", ddl.op.label(), ddl.op.component_name()),
+                    values: statement_values(&ddl.op),
+                });
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .ok()?;
+        found
+    }
+
+    /// Logs how the statement ended, `result`, for a client that left before
+    /// it did and so was not told.
+    pub(crate) fn log_unread_outcome(&self, result: &DFResult<Vec<RecordBatch>>) {
+        let statement = &self.statement;
+        match result {
+            Ok(batches) => {
+                let message = batches
+                    .first()
+                    .and_then(|batch| batch.columns().first())
+                    .and_then(|column| column.as_string_opt::<i32>())
+                    .filter(|messages| !messages.is_empty())
+                    .map_or("", |messages| messages.value(0));
+                tracing::info!("`{statement}` finished after its client disconnected: {message}");
+            }
+            Err(e) => {
+                // A log is no place for a credential: the cause is logged
+                // without the values of the statement it may repeat.
+                let cause = e.to_string();
+                let cause = datafusion_ddl::component_options::redact_values(&cause, &self.values);
+                let cause = util::single_line(&cause);
+                tracing::warn!(
+                    "`{statement}` failed after its client disconnected, so it was not applied. Cause: {cause}"
+                );
             }
         }
     }
@@ -2356,9 +2378,8 @@ fn withheld_deleted(withheld: &[Dataset]) -> String {
     )
 }
 
-/// The values of `op`'s definition that a record any API key reads leaves out
-/// of the statement's error: every parameter's, and every value an `ALTER`
-/// sets.
+/// The values of `op`'s definition that a log line leaves out of the
+/// statement's error: every parameter's, and every value an `ALTER` sets.
 fn statement_values(op: &ComponentDdlOp) -> Vec<String> {
     match op {
         ComponentDdlOp::CreateDataset { dataset, .. } => {

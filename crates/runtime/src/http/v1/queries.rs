@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Runtime;
 use crate::config::ClusterRole;
+use crate::datafusion::query::registry::CancelOutcome;
 use crate::datafusion::query::write_to_json_value;
 use crate::jobs::{JobErrorCode, JobExecutor, JobState, JobStatus};
 
@@ -691,7 +692,8 @@ pub(crate) async fn cancel(
         (status = 200, description = "Active SQL query cancelled", body = CancelActiveQueryResponse),
         (status = 400, description = "Invalid query ID"),
         (status = 403, description = "API key does not allow write access"),
-        (status = 404, description = "Active SQL query not found")
+        (status = 404, description = "Active SQL query not found"),
+        (status = 409, description = "Active SQL query defines, changes, or removes a dataset or catalog, and runs to its end")
     )
 ))]
 pub(crate) async fn cancel_active(
@@ -712,28 +714,34 @@ pub(crate) async fn cancel_active(
     };
 
     let caller = crate::jobs::current_job_owner().await;
-    if rt
+    match rt
         .df
         .query_cancel_registry()
         .cancel_owned(parsed_uuid, &caller)
     {
-        return (
+        CancelOutcome::Cancelled => (
             StatusCode::OK,
             Json(CancelActiveQueryResponse {
                 query_id,
                 status: "cancelled".to_string(),
             }),
         )
-            .into_response();
+            .into_response(),
+        CancelOutcome::NotCancellable => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("Active SQL query '{query_id}' defines, changes, or removes a dataset or catalog, which cannot stop partway, so it runs to its end and cannot be cancelled."),
+            })),
+        )
+            .into_response(),
+        CancelOutcome::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("Active SQL query '{query_id}' not found"),
+            })),
+        )
+            .into_response(),
     }
-
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({
-            "error": format!("Active SQL query '{query_id}' not found"),
-        })),
-    )
-        .into_response()
 }
 
 /// List currently-active synchronous queries known to this runtime.

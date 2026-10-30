@@ -94,7 +94,7 @@ use datafusion::execution::SessionState;
 use datafusion::prelude::SessionContext;
 
 use async_stream::stream;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 
 use super::{
     SPICE_RUNTIME_SCHEMA,
@@ -103,6 +103,7 @@ use super::{
 };
 
 use super::managed_runtime;
+use crate::component_ddl::RunningStatement;
 use crate::datafusion::{
     DataFusion,
     query::cache::RequestCacheManager,
@@ -1966,14 +1967,36 @@ impl Query {
                     inner_span.clone(),
                 );
 
+                // A statement that defines, changes, or removes a dataset or
+                // catalog cannot stop partway once it runs, so neither the
+                // query timeout nor a cancel request stops it: its client gets
+                // its real outcome, and a cancel request is told it cannot
+                // cancel it. A cancel, a timeout, or a client that left before
+                // this point stops it here, before it runs.
+                let running_statement = RunningStatement::of(&plan);
+                let (stream_cancel_token, timeout_timer_guard) = match running_statement {
+                    Some(_) => {
+                        active_query_guard.refuse_cancellation();
+                        drop(timeout_timer_guard);
+                        Self::ensure_not_cancelled(
+                            &query_cancel_token,
+                            &query_id_str,
+                            &timeout_state,
+                        )?;
+                        (tokio_util::sync::CancellationToken::new(), None)
+                    }
+                    None => (query_cancel_token.clone(), timeout_timer_guard),
+                };
+
                 // Wrap with cancellation observation so that cancelling the
                 // query (via HTTP `/v1/sql/{id}/cancel`, the custom Flight
                 // `CancelQuery` action, or client disconnect) terminates the
-                // stream with a clear error. The active-query registry guard is held by the
+                // stream with a clear error; a statement that runs to its end
+                // passes a token nothing cancels. The active-query registry guard is held by the
                 // wrapped stream so deregistration occurs on drop.
                 let final_stream = attach_cancellation_to_stream(
                     final_stream,
-                    query_cancel_token.clone(),
+                    stream_cancel_token,
                     Arc::clone(&query_id_str),
                     timeout_state.clone(),
                     // Bundle the admission permit and the timeout-timer guard
@@ -1987,16 +2010,20 @@ impl Query {
                     (active_query_guard, admission_permit, timeout_timer_guard),
                 );
 
-                Ok(QueryResult::new(
-                    attach_query_tracker_to_stream(
-                        inner_span,
-                        Arc::clone(&request_context),
-                        tracker,
-                        final_stream,
-                    ),
-                    cache_manager.cache_status,
-                )
-                .with_physical_plan(physical_plan_for_result))
+                let stream = attach_query_tracker_to_stream(
+                    inner_span,
+                    Arc::clone(&request_context),
+                    tracker,
+                    final_stream,
+                );
+                let stream = match running_statement {
+                    Some(statement) => {
+                        run_to_end(stream, statement, Arc::clone(&request_context))
+                    }
+                    None => stream,
+                };
+                Ok(QueryResult::new(stream, cache_manager.cache_status)
+                    .with_physical_plan(physical_plan_for_result))
             }
             .instrument(span.clone())
             .instrument(trace_span.clone());
@@ -2330,6 +2357,40 @@ fn attach_query_tracker_to_stream(
         schema,
         updated_stream.instrument(span),
     ))
+}
+
+/// Reads `stream`, the result of `statement`, to its end on a task of its own,
+/// started by the first read of the stream returned. The statement changes a
+/// dataset or catalog and cannot stop partway, so a client that leaves does not
+/// stop it, and its record holds what it did; a client that left before it
+/// ended is not told, so its outcome is logged. The task runs as the request,
+/// on the runtime the statement was planned on, rather than on whichever
+/// runtime reads the result first, such as the HTTP server's. The result, one
+/// row, is held until it is read.
+fn run_to_end(
+    stream: SendableRecordBatchStream,
+    statement: RunningStatement,
+    request_context: Arc<RequestContext>,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let runtime = Handle::current();
+    let result = futures::stream::once(async move {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        runtime.spawn(request_context.scope(async move {
+            let result = stream.try_collect::<Vec<RecordBatch>>().await;
+            if let Err(unread) = sender.send(result) {
+                statement.log_unread_outcome(&unread);
+            }
+        }));
+        receiver.await.unwrap_or_else(|_| {
+            Err(DataFusionError::Execution(
+                "The statement stopped before it finished; the Spice log says why.".to_string(),
+            ))
+        })
+    })
+    .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>)))
+    .try_flatten();
+    Box::pin(RecordBatchStreamAdapter::new(schema, result))
 }
 
 /// Batch view used by [`QueryTrackerStream`] for owned and Arc-shared items.
@@ -4305,7 +4366,10 @@ mod tests {
             .find(|info| info.query_id == query_id)
             .map(|info| info.owner)
             .expect("the registered query should expose its owning scope");
-        assert!(registry.cancel_owned(query_id, &owner));
+        assert_eq!(
+            registry.cancel_owned(query_id, &owner),
+            super::registry::CancelOutcome::Cancelled
+        );
         assert!(cancel_token.is_cancelled());
         let cancellation = cached_query
             .data

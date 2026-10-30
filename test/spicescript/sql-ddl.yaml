@@ -5,11 +5,13 @@ description: >
   an `:admin` key defines one. What a read-only key reads (SHOW CREATE, and the
   task history of every statement, mistyped or cut short ones included) holds
   none of a definition's secrets, nor does the error of a source that repeats
-  a secret a definition names by reference.
+  a secret a definition names by reference. A definition runs to its end: the
+  query timeout does not stop it, and its client and record get its outcome.
 
 sources:
   lake: { kind: files }
   ref: { kind: postgres }
+  api: { kind: mock-http }
 
 variants:
   # A DuckLake connection string with a password, which a definition names as
@@ -192,4 +194,32 @@ steps:
       status: 200
       body-contains: p_last
       body-lacks: ['leak-']
+    eventually: 30s
+
+  # A definition cannot stop partway, so the query timeout does not apply to
+  # it: its client gets its outcome, and its record holds it. The source
+  # answers its first request 5 s late, past a 2 s timeout, and the rest at once.
+  - source-exec:
+      api: |
+        path: /slow.csv
+        headers: { content-type: text/csv }
+        body: "id,v\n1,a\n2,b\n"
+  - source-exec:
+      api: |
+        path: /slow.csv
+        headers: { content-type: text/csv }
+        body: "id,v\n1,a\n2,b\n"
+        delay-ms: 5000
+        times: 1
+  - restart:
+      patch:
+        spicepod:
+          runtime:
+            query:
+              timeout: 2s
+  - spice-exec: "CREATE TABLE slow WITH (from = '${sources.api.url}/slow.csv', file_format = 'csv')"
+  - query: SELECT count(*) AS n FROM slow
+    expect: { rows: [['2']] }
+  - query: SELECT error_message FROM runtime.task_history WHERE task = 'sql_query' AND input LIKE 'CREATE TABLE slow %'
+    expect: { rows: [[null]] }
     eventually: 30s
