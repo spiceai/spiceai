@@ -202,6 +202,92 @@ struct BakeOutput<'a> {
     input_ids: &'a [String],
 }
 
+/// One seq-prefix bake input's files, split by whether the bake's deletion
+/// filter removes a row from them
+/// ([`CayenneTableProvider::bake_partition_input_files`]).
+struct BakeInputFiles {
+    snapshot_id: String,
+    /// The input's deletion threshold, as the bake applies it.
+    threshold: i64,
+    /// The files the filter removes a row from, as the capture their scan reads.
+    rewrite: CapturedSnapshotFiles,
+    /// File names of [`Self::rewrite`].
+    rewrite_names: Vec<String>,
+    /// The files the filter removes no row from, by file name. The bake links
+    /// them into its output instead of re-encoding them.
+    keep_names: Vec<String>,
+}
+
+/// The files of every input of a seq-prefix bake that keeps some of them.
+struct BakeFilePartition {
+    inputs: Vec<BakeInputFiles>,
+    rewritten_bytes: u64,
+}
+
+impl BakeFilePartition {
+    fn rewritten_files(&self) -> usize {
+        self.inputs.iter().map(|input| input.rewrite_names.len()).sum()
+    }
+
+    fn kept_files(&self) -> usize {
+        self.inputs.iter().map(|input| input.keep_names.len()).sum()
+    }
+
+    /// The inputs with a file to rewrite, and those files' captures by input.
+    fn rewrite_inputs(&self) -> (Vec<(String, i64)>, HashMap<String, CapturedSnapshotFiles>) {
+        self.inputs
+            .iter()
+            .filter(|input| !input.rewrite_names.is_empty())
+            .map(|input| {
+                (
+                    (input.snapshot_id.clone(), input.threshold),
+                    (input.snapshot_id.clone(), input.rewrite.clone()),
+                )
+            })
+            .unzip()
+    }
+}
+
+/// The first of `kept` that appears twice in it or is already in `written`.
+///
+/// A bake links the files it keeps from several input directories into one
+/// output directory, so two with one name would leave only one of them, and a
+/// kept file named like one the bake wrote would replace it.
+fn first_bake_link_collision<'a>(
+    kept: impl IntoIterator<Item = &'a str>,
+    written: &HashSet<String>,
+) -> Option<&'a str> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    kept.into_iter()
+        .find(|name| written.contains(*name) || !seen.insert(name))
+}
+
+/// Rows `plan` yields.
+async fn count_plan_rows(
+    plan: Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<datafusion::execution::TaskContext>,
+) -> DataFusionResult<u64> {
+    use futures::TryStreamExt as _;
+    let mut stream = datafusion_physical_plan::execute_stream(plan, task_ctx)?;
+    let mut rows: u64 = 0;
+    while let Some(batch) = stream.try_next().await? {
+        rows = rows.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
+    }
+    Ok(rows)
+}
+
+/// Test-only view of what the last seq-prefix bake of a table kept, and a
+/// switch to make it rewrite every file.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct TestBakeFiles {
+    /// Rewrite every input file, as the bake did before it could keep any.
+    pub(crate) rewrite_all: bool,
+    /// `(files rewritten, files kept)` by the last committed bake that split
+    /// its inputs, or `None` when it rewrote every file unsplit.
+    pub(crate) last: Option<(usize, usize)>,
+}
+
 /// An on-conflict deletion update with the deletion index it extends to, built
 /// before its publication's locks
 /// ([`CayenneTableProvider::prepare_on_conflict_deletion_update`]).
@@ -2565,6 +2651,9 @@ pub struct CayenneTableProvider {
     /// row. Lets a test hold a bake mid-encode. Consumed on first fire.
     #[cfg(test)]
     test_bake_input_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
+    /// See [`TestBakeFiles`].
+    #[cfg(test)]
+    test_bake_files: Arc<ParkingMutex<TestBakeFiles>>,
     /// Test-only seam fired after a mem-tier checkpoint has built its deletion-index
     /// extension and before it takes the listing fence to publish it. Consumed on
     /// first fire.
@@ -10582,6 +10671,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_bake_input_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_bake_files: Arc::new(ParkingMutex::new(TestBakeFiles::default())),
+            #[cfg(test)]
             test_pre_checkpoint_deletion_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_catalog_commit_hook: Arc::new(ParkingMutex::new(None)),
@@ -13046,6 +13137,8 @@ impl CayenneTableProvider {
             test_pre_bake_prune_publish_hook: Arc::clone(&self.test_pre_bake_prune_publish_hook),
             #[cfg(test)]
             test_bake_input_hook: Arc::clone(&self.test_bake_input_hook),
+            #[cfg(test)]
+            test_bake_files: Arc::clone(&self.test_bake_files),
             #[cfg(test)]
             test_pre_checkpoint_deletion_publish_hook: Arc::clone(
                 &self.test_pre_checkpoint_deletion_publish_hook,
@@ -20839,13 +20932,17 @@ impl CayenneTableProvider {
         &self,
         state: &dyn Session,
         inputs: &[(String, i64)],
+        subsets: Option<&HashMap<String, CapturedSnapshotFiles>>,
         target_partitions: usize,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
     ) -> Option<OverwriteRangePlan> {
         // As `overwrite_range_plan`.
         const MAX_SAMPLE_ROWS: usize = 65_536;
-        if self.context.has_cluster_by() || self.context.sort_columns_are_authoritative() {
+        if inputs.is_empty()
+            || self.context.has_cluster_by()
+            || self.context.sort_columns_are_authoritative()
+        {
             return None;
         }
         // Split for the shards the bake's write will run (see
@@ -20868,7 +20965,7 @@ impl CayenneTableProvider {
             };
             let key_type = schema.field(index).data_type().clone();
             let sample = match self
-                .sample_snapshots_column(state, inputs, index, &key_type, MAX_SAMPLE_ROWS)
+                .sample_snapshots_column(state, inputs, subsets, index, &key_type, MAX_SAMPLE_ROWS)
                 .await
             {
                 Ok(Some(sample)) => sample,
@@ -20903,11 +21000,13 @@ impl CayenneTableProvider {
     }
 
     /// A strided sample of column `index` across the files of the `inputs`
-    /// snapshots; see [`Self::sample_plan_column`].
+    /// snapshots — only the files of an input's capture in `subsets`, when it
+    /// has one; see [`Self::sample_plan_column`].
     async fn sample_snapshots_column(
         &self,
         state: &dyn Session,
         inputs: &[(String, i64)],
+        subsets: Option<&HashMap<String, CapturedSnapshotFiles>>,
         index: usize,
         data_type: &DataType,
         max_rows: usize,
@@ -20915,10 +21014,17 @@ impl CayenneTableProvider {
         let projection = vec![index];
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(inputs.len());
         for (snapshot_id, _) in inputs {
-            plans.push(
-                self.create_snapshot_scan_plan(state, snapshot_id, Some(&projection), &[], None)
-                    .await?,
-            );
+            let plan = match subsets.and_then(|subsets| subsets.get(snapshot_id)) {
+                Some(files) => {
+                    self.scan_bake_files(state, snapshot_id, Some(&projection), files)
+                        .await?
+                }
+                None => {
+                    self.create_snapshot_scan_plan(state, snapshot_id, Some(&projection), &[], None)
+                        .await?
+                }
+            };
+            plans.push(plan);
         }
         let plan: Arc<dyn ExecutionPlan> = if plans.len() == 1 {
             plans.remove(0)
@@ -29525,23 +29631,55 @@ impl CayenneTableProvider {
         let state = ctx.state();
         let pk_indices = self.pk_column_indices.clone();
 
+        // Split each input's files by whether the deletion filter below removes a
+        // row from them, and re-encode only those that it does. A file it removes
+        // no row from would come out of the rewrite row for row as it went in, so
+        // the bake links it into its output as it is: the output holds the same
+        // rows under the same threshold either way, and the prune below is the
+        // same. `None` rewrites every file.
+        let partition = Box::pin(self.bake_partition_input_files(
+            &state,
+            &selected,
+            &pk_indices,
+            &deletion_snapshot,
+        ))
+        .await;
+
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(selected.len());
-        for (snapshot_id, threshold) in &selected {
-            let plan = self
-                .create_snapshot_scan_plan(&state, snapshot_id, None, &[], None)
-                .await?;
-            let filtered = self.apply_partial_deletion_filter(
-                plan,
-                &pk_indices,
-                *threshold,
-                &deletion_snapshot,
-            )?;
-            plans.push(filtered);
-        }
-        let merged_plan: Arc<dyn ExecutionPlan> = if plans.len() == 1 {
-            plans.remove(0)
+        if let Some(partition) = &partition {
+            for input in &partition.inputs {
+                if input.rewrite_names.is_empty() {
+                    continue;
+                }
+                let plan = self
+                    .scan_bake_files(&state, &input.snapshot_id, None, &input.rewrite)
+                    .await?;
+                plans.push(self.apply_partial_deletion_filter(
+                    plan,
+                    &pk_indices,
+                    input.threshold,
+                    &deletion_snapshot,
+                )?);
+            }
         } else {
-            UnionExec::try_new(plans)?
+            for (snapshot_id, threshold) in &selected {
+                let plan = self
+                    .create_snapshot_scan_plan(&state, snapshot_id, None, &[], None)
+                    .await?;
+                let filtered = self.apply_partial_deletion_filter(
+                    plan,
+                    &pk_indices,
+                    *threshold,
+                    &deletion_snapshot,
+                )?;
+                plans.push(filtered);
+            }
+        }
+        let merged_plan: Arc<dyn ExecutionPlan> = match plans.len() {
+            // Every file is kept: the bake writes nothing and links them all.
+            0 => Arc::new(EmptyExec::new(self.table_schema())),
+            1 => plans.remove(0),
+            _ => UnionExec::try_new(plans)?,
         };
         // Kept to read its deletion filters' counts once the stream is drained.
         let bake_plan = Arc::clone(&merged_plan);
@@ -29562,17 +29700,26 @@ impl CayenneTableProvider {
         // not apply; size the parallel-encode fan-out from the selected inputs'
         // on-disk bytes exactly as the size-tier path does. `is_position_based()`
         // is false here (gated above), so `keeps_positions_serial` is false.
-        // Summed by the selection above.
-        let total_input_bytes = selected_input_bytes;
+        // The bytes it re-encodes: the selection's, or the rewritten files'.
+        let total_input_bytes = partition
+            .as_ref()
+            .map_or(selected_input_bytes, |partition| partition.rewritten_bytes);
         let (target_partitions, estimated_bytes) = subset_merge_write_shape(
             /* keeps_positions_serial */ false,
             state.config().target_partitions(),
             total_input_bytes,
         );
+        let (range_inputs, range_subsets) = partition
+            .as_ref()
+            .map_or_else(|| (selected.clone(), None), |partition| {
+                let (inputs, subsets) = partition.rewrite_inputs();
+                (inputs, Some(subsets))
+            });
         // Boxed for the reason `snapshot_bytes_for_merge_budget` is.
         let range_plan = Box::pin(self.bake_range_plan(
             &state,
-            &selected,
+            &range_inputs,
+            range_subsets.as_ref(),
             target_partitions,
             target_size_bytes,
             estimated_bytes,
@@ -29611,7 +29758,16 @@ impl CayenneTableProvider {
             // Page-cache hygiene (see the size-tier compaction path): drop the
             // merged output's just-written pages while it is durable but not yet
             // query-visible, so the bake doesn't evict the hot query working set.
+            // Before the kept files are linked in: their pages are the inputs'.
             self.evict_compaction_output_pages(&new_snapshot_id).await;
+        }
+
+        if let Some(partition) = &partition
+            && let Err(error) = Box::pin(self.link_bake_kept_files(&new_snapshot_id, partition)).await
+        {
+            self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                .await;
+            return Err(error);
         }
 
         let old_ids: Vec<String> = selected.iter().map(|(id, _)| id.clone()).collect();
@@ -29800,8 +29956,18 @@ impl CayenneTableProvider {
         // Page-cache hygiene for the merged-away INPUTS (Tier 1) — see the
         // size-tier path. After the swap + retire so new scans see the merged
         // output; drops the inputs' clean pages the bake just read. Best-effort.
+        // A kept file's pages are the output's, so only rewritten files go.
         if !is_s3 {
-            self.evict_compaction_input_pages(&old_ids).await;
+            match &partition {
+                Some(partition) => self.evict_bake_rewritten_input_pages(partition).await,
+                None => self.evict_compaction_input_pages(&old_ids).await,
+            }
+        }
+        #[cfg(test)]
+        {
+            self.test_bake_files.lock().last = partition
+                .as_ref()
+                .map(|partition| (partition.rewritten_files(), partition.kept_files()));
         }
 
         // The bake writes as much as any other merge, so it belongs in the same
@@ -29840,6 +30006,250 @@ impl CayenneTableProvider {
         self.schedule_orphan_dv_sweep();
 
         Ok(true)
+    }
+
+    /// Split each bake input's files by whether the bake's deletion filter removes
+    /// a row from them (see [`Self::bake_file_holds_deleted_rows`]), or `None`
+    /// when the bake must rewrite every file: no file can be kept, the table keeps
+    /// state keyed by file path that a linked file would lose (a secondary
+    /// index, position deletes), or its layout requires the rewrite (cluster or
+    /// authoritative sort columns).
+    ///
+    /// Each input is split over one capture of its directory listing — what its
+    /// scan reads — so its rewritten and kept files are exactly its files. A file
+    /// whose check fails is rewritten.
+    async fn bake_partition_input_files(
+        &self,
+        state: &dyn Session,
+        selected: &[(String, i64)],
+        pk_indices: &[usize],
+        deletion_snapshot: &PkDeletionSnapshot,
+    ) -> Option<BakeFilePartition> {
+        #[cfg(test)]
+        if self.test_bake_files.lock().rewrite_all {
+            return None;
+        }
+        if self.lookup_index.is_some()
+            || self.holds_position_deletes()
+            || self.context.has_cluster_by()
+            || self.context.sort_columns_are_authoritative()
+            || pk_indices.is_empty()
+        {
+            return None;
+        }
+        let mut inputs = Vec::with_capacity(selected.len());
+        let mut rewritten_bytes = 0_u64;
+        for (snapshot_id, threshold) in selected {
+            let captured = match self.capture_snapshot_files_under_fence(snapshot_id).await {
+                Ok(captured) => captured,
+                Err(error) => {
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_name(),
+                        snapshot_id = snapshot_id.as_str(),
+                        %error,
+                        "Seq-prefix bake rewrites every file: an input could not be listed"
+                    );
+                    return None;
+                }
+            };
+            let mut rewrite: Vec<PartitionedFile> = Vec::new();
+            let (mut rewrite_names, mut keep_names) = (Vec::new(), Vec::new());
+            for file in captured.files.iter() {
+                let name = file.object_meta.location.filename()?.to_string();
+                let holds = match Box::pin(self.bake_file_holds_deleted_rows(
+                    state,
+                    snapshot_id,
+                    &captured,
+                    file,
+                    *threshold,
+                    pk_indices,
+                    deletion_snapshot,
+                ))
+                .await
+                {
+                    Ok(holds) => holds,
+                    Err(error) => {
+                        tracing::debug!(
+                            target: "cayenne::compaction",
+                            table = self.table_name(),
+                            file = name.as_str(),
+                            %error,
+                            "Seq-prefix bake rewrites a file it could not check for deleted rows"
+                        );
+                        true
+                    }
+                };
+                if holds {
+                    rewritten_bytes = rewritten_bytes.saturating_add(file.object_meta.size);
+                    rewrite.push(file.clone());
+                    rewrite_names.push(name);
+                } else {
+                    keep_names.push(name);
+                }
+            }
+            inputs.push(BakeInputFiles {
+                snapshot_id: snapshot_id.clone(),
+                threshold: *threshold,
+                rewrite: CapturedSnapshotFiles::new(
+                    captured.dir_generation,
+                    captured.listing_epoch,
+                    Arc::new(rewrite),
+                ),
+                rewrite_names,
+                keep_names,
+            });
+        }
+        let partition = BakeFilePartition {
+            inputs,
+            rewritten_bytes,
+        };
+        (partition.kept_files() > 0).then_some(partition)
+    }
+
+    /// Whether the bake's deletion filter for an input at `threshold` removes a
+    /// row from `file`: the same filter over the file's key columns alone, with
+    /// the rows it lets through counted against the rows the file holds.
+    #[expect(clippy::too_many_arguments)]
+    async fn bake_file_holds_deleted_rows(
+        &self,
+        state: &dyn Session,
+        snapshot_id: &str,
+        captured: &CapturedSnapshotFiles,
+        file: &PartitionedFile,
+        threshold: i64,
+        pk_indices: &[usize],
+        deletion_snapshot: &PkDeletionSnapshot,
+    ) -> DataFusionResult<bool> {
+        let one_file = CapturedSnapshotFiles::new(
+            captured.dir_generation,
+            captured.listing_epoch,
+            Arc::new(vec![file.clone()]),
+        );
+        let projection = pk_indices.to_vec();
+        let scan = self
+            .scan_bake_files(state, snapshot_id, Some(&projection), &one_file)
+            .await?;
+        let schema = self.table_schema();
+        let scan_schema = scan.schema();
+        let pk_in_scan = pk_indices
+            .iter()
+            .map(|&index| scan_schema.index_of(schema.field(index).name()))
+            .collect::<std::result::Result<Vec<usize>, _>>()?;
+        let filtered =
+            self.apply_partial_deletion_filter(scan, &pk_in_scan, threshold, deletion_snapshot)?;
+        let task_ctx = state.task_ctx();
+        let surviving = count_plan_rows(filtered, Arc::clone(&task_ctx)).await?;
+        // A scan plan yields its rows once: a second execution of the plan the
+        // filter wraps comes back empty, so the file's rows are counted through a
+        // plan of their own.
+        let held = count_plan_rows(
+            self.scan_bake_files(state, snapshot_id, Some(&projection), &one_file)
+                .await?,
+            task_ctx,
+        )
+        .await?;
+        Ok(surviving != held)
+    }
+
+    /// A scan of `files`, a capture of some of `snapshot_id`'s files, read as
+    /// [`Self::create_snapshot_scan_plan`] reads the whole snapshot.
+    async fn scan_bake_files(
+        &self,
+        state: &dyn Session,
+        snapshot_id: &str,
+        projection: Option<&Vec<usize>>,
+        files: &CapturedSnapshotFiles,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.create_snapshot_scan_plan_with_config(
+            state,
+            snapshot_id,
+            projection,
+            &[],
+            None,
+            state.config(),
+            false,
+            None,
+            self.table_schema(),
+            false,
+            Self::SMALL_GROUP_REPARTITION_OPT_OUT_BYTES,
+            Some(files),
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Link (or, on object storage, copy) the files a bake keeps into its output
+    /// snapshot, after the files it wrote, and confirm the output then holds
+    /// exactly both. Refuses — before linking anything — a kept file whose name
+    /// another kept or written file already has.
+    async fn link_bake_kept_files(
+        &self,
+        new_snapshot_id: &str,
+        partition: &BakeFilePartition,
+    ) -> Result<()> {
+        let written: HashSet<String> = self
+            .list_snapshot_files_with_sizes(new_snapshot_id)
+            .await?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        let kept = partition
+            .inputs
+            .iter()
+            .flat_map(|input| input.keep_names.iter().map(String::as_str));
+        if let Some(name) = first_bake_link_collision(kept, &written) {
+            return InternalSnafu {
+                table: self.table_name().to_string(),
+                message: format!(
+                    "seq-prefix bake would link two files named '{name}' into snapshot                      {new_snapshot_id}; its output is discarded"
+                ),
+            }
+            .fail();
+        }
+        for input in &partition.inputs {
+            let names: Vec<&str> = input.keep_names.iter().map(String::as_str).collect();
+            self.link_or_copy_snapshot_files(&input.snapshot_id, new_snapshot_id, &names)
+                .await?;
+        }
+        if !self.table_metadata.path.starts_with("s3://") {
+            Self::sync_snapshot_dir(&self.snapshot_dir_path_for(new_snapshot_id))
+                .await
+                .map_err(|source| Error::Catalog { source })?;
+        }
+        let listed = self.list_snapshot_files_with_sizes(new_snapshot_id).await?;
+        let expected = written.len() + partition.kept_files();
+        ensure!(
+            listed.len() == expected,
+            InternalSnafu {
+                table: self.table_name().to_string(),
+                message: format!(
+                    "seq-prefix bake output {new_snapshot_id} holds {} files after linking,                      expected {expected}; its output is discarded",
+                    listed.len()
+                ),
+            }
+        );
+        Ok(())
+    }
+
+    /// Drop the page cache of the input files a bake rewrote. Best-effort.
+    async fn evict_bake_rewritten_input_pages(&self, partition: &BakeFilePartition) {
+        let paths: Vec<std::path::PathBuf> = partition
+            .inputs
+            .iter()
+            .flat_map(|input| {
+                let dir = self.snapshot_dir_path_for(&input.snapshot_id);
+                input
+                    .rewrite_names
+                    .iter()
+                    .map(move |name| dir.join(name))
+            })
+            .collect();
+        if !paths.is_empty() {
+            super::fadvise_tier::evict_clean_files(paths).await;
+        }
     }
 
     async fn cleanup_failed_compaction_snapshot(&self, new_snapshot_id: &str, is_s3: bool) {
@@ -83447,6 +83857,8 @@ mod tests {
     mod auto_deletion_mode;
 
     mod bake_isolation;
+
+    mod bake_partial;
 
     mod first_load_pk_filter;
 
