@@ -38,7 +38,10 @@ snafu.workspace = true
 duckdb = { workspace = true, features = [
 	"bundled",
 	"r2d2",
-	"extensions-full",
+	"json",
+	"parquet",
+	"vtab-arrow",
+	"appender-arrow",
 ] }
 
 [features]

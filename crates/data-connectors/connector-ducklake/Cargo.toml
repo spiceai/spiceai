@@ -14,7 +14,14 @@ async-trait.workspace = true
 data_components = { path = "../../data_components", features = ["duckdb"] }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true }
-duckdb = { workspace = true, features = ["bundled", "r2d2", "extensions-full"] }
+duckdb = { workspace = true, features = [
+    "bundled",
+    "r2d2",
+    "json",
+    "parquet",
+    "vtab-arrow",
+    "appender-arrow",
+] }
 runtime-component = { path = "../../runtime-component" }
 runtime-datafusion = { path = "../../runtime-datafusion" }
 runtime-parameters = { path = "../../runtime-parameters" }
