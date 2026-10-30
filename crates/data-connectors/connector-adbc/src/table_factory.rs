@@ -22,6 +22,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use data_components::adbc_helpers::DUCKDB_DRIVER;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::optimizer::OptimizerRule;
@@ -41,9 +42,6 @@ type BoxedError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The `BigQuery` driver, as ADBC spells it in the `driver` parameter.
 const BIGQUERY_DRIVER: &str = "bigquery";
-
-/// The `DuckDB` driver, as ADBC spells it in the `driver` parameter.
-pub(crate) const DUCKDB_DRIVER: &str = "duckdb";
 
 /// The unparser dialect for a driver.
 ///

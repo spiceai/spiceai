@@ -34,14 +34,49 @@ use std::sync::Arc;
 
 use crate::{FieldMetadata, metadata_enriched_table_provider};
 
-/// Builds the list of ADBC database options from connector parameters.
+/// The `DuckDB` driver name used by ADBC connectors.
+pub const DUCKDB_DRIVER: &str = "duckdb";
+
+/// `DuckDB` exports this ADBC entry point instead of `AdbcDriverInit`.
+pub const DUCKDB_ADBC_ENTRYPOINT: &[u8] = b"duckdb_adbc_init";
+
+/// Match the `duckdb:` connector's read-only access and UTC timestamps by default.
+pub const DUCKDB_DB_DEFAULTS: &[(&str, &str)] =
+    &[("access_mode", "read_only"), ("TimeZone", "UTC")];
+
+/// Applies the `adbc.` prefix a driver-option key takes when it is written without
+/// one. `bigquery.sql.dataset_id` and `adbc.bigquery.sql.dataset_id` name the same
+/// option, so anything matching on a key has to agree on the spelling.
+#[must_use]
+pub fn normalize_driver_option_key(key: &str) -> String {
+    if key.starts_with("adbc.") {
+        key.to_string()
+    } else {
+        format!("adbc.{key}")
+    }
+}
+
+/// Returns `duckdb_adbc_init` for `DuckDB`, which does not export `AdbcDriverInit`.
+#[must_use]
+pub fn driver_entrypoint(driver_name: &str) -> Option<&'static [u8]> {
+    (driver_name == DUCKDB_DRIVER).then_some(DUCKDB_ADBC_ENTRYPOINT)
+}
+
+/// Builds database options, preserving raw `DuckDB` keys because it rejects unknown keys.
+/// Uses `path` for `DuckDB`: 1.4.4 rejects `uri`, while both 1.4.4 and 1.5.5 accept `path`.
 pub fn build_db_options(
+    driver_name: &str,
     uri: &str,
     username: Option<&str>,
     password: Option<&str>,
     driver_options: Option<&str>,
 ) -> Vec<(OptionDatabase, adbc_core::options::OptionValue)> {
-    let mut opts = vec![(OptionDatabase::Uri, uri.into())];
+    let uri_option = if driver_name == DUCKDB_DRIVER {
+        OptionDatabase::Other("path".to_string())
+    } else {
+        OptionDatabase::Uri
+    };
+    let mut opts = vec![(uri_option, uri.into())];
     if let Some(u) = username {
         opts.push((OptionDatabase::Username, u.into()));
     }
@@ -60,14 +95,25 @@ pub fn build_db_options(
                     tracing::warn!("Ignoring ADBC driver option with empty key");
                     continue;
                 }
-                let key = if key.starts_with("adbc.") {
-                    key.to_string()
-                } else {
-                    format!("adbc.{key}")
-                };
-                opts.push((OptionDatabase::Other(key), value.trim().into()));
+                opts.push((
+                    OptionDatabase::Other(if driver_name == DUCKDB_DRIVER {
+                        key.to_string()
+                    } else {
+                        normalize_driver_option_key(key)
+                    }),
+                    value.trim().into(),
+                ));
             } else {
                 tracing::warn!("Ignoring malformed ADBC driver option (expected 'key=value')");
+            }
+        }
+    }
+    if driver_name == DUCKDB_DRIVER {
+        for &(key, value) in DUCKDB_DB_DEFAULTS {
+            if !opts.iter().any(|(option, _)| {
+                matches!(option, OptionDatabase::Other(name) if name.eq_ignore_ascii_case(key))
+            }) {
+                opts.push((OptionDatabase::Other(key.to_string()), value.into()));
             }
         }
     }
@@ -79,19 +125,10 @@ pub fn build_db_options(
 ///
 /// These are the stock `DataFusion` dialects, which rewrite no Spice function.
 ///
-/// Its only caller today is the ADBC **catalog** connector, which installs no
-/// federation function-support policy at all, so every Spice-only UDF in a
-/// federated plan reaches the unparser and is emitted verbatim into the remote
-/// SQL. That is a live defect, not a safe configuration
-/// ([#13664](https://github.com/spiceai/spiceai/issues/13664)); the fix is to
-/// install the policy, not to change the dialect.
-///
-/// The ADBC *dataset* connector has its own dialect, in `connector-adbc`, which
-/// rewrites the JSON extraction functions into `BigQuery` SQL. **Do not reach
-/// for that one from here.** It renders only the call shapes `BigQuery` can
-/// express and errors on the rest, and the policy paired with it is what keeps
-/// the rest from reaching the unparser at all; without that policy it turns
-/// #13664's wrong-function error into a failed query.
+/// The catalog connector uses these for drivers other than `DuckDB`. Its
+/// `DuckDB` dialect and function-support policy must stay paired in the runtime.
+/// The dataset connector's `BigQuery` dialect rewrites Spice functions and must
+/// only be used with its matching policy; the catalog keeps the stock dialect.
 #[must_use]
 pub fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
     match driver_name {
@@ -293,4 +330,214 @@ fn bigquery_information_schema_table(table_reference: &TableReference, view: &st
 
 fn bigquery_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_driver_entrypoint() {
+        assert_eq!(
+            driver_entrypoint("duckdb"),
+            Some(b"duckdb_adbc_init".as_slice())
+        );
+        for driver in ["sqlite", "postgresql", "snowflake", "other"] {
+            assert_eq!(driver_entrypoint(driver), None, "driver: {driver}");
+        }
+    }
+
+    fn assert_db_options_eq(
+        actual: Vec<(OptionDatabase, adbc_core::options::OptionValue)>,
+        expected: Vec<(OptionDatabase, &str)>,
+    ) {
+        assert_eq!(actual.len(), expected.len());
+        for ((key, value), (expected_key, expected_value)) in actual.into_iter().zip(expected) {
+            assert_eq!(key, expected_key);
+            let adbc_core::options::OptionValue::String(value) = value else {
+                panic!("expected a string database option, got {value:?}");
+            };
+            assert_eq!(value, expected_value);
+        }
+    }
+
+    #[test]
+    fn test_build_db_options_duckdb_defaults() {
+        assert_db_options_eq(
+            build_db_options("duckdb", "test.db", None, None, None),
+            vec![
+                (OptionDatabase::Other("path".into()), "test.db"),
+                (OptionDatabase::Other("access_mode".into()), "read_only"),
+                (OptionDatabase::Other("TimeZone".into()), "UTC"),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_build_db_options_duckdb_raw_keys() {
+        assert_db_options_eq(
+            build_db_options(
+                "duckdb",
+                "test.db",
+                None,
+                None,
+                Some("threads=2;adbc.custom=value"),
+            ),
+            vec![
+                (OptionDatabase::Other("path".into()), "test.db"),
+                (OptionDatabase::Other("threads".into()), "2"),
+                (OptionDatabase::Other("adbc.custom".into()), "value"),
+                (OptionDatabase::Other("access_mode".into()), "read_only"),
+                (OptionDatabase::Other("TimeZone".into()), "UTC"),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_build_db_options_duckdb_access_mode_override() {
+        assert_db_options_eq(
+            build_db_options(
+                "duckdb",
+                "test.db",
+                None,
+                None,
+                Some("ACCESS_MODE=read_write"),
+            ),
+            vec![
+                (OptionDatabase::Other("path".into()), "test.db"),
+                (OptionDatabase::Other("ACCESS_MODE".into()), "read_write"),
+                (OptionDatabase::Other("TimeZone".into()), "UTC"),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_build_db_options_duckdb_timezone_override() {
+        assert_db_options_eq(
+            build_db_options(
+                "duckdb",
+                "test.db",
+                None,
+                None,
+                Some("timezone=America/New_York"),
+            ),
+            vec![
+                (OptionDatabase::Other("path".into()), "test.db"),
+                (OptionDatabase::Other("timezone".into()), "America/New_York"),
+                (OptionDatabase::Other("access_mode".into()), "read_only"),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_build_db_options_uri_only() {
+        let opts = build_db_options("snowflake", "file:test.db", None, None, None);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].0, OptionDatabase::Uri);
+        assert!(
+            matches!(&opts[0].1, adbc_core::options::OptionValue::String(s) if s == "file:test.db")
+        );
+    }
+
+    #[test]
+    fn test_build_db_options_with_username_password() {
+        let opts = build_db_options(
+            "postgresql",
+            "postgres://host/db",
+            Some("admin"),
+            Some("secret"),
+            None,
+        );
+        assert_eq!(opts.len(), 3);
+
+        assert_eq!(opts[0].0, OptionDatabase::Uri);
+        assert!(
+            matches!(&opts[0].1, adbc_core::options::OptionValue::String(s) if s == "postgres://host/db")
+        );
+
+        assert_eq!(opts[1].0, OptionDatabase::Username);
+        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "admin"));
+
+        assert_eq!(opts[2].0, OptionDatabase::Password);
+        assert!(matches!(&opts[2].1, adbc_core::options::OptionValue::String(s) if s == "secret"));
+    }
+
+    #[test]
+    fn test_build_db_options_username_only() {
+        let opts = build_db_options("sqlite", "sqlite:test.db", Some("user"), None, None);
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0].0, OptionDatabase::Uri);
+        assert_eq!(opts[1].0, OptionDatabase::Username);
+        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "user"));
+    }
+
+    #[test]
+    fn test_build_db_options_with_driver_options_unprefixed() {
+        let opts = build_db_options(
+            "snowflake",
+            "uri://db",
+            None,
+            None,
+            Some("snowflake.sql.db=MY_DB;snowflake.sql.schema=PUBLIC"),
+        );
+        assert_eq!(opts.len(), 3);
+        assert_eq!(opts[0].0, OptionDatabase::Uri);
+        assert_eq!(
+            opts[1].0,
+            OptionDatabase::Other("adbc.snowflake.sql.db".to_string())
+        );
+        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "MY_DB"));
+        assert_eq!(
+            opts[2].0,
+            OptionDatabase::Other("adbc.snowflake.sql.schema".to_string())
+        );
+        assert!(matches!(&opts[2].1, adbc_core::options::OptionValue::String(s) if s == "PUBLIC"));
+    }
+
+    #[test]
+    fn test_build_db_options_with_driver_options_prefixed() {
+        let opts = build_db_options(
+            "snowflake",
+            "uri://db",
+            None,
+            None,
+            Some("adbc.snowflake.sql.db=MY_DB;adbc.snowflake.sql.schema=PUBLIC"),
+        );
+        assert_eq!(opts.len(), 3);
+        assert_eq!(
+            opts[1].0,
+            OptionDatabase::Other("adbc.snowflake.sql.db".to_string())
+        );
+        assert_eq!(
+            opts[2].0,
+            OptionDatabase::Other("adbc.snowflake.sql.schema".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_db_options_driver_options_trailing_semicolon() {
+        let opts = build_db_options("snowflake", "uri://db", None, None, Some("key=value;"));
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[1].0, OptionDatabase::Other("adbc.key".to_string()));
+        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "value"));
+    }
+
+    #[test]
+    fn test_build_db_options_driver_options_malformed_ignored() {
+        let opts = build_db_options(
+            "snowflake",
+            "uri://db",
+            None,
+            None,
+            Some("good=val;bad_no_equals;another=ok"),
+        );
+        assert_eq!(opts.len(), 3); // uri + good + another (bad_no_equals skipped)
+    }
+
+    #[test]
+    fn test_build_db_options_driver_options_empty_key_ignored() {
+        let opts = build_db_options("snowflake", "uri://db", None, None, Some("=value;good=ok"));
+        assert_eq!(opts.len(), 2); // uri + good (empty key skipped)
+        assert_eq!(opts[1].0, OptionDatabase::Other("adbc.good".to_string()));
+    }
 }

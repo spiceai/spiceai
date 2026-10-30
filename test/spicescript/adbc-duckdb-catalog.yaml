@@ -1,0 +1,97 @@
+name: adbc-duckdb-catalog
+description: >
+  Discover DuckDB schemas and tables through the ADBC catalog, select tables
+  with include/exclude patterns, and compare typed rows, aggregates and joins
+  against a concurrent read-only DuckDB reader. Decimal avg stays local.
+
+sources:
+  src: { kind: duckdb }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: adbc-duckdb-catalog
+  catalogs:
+    - from: adbc
+      name: ddb
+      include: ['main.*', 'other.*']
+      exclude: ['main.secret']
+      params: ${sources.src.adbc_params}
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  # DuckDB permits a writer only before Spice opens the file read-only.
+  - source-exec:
+      src: |
+        CREATE TABLE readings (
+          id INTEGER, item_id INTEGER, amount DECIMAL(10,2), value DOUBLE,
+          note VARCHAR, day DATE, seen_at TIMESTAMP, active BOOLEAN
+        );
+        INSERT INTO readings VALUES
+          (1, 1, 12.50, 1.25, 'café', DATE '2024-01-01', TIMESTAMP '2024-01-01 12:30:00', true),
+          (2, 1, 20.00, -2.5, '東京', DATE '2024-01-02', TIMESTAMP '2024-01-02 00:00:01', false),
+          (3, 2, NULL, NULL, NULL, NULL, NULL, NULL),
+          (4, 2, -2.50, 0.0, 'naïve', DATE '2024-02-29', TIMESTAMP '2024-02-29 23:59:59', true);
+        CREATE TABLE items (id INTEGER, name VARCHAR);
+        INSERT INTO items VALUES (1, 'alpha'), (2, 'βeta');
+        CREATE SCHEMA other;
+        CREATE TABLE other.extra (id INTEGER, note VARCHAR);
+        INSERT INTO other.extra VALUES (1, '雪'), (2, NULL);
+        CREATE TABLE secret (id INTEGER);
+        INSERT INTO secret VALUES (99);
+        CREATE SCHEMA ignored;
+        CREATE TABLE ignored.hidden (id INTEGER);
+        INSERT INTO ignored.hidden VALUES (100);
+  - start: {}
+
+  - query: >
+      SELECT table_schema, table_name FROM information_schema.tables
+      WHERE table_catalog = 'ddb' AND table_schema <> 'information_schema' ORDER BY 1, 2
+    expect:
+      rows:
+        - [main, items]
+        - [main, readings]
+        - [other, extra]
+  - query: SELECT * FROM ddb.main.readings ORDER BY id
+    oracle-sql: SELECT * FROM main.readings ORDER BY id
+  - query: SELECT * FROM ddb.main.items ORDER BY id
+    oracle-sql: SELECT * FROM main.items ORDER BY id
+  - query: SELECT * FROM ddb.other.extra ORDER BY id
+    oracle-sql: SELECT * FROM other.extra ORDER BY id
+  - query: >
+      SELECT item_id, count(*) AS n, sum(value) AS total FROM ddb.main.readings
+      WHERE active = true GROUP BY item_id ORDER BY item_id
+    oracle-sql: >
+      SELECT item_id, count(*) AS n, sum(value) AS total FROM main.readings
+      WHERE active = true GROUP BY item_id ORDER BY item_id
+  - query: >
+      SELECT i.name, count(*) AS n, sum(r.amount) AS total
+      FROM ddb.main.readings r JOIN ddb.main.items i ON r.item_id = i.id
+      WHERE r.note IS NOT NULL GROUP BY i.name ORDER BY i.name
+    oracle-sql: >
+      SELECT i.name, count(*) AS n, sum(r.amount) AS total
+      FROM main.readings r JOIN main.items i ON r.item_id = i.id
+      WHERE r.note IS NOT NULL GROUP BY i.name ORDER BY i.name
+  - query: SELECT avg(amount) AS mean FROM ddb.main.readings
+    oracle-sql: SELECT avg(amount) AS mean FROM main.readings
+  - explain: SELECT id FROM ddb.main.readings WHERE id > 1
+    contains: [VirtualExecutionPlan]
+    omits: [FilterExec]
+  - explain: SELECT avg(amount) AS mean FROM ddb.main.readings
+    contains: [AggregateExec, VirtualExecutionPlan]
+
+  # The CLI attaches read-only while the catalog still holds its connections.
+  - source-query:
+      src: SELECT id, note FROM main.readings ORDER BY id
+    expect:
+      rows:
+        - [1, café]
+        - [2, 東京]
+        - [3, null]
+        - [4, naïve]
+  - query: SELECT * FROM ddb.main.secret
+    expect-error: true
+  - query: SELECT * FROM ddb.ignored.hidden
+    expect-error: true
