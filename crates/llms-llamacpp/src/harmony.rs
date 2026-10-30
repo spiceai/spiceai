@@ -108,13 +108,13 @@ impl Markers {
         let mut out = Vec::new();
         let mut rest = text;
         while !rest.is_empty() {
-            let (token, len) = match spelled.iter().find(|(s, _)| rest.starts_with(s)) {
-                Some((s, token)) => (Some(*token), s.len()),
-                None => {
+            let (token, len) =
+                if let Some((s, token)) = spelled.iter().find(|(s, _)| rest.starts_with(s)) {
+                    (Some(*token), s.len())
+                } else {
                     let next = spelled.iter().filter_map(|(s, _)| rest.find(s)).min();
                     (None, next.unwrap_or(rest.len()))
-                }
-            };
+                };
             out.push((token, &rest[..len]));
             rest = &rest[len..];
         }
