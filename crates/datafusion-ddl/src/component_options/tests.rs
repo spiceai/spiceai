@@ -1248,11 +1248,59 @@ fn every_test_spicepod_component_round_trips_through_its_create_statement() {
 /// A statement that cannot be read into tokens gives up each word that may be
 /// a value: a quoted word even when it spells a keyword, such as `'secret`, and
 /// an unquoted word that is not a keyword; a word shorter than four
-/// characters stays.
+/// characters stays, except inside a literal, which the end of the text cuts
+/// short here and which is given up whole.
 #[test]
 fn an_unreadable_statement_gives_up_quoted_keywords() {
     assert_eq!(
         unreadable_parts("CREATE TABLE t WITH (pg_pass = 'secret, pg_user = Xy9, pg_db = mydb)"),
-        ["pg_pass", "'secret", "secret", "pg_user", "pg_db", "mydb"]
+        [
+            "secret, pg_user = Xy9, pg_db = mydb)",
+            "pg_pass",
+            "'secret",
+            "secret",
+            "pg_user",
+            "pg_db",
+            "mydb"
+        ]
+    );
+}
+
+/// Each literal of a statement that cannot be read into tokens is given up
+/// whole, closed or cut short by the end of the text, with `'` or a dollar
+/// quote: a value of short words, such as `'zqx qjv wkp`, is no less a secret.
+#[test]
+fn an_unreadable_statement_gives_up_each_literal_whole() {
+    assert_eq!(
+        unreadable_parts("CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = 'zqx qjv wkp"),
+        [
+            "postgres:public.t",
+            "zqx qjv wkp",
+            "'postgres:public.t'",
+            "postgres:public.t",
+            "pg_pass"
+        ]
+    );
+    assert_eq!(
+        unreadable_parts("x = 'ab cd', y = $tag$ef gh"),
+        ["ab cd", "ef gh", "$tag$ef"]
+    );
+    assert_eq!(
+        unreadable_parts("x = 'it''s ok"),
+        ["it''s ok", "'it''s", "it''s"]
+    );
+}
+
+/// Another argument of a call that repeats a value its statement gave up, such
+/// as a confirmation, gives it up too.
+#[test]
+fn a_calls_other_arguments_give_up_its_statements_values() {
+    let (recorded, _) = recorded_call_arguments(
+        r#"{"query":"CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = 'hunter2')","confirmation":"password hunter2"}"#,
+    )
+    .expect("the call holds a statement that defines a component");
+    assert_eq!(
+        recorded,
+        r#"{"query":"CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = '<redacted>')","confirmation":"password <redacted>"}"#
     );
 }

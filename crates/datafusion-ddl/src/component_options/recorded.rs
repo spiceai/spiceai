@@ -80,13 +80,19 @@ impl<'a> RecordedStatement<'a> {
 }
 
 /// The parts of `text`, which cannot be read into tokens, that may be values:
-/// each word of at least [`SHORTEST_BARE_VALUE`] characters that is quoted or
-/// is not a keyword, as written and without the quotes around it. A quoted
-/// keyword, such as `'secret`, is a literal. A source that quotes the text
-/// back loses them, which may take out a name too; that fails closed.
+/// each quoted literal of at least [`SHORTEST_BARE_VALUE`] characters, as a
+/// whole, closed or cut short by the end of the text, since a literal of short
+/// words is no less a secret; then each word of that many characters that is
+/// quoted or is not a keyword, as written and without the quotes around it. A
+/// quoted keyword, such as `'secret`, is a literal. A source that quotes the
+/// text back loses them, which may take out a name too; that fails closed.
 #[must_use]
 pub fn unreadable_parts(text: &str) -> Vec<String> {
-    let mut parts = Vec::new();
+    let mut parts: Vec<String> = quoted_literals(text)
+        .into_iter()
+        .filter(|literal| literal.chars().count() >= SHORTEST_BARE_VALUE)
+        .map(str::to_string)
+        .collect();
     for word in text.split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | '=' | ';'))
     {
         let bare = word.trim_matches(|c: char| matches!(c, '\'' | '"' | '`'));
@@ -105,6 +111,50 @@ pub fn unreadable_parts(text: &str) -> Vec<String> {
         }
     }
     parts
+}
+
+/// The text inside each quote of `text`, to the quote that closes it or to the
+/// end of `text`: a `'`, `"`, or `` ` `` quote, in which a doubled quote stays
+/// inside, or a dollar quote, `$$` or `$tag$`, which the same tag closes.
+fn quoted_literals(text: &str) -> Vec<&str> {
+    let mut literals = Vec::new();
+    let mut rest = 0;
+    while let Some(offset) = text[rest..].find(['\'', '"', '`', '$']) {
+        let start = rest + offset;
+        let opener = &text[start..];
+        let close = if opener.starts_with('$') {
+            let tag_len = opener[1..]
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(opener.len() - 1);
+            if !opener[1 + tag_len..].starts_with('$') {
+                rest = start + 1;
+                continue;
+            }
+            &opener[..tag_len + 2]
+        } else {
+            &opener[..1]
+        };
+        let from = start + close.len();
+        let mut end = text.len();
+        let mut at = from;
+        while let Some(found) = text[at..].find(close) {
+            let i = at + found;
+            // A doubled `'`, `"`, or `` ` `` is one quote inside the literal.
+            if close.len() == 1 && text[i + 1..].starts_with(close) {
+                at = i + 2;
+                continue;
+            }
+            end = i;
+            break;
+        }
+        literals.push(&text[from..end]);
+        rest = if end == text.len() {
+            text.len()
+        } else {
+            end + close.len()
+        };
+    }
+    literals
 }
 
 /// `message`, an error a statement failed with or a result that repeats it,
@@ -190,7 +240,34 @@ pub fn recorded_call_arguments(arguments: &str) -> Option<(String, Vec<String>)>
             Cow::Borrowed(_) => None,
         };
     };
-    record_json_statements(&mut value, &mut removed).then(|| (value.to_string(), removed))
+    if !record_json_statements(&mut value, &mut removed) {
+        return None;
+    }
+    // Another argument of the call can repeat a value a statement gave up.
+    redact_json_strings(&mut value, &removed);
+    Some((value.to_string(), removed))
+}
+
+/// Take `removed` out of every string of `value`.
+fn redact_json_strings(value: &mut Value, removed: &[String]) {
+    match value {
+        Value::String(text) => {
+            if let Cow::Owned(redacted) = redact_values(text, removed) {
+                *text = redacted;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_json_strings(item, removed);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                redact_json_strings(item, removed);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Record each statement in the strings of `value`, as

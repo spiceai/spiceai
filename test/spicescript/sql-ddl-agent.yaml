@@ -306,6 +306,28 @@ steps:
       body: SELECT task, input, captured_output, error_message FROM runtime.task_history WHERE task IN ('tool_use::peer3__sql', 'tool_use::peer5__sql') AND (input LIKE '%t12%' OR input LIKE '%t13%') ORDER BY task
     expect: { status: 200, body-matches: 'TABLE t12[\s\S]*TABLE t13', body-lacks: ['leak-'] }
     eventually: 30s
+  # A call whose other argument repeats the password its statement sets, and
+  # a statement cut short inside a quote whose password is short words.
+  - http:
+      method: POST
+      path: /v1/tools/peer2__query
+      headers: { content-type: application/json }
+      body: '{"query": "CREATE TABLE t14 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-sibling'')", "confirmation": "password leak-sibling"}'
+    expect: { body-contains: t14 }
+  - http:
+      method: POST
+      path: /v1/tools/peer__sql
+      headers: { content-type: application/json }
+      body: '{"query": "CREATE TABLE t15 WITH (from = ''postgres:public.t'', pg_pass = ''zqx qjv wkp"}'
+    expect: { body-contains: t15 }
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SELECT task, input, captured_output, error_message FROM runtime.task_history WHERE task IN ('tool_use::peer2__query', 'tool_use::peer__sql') AND (input LIKE '%t14%' OR error_message LIKE '%t15%') ORDER BY task
+    expect: { status: 200, body-matches: 'TABLE t14[\s\S]*TABLE t15', body-lacks: ['leak-', 'zqx', 'qjv', 'wkp'] }
+    eventually: 30s
   # Every row of task history, every column a value can reach.
   - http:
       method: POST
