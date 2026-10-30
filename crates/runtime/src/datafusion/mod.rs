@@ -7076,8 +7076,7 @@ impl DataFusion {
         // The plain parser suffices: only `CREATE TABLE ... CLUSTER BY` needs
         // `planner::parse_sql_statement`, and it has no table functions.
         let dialect = state.config().options().sql_parser.dialect;
-        state
-            .sql_to_statement(sql, &dialect)
+        sql_depth_guard::sql_to_statement(&state, sql, &dialect)
             .and_then(|mut statement| bind_table_function_args(&mut statement, None))
             .is_ok_and(|placeholders| placeholders == TableFunctionPlaceholders::Present)
     }
