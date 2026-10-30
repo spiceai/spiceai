@@ -580,7 +580,10 @@ async fn splitting_a_bakes_inputs_leaves_their_listings_whole() {
         "precondition: the split both keeps and rewrites files"
     );
 
-    for (id, files, rows) in &whole {
+    // Newest first: the split checks the inputs in order, so a listing it stored
+    // would be the last input's, and a capture of any other snapshot would
+    // replace it before the last input is checked.
+    for (id, files, rows) in whole.iter().rev() {
         let captured = t
             .provider
             .capture_snapshot_files_under_fence(id)
