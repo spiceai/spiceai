@@ -44,21 +44,35 @@ struct Batch {
 struct Counts {
     commits: usize,
     spilled: usize,
+    spilled_missing: usize,
     position_alone: usize,
     position_with_other_changes: usize,
     kinds: BTreeMap<&'static str, usize>,
 }
 
 impl Counts {
-    fn add(&mut self, encoded: &[u8]) {
+    /// `spilled` maps a spilled payload's digest, in hex, to its bytes.
+    fn add(&mut self, encoded: &[u8], spilled: &BTreeMap<String, bytes::Bytes>) {
         let record = Record::decode(encoded).expect("log record");
         self.commits += 1;
-        if record.spilled.is_some() {
-            self.spilled += 1;
-            return;
-        }
+        let payload = match &record.spilled {
+            Some(reference) => {
+                self.spilled += 1;
+                let digest: String = reference
+                    .digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                let Some(bytes) = spilled.get(&digest) else {
+                    self.spilled_missing += 1;
+                    return;
+                };
+                bytes.clone()
+            }
+            None => record.payload,
+        };
         let mut names = Vec::new();
-        for payload in Group::decode(record.payload).expect("group").payloads {
+        for payload in Group::decode(payload).expect("group").payloads {
             let record = cayenne_metastore_actions::Record::decode(payload).expect("record");
             names.extend(
                 record
@@ -98,6 +112,22 @@ async fn main() {
     let head = &reader.state().head;
     // Nothing is deleted yet, so every sealed batch is still present; the head's
     // window holds the commits not yet sealed.
+    // Spilled payloads live at `objects/<generation>/records/<digest>`.
+    let mut spilled = BTreeMap::new();
+    for meta in listed(&store, &prefix.clone().join("objects")).await {
+        let parts: Vec<_> = meta.location.parts().collect();
+        if parts.len() >= 2 && parts[parts.len() - 2].as_ref() == "records" {
+            let digest = parts[parts.len() - 1].as_ref().to_string();
+            let bytes = store
+                .get(&meta.location)
+                .await
+                .expect("spilled record")
+                .bytes()
+                .await
+                .expect("bytes");
+            spilled.insert(digest, bytes);
+        }
+    }
     let mut counts = Counts::default();
     for meta in listed(&store, &prefix.clone().join("wal")).await {
         let bytes = store
@@ -108,18 +138,19 @@ async fn main() {
             .await
             .expect("bytes");
         for encoded in Batch::decode(bytes).expect("batch").records {
-            counts.add(&encoded);
+            counts.add(&encoded, &spilled);
         }
     }
     for entry in &head.window {
-        counts.add(&entry.encoded);
+        counts.add(&entry.encoded, &spilled);
     }
     println!(
-        "head commit={} floor={} commits_read={} spilled_unread={} position_alone={} position_with_other_changes={}",
+        "head commit={} floor={} commits_read={} spilled={} spilled_missing={} position_alone={} position_with_other_changes={}",
         head.commit,
         head.floor,
         counts.commits,
         counts.spilled,
+        counts.spilled_missing,
         counts.position_alone,
         counts.position_with_other_changes
     );
