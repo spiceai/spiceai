@@ -81,7 +81,7 @@
   "mysql-cdc-parity": 43,
   "mysql-cdc-shared-binlog": 41,
   "mysql-cdc-upgrade": 12,
-  "mysql-connection-pool": 23,
+  "mysql-connection-pool": 65,
   "mysql-join-capabilities": 11,
   "mysql-literals": 12,
   "mysql-null-ordering": 11,
