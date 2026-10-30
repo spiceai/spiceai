@@ -4502,7 +4502,6 @@ dependencies = [
  "arrow",
  "async-stream",
  "async-trait",
- "bigdecimal",
  "chrono",
  "chrono-tz 0.8.6",
  "clickhouse-rs",
