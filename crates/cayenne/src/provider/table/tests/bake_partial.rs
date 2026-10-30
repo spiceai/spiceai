@@ -175,7 +175,9 @@ fn key_columns(key: Key, keys: &[i64]) -> Vec<ArrayRef> {
 async fn upsert(provider: &CayenneTableProvider, key: Key, rows: &[(i64, i64)]) {
     let keys: Vec<i64> = rows.iter().map(|(ts, _)| *ts).collect();
     let mut columns = key_columns(key, &keys);
-    columns.push(Arc::new(Int64Array::from_iter_values(rows.iter().map(|(_, v)| *v))));
+    columns.push(Arc::new(Int64Array::from_iter_values(
+        rows.iter().map(|(_, v)| *v),
+    )));
     columns.push(Arc::new(StringArray::from_iter_values(
         rows.iter().map(|(ts, v)| pad(*ts, *v)),
     )));
@@ -227,8 +229,9 @@ async fn write_checkpoints_keyed(
 ) {
     for c in range {
         let fresh = c * ROWS_PER_CHECKPOINT;
-        let mut rows: Vec<(i64, i64)> =
-            (fresh..fresh + ROWS_PER_CHECKPOINT).map(|ts| (ts, c)).collect();
+        let mut rows: Vec<(i64, i64)> = (fresh..fresh + ROWS_PER_CHECKPOINT)
+            .map(|ts| (ts, c))
+            .collect();
         if c > 0 {
             rows.extend((fresh - REPLAYED_PER_CHECKPOINT..fresh).map(|ts| (ts, c)));
         }
@@ -332,20 +335,31 @@ async fn bake(provider: &CayenneTableProvider, what: &str) {
 
 /// Physically delete the snapshot directories `provider` has retired: elapse
 /// their grace, sweep, and wait until they are gone.
-async fn sweep_retired(provider: &CayenneTableProvider) {
-    let retired: Vec<String> = provider.retired_snapshot_dirs.lock().keys().cloned().collect();
+///
+/// A scan first, so the provider's cached scan view moves to the live snapshots
+/// and releases its pins on the retired ones, as the next query does.
+async fn sweep_retired(provider: &CayenneTableProvider, name: &str) {
+    let _ = rows_of(provider, name).await;
+    let retired: Vec<String> = provider
+        .retired_snapshot_dirs
+        .lock()
+        .keys()
+        .cloned()
+        .collect();
     let past = std::time::Instant::now()
         .checked_sub(CayenneTableProvider::SNAPSHOT_CLEANUP_GRACE * 2)
         .expect("the clock has run longer than two graces");
-    for at in provider.retired_snapshot_dirs.lock().values_mut() {
-        *at = past;
-    }
-    for at in provider.snapshot_last_listed.lock().values_mut() {
-        *at = past;
-    }
-    provider.sweep_retired_snapshot_dirs();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
+        // A pass that finds the file-deletion hold taken (an orphaned-DV sweep the
+        // bake scheduled) deletes nothing, so sweep again on every poll.
+        for at in provider.retired_snapshot_dirs.lock().values_mut() {
+            *at = past;
+        }
+        for at in provider.snapshot_last_listed.lock().values_mut() {
+            *at = past;
+        }
+        provider.sweep_retired_snapshot_dirs();
         let mut left: Vec<&String> = Vec::new();
         for id in &retired {
             if tokio::fs::try_exists(provider.snapshot_dir_path_for(id))
@@ -372,7 +386,11 @@ async fn sweep_retired(provider: &CayenneTableProvider) {
 /// from one that rewrites every file, and both match the model. The partial
 /// table must actually keep files, and still rewrite the ones holding replayed
 /// or deleted keys, or the comparison proves nothing.
-async fn partial_bake_matches_full_bake(key: Key, partial_name: &'static str, full_name: &'static str) {
+async fn partial_bake_matches_full_bake(
+    key: Key,
+    partial_name: &'static str,
+    full_name: &'static str,
+) {
     let partial = table_keyed(partial_name, key, false).await;
     let full = table_keyed(full_name, key, true).await;
     let mut model = Model::new();
@@ -414,7 +432,7 @@ async fn partial_bake_matches_full_bake(key: Key, partial_name: &'static str, fu
             "round {round}: both bakes prune the same tombstones"
         );
 
-        sweep_retired(&partial.provider).await;
+        sweep_retired(&partial.provider, partial.name).await;
         assert_rows(
             &rows_of(&full.provider, full.name).await,
             &model,
@@ -450,16 +468,12 @@ async fn partial_bake_matches_full_bake(key: Key, partial_name: &'static str, fu
     } = partial;
     drop(provider);
     let reopened = reopen(&catalog, &tmp, name, key).await;
-    assert_rows(
-        &rows_of(&reopened, name).await,
-        &model,
-        "after a restart",
-    );
+    assert_rows(&rows_of(&reopened, name).await, &model, "after a restart");
 
     // Bake again after the restart, over files earlier bakes kept and linked.
     write_checkpoints_keyed(&[(&reopened, key)], &mut model, 14..17, true).await;
     bake(&reopened, "after the restart").await;
-    sweep_retired(&reopened).await;
+    sweep_retired(&reopened, name).await;
     assert_rows(
         &rows_of(&reopened, name).await,
         &model,
@@ -477,8 +491,12 @@ async fn a_partial_bake_returns_the_rows_a_full_bake_does() {
 /// tombstoned key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_partial_bake_on_an_int64_key_returns_the_rows_a_full_bake_does() {
-    partial_bake_matches_full_bake(Key::Int64, "bake_partial_int64_kept", "bake_partial_int64_full")
-        .await;
+    partial_bake_matches_full_bake(
+        Key::Int64,
+        "bake_partial_int64_kept",
+        "bake_partial_int64_full",
+    )
+    .await;
 }
 
 /// The kept files' names are checked before any is linked: a name repeated
@@ -544,7 +562,12 @@ async fn splitting_a_bakes_inputs_leaves_their_listings_whole() {
     let pk_indices = t.provider.pk_column_indices.clone();
     let partition = t
         .provider
-        .bake_partition_input_files(&state, &selected, &pk_indices, &t.provider.pk_deletion_snapshot())
+        .bake_partition_input_files(
+            &state,
+            &selected,
+            &pk_indices,
+            &t.provider.pk_deletion_snapshot(),
+        )
         .await
         .expect("the inputs split: older files hold no replayed key");
     assert!(
@@ -578,14 +601,12 @@ async fn splitting_a_bakes_inputs_leaves_their_listings_whole() {
 
 /// Checkpoint `c` with fresh keys only, at version `c`: no key it writes was
 /// written before, so it records no tombstone.
-async fn write_fresh_checkpoints(
-    t: &Table,
-    model: &mut Model,
-    range: std::ops::Range<i64>,
-) {
+async fn write_fresh_checkpoints(t: &Table, model: &mut Model, range: std::ops::Range<i64>) {
     for c in range {
         let fresh = c * ROWS_PER_CHECKPOINT;
-        let rows: Vec<(i64, i64)> = (fresh..fresh + ROWS_PER_CHECKPOINT).map(|ts| (ts, c)).collect();
+        let rows: Vec<(i64, i64)> = (fresh..fresh + ROWS_PER_CHECKPOINT)
+            .map(|ts| (ts, c))
+            .collect();
         for (ts, v) in &rows {
             model.insert((*ts, hash_of(*ts)), *v);
         }
@@ -625,7 +646,7 @@ async fn the_byte_bound_never_stops_a_bake_where_its_prune_is_unsafe() {
 
     // Every snapshot is over a one-byte bound.
     t.provider.test_bake_files.lock().max_input_bytes = Some(1);
-    let tombstones_before = t.provider.pk_deletion_snapshot().delete_len();
+    let protected_before = t.provider.protected_snapshots.load().len();
     assert!(
         t.provider
             .bake_seq_prefix_protected_snapshots()
@@ -635,12 +656,71 @@ async fn the_byte_bound_never_stops_a_bake_where_its_prune_is_unsafe() {
          rather than stop where the clean-prefix gate declines"
     );
     assert!(
-        t.provider.pk_deletion_snapshot().delete_len() < tombstones_before,
-        "the second bake pruned tombstones"
+        t.provider.protected_snapshots.load().len() + 2 < protected_before,
+        "the second bake folded the first bake's output and the snapshots before it"
     );
     assert_rows(
         &rows_of(&t.provider, t.name).await,
         &model,
         "after a bake under the byte bound",
+    );
+}
+
+/// The per-file check takes each input file's row count from its footer, as an
+/// exact count equal to the rows a scan of the file reads, so it reads the
+/// file's key columns once rather than twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bake_input_files_row_count_comes_exact_from_its_footer() {
+    let t = table("bake_partial_exact_rows", false).await;
+    let mut model = Model::new();
+    write_checkpoints(&t, &mut model, 0..2).await;
+
+    let ctx = t.provider.create_compaction_session_context();
+    let state = ctx.state();
+    let projection = t.provider.pk_column_indices.clone();
+    let protected: Vec<String> = t
+        .provider
+        .protected_snapshots
+        .load()
+        .keys()
+        .cloned()
+        .collect();
+    let mut checked = 0;
+    for id in &protected {
+        let captured = t
+            .provider
+            .capture_snapshot_files_under_fence(id)
+            .await
+            .expect("capture");
+        for file in captured.files.iter() {
+            let footer = t
+                .provider
+                .bake_file_row_count(&state, id, file)
+                .await
+                .expect("footer row count");
+            let scan = t
+                .provider
+                .scan_bake_files(
+                    &state,
+                    id,
+                    Some(&projection),
+                    &captured.subset(vec![file.clone()]),
+                )
+                .await
+                .expect("key scan");
+            let counted = count_plan_rows(scan, state.task_ctx())
+                .await
+                .expect("count");
+            assert_eq!(
+                footer,
+                Some(counted),
+                "snapshot {id}: the footer reports the file's exact row count"
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked > 0,
+        "precondition: the table has input files to check"
     );
 }
