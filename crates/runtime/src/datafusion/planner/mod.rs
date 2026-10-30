@@ -69,7 +69,7 @@ use tokio::runtime::Handle;
 
 use crate::accelerated::AcceleratedTable;
 use crate::config::ClusterRole;
-use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, sql_depth_guard};
 use datafusion_ddl::{SharedDdlExtensionStore, has_ddl_extensions};
 
 /// The type of catalog backing the planner's DML interception.
@@ -162,7 +162,7 @@ pub async fn create_logical_plan(
 /// the rest of the statement points at the user's own line and column.
 pub(crate) fn parse_sql_statement(sql: &str, session: &SessionState) -> DFResult<Statement> {
     let dialect = session.config().options().sql_parser.dialect;
-    let configured_dialect_error = match session.sql_to_statement(sql, &dialect) {
+    let configured_dialect_error = match sql_depth_guard::sql_to_statement(session, sql, &dialect) {
         Ok(statement) => return Ok(statement),
         Err(error) => error,
     };
@@ -189,7 +189,9 @@ fn split_create_table_cluster_by(
     sql: &str,
     session: &SessionState,
 ) -> Option<(WrappedCollection<Vec<SQLExpr>>, String)> {
-    let Ok(Statement::Statement(generic)) = session.sql_to_statement(sql, &Dialect::Generic) else {
+    let Ok(Statement::Statement(generic)) =
+        sql_depth_guard::sql_to_statement(session, sql, &Dialect::Generic)
+    else {
         return None;
     };
     let SQLStatement::CreateTable(table) = *generic else {
