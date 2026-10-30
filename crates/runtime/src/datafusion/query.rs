@@ -137,6 +137,11 @@ pub enum Error {
     FailedToAccessCache { source: ::cache::Error },
 
     #[snafu(display(
+        "No cached result for this query: the request set 'Cache-Control: only-if-cached', so the query was not run."
+    ))]
+    NotCached,
+
+    #[snafu(display(
         "Unable to convert cached result to a record batch stream: {}",
         format_datafusion_error(source)
     ))]

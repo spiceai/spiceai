@@ -1584,28 +1584,6 @@
       "group": "sqlite"
     }
   ],
-  "mysql-cdc-parity": [
-    {
-      "run": "mysql-cdc-parity",
-      "who": "turso-position",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready: a dataset is in Error: .*Database schema conflict|spiced not ready: a dataset is in Error: .*Failed to commit staged on-conflict metadata",
-      "pattern": "spiced not ready: a dataset is in Error: .*Database schema conflict|spiced not ready: a dataset is in Error: .*Failed to commit staged on-conflict metadata",
-      "group": "sqlite",
-      "may-pass": true
-    },
-    {
-      "run": "mysql-cdc-parity",
-      "who": "turso-key",
-      "key": "start: {}",
-      "kind": "status",
-      "signature": "spiced not ready: a dataset is in Error: .*Database schema conflict|spiced not ready: a dataset is in Error: .*Failed to commit staged on-conflict metadata",
-      "pattern": "spiced not ready: a dataset is in Error: .*Database schema conflict|spiced not ready: a dataset is in Error: .*Failed to commit staged on-conflict metadata",
-      "group": "sqlite",
-      "may-pass": true
-    }
-  ],
   "mysql-cdc-shared-binlog": [
     {
       "run": "mysql-cdc-shared-binlog[engine=cayenne]",
@@ -2421,28 +2399,6 @@
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to cast DuckDB result batch to projected schema: Unable to cast column 0 'span' from Interval(MonthDayNano) to Duration(ns): Compute error: Cannot convert interval containing non-zero months or days",
       "group": "duckdb"
-    }
-  ],
-  "postgres-cdc-parity": [
-    {
-      "run": "postgres-cdc-parity",
-      "who": "turso-position",
-      "key": "query: SELECT * FROM customers #3",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "sqlite",
-      "may-pass": true
-    },
-    {
-      "run": "postgres-cdc-parity",
-      "who": "turso-key",
-      "key": "query: SELECT * FROM customers #3",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "pattern": "answer differs from the expected one: (RowCountMismatch|DataMismatch) \\{",
-      "group": "sqlite",
-      "may-pass": true
     }
   ],
   "postgres-literals": [

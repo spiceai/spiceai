@@ -66,8 +66,8 @@ use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 
 use data_accelerator_api::{
-    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator, FilePathError,
-    spice_data_base_path, upsert_dedup,
+    AccelerationSource, BootstrapStatus, DataAccelerator, FilePathError, spice_data_base_path,
+    upsert_dedup,
 };
 use runtime_acceleration::Engine;
 use runtime_acceleration::acceleration::Mode;
@@ -578,34 +578,9 @@ impl DataAccelerator for TursoAccelerator {
         self.has_existing_file(source)
     }
 
-    /// A sidecar over the Turso database at `path`, for state the runtime owns rather
-    /// than a dataset — the Cayenne metastore's `cayenne.db`.
-    ///
-    /// Goes through [`Self::get_shared_pool_for_path`] rather than opening the file,
-    /// because the lock that serializes sidecar DDL against a concurrent
-    /// `BEGIN CONCURRENT` write lives on the pool instance: a second pool over the same
-    /// file would hold a lock no other sidecar observes.
-    async fn sidecar_for_path(
-        &self,
-        path: &str,
-        dataset_name: &str,
-    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
-        let pool = self
-            .get_shared_pool_for_path(path)
-            .await
-            .map_err(|source| CheckpointError::Store {
-                source: Box::new(source),
-            })?;
-        Ok(Arc::new(runtime_checkpoint_turso::TursoSidecar::new(
-            pool,
-            dataset_name.to_string(),
-        )))
-    }
-
     async fn sidecar(
         &self,
         source: &dyn AccelerationSource,
-        _registry: Arc<AcceleratorEngineRegistry>,
         open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
         let turso_file = self
@@ -1959,46 +1934,5 @@ mod tests {
 
         cleanup_turso_test_files(&metastore);
         cleanup_turso_test_files(&unrelated);
-    }
-    /// Cayenne asks for its metastore sidecar through `&dyn DataAccelerator`, so this
-    /// pins two things about that substitution.
-    ///
-    /// First, the Turso engine must *answer* `sidecar_for_path` rather than fall through
-    /// to the trait's unsupported default — the silent version of that bug is a metastore
-    /// reporting at run time that no accelerator hosts databases.
-    ///
-    /// Second, the sidecar must arrive over the engine's own path-keyed pool, because the
-    /// lock serializing sidecar DDL against a concurrent `BEGIN CONCURRENT` write lives on
-    /// the pool instance: a sidecar holding a private pool would hold a lock nothing else
-    /// observes. That is asserted by strong count on the cached `Arc`, taken from the SAME
-    /// accelerator instance the sidecar is built on — comparing pools across two instances
-    /// proves nothing, since the cache is per-instance and a private pool would pass.
-    #[tokio::test]
-    async fn sidecar_for_path_answers_through_the_trait_and_shares_the_pool() {
-        let dir = std::env::temp_dir().join("spice_turso_sidecar_for_path");
-        std::fs::create_dir_all(&dir).expect("temp directory should be creatable");
-        let metastore = dir.join("cayenne.db").to_string_lossy().to_string();
-        cleanup_turso_test_files(&metastore);
-
-        let accelerator = TursoAccelerator::new();
-        let cached = accelerator
-            .get_shared_pool_for_path(&metastore)
-            .await
-            .expect("a pool should resolve for the metastore path");
-        let before = Arc::strong_count(&cached);
-
-        let engine: &dyn DataAccelerator = &accelerator;
-        let sidecar = engine
-            .sidecar_for_path(&metastore, "orders")
-            .await
-            .expect("the Turso engine must answer sidecar_for_path, not take the default");
-
-        assert!(
-            Arc::strong_count(&cached) > before,
-            "the sidecar must hold the pool already cached for this path, not one of its own"
-        );
-        drop(sidecar);
-
-        cleanup_turso_test_files(&metastore);
     }
 }

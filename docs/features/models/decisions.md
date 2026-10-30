@@ -124,6 +124,22 @@ curl -X POST http://localhost:8090/v1/decisions \
 - `usage` is omitted when the model did not report it.
 - Each request is recorded in `runtime.task_history` as an `ai_decision` task.
 
+## Reranking with `rerank()`
+
+`rerank(..., model => 'name')` picks how to score candidates in this order:
+
+1. A native reranker (Cohere, Voyage, Jina, TEI, HTTP) scores them itself.
+2. A model with a native decisions API (`typesafe:jev`, `openai:gpt-6-luna`) asks one `noul` question per candidate: "is this document relevant to the query?". The probability is the `rerank_score`. `strategy` defaults to `'pointwise'` (one request per candidate); `'listwise'` asks all questions in one request.
+3. Any other chat model gets an LLM-as-judge prompt and returns relative scores. `strategy` defaults to `'listwise'`.
+
+A chat model can answer decisions too (see below), but `rerank()` uses it as a judge unless asked otherwise. To pick the path yourself:
+
+- `via => 'chat'`: the LLM-as-judge prompt, also for `gpt-6-luna`.
+- `via => 'decisions'`: one relevance question per candidate, also for a chat model, which answers through the adapter below.
+- `prompt_template => '...'`: only the chat path uses a prompt template, so it implies `via => 'chat'`. With `via => 'decisions'`, or with a model that has no chat (such as `typesafe:jev`), the query fails instead of ignoring the template.
+
+`via` and `prompt_template` do not apply to native rerankers; the query fails if either is set.
+
 ## How a chat model answers
 
 - The questions become a JSON schema that pins each answer to its own options or rubric levels, and the schema is written into the system prompt. The input is sent as an untrusted document, and the prompt tells the model never to follow instructions found in it.

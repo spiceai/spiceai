@@ -28,9 +28,7 @@ use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 
 use app::App;
 use async_trait::async_trait;
-use data_accelerator_api::{
-    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator,
-};
+use data_accelerator_api::{AccelerationSource, BootstrapStatus, DataAccelerator};
 use data_accelerator_api::{FilePathError, spice_data_base_path};
 use data_components::poly::PolyTableProvider;
 use datafusion::error::DataFusionError;
@@ -781,7 +779,6 @@ impl DataAccelerator for DuckDBAccelerator {
     async fn sidecar(
         &self,
         source: &dyn AccelerationSource,
-        _registry: Arc<AcceleratorEngineRegistry>,
         open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
         // Resolved unconditionally, and that is load-bearing: `duckdb_file_path`
@@ -2443,7 +2440,7 @@ mod tests {
     use runtime_acceleration::testing::TestAccelerationSource;
 
     use crate::DuckDBAccelerator;
-    use data_accelerator_api::{AcceleratorEngineRegistry, DataAccelerator};
+    use data_accelerator_api::DataAccelerator;
     use runtime_acceleration::Engine;
     use runtime_acceleration::acceleration::{Acceleration, Mode};
     use runtime_acceleration::sidecar::OpenOption;
@@ -3489,11 +3486,7 @@ mod tests {
         // `Arc<dyn AcceleratorSidecar>` is not `Debug`, so assert on `is_err` rather
         // than `expect_err`.
         let resolved = DuckDBAccelerator::new()
-            .sidecar(
-                &dataset,
-                Arc::new(AcceleratorEngineRegistry::new()),
-                OpenOption::OpenExisting,
-            )
+            .sidecar(&dataset, OpenOption::OpenExisting)
             .await
             .is_err();
         assert!(
