@@ -1,0 +1,69 @@
+name: clickhouse-sql-semantics
+description: >
+  ClickHouse federation preserves SQL NULL, Unicode, decimal aggregation and
+  correlation semantics, checked against PostgreSQL holding the same rows.
+  Ordinary filters still execute on the source.
+
+sources:
+  ch: { kind: clickhouse }
+  pg: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: clickhouse-sql-semantics
+  datasets:
+    - from: clickhouse:e
+      name: e
+      params: ${sources.ch.params}
+    - from: clickhouse:u
+      name: u
+      params: ${sources.ch.params}
+
+defaults:
+  expect: { oracle: pg }
+
+steps:
+  - source-exec:
+      ch: |
+        CREATE TABLE e (id Int32, v Nullable(Int32), s Nullable(String), d Nullable(Decimal(18,2)), dt Date, discount Nullable(Decimal(15,2))) ENGINE=Memory;
+        INSERT INTO e VALUES (1,1,'naïve',9007199254740993.01,'2024-01-01',0.05),(2,1,'漢字',9007199254740993.01,'2024-02-03',0.06),(3,2,'😀',NULL,'2024-05-06',0.07),(4,NULL,NULL,NULL,'2024-12-31',NULL);
+        CREATE TABLE u (id Int32, label String) ENGINE=Memory;
+        INSERT INTO u VALUES (2,'blue');
+  - source-exec:
+      pg: |
+        CREATE TABLE e (id int, v int, s text, d numeric(18,2), dt date, discount numeric(15,2));
+        INSERT INTO e VALUES (1,1,'naïve',9007199254740993.01,'2024-01-01',0.05),(2,1,'漢字',9007199254740993.01,'2024-02-03',0.06),(3,2,'😀',NULL,'2024-05-06',0.07),(4,NULL,NULL,NULL,'2024-12-31',NULL);
+        CREATE TABLE u (id int, label text);
+        INSERT INTO u VALUES (2,'blue');
+  - start: {}
+  - query: SELECT id FROM e WHERE v NOT IN (1,NULL)
+    expect-empty: true
+  - query: SELECT id, v IN (1,NULL) AS p, v NOT IN (1,NULL) AS q FROM e ORDER BY id
+  - query: SELECT id, v IN (1) AS p, v NOT IN (1) AS q FROM e ORDER BY id
+  - query: SELECT id, v IN (1,2) AS p, v NOT IN (1,2) AS q FROM e ORDER BY id
+  - query: SELECT id FROM e WHERE v NOT IN (1) ORDER BY id
+  - query: SELECT id FROM e WHERE v NOT IN (1,2)
+    expect-empty: true
+  - query: SELECT id, v IN (1,2,3,4,5,6,7,8,9,10,11,12) AS p, v NOT IN (1,2,3,4,5,6,7,8,9,10,11,12) AS q FROM e ORDER BY id
+  - query: SELECT id FROM e WHERE v NOT IN (1,2,3,4,5,6,7,8,9,10,11,12)
+    expect-empty: true
+  - query: SELECT id, (v > 0) IS TRUE AS p, (v > 0) IS NOT TRUE AS q FROM e ORDER BY id
+  - query: SELECT id, upper(s), lower(s), substring(s,1,3), char_length(s) FROM e ORDER BY id
+  - query: SELECT id, EXTRACT(YEAR FROM dt) = 2024 AS year_matches, EXTRACT(MONTH FROM dt) FROM e ORDER BY id
+  - query: SELECT sum(d) AS total FROM e
+  - query: SELECT concat('avg=', CAST(CAST(avg(d) AS DECIMAL(38,6)) AS VARCHAR)) AS exact FROM e
+  - query: SELECT id, concat('avg=', CAST(CAST(avg(d) OVER () AS DECIMAL(38,6)) AS VARCHAR)) AS exact FROM e ORDER BY id
+  - query: SELECT concat('sum=', CAST(CAST(sum(d) AS DECIMAL(38,2)) AS VARCHAR)) AS exact FROM e
+  - query: SELECT sum(id), avg(id), min(id), max(id), count(*), count(DISTINCT v) FROM e WHERE id < 0
+  - query: SELECT e.id, count(u.id) AS n, min(u.id) AS m FROM e LEFT JOIN u ON e.id = u.id GROUP BY e.id ORDER BY e.id
+  - query: SELECT id FROM e WHERE EXISTS (SELECT 1 FROM u WHERE u.id = e.id AND u.label = 'blue')
+  - query: SELECT concat('sum=', CAST(sum(CASE WHEN v = 1 THEN CAST('10000000000000000000.01' AS DECIMAL(38,2)) ELSE CAST(0 AS DECIMAL(38,2)) END) AS VARCHAR)) AS exact FROM e
+  - query: SELECT id FROM e WHERE discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01 ORDER BY id
+  - query: SELECT id FROM e WHERE NOT ((CAST(v AS DOUBLE PRECISION) + 20.0) IN (31.6,21.6,1.4)) ORDER BY id
+  - explain: SELECT id FROM e WHERE id > 1
+    contains: [VirtualExecutionPlan]
+  - explain: SELECT sum(d) FROM e
+    contains: [AggregateExec, VirtualExecutionPlan]
+  - query: SELECT l1.id FROM e l1 WHERE EXISTS (SELECT 1 FROM e l2 WHERE l2.v = l1.v AND l2.id <> l1.id) AND NOT EXISTS (SELECT 1 FROM e l3 WHERE l3.v = l1.v AND l3.id <> l1.id AND l3.id > l1.id)
+  - query: SELECT u.label, count(*) AS n FROM u JOIN e l1 ON u.id = l1.id WHERE EXISTS (SELECT 1 FROM e l2 WHERE l2.v = l1.v AND l2.id <> l1.id) AND NOT EXISTS (SELECT 1 FROM e l3 WHERE l3.v = l1.v AND l3.id <> l1.id AND l3.id > l1.id) GROUP BY u.label

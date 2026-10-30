@@ -1,8 +1,3 @@
-# Known failing (#15541) where DataFusion runs the query (Arrow, Cayenne): a CASE whose
-# first branch is narrower than a later one (INT, then BIGINT) fails with
-# "Schema mismatch: … expected Int32, received Int64"; and rank() and
-# row_number() are unsigned, so -rank() fails. Sent to DuckDB or PostgreSQL,
-# both answer.
 name: case-mixed-widths
 description: >
   A CASE with branches of different integer widths answers with the wider

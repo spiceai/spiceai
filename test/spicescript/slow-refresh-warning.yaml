@@ -1,0 +1,52 @@
+name: slow-refresh-warning
+description: >
+  A refresh that runs far longer than the dataset's recent refreshes is
+  reported while it is still running, once it passes three times their median
+  duration (and at least 30 s more), naming the dataset and the baseline.
+  Refreshes at their usual pace are not reported. The source is a MySQL view
+  whose per-row SLEEP sets how long a refresh takes.
+
+sources:
+  src: { kind: mysql }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: slow-refresh-warning
+  datasets:
+    - from: mysql:paced
+      name: paced
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        refresh_mode: full
+        refresh_check_interval: 1s
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id INT PRIMARY KEY, v INT);
+        INSERT INTO t VALUES (1, 10);
+        CREATE VIEW paced AS SELECT id, v, SLEEP(0.2) AS s FROM t;
+  - start: {}
+  - query: SELECT id, v FROM paced
+    expect: { rows: [['1', '10']] }
+  # A baseline of at least three refreshes at the usual pace, none of them reported.
+  - wait-metric: { name: dataset_acceleration_refresh_duration_ms_count, labels: { dataset: paced }, above: 4, timeout: 60s }
+  - assert-log: { lacks: ["Refresh of dataset 'paced' has run for"] }
+
+  # The source slows down: each refresh now takes 35 s.
+  - source-exec: { src: "CREATE OR REPLACE VIEW paced AS SELECT id, v, SLEEP(35) AS s FROM t" }
+  - assert-log:
+      contains: ["WARN .*Refresh of dataset 'paced' has run for \\d+s, more than 3 times the \\d+m?s its last \\d+ full refreshes took at the median, so its accelerated data is falling further behind the source than usual\\. .*See: https://spiceai\\.org/docs/features/data-acceleration/data-refresh"]
+    eventually: 60s
+  # One warning per slow refresh, not one per check.
+  - assert-log: { count: { "Refresh of dataset 'paced' has run for": 1 } }
+
+  # The source recovers; the slow refresh finishes and later ones are not reported.
+  - source-exec: { src: "CREATE OR REPLACE VIEW paced AS SELECT id, v, SLEEP(0.2) AS s FROM t" }
+  - assert-log: { contains: ["Loaded 1 rows? .*for dataset paced in 3[5-9]s"] }
+    eventually: 60s
+  - mark-metrics: recovered
+  - wait-metric: { name: dataset_acceleration_refresh_duration_ms_count, labels: { dataset: paced }, increased-by: 3, since: recovered, timeout: 60s }
+  - assert-log: { count: { "Refresh of dataset 'paced' has run for": 1 } }
