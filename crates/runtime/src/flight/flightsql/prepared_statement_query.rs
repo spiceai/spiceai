@@ -393,7 +393,7 @@ pub(crate) async fn do_get(
         let context_clone = Arc::clone(&context);
         let outcome = context_clone
             .scope(async {
-                run_transaction(&datafusion, &statements, param_values, read_only).await
+                run_transaction(&datafusion, &statements, param_values, read_only, |_| 0).await
             })
             .await
             .map_err(transaction_error_to_status)?;

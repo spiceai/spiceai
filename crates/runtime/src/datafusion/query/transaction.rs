@@ -189,14 +189,17 @@ pub fn schema_statement(sql: &str) -> String {
 /// # Errors
 ///
 /// Returns a [`TransactionError`] if the body is not a valid v1 transaction, a
-/// statement fails to plan or execute, the optimistic-concurrency re-check
-/// loses (retryable [`TransactionError::Conflict`]), or the staged writes fail
-/// to publish.
+/// statement fails to plan or execute, the final result (plus the
+/// `render_bytes` the caller needs to encode it) cannot be reserved from the
+/// query memory pool, the optimistic-concurrency re-check loses (retryable
+/// [`TransactionError::Conflict`]), or the staged writes fail to publish. Every
+/// one of these is raised before anything is published.
 pub async fn run_transaction(
     df: &Arc<DataFusion>,
     statements: &[String],
     parameters: Option<ParamValues>,
     read_only: bool,
+    render_bytes: impl Fn(&[RecordBatch]) -> usize + Send,
 ) -> Result<TransactionOutcome, TransactionError> {
     // Prepare the transaction: identify every participant table, validate the
     // write targets, capture their begin tokens, and install the transaction on
@@ -227,11 +230,12 @@ pub async fn run_transaction(
         // here and returned after commit. Intermediate statements (the gate,
         // earlier writes) are drained without keeping their batches.
         let consume = if index + 1 == statement_count {
-            collect_reserved(query_res.into_record_batch_stream(), &reservation)
-                .await
-                .map(|batches| {
-                    last = Some((batches, cache_status));
-                })
+            match collect_reserved(query_res.into_record_batch_stream(), &reservation).await {
+                Ok(batches) => reservation
+                    .try_grow(render_bytes(&batches))
+                    .map(|()| last = Some((batches, cache_status))),
+                Err(e) => Err(e),
+            }
         } else {
             query_res.drain().await
         };

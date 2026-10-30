@@ -100,7 +100,9 @@ pub(crate) async fn do_get(
         // and the write would publish immediately, breaking atomicity/staging.
         let context_clone = std::sync::Arc::clone(&context);
         let outcome = context_clone
-            .scope(async { run_transaction(&datafusion, &statements, None, read_only).await })
+            .scope(async {
+                run_transaction(&datafusion, &statements, None, read_only, |_| 0).await
+            })
             .await
             .map_err(transaction_error_to_status)?;
         let batches = outcome

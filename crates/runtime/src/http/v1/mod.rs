@@ -380,12 +380,16 @@ async fn transaction_to_http_response(
     read_only: bool,
     format: ResponseMimeType,
 ) -> Response {
-    match run_transaction(&df, &statements, parameters, read_only).await {
+    match run_transaction(&df, &statements, parameters, read_only, |data| {
+        rendered_bytes(format, data)
+    })
+    .await
+    {
         Ok(outcome) => match outcome.result {
             // Return the final statement's result (for the canonical gate+write
             // shape, the write's row-count summary).
             Some((batches, cache_status)) => {
-                buffered_body_response(batches, outcome.reservation, cache_status, format).await
+                render_reserved(batches, outcome.reservation, cache_status, format).await
             }
             None => (StatusCode::OK, "COMMIT").into_response(),
         },
@@ -523,26 +527,30 @@ where
         Ok(data) => data,
         Err(e) => return buffered_error_response(&e),
     };
-    buffered_body_response(data, reservation, cache_status, format).await
+    if let Err(e) = reservation.try_grow(rendered_bytes(format, &data)) {
+        return buffered_error_response(&e);
+    }
+    render_reserved(data, reservation, cache_status, format).await
 }
 
-/// Renders a collected result whose batches `reservation` holds, reserving the
-/// rendered `text/plain` table in it first.
-async fn buffered_body_response(
+/// The bytes rendering `data` as `format` adds beyond its batches: the padded
+/// `text/plain` table. A table that cannot be measured reports 0, and rendering
+/// it fails with the same error.
+fn rendered_bytes(format: ResponseMimeType, data: &[RecordBatch]) -> usize {
+    match format {
+        ResponseMimeType::Plain => plain_text_size(data).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Renders a collected result while `reservation` holds its batches and
+/// [`rendered_bytes`].
+async fn render_reserved(
     data: Vec<RecordBatch>,
     reservation: MemoryReservation,
     cache_status: CacheStatus,
     format: ResponseMimeType,
 ) -> Response {
-    if matches!(format, ResponseMimeType::Plain) {
-        let size = match plain_text_size(&data) {
-            Ok(size) => size,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        };
-        if let Err(e) = reservation.try_grow(size) {
-            return buffered_error_response(&e);
-        }
-    }
     let response = to_http_response(data, cache_status, format, ResponseMetadata::empty())
         .await
         .into_response();
@@ -1398,6 +1406,27 @@ mod tests {
             ),
             (8 << 20, ResponseMimeType::Plain, StatusCode::OK),
         ];
+        // The rendered bytes are refused inside the transaction, before commit.
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                tokio::runtime::Handle::current(),
+            )
+            .memory_limit(Some(1 << 20))
+            .build(),
+        );
+        let refused = run_transaction(&df, &["SELECT 1 AS v".to_string()], None, false, |_| {
+            2 << 20
+        })
+        .await;
+        assert!(matches!(
+            refused,
+            Err(TransactionError::Stream(
+                DataFusionError::ResourcesExhausted(_)
+            ))
+        ));
+
         for (limit, format, expected) in cases {
             let df = Arc::new(
                 DataFusionBuilder::new(
