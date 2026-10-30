@@ -392,7 +392,6 @@ async fn mysql_binlog_replication_end_to_end() -> Result<(), anyhow::Error> {
 
 /// Same lifecycle against the Cayenne accelerator — the file-backed engine
 /// additionally exercises the `spice_sys_mysql_binlog` position sidecar.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_binlog_replication_end_to_end_cayenne() -> Result<(), anyhow::Error> {
     let temp_dir = tempfile::tempdir()?;
@@ -422,7 +421,6 @@ async fn mysql_binlog_replication_end_to_end_cayenne() -> Result<(), anyhow::Err
 /// re-snapshot), replays the changes made while it was down, and re-reaches
 /// Ready via lag-based readiness — proving durable data + resumable position
 /// survive a process restart.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_binlog_replication_restart_resume_cayenne() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -551,7 +549,6 @@ async fn mysql_binlog_replication_restart_resume_cayenne() -> Result<(), anyhow:
 /// the empty-set round-trip), run 2 would error or diverge, failing this test.
 /// Cursor-type persistence itself is unit-tested per engine in
 /// `runtime::dataaccelerator::spice_sys::mysql_binlog`.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_binlog_replication_gtid_resume_cayenne() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -784,7 +781,6 @@ async fn bump_counter_rows(pool: &mysql_async::Pool, rounds: i64) -> Result<(), 
 ///
 /// Coalescing is pinned wide so the consumer is holding a batch of not-yet-durable
 /// updates when the kill lands.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_binlog_replication_survives_a_dump_reconnect_cayenne() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -1192,7 +1188,6 @@ const TYPES_CHECKS: &[(&str, i64)] = &[
 /// `Time64` is a time-of-day while `TIME` spans ±838 hours. Negative `TIME` is
 /// rejected with a structured error, covered by `negative_time_errors` in
 /// `data_components::mysql_replication::rows`.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_binlog_replication_decodes_every_column_type_cayenne() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(

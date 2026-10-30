@@ -17,6 +17,13 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 #![recursion_limit = "256"]
 
+// Windows users run `spiced` under WSL or in Docker, and the Windows `spice` CLI
+// connects to it.
+#[cfg(windows)]
+compile_error!(
+    "spiced does not build for native Windows. Run it under WSL or in Docker. See: https://spiceai.org/docs/installation"
+);
+
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
@@ -101,7 +108,6 @@ use connector_spark as _;
 
 // Same force-linkage for accelerator engines, which self-register via
 // `register_data_accelerator!` into a linkme slice of their own.
-#[cfg(not(windows))]
 use accelerator_cayenne as _;
 #[cfg(feature = "duckdb")]
 use accelerator_duckdb as _;
@@ -647,7 +653,6 @@ pub fn install_cpu_budget(args: &Args, app: Option<&App>) -> Result<(), cpu_budg
     // lost to an earlier one, the summary and the Vortex declaration below must
     // still report the same numbers.
     cpu_budget::cpu_budget().log_summary();
-    #[cfg(not(windows))]
     declare_vortex_parallelism();
     Ok(())
 }
@@ -660,7 +665,6 @@ pub fn install_cpu_budget(args: &Args, app: Option<&App>) -> Result<(), cpu_budg
 /// effect. The declaration is first-write-wins on the Vortex side: a call
 /// arriving after anything read the parallelism fails, and the warning names
 /// the value that stayed in effect.
-#[cfg(not(windows))]
 fn declare_vortex_parallelism() {
     let Some(cores) = std::num::NonZeroUsize::new(cpu_budget::cpu_budget().vortex_parallelism())
     else {
@@ -1136,9 +1140,6 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         // same reason as the compaction metrics above (bind to the real Prometheus
         // meter, not the early noop one). Localizes *which* valve is stalling the CDC
         // apply path when ingest falls behind.
-        // Gated like the dependency itself: `accelerator-cayenne` is a
-        // `cfg(not(windows))` target dependency, so on Windows the crate does not exist.
-        #[cfg(not(windows))]
         accelerator_cayenne::register_cayenne_telemetry();
     }
 

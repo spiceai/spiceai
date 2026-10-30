@@ -17028,7 +17028,6 @@ version = "4.10.0+2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e234cf318915c1059d4921ef7f75616b5219b10b46e9f3a511a15eb4b56a3f77"
 dependencies = [
- "cmake",
  "libc",
  "libz-sys",
  "num_enum",
@@ -18773,7 +18772,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "winver",
 ]
 
 [[package]]

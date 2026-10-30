@@ -20,7 +20,6 @@ limitations under the License.
 //! executor, registers the catalog, creates a table through it, and reads whether that
 //! table's Cayenne provider runs the closed-loop tuner.
 
-#![cfg(not(windows))]
 #![expect(clippy::expect_used, dead_code)]
 
 // Accelerator engines self-register through a linkme slice; the linker drops an unreferenced

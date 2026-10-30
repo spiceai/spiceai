@@ -56,7 +56,6 @@ pub async fn start_mysql_docker_container() -> Result<RunningContainer, anyhow::
 
 /// How many times [`start_mysql_docker_container_retrying_startup`] tries to
 /// bring the container up before reporting the last failure.
-#[cfg(not(target_os = "windows"))]
 const MYSQL_STARTUP_ATTEMPTS: u32 = 3;
 
 /// Start a `MySQL` container, retrying only the container startup.
@@ -65,7 +64,6 @@ const MYSQL_STARTUP_ATTEMPTS: u32 = 3;
 /// Nothing after the container is up is repeated, so a lost update cannot be
 /// retried into a pass. Each attempt uses a new container name and Docker-owned
 /// host port; a failed attempt drops its guard to remove only its container ID.
-#[cfg(not(target_os = "windows"))]
 pub async fn start_mysql_docker_container_retrying_startup()
 -> Result<RunningContainer, anyhow::Error> {
     let mut attempt = 1;

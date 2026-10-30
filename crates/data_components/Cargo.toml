@@ -141,9 +141,6 @@ apache-avro = { version = "0.21", optional = true, default-features = false, fea
     "zstandard",
 ] }
 
-[target.'cfg(windows)'.dependencies]
-rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
-
 [features]
 bench = [] # Feature for benchmarking that exposes internal functions
 adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "datafusion-table-providers/adbc-federation"]

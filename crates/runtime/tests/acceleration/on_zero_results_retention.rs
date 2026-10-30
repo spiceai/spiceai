@@ -150,7 +150,6 @@ fn combined_retention_dataset(dir: &Path, name: &str) -> Dataset {
     dataset
 }
 
-#[cfg(not(target_os = "windows"))]
 fn cayenne_time_dataset(source: &Path, name: &str, scheduled_ticker: bool) -> Dataset {
     let mut dataset = Dataset::new(format!("file://{}", source.display()), name);
     dataset.params = Some(Params::from_string_map(
@@ -461,7 +460,6 @@ async fn arrow_write_time_retention_sql_does_not_resurrect_via_fallback() -> any
         .await
 }
 
-#[cfg(not(target_os = "windows"))]
 async fn cayenne_time_retention_fallback_case(
     table: &str,
     scheduled_ticker: bool,
@@ -526,7 +524,6 @@ async fn cayenne_time_retention_fallback_case(
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cayenne_unscheduled_time_retention_does_not_resurrect_via_fallback() -> anyhow::Result<()>
 {
@@ -539,7 +536,6 @@ async fn cayenne_unscheduled_time_retention_does_not_resurrect_via_fallback() ->
         .await
 }
 
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cayenne_scheduled_time_retention_does_not_resurrect_via_fallback() -> anyhow::Result<()> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
