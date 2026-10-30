@@ -52,7 +52,7 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 // =============================================================================
 
 /// Macro to generate multi-threaded test variants for all backends.
-/// Creates `{test_fn}_sqlite` and `{test_fn}_turso` variants.
+/// Creates a `{test_fn}_sqlite` variant.
 macro_rules! test_with_backends_multithreaded {
     ($test_fn:ident) => {
         paste::paste! {
@@ -61,11 +61,6 @@ macro_rules! test_with_backends_multithreaded {
                 $test_fn(BackendType::Sqlite).await
             }
 
-            #[cfg(feature = "turso")]
-            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn [<$test_fn _turso>]() -> TestResult<()> {
-                $test_fn(BackendType::Turso).await
-            }
         }
     };
     ($test_fn:ident, workers = $workers:expr) => {
@@ -75,11 +70,6 @@ macro_rules! test_with_backends_multithreaded {
                 $test_fn(BackendType::Sqlite).await
             }
 
-            #[cfg(feature = "turso")]
-            #[tokio::test(flavor = "multi_thread", worker_threads = $workers)]
-            async fn [<$test_fn _turso>]() -> TestResult<()> {
-                $test_fn(BackendType::Turso).await
-            }
         }
     };
 }
@@ -100,8 +90,6 @@ fn create_test_schema() -> Arc<Schema> {
 fn connection_string_for_backend(backend: BackendType, db_path: &std::path::Path) -> String {
     match backend {
         BackendType::Sqlite => format!("sqlite://{}", db_path.to_string_lossy()),
-        #[cfg(feature = "turso")]
-        BackendType::Turso => format!("libsql://{}", db_path.to_string_lossy()),
     }
 }
 

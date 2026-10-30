@@ -969,6 +969,7 @@ fn handle_query_error(e: query::Error) -> Status {
         | query::Error::UnableToExecuteQuery { source } => handle_datafusion_error(&source),
         query::Error::QueryCancelled { .. } => Status::cancelled(e.to_string()),
         query::Error::QueryTimedOut { .. } => Status::deadline_exceeded(e.to_string()),
+        query::Error::NotCached => Status::failed_precondition(e.to_string()),
         _ => to_tonic_err(e),
     }
 }

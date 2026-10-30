@@ -15,11 +15,8 @@
 //!
 //! Three workloads are exercised, each across `[1, 2, 4, 8, 16, 32, 64, 128]`
 //! concurrency levels (64 covers the stated single-machine goal, 128 covers
-//! oversubscription on common 64-core SMT-2 boxes) and across **both
-//! Cayenne metastore backends**
-//! (`Sqlite` and `Turso`, the latter compiled in when the `turso` feature
-//! is enabled — see `CAYENNE_LANES`). DuckDB runs once per workload as the
-//! external baseline.
+//! oversubscription on common 64-core SMT-2 boxes) and across every lane in
+//! `CAYENNE_LANES`. DuckDB runs once per workload as the external baseline.
 //!
 //! * **`vs_duckdb_scaling_reads`** — N concurrent `SELECT COUNT(*)` queries
 //!   against one pre-loaded 1M-row table. Cayenne uses one long-lived warm
@@ -27,8 +24,7 @@
 //!   Spice runtime). DuckDB opens one fresh `Connection` per OS thread
 //!   from the shared on-disk database path. The bench shows whether
 //!   reader-side scaling is bounded by mutex contention or runs cleanly
-//!   to the core count. Cayenne lane ids are `cayenne_warm` /
-//!   `cayenne_turso_warm`.
+//!   to the core count. The Cayenne lane id is `cayenne_warm`.
 //!
 //! * **`vs_duckdb_scaling_writes`** — sustained insert throughput driven by
 //!   N concurrent background writer tasks against one table via the generic
@@ -74,25 +70,6 @@ use std::time::Duration;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use duckdb::Connection;
 use tokio::runtime::Runtime;
-
-/// Whether the given Cayenne metastore lane is exercised by the
-/// sustained-writes scaling benches. Returns `true` for every backend
-/// currently — earlier this gated Turso off because the sustained-writes
-/// pattern tripped Turso's BEGIN CONCURRENT commit-time MVCC and the
-/// retry-on-conflict matcher in `turso-shared` only recognised SQLite
-/// `BUSY`/`LOCKED` messages, not Turso's `"Write-write conflict"`. That
-/// matcher now accepts the Turso message, so the existing retry loops
-/// in `commit_inlined_mutation` (and siblings) converge under
-/// sustained writes. Kept as a switch so a future backend that genuinely
-/// can't survive sustained writes (e.g., a snapshot-only metastore) can
-/// opt out without bench-file surgery.
-fn lane_supports_sustained_writes(lane: common::Metastore) -> bool {
-    match lane {
-        common::Metastore::Sqlite => true,
-        #[cfg(feature = "turso")]
-        common::Metastore::Turso => true,
-    }
-}
 
 /// Bounded-timeout wait for `n` writer-completion signals. Replaces the
 /// earlier `AtomicUsize` + `std::hint::spin_loop` pattern that burned an
@@ -244,7 +221,7 @@ fn bench_read_scaling(c: &mut Criterion) {
     let batch = make_batch(schema(), 0, READ_ROWS);
     let duckdb_fixture = build_duckdb_read_fixture(&batch);
 
-    // For each Cayenne metastore (Sqlite, optionally Turso): set up the
+    // For each Cayenne metastore lane: set up the
     // table once, spawn worker pools per concurrency level, run the
     // BenchmarkId-prefixed by `lane.lane()`.
     for &lane in CAYENNE_LANES {
@@ -480,17 +457,8 @@ fn bench_write_scaling(c: &mut Criterion) {
     // For each Cayenne metastore lane: run the full concurrency sweep.
     // Each (lane, concurrency) point gets a fresh fixture because writes
     // accumulate state on disk and we want every measurement to start
-    // from an empty table. Both backends (`Sqlite` + `Turso`) run today —
-    // earlier Turso was gated off because `is_retryable_write_conflict`
-    // didn't recognise Turso's BEGIN CONCURRENT "Write-write conflict"
-    // message. Once that matcher was fixed, the existing retry-on-conflict
-    // loop in `commit_inlined_mutation` converges and sustained Turso
-    // writes complete cleanly. The `lane_supports_sustained_writes` gate
-    // stays as a future switch.
+    // from an empty table.
     for &lane in CAYENNE_LANES {
-        if !lane_supports_sustained_writes(lane) {
-            continue;
-        }
         let lane_label = lane.lane().to_string();
         for &concurrency in CONCURRENCIES {
             group.throughput(Throughput::Elements(
@@ -667,16 +635,8 @@ fn bench_cdc_scaling(c: &mut Criterion) {
     // For each Cayenne metastore lane: run the full concurrency sweep on
     // the CDC pipelined path. Same structure as `bench_write_scaling`,
     // but the Cayenne writer pumps `write_cdc_append_stream + finish()`
-    // instead of `insert_into`. Lane id is `cayenne_cdc` (Sqlite) or
-    // `cayenne_turso_cdc` (Turso).
-    //
-    // Both backends (`Sqlite` + `Turso`) run today — see the comment at
-    // the top of `bench_write_scaling` for why the Turso lane is no
-    // longer gated off.
+    // instead of `insert_into`. Lane id is `cayenne_cdc`.
     for &lane in CAYENNE_LANES {
-        if !lane_supports_sustained_writes(lane) {
-            continue;
-        }
         let lane_label = format!("{}_cdc", lane.lane());
         for &concurrency in CONCURRENCIES {
             group.throughput(Throughput::Elements(
