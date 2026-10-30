@@ -29717,7 +29717,15 @@ impl CayenneTableProvider {
         }
         // Bound the bytes this bake folds, at a point the clean-prefix gate below
         // accepts (see `BAKE_MAX_INPUT_BYTES`).
-        let max_input_bytes = self.bake_max_input_bytes();
+        // A test may lower the bound to exercise it without 256 MiB of data.
+        #[cfg(test)]
+        let max_input_bytes = self
+            .test_bake_files
+            .lock()
+            .max_input_bytes
+            .unwrap_or(BAKE_MAX_INPUT_BYTES);
+        #[cfg(not(test))]
+        let max_input_bytes = BAKE_MAX_INPUT_BYTES;
         if selected_input_bytes > max_input_bytes {
             let keep = Box::pin(self.bake_prefix_within_bytes(
                 &selected,
@@ -30198,16 +30206,6 @@ impl CayenneTableProvider {
         self.schedule_orphan_dv_sweep();
 
         Ok(true)
-    }
-
-    /// The bytes one seq-prefix bake aims to fold: [`BAKE_MAX_INPUT_BYTES`], or a
-    /// test's override.
-    fn bake_max_input_bytes(&self) -> u64 {
-        #[cfg(test)]
-        if let Some(bytes) = self.test_bake_files.lock().max_input_bytes {
-            return bytes;
-        }
-        BAKE_MAX_INPUT_BYTES
     }
 
     /// How many of `selected`, a bake's prefix in order, to fold under

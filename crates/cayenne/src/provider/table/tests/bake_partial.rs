@@ -219,13 +219,13 @@ async fn write_checkpoint(provider: &CayenneTableProvider, key: Key, rows: &[(i6
 
 /// Checkpoint `c`: its own fresh keys at version `c`, the newest
 /// `REPLAYED_PER_CHECKPOINT` keys of checkpoint `c - 1` again at version `c`,
-/// and, with `deletes`, the `DELETED_PER_CHECKPOINT` keys of `c - 1` below
+/// and, `with_deletes`, the `DELETED_PER_CHECKPOINT` keys of `c - 1` below
 /// those deleted.
 async fn write_checkpoints_keyed(
     tables: &[(&CayenneTableProvider, Key)],
     model: &mut Model,
     range: std::ops::Range<i64>,
-    deletes: bool,
+    with_deletes: bool,
 ) {
     for c in range {
         let fresh = c * ROWS_PER_CHECKPOINT;
@@ -235,7 +235,7 @@ async fn write_checkpoints_keyed(
         if c > 0 {
             rows.extend((fresh - REPLAYED_PER_CHECKPOINT..fresh).map(|ts| (ts, c)));
         }
-        let deleted: Vec<i64> = if deletes && c > 0 {
+        let deleted: Vec<i64> = if with_deletes && c > 0 {
             let top = fresh - REPLAYED_PER_CHECKPOINT;
             (top - DELETED_PER_CHECKPOINT..top).collect()
         } else {
