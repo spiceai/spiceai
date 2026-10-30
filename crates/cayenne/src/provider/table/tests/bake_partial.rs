@@ -217,12 +217,6 @@ async fn delete(provider: &CayenneTableProvider, key: Key, keys: &[i64]) {
     );
 }
 
-/// Upsert `(ts, v)` rows into `provider` and checkpoint them.
-async fn write_checkpoint(provider: &CayenneTableProvider, key: Key, rows: &[(i64, i64)]) {
-    upsert(provider, key, rows).await;
-    provider.checkpoint_mem_tier().await.expect("checkpoint");
-}
-
 /// Checkpoint `c`: its own fresh keys at version `c`, the newest
 /// `REPLAYED_PER_CHECKPOINT` keys of checkpoint `c - 1` again at version `c`,
 /// and, `with_deletes`, the `DELETED_PER_CHECKPOINT` keys of `c - 1` below
