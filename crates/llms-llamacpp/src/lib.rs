@@ -3296,10 +3296,15 @@ mod tests {
     const HARMONY_OPENS: &str = "{% for m in messages %}<|start|>{{ m.role }}<|message|>{{ m.content }}<|end|>{% endfor %}<|start|>assistantOPENS";
 
     /// What a Harmony model's `reply` sends when the template's generation prompt goes on from
-    /// `<|start|>assistant` with `opens`, for a request with the `response_format` type
-    /// `format`. The request is queued as the engine queues it, so the reply is read from
-    /// where the engine starts reading it.
-    fn harmony_reply_after(opens: &str, format: Option<&str>, reply: &str) -> Vec<String> {
+    /// `<|start|>assistant` with `opens`, for a request with the fields `request` sets, or why
+    /// the request fails, and the `root` rule of the request's grammar, if it has one. The
+    /// request is queued as the engine queues it, so the reply is read from where the engine
+    /// starts reading it.
+    fn harmony_reply_after(
+        opens: &str,
+        request: serde_json::Value,
+        reply: &str,
+    ) -> (std::result::Result<Vec<String>, String>, Option<String>) {
         let (jobs, queued) = std_mpsc::channel();
         let llama = LlamaCpp {
             decoder: DecodeThread {
@@ -3320,8 +3325,8 @@ mod tests {
             "model": "gpt-oss",
             "messages": [{ "role": "user", "content": "What is the capital of France?" }],
         });
-        if let Some(format) = format {
-            req["response_format"] = serde_json::json!({ "type": format });
+        if let (Some(req), serde_json::Value::Object(fields)) = (req.as_object_mut(), request) {
+            req.extend(fields);
         }
         let req: CreateChatCompletionRequest = serde_json::from_value(req).expect("a request");
         let receivers = llama
@@ -3333,22 +3338,17 @@ mod tests {
             prompt.ends_with(&format!("<|end|><|start|>assistant{opens}")),
             "the generation prompt goes on with {opens:?}: {prompt:?}"
         );
-        // A grammar holds a structured reply from its first header.
-        assert_eq!(
-            sampling
-                .grammar
-                .is_some_and(|g| g.contains("root ::= analysis* <[2]> \"final\"")),
-            format.is_some()
-        );
-        let (finish, _) = generate_harmony(&mut out, reply);
-        assert_eq!(
-            finish,
-            Some(FinishReason::Stop),
-            "{reply:?} ends at `<|return|>`"
-        );
-        out.finish(FinishReason::Stop, 1)
-            .expect("the request succeeds");
-        joined(sent(rx))
+        let root = sampling.grammar.as_deref().and_then(|grammar| {
+            grammar
+                .lines()
+                .find_map(|line| line.strip_prefix("root ::= "))
+                .map(ToString::to_string)
+        });
+        let finish = generate_harmony(&mut out, reply)
+            .0
+            .expect("the reply ends at `<|return|>` or `<|call|>`");
+        let sent = out.finish(finish, 1).map(|_| joined(sent(rx)));
+        (sent, root)
     }
 
     /// A stock gpt-oss template ends its generation prompt at `<|start|>assistant`, so the
@@ -3359,32 +3359,152 @@ mod tests {
     fn a_harmony_reply_goes_on_from_where_the_generation_prompt_leaves_it() {
         let rest = "Recall it.<|end|><|start|>assistant<|channel|>final<|message|>Paris<|return|>";
         let read = [
-            ("", None, format!("<|channel|>analysis<|message|>{rest}")),
-            (
-                "<|channel|>final<|message|>",
-                None,
-                "Paris<|return|>".to_string(),
-            ),
-            ("<|channel|>analysis<|message|>", None, rest.to_string()),
-            ("<|channel|>analysis", None, format!("<|message|>{rest}")),
-            // what the grammar of a structured reply forces, whatever the prompt opened
-            (
-                "<|channel|>final<|message|>",
-                Some("json_object"),
-                "<|channel|>final<|message|>{\"capital\":\"Paris\"}<|return|>".to_string(),
-            ),
+            ("", format!("<|channel|>analysis<|message|>{rest}")),
+            ("<|channel|>final<|message|>", "Paris<|return|>".to_string()),
+            ("<|channel|>analysis<|message|>", rest.to_string()),
+            ("<|channel|>analysis", format!("<|message|>{rest}")),
         ]
-        .map(|(opens, format, reply)| harmony_reply_after(opens, format, &reply));
+        .map(|(opens, reply)| {
+            harmony_reply_after(opens, serde_json::json!({}), &reply)
+                .0
+                .expect("the request succeeds")
+        });
         let answer = || vec!["r:Recall it.".to_string(), "c:Paris".to_string()];
         assert_eq!(
             read,
-            [
+            [answer(), vec!["c:Paris".to_string()], answer(), answer()]
+        );
+    }
+
+    /// A grammar that holds a reply, to a `response_format` or to a required call, goes on from
+    /// where the generation prompt leaves the reply rather than making it write a header
+    /// inside a message the prompt opened. A message the grammar cannot go on from, such as a
+    /// final message before a required call, keeps the grammar of a whole reply, and the reply
+    /// is read from its first header.
+    #[test]
+    fn a_harmony_grammar_goes_on_from_where_the_generation_prompt_leaves_it() {
+        let structured = serde_json::json!({ "response_format": { "type": "json_object" } });
+        let required = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                        "required": ["city"],
+                    },
+                },
+            }],
+            "tool_choice": "required",
+        });
+        let json = "{\"capital\":\"Paris\"}";
+        let final_json = format!("<|channel|>final<|message|>{json}<|return|>");
+        let call =
+            "<|channel|>commentary to=functions.get_weather<|message|>{\"city\":\"Paris\"}<|call|>";
+        let cases = [
+            ("", &structured, final_json.clone()),
+            (
+                "<|channel|>final<|message|>",
+                &structured,
+                format!("{json}<|return|>"),
+            ),
+            (
+                "<|channel|>analysis<|message|>",
+                &structured,
+                format!("Recall it.<|end|><|start|>assistant{final_json}"),
+            ),
+            (
+                "<|channel|>",
+                &structured,
+                format!("final<|message|>{json}<|return|>"),
+            ),
+            (
+                "<|channel|>final",
+                &structured,
+                format!("<|message|>{json}<|return|>"),
+            ),
+            (
+                "<|channel|>analysis",
+                &structured,
+                format!("<|message|>Recall it.<|end|><|start|>assistant{final_json}"),
+            ),
+            ("<|channel|>commentary<|message|>", &structured, final_json),
+            ("", &required, call.to_string()),
+            (
+                "<|channel|>analysis<|message|>",
+                &required,
+                format!("Look it up.<|end|><|start|>assistant{call}"),
+            ),
+            (
+                "<|channel|>commentary to=functions.get_weather<|message|>",
+                &required,
+                "{\"city\":\"Paris\"}<|call|>".to_string(),
+            ),
+            (
+                "<|channel|>",
+                &required,
+                call["<|channel|>".len()..].to_string(),
+            ),
+            (
+                "<|channel|>analysis",
+                &required,
+                format!("<|message|>Look it up.<|end|><|start|>assistant{call}"),
+            ),
+            ("<|channel|>final<|message|>", &required, call.to_string()),
+        ];
+        let read: Vec<_> = cases
+            .iter()
+            .map(|(opens, request, reply)| harmony_reply_after(opens, (*request).clone(), reply))
+            .collect();
+        let structured_root = "analysis* <[2]> \"final\" constrain? <[3]> reply-root";
+        let after_analysis = format!("<[4]> <[1]> \"assistant\" {structured_root}");
+        let call_root = "<[2]> \"commentary to=functions.\" call";
+        let answer = || vec![format!("c:{json}")];
+        let called = || vec!["t:get_weather({\"city\":\"Paris\"})".to_string()];
+        let expected = [
+            (answer(), structured_root.to_string()),
+            (answer(), "reply-root".to_string()),
+            (
+                vec!["r:Recall it.".to_string(), format!("c:{json}")],
+                format!("reasoning {after_analysis}"),
+            ),
+            (
                 answer(),
-                vec!["c:Paris".to_string()],
-                answer(),
-                answer(),
-                vec!["c:{\"capital\":\"Paris\"}".to_string()],
-            ]
+                format!(
+                    "\"analysis\" <[3]> reasoning {after_analysis} | \"final\" constrain? <[3]> reply-root"
+                ),
+            ),
+            (answer(), "constrain? <[3]> reply-root".to_string()),
+            (
+                vec!["r:Recall it.".to_string(), format!("c:{json}")],
+                format!("<[3]> reasoning {after_analysis}"),
+            ),
+            (answer(), structured_root.to_string()),
+            (called(), format!("analysis? {call_root}")),
+            (
+                [vec!["r:Look it up.".to_string()], called()].concat(),
+                format!("reasoning <[4]> <[1]> \"assistant\" {call_root}"),
+            ),
+            (called(), "tool0-root".to_string()),
+            (
+                called(),
+                format!(
+                    "\"analysis\" <[3]> reasoning <[4]> <[1]> \"assistant\" {call_root} | \"commentary to=functions.\" call"
+                ),
+            ),
+            (
+                [vec!["r:Look it up.".to_string()], called()].concat(),
+                format!("<[3]> reasoning <[4]> <[1]> \"assistant\" {call_root}"),
+            ),
+            (called(), format!("analysis? {call_root}")),
+        ];
+        assert_eq!(
+            read,
+            expected
+                .into_iter()
+                .map(|(sent, root)| (Ok(sent), Some(root)))
+                .collect::<Vec<_>>()
         );
     }
 

@@ -747,9 +747,15 @@ mod tests {
             ),
             Route::Header(String::new())
         );
-        // a grammar holds the reply from its first header
+        // a grammar goes on from a message it allows there, so the reply does too; from one
+        // it does not, such as a final message before a required call, the grammar holds the
+        // whole reply, and the reply starts in a header
         assert_eq!(
             after("<|start|>assistant<|channel|>final<|message|>", Held::Reply),
+            Route::Content { last: true }
+        );
+        assert_eq!(
+            after("<|start|>assistant<|channel|>final<|message|>", Held::Call),
             Route::Header(String::new())
         );
     }
