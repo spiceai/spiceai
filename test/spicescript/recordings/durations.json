@@ -6,7 +6,7 @@
   "builtins": 4,
   "cayenne-upgrade": 4,
   "cayenne-vnext": 5,
-  "cayenne-vnext-recreate": 3,
+  "cayenne-vnext-recreate": 5,
   "cayenne-vnext-state-down": 7,
   "cayenne-writes": 28,
   "cdc-chaos": 177,
