@@ -31,6 +31,7 @@ pub mod redact;
 pub mod retry_strategy;
 #[cfg(feature = "datafusion")]
 pub mod security;
+pub mod source;
 pub mod spice_paths;
 pub mod topological_ordering;
 pub mod tracers;

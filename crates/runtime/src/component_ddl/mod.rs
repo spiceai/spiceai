@@ -301,7 +301,7 @@ impl ComponentDdlHandler for RuntimeComponentDdl {
         let Some(app) = runtime.read_app().await else {
             return Ok(None);
         };
-        match kind {
+        let statement = match kind {
             ComponentKind::Dataset => {
                 let wanted = resolved_dataset_name(name);
                 let Some(dataset) = app
@@ -312,16 +312,20 @@ impl ComponentDdlHandler for RuntimeComponentDdl {
                     return Ok(None);
                 };
                 let shown = ShownParameters::of_dataset(&runtime, dataset).await;
-                create_statement(dataset, &|path| shown.shows(path)).map(Some)
+                create_statement(dataset, &|path| shown.shows(path))?
             }
             ComponentKind::Catalog => {
                 let Some(catalog) = app.catalogs.iter().find(|c| c.name == name) else {
                     return Ok(None);
                 };
                 let shown = ShownParameters::of_catalog(&runtime, catalog).await;
-                create_statement(catalog, &|path| shown.shows(path)).map(Some)
+                create_statement(catalog, &|path| shown.shows(path))?
             }
-        }
+        };
+        // A source URL can carry a user name and password, which the statement
+        // leaves out, as `/v1/datasets` and `/v1/catalogs` leave them out of
+        // `from`.
+        Ok(Some(util::redact::redact_message_credentials(&statement)))
     }
 }
 

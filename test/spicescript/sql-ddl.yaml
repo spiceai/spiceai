@@ -114,6 +114,32 @@ steps:
       body-matches: ["cayenne_s3_secret\\\\\" = '<redacted>'", "cayenne_s3_auth\\\\\" = 'iam_role'"]
       body-lacks: ['leak-']
 
+  # A source URL can carry a user name and password. A read-only key reads the
+  # definition without them, in SHOW CREATE, /v1/datasets, and task history.
+  - source-exec:
+      api: |
+        path: /creds.csv
+        headers: { content-type: text/csv }
+        body: "id,v\n1,a\n"
+  - spice-exec: "CREATE TABLE creds WITH (from = 'http://scenario-user:leak-url-password@${sources.api.host}${sources.api.path}/creds.csv', file_format = 'csv')"
+  - query: SELECT count(*) AS n FROM creds
+    expect: { rows: [['1']] }
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SHOW CREATE TABLE creds
+    expect:
+      status: 200
+      body-matches: ["from = 'http://127\\.0\\.0\\.1:[0-9]+/[^']*/creds\\.csv'"]
+      body-lacks: ['leak-', 'scenario-user']
+  - http:
+      method: GET
+      path: /v1/datasets
+      api-key: reader-key
+    expect: { status: 200, body-contains: creds, body-lacks: ['leak-', 'scenario-user'] }
+
   # Every way a statement can carry a secret: written correctly, behind
   # comments the parser reads, mistyped, cut short, or after another statement.
   # None of these is applied.

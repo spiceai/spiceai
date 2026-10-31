@@ -1006,6 +1006,37 @@ fn a_statement_records_no_secret_however_it_is_written() {
     }
 }
 
+/// A URL a statement keeps, such as its `from`, is recorded without the user
+/// name and password it carries, as `/v1/datasets` reports `from`, and an
+/// error that repeats them loses them too.
+#[test]
+fn a_kept_urls_user_name_and_password_are_taken_out() {
+    let dialect = PostgreSqlDialect {};
+    let shown = |name: &str| matches!(name, "file_format" | "http_endpoint");
+    let recorded = recorded_statement(
+        "CREATE TABLE t WITH (from = 'https://admin:pw-536271@files.example.com/a.csv', file_format = 'csv', http_endpoint = 'https://u:pw-907162@api.example.com')",
+        &dialect,
+        &shown,
+    );
+    assert_eq!(
+        recorded.text,
+        "CREATE TABLE t WITH (from = 'https://files.example.com/a.csv', file_format = 'csv', http_endpoint = 'https://api.example.com')"
+    );
+    assert_eq!(
+        redact_values(
+            "Failed to fetch https://admin:pw-536271@files.example.com/a.csv: 401; retried as u with pw-907162",
+            &recorded.removed
+        ),
+        "Failed to fetch https://<redacted>@files.example.com/a.csv: 401; retried as u with <redacted>"
+    );
+    // A statement without such a URL keeps its text.
+    let unchanged = "CREATE TABLE t WITH (from = 'postgres:public.t')";
+    assert!(matches!(
+        recorded_statement(unchanged, &dialect, &shown).text,
+        Cow::Borrowed(_)
+    ));
+}
+
 /// An error a statement fails with is recorded without the values its text
 /// had taken out: the parser quotes the token it stopped at.
 #[test]

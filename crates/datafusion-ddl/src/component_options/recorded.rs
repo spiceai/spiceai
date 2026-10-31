@@ -32,6 +32,7 @@ use datafusion::sql::sqlparser::dialect::{Dialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::keywords::{ALL_KEYWORDS, Keyword};
 use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 use serde_json::{Map, Value};
+use util::redact::take_out_url_credentials;
 
 use super::{
     ComponentKind, REDACTED, REDACTED_SQL, byte_offset, is_params_map, is_secret_reference,
@@ -912,22 +913,32 @@ impl<'s, 't> Recording<'s, 't> {
     }
 
     fn finish(mut self) -> RecordedStatement<'s> {
+        let text = if self.replacements.is_empty() {
+            Cow::Borrowed(self.sql)
+        } else {
+            self.replacements
+                .sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+            let mut text = self.sql.to_string();
+            for (range, replacement) in self.replacements {
+                text.replace_range(range, &replacement);
+            }
+            Cow::Owned(text)
+        };
+        // A value kept as written, such as `from`, can be a URL that carries a
+        // user name and password: they are taken out, as `/v1/datasets` takes
+        // them out of `from`.
+        let (stripped, taken) = take_out_url_credentials(&text);
+        let text = match stripped {
+            Cow::Owned(stripped) => Cow::Owned(stripped),
+            Cow::Borrowed(_) => text,
+        };
+        for part in &taken {
+            remember(&mut self.removed, part, true);
+        }
         self.removed.sort();
         self.removed.dedup();
-        if self.replacements.is_empty() {
-            return RecordedStatement {
-                text: Cow::Borrowed(self.sql),
-                removed: self.removed,
-            };
-        }
-        self.replacements
-            .sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
-        let mut text = self.sql.to_string();
-        for (range, replacement) in self.replacements {
-            text.replace_range(range, &replacement);
-        }
         RecordedStatement {
-            text: Cow::Owned(text),
+            text,
             removed: self.removed,
         }
     }

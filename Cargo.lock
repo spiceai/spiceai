@@ -24079,6 +24079,7 @@ dependencies = [
  "http-body 1.0.1",
  "humantime",
  "parking_lot",
+ "percent-encoding",
  "pin-project",
  "rand 0.10.1",
  "serde_json",

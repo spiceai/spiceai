@@ -20,6 +20,11 @@ limitations under the License.
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
+mod source_credentials;
+pub use source_credentials::{
+    redact_message_credentials, redact_source_credentials, take_out_url_credentials,
+};
+
 /// What a value taken out is replaced with.
 pub const REDACTED: &str = "<redacted>";
 
