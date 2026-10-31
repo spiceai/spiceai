@@ -18,6 +18,7 @@ limitations under the License.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use prost::Message;
 use snafu::{Snafu, ensure};
 
 use crate::proto::{
@@ -147,6 +148,32 @@ pub struct DatasetState {
     pub positions: BTreeMap<(String, String), Vec<u8>>,
     /// Tables an unconverted mutation touched: their state here is unknown.
     pub unknown: BTreeSet<String>,
+    /// Unresolved transactions across datasets, by id.
+    pub prepared: BTreeMap<String, Prepared>,
+}
+
+/// A transaction's `Prepare` on this dataset, held until its `Resolve`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Prepared {
+    /// The tables it reserves.
+    pub footprint: BTreeSet<String>,
+    /// Its actions, as an encoded [`Record`], applied by a `Resolve` that commits.
+    pub actions: Vec<u8>,
+}
+
+impl Prepared {
+    /// The prepared actions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError`] when the stored record does not decode.
+    pub fn record(&self, txn: &str) -> Result<Record> {
+        Record::decode(self.actions.as_slice()).map_err(|error| ApplyError::Guard {
+            action: "Resolve",
+            table_id: txn.to_string(),
+            guard: format!("prepared actions decode: {error}"),
+        })
+    }
 }
 
 fn select(value: i32) -> Select {
@@ -182,7 +209,19 @@ impl DatasetState {
         let mut tables = BTreeMap::new();
         let mut positions = BTreeMap::new();
         let mut creates = false;
+        let mut transactions = false;
+        // A committing `Resolve` changes what its `Prepare` holds.
+        let mut resolved = Vec::new();
         for action in &record.actions {
+            if let Some(Kind::Resolve(a)) = &action.kind
+                && a.commit
+                && let Some(prepared) = self.prepared.get(&a.txn)
+                && let Ok(inner) = prepared.record(&a.txn)
+            {
+                resolved.extend(inner.actions);
+            }
+        }
+        for action in record.actions.iter().chain(&resolved) {
             if let Some(table_id) = action.table_id() {
                 tables
                     .entry(table_id.to_string())
@@ -197,10 +236,12 @@ impl DatasetState {
                 Some(Kind::CreateTable(_) | Kind::DropTable(_) | Kind::Unconverted(_)) => {
                     creates = true;
                 }
+                Some(Kind::Prepare(_) | Kind::Resolve(_)) => transactions = true,
                 _ => {}
             }
         }
         let unknown = creates.then(|| self.unknown.clone());
+        let prepared = transactions.then(|| self.prepared.clone());
         for action in &record.actions {
             if let Err(error) = self.apply_action(action) {
                 for (table_id, prior) in tables {
@@ -217,6 +258,9 @@ impl DatasetState {
                 }
                 if let Some(unknown) = unknown {
                     self.unknown = unknown;
+                }
+                if let Some(prepared) = prepared {
+                    self.prepared = prepared;
                 }
                 return Err(error);
             }
@@ -243,6 +287,21 @@ impl DatasetState {
     fn apply_action(&mut self, action: &Action) -> Result<()> {
         let name = action.name();
         let kind = action.kind.as_ref().ok_or(ApplyError::EmptyAction)?;
+        if let Some(table_id) = action.table_id()
+            && let Some((txn, _)) = self
+                .prepared
+                .iter()
+                .find(|(_, prepared)| prepared.footprint.contains(table_id))
+        {
+            // The reservation: what a `Prepare` checked must still hold at its
+            // `Resolve`, which re-runs no guard.
+            return GuardSnafu {
+                action: name,
+                table_id: table_id.to_string(),
+                guard: format!("no unresolved transaction '{txn}' reserves the table"),
+            }
+            .fail();
+        }
         if let Some(table_id) = action.table_id()
             && self.unknown.contains(table_id)
             && !matches!(kind, Kind::CreateTable(_) | Kind::DropTable(_))
@@ -606,7 +665,100 @@ impl DatasetState {
             Kind::Unconverted(a) => {
                 self.unknown.insert(a.table_id.clone());
             }
+            Kind::Prepare(a) => self.prepare(a)?,
+            Kind::Resolve(a) => {
+                let footprint: BTreeSet<String> = a.footprint.iter().cloned().collect();
+                ensure!(
+                    self.prepared
+                        .get(&a.txn)
+                        .is_some_and(|prepared| prepared.footprint == footprint),
+                    GuardSnafu {
+                        action: name,
+                        table_id: a.txn.clone(),
+                        guard: "an unresolved Prepare with the same transaction and footprint"
+                            .to_string(),
+                    }
+                );
+                // Removed first, so its own reservation no longer applies to it.
+                let Some(prepared) = self.prepared.remove(&a.txn) else {
+                    return Ok(());
+                };
+                if a.commit {
+                    for action in prepared.record(&a.txn)?.actions {
+                        self.apply_action(&action)?;
+                    }
+                }
+            }
         }
+        Ok(())
+    }
+
+    /// Accept a `Prepare` iff no unresolved one shares a table with it and its
+    /// actions apply to its footprint's tables now. Those tables stay reserved,
+    /// so the actions still apply at the `Resolve`.
+    fn prepare(&mut self, a: &crate::proto::Prepare) -> Result<()> {
+        let guard = |guard: String| ApplyError::Guard {
+            action: "Prepare",
+            table_id: a.txn.clone(),
+            guard,
+        };
+        let footprint: BTreeSet<String> = a.footprint.iter().cloned().collect();
+        if a.txn.is_empty() || footprint.is_empty() || self.prepared.contains_key(&a.txn) {
+            return Err(guard(
+                "a new transaction id and a non-empty footprint".to_string(),
+            ));
+        }
+        if let Some((other, _)) = self
+            .prepared
+            .iter()
+            .find(|(_, prepared)| !prepared.footprint.is_disjoint(&footprint))
+        {
+            return Err(guard(format!(
+                "no unresolved transaction '{other}' shares a table with it"
+            )));
+        }
+        let record = Record::decode(a.actions.as_slice())
+            .map_err(|error| guard(format!("prepared actions decode: {error}")))?;
+        let mut scratch = DatasetState::default();
+        for table_id in &footprint {
+            let table = self.tables.get(table_id).ok_or_else(|| ApplyError::NoTable {
+                action: "Prepare",
+                table_id: table_id.clone(),
+            })?;
+            scratch.tables.insert(table_id.clone(), table.clone());
+            if self.unknown.contains(table_id) {
+                scratch.unknown.insert(table_id.clone());
+            }
+        }
+        for action in &record.actions {
+            let in_footprint = action
+                .table_id()
+                .is_some_and(|table_id| footprint.contains(table_id));
+            let changes_data = !matches!(
+                action.kind,
+                Some(
+                    Kind::CreateTable(_)
+                        | Kind::DropTable(_)
+                        | Kind::Unconverted(_)
+                        | Kind::Prepare(_)
+                        | Kind::Resolve(_)
+                )
+            );
+            if !(in_footprint && changes_data) {
+                return Err(guard(format!(
+                    "{} changes a table of its footprint and no table's identity",
+                    action.name()
+                )));
+            }
+            scratch.apply_action(action)?;
+        }
+        self.prepared.insert(
+            a.txn.clone(),
+            Prepared {
+                footprint,
+                actions: a.actions.clone(),
+            },
+        );
         Ok(())
     }
 }
@@ -738,7 +890,8 @@ fn map_differences<K: Ord + std::fmt::Debug, V: PartialEq + std::fmt::Debug>(
 mod tests {
     use super::*;
     use crate::proto::{
-        AddFiles, AdvanceSeq, AdvanceSourcePosition, CreateTable, TableRef, Unconverted,
+        AddFiles, AdvanceSeq, AdvanceSourcePosition, CreateTable, Prepare, Resolve, TableRef,
+        Unconverted,
     };
 
     /// The obviously atomic apply: every action on a copy, kept only if all apply.
@@ -765,7 +918,7 @@ mod tests {
 
     fn random_action(rng: &mut Lcg) -> Action {
         let table_id = format!("t{}", rng.below(4));
-        let kind = match rng.below(7) {
+        let kind = match rng.below(9) {
             0 => Kind::CreateTable(CreateTable {
                 table_id,
                 name: format!("n{}", rng.below(5)),
@@ -795,12 +948,180 @@ mod tests {
                 position: vec![u8::try_from(rng.below(250)).unwrap_or_default()],
                 clear: rng.below(5) == 0,
             }),
-            _ => Kind::Unconverted(Unconverted {
+            6 => Kind::Unconverted(Unconverted {
                 table_id,
                 method: "m".into(),
             }),
+            7 => {
+                let other = format!("t{}", rng.below(4));
+                let mut footprint = vec![table_id.clone(), other.clone()];
+                footprint.sort();
+                footprint.dedup();
+                let inner = Record {
+                    actions: vec![
+                        Action::new(Kind::AdvanceSeq(AdvanceSeq {
+                            table_id,
+                            to: i64::try_from(rng.below(40)).unwrap_or_default(),
+                        })),
+                        Action::new(Kind::AddFiles(AddFiles {
+                            table_id: other,
+                            snapshot_id: "s".into(),
+                            files: vec![FileEntry {
+                                path: format!("f{}", rng.below(12)),
+                                rows: 1,
+                                ..FileEntry::default()
+                            }],
+                            upsert: false,
+                        })),
+                    ],
+                };
+                Kind::Prepare(Prepare {
+                    txn: format!("x{}", rng.below(3)),
+                    footprint,
+                    actions: inner.encode_to_vec(),
+                })
+            }
+            _ => {
+                let other = format!("t{}", rng.below(4));
+                let mut footprint = vec![table_id, other];
+                footprint.sort();
+                footprint.dedup();
+                Kind::Resolve(Resolve {
+                    txn: format!("x{}", rng.below(3)),
+                    footprint,
+                    commit: rng.below(2) == 0,
+                })
+            }
         };
         Action::new(kind)
+    }
+
+    fn create(table_id: &str) -> Action {
+        Action::new(Kind::CreateTable(CreateTable {
+            table_id: table_id.into(),
+            name: table_id.into(),
+            current_snapshot_id: "s".into(),
+            ..CreateTable::default()
+        }))
+    }
+
+    fn advance(table_id: &str, to: i64) -> Action {
+        Action::new(Kind::AdvanceSeq(AdvanceSeq {
+            table_id: table_id.into(),
+            to,
+        }))
+    }
+
+    fn prepare(txn: &str, footprint: &[&str], actions: Vec<Action>) -> Action {
+        Action::new(Kind::Prepare(Prepare {
+            txn: txn.into(),
+            footprint: footprint.iter().map(ToString::to_string).collect(),
+            actions: Record { actions }.encode_to_vec(),
+        }))
+    }
+
+    fn resolve(txn: &str, footprint: &[&str], commit: bool) -> Action {
+        Action::new(Kind::Resolve(Resolve {
+            txn: txn.into(),
+            footprint: footprint.iter().map(ToString::to_string).collect(),
+            commit,
+        }))
+    }
+
+    fn one(action: Action) -> Record {
+        Record {
+            actions: vec![action],
+        }
+    }
+
+    #[test]
+    fn a_prepared_table_refuses_other_changes_until_its_resolve_commits_the_actions() {
+        let mut state = DatasetState::default();
+        state
+            .apply(&Record {
+                actions: vec![create("a"), create("b")],
+            })
+            .expect("create");
+        state
+            .apply(&one(prepare("x", &["a"], vec![advance("a", 5)])))
+            .expect("prepare");
+        assert_eq!(state.tables["a"].seq, 0, "a prepared action is not visible");
+        assert_eq!(
+            state.apply(&one(advance("a", 3))),
+            Err(ApplyError::Guard {
+                action: "AdvanceSeq",
+                table_id: "a".into(),
+                guard: "no unresolved transaction 'x' reserves the table".into(),
+            })
+        );
+        assert_eq!(
+            state.apply(&one(prepare("y", &["a", "b"], vec![advance("b", 1)]))),
+            Err(ApplyError::Guard {
+                action: "Prepare",
+                table_id: "y".into(),
+                guard: "no unresolved transaction 'x' shares a table with it".into(),
+            })
+        );
+        state.apply(&one(advance("b", 2))).expect("b is not reserved");
+        assert_eq!(
+            state.apply(&one(resolve("x", &["a", "b"], true))),
+            Err(ApplyError::Guard {
+                action: "Resolve",
+                table_id: "x".into(),
+                guard: "an unresolved Prepare with the same transaction and footprint".into(),
+            })
+        );
+        state
+            .apply(&one(resolve("x", &["a"], true)))
+            .expect("resolve");
+        assert_eq!(state.tables["a"].seq, 5);
+        assert!(state.prepared.is_empty());
+        state.apply(&one(advance("a", 6))).expect("released");
+        assert_eq!(state.tables["a"].seq, 6);
+    }
+
+    #[test]
+    fn an_aborted_prepare_discards_its_actions_and_a_refused_one_is_not_held() {
+        let mut state = DatasetState::default();
+        state.apply(&one(create("a"))).expect("create");
+        state
+            .apply(&one(prepare("x", &["a"], vec![advance("a", 5)])))
+            .expect("prepare");
+        state
+            .apply(&one(resolve("x", &["a"], false)))
+            .expect("abort");
+        assert_eq!(state.tables["a"].seq, 0);
+        // An action outside the footprint is refused, and the Prepare is not held.
+        assert_eq!(
+            state.apply(&one(prepare("y", &["a"], vec![advance("b", 1)]))),
+            Err(ApplyError::Guard {
+                action: "Prepare",
+                table_id: "y".into(),
+                guard: "AdvanceSeq changes a table of its footprint and no table's identity"
+                    .into(),
+            })
+        );
+        assert!(state.prepared.is_empty());
+        state.apply(&one(advance("a", 1))).expect("not reserved");
+    }
+
+    #[test]
+    fn a_checkpoint_keeps_an_unresolved_prepare_and_its_reservation() {
+        let mut state = DatasetState::default();
+        state.apply(&one(create("a"))).expect("create");
+        state
+            .apply(&one(prepare("x", &["a"], vec![advance("a", 5)])))
+            .expect("prepare");
+        let mut rebuilt = DatasetState::default();
+        rebuilt
+            .apply(&crate::checkpoint::state_as_root(&state))
+            .expect("root");
+        assert_eq!(rebuilt, state);
+        assert!(rebuilt.apply(&one(advance("a", 1))).is_err(), "still reserved");
+        rebuilt
+            .apply(&one(resolve("x", &["a"], true)))
+            .expect("resolve after the checkpoint");
+        assert_eq!(rebuilt.tables["a"].seq, 5);
     }
 
     /// Applying in place restores what a refused record changed: after every

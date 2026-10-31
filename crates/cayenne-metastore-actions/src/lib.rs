@@ -23,7 +23,7 @@ pub mod size;
 pub mod state;
 
 pub use proto::{Action, ObjRef, Record, action::Kind};
-pub use state::{ApplyError, DatasetState, TableState, differences};
+pub use state::{ApplyError, DatasetState, Prepared, TableState, differences};
 
 pub mod checkpoint;
 pub use checkpoint::{state_as_record, state_as_root};

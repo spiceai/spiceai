@@ -466,11 +466,39 @@ pub struct Unconverted {
     pub method: String,
 }
 
+/// The first half of a transaction across datasets, on one participant: its
+/// actions apply only at a matching [`Resolve`] that commits. Until then no
+/// other record may change a table in `footprint` (the reservation).
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct Prepare {
+    #[prost(string, tag = "1")]
+    pub txn: String,
+    /// Sorted table ids.
+    #[prost(string, repeated, tag = "2")]
+    pub footprint: Vec<String>,
+    /// The prepared actions, as an encoded [`Record`].
+    #[prost(bytes = "vec", tag = "3")]
+    pub actions: Vec<u8>,
+}
+
+/// The outcome of a prepared transaction, copied from its decision so replay
+/// never reads the decision object.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct Resolve {
+    #[prost(string, tag = "1")]
+    pub txn: String,
+    /// Sorted table ids; must equal the `Prepare`'s.
+    #[prost(string, repeated, tag = "2")]
+    pub footprint: Vec<String>,
+    #[prost(bool, tag = "3")]
+    pub commit: bool,
+}
+
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Action {
     #[prost(
         oneof = "action::Kind",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38"
     )]
     pub kind: Option<action::Kind>,
 }
@@ -550,6 +578,10 @@ pub mod action {
         AdvanceSourcePosition(super::AdvanceSourcePosition),
         #[prost(message, tag = "36")]
         Unconverted(super::Unconverted),
+        #[prost(message, tag = "37")]
+        Prepare(super::Prepare),
+        #[prost(message, tag = "38")]
+        Resolve(super::Resolve),
     }
 }
 
@@ -601,7 +633,7 @@ impl Action {
             Kind::ClearInsertRecords(a) => &a.table_id,
             Kind::AddPartition(a) => &a.table_id,
             Kind::Unconverted(a) => &a.table_id,
-            Kind::AdvanceSourcePosition(_) => return None,
+            Kind::AdvanceSourcePosition(_) | Kind::Prepare(_) | Kind::Resolve(_) => return None,
         })
     }
 
@@ -648,6 +680,8 @@ impl Action {
                 Kind::AddPartition(_) => "AddPartition",
                 Kind::AdvanceSourcePosition(_) => "AdvanceSourcePosition",
                 Kind::Unconverted(_) => "Unconverted",
+                Kind::Prepare(_) => "Prepare",
+                Kind::Resolve(_) => "Resolve",
             },
         }
     }

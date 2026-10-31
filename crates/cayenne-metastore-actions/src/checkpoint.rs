@@ -157,6 +157,13 @@ pub fn state_as_root(state: &crate::DatasetState) -> Record {
             },
         )));
     }
+    for (txn, prepared) in &state.prepared {
+        actions.push(Action::new(Kind::Prepare(p::Prepare {
+            txn: txn.clone(),
+            footprint: prepared.footprint.iter().cloned().collect(),
+            actions: prepared.actions.clone(),
+        })));
+    }
     Record { actions }
 }
 
