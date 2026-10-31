@@ -24,6 +24,7 @@ spicepod:
       time_format: timestamptz
       acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_check_interval: 1h }
 defaults:
+  cluster-partition-by: { '*': id }
   expect: { oracle: src }
   compare-variants: false
 steps:
@@ -57,7 +58,11 @@ steps:
     expect: { status: 201 }
   - query: SELECT id, payload, ts FROM t
     eventually: 30s
+  # The next plain refresh loads only the new rows, once.
+  - source-exec:
+      src: INSERT INTO t SELECT i, 'p' || i, TIMESTAMPTZ '2100-01-01 00:00Z' + i * INTERVAL '1 minute' FROM generate_series(61, 70) i;
   - http: { method: POST, path: /v1/datasets/t/acceleration/refresh }
     expect: { status: 201 }
-  - query: SELECT COUNT(*) AS n, COUNT(DISTINCT id) AS ids FROM t
+  - query: SELECT id, payload, ts FROM t
     eventually: 30s
+  - query: SELECT COUNT(*) AS n, COUNT(DISTINCT id) AS ids FROM t
