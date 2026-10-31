@@ -6,7 +6,8 @@ description: >
   of a would delete it, a is refused when it is configured, with a message
   naming the state location, and dataset b keeps its catalog: after a restart
   it is reopened, not created again, and its answers still match the
-  PostgreSQL source.
+  PostgreSQL source. With the flag disabled, a loads as it did before the
+  flag existed.
 
 sources:
   src: { kind: postgres }
@@ -64,5 +65,14 @@ steps:
 
   # b's catalog survived: the restart reopened it rather than creating a new one.
   - assert-log: { count: { 'Created the Cayenne object-native metastore': 1, 'Opened the Cayenne object-native metastore': '>=1' } }
+  - query: SELECT * FROM b_ds
+    eventually: 60s
+
+  # With the flag disabled the state location is not a metastore, so nothing is
+  # refused: a loads on SQLite as it did before the flag existed.
+  - restart:
+      patch: { spicepod: { runtime: { params: { cayenne_vnext: disabled } } }, datasets: { a_ds: { acceleration: { mode: file } } } }
+  - query: SELECT * FROM a_ds
+    eventually: 60s
   - query: SELECT * FROM b_ds
     eventually: 60s

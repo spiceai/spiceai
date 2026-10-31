@@ -1780,13 +1780,15 @@ impl CayenneAccelerator {
         source: &dyn AccelerationSource,
         data_dir: &str,
     ) -> Result<()> {
-        // The object-native metastore lives under a local `runtime.state.location`
-        // rather than the metadata directory when one is set.
-        let state_dir = source
-            .app()
-            .runtime
-            .state
-            .as_ref()
+        // With `cayenne_vnext` enabled, the object-native metastore lives under a local
+        // `runtime.state.location` rather than the metadata directory when one is set.
+        // Disabled, the state location holds no metastore of this instance's making;
+        // one left there by an earlier enabled run is found on disk before a delete by
+        // `ensure_no_catalog_under_data_dir`.
+        let app = source.app();
+        let state_dir = Self::vnext_enabled(source)?
+            .then_some(app.runtime.state.as_ref())
+            .flatten()
             .and_then(|state| url::Url::parse(&state.location).ok())
             .filter(|url| url.scheme() == "file")
             .and_then(|url| url.to_file_path().ok())
