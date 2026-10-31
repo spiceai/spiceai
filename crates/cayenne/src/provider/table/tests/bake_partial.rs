@@ -772,3 +772,56 @@ async fn a_futile_bake_backs_its_trigger_off() {
         provider.context.effective_bake_deletion_index_trigger()
     );
 }
+
+/// A triggered bake that prunes many tombstones keeps its trigger, even when
+/// tombstones newer than its cutoff leave the index above the trigger.
+///
+/// On a table taking upserts fast, tombstones keep arriving during a bake. Here
+/// the replays in the three kept-back checkpoints play that part: the bake
+/// prunes the older replays' tombstones and leaves theirs. Judged by the
+/// residual against the trigger, that productive bake read as futile, and
+/// CH-benCHmark `stock`'s trigger climbed from 50k to 3.75M while its index
+/// grew to 975k.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_productive_bake_that_leaves_the_index_over_its_trigger_keeps_it() {
+    use super::super::super::compaction::CompactionRunner as _;
+    const TRIGGER: usize = 10;
+    let ctx = SessionContext::new();
+    let (provider, _catalog, _tmp) = create_cdc_table_with_schema(
+        "bake_partial_productive",
+        ctx.runtime_env(),
+        schema(Key::Composite),
+        Key::Composite.columns(),
+        VortexConfig {
+            bake_deletion_index_trigger: TRIGGER,
+            ..config()
+        },
+        on_conflict(Key::Composite),
+    )
+    .await;
+    provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+    provider.test_bake_files.lock().link_min_file_bytes = Some(0);
+    let mut model = Model::new();
+    write_checkpoints_keyed(&[(&provider, Key::Composite)], &mut model, 0..9, false).await;
+    let before = provider.pk_deletion_snapshot().delete_len();
+
+    provider
+        .run_compaction_trigger()
+        .await
+        .expect("compaction trigger");
+    let residual = provider
+        .context
+        .ingest_stats_bake_residual()
+        .expect("the trigger baked and recorded its residual");
+    assert!(
+        residual >= TRIGGER && residual * 2 < before,
+        "precondition: the bake pruned most of the {before} tombstones yet left {residual}, \
+         over the trigger of {TRIGGER}"
+    );
+    assert_eq!(
+        provider.context.effective_bake_deletion_index_trigger(),
+        TRIGGER,
+        "a bake that pruned {} tombstones keeps its trigger",
+        before - residual
+    );
+}

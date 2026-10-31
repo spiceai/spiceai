@@ -30038,6 +30038,11 @@ impl CayenneTableProvider {
             let reclaimed =
                 held_before_prune.saturating_sub(self.pk_deletion_snapshot().delete_len());
             self.record_reclaim_yield(&bake_plan, bake_position_deletes, reclaimed);
+            self.context.record_bake_prune(held_before_prune, reclaimed);
+        } else {
+            // The prune was withheld: the bake pruned nothing.
+            self.context
+                .record_bake_prune(self.pk_deletion_snapshot().delete_len(), 0);
         }
 
         if clean_prefix_holds {
