@@ -1,7 +1,7 @@
 {
-  "acceleration-source-change-at-restart": [
+  "acceleration-source-change": [
     {
-      "run": "acceleration-source-change-at-restart",
+      "run": "acceleration-source-change",
       "who": "cayenne",
       "key": "query: SELECT id, name FROM items ORDER BY id #2",
       "kind": "wrong-answer",
@@ -9,9 +9,41 @@
       "group": "schema-evolution"
     },
     {
-      "run": "acceleration-source-change-at-restart",
+      "run": "acceleration-source-change",
+      "who": "cayenne",
+      "key": "query: SELECT id, name FROM items ORDER BY id #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1, actual: 2 }",
+      "group": "schema-evolution"
+    },
+    {
+      "run": "acceleration-source-change",
+      "who": "cayenne",
+      "key": "query: SELECT id, name FROM items ORDER BY id #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1, actual: 2 }",
+      "group": "schema-evolution"
+    },
+    {
+      "run": "acceleration-source-change",
       "who": "duckdb",
       "key": "query: SELECT id, name FROM items ORDER BY id #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1, actual: 2 }",
+      "group": "schema-evolution"
+    },
+    {
+      "run": "acceleration-source-change",
+      "who": "duckdb",
+      "key": "query: SELECT id, name FROM items ORDER BY id #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1, actual: 2 }",
+      "group": "schema-evolution"
+    },
+    {
+      "run": "acceleration-source-change",
+      "who": "duckdb",
+      "key": "query: SELECT id, name FROM items ORDER BY id #4",
       "kind": "wrong-answer",
       "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1, actual: 2 }",
       "group": "schema-evolution"
