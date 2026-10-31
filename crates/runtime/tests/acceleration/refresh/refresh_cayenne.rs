@@ -14,9 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::acceleration::refresh::common::{
-    execute_ps_sql, execute_rt_sql, get_acceleration_config_append, get_acceleration_config_full,
-    get_dataset_no_time_column, initialize_postgres, initialize_postgres_with_value_column,
-    refresh_table, start_test_runtime, test_append_iso8601_for_engine,
+    execute_rt_sql, get_acceleration_config_append, get_acceleration_config_full,
+    get_dataset_no_time_column, initialize_postgres, test_append_iso8601_for_engine,
     test_append_timestamp_for_engine, test_append_unix_seconds_for_engine,
 };
 use crate::postgres::common;
@@ -24,7 +23,6 @@ use crate::{
     configure_test_datafusion, configure_test_datafusion_request_context, init_tracing,
     utils::{register_test_connectors, test_request_context, wait_until_true},
 };
-use arrow::array::Array;
 use datafusion::common::TableReference;
 use runtime::status::ComponentStatus;
 use spicepod::acceleration::Mode;
@@ -73,157 +71,20 @@ async fn cayenne_refresh_matches_source(
     .await
 }
 
-/// Test that Cayenne append mode works with both `primary_key` and `time_column` specified.
-/// This validates that:
-/// 1. `time_column` is used for incremental queries (fetch only new data)
-/// 2. `primary_key` is used for deduplication at insert time (upsert behavior)
+/// Cayenne append mode, `mode: file`, with both `primary_key` and `time_column`: the time
+/// column selects the rows each refresh fetches, and the primary key deduplicates them on
+/// insert (`on_conflict: upsert`). The rows after each refresh must match `PostgreSQL`; see
+/// [`super::refresh_modes::upsert_history_matches_postgres_source`] for the history.
 #[tokio::test]
 async fn test_cayenne_append_mode_with_pk_and_time_column() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-
-    test_request_context()
-        .scope(async {
-            let running_container = common::start_postgres_docker_container().await?;
-            let port = usize::from(running_container.host_port(5432)?);
-
-            // Use table with value column for testing upserts
-            let db_conn = initialize_postgres_with_value_column(port).await?;
-
-            // Create unique temp directory for this test
-            let temp_dir = tempfile::tempdir()?;
-            let metadata_dir = temp_dir.path().join("cayenne_metadata");
-            std::fs::create_dir_all(&metadata_dir)?;
-
-            let mut params = HashMap::new();
-            params.insert(
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.to_str().expect("valid UTF-8 path").to_string(),
-            );
-
-            // Configure with BOTH primary_key and time_column
-            let mut acceleration_config =
-                get_acceleration_config_append("cayenne", Some(Params::from_string_map(params)));
-            acceleration_config.mode = Mode::File;
-            // Keep both primary_key (from get_acceleration_config_append) and time_column (from get_dataset)
-
-            let rt = start_test_runtime(port, acceleration_config).await?;
-
-            // Verify initial data loaded with correct value
-            let results =
-                execute_rt_sql(Arc::clone(&rt), "SELECT id, value from test_table").await?;
-            assert_eq!(
-                results
-                    .iter()
-                    .map(arrow::array::RecordBatch::num_rows)
-                    .sum::<usize>(),
-                1,
-                "Expected 1 row after initial load"
-            );
-
-            // Check initial value
-            let initial_value = results
-                .first()
-                .and_then(|batch| {
-                    batch
-                        .column(1)
-                        .as_any()
-                        .downcast_ref::<arrow::array::StringArray>()
-                })
-                .and_then(|arr| if arr.is_empty() { None } else { Some(arr.value(0).to_string()) })
-                .expect("Should have initial value");
-            assert_eq!(initial_value, "initial_value", "Initial value should be 'initial_value'");
-
-            // Get the ID of the first row for later upsert test
-            let first_id = results
-                .first()
-                .and_then(|batch| {
-                    batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<arrow::array::Int32Array>()
-                })
-                .and_then(|arr| if arr.is_empty() { None } else { Some(arr.value(0)) })
-                .expect("Should have at least one row");
-
-            // Insert a new row with a new timestamp and different value
-            execute_ps_sql(
-                &db_conn,
-                "INSERT INTO test_table (created_at, value) VALUES (date_trunc('milliseconds', now()), 'second_value');",
-            )
-            .await?;
-
-            refresh_table(Arc::clone(&rt), "test_table").await?;
-
-            // Verify new row was appended
-            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
-            assert_eq!(
-                results
-                    .iter()
-                    .map(arrow::array::RecordBatch::num_rows)
-                    .sum::<usize>(),
-                2,
-                "Expected 2 rows after refresh with new data"
-            );
-
-            // Test upsert: update existing row (same PK, new timestamp, new value)
-            execute_ps_sql(
-                &db_conn,
-                &format!(
-                    "UPDATE test_table SET created_at = date_trunc('milliseconds', now() + interval '1 second'), value = 'updated_value' WHERE id = {first_id};"
-                ),
-            )
-            .await?;
-
-            refresh_table(Arc::clone(&rt), "test_table").await?;
-
-            // Should still have 2 rows (upsert updated the existing row, not inserted a new one)
-            let results = execute_rt_sql(
-                Arc::clone(&rt),
-                &format!("SELECT id, value from test_table WHERE id = {first_id}"),
-            )
-            .await?;
-            assert_eq!(
-                results
-                    .iter()
-                    .map(arrow::array::RecordBatch::num_rows)
-                    .sum::<usize>(),
-                1,
-                "Expected exactly 1 row with the upserted id"
-            );
-
-            // Verify the value was actually updated
-            let updated_value = results
-                .first()
-                .and_then(|batch| {
-                    batch
-                        .column(1)
-                        .as_any()
-                        .downcast_ref::<arrow::array::StringArray>()
-                })
-                .and_then(|arr| if arr.is_empty() { None } else { Some(arr.value(0).to_string()) })
-                .expect("Should have updated value");
-            assert_eq!(
-                updated_value, "updated_value",
-                "Value should be updated to 'updated_value' after upsert"
-            );
-
-            // Verify total row count is still 2
-            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
-            assert_eq!(
-                results
-                    .iter()
-                    .map(arrow::array::RecordBatch::num_rows)
-                    .sum::<usize>(),
-                2,
-                "Expected 2 rows total after upsert (not 3) - PK deduplication should work"
-            );
-
-            tracing::info!("✓ Cayenne append mode with both primary_key and time_column works correctly");
-
-            running_container.cleanup().await;
-            Ok(())
-        })
-        .await
+    let (_temp_dir, params) = cayenne_params();
+    super::refresh_modes::upsert_history_matches_postgres_source("cayenne", move |_port| {
+        let mut acceleration = get_acceleration_config_append("cayenne", Some(params));
+        acceleration.mode = Mode::File;
+        acceleration
+    })
+    .await
 }
 
 /// Regression test for #12779.
@@ -243,133 +104,22 @@ async fn test_cayenne_append_mode_with_pk_and_time_column() -> Result<(), anyhow
 #[tokio::test]
 async fn test_cayenne_partitioned_append_on_conflict_upsert() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-
-    test_request_context()
-        .scope(async {
-            let running_container = common::start_postgres_docker_container().await?;
-            let port = usize::from(running_container.host_port(5432)?);
-
-            // Use table with value column for observing upsert changes.
-            let db_conn = initialize_postgres_with_value_column(port).await?;
-
-            let temp_dir = tempfile::tempdir()?;
-            let metadata_dir = temp_dir.path().join("cayenne_metadata");
-            std::fs::create_dir_all(&metadata_dir)?;
-
-            let mut params = HashMap::new();
-            params.insert(
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.to_str().expect("valid UTF-8 path").to_string(),
-            );
-
-            // Append + on_conflict upsert + primary_key id, plus partition_by to
-            // route writes through the cross-partition coordinator.
-            let mut acceleration_config =
-                get_acceleration_config_append("cayenne", Some(Params::from_string_map(params)));
-            acceleration_config.mode = Mode::File;
-            acceleration_config.partition_by = vec![PartitionedBy {
+    let (_temp_dir, params) = cayenne_params();
+    // Before the fix the initial load, itself a partitioned append, fails and the dataset
+    // never becomes ready.
+    super::refresh_modes::upsert_history_matches_postgres_source(
+        "cayenne-partitioned",
+        move |_port| {
+            let mut acceleration = get_acceleration_config_append("cayenne", Some(params));
+            acceleration.mode = Mode::File;
+            acceleration.partition_by = vec![PartitionedBy {
                 name: "id_bucket".to_string(),
                 expression: "bucket(4, id)".to_string(),
             }];
-
-            let rt = start_test_runtime(port, acceleration_config).await?;
-
-            // Initial load is itself a partitioned append; before the fix it
-            // fails and the dataset never becomes ready.
-            let results =
-                execute_rt_sql(Arc::clone(&rt), "SELECT id, value from test_table").await?;
-            assert_eq!(
-                results
-                    .iter()
-                    .map(arrow::array::RecordBatch::num_rows)
-                    .sum::<usize>(),
-                1,
-                "Expected 1 row after initial load"
-            );
-
-            let first_id = results
-                .first()
-                .and_then(|batch| {
-                    batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<arrow::array::Int32Array>()
-                })
-                .and_then(|arr| if arr.is_empty() { None } else { Some(arr.value(0)) })
-                .expect("Should have at least one row");
-
-            // Append a distinct row.
-            execute_ps_sql(
-                &db_conn,
-                "INSERT INTO test_table (created_at, value) VALUES (date_trunc('milliseconds', now()), 'second_value');",
-            )
-            .await?;
-            refresh_table(Arc::clone(&rt), "test_table").await?;
-
-            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
-            assert_eq!(
-                results
-                    .iter()
-                    .map(arrow::array::RecordBatch::num_rows)
-                    .sum::<usize>(),
-                2,
-                "Expected 2 rows after appending a new row"
-            );
-
-            // Append a row with a conflicting primary key; upsert must update in
-            // place, not insert a duplicate.
-            execute_ps_sql(
-                &db_conn,
-                &format!(
-                    "UPDATE test_table SET created_at = date_trunc('milliseconds', now() + interval '1 second'), value = 'updated_value' WHERE id = {first_id};"
-                ),
-            )
-            .await?;
-            refresh_table(Arc::clone(&rt), "test_table").await?;
-
-            let results = execute_rt_sql(
-                Arc::clone(&rt),
-                &format!("SELECT id, value from test_table WHERE id = {first_id}"),
-            )
-            .await?;
-            assert_eq!(
-                results
-                    .iter()
-                    .map(arrow::array::RecordBatch::num_rows)
-                    .sum::<usize>(),
-                1,
-                "Expected exactly 1 row with the upserted id"
-            );
-
-            let updated_value = results
-                .first()
-                .and_then(|batch| {
-                    batch
-                        .column(1)
-                        .as_any()
-                        .downcast_ref::<arrow::array::StringArray>()
-                })
-                .and_then(|arr| if arr.is_empty() { None } else { Some(arr.value(0).to_string()) })
-                .expect("Should have updated value");
-            assert_eq!(
-                updated_value, "updated_value",
-                "Value should be updated to 'updated_value' after upsert"
-            );
-
-            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
-            assert_eq!(
-                results
-                    .iter()
-                    .map(arrow::array::RecordBatch::num_rows)
-                    .sum::<usize>(),
-                2,
-                "Expected 2 rows total after upsert (not 3)"
-            );
-
-            running_container.cleanup().await;
-            Ok(())
-        })
-        .await
+            acceleration
+        },
+    )
+    .await
 }
 
 #[tokio::test]
