@@ -24,20 +24,23 @@ limitations under the License.
 //! this crate, not the entire runtime.
 
 use async_trait::async_trait;
-use data_components::Read;
-use data_components::duckdb::with_utc_session_timezone;
+use data_components::adbc_helpers::{
+    DUCKDB_DRIVER, await_adbc_initialization, driver_entrypoint, load_adbc_database,
+    managed_duckdb_options, offload_adbc_drop,
+};
 use data_connector_api::ConnectorContext;
 use data_connector_api::{
-    AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
-    DataConnectorFactory, DataConnectorResult,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult,
 };
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion_table_providers::UnsupportedTypeAction;
-use datafusion_table_providers::duckdb::DuckDBTableFactory;
-use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::is_table_function;
-use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use duckdb::AccessMode;
+use datafusion::sql::sqlparser::{ast::TableFactor, dialect::DuckDbDialect, parser::Parser};
+use datafusion_table_providers::adbc::AdbcTableFactory;
+use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
+use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
+    ADBCPool, AdbcConnectionPoolBuilder,
+};
 use runtime_component::dataset::DatasetSpec;
 use runtime_datafusion::dialect::new_duckdb_dialect;
 use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_table_providers;
@@ -54,13 +57,38 @@ pub enum Error {
         "Missing required parameter `duckdb_open`. Set it to the DuckDB database file to read, for example `duckdb_open: ./data.duckdb`. For details, visit: https://spiceai.org/docs/components/data-connectors/duckdb"
     ))]
     MissingDuckDBFile,
+
+    #[snafu(display(
+        "Failed to load the installed DuckDB library. Install libduckdb on the system library path or register the 'duckdb' ADBC driver manifest. For details, visit: https://spiceai.org/docs/components/data-connectors/duckdb"
+    ))]
+    MissingLibrary {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed to open DuckDB: {source}"))]
+    Initialize {
+        source: data_components::adbc_helpers::AdbcInitError,
+    },
+
+    #[snafu(display("Failed to initialize DuckDB for {component}: {source}"))]
+    Setup {
+        component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("The DuckDB connection does not support synchronous setup"))]
+    MissingSyncConnection,
+
+    #[snafu(display("The DuckDB connector has already been closed"))]
+    Closed,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// `DuckDB` data connector.
 pub struct DuckDB {
-    duckdb_factory: DuckDBTableFactory,
+    duckdb_factory: Option<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>>,
+    function_view: Option<String>,
 }
 
 impl std::fmt::Debug for DuckDB {
@@ -69,83 +97,153 @@ impl std::fmt::Debug for DuckDB {
     }
 }
 
+impl Drop for DuckDB {
+    fn drop(&mut self) {
+        if let Some(factory) = self.duckdb_factory.take() {
+            offload_adbc_drop(factory);
+        }
+    }
+}
+
+/// Recognizes the same bare table-function syntax as the bundled provider.
+fn is_table_function(reference: &TableReference) -> bool {
+    let TableReference::Bare { table } = reference else {
+        return false;
+    };
+    let dialect = DuckDbDialect {};
+    let Ok(mut parser) = Parser::new(&dialect).try_with_sql(table) else {
+        return false;
+    };
+    matches!(
+        parser.parse_table_factor(),
+        Ok(TableFactor::Table { args: Some(_), .. })
+    )
+}
+
+/// Encodes every UTF-8 byte, so distinct function text cannot share a view name.
+/// The identifier is quoted when used in SQL; no function text enters its name.
+fn table_function_view_name(function: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut name = String::from("spice_duckdb_");
+    for byte in function.bytes() {
+        name.push(char::from(HEX[usize::from(byte >> 4)]));
+        name.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    name.push_str("__view");
+    name
+}
+
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
 impl DuckDB {
-    /// Build a [`DuckDBTableFactory`] with the Spice function deny-list installed.
-    ///
-    /// Without the deny-list, federation pushes Spice-only UDFs (`json_get_str`,
-    /// the embedding/distance UDFs, etc.) into the SQL sent to `DuckDB`, where
-    /// those functions don't exist — the query then fails with an "unknown
-    /// function" error from `DuckDB`. Installing the deny-list makes `DuckDB`'s
-    /// `can_execute_plan` refuse such plans so `DataFusion` evaluates the affected
-    /// expressions locally instead. We use [`deny_spice_functions_for_duckdb`]
-    /// (rather than the generic deny-list) so functions `DuckDB` *does* support
-    /// natively — e.g. `cosine_distance`, which `DuckDB` unparses to
-    /// `array_cosine_distance` — still federate. See issue #10703.
-    fn with_spice_deny_list(factory: DuckDBTableFactory) -> DuckDBTableFactory {
-        // The spiceai table-providers fork restores the `with_function_support`
-        // deny-list seam on DuckDBTableFactory (see issue #10703). Install the
-        // DuckDB-aware deny-list so Spice-only UDFs that DuckDB can't run are
-        // evaluated locally, while functions DuckDB's dialect can rewrite (e.g.
-        // cosine_distance -> array_cosine_distance) still federate. The factory's
-        // seam takes the table-providers FunctionSupport type, so we build the
-        // deny-list directly in that type from the runtime's shared name list.
-        factory.with_function_support(deny_spice_functions_for_duckdb_table_providers())
-    }
-
-    /// Creates an in-memory `DuckDB` table factory.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the in-memory `DuckDB` connection cannot be established.
-    pub fn create_in_memory(params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
-        let pool = Arc::new(with_utc_session_timezone(
-            DuckDbConnectionPool::new_memory()
-                .map_err(|source| DataConnectorError::UnableToConnectInternal {
-                    dataconnector: "duckdb".to_string(),
-                    connector_component: params.component.clone(),
-                    source,
-                })?
-                .with_unsupported_type_action(
-                    params
-                        .unsupported_type_action
-                        .unwrap_or(UnsupportedTypeAction::Error),
-                ),
-        ));
-
+    async fn create(params: ConnectorParams) -> data_connector_api::NewDataConnectorResult {
+        // `unsupported_type_action` is accepted and has nothing to act on. It
+        // guarded the bundled DuckDB path, which could not convert nested lists
+        // of non-primitive types (and structs holding them) to Arrow. DuckDB's
+        // own Arrow export, which ADBC returns, converts every DuckDB type, so
+        // no column is unsupported and none is dropped.
+        let path = params
+            .parameters
+            .get("open")
+            .expose()
+            .ok()
+            .map(str::to_owned);
+        let function = match &params.component {
+            ConnectorComponent::Dataset(dataset) => {
+                let reference = TableReference::from(dataset.path());
+                is_table_function(&reference).then(|| reference.table().to_owned())
+            }
+            ConnectorComponent::Catalog(_) => None,
+        };
+        let function_view = function.as_deref().map(table_function_view_name);
+        let view = function_view.clone();
+        let component = params.component.clone();
+        let init = tokio::task::spawn_blocking(
+            move || -> Result<Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>> {
+                // One database owns every pooled connection, including memory views
+                // and attachments. File sources open their database read-only.
+                let database_path = if function.is_some() {
+                    ":memory:"
+                } else {
+                    path.as_deref().unwrap_or(":memory:")
+                };
+                let db = load_adbc_database(
+                    DUCKDB_DRIVER,
+                    driver_entrypoint(DUCKDB_DRIVER),
+                    managed_duckdb_options(database_path, database_path != ":memory:"),
+                )
+                .map_err(|source| match source {
+                    source @ data_components::adbc_helpers::AdbcInitError::LoadDriver { .. } => {
+                        Error::MissingLibrary {
+                            source: Box::new(source),
+                        }
+                    }
+                    source => Error::Initialize { source },
+                })?;
+                let joins = if database_path == ":memory:" {
+                    JoinPushDown::Disallow
+                } else {
+                    JoinPushDown::AllowedFor(format!("duckdb:file:{database_path}"))
+                };
+                let setup =
+                    || -> std::result::Result<_, Box<dyn std::error::Error + Send + Sync>> {
+                        // Only file databases with the same path share a SQL namespace.
+                        // Memory views and attachments belong to this database alone.
+                        let pool = Arc::new(
+                            AdbcConnectionPoolBuilder::new(db)
+                                .with_join_push_down(joins)
+                                .build()?,
+                        );
+                        if let (Some(function), Some(view)) = (function, view) {
+                            let connection = Arc::clone(&pool).connect_sync()?;
+                            let connection =
+                                connection.as_sync().context(MissingSyncConnectionSnafu)?;
+                            if let Some(path) = path.filter(|path| path != ":memory:") {
+                                let alias = std::path::Path::new(&path)
+                                    .file_stem()
+                                    .and_then(std::ffi::OsStr::to_str)
+                                    .unwrap_or("source");
+                                connection.execute(
+                                    &format!(
+                                        "ATTACH '{}' AS {} (READ_ONLY)",
+                                        path.replace('\'', "''"),
+                                        quote_identifier(alias)
+                                    ),
+                                    &[],
+                                )?;
+                            }
+                            connection.execute(
+                                &format!(
+                                    "CREATE VIEW memory.main.{} AS SELECT * FROM {function}",
+                                    quote_identifier(&view)
+                                ),
+                                &[],
+                            )?;
+                        }
+                        Ok(pool)
+                    };
+                setup().map_err(|source| Error::Setup { component, source })
+            },
+        );
+        let pool = await_adbc_initialization(init).await.map_err(|source| {
+            DataConnectorError::UnableToConnectInternal {
+                dataconnector: "duckdb".into(),
+                connector_component: params.component,
+                source: Box::new(source),
+            }
+        })?;
         #[expect(
             clippy::disallowed_methods,
-            reason = "`with_spice_deny_list` installs the DuckDB deny-list on the factory it is handed"
+            reason = "The DuckDB function policy is installed immediately on this factory"
         )]
-        let factory = DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect());
-        Ok(Self::with_spice_deny_list(factory))
-    }
-
-    /// Creates a file-based `DuckDB` table factory.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the file-based `DuckDB` connection cannot be established.
-    pub fn create_file(path: &str, params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
-        let pool = Arc::new(with_utc_session_timezone(
-            DuckDbConnectionPool::new_file(path, &AccessMode::ReadOnly)
-                .map_err(|source| DataConnectorError::UnableToConnectInternal {
-                    dataconnector: "duckdb".to_string(),
-                    connector_component: params.component.clone(),
-                    source,
-                })?
-                .with_unsupported_type_action(
-                    params
-                        .unsupported_type_action
-                        .unwrap_or(UnsupportedTypeAction::Error),
-                ),
-        ));
-
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "`with_spice_deny_list` installs the DuckDB deny-list on the factory it is handed"
-        )]
-        let factory = DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect());
-        Ok(Self::with_spice_deny_list(factory))
+        let factory = AdbcTableFactory::new(pool)
+            .with_function_support(deny_spice_functions_for_duckdb_table_providers());
+        Ok(Arc::new(Self {
+            duckdb_factory: Some(factory),
+            function_view,
+        }) as Arc<dyn DataConnector>)
     }
 }
 
@@ -184,16 +282,7 @@ impl DataConnectorFactory for DuckDBFactory {
         params: ConnectorParams,
         _context: &'a dyn ConnectorContext,
     ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
-        Box::pin(async move {
-            let duckdb_factory =
-                if let Some(db_path) = params.parameters.clone().get("open").expose().ok() {
-                    DuckDB::create_file(db_path, &params)?
-                } else {
-                    DuckDB::create_in_memory(&params)?
-                };
-
-            Ok(Arc::new(DuckDB { duckdb_factory }) as Arc<dyn DataConnector>)
-        })
+        Box::pin(DuckDB::create(params))
     }
 
     fn supports_unsupported_type_action(&self) -> bool {
@@ -265,7 +354,21 @@ impl DataConnector for DuckDB {
             });
         }
 
-        Ok(Read::table_provider(&self.duckdb_factory, path)
+        let path = self
+            .function_view
+            .as_ref()
+            .map_or(path, |view| TableReference::bare(view.clone()));
+        let factory = self
+            .duckdb_factory
+            .as_ref()
+            .context(ClosedSnafu)
+            .map_err(|source| DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "duckdb".into(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(source),
+            })?;
+        Ok(factory
+            .table_provider(path, Some(new_duckdb_dialect()))
             .await
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "duckdb",
@@ -287,6 +390,52 @@ data_connector_api::register_data_connector!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_function_names_preserve_every_byte() {
+        // DTP's flattening convention ends in __view but drops punctuation.
+        // Encoding keeps even paths differing only by punctuation distinct.
+        assert_eq!(
+            table_function_view_name("f('a-b')"),
+            "spice_duckdb_662827612d622729__view"
+        );
+        assert_eq!(
+            table_function_view_name("f('ab')"),
+            "spice_duckdb_66282761622729__view"
+        );
+        assert_eq!(
+            table_function_view_name("f('雪')"),
+            "spice_duckdb_662827e99baa2729__view"
+        );
+        assert_eq!(quote_identifier("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn recognizes_bare_table_functions() {
+        for (name, expected) in [
+            ("t", false),
+            ("read_parquet('a.b.parquet')", true),
+            ("read_csv_auto('x.csv', header=true)", true),
+        ] {
+            assert_eq!(
+                is_table_function(&TableReference::from(name)),
+                expected,
+                "{name}"
+            );
+        }
+        assert!(!is_table_function(&TableReference::partial("main", "f()")));
+    }
+
+    #[test]
+    fn missing_library_error_names_the_installation_fix() {
+        assert_eq!(
+            Error::MissingLibrary {
+                source: "driver not found".into(),
+            }
+            .to_string(),
+            "Failed to load the installed DuckDB library. Install libduckdb on the system library path or register the 'duckdb' ADBC driver manifest. For details, visit: https://spiceai.org/docs/components/data-connectors/duckdb"
+        );
+    }
 
     #[test]
     fn missing_file_error_names_the_spicepod_key() {

@@ -40,11 +40,151 @@ pub const DUCKDB_DRIVER: &str = "duckdb";
 /// `DuckDB` exports this ADBC entry point instead of `AdbcDriverInit`.
 pub const DUCKDB_ADBC_ENTRYPOINT: &[u8] = b"duckdb_adbc_init";
 
-/// The settings every `DuckDB` database opens with, matching the `duckdb:`
-/// connector: read-only, so Spice never takes the write lock or upgrades the
-/// file, and a UTC session, so timestamps answer the same.
-pub const DUCKDB_DB_DEFAULTS: &[(&str, &str)] =
-    &[("access_mode", "read_only"), ("TimeZone", "UTC")];
+/// Builds raw database settings for a Spice-managed `DuckDB` source.
+///
+/// Direct `adbc:` connections use [`build_db_options`] instead, preserving the
+/// driver's access mode and host time zone defaults.
+#[must_use]
+pub fn managed_duckdb_options(
+    path: &str,
+    read_only: bool,
+) -> Vec<(OptionDatabase, adbc_core::options::OptionValue)> {
+    let mut options = vec![(OptionDatabase::Other("path".into()), path.into())];
+    if read_only {
+        options.push((
+            OptionDatabase::Other("access_mode".into()),
+            "read_only".into(),
+        ));
+    }
+    options.push((OptionDatabase::Other("TimeZone".into()), "UTC".into()));
+    options
+}
+
+/// Errors during blocking ADBC initialization.
+#[derive(Debug, snafu::Snafu)]
+pub enum AdbcInitError {
+    #[snafu(display("Failed to load ADBC driver '{driver_location}': {source}"))]
+    LoadDriver {
+        driver_location: String,
+        source: adbc_core::error::Error,
+    },
+    #[snafu(display("Failed to create ADBC database: {source}"))]
+    CreateDatabase { source: adbc_core::error::Error },
+    #[snafu(display("ADBC driver initialization timed out after 120 seconds"))]
+    Timeout,
+    #[snafu(display("ADBC initialization task failed: {source}"))]
+    Join { source: tokio::task::JoinError },
+    #[snafu(display("{source}"))]
+    Initialize {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+/// Loads an installed driver and opens one database. Call on a blocking thread.
+///
+/// # Errors
+/// Returns the driver loading or database initialization error.
+pub fn load_adbc_database(
+    driver_location: &str,
+    entrypoint: Option<&[u8]>,
+    options: Vec<(OptionDatabase, adbc_core::options::OptionValue)>,
+) -> Result<adbc_driver_manager::ManagedDatabase, AdbcInitError> {
+    use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT, options::AdbcVersion};
+    use snafu::ResultExt as _;
+    let mut driver = adbc_driver_manager::ManagedDriver::load_from_name(
+        driver_location,
+        entrypoint,
+        AdbcVersion::V110,
+        LOAD_FLAG_DEFAULT,
+        None,
+    )
+    .context(LoadDriverSnafu { driver_location })?;
+    driver
+        .new_database_with_opts(options)
+        .context(CreateDatabaseSnafu)
+}
+
+/// Bounds the wait for blocking driver initialization to two minutes.
+///
+/// Aborting cannot interrupt FFI already executing on the blocking thread.
+///
+/// # Errors
+/// Returns the initialization, task, or timeout error.
+pub async fn await_adbc_initialization<T, E>(
+    handle: tokio::task::JoinHandle<Result<T, E>>,
+) -> Result<T, AdbcInitError>
+where
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let abort = handle.abort_handle();
+    match tokio::time::timeout(std::time::Duration::from_mins(2), handle).await {
+        Ok(Ok(result)) => result.map_err(|source| AdbcInitError::Initialize {
+            source: source.into(),
+        }),
+        Ok(Err(source)) => Err(AdbcInitError::Join { source }),
+        Err(_) => {
+            abort.abort();
+            Err(AdbcInitError::Timeout)
+        }
+    }
+}
+
+/// Moves driver-owned resources onto the shared blocking cleanup worker.
+pub fn offload_adbc_drop(resource: impl Send + 'static) {
+    match adbc_cleanup_sender().try_send(Box::new(resource)) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::TrySendError::Full(resource)) => offload_adbc_factory_drop(
+            resource,
+            "ADBC cleanup queue full; offloading drop to overflow thread",
+        ),
+        Err(std::sync::mpsc::TrySendError::Disconnected(resource)) => offload_adbc_factory_drop(
+            resource,
+            "ADBC cleanup channel closed; offloading drop to overflow thread",
+        ),
+    }
+}
+
+const ADBC_CLEANUP_QUEUE_CAPACITY: usize = 64;
+
+fn offload_adbc_factory_drop(factory: Box<dyn Send>, reason: &str) {
+    tracing::warn!("{reason}");
+    if std::thread::Builder::new()
+        .name("adbc-cleanup-overflow".to_string())
+        .spawn(move || {
+            drop(factory);
+        })
+        .is_err()
+    {
+        tracing::warn!("Failed to spawn overflow ADBC cleanup thread; dropping inline");
+    }
+}
+
+/// Returns a sender for offloading ADBC factory cleanup to a dedicated
+/// background thread. The worker thread is created once (on first use) and
+/// processes drop work sequentially with bounded buffering, avoiding both
+/// unbounded thread spawns and unbounded cleanup backlog growth.
+fn adbc_cleanup_sender() -> &'static std::sync::mpsc::SyncSender<Box<dyn Send>> {
+    static SENDER: std::sync::OnceLock<std::sync::mpsc::SyncSender<Box<dyn Send>>> =
+        std::sync::OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<Box<dyn Send>>(ADBC_CLEANUP_QUEUE_CAPACITY);
+        if std::thread::Builder::new()
+            .name("adbc-cleanup".to_string())
+            .spawn(move || {
+                for factory in rx {
+                    drop(factory);
+                }
+            })
+            .is_err()
+        {
+            tracing::warn!(
+                "Failed to spawn ADBC cleanup worker thread; subsequent cleanup will use the overflow thread path or be performed inline as a last resort"
+            );
+        }
+        tx
+    })
+}
 
 /// Applies the `adbc.` prefix a driver-option key takes when it is written without
 /// one. `bigquery.sql.dataset_id` and `adbc.bigquery.sql.dataset_id` name the same
@@ -67,7 +207,7 @@ pub fn driver_entrypoint(driver_name: &str) -> Option<&'static [u8]> {
 /// Builds the list of ADBC database options from connector parameters.
 ///
 /// For `DuckDB` the file is passed as `path` (1.4.4 rejects `uri`; 1.4.4 and
-/// 1.5.5 both accept `path`), followed by [`DUCKDB_DB_DEFAULTS`].
+/// 1.5.5 both accept `path`). Access mode and time zone retain driver defaults.
 pub fn build_db_options(
     driver_name: &str,
     uri: &str,
@@ -106,11 +246,6 @@ pub fn build_db_options(
             } else {
                 tracing::warn!("Ignoring malformed ADBC driver option (expected 'key=value')");
             }
-        }
-    }
-    if driver_name == DUCKDB_DRIVER {
-        for &(key, value) in DUCKDB_DB_DEFAULTS {
-            opts.push((OptionDatabase::Other(key.to_string()), value.into()));
         }
     }
     opts
@@ -358,14 +493,10 @@ mod tests {
     }
 
     #[test]
-    fn test_build_db_options_duckdb_defaults() {
+    fn test_build_db_options_duckdb_has_no_managed_defaults() {
         assert_db_options_eq(
             build_db_options("duckdb", "test.db", None, None, None),
-            vec![
-                (OptionDatabase::Other("path".into()), "test.db"),
-                (OptionDatabase::Other("access_mode".into()), "read_only"),
-                (OptionDatabase::Other("TimeZone".into()), "UTC"),
-            ],
+            vec![(OptionDatabase::Other("path".into()), "test.db")],
         );
     }
 
@@ -386,7 +517,28 @@ mod tests {
                     "read_write",
                 ),
                 (OptionDatabase::Other("adbc.custom".into()), "value"),
+            ],
+        );
+    }
+
+    #[test]
+    fn managed_duckdb_file_is_read_only_and_utc() {
+        assert_db_options_eq(
+            managed_duckdb_options("test.db", true),
+            vec![
+                (OptionDatabase::Other("path".into()), "test.db"),
                 (OptionDatabase::Other("access_mode".into()), "read_only"),
+                (OptionDatabase::Other("TimeZone".into()), "UTC"),
+            ],
+        );
+    }
+
+    #[test]
+    fn managed_duckdb_memory_is_writable_and_utc() {
+        assert_db_options_eq(
+            managed_duckdb_options(":memory:", false),
+            vec![
+                (OptionDatabase::Other("path".into()), ":memory:"),
                 (OptionDatabase::Other("TimeZone".into()), "UTC"),
             ],
         );

@@ -3,7 +3,7 @@ description: >
   A query corpus answers the same through Spice as on the source itself, for
   PostgreSQL, MySQL and DuckDB, both federated (each query rewritten and pushed
   to the source) and accelerated into Cayenne, and the variants agree with each
-  other. DuckDB is also read through ADBC with the DuckDB driver.
+  other. The duckdb connector uses ADBC read-only.
 
 sources:
   src: { kind: '${matrix.source}' }
@@ -15,19 +15,8 @@ variants:
   federated: {}
   cayenne:
     datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }
-  adbc:
-    when: { source: duckdb }
-    datasets:
-      t:
-        from: adbc:t
-        params:
-          $merge: '${sources.src.adbc_params}'
-          duckdb_open: null
-      u:
-        from: adbc:u
-        params:
-          $merge: '${sources.src.adbc_params}'
-          duckdb_open: null
+  # duckdb: now exercises ADBC read-only alongside oracle: src. Direct adbc:
+  # takes the write lock; PostgreSQL-mirror scripts retain that variant.
 
 spicepod:
   version: v1
@@ -123,7 +112,7 @@ steps:
   # the source, the accelerated one read Cayenne.
   - explain: SELECT id FROM t WHERE i > 40
     contains: VirtualExecutionPlan
-    only: [federated, adbc]
+    only: federated
   - explain: SELECT id FROM t WHERE i > 40
     contains: CayenneAccelerationExec
     only: cayenne

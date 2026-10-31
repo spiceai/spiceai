@@ -4630,12 +4630,12 @@ dependencies = [
 name = "connector-duckdb"
 version = "2.5.0-unstable"
 dependencies = [
+ "adbc_driver_manager",
  "async-trait",
  "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
- "duckdb",
  "linkme",
  "paste",
  "runtime",
@@ -4643,6 +4643,7 @@ dependencies = [
  "runtime-datafusion",
  "runtime-parameters",
  "snafu",
+ "tokio",
 ]
 
 [[package]]

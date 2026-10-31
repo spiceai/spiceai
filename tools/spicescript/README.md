@@ -160,6 +160,13 @@ steps:
 | `docker` | Any image: `image`, `ports`, `env` (`${port.N}` is the host port of container port N), `command`, and `ready` (a shell command that succeeds once the container is ready). `source-exec` runs a shell command inside it and `source-query` returns the lines it prints. `host-network: true` lets the container reach `spiced` and the other sources on the host: on Linux it shares the host's network, elsewhere Docker routes to the host, and `${sources.<name>.host_from_container}` is the host's address from inside the container either way. Useful for services such as Debezium Server. |
 | `mock-http` | An HTTP server whose routes the script sets with `source-exec`: `path`, and optionally `method`, `query`, `headers-match`, `status`, `headers`, `body`, `delay-ms` and `times`; `reset` removes them all. `source-query` reads what it received: `count <path>`, `log <path>`, `header <path> <name>`. |
 
+For `duckdb` sources, the runner adds the matching library directory to the
+`spiced` process's `LD_LIBRARY_PATH` (Linux) or `DYLD_FALLBACK_LIBRARY_PATH`
+(macOS), keeping existing search paths. This lets `duckdb:` load `libduckdb`
+by name. Its read-only file connection can coexist with CLI oracle queries.
+Direct `adbc:` opens read-write and holds the file lock: check the CLI oracle
+before `start` or after `stop`, or mirror the data to another source.
+
 Files and object stores answer no queries themselves, so a script mirrors their
 rows into a database to have an oracle (`generate: … mirror: <source>`).
 

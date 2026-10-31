@@ -24,6 +24,13 @@ limitations under the License.
 //! `${sources.<name>.params}` holds `duckdb_open` for `duckdb:<table>`.
 //! `.path` holds the file path, and `.adbc_params` holds `adbc_driver`,
 //! `adbc_uri` and `adbc_driver_path` for `adbc:<table>`.
+//!
+//! `.library_dir` is passed to `spiced` through `LD_LIBRARY_PATH` on Linux and
+//! `DYLD_FALLBACK_LIBRARY_PATH` on macOS, preserving existing search paths.
+//! The runner launches `spiced` directly, so macOS does not strip `DYLD_*`.
+//! This lets `duckdb:` load the matching installed `libduckdb` by name.
+//! Direct `adbc:` opens read-write; its CLI oracle must run before `start` or
+//! after `stop`, since it cannot share the writer's file lock.
 
 use std::path::PathBuf;
 
@@ -78,6 +85,14 @@ impl Source for DuckDb {
         let path = std::fs::canonicalize(self.path(namespace))?;
         let mut result = Namespace::params(json!({ "duckdb_open": path }));
         result.extra.insert("path".into(), json!(path));
+        let library_dir = std::path::Path::new(&self.library)
+            .parent()
+            .ok_or_else(|| {
+                anyhow::anyhow!("DuckDB library has no parent directory: {}", self.library)
+            })?;
+        result
+            .extra
+            .insert("library_dir".into(), json!(library_dir));
         result.extra.insert(
             "adbc_params".into(),
             json!({

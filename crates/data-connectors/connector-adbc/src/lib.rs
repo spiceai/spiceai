@@ -14,13 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use adbc_core::options::AdbcVersion;
-use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
-use adbc_driver_manager::ManagedDriver;
 use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use async_trait::async_trait;
 use data_components::adbc_helpers::{
-    build_db_options, driver_entrypoint, normalize_driver_option_key,
+    await_adbc_initialization, build_db_options, driver_entrypoint, load_adbc_database,
+    normalize_driver_option_key,
 };
 use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use data_connector_api::ConnectorContext;
@@ -40,7 +38,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -58,6 +56,11 @@ type ManagedAdbcTableFactory = AdbcTableFactoryWithPolicy<adbc_driver_manager::M
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("{source}"))]
+    InitializeDriver {
+        source: data_components::adbc_helpers::AdbcInitError,
+    },
+
     #[snafu(display("Missing required parameter: adbc_driver"))]
     MissingAdbcDriver,
 
@@ -122,67 +125,9 @@ impl std::fmt::Debug for Adbc {
 impl Drop for Adbc {
     fn drop(&mut self) {
         if let Some(factory) = self.factory.take() {
-            // Send to the dedicated cleanup thread so we don't stall the Tokio
-            // runtime. If the bounded queue is full or the worker is gone,
-            // offload to a dedicated overflow thread instead of dropping inline.
-            match adbc_cleanup_sender().try_send(factory) {
-                Ok(()) => {}
-                Err(std::sync::mpsc::TrySendError::Full(factory)) => {
-                    offload_adbc_factory_drop(
-                        factory,
-                        "ADBC cleanup queue full; offloading drop to overflow thread",
-                    );
-                }
-                Err(std::sync::mpsc::TrySendError::Disconnected(factory)) => {
-                    offload_adbc_factory_drop(
-                        factory,
-                        "ADBC cleanup channel closed; offloading drop to overflow thread",
-                    );
-                }
-            }
+            data_components::adbc_helpers::offload_adbc_drop(factory);
         }
     }
-}
-
-const ADBC_CLEANUP_QUEUE_CAPACITY: usize = 64;
-
-fn offload_adbc_factory_drop(factory: ManagedAdbcTableFactory, reason: &str) {
-    tracing::warn!("{reason}");
-    if std::thread::Builder::new()
-        .name("adbc-cleanup-overflow".to_string())
-        .spawn(move || {
-            drop(factory);
-        })
-        .is_err()
-    {
-        tracing::warn!("Failed to spawn overflow ADBC cleanup thread; dropping inline");
-    }
-}
-
-/// Returns a sender for offloading ADBC factory cleanup to a dedicated
-/// background thread. The worker thread is created once (on first use) and
-/// processes drop work sequentially with bounded buffering, avoiding both
-/// unbounded thread spawns and unbounded cleanup backlog growth.
-fn adbc_cleanup_sender() -> &'static std::sync::mpsc::SyncSender<ManagedAdbcTableFactory> {
-    static SENDER: OnceLock<std::sync::mpsc::SyncSender<ManagedAdbcTableFactory>> = OnceLock::new();
-    SENDER.get_or_init(|| {
-        let (tx, rx) =
-            std::sync::mpsc::sync_channel::<ManagedAdbcTableFactory>(ADBC_CLEANUP_QUEUE_CAPACITY);
-        if std::thread::Builder::new()
-            .name("adbc-cleanup".to_string())
-            .spawn(move || {
-                for factory in rx {
-                    drop(factory);
-                }
-            })
-            .is_err()
-        {
-            tracing::warn!(
-                "Failed to spawn ADBC cleanup worker thread; subsequent cleanup will use the overflow thread path or be performed inline as a last resort"
-            );
-        }
-        tx
-    })
 }
 
 type ConnectorCache = parking_lot::Mutex<HashMap<String, Arc<ConnectorCacheEntry>>>;
@@ -454,24 +399,8 @@ impl AdbcFactory {
         // the driver supports them for stricter cancellation.
         let entrypoint = driver_entrypoint(driver_name);
         let init_handle = tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
-            let mut driver = ManagedDriver::load_from_name(
-                &driver_location,
-                entrypoint,
-                AdbcVersion::V110,
-                LOAD_FLAG_DEFAULT,
-                None,
-            )
-            .context(UnableToLoadDriverSnafu {
-                driver_location: driver_location.clone(),
-            })?;
-
-            let db =
-                driver
-                    .new_database_with_opts(db_options)
-                    .context(UnableToCreateDatabaseSnafu {
-                        driver_location: driver_location.clone(),
-                        uri: uri_str.clone(),
-                    })?;
+            let db = load_adbc_database(&driver_location, entrypoint, db_options)
+                .context(InitializeDriverSnafu)?;
 
             let mut pool_builder = AdbcConnectionPoolBuilder::new(db)
                 .with_max_size(pool_size)
@@ -491,40 +420,23 @@ impl AdbcFactory {
 
             Ok(Arc::new(pool))
         });
-        let abort_handle = init_handle.abort_handle();
-
-        let pool = tokio::time::timeout(std::time::Duration::from_mins(2), init_handle)
-            .await
-            .map_err(|_elapsed| {
-                abort_handle.abort();
+        let pool = await_adbc_initialization(init_handle).await.map_err(|e| {
+            let error_string = e.to_string();
+            if is_auth_or_permission_error(&error_string) {
+                let hint = auth_permission_hint(&driver_name_owned);
+                DataConnectorError::UnableToConnectInternal {
+                    dataconnector: format!("adbc ({driver_name_owned})"),
+                    connector_component: component,
+                    source: format!("{error_string}. {hint}").into(),
+                }
+            } else {
                 DataConnectorError::UnableToConnectInternal {
                     dataconnector: "adbc".to_string(),
-                    connector_component: component.clone(),
-                    source: "ADBC driver initialization timed out after 120 seconds".into(),
+                    connector_component: component,
+                    source: Box::new(e),
                 }
-            })?
-            .map_err(|e| DataConnectorError::UnableToConnectInternal {
-                dataconnector: "adbc".to_string(),
-                connector_component: component.clone(),
-                source: Box::new(e),
-            })?
-            .map_err(|e| {
-                let error_string = e.to_string();
-                if is_auth_or_permission_error(&error_string) {
-                    let hint = auth_permission_hint(&driver_name_owned);
-                    DataConnectorError::UnableToConnectInternal {
-                        dataconnector: format!("adbc ({driver_name_owned})"),
-                        connector_component: component,
-                        source: format!("{error_string}. {hint}").into(),
-                    }
-                } else {
-                    DataConnectorError::UnableToConnectInternal {
-                        dataconnector: "adbc".to_string(),
-                        connector_component: component,
-                        source: Box::new(e),
-                    }
-                }
-            })?;
+            }
+        })?;
 
         let adbc_factory = AdbcTableFactoryWithPolicy::new(
             Arc::clone(&pool),
