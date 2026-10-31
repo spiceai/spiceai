@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated::refresh::Refresh;
 use crate::component::dataset::acceleration::OnConflictBehavior;
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
 use crate::dataupdate::UpdateType;
@@ -131,7 +130,6 @@ impl TaskSpan {
             Arc::new(TaskSpan::table_schema(is_cluster_mode)),
             Some(vec!["span_id".to_string()]),
             acceleration_settings,
-            Refresh::default(),
             retention,
             Arc::new(RwLock::new(Secrets::default())),
             runtime,

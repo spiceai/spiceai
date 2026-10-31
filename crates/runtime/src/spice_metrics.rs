@@ -27,7 +27,6 @@ use tokio::sync::RwLock;
 
 use crate::Runtime;
 use crate::accelerated::Retention;
-use crate::accelerated::refresh::Refresh;
 use crate::component::dataset::TimeFormat;
 use crate::datafusion::Error as DataFusionError;
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
@@ -117,7 +116,6 @@ pub async fn register_metrics_table(
         otel_arrow::schema(),
         None,
         internal_acceleration(),
-        Refresh::default(),
         retention,
         Arc::new(RwLock::new(Secrets::default())),
         runtime,

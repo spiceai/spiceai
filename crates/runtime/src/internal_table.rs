@@ -28,7 +28,7 @@ use tokio::sync::RwLock;
 use crate::Runtime;
 use crate::accelerated::{AcceleratedTableBuilderError, Retention};
 use crate::component::access::AccessMode;
-use crate::component::dataset::acceleration::{Acceleration, Engine, Mode};
+use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::component::dataset::builder::DatasetBuilder;
 use crate::federated::FederatedTable;
 use crate::secrets::Secrets;
@@ -286,7 +286,6 @@ pub async fn create_internal_accelerated_table(
     schema: Arc<Schema>,
     primary_key: Option<Vec<String>>,
     acceleration: Acceleration,
-    refresh: Refresh,
     retention: Option<Retention>,
     secrets: Arc<RwLock<Secrets>>,
     runtime: Arc<Runtime>,
@@ -323,11 +322,14 @@ pub async fn create_internal_accelerated_table(
         federated_table,
         "internal".to_string(),
         accelerated_table_provider,
-        refresh,
+        // The source is a sink that keeps nothing: the rows arrive only by writes to the
+        // acceleration. A refresh would read no rows and replace the ones already written.
+        Refresh::new(RefreshMode::Disabled),
         runtime.tokio_io_runtime(),
     );
     builder.cpu_runtime(runtime.datafusion().refresh_runtime().cloned());
     builder.write_to_accelerator_only();
+    builder.initial_load_complete(true);
     builder.node_local();
 
     builder.retention(retention);
