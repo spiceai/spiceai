@@ -126,6 +126,14 @@ pub const MAX_SQL_DATA_TYPE_DEPTH: usize = 32;
 /// query, outside any CTE, do not count.
 pub const MAX_CTE_EXPANDED_REFERENCES: usize = 4096;
 
+/// Maximum number of grouping sets one `GROUP BY` may produce, counted before
+/// planning expands `CUBE`, `ROLLUP` and `GROUPING SETS`.
+///
+/// `CUBE` of `n` expressions produces `2^n` sets, and the planner materializes
+/// every set before it applies a limit. Separate grouping elements multiply.
+/// The limit matches PostgreSQL's, which admits `CUBE` of up to 12 expressions.
+pub const MAX_GROUPING_SETS: usize = 4096;
+
 /// Reject `statement` if its queries, any of its expression trees, or any
 /// `arrow_cast` type string it carries, is nested more deeply than the fixed
 /// limits above, or if its CTE references expand past
@@ -442,7 +450,8 @@ impl Visitor for DepthCollector {
 }
 
 /// Bound the expressions of `query` that become column names by
-/// [`MAX_UNPROTECTED_EXPR_DEPTH`].
+/// [`MAX_UNPROTECTED_EXPR_DEPTH`], and each `GROUP BY` by
+/// [`MAX_GROUPING_SETS`].
 ///
 /// A subquery in `FROM` or in an expression is a [`Query`] of its own, which
 /// the statement visitor reaches and checks separately.
@@ -474,6 +483,7 @@ fn check_named_expr_depths(query: &Query) -> DFResult<()> {
                     for expr in group_by {
                         check(expr)?;
                     }
+                    ensure_grouping_sets_within_limit(group_by)?;
                 }
             }
             SetExpr::SetOperation { left, right, .. } => {
@@ -494,6 +504,36 @@ fn check_named_expr_depths(query: &Query) -> DFResult<()> {
             | SetExpr::Merge(_)
             | SetExpr::Table(_) => {}
         }
+    }
+    Ok(())
+}
+
+/// Reject a `GROUP BY` list that expands to more than [`MAX_GROUPING_SETS`]
+/// grouping sets.
+///
+/// # Errors
+///
+/// Returns [`DataFusionError::Plan`] naming the limit.
+pub fn ensure_grouping_sets_within_limit(group_by: &[Expr]) -> DFResult<()> {
+    let mut count: usize = 1;
+    for expr in group_by {
+        let sets = match expr {
+            Expr::Cube(exprs) => u32::try_from(exprs.len())
+                .ok()
+                .and_then(|n| 1_usize.checked_shl(n))
+                .unwrap_or(usize::MAX),
+            Expr::Rollup(exprs) => exprs.len().saturating_add(1),
+            Expr::GroupingSets(sets) => sets.len(),
+            _ => 1,
+        };
+        count = count.saturating_mul(sets);
+    }
+    if count > MAX_GROUPING_SETS {
+        return Err(DataFusionError::Plan(format!(
+            "Query rejected: GROUP BY expands to more than {MAX_GROUPING_SETS} grouping sets. \
+             CUBE of n expressions produces 2^n sets, and separate CUBE, ROLLUP and GROUPING SETS \
+             elements multiply. Group by fewer expressions."
+        )));
     }
     Ok(())
 }
@@ -1443,6 +1483,66 @@ mod tests {
         let err = depth_check(&doubling(levels + 1, "(SELECT 1 AS x) t"))
             .expect_err("one more level is over the cap");
         assert_eq!(err.to_string(), too_many_cte_references_error().to_string());
+    }
+
+    fn cube_of(n: usize) -> String {
+        let columns: Vec<String> = (0..n).map(|i| format!("c{i}")).collect();
+        format!("CUBE({})", columns.join(", "))
+    }
+
+    fn grouping_error() -> String {
+        format!(
+            "Error during planning: Query rejected: GROUP BY expands to more than \
+             {MAX_GROUPING_SETS} grouping sets"
+        )
+    }
+
+    #[test]
+    fn cube_is_bounded_at_the_grouping_set_cap() {
+        let columns = MAX_GROUPING_SETS.ilog2() as usize;
+        depth_check(&format!("SELECT 1 FROM t GROUP BY {}", cube_of(columns)))
+            .expect("a CUBE at the cap passes");
+        let err = depth_check(&format!(
+            "SELECT 1 FROM t GROUP BY {}",
+            cube_of(columns + 1)
+        ))
+        .expect_err("one more CUBE expression is over the cap");
+        assert!(err.to_string().starts_with(&grouping_error()), "{err}");
+        let err = depth_check(&format!("SELECT 1 FROM t GROUP BY {}", cube_of(64)))
+            .expect_err("a CUBE wider than usize is rejected");
+        assert!(err.to_string().starts_with(&grouping_error()), "{err}");
+    }
+
+    /// Separate grouping elements multiply, in subqueries as well.
+    #[test]
+    fn grouping_elements_multiply_against_the_cap() {
+        let half = MAX_GROUPING_SETS.ilog2() as usize / 2;
+        let at_cap = format!("GROUP BY {0}, {0}, a", cube_of(half));
+        depth_check(&format!("SELECT 1 FROM t {at_cap}")).expect("a product at the cap passes");
+        for sql in [
+            format!("SELECT 1 FROM t {at_cap}, ROLLUP(a)"),
+            format!("SELECT 1 FROM t {at_cap}, GROUPING SETS ((a), (b))"),
+            format!("SELECT * FROM (SELECT 1 FROM t {at_cap}, ROLLUP(a)) s"),
+        ] {
+            let err = depth_check(&sql).expect_err("a product over the cap is rejected");
+            assert!(
+                err.to_string().starts_with(&grouping_error()),
+                "{sql}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_normal_grouping_sets() {
+        for sql in [
+            "SELECT a, b, SUM(x) FROM t GROUP BY GROUPING SETS ((a, b), (a), ())",
+            "SELECT a, b, SUM(x) FROM t GROUP BY CUBE(a, b)",
+            "SELECT a, b, SUM(x) FROM t GROUP BY ROLLUP(a, b)",
+            "SELECT a, b, c, SUM(x) FROM t GROUP BY a, CUBE(b, c), ROLLUP(a, b)",
+            "SELECT a, SUM(x) FROM t GROUP BY a",
+        ] {
+            depth_check(sql).expect("normal grouping passes");
+        }
     }
 
     /// Table references outside CTE expansion do not count.
