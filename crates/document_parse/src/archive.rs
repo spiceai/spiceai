@@ -24,8 +24,8 @@ limitations under the License.
 //! on the bytes actually decompressed.
 
 use bytes::Bytes;
+use memchr::memmem;
 use snafu::ResultExt;
-use std::collections::VecDeque;
 use std::io::{Cursor, Read, Write};
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
@@ -232,12 +232,15 @@ pub(crate) fn rebuild_package(raw: &Bytes, format: DocumentType, limits: Limits)
 /// `/DecodeParms` predictor is accepted only on the final stage of a chain that
 /// ends in Flate (see [`apply_decode_parms`]).
 ///
-/// The dictionary in front of each `stream` keyword is tokenised, not scanned
-/// for byte patterns. PDF whitespace (including NUL) and `%` comments between
-/// tokens cannot hide a key, and a `/Filter` that appears inside a string or a
-/// nested dictionary is not the stream's filter. A `stream` that does not
-/// follow a dictionary is content, not a stream; a dictionary that does follow
-/// one but cannot be parsed fails closed.
+/// Streams are found the way `PDFium` reads them, by parsing forward from each
+/// object's `obj` keyword ([`pdf_streams`]), so no bytes in front of an object
+/// (a decoy stream, an unterminated string, a comment) can hide it. Each
+/// stream's dictionary is tokenised, not scanned for byte patterns. PDF
+/// whitespace (including NUL) and `%` comments between tokens cannot hide a
+/// key, and a `/Filter` that appears inside a string or a nested dictionary is
+/// not the stream's filter. A `stream` word that does not follow an object's
+/// dictionary is content, not a stream; a dictionary that cannot be parsed
+/// fails closed.
 pub(crate) fn ensure_pdf_within_budget(raw: &Bytes) -> Result<()> {
     let budget = MAX_PACKAGE_BYTES;
     let mut consumed: u64 = 0;
@@ -393,346 +396,164 @@ fn decode_stage(filter: PdfFilter, data: &[u8], cap: u64) -> Vec<u8> {
     }
 }
 
-/// Every stream object in `raw`, each paired with its declared filter chain.
-/// A `stream` byte sequence that is not the keyword after a dictionary — the
-/// word inside content, or `endstream` — is not a stream object. After each
-/// real stream is recorded, its payload is skipped (via `/Length`, or by
-/// finding `endstream`) so dictionary-like bytes inside the content cannot be
-/// mistaken for another stream declaration.
+/// Every stream object `PDFium` could decode in `raw`, each paired with its
+/// declared filter chain.
+///
+/// `PDFium` reads an object by seeking to the offset the cross-reference table
+/// gives for it and parsing `N G obj` there, whatever the bytes before that
+/// offset are. So nothing before an object decides whether its stream is
+/// budgeted: not an earlier stream whose payload seems to cover it, not a
+/// literal string or `%` comment that seems to hold it, and not a malformed or
+/// unterminated earlier object. Every `obj` keyword is a place `PDFium` may
+/// start reading, and the object parsed forward from it is a stream when a
+/// dictionary and then the `stream` keyword follow.
+///
+/// Two outcomes fail the document closed, as a single [`PdfFilter::Unbounded`]
+/// stream. A dictionary this scan cannot parse could end wherever `PDFium`'s
+/// more lenient parser ends it, so it fails closed when any `stream` keyword
+/// follows it. And parsing from every `obj` lets objects nested in strings or
+/// comments make the scan read the same bytes again, so it fails closed once its
+/// work passes [`SCAN_WORK_PER_BYTE`] reads of each byte.
 fn pdf_streams(raw: &[u8]) -> Vec<PdfStream> {
-    const KEYWORD: &[u8] = b"stream";
+    let work_limit = raw
+        .len()
+        .saturating_mul(SCAN_WORK_PER_BYTE)
+        .saturating_add(SCAN_WORK_ALLOWANCE);
+    let mut work = 0usize;
     let mut streams = Vec::new();
-    let mut from = 0;
-    // Strings and comments are lexed from the end of the last validated payload
-    // so binary stream bytes (e.g. a `0x28` in an image) cannot look like `(`.
-    let mut lexer = PdfLexer::new(0);
-    while let Some(rel) = find(&raw[from..], KEYWORD) {
-        let pos = from + rel;
-        from = pos + KEYWORD.len();
-        if !is_stream_keyword(raw, pos) || lexer.covers(raw, pos) {
+    let mut last_dict_start = None;
+    for pos in memmem::find_iter(raw, b"obj") {
+        if !is_obj_keyword(raw, pos) {
             continue;
         }
-        let Some(stream_info) = stream_before(raw, &lexer) else {
-            continue;
-        };
-        // Stream data begins after the end-of-line that follows the keyword.
-        let mut data = from;
-        if raw.get(data) == Some(&b'\r') {
-            data += 1;
+        let from = pos + b"obj".len();
+        let dict_start = from + ws_len(&raw[from..]);
+        work = work.saturating_add(dict_start - from);
+        // An `obj` in a comment just before a dictionary reaches the same
+        // dictionary as the object's own keyword; it is one stream, counted once.
+        if raw[dict_start..].starts_with(b"<<") && last_dict_start != Some(dict_start) {
+            last_dict_start = Some(dict_start);
+            match object_body(raw, dict_start, &mut work) {
+                ObjectBody::NotAStream => {}
+                ObjectBody::Stream(stream) => streams.push(stream),
+                ObjectBody::Unparsable => {
+                    // No `stream` keyword after it means no stream object
+                    // starts anywhere later either, so the scan is complete.
+                    if has_stream_keyword_from(raw, dict_start) {
+                        streams.push(unverifiable_stream());
+                    }
+                    break;
+                }
+            }
         }
-        if raw.get(data) == Some(&b'\n') {
-            data += 1;
+        if work > work_limit {
+            streams.push(unverifiable_stream());
+            break;
         }
-        streams.push(PdfStream {
-            filters: stream_info.filters,
-            data_start: data,
-        });
-        // Do not resume the keyword search inside this stream's payload, and
-        // do not let that payload participate in later string detection.
-        from = stream_payload_end(raw, data, stream_info.length);
-        lexer.restart(from);
     }
     streams
 }
 
-/// `stream` at `pos` is a keyword when a token boundary precedes it. `>` covers
-/// a dictionary closed flush against the keyword (`>>stream`); `/stream` is a
-/// name and `endstream` is a different keyword, so neither matches.
-fn is_stream_keyword(raw: &[u8], pos: usize) -> bool {
-    pos == 0 || is_pdf_whitespace(raw[pos - 1]) || raw[pos - 1] == b'>'
+/// A document is read about once by [`pdf_streams`]. Past this many reads per
+/// byte (plus [`SCAN_WORK_ALLOWANCE`]), objects are nested to make the scan
+/// quadratic, and the document fails closed.
+const SCAN_WORK_PER_BYTE: usize = 4;
+
+/// Work [`pdf_streams`] may spend on any document, however small, before
+/// [`SCAN_WORK_PER_BYTE`] applies.
+const SCAN_WORK_ALLOWANCE: usize = 1024 * 1024;
+
+/// What an object holds, parsed forward from its dictionary at `dict_start`.
+enum ObjectBody {
+    /// A dictionary with no `stream` keyword after it.
+    NotAStream,
+    Stream(PdfStream),
+    /// A dictionary this scan cannot parse, so where it ends is unknown.
+    Unparsable,
 }
 
-/// Index just past a stream's payload: `/Length` bytes from `data_start` when
-/// known *and* an `endstream` sits at that boundary; otherwise the first
-/// `endstream` after `data_start`.
-///
-/// Trusting a bare length would let `/Length 999999999` on an empty stream
-/// skip to EOF and hide a later Flate bomb. Requiring `endstream` at the
-/// claimed boundary still allows a payload that embeds the ASCII bytes
-/// `endstream` mid-content, because the real terminator is the one at
-/// `data_start + Length`.
-fn stream_payload_end(raw: &[u8], data_start: usize, length: Option<u64>) -> usize {
-    if let Some(len) = length {
-        let by_length = data_start
-            .saturating_add(usize::try_from(len).unwrap_or(usize::MAX))
-            .min(raw.len());
-        let after = after_endstream(raw, by_length);
-        if after > by_length {
-            return after;
-        }
-        // Claimed length has no matching endstream — treat as unverifiable.
+/// Parses the dictionary at `dict_start` and, after PDF whitespace and
+/// comments, the `stream` keyword that makes it a stream object, adding the
+/// bytes read to `work`.
+fn object_body(raw: &[u8], dict_start: usize, work: &mut usize) -> ObjectBody {
+    let Some(dict) = parse_dictionary(&raw[dict_start..], 0) else {
+        return ObjectBody::Unparsable;
+    };
+    let dict_end = dict_start + dict.consumed;
+    let keyword = dict_end + ws_len(&raw[dict_end..]);
+    *work = work.saturating_add(keyword - dict_start);
+    if !(raw[keyword..].starts_with(b"stream") && token_ends(raw, keyword + b"stream".len())) {
+        return ObjectBody::NotAStream;
     }
-    find_endstream(raw, data_start).map_or(raw.len(), |pos| pos + b"endstream".len())
-}
-
-/// If `endstream` sits at or just after `at` (with optional whitespace), return
-/// the index past that keyword; otherwise `at`.
-fn after_endstream(raw: &[u8], at: usize) -> usize {
-    let mut i = at;
-    i += ws_len(&raw[i..]);
-    if raw[i..].starts_with(b"endstream")
-        && (i + b"endstream".len() == raw.len()
-            || is_pdf_whitespace(raw[i + b"endstream".len()])
-            || is_pdf_delimiter(raw[i + b"endstream".len()]))
-    {
-        return i + b"endstream".len();
-    }
-    at
-}
-
-fn find_endstream(raw: &[u8], from: usize) -> Option<usize> {
-    const KEYWORD: &[u8] = b"endstream";
-    let mut cursor = from;
-    while let Some(rel) = find(&raw[cursor..], KEYWORD) {
-        let pos = cursor + rel;
-        let boundary_before = pos == 0 || is_pdf_whitespace(raw[pos - 1]);
-        let after = pos + KEYWORD.len();
-        let boundary_after =
-            after == raw.len() || is_pdf_whitespace(raw[after]) || is_pdf_delimiter(raw[after]);
-        if boundary_before && boundary_after {
-            return Some(pos);
-        }
-        cursor = pos + 1;
-    }
-    None
-}
-
-struct StreamInfo {
-    filters: Vec<PdfFilter>,
-    /// Direct `/Length` in bytes, or the uniquely resolved value of an
-    /// indirect `/Length N G R`. `None` when the length is absent or when more
-    /// than one candidate object definition exists (ambiguous / decoy).
-    length: Option<u64>,
-}
-
-/// The `/Filter` chain and `/Length` of the dictionary that ends just before
-/// the `stream` keyword `lexer` last reached (see [`PdfLexer::covers`]).
-///
-/// `None` when `stream` is not preceded by a dictionary (content, not a stream
-/// object). When a dictionary is there but its chain cannot be determined, the
-/// filters are a single [`PdfFilter::Unbounded`] stage so the document fails
-/// closed.
-fn stream_before(raw: &[u8], lexer: &PdfLexer) -> Option<StreamInfo> {
-    let close = lexer.dict_closer(raw)?;
-    let parsed = filters_of_dict(raw, close, lexer).unwrap_or(ParsedDict {
-        consumed: 0,
-        filters: vec![PdfFilter::Unbounded],
-        length: None,
-        length_ref: None,
-    });
-    let length = parsed.length.or_else(|| {
-        parsed
-            .length_ref
-            .and_then(|(obj, generation)| resolve_indirect_int(raw, obj, generation))
-    });
-    Some(StreamInfo {
-        filters: parsed.filters,
-        length,
+    let data_start = stream_data_start(raw, keyword + b"stream".len());
+    *work = work.saturating_add(data_start - keyword);
+    ObjectBody::Stream(PdfStream {
+        filters: dict.filters,
+        data_start,
     })
 }
 
-/// Resolves an indirect object `obj gen R` whose body is an integer, used for
-/// `/Length N G R`. Returns a value only when exactly one matching object
-/// header exists in `raw` (PDF whitespace between the numbers is allowed, so
-/// `6\t0 obj` counts). A Catalog string that embeds a second fake definition
-/// makes the reference ambiguous, so discovery falls back to `endstream`
-/// instead of trusting a decoy integer.
-fn resolve_indirect_int(raw: &[u8], obj: u32, generation: u32) -> Option<u64> {
-    let mut values = Vec::new();
-    let mut i = 0;
-    while i < raw.len() {
-        if i > 0 && !is_pdf_whitespace(raw[i - 1]) {
-            i += 1;
-            continue;
-        }
-        let Some((header_end, parsed_obj, parsed_gen)) = parse_object_header(&raw[i..]) else {
-            i += 1;
-            continue;
-        };
-        i += header_end;
-        if parsed_obj != obj || parsed_gen != generation {
-            continue;
-        }
-        let rest = skip_ws(&raw[i..]);
-        if let Some(value) = parse_u64(rest) {
-            values.push(value);
-        }
-    }
-    (values.len() == 1).then(|| values[0])
-}
-
-/// Parses an `obj gen obj` header at the start of `data`, allowing PDF
-/// whitespace between the tokens. Returns `(bytes_consumed, obj, generation)`.
-fn parse_object_header(data: &[u8]) -> Option<(usize, u32, u32)> {
-    let obj = parse_u64(data)?;
-    let after_obj = skip_number(data)?;
-    let gen_at = after_obj + ws_len(&data[after_obj..]);
-    let generation = parse_u64(&data[gen_at..])?;
-    let after_gen = gen_at + skip_number(&data[gen_at..])?;
-    let kw_at = after_gen + ws_len(&data[after_gen..]);
-    if !data[kw_at..].starts_with(b"obj") || !token_ends(data, kw_at + 3) {
-        return None;
-    }
-    let obj = u32::try_from(obj).ok()?;
-    let generation = u32::try_from(generation).ok()?;
-    Some((kw_at + 3, obj, generation))
-}
-
-fn parse_u64(data: &[u8]) -> Option<u64> {
-    let mut i = 0;
-    // PDF integers may carry an optional leading `+` (ISO 32000-1 §7.3.3).
-    if data.first() == Some(&b'+') {
-        i = 1;
-    }
-    let mut value: u64 = 0;
-    let mut digits = 0usize;
-    while i < data.len() && data[i].is_ascii_digit() {
-        value = value
-            .checked_mul(10)?
-            .checked_add(u64::from(data[i] - b'0'))?;
-        digits += 1;
-        i += 1;
-    }
-    (digits > 0).then_some(value)
-}
-
-/// A forward scan of the bytes from the end of the last validated stream
-/// payload to the `stream` keyword being checked. Each byte is classified once,
-/// and what the dictionary lookup needs is kept as the scan goes, so finding
-/// every stream stays linear in the document's size however many `stream`
-/// words, comments, or `<<` bytes the document holds.
-///
-/// The scan starts outside any string or comment: at the start of the document
-/// or just past a validated payload, so binary stream bytes (e.g. a `0x28` in
-/// an image) never open a string. Literal strings and `%` comments are
-/// consumed as whole tokens. The first `%` outside a string owns the rest of
-/// its line, so `>>`, `(`, or a second `%` inside it is comment text. A `%`
-/// inside a string is string text, including one in a string opened on an
-/// earlier line, so it cannot hide the dictionary's `>>`. A string that never
-/// closes runs to the end of the document.
-struct PdfLexer {
-    /// Where the scan started.
-    start: usize,
-    /// Every byte before `cursor` is classified. A string or comment is
-    /// consumed whole, so `cursor` can sit past a position it covers.
-    cursor: usize,
-    /// Index just past the last byte before `cursor` that is neither PDF
-    /// whitespace nor comment text: where a dictionary's `>>` has to end for
-    /// the `stream` keyword after it to belong to that dictionary.
-    significant_end: usize,
-    /// Starts of the nearest [`MAX_DICT_CANDIDATES`] `<<` outside strings and
-    /// comments, oldest first: the candidate dictionary openers.
-    dict_openers: VecDeque<usize>,
-}
-
-impl PdfLexer {
-    fn new(start: usize) -> Self {
-        Self {
-            start,
-            cursor: start,
-            significant_end: start,
-            dict_openers: VecDeque::with_capacity(MAX_DICT_CANDIDATES),
-        }
-    }
-
-    /// Starts a new scan at `start`, the end of a validated stream payload.
-    fn restart(&mut self, start: usize) {
-        self.start = start;
-        self.cursor = start;
-        self.significant_end = start;
-        self.dict_openers.clear();
-    }
-
-    /// Whether `pos` sits inside a literal string or a `%` comment, scanning
-    /// forward to it. A `stream` there is text, not a keyword, so a Catalog
-    /// string such as `(<< /Length 999999999 >>stream)` cannot invent a
-    /// phantom stream. `pos` never decreases between calls on the same scan.
-    fn covers(&mut self, raw: &[u8], pos: usize) -> bool {
-        while self.cursor < pos {
-            let i = self.cursor;
-            match raw[i] {
-                b'%' => {
-                    self.cursor = raw[i..]
-                        .iter()
-                        .position(|&b| b == b'\n' || b == b'\r')
-                        .map_or(raw.len(), |offset| i + offset);
-                }
-                b'(' => {
-                    self.cursor = skip_literal_string(&raw[i..]).map_or(raw.len(), |len| i + len);
-                    self.significant_end = self.cursor;
-                }
-                byte => {
-                    if !is_pdf_whitespace(byte) {
-                        self.significant_end = i + 1;
-                    }
-                    if byte == b'<' && raw.get(i + 1) == Some(&b'<') {
-                        if self.dict_openers.len() == MAX_DICT_CANDIDATES {
-                            self.dict_openers.pop_front();
-                        }
-                        self.dict_openers.push_back(i);
-                    }
-                    self.cursor = i + 1;
-                }
-            }
-        }
-        self.cursor > pos
-    }
-
-    /// Index just past the `>>` that closes the dictionary before the position
-    /// last passed to [`Self::covers`], after PDF whitespace and comments.
-    /// `None` when no dictionary closer sits there, which is what distinguishes
-    /// a real stream from the word `stream`.
-    fn dict_closer(&self, raw: &[u8]) -> Option<usize> {
-        let close = self.significant_end;
-        (close >= 2 && &raw[close - 2..close] == b">>").then_some(close)
+/// A stream that fails the document closed when it is budgeted.
+fn unverifiable_stream() -> PdfStream {
+    PdfStream {
+        filters: vec![PdfFilter::Unbounded],
+        data_start: 0,
     }
 }
 
-/// How far back from a dictionary closer its opening `<<` is looked for.
-/// Stream dictionaries are a few hundred bytes; past this the chain cannot be
-/// attributed and the stream fails closed.
-const DICT_LOOKBACK_BYTES: usize = 1024 * 1024;
+/// `obj` at `pos` is the keyword of an object header (`N G obj`): whitespace
+/// separates it from the generation number (a comment before it ends in an
+/// end-of-line), and a token boundary follows it. `endobj` is a different
+/// keyword, so it does not match.
+fn is_obj_keyword(raw: &[u8], pos: usize) -> bool {
+    pos > 0 && is_pdf_whitespace(raw[pos - 1]) && token_ends(raw, pos + b"obj".len())
+}
 
-/// Cap on opening-`<<` candidates tried per stream, nearest first. The match is
-/// the candidate whose token parse ends exactly on the closer; the rest open
-/// dictionaries nested inside it. Stopping here bounds the work per stream, and
-/// failing closed when none match is safe.
-const MAX_DICT_CANDIDATES: usize = 64;
+/// `stream` at `pos` is a keyword when it is a whole token: a token boundary
+/// precedes it (`>` covers a dictionary closed flush against it, `>>stream`)
+/// and one follows it. `streamX` is a different word to `PDFium`, `/stream` is a
+/// name, and `endstream` is a different keyword, so none of them match.
+fn is_stream_keyword(raw: &[u8], pos: usize) -> bool {
+    (pos == 0 || is_pdf_whitespace(raw[pos - 1]) || raw[pos - 1] == b'>')
+        && token_ends(raw, pos + b"stream".len())
+}
+
+/// Whether a `stream` keyword appears at or after `from`.
+fn has_stream_keyword_from(raw: &[u8], from: usize) -> bool {
+    memmem::find_iter(&raw[from..], b"stream").any(|rel| is_stream_keyword(raw, from + rel))
+}
+
+/// Where a stream's data begins: just past the first end-of-line (`\n`, `\r`,
+/// or `\r\n`) after the `stream` keyword, which is where `PDFium` starts
+/// reading it whatever sits between the keyword and that end-of-line.
+fn stream_data_start(raw: &[u8], after_keyword: usize) -> usize {
+    let Some(offset) = raw[after_keyword..]
+        .iter()
+        .position(|&b| b == b'\n' || b == b'\r')
+    else {
+        return raw.len();
+    };
+    let eol = after_keyword + offset;
+    if raw[eol] == b'\r' && raw.get(eol + 1) == Some(&b'\n') {
+        eol + 2
+    } else {
+        eol + 1
+    }
+}
 
 /// Deepest nesting of arrays/dictionaries accepted while skipping a value.
 /// Past this the parse fails closed rather than overflowing the stack on an
 /// attacker-controlled nest.
 const MAX_VALUE_DEPTH: usize = 32;
 
-/// The top-level `/Filter` chain and `/Length` of the dictionary that closes
-/// at `close`, trying `lexer`'s `<<` openers nearest first. A `<<` inside a
-/// `%` comment or a literal string is not an opener, so it was never recorded.
-/// `None` when no candidate opening parses as that dictionary.
-fn filters_of_dict(raw: &[u8], close: usize, lexer: &PdfLexer) -> Option<ParsedDict> {
-    let window_start = close.saturating_sub(DICT_LOOKBACK_BYTES);
-    lexer
-        .dict_openers
-        .iter()
-        .rev()
-        .take_while(|&&start| start >= window_start)
-        .find_map(|&start| {
-            parse_dictionary(&raw[start..close], 0)
-                .filter(|parsed| parsed.consumed == close - start)
-        })
-}
-
 struct ParsedDict {
     consumed: usize,
     /// Empty when the dictionary declares no `/Filter`.
     filters: Vec<PdfFilter>,
-    /// Direct integer `/Length`, when declared as a number.
-    length: Option<u64>,
-    /// Indirect `/Length N G R`, when declared as a reference.
-    length_ref: Option<(u32, u32)>,
 }
 
 /// Parses one `<< … >>` dictionary starting at `data[0]`, recording its
-/// top-level `/Filter` and `/Length`. Nested dictionaries, strings, and arrays
+/// top-level `/Filter`. Nested dictionaries, strings, and arrays
 /// are skipped as values, so a `/Filter` inside one of them cannot shadow the
 /// real key. `depth` bounds how deep nested values may go.
 fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
@@ -742,8 +563,6 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
     let mut i = 2;
     let mut filters: Option<Vec<PdfFilter>> = None;
     let mut decode_parms: Option<DecodeParms> = None;
-    let mut length: Option<u64> = None;
-    let mut length_ref: Option<(u32, u32)> = None;
     loop {
         i += ws_len(&data[i..]);
         if data.get(i..i + 2) == Some(b">>") {
@@ -753,8 +572,6 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
                     filters.unwrap_or_default(),
                     decode_parms.unwrap_or(DecodeParms::NoPredictor),
                 ),
-                length,
-                length_ref,
             });
         }
         if data.get(i) != Some(&b'/') {
@@ -774,20 +591,6 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
                 } else {
                     value
                 });
-            }
-            b"Length" => {
-                let (value, value_len) = parse_length_value(&data[i..])?;
-                i += value_len;
-                match value {
-                    LengthValue::Direct(n) => {
-                        length = Some(n);
-                        length_ref = None;
-                    }
-                    LengthValue::Indirect { obj, generation } => {
-                        length = None;
-                        length_ref = Some((obj, generation));
-                    }
-                }
             }
             // Resolved against the filter chain once the dictionary closes, so
             // the order of `/Filter` and `/DecodeParms` does not matter.
@@ -983,28 +786,6 @@ fn decode_parms_has_predictor_at(data: &[u8], depth: usize) -> bool {
         }
         _ => false,
     }
-}
-
-enum LengthValue {
-    Direct(u64),
-    Indirect { obj: u32, generation: u32 },
-}
-
-/// A `/Length` value: a direct integer, or an `N G R` indirect reference.
-fn parse_length_value(data: &[u8]) -> Option<(LengthValue, usize)> {
-    let n_len = skip_number(data)?;
-    let n = parse_u64(data)?;
-    let gen_at = n_len + ws_len(&data[n_len..]);
-    if let Some(gen_len) = skip_number(&data[gen_at..]) {
-        let r_at = gen_at + gen_len + ws_len(&data[gen_at + gen_len..]);
-        if data.get(r_at) == Some(&b'R') && token_ends(data, r_at + 1) {
-            let generation = parse_u64(&data[gen_at..])?;
-            let obj = u32::try_from(n).ok()?;
-            let generation = u32::try_from(generation).ok()?;
-            return Some((LengthValue::Indirect { obj, generation }, r_at + 1));
-        }
-    }
-    Some((LengthValue::Direct(n), n_len))
 }
 
 /// The `/Filter` value at `data[0]` (already past whitespace): a name, an array
@@ -1229,18 +1010,12 @@ fn ws_len(data: &[u8]) -> usize {
     i
 }
 
-fn skip_ws(data: &[u8]) -> &[u8] {
-    &data[ws_len(data)..]
-}
-
-/// Test helper view of [`stream_before`]: just the filter chain.
+/// Test helper: the filter chain of the dictionary that opens `raw` and ends,
+/// after PDF whitespace and comments, at the `stream` keyword at `keyword_pos`.
 #[cfg(test)]
 fn filters_before(raw: &[u8], keyword_pos: usize) -> Option<Vec<PdfFilter>> {
-    let mut lexer = PdfLexer::new(0);
-    if lexer.covers(raw, keyword_pos) {
-        return None;
-    }
-    stream_before(raw, &lexer).map(|info| info.filters)
+    let dict = parse_dictionary(raw, 0)?;
+    (dict.consumed + ws_len(&raw[dict.consumed..]) == keyword_pos).then_some(dict.filters)
 }
 
 /// A PDF name token (without its leading `/`), with `#XX` hex escapes decoded,
@@ -1275,15 +1050,6 @@ fn hex_value(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 /// Inflates `data` as a zlib stream (PDF `/FlateDecode`), falling back to raw
