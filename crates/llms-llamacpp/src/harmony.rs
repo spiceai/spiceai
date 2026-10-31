@@ -247,8 +247,10 @@ impl Reader {
     /// tokens, so its text marks what the model reads, and the whole prompt is read here as
     /// a reply is, from its first `<|start|>`: a marker marks only where it would in a reply,
     /// so `<|start|>` in a body, or `<|end|>` inside a call's unfinished JSON arguments, is
-    /// text, and a call goes on from the arguments the prompt began. Each header is read
-    /// from after its role, as the header after a stock prompt's `<|start|>assistant` is.
+    /// text, and a call goes on from the arguments the prompt began. An `<|end|>` the next
+    /// message's `<|start|>` follows closes its message whatever the body, as the template
+    /// closes an earlier turn's reply. Each header is read from after its role, as the header
+    /// after a stock prompt's `<|start|>assistant` is.
     ///
     /// A reply held to a grammar goes on from where the prompt leaves it only where the
     /// grammar can too: from a rule of the grammar's own ([`Reader::opened`]), or once the
@@ -263,10 +265,16 @@ impl Reader {
         // Whether the text read next starts with a message's role, and where the header of
         // the message the prompt leaves open starts.
         let (mut role, mut header_from, mut at) = (false, first, first);
-        for (token, text) in self.markers.spell(&prompt[first..]) {
+        let mut pieces = self.markers.spell(&prompt[first..]).into_iter().peekable();
+        while let Some((token, text)) = pieces.next() {
             let next = at + text.len();
+            // An `<|end|>` that the next message's `<|start|>` follows is where the template
+            // closed a message, as it closes an earlier turn's reply, even in a body that reads
+            // `<|end|>` as text, as a structured reply's final message does.
+            let closes = token == Some(self.markers.end)
+                && matches!(pieces.peek(), Some((next, _)) if *next == Some(self.markers.start));
             match token {
-                Some(token) if self.marks(token, "") => {
+                Some(token) if closes || self.marks(token, "") => {
                     role = token == self.markers.start;
                     self.begun.clear();
                     if !matches!(self.mark(token), Mark::Next) {
