@@ -62,8 +62,9 @@ struct Inner {
     staged_checkpoint: u64,
     /// Changes accepted and visible on this node but not yet committed, one
     /// buffer per set of tables they touch, oldest first. A buffer commits as one
-    /// record at an acknowledgement point for one of its tables, or when it
-    /// reaches the size or age bound; another table's commit never publishes it.
+    /// record at an acknowledgement point for one of its tables, or with the
+    /// next change to one of them made outside a deferred scope; another table's
+    /// commit never publishes it.
     pending: Vec<Pending>,
 }
 
@@ -75,14 +76,7 @@ struct Pending {
     /// Table ids, and `""` for changes no table owns.
     tables: std::collections::BTreeSet<String>,
     actions: Vec<Action>,
-    bytes: usize,
-    since: std::time::Instant,
 }
-
-/// Commit buffered changes once they are this large or this old, even before an
-/// acknowledgement point asks for them.
-const PENDING_MAX_BYTES: usize = 256 * 1024;
-const PENDING_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Head-log tuning for a native catalog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -464,14 +458,25 @@ impl Inner {
             );
             return Err(invalid(error));
         }
-        let tables = self.tables_of(&record.actions);
-        let bytes = record.encoded_len();
+        let mut tables = self.tables_of(&record.actions);
+        // Creating or dropping a table changes which table a name refers to, which
+        // table ids alone do not order: a create under a name whose drop is still
+        // buffered must not commit first, or the log would hold the name twice. Such
+        // a record therefore takes every buffered change with it.
+        if record.actions.iter().any(|action| {
+            matches!(
+                action.kind,
+                Some(Kind::CreateTable(_) | Kind::DropTable(_) | Kind::Unconverted(_))
+            )
+        }) {
+            for buffer in &self.pending {
+                tables.extend(buffer.tables.iter().cloned());
+            }
+        }
         // Merge every buffer this record shares a table with, oldest first.
         let mut merged = Pending {
             tables: tables.clone(),
             actions: Vec::new(),
-            bytes: 0,
-            since: std::time::Instant::now(),
         };
         let mut kept = Vec::with_capacity(self.pending.len());
         for buffer in std::mem::take(&mut self.pending) {
@@ -480,18 +485,15 @@ impl Inner {
             } else {
                 merged.tables.extend(buffer.tables);
                 merged.actions.extend(buffer.actions);
-                merged.bytes += buffer.bytes;
-                merged.since = merged.since.min(buffer.since);
             }
         }
         merged.actions.extend(record.actions);
-        merged.bytes += bytes;
-        // Outside a deferred scope a change is durable when its method returns.
-        let due = !crate::catalog::commits_deferred()
-            || merged.bytes >= PENDING_MAX_BYTES
-            || merged.since.elapsed() >= PENDING_MAX_AGE;
         self.pending = kept;
-        if due {
+        // Outside a deferred scope a change is durable when its method returns.
+        // Inside one it waits for the scope's acknowledgement point however large
+        // or old it grows, so the position staged last shares its record; every
+        // deferred scope ends at such a point.
+        if !crate::catalog::commits_deferred() {
             return self.publish_buffers(vec![merged]).await;
         }
         self.pending.push(merged);

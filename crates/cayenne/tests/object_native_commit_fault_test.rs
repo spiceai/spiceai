@@ -267,3 +267,26 @@ async fn another_datasets_commit_leaves_a_datasets_buffered_changes_pending() {
         "orders' change and position did not commit as one record: {records:?}"
     );
 }
+
+/// A table dropped in a deferred scope and created again under its name outside
+/// it: the log must replay, and hold only the new table under that name.
+#[tokio::test]
+async fn a_name_dropped_in_a_deferred_scope_can_be_created_again() {
+    use cayenne::MetadataCatalog;
+    let (_faults, store, catalog) = setup().await;
+    let first = create(&catalog, "orders").await;
+    cayenne::catalog::with_deferred_commits(async {
+        catalog.drop_table("orders").await.expect("drop orders");
+    })
+    .await;
+    let second = create(&catalog, "orders").await;
+    assert_ne!(first, second);
+    drop(catalog);
+    let reopened = ObjectNativeCatalog::open(Arc::clone(&store), Path::from("catalog"))
+        .await
+        .expect("the log replays");
+    assert_eq!(
+        reopened.get_table("orders").await.expect("orders").table_id,
+        second
+    );
+}
