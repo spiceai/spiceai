@@ -164,6 +164,7 @@ pub struct RefreshOverrides {
         rename = "refresh_mode",
         deserialize_with = "parse_override_mode"
     )]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<OnDemandRefreshMode>))]
     pub mode: Option<RefreshMode>,
 
     /// The maximum amount of jitter to add to the refresh. Defaults to the `refresh_jitter_max` specified in the spicepod, or 10% of the `refresh_check_interval`.
@@ -174,6 +175,18 @@ pub struct RefreshOverrides {
     )]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, example = "10s"))]
     pub max_jitter: Option<Duration>,
+}
+
+/// The `refresh_mode` values an on-demand refresh accepts, as documented in the API
+/// schema. Requests are read as a [`RefreshMode`] and checked by
+/// [`RefreshOverrides::validate_mode`].
+#[cfg(feature = "openapi")]
+#[derive(utoipa::ToSchema)]
+#[schema(rename_all = "lowercase")]
+#[expect(dead_code, reason = "only describes the API schema")]
+enum OnDemandRefreshMode {
+    Full,
+    Append,
 }
 
 /// Reads `refresh_mode`. An unknown value is rejected naming only the modes an
