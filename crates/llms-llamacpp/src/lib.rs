@@ -3410,8 +3410,9 @@ mod tests {
     }
 
     /// A gpt-oss-style template whose generation prompt goes on from `<|start|>assistant` with
-    /// `OPENS`, as a custom template may.
-    const HARMONY_OPENS: &str = "{% for m in messages %}<|start|>{{ m.role }}<|message|>{{ m.content }}<|end|>{% endfor %}<|start|>assistantOPENS";
+    /// `OPENS`, as a custom template may. An earlier turn's reply is a final message, closed
+    /// with `<|end|>`, as gpt-oss's own template renders one.
+    const HARMONY_OPENS: &str = "{% for m in messages %}<|start|>{{ m.role }}{% if m.role == 'assistant' %}<|channel|>final{% endif %}<|message|>{{ m.content }}<|end|>{% endfor %}<|start|>assistantOPENS";
 
     /// What a Harmony model's `reply` sends when the template's generation prompt goes on from
     /// `<|start|>assistant` with `opens`, for a request with the fields `request` sets, or why
@@ -3521,6 +3522,13 @@ mod tests {
             }],
             "tool_choice": "required",
         });
+        // a second turn, after an earlier structured reply
+        let mut second_turn = structured.clone();
+        second_turn["messages"] = serde_json::json!([
+            { "role": "user", "content": "What is the capital of France?" },
+            { "role": "assistant", "content": "{\"capital\":\"Paris\"}" },
+            { "role": "user", "content": "And of Italy?" },
+        ]);
         let json = "{\"capital\":\"Paris\"}";
         let final_json = format!("<|channel|>final<|message|>{json}<|return|>");
         let call =
@@ -3575,6 +3583,11 @@ mod tests {
                 format!("<|message|>Look it up.<|end|><|start|>assistant{call}"),
             ),
             ("<|channel|>final<|message|>", &required, call.to_string()),
+            (
+                "<|channel|>final<|message|>",
+                &second_turn,
+                format!("{json}<|return|>"),
+            ),
         ];
         let read: Vec<_> = cases
             .iter()
@@ -3621,6 +3634,7 @@ mod tests {
                 format!("<[3]> reasoning <[4]> <[1]> \"assistant\" {call_root}"),
             ),
             (called(), format!("analysis? {call_root}")),
+            (answer(), "reply-root".to_string()),
         ];
         assert_eq!(
             read,

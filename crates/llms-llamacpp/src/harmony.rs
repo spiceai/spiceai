@@ -936,6 +936,33 @@ mod tests {
         assert_eq!(free.route, Route::Reasoning);
     }
 
+    /// A structured reply's final body reads `<|end|>` as text, since its JSON may spell one.
+    /// In the prompt, an `<|end|>` the next message's `<|start|>` follows is where the template
+    /// closed a message, as it closes an earlier turn's final message, so the reply still goes on
+    /// from the message the prompt leaves open, `<|end|>` in its JSON included.
+    #[test]
+    fn an_earlier_turn_closes_where_the_next_message_starts() {
+        let history = "<|start|>user<|message|>Capital?<|end|><|start|>assistant<|channel|>final<|message|>{\"answer\":\"Paris\"}<|end|><|start|>user<|message|>Second city?<|end|>";
+        let after = |opened: &str| {
+            Reader::new(TEST_MARKERS, Vec::new(), Held::Reply)
+                .after(&format!("{history}<|start|>assistant{opened}"))
+        };
+        let begun = after("<|channel|>final<|message|>{\"note\":\"<|end|>\",\"answer\":\"Ly");
+        assert_eq!(
+            (begun.route.clone(), begun.pending(), begun.begun.as_str()),
+            (
+                Route::Content { last: true },
+                "<|channel|>final<|message|>{\"note\":\"<|end|>\",\"answer\":\"Ly",
+                "{\"note\":\"<|end|>\",\"answer\":\"Ly"
+            )
+        );
+        let opened = after("<|channel|>final<|message|>");
+        assert_eq!(
+            (opened.route.clone(), opened.opened(), opened.pending()),
+            (Route::Content { last: true }, &Opened::Final, "")
+        );
+    }
+
     #[test]
     fn a_reply_that_runs_out_mid_call_makes_no_call() {
         assert_eq!(
