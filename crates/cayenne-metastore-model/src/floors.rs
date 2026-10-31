@@ -18,15 +18,14 @@ pub struct State {
     store: Store,
     log: Vec<Record>,
     captured: Option<Store>,
-    pin: Option<Store>,
-    checked: bool,
-    valid: bool,
+    /// A running query, started on the current state; retention keeps it.
+    query: Option<Store>,
     published: bool,
     scan: bool,
     deleted: bool,
     queue: Vec<usize>,
     bad_read: bool,
-    bad_pin: bool,
+    bad_query: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -36,8 +35,7 @@ pub enum Action {
     Floor(usize),
     Poll,
     Read,
-    Pin,
-    Recheck,
+    Query,
     Scan,
     Delete,
 }
@@ -62,19 +60,17 @@ impl Model for Protocol {
             store: Store::default(),
             log: vec![],
             captured: None,
-            pin: None,
-            checked: false,
-            valid: false,
+            query: None,
             published: false,
             scan: false,
             deleted: false,
             queue: vec![],
             bad_read: false,
-            bad_pin: false,
+            bad_query: false,
         }]
     }
     fn actions(&self, state: &State, action: &mut Vec<Action>) {
-        use Action::{Append, Create, Delete, Floor, Observe, Pin, Poll, Read, Recheck, Scan};
+        use Action::{Append, Create, Delete, Floor, Observe, Poll, Query, Read, Scan};
         if state.log.len() < self.bound {
             action.extend([Append(0), Append(1)]);
         }
@@ -94,12 +90,9 @@ impl Model for Protocol {
         }
         if state.captured.is_some() {
             action.push(Read);
-            if state.pin.is_none() {
-                action.push(Pin);
-            }
         }
-        if state.pin.is_some() && !state.checked {
-            action.push(Recheck);
+        if state.query.is_none() {
+            action.push(Query);
         }
         if state.published && !state.scan {
             action.push(Scan);
@@ -107,10 +100,10 @@ impl Model for Protocol {
         if state.scan && !state.deleted {
             action.push(Delete);
         }
-        action.retain(|action| self.next_state(state, action.clone()).is_some());
+        crate::prune_for_simulation(self, state, action);
     }
     fn next_state(&self, state: &State, action: Action) -> Option<State> {
-        use Action::{Append, Create, Delete, Floor, Observe, Pin, Poll, Read, Recheck, Scan};
+        use Action::{Append, Create, Delete, Floor, Observe, Poll, Query, Read, Scan};
         let mut next = state.clone();
         match action {
             Append(z) => {
@@ -144,11 +137,11 @@ impl Model for Protocol {
                 let target = p.first + p.window.len();
                 next.bad_read |= self.read(p, &state.store) != Some(state.log[..target].to_vec());
             }
-            Pin => next.pin.clone_from(&state.captured),
-            Recheck => {
-                next.checked = true;
-                next.valid =
-                    crate::core::pin_admitted(state.pin.as_ref()?.floor, state.store.floor);
+            Query => {
+                let mut p = state.store.clone();
+                p.batches.clear();
+                p.pending.clear();
+                next.query = Some(p);
             }
             Scan => {
                 next.scan = true;
@@ -163,14 +156,10 @@ impl Model for Protocol {
                             *action + b.len() <= state.store.floor
                         };
                         eligible
-                            && !state.pin.as_ref().is_some_and(|p| {
-                                if self.mode.contains("no-pin-base") {
-                                    let target = p.first + p.window.len();
-                                    *action < target && target <= *action + b.len()
-                                } else {
-                                    p.index.iter().any(|(x, _)| x == action)
-                                }
-                            })
+                            && !state
+                                .query
+                                .as_ref()
+                                .is_some_and(|p| p.index.iter().any(|(x, _)| x == action))
                     })
                     .map(|(action, _)| *action)
                     .collect();
@@ -187,10 +176,9 @@ impl Model for Protocol {
                 }
             }
         }
-        if next.checked && next.valid {
-            let p = next.pin.as_ref()?;
+        if let Some(p) = next.query.as_ref() {
             let target = p.first + p.window.len();
-            next.bad_pin |= self.read(p, &next.store) != Some(next.log[..target].to_vec());
+            next.bad_query |= self.read(p, &next.store) != Some(next.log[..target].to_vec());
         }
         if next == *state { None } else { Some(next) }
     }
@@ -210,9 +198,7 @@ impl Model for Protocol {
                     .map(|v| v.into_iter().map(payload).collect::<Vec<_>>())
                     == Some(state.log.iter().copied().map(payload).collect())
             }),
-            Property::always("I7 validated pinned snapshot", |_, state: &State| {
-                !state.bad_pin
-            }),
+            Property::always("I7 query snapshot", |_, state: &State| !state.bad_query),
             Property::sometimes("floor inside listed batch", |_, state: &State| {
                 state
                     .store
@@ -231,16 +217,12 @@ impl Model for Protocol {
             Property::sometimes("floor at w_first minus one", |_, state: &State| {
                 state.published && state.store.floor == state.store.first
             }),
-            Property::sometimes("pin before floor survives GC", |_, state: &State| {
+            Property::sometimes("query before floor survives GC", |_, state: &State| {
                 state.deleted
-                    && state.valid
                     && state
-                        .pin
+                        .query
                         .as_ref()
                         .is_some_and(|p| p.floor < state.store.floor)
-            }),
-            Property::sometimes("late pin rejected by recheck", |_, state: &State| {
-                state.checked && !state.valid && state.scan
             }),
             Property::sometimes("delayed seal after GC", |_, state: &State| {
                 state.store.revived

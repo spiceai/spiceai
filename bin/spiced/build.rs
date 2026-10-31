@@ -17,6 +17,17 @@ limitations under the License.
 use std::process::Command;
 
 fn main() {
+    // This script has no build dependencies, so it runs at the start of the build: a
+    // native Windows build stops here with the supported path rather than on the first
+    // dependency with no Windows code (the `compile_error!` in `lib.rs` is only reached
+    // once every dependency has compiled).
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!(
+            "cargo::error=spiced does not build for native Windows. Run it under WSL or in Docker. See: https://spiceai.org/docs/installation"
+        );
+        return;
+    }
+
     let git_hash: String = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()

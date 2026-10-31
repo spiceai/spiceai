@@ -32,8 +32,9 @@ use arrow::{
     datatypes::DataType,
     error::ArrowError,
 };
-use arrow_schema::SchemaRef;
+use arrow_schema::{Schema, SchemaRef};
 use arrow_tools::record_batch::{slice_memory_size, try_cast_to};
+use arrow_tools::schema::schema_meta_get_computed_columns;
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use arrow_tools::type_rewrite::rewrite_data_type;
 use async_stream::stream;
@@ -51,7 +52,7 @@ use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_planner::ExtensionPlanner;
 use datafusion::{
-    common::TableReference,
+    common::{Column, TableReference},
     dataframe::DataFrame,
     datasource::TableProvider,
     error::DataFusionError,
@@ -117,6 +118,7 @@ pub mod changes;
 #[cfg(test)]
 mod deletion;
 mod latest_by_time;
+mod slow_refresh;
 
 /// The largest UTC offset a time may carry (+14:00), in nanoseconds.
 const MAX_UTC_OFFSET_NANOS: u128 = 14 * 3_600 * 1_000_000_000;
@@ -526,6 +528,7 @@ impl RefreshTaskBuilder {
             runtime_status: self.runtime_status,
             dataset_name: self.dataset_name,
             dataset_metric_labels,
+            refresh_durations: slow_refresh::RefreshDurations::default(),
             federated: self.federated,
             federated_source: self.federated_source,
             accelerator: self.accelerator,
@@ -610,6 +613,9 @@ pub struct RefreshTask {
     /// Prebuilt per-dataset metric labels (see [`DatasetMetricLabels`]), reused
     /// by the hot metric-record sites instead of re-allocating the label.
     dataset_metric_labels: DatasetMetricLabels,
+    /// How long recent successful refreshes took, which a running refresh is compared
+    /// with to report one that is far slower.
+    refresh_durations: slow_refresh::RefreshDurations,
     federated: Arc<FederatedTable>,
     federated_source: Option<String>,
     accelerator: Arc<dyn TableProvider>,
@@ -810,9 +816,6 @@ impl RefreshTask {
             let _ = self.federated.try_wait_table_provider().await;
         }
 
-        // Limit parallel refreshes via a semaphore
-        let _permit = self.semaphore.acquire().await;
-
         let max_retries = if refresh.retry_enabled {
             refresh.retry_max_attempts
         } else {
@@ -835,6 +838,9 @@ impl RefreshTask {
             .last()
             .unwrap_or_else(|| unreachable!("There is always at least one span"));
         let result = retry(retry_strategy, || async {
+            // Limit parallel refreshes via a semaphore. The permit covers one attempt, so a
+            // refresh waiting out a retry backoff does not hold back other datasets.
+            let _permit = self.semaphore.acquire().await;
             match self.run_once(&refresh).await {
                 Ok(outcome) => Ok(outcome),
                 Err(retry_err) => {
@@ -985,6 +991,10 @@ impl RefreshTask {
         );
 
         let start_time = SystemTime::now();
+        let started = Instant::now();
+        // Warns if this refresh runs far longer than the dataset's recent ones did. Dropped,
+        // and so cancelled, when the refresh returns.
+        let _slow_refresh_watch = self.watch_for_slow_refresh(refresh.mode);
 
         // The source commit an append refresh loads, saved only once its rows are
         // written: a refresh that fails or is cancelled must be read again.
@@ -1104,6 +1114,9 @@ impl RefreshTask {
             return Err(e);
         }
 
+        self.refresh_durations
+            .record(refresh.mode, started.elapsed());
+
         // Only record metrics if a refresh was successful
         self.handle_metrics(
             &dataset_metrics_label_sets,
@@ -1123,6 +1136,24 @@ impl RefreshTask {
         }
 
         Ok(RefreshOutcome::Refreshed)
+    }
+
+    /// Starts the watch that reports this refresh if it runs far longer than the dataset's
+    /// recent refreshes in `mode` did; `None` until there are enough of them.
+    fn watch_for_slow_refresh(
+        &self,
+        mode: RefreshMode,
+    ) -> Option<tokio_util::task::AbortOnDropHandle<()>> {
+        if is_spice_internal_dataset(&self.dataset_name) {
+            return None;
+        }
+        let slow = self.refresh_durations.slow_after(mode)?;
+        Some(slow_refresh::watch(
+            self.component_type(),
+            self.dataset_name.clone(),
+            mode,
+            slow,
+        ))
     }
 
     /// Ends a refresh that found nothing to fetch: the skip is counted, the dataset is
@@ -2844,8 +2875,11 @@ impl RefreshTask {
             return Ok(update);
         };
 
+        // Computed columns, such as embeddings, are not compared: a model can return
+        // different vectors for the same text, so a re-read row would not match its stored copy.
+        let computed_columns = computed_columns(&self.federated.table_provider().await.schema());
         let existing_records = self
-            .stored_rows_to_compare(refresh, &filter_converter, stored_from)
+            .stored_rows_to_compare(refresh, &filter_converter, stored_from, &computed_columns)
             .await?;
 
         // Use the update stream's schema for dedup comparison, not the full federated
@@ -2865,6 +2899,7 @@ impl RefreshTask {
         let filter_fields: Vec<std::sync::Arc<arrow::datatypes::Field>> = output_schema
             .fields()
             .iter()
+            .filter(|field| !computed_columns.contains(field.name()))
             .map(|field| {
                 if let Some((_, acc_field)) = accelerator_schema.fields().find(field.name()) {
                     if field.data_type() == acc_field.data_type() {
@@ -2932,14 +2967,16 @@ impl RefreshTask {
     }
 
     /// The stored rows an append compares its incoming rows with: those `stored_from`
-    /// selects, plus every stored row whose time column is NULL.
+    /// selects, plus every stored row whose time column is NULL, without the `skipped` columns.
     async fn stored_rows_to_compare(
         &self,
         refresh: &Refresh,
         filter_converter: &TimestampFilterConvert,
         stored_from: StoredRowsFrom,
+        skipped: &[String],
     ) -> Result<Vec<RecordBatch>, RetryError<super::Error>> {
         let federated_provider = self.federated.table_provider().await;
+        let skipped: Vec<Column> = skipped.iter().map(Column::new_unqualified).collect();
 
         // The high-water filter below must widen in step with the source-side filter in
         // `get_full_or_incremental_append_update`: on a day-granular time column, if the
@@ -2956,6 +2993,7 @@ impl RefreshTask {
             )
             .await,
         )
+        .and_then(|df| df.drop_columns(&skipped))
         .map_err(find_datafusion_root)
         .context(super::UnableToScanTableProviderSnafu)?;
         if let Some(filter) = stored_from.filter(filter_converter) {
@@ -3022,6 +3060,7 @@ impl RefreshTask {
                 )
                 .await,
             )
+            .and_then(|df| df.drop_columns(&skipped))
             .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?
             .filter(ident(tc).is_null())
@@ -3094,7 +3133,7 @@ impl RefreshTask {
             });
         };
 
-        let is_integer_time_column = matches!(
+        let is_unix_time_column = matches!(
             accelerated_field.data_type(),
             DataType::Int8
                 | DataType::Int16
@@ -3104,11 +3143,14 @@ impl RefreshTask {
                 | DataType::UInt16
                 | DataType::UInt32
                 | DataType::UInt64
+                | DataType::Float16
+                | DataType::Float32
+                | DataType::Float64
         );
 
         // Extract the max timestamp value based on the column's data type.
         // - String columns (ISO8601): parse the ISO string back to nanos
-        // - Integer columns (UnixSeconds/UnixMillis): read raw integer value
+        // - Integer and float columns (UnixSeconds/UnixMillis/UnixNanos): read the raw value
         // - Timestamp and date columns: normalized to nanoseconds in memory
         // Handle all string array types (Utf8, LargeUtf8, Utf8View) for ISO8601 columns.
         let iso_str_value = col_array
@@ -3136,9 +3178,9 @@ impl RefreshTask {
                     ),
                 },
             )?
-        } else if is_integer_time_column {
-            // Integer time columns are returned as-is (not cast to Timestamp)
-            // to avoid DuckDB cast errors. Extract the integer value directly.
+        } else if is_unix_time_column {
+            // Unix time columns are returned as-is (not cast to Timestamp)
+            // to avoid DuckDB cast errors. Extract the value directly.
             if col_array.is_empty() {
                 return Ok(None);
             }
@@ -3189,9 +3231,34 @@ impl RefreshTask {
                     }
                     u128::from(arr.value(0))
                 }
+                DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                    let arr = arrow::compute::cast(col_array, &DataType::Float64).map_err(|e| {
+                        super::Error::FailedToFindLatestTimestamp {
+                            reason: format!("Failed to cast float time column to Float64: {e}"),
+                        }
+                    })?;
+                    let arr = arr
+                        .as_any()
+                        .downcast_ref::<arrow::array::Float64Array>()
+                        .ok_or_else(|| super::Error::FailedToFindLatestTimestamp {
+                            reason: "Failed to downcast float time column to Float64Array."
+                                .to_string(),
+                        })?;
+                    if arr.is_null(0) {
+                        return Ok(None);
+                    }
+                    let float_val = arr.value(0);
+                    whole_units_at_or_below(float_val).ok_or_else(|| {
+                        super::Error::FailedToFindLatestTimestamp {
+                            reason: format!(
+                                "Float time column value {float_val} is negative, not finite or out of range and cannot be used as a timestamp."
+                            ),
+                        }
+                    })?
+                }
                 other => {
                     return Err(super::Error::FailedToFindLatestTimestamp {
-                        reason: format!("Unexpected data type {other} for integer time column."),
+                        reason: format!("Unexpected data type {other} for unix time column."),
                     });
                 }
             }
@@ -3215,7 +3282,7 @@ impl RefreshTask {
             nanos as u128
         };
 
-        if is_integer_time_column {
+        if is_unix_time_column {
             match refresh.time_format {
                 Some(TimeFormat::UnixMillis) => {
                     value *= 1_000_000;
@@ -3674,6 +3741,19 @@ pub fn max_timestamp_df(
         .limit(0, Some(1))
 }
 
+/// The whole number of units at or below a float unix time, so a high-water mark read
+/// from it never passes a stored row. `None` for a negative, non-finite or out-of-range
+/// value.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn whole_units_at_or_below(value: f64) -> Option<u128> {
+    (value.is_finite() && (0.0..u64::MAX as f64).contains(&value))
+        .then(|| u128::from(value.floor() as u64))
+}
+
 /// Read the single temporal value `max_timestamp_df` returned as epoch nanoseconds,
 /// whatever unit and timezone the acceleration stores it in.
 ///
@@ -3879,6 +3959,17 @@ fn filter_records(
     let predicates = dedup_predicates(update_data, existing_records, filter_schema, used)?;
 
     filter_record_batch(update_data, &predicates.into()).context(super::FailedToFilterUpdatesSnafu)
+}
+
+/// The columns computed from another column of `schema`, such as its embeddings.
+fn computed_columns(schema: &Schema) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .filter_map(|field| schema_meta_get_computed_columns(schema, field.name()))
+        .flatten()
+        .map(|field| field.name().clone())
+        .collect()
 }
 
 /// Produces the rows in `update_data` that are absent from `existing_records`, while consuming
@@ -6636,7 +6727,7 @@ mod tests {
         let converter = task
             .get_accelerator_filter_converter(refresh)
             .expect("the time column has a filter converter");
-        task.stored_rows_to_compare(refresh, &converter, stored_from)
+        task.stored_rows_to_compare(refresh, &converter, stored_from, &[])
             .await
             .expect("the comparison set is read")
             .iter()
@@ -6663,6 +6754,54 @@ mod tests {
             .append_overlap(Duration::from_nanos(500));
         let mark = high_water_mark(&task, &refresh).await;
 
+        assert_eq!(compared_row_count(&task, &refresh, mark).await, 1);
+    }
+
+    /// A float unix time column is read as unix time, not as nanoseconds since the epoch,
+    /// so an append reads after the latest stored row instead of from about 1970.
+    #[tokio::test]
+    async fn append_on_a_float_unix_seconds_column_reads_after_the_latest_stored_row() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Float64,
+            false,
+        )]));
+        let stored = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Float64Array::from(vec![
+                1_700_000_000.25,
+                1_700_000_100.75,
+            ]))],
+        )
+        .expect("stored batch");
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![stored]])
+                .expect("accelerator mem table"),
+        ) as Arc<dyn TableProvider>;
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("federated mem table"),
+        ) as Arc<dyn TableProvider>;
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("test_float_unix_seconds"),
+            Arc::new(FederatedTable::new_unchecked(federated_table)),
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+        let refresh = Refresh::new(RefreshMode::Append)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::UnixSeconds);
+
+        assert_eq!(
+            task.timestamp_nanos_for_append_query(&refresh)
+                .await
+                .expect("the high-water mark is read"),
+            Some(1_700_000_100_000_000_000)
+        );
+        let mark = high_water_mark(&task, &refresh).await;
         assert_eq!(compared_row_count(&task, &refresh, mark).await, 1);
     }
 

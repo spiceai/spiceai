@@ -66,7 +66,7 @@ impl Model for Protocol {
             a.push(Action::Checkpoint);
         }
         a.push(Action::Recover);
-        a.retain(|a| self.next_state(s, a.clone()).is_some());
+        crate::prune_for_simulation(self, s, a);
     }
     fn next_state(&self, s: &State, action: Action) -> Option<State> {
         let mut n = s.clone();

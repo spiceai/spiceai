@@ -32,12 +32,16 @@ tracing-subscriber.workspace = true
 
 # HTTP client
 reqwest = { workspace = true, features = ["stream"] }
+# Read the certificate error behind a failed TLS handshake
+rustls.workspace = true
 
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
 secrecy.workspace = true
 zeroize = "1.8"
+# Reading a coding agent's own config for settings that outrank spice's
+toml = "1"
 
 # Environment files
 dotenv.workspace = true
@@ -65,7 +69,7 @@ ansi_colors = { path = "../../crates/ansi_colors" }
 # Archive extraction
 flate2 = "1"
 tar = "0.4"
-zip = "7"
+zip = "9.1"
 
 # YAML parsing for spicepod
 yaml = { path = "../../crates/yaml" }

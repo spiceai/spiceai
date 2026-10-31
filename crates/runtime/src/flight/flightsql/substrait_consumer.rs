@@ -27,6 +27,7 @@ use datafusion::logical_expr::{Expr, Extension, LogicalPlan};
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
     DefaultSubstraitLambdaConsumer, SubstraitConsumer, from_scalar_function,
+    from_substrait_func_args, name_to_op,
 };
 use datafusion_substrait::substrait::proto::expression::ScalarFunction;
 use datafusion_substrait::substrait::proto::{
@@ -35,8 +36,10 @@ use datafusion_substrait::substrait::proto::{
 use parking_lot::RwLock;
 
 /// Lowers Substrait plans the way `datafusion-substrait`'s
-/// `DefaultSubstraitConsumer` does, except that a Substrait `like` or `ilike`
-/// always becomes [`Expr::Like`].
+/// `DefaultSubstraitConsumer` does. Spice operator declarations bind to SQL
+/// syntax independently of upstream UDF names, and `like` / `ilike` lower to
+/// [`Expr::Like`]. Ordinary external function declarations retain the default
+/// registry lookup.
 ///
 /// `datafusion-substrait` resolves a function to a session UDF of the same name
 /// before its built-in expressions, and the session registers
@@ -131,18 +134,17 @@ fn spark_like_to_like_expr(expr: Expr) -> Result<Expr> {
     let Expr::ScalarFunction(ScalarFunctionExpr { func, args }) = expr else {
         return Ok(expr);
     };
-    let case_insensitive = match func.name() {
-        "like" => false,
-        "ilike" => true,
-        _ => return Ok(Expr::ScalarFunction(ScalarFunctionExpr { func, args })),
-    };
-    if args.len() != 2 && args.len() != 3 {
+    if !matches!(func.name(), "like" | "ilike") || (args.len() != 2 && args.len() != 3) {
         return Ok(Expr::ScalarFunction(ScalarFunctionExpr { func, args }));
     }
+    substrait_like_expr(func.name(), args)
+}
 
+fn substrait_like_expr(function_name: &str, args: Vec<Expr>) -> Result<Expr> {
+    let case_insensitive = function_name == "ilike";
     let mut args = args.into_iter();
     let (Some(expr), Some(pattern)) = (args.next(), args.next()) else {
-        return substrait_err!("Expected two or three arguments for `{}`", func.name());
+        return substrait_err!("Expected two or three arguments for `{}`", function_name);
     };
     let pattern = fold_literal_casts(pattern)?;
     let escape_char = match args.next() {
@@ -151,7 +153,7 @@ fn spark_like_to_like_expr(expr: Expr) -> Result<Expr> {
         Some(other) => {
             return substrait_err!(
                 "Expected a Utf8 literal for the `{}` escape character, but found {other:?}",
-                func.name()
+                function_name
             );
         }
     }
@@ -164,6 +166,57 @@ fn spark_like_to_like_expr(expr: Expr) -> Result<Expr> {
         escape_char,
         case_insensitive,
     )))
+}
+
+/// These declarations describe SQL syntax bound by the sidecar, rather than a
+/// function lookup in the receiving session's user-function registry.
+fn lower_spice_operator(name: &str, mut arguments: Vec<Expr>) -> Result<Expr> {
+    if let Some(operator) = name_to_op(name) {
+        let mut arguments = arguments.into_iter();
+        let (Some(left), Some(right), None) =
+            (arguments.next(), arguments.next(), arguments.next())
+        else {
+            return substrait_err!(
+                "Spice Substrait operator {name} requires exactly two arguments"
+            );
+        };
+        return Ok(Expr::BinaryExpr(
+            datafusion::logical_expr::expr::BinaryExpr::new(
+                Box::new(left),
+                operator,
+                Box::new(right),
+            ),
+        ));
+    }
+    if matches!(name, "like" | "ilike") {
+        if arguments.len() != 2 && arguments.len() != 3 {
+            return substrait_err!(
+                "Spice Substrait operator {name} requires two or three arguments"
+            );
+        }
+        return substrait_like_expr(name, arguments);
+    }
+    if arguments.len() != 1 {
+        return substrait_err!("Spice Substrait operator {name} requires exactly one argument");
+    }
+    let argument = Box::new(arguments.remove(0));
+    Ok(match name {
+        "not" => Expr::Not(argument),
+        "is_null" => Expr::IsNull(argument),
+        "is_not_null" => Expr::IsNotNull(argument),
+        "is_true" => Expr::IsTrue(argument),
+        "is_false" => Expr::IsFalse(argument),
+        "is_unknown" => Expr::IsUnknown(argument),
+        "is_not_true" => Expr::IsNotTrue(argument),
+        "is_not_false" => Expr::IsNotFalse(argument),
+        "is_not_unknown" => Expr::IsNotUnknown(argument),
+        "negate" => Expr::Negative(argument),
+        _ => {
+            return Err(datafusion::common::DataFusionError::NotImplemented(
+                format!("Unsupported Spice Substrait operator: {name}"),
+            ));
+        }
+    })
 }
 
 #[async_trait]
@@ -190,6 +243,28 @@ impl SubstraitConsumer for SpiceSubstraitConsumer<'_> {
         expr: &ScalarFunction,
         input_schema: &DFSchema,
     ) -> Result<Expr> {
+        if let Some(operator) = self
+            .extensions
+            .functions
+            .get(&expr.function_reference)
+            .and_then(|name| name.strip_prefix("spice.operator."))
+        {
+            let arguments = from_substrait_func_args(self, &expr.arguments, input_schema).await?;
+            return lower_spice_operator(operator, arguments);
+        }
+        if let Some(name) = self
+            .extensions
+            .functions
+            .get(&expr.function_reference)
+            .and_then(|name| name.strip_prefix("spice.function."))
+        {
+            let func = self.state.udf(name)?;
+            let args = from_substrait_func_args(self, &expr.arguments, input_schema).await?;
+            return spark_like_to_like_expr(Expr::ScalarFunction(ScalarFunctionExpr {
+                func,
+                args,
+            }));
+        }
         spark_like_to_like_expr(from_scalar_function(self, expr, input_schema).await?)
     }
 

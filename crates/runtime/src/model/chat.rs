@@ -35,10 +35,6 @@ use snafu::ResultExt;
 #[cfg(feature = "models")]
 use spicepod::component::model::ModelFileType;
 use spicepod::component::model::{Model, ModelSource};
-#[cfg(feature = "models")]
-use std::path::PathBuf;
-#[cfg(feature = "models")]
-use std::str::FromStr;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::sync::RwLock;
@@ -130,7 +126,14 @@ pub async fn try_to_chat_model(
     rt: Arc<Runtime>,
 ) -> Result<LoadedChatModel, LlmError> {
     let secrets = rt.secrets();
-    let model = construct_model(component, params, &secrets, rt.token_provider_registry()).await?;
+    let model = construct_model(
+        component,
+        params,
+        &secrets,
+        rt.token_provider_registry(),
+        rt.df.cluster_config.allow_insecure_connections(),
+    )
+    .await?;
 
     // Handle tool usage
     let spice_tool_opt: Option<SpiceToolsOptions> = extract_secret!(params, "tools")
@@ -200,11 +203,21 @@ pub(crate) async fn typed_params<P: TypedParams>(
         })
 }
 
+/// `allow_insecure_connections` is spiced's `--allow-insecure-connections`, which a local model
+/// split across nodes over unauthenticated connections needs.
+#[cfg_attr(
+    not(feature = "models"),
+    expect(
+        unused_variables,
+        reason = "only a local model, which needs the `models` feature, is split across nodes"
+    )
+)]
 pub async fn construct_model(
     component: &spicepod::component::model::Model,
     params: &HashMap<String, SecretString>,
     secrets: &Arc<RwLock<Secrets>>,
     token_registry: Arc<TokenProviderRegistry>,
+    allow_insecure_connections: bool,
 ) -> Result<Arc<dyn Chat>, LlmError> {
     let model_id = component.get_model_id();
     let source = component.get_source().ok_or(LlmError::UnknownModelSource {
@@ -220,7 +233,7 @@ pub async fn construct_model(
             let p =
                 typed_params::<HuggingFaceModelParams>(component, params, source.clone(), secrets)
                     .await?;
-            huggingface(model_id, component, &p).await
+            huggingface(model_id, component, &p, allow_insecure_connections).await
         }
         #[cfg(not(feature = "models"))]
         ModelSource::HuggingFace => Err(LlmError::UnknownModelSource {
@@ -230,7 +243,7 @@ pub async fn construct_model(
         ModelSource::File => {
             let p =
                 typed_params::<FileModelParams>(component, params, source.clone(), secrets).await?;
-            file(component, &p).await
+            file(component, &p, allow_insecure_connections).await
         }
         #[cfg(not(feature = "models"))]
         ModelSource::File => Err(LlmError::UnknownModelSource {
@@ -426,6 +439,7 @@ async fn huggingface(
     model_id: Option<String>,
     component: &spicepod::component::model::Model,
     params: &HuggingFaceModelParams,
+    allow_insecure_connections: bool,
 ) -> Result<Arc<dyn Chat>, LlmError> {
     let Some(id) = model_id else {
         return Err(LlmError::FailedToLoadModel {
@@ -441,32 +455,18 @@ async fn huggingface(
         endpoint: params.hf_endpoint.as_deref(),
     };
 
-    // For GGUF models, we require user specify via `.files[].path`: the shards of a split
-    // GGUF, and an MTP draft head, are each listed.
-    let gguf_files = component
-        .find_all_file_path(ModelFileType::Weights)
-        .iter()
-        .filter_map(|p| {
-            let path = PathBuf::from_str(p.as_str()).ok()?;
-            path.extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
-                .then_some(path)
-        })
-        .collect::<Vec<_>>();
-
-    if !gguf_files.is_empty() {
-        tracing::debug!(
-            "For Huggingface model {}, the GGUF files {:?} will be downloaded and used.",
-            component.name,
-            gguf_files
-        );
-    }
+    // The model's GGUF files, or a GGUF quantization or its folder by name; the download
+    // resolves them against the repository, and with none chooses a GGUF repository's
+    // quantization.
+    let files = component.gguf_selectors();
+    let files: Vec<&str> = files.iter().map(String::as_str).collect();
 
     let chat_template_literal = params.chat_template.as_deref();
     let distributed = parse_distributed_config(
         params.distributed_backend,
         params.node_rank.as_deref(),
         params.nodes.as_deref(),
+        allow_insecure_connections,
     )?;
 
     let default_reasoning_effort =
@@ -475,7 +475,7 @@ async fn huggingface(
     llms::chat::create_hf_model(
         &id,
         model_type,
-        &gguf_files,
+        &files,
         hub,
         chat_template_literal,
         distributed,
@@ -502,13 +502,15 @@ fn default_reasoning_effort(
 }
 
 /// Parse the optional multi-node distributed-inference params (`distributed_backend`,
-/// `node_rank`, `nodes`) for a Huggingface model into a [`llms::chat::DistributedConfig`].
+/// `node_rank`, `nodes`) for a Huggingface model into a [`llms::chat::DistributedConfig`],
+/// with spiced's `--allow-insecure-connections`.
 /// Returns `Ok(None)` when distributed mode is not requested.
 #[cfg(feature = "models")]
 fn parse_distributed_config(
     distributed_backend: DistributedBackendSetting,
     node_rank: Option<&str>,
     nodes: Option<&str>,
+    allow_insecure_connections: bool,
 ) -> Result<Option<llms::chat::DistributedConfig>, LlmError> {
     let backend = match distributed_backend {
         DistributedBackendSetting::None => {
@@ -558,6 +560,7 @@ fn parse_distributed_config(
         backend,
         node_rank,
         nodes,
+        allow_insecure_connections,
     };
     config
         .validate()
@@ -817,6 +820,7 @@ fn azure(
 async fn file(
     component: &spicepod::component::model::Model,
     params: &FileModelParams,
+    allow_insecure_connections: bool,
 ) -> Result<Arc<dyn Chat>, LlmError> {
     let model_weights = component.find_all_file_path(ModelFileType::Weights);
     if model_weights.is_empty() {
@@ -841,6 +845,7 @@ async fn file(
         params.distributed_backend,
         params.node_rank.as_deref(),
         params.nodes.as_deref(),
+        allow_insecure_connections,
     )?;
     let context_length = parse_context_length(params)?;
     let paged_attention = params.paged_attention;
@@ -1174,7 +1179,7 @@ mod test {
         pairs: &[(&str, &str)],
     ) -> Result<Option<llms::chat::DistributedConfig>, LlmError> {
         let get = |k: &str| pairs.iter().find(|(pk, _)| *pk == k).map(|(_, v)| *v);
-        parse_distributed_config(backend, get("node_rank"), get("nodes"))
+        parse_distributed_config(backend, get("node_rank"), get("nodes"), false)
     }
 
     #[cfg(feature = "models")]

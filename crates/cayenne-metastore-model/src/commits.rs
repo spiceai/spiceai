@@ -23,6 +23,9 @@ struct Request {
     answer: u8,
     success: bool,
     unreadable: bool,
+    /// Resolution found no retained evidence past the horizon: the commit
+    /// outcome is reported unknown and the attempt is never retried.
+    unknown: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[expect(
@@ -33,6 +36,12 @@ pub struct State {
     pos: usize,
     etag: usize,
     lease: usize,
+    /// Store time of the head: it advances with every head write.
+    time: usize,
+    /// Head store time at which each history position was accepted.
+    times: Vec<usize>,
+    /// Checkpoints have dropped the attempt ids of positions up to here.
+    evidence_floor: usize,
     window: Vec<usize>,
     batches: Vec<Vec<usize>>,
     // Pending creates retain actual observed bytes, including after deletion.
@@ -54,15 +63,14 @@ pub struct State {
     plan: bool,
     deleted: bool,
     gc_lease: usize,
-    pin: u8,
-    pin_base: usize,
-    pin_target: usize,
-    pin_valid: bool,
+    query: bool,
+    query_base: usize,
+    query_target: usize,
     snapshot: bool,
     read: bool,
     bad_read: bool,
     bad_replay: bool,
-    bad_pin: bool,
+    bad_query: bool,
     bad_recovery: bool,
     bad_fence: bool,
     bad_i1: bool,
@@ -96,15 +104,20 @@ pub enum Action {
     Floor,
     Scan,
     Delete,
-    ChoosePin,
-    Pin,
-    Recheck,
+    Query,
     Snapshot,
     Recover,
     Lagging,
     Advance,
+    /// A checkpoint drops attempt ids older than the evidence horizon.
+    Expire,
 }
+/// The evidence horizon `T_O`, in head store-time units.
+const HORIZON: usize = 2;
 impl Protocol {
+    fn expiry(&self) -> bool {
+        self.has("expiry")
+    }
     fn head(state: &State) -> Head {
         Head {
             pos: state.pos,
@@ -164,6 +177,10 @@ impl Protocol {
     fn append(&self, state: &mut State, id: usize) {
         state.pos += 1;
         state.history.push(id);
+        if self.expiry() {
+            state.time += 1;
+            state.times.push(state.time);
+        }
         state.window.push(id);
         if state.window.len() > self.k {
             state.window.remove(0);
@@ -187,6 +204,9 @@ impl Model for Protocol {
             pos,
             etag: 0,
             lease: 1,
+            time: 0,
+            times: if self.expiry() { vec![0; pos] } else { vec![] },
+            evidence_floor: 0,
             window: history[pos - self.k..].to_vec(),
             batches: vec![vec![]; self.k + self.bound + 4],
             pending: vec![],
@@ -207,15 +227,14 @@ impl Model for Protocol {
             plan: false,
             deleted: false,
             gc_lease: 0,
-            pin: 0,
-            pin_base: 0,
-            pin_target: 0,
-            pin_valid: false,
+            query: false,
+            query_base: 0,
+            query_target: 0,
             snapshot: false,
             read: false,
             bad_read: false,
             bad_replay: false,
-            bad_pin: false,
+            bad_query: false,
             bad_recovery: false,
             bad_fence: false,
             bad_i1: false,
@@ -236,8 +255,8 @@ impl Model for Protocol {
     }
     fn actions(&self, state: &State, action: &mut Vec<Action>) {
         use Action::{
-            Ack, Advance, ChoosePin, Copy, Delete, Deliver, Fence, Floor, Issue, Lagging, Observe,
-            Parts, Pin, Poll, Recheck, Recover, Resolve, Response, Root, Scan, Snapshot,
+            Ack, Advance, Copy, Delete, Deliver, Fence, Floor, Issue, Lagging, Observe, Parts,
+            Poll, Query, Recover, Resolve, Response, Root, Scan, Snapshot,
         };
         if self.storage() {
             if state.stage == 0 {
@@ -255,16 +274,10 @@ impl Model for Protocol {
             if state.plan && !state.deleted {
                 action.push(Delete);
             }
-            if state.pin == 0 {
-                action.push(ChoosePin);
+            if !state.query {
+                action.push(Query);
             }
-            if state.pin == 1 {
-                action.push(Pin);
-            }
-            if state.pin == 2 {
-                action.push(Recheck);
-            }
-            if state.pin == 3 && !state.snapshot {
+            if state.query && !state.snapshot {
                 action.push(Snapshot);
             }
             if !state.lagged && state.deleted {
@@ -380,6 +393,9 @@ impl Model for Protocol {
             action.push(Poll);
         }
         action.push(Recover);
+        if self.expiry() {
+            action.push(Action::Expire);
+        }
         if state.lease
             < if self.has("copy") || self.has("observed") {
                 1
@@ -391,12 +407,12 @@ impl Model for Protocol {
         {
             action.push(Fence);
         }
-        action.retain(|x| self.next_state(state, x.clone()).is_some());
+        crate::prune_for_simulation(self, state, action);
     }
     fn next_state(&self, state: &State, action: Action) -> Option<State> {
         use Action::{
-            Ack, Advance, ChoosePin, Copy, Delete, Deliver, Fence, Floor, Issue, Lagging, Observe,
-            Parts, Pin, Poll, Recheck, Recover, Resolve, Response, Root, Scan, Snapshot,
+            Ack, Advance, Copy, Delete, Deliver, Fence, Floor, Issue, Lagging, Observe, Parts,
+            Poll, Query, Recover, Resolve, Response, Root, Scan, Snapshot,
         };
         let mut next = state.clone();
         match action {
@@ -442,6 +458,7 @@ impl Model for Protocol {
                     answer: 0,
                     success: false,
                     unreadable: false,
+                    unknown: false,
                 };
                 next.requests[w].push(r);
                 if self.has("no-observed") && (state.pos + 1).is_multiple_of(self.k) {
@@ -493,6 +510,15 @@ impl Model for Protocol {
                 // Look for acceptance in retained storage; absence remains unresolved.
                 let answer = if self.has("restart") && state.restored[r.id - 1] {
                     u8::from(state.history.contains(&r.id))
+                } else if self.expiry() && state.pos >= r.pos && r.pos <= state.evidence_floor {
+                    // Checkpoints dropped this position's attempt id. The head
+                    // moved past the base, but absence is not rejection here.
+                    if self.has("no-horizon") {
+                        crate::core::resolve_attempt(None, Self::head(state).accepts(r.base))
+                    } else {
+                        next.requests[w][i].unknown = true;
+                        0
+                    }
                 } else if state.pos >= r.pos {
                     match self.get(state, r.pos) {
                         Some(id) => {
@@ -533,6 +559,10 @@ impl Model for Protocol {
             Observe => Self::queue(&mut next, state.pos / self.k - 1, state.window.clone()),
             Fence => {
                 next.lease += 1;
+                // A takeover is a head commit, so the store time advances.
+                if self.expiry() {
+                    next.time += 1;
+                }
                 // The faulty store assigns the captured initial tag to different head bytes.
                 if self.has("etag") {
                     next.etag = if self.has("etag-repeat") {
@@ -573,10 +603,8 @@ impl Model for Protocol {
                 } else {
                     state.floor
                 };
-                next.plan = floor >= self.k
-                    && !(state.pin >= 2
-                        && (state.pin == 2 || state.pin_valid)
-                        && state.pin_base < self.k);
+                // Retention keeps a running query's state; no reader writes.
+                next.plan = floor >= self.k && !(state.query && state.query_base < self.k);
                 next.gc = true;
             }
             Delete => {
@@ -584,28 +612,28 @@ impl Model for Protocol {
                 next.deleted = true;
                 next.stale |= state.lease > state.gc_lease;
             }
-            ChoosePin => {
-                next.pin = 1;
-                next.pin_base = state.floor;
-                next.pin_target = state.pos;
-            }
-            Pin => next.pin = 2,
-            Recheck => {
-                next.pin = 3;
-                next.pin_valid = crate::core::pin_admitted(state.pin_base, state.floor);
+            Query => {
+                next.query = true;
+                next.query_base = state.floor;
+                next.query_target = state.pos;
             }
             Snapshot => {
                 next.snapshot = true;
-                if state.pin_valid {
-                    next.bad_pin = self
-                        .decode(state, state.pin_base, state.pin_target)
-                        .as_deref()
-                        != Some(&state.history[..state.pin_target]);
-                }
+                next.bad_query = self
+                    .decode(state, state.query_base, state.query_target)
+                    .as_deref()
+                    != Some(&state.history[..state.query_target]);
             }
             Recover => {
                 next.bad_recovery |= self.decode(state, state.floor, state.pos).as_deref()
                     != Some(state.history.as_slice());
+            }
+            Action::Expire => {
+                next.evidence_floor = state
+                    .times
+                    .iter()
+                    .take_while(|t| **t + HORIZON <= state.time)
+                    .count();
             }
             Lagging => {
                 next.lagged = true; // Reader retained base 0 before it fell behind GC.
@@ -670,8 +698,8 @@ impl Model for Protocol {
                 state.history.len() == state.pos
             }),
             Property::always("I8 replay equality", |_, state: &State| !state.bad_replay),
-            Property::always("I7 pinned snapshot equals serial", |_, state: &State| {
-                !state.bad_pin
+            Property::always("I7 query snapshot equals serial", |_, state: &State| {
+                !state.bad_query
             }),
             Property::always("I8 recovery equals serial reference", |_, state: &State| {
                 !state.bad_recovery
@@ -695,6 +723,25 @@ impl Model for Protocol {
                 },
             ));
         }
+        if self.expiry() {
+            p.push(Property::always(
+                "unknown commit outcome never retried",
+                |_, s: &State| {
+                    s.requests
+                        .iter()
+                        .all(|rs| rs.iter().rev().skip(1).all(|r| !r.unknown))
+                },
+            ));
+            p.push(Property::sometimes(
+                "unresolved past evidence horizon",
+                |_, s: &State| {
+                    s.requests
+                        .iter()
+                        .flatten()
+                        .any(|r| r.unknown && s.history.contains(&r.id))
+                },
+            ));
+        }
         if self.has("retry") {
             p.push(Property::sometimes(
                 "head read unavailable",
@@ -710,8 +757,8 @@ impl Model for Protocol {
                 Property::sometimes("reader more than K behind completed", |_, state: &State| {
                     state.lagged && !state.bad_replay
                 }),
-                Property::sometimes("valid pinned snapshot completed", |_, state: &State| {
-                    state.snapshot && state.pin_valid && !state.bad_pin
+                Property::sometimes("query snapshot completed", |_, state: &State| {
+                    state.snapshot && !state.bad_query
                 }),
             ]);
         } else {

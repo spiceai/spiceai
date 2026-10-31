@@ -48,9 +48,11 @@ target/debug/spicescript --jobs 8 --spiced trunk=target/release/spiced test/spic
 target/debug/spicescript --jobs 4 \
   --spiced release=$HOME/.spice/bin/spiced --spiced dev=target/release/spiced \
   test/spicescript/postgres-cdc-parity.yaml
-# Start on a release and upgrade in place to the build under test at each `upgrade` step:
+# Upgrade scripts start on the release their `from:` names, downloaded once, and move
+# to the build under test at each `upgrade` step; --from replaces that release:
+target/debug/spicescript --spiced dev=target/release/spiced test/spicescript/cayenne-upgrade.yaml
 target/debug/spicescript --from $HOME/.spice/bin/spiced \
-  --spiced dev=target/release/spiced test/spicescript/postgres-upgrade.yaml
+  --spiced dev=target/release/spiced test/spicescript/cayenne-upgrade.yaml
 # Every instance as a scheduler with one executor, over node mTLS:
 target/debug/spicescript --cluster test/spicescript/query-coverage.yaml
 # Known-failing scripts of one group, without waiting out every limit:
@@ -70,7 +72,8 @@ DuckDB CLI matching Spice's embedded DuckDB into `~/.cache/spicescript/`
 | --- | --- |
 | `<SCRIPTS>…` | Script files, or directories of `*.yaml` scripts (not their subdirectories, except that `known-failing/` includes its group directories). |
 | `--spiced [NAME=]PATH` | A `spiced` to test; repeat it to run every script on several binaries, which must give identical answers. Default: `~/.spice/bin/spiced`. |
-| `--from PATH` | Start every instance on this binary; each `upgrade` step moves it to the binary under test, over the same data. |
+| `--from PATH` | Start every instance on this binary instead of the release its script's `from:` names (see [Upgrades](#upgrades)); each `upgrade` step moves it to the binary under test, over the same data. Combine it with `--matrix from=…` to run one base version. |
+| `--from-release FROM=VERSION` | Start the runs whose `from:` is `FROM` (such as `2.3.x`) on release `VERSION` (such as `2.3.2`) instead of the one it resolves to (see [Upgrades](#upgrades)). Repeat it for several. |
 | `--cluster` | Run every instance as a scheduler plus one executor over node mTLS. Scripts that can't run distributed (memory-mode Cayenne, DuckDB or SQLite accelerations) are skipped. |
 | `--jobs N` | Run up to N `spiced` processes at once (default 1). Every instance of every matrix combination is a job of its own, taking a slot per process, executors included, and freeing it when it finishes. A combination that stops and starts a source its instances share, or whose variants work together (`run-variants: side-by-side`), runs its instances a step at a time as one job; a script with `defaults.exclusive` runs alone. Scripts ask for slots longest first, from recorded durations. Each script's output is printed when it finishes, with progress lines and the slowest scripts at the end. |
 | `--partition I/N` | Run only share I of N (1-based), for splitting a suite across CI jobs. Scripts go longest first, by recorded duration, to the share with the least work so far, so every job computes the same split and the shares take about as long. |
@@ -79,18 +82,38 @@ DuckDB CLI matching Spice's embedded DuckDB into `~/.cache/spicescript/`
 | `--matrix KEY=VALUE` | Choose which **runs** happen: only the matrix combinations with this value of a key under `matrix:` (as `${matrix.KEY}` prints it), such as `src=clickhouse`; repeat a key for several values. Scripts without the key or any of the values are skipped. Expected failures of the combinations left out are neither required to fail nor dropped by `--record-failures`. |
 | `--variant NAME` | Choose which **instances** start in each run: only this name under `variants:`, such as `cayenne`; repeat it for several. Scripts with none of them are skipped. Expected failures of the variants left out, and of comparisons between variants (the run compares a different set), are neither required to fail nor dropped by `--record-failures`. Neither option combines with `--record-durations`. |
 | `--work-dir DIR` | Where instances keep their spicepods, data and `spiced.log` (default `target/spicescript`). |
+| `--cell-width CHARS` | The widest a value is drawn in a mismatch report's tables (default 40): a longer one keeps its start and end around `…`. The report's first line still names the first mismatched value in full. `0` draws every value whole, for when you need the whole of a large value. |
+| `--log-capture DIR` | Leave each script with a failure's logs in `DIR/<script>/` (see **Logs and cleanup** below). CI uploads it from a failed shard as `spicescript-logs-<n>`. |
+| `--results PATH` | Write every script's outcome to this JSON file, passes included: its file, `outcome` (`passed`, or `failed` when anything failed other than as the ledger expects), run time, checks passed, every failed check with its `ledger` status (`expected`, `changed`, `new`, or `recorded` under `--record-failures`), the ledger entries that no longer fail, and the problems and notes the run prints. The file is rewritten as each script finishes, so an interrupted run leaves the scripts it finished; `complete` is set once the run reaches the end. CI uploads it from every shard as `spicescript-results-<n>`. |
 | `--keep` | Leave source containers running after the run, for debugging. |
 | `--spice-cli PATH` | The `spice` CLI that `spice` steps run. |
 | `--record-failures` | Rewrite each run script's entries in its directory's `recordings/expected-failures.json` with the failures this run saw (see [Expected failures](#expected-failures)). |
 | `--check` | Parse every script, including its corpora, and stop. Also fails on an `avoid:` whose defect no longer fails anywhere. |
 
 **Logs and cleanup.** Each failure prints the step, what was expected and what
-was seen, and the instance's `spiced.log` path. A run removes the containers,
-networks and `spiced` processes it started, including after SIGINT or SIGTERM
-and after a failed or interrupted start. A runner killed with SIGKILL can't
-clean up, so the next run reaps what dead runners left: `spiced` processes
-recorded in `spiced.pid`, and containers and networks named after the dead
-runner's pid.
+was seen, and the instance's `spiced.log` path. With
+`--log-capture DIR`, every script with a failure, expected or not, also
+leaves its logs in a directory of its own:
+
+```text
+DIR/<script>/script.yaml                  the script as run
+DIR/<script>/output.txt                   what the run printed for it
+DIR/<script>/[<combination>/]<source>.log each source container's output
+DIR/<script>/[<combination>/]<instance>/  its spiced.log (executors' too), spicepod, slt and random-query reports
+```
+
+`<combination>` is the matrix combination (`src_postgres`), for a script with
+a matrix; combinations whose values differ only in case or punctuation also
+get their position in the matrix (`k_a_b-1`, `k_a_b-2`). A container that fails to start or become healthy puts its last lines
+of output in the error either way. Processes a script starts inside a container
+(Debezium Server under `source-exec`) write to the container's output,
+`/proc/1/fd/1`, so its log has them too.
+
+A run removes the containers, networks and `spiced` processes it started,
+including after SIGINT or SIGTERM and after a failed or interrupted start. A
+runner killed with SIGKILL can't clean up, so the next run reaps what dead
+runners left: `spiced` processes recorded in `spiced.pid`, and containers and
+networks named after the dead runner's pid.
 
 ## Scripts
 
@@ -199,7 +222,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `stop: {}` | SIGTERM, then SIGKILL after 45 s; fails if the shutdown wasn't clean. |
 | `kill-spiced: {}` | SIGKILL; `{ signal: STOP-then-KILL }` freezes it first. |
 | `restart: {}` | Stop (or `{ kill: KILL }`) and start again; takes `start`'s options. |
-| `upgrade: {}` | Like `restart`, but starts the binary under test (see `--from`). |
+| `upgrade: {}` | Like `restart`, but starts the binary under test (see [Upgrades](#upgrades)). |
 | `wait-ready: { timeout }` | Wait for `/v1/ready`. |
 | `edit-spicepod: <patch>` | Rewrite the running instance's spicepod (for `--pods-watcher-enabled`). |
 | `start-source`, `stop-source`, `pause-source`, `unpause-source: <name>` | Control a source container; it keeps its host port across a stop. |
@@ -228,13 +251,126 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `corpus: <file.sql>` | One `query` per statement in the file (see Corpora). |
 | `slt-setup` / `slt: { file, source }` | Run a sqllogictest file: statements on the source, then its queries through Spice against the recorded answers. |
 | `tlp: { table, seed, queries, depth, aggregate, oracle, avoid }` | Ternary logic partitioning over random predicates. |
-| `random-queries: { tables, joins, seed, queries, depth, oracle, avoid }` | Random nested-subquery queries, each checked against the oracle. |
+| `random-queries: { tables, joins, seed, queries, depth, oracle, protocols, avoid }` | Random nested-subquery queries checked against an oracle or across protocols. |
 | `sleep: 5s` | Wait; prefer `eventually`, `consistently` and `drive`. |
 
 Any step takes `only: <variant>` or `except: <variant>` (or a list), and
 `when: { <matrix key>: <value> }`. A failed lifecycle step (`start`, `stop`,
 `restart`, `upgrade`, `kill-spiced`, `wait-ready`) skips the rest of that
 instance; any other failure is a failed check and the script goes on.
+
+`protocols` on `query`, `corpus`, and inside `random-queries` selects the
+transports to compare: `flight`, `flightsql`, and `http` (`/v1/sql`, JSON).
+Existing queries retain their current path; random queries default to `[flight]`.
+Without a random-query `oracle`, select at least two distinct protocols,
+including `flight` or `flightsql` to supply the Arrow result schema. HTTP JSON
+requires unique result column names. Queries must be deterministic and read
+unchanging data. Every selected transport must succeed and return the same
+rows, including duplicates and NULLs; empty results are also compared.
+An optional random-query `oracle` additionally checks those results against a source.
+Explicit protocol comparisons check values exactly after normalizing unordered
+rows and signed zero. The protocol fixture uses one execution core to keep
+floating aggregate evaluation stable between independent requests. Flight SQL checks the advertised schema against every
+stream, including decimal precision/scale, nullability, and metadata. HTTP is
+decoded from its raw JSON text using the Arrow schema, retaining decimal digits.
+Prepared queries (`parameters` or `flight-session`) support an explicit
+`protocols: [flightsql]`; the existing prepared path is retained when omitted.
+
+[`query-protocols.yaml`](../../test/spicescript/query-protocols.yaml) compares
+Flight SQL with HTTP using the generated SQL reference corpus and seeded
+random queries over local Parquet files. One seed also exercises plain Flight:
+
+```bash
+target/debug/spicescript --spiced target/release/spiced test/spicescript/query-protocols.yaml
+```
+
+The [SQL surface generator](../../test/spicescript/corpus/sql_surface.py) maintains
+an inventory pinned to a revision of `spiceai/docs`, explicit function arguments,
+and the generated [coverage index](../../test/spicescript/corpus/sql-surface-coverage.json).
+It includes documented aliases, operators, query clauses, optional argument
+forms, and literal-sensitive decimal schema cases. Core scalar cases use typed
+literals, columns with NULLs and duplicate rows, and empty inputs. This is
+representative surface coverage, not an exhaustive enumeration of SQL programs
+or a proof of each function's semantics. Existing oracle suites keep checking
+results independently of protocol parity.
+
+```bash
+python3 test/spicescript/corpus/sql_surface.py
+python3 test/spicescript/corpus/sql_surface.py --check
+# Audit against a checkout of the documentation repository:
+python3 test/spicescript/corpus/sql_surface.py --check --docs-dir /path/to/docs/website/docs/reference/sql
+```
+
+Reproduced failures remain generated and executable in
+[`known-failing/sql-protocols`](../../test/spicescript/known-failing/sql-protocols).
+Their case identifiers, reasons, documentation revision, source commit and
+runtime binary hash are recorded in `corpus/sql-surface-known-failures.json`
+and `corpus/sql-surface-known-values.json`. They are not counted as passing
+surface coverage. Remove resolved entries and regenerate to return those
+cases to the passing suite; the failure ledger also detects when a case stops
+failing or changes its symptom.
+
+When the reference changes, refresh its inventory with `--docs-dir ...
+--refresh-inventory`, add cases for new entries, and regenerate. CI checks the
+generated files and alias parsing without requiring network access. AI,
+embeddings, indexed search, prepared statements and writes have separate
+fixtures named in the coverage index. The prepared decimal and NULL cases also
+run in `sql-schema-protocols.yaml`, and `sql-operator-values.yaml` checks
+operator semantics against literal expected answers. They are not counted as deterministic
+core protocol cases. `sql-explain-protocols.yaml` exercises documented EXPLAIN
+options independently on HTTP and Flight SQL because live plan metrics vary.
+
+ADBC is a client API; its Flight SQL driver uses the Flight SQL protocol.
+This scenario exercises Flight SQL directly, rather than an ADBC driver.
+
+### Upgrades
+
+```yaml
+name: orders-upgrade
+matrix:
+  from: [2.3.x, 2.4.x]               # one run per base release: name[from=2.4.x]
+from: '${matrix.from}'               # or one release: from: 2.4.x, from: 2.4.0
+steps:
+  - start: {}                        # on the base release
+  - query: SELECT * FROM orders
+  - upgrade: {}                      # on the binary under test, over the same data
+  - query: SELECT * FROM orders
+```
+
+`from:` names the release a script's instances start on, as `X.Y.Z` or `X.Y.x`,
+the newest published X.Y release on GitHub with a `spiced` build for this host.
+Before running, spicescript lists the releases once (with `GITHUB_TOKEN` or
+`GH_TOKEN` if set, for the API's rate limit) and caches the list for an hour in
+`~/.cache/spicescript/releases.json`, which records what each `X.Y.x` resolved
+to and when; if GitHub can't be reached, an older cached list is used with a
+warning. It then downloads each release the selected runs need
+(`spiced_<os>_<arch>.tar.gz` from the GitHub release) once into
+`~/.cache/spicescript/spiced-<version>/` and checks its `--version`. The output
+names the release behind each `from:`, and each run the release it starts on:
+
+```
+from 2.3.x: v2.3.3 (newest published), ~/.cache/spicescript/spiced-2.3.3/spiced
+from 2.4.x: v2.4.0 (newest published), ~/.cache/spicescript/spiced-2.4.0/spiced
+== orders-upgrade[from=2.3.x]: …
+   from   v2.3.3 (2.3.x)
+```
+
+Executors start on the release too, and `upgrade` moves the scheduler and
+executors to the binary under test. Because `X.Y.x` follows the releases, a
+new patch release changes what the same commit upgrades from.
+
+- Without `from:`, instances start on the binary under test and `upgrade` is a
+  restart. A `from:` on a script with no `upgrade` step is rejected.
+- `--from-release 2.3.x=2.3.2` starts the runs whose `from:` is `2.3.x` on
+  v2.3.2 instead; repeat it for several. With `--matrix from=2.3.x` it narrows
+  the run to that one base release.
+- `--from PATH` starts every instance on that binary instead, whatever the
+  script names.
+- OSS release builds have only the `release` and `models` features. A release
+  asked for another one (acceleration snapshots, for one) starts anyway and
+  logs that the feature is in the Enterprise distribution. spicescript fails
+  the start on that line, naming the release, rather than letting a later
+  check fail for a reason it can't see.
 
 ### Source-neutral writes
 

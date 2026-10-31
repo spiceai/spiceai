@@ -217,7 +217,6 @@ async fn checkpoint_schema(rt: &Arc<Runtime>, ds: &Dataset) -> Option<Arc<Schema
     checkpoint.get_schema().await.ok().flatten()
 }
 
-#[cfg(not(windows))]
 #[tokio::test]
 async fn sink_accelerated_metric_survives_restart_without_schema_mismatch()
 -> Result<(), anyhow::Error> {
@@ -300,7 +299,6 @@ async fn sink_accelerated_metric_survives_restart_without_schema_mismatch()
 /// startup. Registering it only on the first write leaves those rows unreachable — queries
 /// fail to plan against a table that does not exist — for however long it takes the next
 /// export to arrive, which on a low-rate metric can be minutes.
-#[cfg(not(windows))]
 #[tokio::test]
 async fn sink_accelerated_metric_is_queryable_before_its_first_write_after_restart()
 -> Result<(), anyhow::Error> {

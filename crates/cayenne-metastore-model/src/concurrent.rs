@@ -210,7 +210,7 @@ impl Model for Protocol {
                 }
             }
         }
-        action.retain(|action| self.next_state(state, action.clone()).is_some());
+        crate::prune_for_simulation(self, state, action);
     }
     fn next_state(&self, state: &State, action: Action) -> Option<State> {
         use Action::{Advance, Checkpoint, Deadline, Decide, Gc, Prepare, Resolve, Seal, Writer};
@@ -254,7 +254,11 @@ impl Model for Protocol {
                 }
             }
             Checkpoint(i) => {
-                next.ds[i].store.checkpoint();
+                // The writer checkpoints at its newest batch end.
+                let first = next.ds[i].store.first;
+                if !next.ds[i].store.checkpoint(first) {
+                    return None;
+                }
                 next.ds[i].checkpoint = true;
             }
             Gc(i) => {

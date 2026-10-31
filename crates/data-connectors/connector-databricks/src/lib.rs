@@ -712,6 +712,13 @@ impl Databricks {
                         ),
                     });
                 }
+                if self.delta_provider.is_some() && uc_table.is_catalog_managed() {
+                    return Err(DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "databricks".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message: catalog_managed_delta_lake_message(&full_name),
+                    });
+                }
                 tracing::debug!(
                     table = %full_name,
                     table_type = %uc_table.table_type,
@@ -1140,6 +1147,13 @@ impl DataConnector for Databricks {
 /// configuration failures (e.g. foreign tables on Classic SQL warehouses)
 /// into permanent, non-retriable errors so the runtime surfaces them
 /// immediately instead of retrying indefinitely.
+/// Error for a catalog-managed Delta table requested in `delta_lake` mode.
+fn catalog_managed_delta_lake_message(full_name: &str) -> String {
+    format!(
+        "Table '{full_name}' is a catalog-managed Delta table, and Databricks does not allow reading it directly from storage. Set `mode` to `sql_warehouse` or `spark_connect`. See: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+    )
+}
+
 fn classify_table_provider_error(
     dataset: &DatasetSpec,
     source: Box<dyn std::error::Error + Send + Sync>,
@@ -1406,6 +1420,16 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
 
 #[cfg(test)]
 mod tests {
+    use super::catalog_managed_delta_lake_message;
+
+    #[test]
+    fn catalog_managed_delta_lake_message_text() {
+        assert_eq!(
+            catalog_managed_delta_lake_message("c.s.t"),
+            "Table 'c.s.t' is a catalog-managed Delta table, and Databricks does not allow reading it directly from storage. Set `mode` to `sql_warehouse` or `spark_connect`. See: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+        );
+    }
+
     use super::*;
     use app::App;
     use datafusion::{

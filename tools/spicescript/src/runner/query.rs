@@ -211,8 +211,16 @@ pub(super) async fn answer_attempt(
             let parameters = q.parameters.clone().unwrap_or_default();
             instance
                 .spiced
-                .query_prepared(&spice_sql, &parameters, q.session.as_deref(), &q.key)
+                .query_prepared(
+                    &spice_sql,
+                    &parameters,
+                    q.session.as_deref(),
+                    &q.key,
+                    q.protocols.is_some(),
+                )
                 .await
+        } else if let Some(protocols) = &q.protocols {
+            super::generators::protocol_answers(instance, &spice_sql, protocols, &q.key).await
         } else {
             instance.spiced.query_as(&spice_sql, &q.key).await
         }
@@ -225,6 +233,11 @@ pub(super) async fn answer_attempt(
         Err(e) if q.expect_error => {
             check_error_text(&e, q.error_contains.as_deref())?;
             return Ok(None);
+        }
+        Err(e) if q.protocols.is_some() => {
+            return Err(anyhow!(
+                "Spice rejected the query: {e:#}\nSQL:\n{spice_sql}"
+            ));
         }
         Err(e) => return Err(e.context("Spice rejected the query")),
     };
@@ -284,6 +297,12 @@ pub(super) async fn answer_attempt(
             rows: None,
             same_as: None,
         }) => {
+            ensure!(
+                !q.expect_empty || actual.iter().all(|batch| batch.num_rows() == 0),
+                "expected an empty answer, got {} rows:\n{}",
+                actual.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                compare::preview(&actual)
+            );
             if defaults.also_async {
                 async_agrees(
                     instance,
@@ -444,11 +463,40 @@ pub(super) async fn http_agrees(
     schema: &arrow::datatypes::SchemaRef,
     expect_empty: bool,
 ) -> Result<()> {
-    let names: Vec<&String> = schema.fields().iter().map(|f| f.name()).collect();
-    let unique: std::collections::BTreeSet<&&String> = names.iter().collect();
-    if unique.len() != names.len() {
+    let names: std::collections::BTreeSet<_> = schema.fields().iter().map(|f| f.name()).collect();
+    if names.len() != schema.fields().len() {
         return Ok(());
     }
+    let typed = http_answer(instance, sql, schema, &crate::spiced::Key::Default).await?;
+    if let Some(report) = compare::compare(&instance.label, sql, flight, &typed, expect_empty)? {
+        bail!("the HTTP JSON answer differs from Flight's: {report}");
+    }
+    Ok(())
+}
+
+pub(super) async fn http_agrees_as(
+    instance: &Instance,
+    sql: &str,
+    flight: &[RecordBatch],
+    schema: &arrow::datatypes::SchemaRef,
+    expect_empty: bool,
+    key: &crate::spiced::Key,
+) -> Result<()> {
+    let typed = http_answer(instance, sql, schema, key).await?;
+    if let Some(report) =
+        compare::compare_protocol(&instance.label, sql, flight, &typed, expect_empty)?
+    {
+        bail!("the HTTP JSON answer differs from Flight's: {report}");
+    }
+    Ok(())
+}
+
+async fn http_answer(
+    instance: &Instance,
+    sql: &str,
+    schema: &arrow::datatypes::SchemaRef,
+    key: &crate::spiced::Key,
+) -> Result<Vec<RecordBatch>> {
     let (status, _, body) = instance
         .spiced
         .http(
@@ -459,7 +507,7 @@ pub(super) async fn http_agrees(
                 ("accept".into(), "application/json".into()),
             ],
             Some(sql),
-            &crate::spiced::Key::Default,
+            key,
         )
         .await?;
     ensure!(
@@ -471,12 +519,13 @@ pub(super) async fn http_agrees(
     // would round a 38-digit decimal to a double.
     let rows = json_array_elements(&body)
         .with_context(|| format!("HTTP answered with no JSON rows: {}", one_line(&body, 200)))?;
-    let typed = decode_json_rows(&rows, schema)
-        .context("could not decode the HTTP JSON answer as Flight's schema")?;
-    if let Some(report) = compare::compare(&instance.label, sql, flight, &typed, expect_empty)? {
-        bail!("the HTTP JSON answer differs from Flight's: {report}");
-    }
-    Ok(())
+    let typed = decode_json_rows(&rows, schema).with_context(|| {
+        format!(
+            "could not decode the HTTP JSON answer as Flight's schema; body: {}",
+            one_line(&body, 4000)
+        )
+    })?;
+    Ok(typed)
 }
 
 /// Runs the same SQL as a `/v1/queries` job and requires the answer Flight

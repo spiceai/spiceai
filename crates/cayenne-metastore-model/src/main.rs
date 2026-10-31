@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use cayenne_metastore_model::{run, runs};
+
+// Checking clones and drops a state per transition; allocation dominates the
+// system allocator's profile.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -23,28 +29,25 @@ fn main() -> Result<(), String> {
                 "cold-promotion",
                 "read-progress",
                 "read-same-key",
-                "pin-expiry",
-                "transaction-begin-pin",
                 "source-positions",
                 "commits-restart-turnover",
                 "unknown-action-refusal",
-                "orphan-repeated-sweep",
                 "naming",
                 "table-seq",
                 "delete-coverage",
-                "pins-low-water",
                 "pk-index-checkpoint",
-                "removal-serialized",
                 "seq-order-2-exhaust",
                 "seq-order-two-writers-2-exhaust",
                 "commits-retry",
+                "commits-retry-expiry",
+                "standby",
                 "commits-etag",
                 "commits-commit-focus-copy-2-exhaust",
                 "commits-storage-2-exhaust",
                 "window-storage-6-exhaust",
                 "concurrent-floor-aligned-6-exhaust",
+                "retention",
                 "window-txn-0-exhaust",
-                "generations",
                 "concurrent-txn-overlap-0-exhaust",
                 "concurrent-txn-disjoint-0-exhaust",
             ] {

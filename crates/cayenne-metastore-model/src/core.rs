@@ -31,6 +31,8 @@ pub struct Store {
     pub byte_cut: bool,
     pub count_cut: bool,
     pub deleted: Vec<usize>,
+    /// A checkpoint root written at a batch end, which the next commit publishes.
+    pub staged: Option<(usize, Vec<Record>)>,
     pub revived: bool,
     pub conflict: bool,
 }
@@ -97,6 +99,11 @@ impl Store {
             self.first += c;
         }
         self.window.push(r);
+        if let Some((c, root)) = self.staged.take() {
+            self.root = root;
+            self.floor = c;
+            self.index.retain(|&(_, b)| b > c);
+        }
         true
     }
     pub fn decode(&self) -> Option<Vec<Record>> {
@@ -122,14 +129,21 @@ impl Store {
         v.extend(&self.window);
         Some(v)
     }
-    pub fn checkpoint(&mut self) {
-        if let Some(v) = self.decode() {
-            self.root = v;
-            self.floor = self.root.len();
-            self.first = self.floor;
-            self.window.clear();
-            self.index.clear();
+    /// The commit numbers a checkpoint may name: a batch end above the floor,
+    /// or the record before the window, so the floor never splits a batch.
+    pub fn checkpoint_ends(&self) -> Vec<usize> {
+        (self.floor + 1..=self.first)
+            .filter(|&c| c == self.first || self.index.iter().any(|&(_, b)| b == c))
+            .collect()
+    }
+    /// Writes the checkpoint root at `c`; the floor moves with the next commit.
+    pub fn checkpoint(&mut self, c: usize) -> bool {
+        if self.staged.is_some() || !self.checkpoint_ends().contains(&c) {
+            return false;
         }
+        let Some(v) = self.decode() else { return false };
+        self.staged = Some((c, v[..c].to_vec()));
+        true
     }
     pub fn publish(&mut self, c: usize, _mode: &str) -> bool {
         let Some(v) = self.decode() else { return false };
@@ -183,14 +197,4 @@ pub(crate) fn resolve_attempt(evidence: Option<bool>, same_base: bool) -> u8 {
         None if !same_base => 2,
         None => 0,
     }
-}
-
-pub(crate) fn pin_admitted(base: usize, floor: usize) -> bool {
-    base >= floor
-}
-
-/// A closed-generation reference can be admitted only from the CAS base's
-/// reachable set, never from the uploader's earlier observation.
-pub(crate) fn admits_reference(closed: bool, reachable: bool) -> bool {
-    !closed || reachable
 }

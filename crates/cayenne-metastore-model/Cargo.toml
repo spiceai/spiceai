@@ -2,9 +2,11 @@
 name = "cayenne-metastore-model"
 version.workspace = true
 edition = "2024"
+license = "Apache-2.0"
 publish = false
 
 [dependencies]
+mimalloc = { version = "0.1.48" }
 stateright = { workspace = true }
 
 [lints]

@@ -1934,14 +1934,10 @@ mod tests {
         let parsed = Acceleration::try_from(spicepod_acceleration::Acceleration::default())
             .expect("acceleration should parse");
         assert_eq!(parsed.engine, Engine::default());
-        #[cfg(not(windows))]
         assert_eq!(parsed.engine, Engine::Cayenne);
-        #[cfg(windows)]
-        assert_eq!(parsed.engine, Engine::Arrow);
     }
 
     #[test]
-    #[cfg(not(windows))]
     fn a_partitioned_acceleration_without_an_engine_uses_cayenne() {
         let acceleration = spicepod_acceleration::Acceleration {
             partition_by: vec![PartitionedBy {

@@ -1,7 +1,7 @@
 // Copyright 2024-2026 The Spice.ai OSS Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared file lifecycle with prepared mutations, leased reads, or byte-batch recovery.
+//! Shared file lifecycle with prepared mutations, reads bounded by retention, or byte-batch recovery.
 use super::{
     Action as LocalAction, Data, File, Keys, Op, Protocol as Local, Record, Rows, State as Dataset,
 };
@@ -27,7 +27,6 @@ pub(crate) struct State {
     cleared: bool,
     clock: usize,
     expires: usize,
-    renewal: u8,
     cursor: usize,
     pending: Option<usize>,
     rows: Vec<File>,
@@ -41,9 +40,9 @@ pub(crate) struct State {
     gc_while_prepared: bool,
     higher_pending: bool,
     expired_completion: bool,
-    renewal_rejected: bool,
     missing_read_error: bool,
     deleted_pending: bool,
+    query_while_prepared: bool,
     collected_pages: usize,
 }
 impl std::fmt::Debug for State {
@@ -56,7 +55,6 @@ impl std::fmt::Debug for State {
             .field("result", &self.result)
             .field("clock", &self.clock)
             .field("expires", &self.expires)
-            .field("renewal", &self.renewal)
             .field("store", &self.store)
             .field("captured", &self.captured)
             .field("pages", &self.pages)
@@ -72,8 +70,6 @@ pub(crate) enum Action {
     Decide(bool),
     Resolve,
     CollectPrepared,
-    RenewPin,
-    RecheckRenewal,
     SelectRows,
     Tick,
     Dispatch,
@@ -109,11 +105,12 @@ impl Protocol {
     fn bytes(&self) -> bool {
         self.has("byte-window")
     }
-    fn pin_live(&self, s: &State) -> bool {
+    /// Whether the query is still within its retention.
+    fn retained(&self, s: &State) -> bool {
         !self.has("expiry") || s.clock < s.expires
     }
     fn live(&self, s: &State) -> bool {
-        self.pin_live(s) && s.renewal != 1 && s.result != Some(Err(()))
+        self.retained(s) && s.result != Some(Err(()))
     }
     fn cutoff(&self, s: &State, table: usize) -> usize {
         let high = s.dataset.data.high[table];
@@ -300,7 +297,6 @@ impl Model for Protocol {
                     cleared: false,
                     clock: 0,
                     expires: 0,
-                    renewal: 0,
                     cursor: 0,
                     pending: None,
                     rows: vec![],
@@ -314,9 +310,9 @@ impl Model for Protocol {
                     gc_while_prepared: false,
                     higher_pending: false,
                     expired_completion: false,
-                    renewal_rejected: false,
                     missing_read_error: false,
                     deleted_pending: false,
+                    query_while_prepared: false,
                     collected_pages: 0,
                 };
                 if self.has("metadata-prefix") {
@@ -333,8 +329,8 @@ impl Model for Protocol {
         let d = &s.dataset;
         let mut local = vec![];
         let mut observed = d.clone();
-        if self.has("expiry") && !self.pin_live(s) {
-            observed.pin = None;
+        if self.has("expiry") && !self.retained(s) {
+            observed.query = None;
         }
         self.local().actions(&observed, &mut local);
         for a in local {
@@ -355,10 +351,10 @@ impl Model for Protocol {
                 | LocalAction::Floor
                 | LocalAction::CollectLog
                 | LocalAction::Recover => !self.bytes(),
-                LocalAction::Choose | LocalAction::Recheck => {
-                    !self.txn() && !self.has("without-readers")
+                // Queries meet prepared actions only with expiry on, which bounds the graph.
+                LocalAction::Choose => {
+                    (!self.txn() || self.has("expiry")) && !self.has("without-readers")
                 }
-                LocalAction::Pin => !self.txn() && !self.has("without-readers") && d.pin.is_none(),
                 LocalAction::RemovePage => self.bytes(),
                 LocalAction::SelectRemoved => !self.has("expiry"),
                 LocalAction::Delete => true,
@@ -396,12 +392,6 @@ impl Model for Protocol {
             }
         }
         if self.has("expiry") {
-            if !d.queries.is_empty() && !self.live(s) && s.renewal == 0 && s.result.is_none() {
-                actions.push(Action::RenewPin);
-            }
-            if s.renewal == 1 {
-                actions.push(Action::RecheckRenewal);
-            }
             if d.head.floor > 0 && d.selected.is_none() {
                 actions.push(Action::SelectRows);
             }
@@ -435,7 +425,7 @@ impl Model for Protocol {
                 actions.push(Action::CollectStorage);
             }
         }
-        actions.retain(|a| self.next_state(s, a.clone()).is_some());
+        crate::prune_for_simulation(self, s, actions);
     }
     fn next_state(&self, s: &State, action: Action) -> Option<State> {
         let mut n = s.clone();
@@ -488,8 +478,8 @@ impl Model for Protocol {
             }
             Action::Local(a) => {
                 let mut base = s.dataset.clone();
-                if self.has("expiry") && !self.pin_live(s) {
-                    base.pin = None;
+                if self.has("expiry") && !self.retained(s) {
+                    base.query = None;
                 }
                 if matches!(a, LocalAction::Acknowledge) {
                     if s.dataset
@@ -542,12 +532,12 @@ impl Model for Protocol {
                     self.accept(&mut n, r)?;
                     n.cleared = true;
                 } else {
-                    if self.has("no-log-pin-expiry") && matches!(a, LocalAction::CollectLog) {
-                        base.pin = s.dataset.pin;
+                    if self.has("no-log-expiry") && matches!(a, LocalAction::CollectLog) {
+                        base.query = s.dataset.query;
                     }
                     if self.has("no-delete-selection")
                         && matches!(a, LocalAction::Delete)
-                        && !self.pin_live(s)
+                        && !self.retained(s)
                     {
                         base.selected = Some(
                             base.removed
@@ -567,8 +557,9 @@ impl Model for Protocol {
                         n.deleted_pending |=
                             s.pending.is_some_and(|id| !n.dataset.present.contains(&id));
                     }
-                    if matches!(a, LocalAction::Pin) {
+                    if matches!(a, LocalAction::Choose) {
                         n.expires = s.clock + 1;
+                        n.query_while_prepared = !s.dataset.data.prepared.is_empty();
                     }
                     if matches!(a, LocalAction::Choose) && self.bytes() {
                         let mut view = s.store.clone();
@@ -576,18 +567,11 @@ impl Model for Protocol {
                         view.pending.clear();
                         n.captured = Some(view);
                     }
-                    if matches!(a, LocalAction::Recheck)
-                        && self.bytes()
-                        && s.captured.as_ref().is_some_and(|p| p.floor < s.store.floor)
-                    {
-                        n.dataset.queries.clear();
-                        n.captured = None;
-                    }
-                    // Lapse releases retention, not the query's immutable snapshot identity.
-                    n.dataset.pin = if matches!(a, LocalAction::Pin) {
-                        n.dataset.pin
+                    // Expiry releases retention, not the query's immutable snapshot identity.
+                    n.dataset.query = if matches!(a, LocalAction::Choose) {
+                        n.dataset.query
                     } else {
-                        s.dataset.pin
+                        s.dataset.query
                     };
                 }
             }
@@ -601,21 +585,10 @@ impl Model for Protocol {
                     .collect();
                 n.dataset.present.retain(|id| !ids.contains(id));
             }
-            Action::RenewPin => {
-                n.expires = s.clock + 1;
-                n.renewal = 1;
-            }
-            Action::RecheckRenewal => {
-                n.renewal = 2;
-                if s.dataset.head.floor > *s.dataset.queries.first()? || s.clock >= s.expires {
-                    n.result = Some(Err(()));
-                    n.renewal_rejected = true;
-                }
-            }
             Action::SelectRows => {
                 let mut observed = s.dataset.clone();
-                if !self.pin_live(s) && !self.has("no-delete-selection") {
-                    observed.pin = None;
+                if !self.retained(s) && !self.has("no-delete-selection") {
+                    observed.query = None;
                 }
                 n.dataset.selected = Some(
                     observed
@@ -647,7 +620,7 @@ impl Model for Protocol {
                 if s.result.is_some() {
                     return None;
                 }
-                n.expired_completion |= !self.pin_live(s);
+                n.expired_completion |= !self.retained(s);
                 let id = n.pending.take()?;
                 let v = *s.dataset.queries.first()?;
                 if !s.dataset.present.contains(&id) && !self.has("missing-as-empty") {
@@ -696,7 +669,7 @@ impl Model for Protocol {
                 n.dataset.head.floor = c;
             }
             Action::CollectStorage => {
-                let low = s.dataset.pin.unwrap_or(s.store.floor).min(s.store.floor);
+                let low = s.dataset.query.unwrap_or(s.store.floor).min(s.store.floor);
                 let keep = s
                     .pages
                     .iter()
@@ -706,7 +679,7 @@ impl Model for Protocol {
                     .unwrap_or(0);
                 n.store.batches.retain(|(a, b)| {
                     a + b.len()
-                        > if self.has("no-pin-batch") {
+                        > if self.has("no-query-batch") {
                             s.store.floor
                         } else {
                             keep
@@ -780,7 +753,7 @@ impl Model for Protocol {
                     })
                 })
             }),
-            Property::always("I7 lifecycle live pin recovery", |m, s: &State| {
+            Property::always("I7 lifecycle unexpired query recovery", |m, s: &State| {
                 !m.live(s)
                     || s.dataset.queries.is_empty()
                     || m.bytes()
@@ -807,7 +780,7 @@ impl Model for Protocol {
             Property::always("I8 byte lifecycle recovery", |m, s: &State| {
                 !m.bytes() || Self::reconstruct(s, &s.store) == Some(s.dataset.data.clone())
             }),
-            Property::always("I7 byte lifecycle pinned recovery", |m, s: &State| {
+            Property::always("I7 byte lifecycle query recovery", |m, s: &State| {
                 !m.bytes()
                     || s.dataset.queries.is_empty()
                     || s.captured.as_ref().is_some_and(|p| {
@@ -837,6 +810,14 @@ impl Model for Protocol {
                         .as_ref()
                         .is_some_and(|(_, d, _)| !d.prepared.is_empty())
             }),
+            Property::sometimes(
+                "byte checkpoint retains prepared actions",
+                |_, s: &State| {
+                    s.window_collected
+                        && !s.dataset.data.prepared.is_empty()
+                        && s.pages.iter().any(|(_, d, _)| !d.prepared.is_empty())
+                },
+            ),
             Property::sometimes("ordinary write while prepared", |_, s: &State| {
                 s.journal.iter().enumerate().any(|(i, r)| {
                     !r.resolve && !r.ops.is_empty() && !s.dataset.versions[i].prepared.is_empty()
@@ -895,14 +876,12 @@ impl Model for Protocol {
             Property::sometimes("maintenance while prepared", |_, s: &State| {
                 s.maintained_pending
             }),
+            Property::sometimes(
+                "query while prepared returns its snapshot",
+                |_, s: &State| s.query_while_prepared && matches!(s.result, Some(Ok(_))),
+            ),
             Property::sometimes("expired delayed read completes", |_, s: &State| {
                 s.expired_completion && s.result.is_some()
-            }),
-            Property::sometimes("renewed snapshot completes", |_, s: &State| {
-                s.renewal == 2 && s.result.as_ref().is_some_and(Result::is_ok)
-            }),
-            Property::sometimes("renewal head recheck rejects", |_, s: &State| {
-                s.renewal_rejected
             }),
             Property::sometimes("missing delayed object errors", |_, s: &State| {
                 s.missing_read_error
@@ -919,8 +898,8 @@ impl Model for Protocol {
             Property::sometimes("count budget evicts records", |_, s: &State| {
                 s.store.count_pressure && s.store.count_cut
             }),
-            Property::sometimes("pinned replay batch retained", |_, s: &State| {
-                let low = s.dataset.pin.unwrap_or(s.store.floor).min(s.store.floor);
+            Property::sometimes("query replay batch retained", |_, s: &State| {
+                let low = s.dataset.query.unwrap_or(s.store.floor).min(s.store.floor);
                 let base = s
                     .pages
                     .iter()
