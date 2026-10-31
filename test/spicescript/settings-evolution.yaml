@@ -6,7 +6,8 @@ description: >
   source's rows, keeps up with later changes, and answers range filters over
   files written under earlier layouts. A partitioning change that cannot be
   applied fails the dataset with a message naming the fix, and following it
-  serves the source's rows again.
+  serves the source's rows again. A restart into `mode: file_create` loads
+  the recreated acceleration from the source.
 
 sources:
   src: { kind: postgres }
@@ -160,5 +161,17 @@ steps:
   - source-exec: { src: "UPDATE trips SET fare = fare * 2 WHERE id % 97 = 6; INSERT INTO trips VALUES (10006, 'city 6', 59.99, 'after'); DELETE FROM trips WHERE id = 60" }
   - refresh: trips
     when: { refresh_mode: full }
+  - query: SELECT * FROM trips
+    eventually: 60s
+
+  # `mode: file_create` recreates the acceleration on load: it must load again
+  # from the source, with no refresh asked for, rather than serve the empty table.
+  - source-exec: { src: "UPDATE trips SET fare = fare + 1 WHERE id % 89 = 7" }
+  - restart:
+      patch: { datasets: { trips: { acceleration: { mode: file_create } } } }
+  - query: SELECT * FROM trips
+    eventually: 60s
+  - restart:
+      patch: { datasets: { trips: { acceleration: { mode: file } } } }
   - query: SELECT * FROM trips
     eventually: 60s

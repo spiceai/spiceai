@@ -3634,11 +3634,29 @@ impl DataFusion {
             resolve_table_reference(dataset.name.clone()),
             Arc::downgrade(&owner),
         );
+        let registry = self.accelerator_engine_registry();
         let initialized = permit
             .construct(&self.io_runtime, async move {
                 let status = accelerator.init(dataset.as_ref()).await.map_err(|source| {
                     DataFusionError::External(Box::new(EngineInitialization { source }))
                 })?;
+                // `file_create` recreated the acceleration empty during init. The dataset
+                // checkpoint and append cursor describe the table it replaced: left in
+                // place, a full refresh finds the checkpoint and skips the initial load,
+                // and the dataset serves no rows. A snapshot it bootstrapped from carries
+                // its own state, so that is kept.
+                if dataset
+                    .acceleration
+                    .as_ref()
+                    .is_some_and(|acceleration| {
+                        acceleration.mode == crate::component::dataset::acceleration::Mode::FileCreate
+                    })
+                    && matches!(status, BootstrapStatus::None)
+                {
+                    clear_recreated_acceleration_state(dataset.as_ref(), registry)
+                        .await
+                        .map_err(DataFusionError::External)?;
+                }
                 Ok(GenerationOwner::new(status, || {
                     runtime_acceleration::change_sink::Publication::Ready
                 }))
@@ -7942,6 +7960,36 @@ async fn build_snapshot_refresh_state(
 
 #[cfg(test)]
 mod installation_tests;
+
+
+/// Clears `source`'s dataset checkpoint and append cursor after its acceleration was
+/// recreated empty, as [`DataFusion::rebuild_acceleration`] does for a settings
+/// rebuild, so the refresh loads it as on a first start.
+async fn clear_recreated_acceleration_state(
+    source: &dyn AccelerationSource,
+    registry: Arc<AcceleratorEngineRegistry>,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // An engine with no sidecar keeps no checkpoint to clear.
+    if let Ok(checkpoint) = dataset_checkpointer(
+        source,
+        Arc::clone(&registry),
+        OpenOption::OpenExisting,
+        SnapshotBehavior::Disabled,
+    )
+    .await
+    {
+        checkpoint.delete().await?;
+    }
+    crate::dataaccelerator::spice_sys::append_cursor_store_for(
+        source,
+        registry,
+        OpenOption::OpenExisting,
+    )
+    .await
+    .clear()
+    .await?;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
