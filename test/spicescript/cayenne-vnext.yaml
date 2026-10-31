@@ -1,14 +1,13 @@
 name: cayenne-vnext
 description: >
   `runtime.params.cayenne_vnext: enabled` puts new Cayenne datasets on the
-  object-native metastore and leaves existing ones where they are: a dataset
-  created before the flag stays on SQLite and says so, and one added after it
-  is created in the object-native metastore. Turning the flag off is SQLite as
-  before the flag: that dataset rebuilds there from its source, and turning the
-  flag on again keeps it on SQLite and removes its old object-native copy, so a
-  later recreate moves it to the object-native metastore as a new table. Every
-  answer matches the PostgreSQL source throughout, and a value other than
-  `enabled` or `disabled` stops the dataset with a message naming the param.
+  object-native metastore and never moves an existing one: a dataset whose
+  metastore differs from the flag stops with a message naming the dataset and
+  the fix, in either direction. Starting it once with `mode: file_create`
+  reloads it from its source into the metastore the flag names, and it stays
+  there across a restart. Every answer matches the PostgreSQL source
+  throughout, and a value other than `enabled` or `disabled` stops the dataset
+  with a message naming the param.
 
 sources:
   src: { kind: postgres }
@@ -38,9 +37,10 @@ steps:
     eventually: 60s
   - assert-log: { lacks: ['object-native metastore'] }
 
-  # The flag on, and a dataset added: the existing one stays on SQLite, the new
-  # one goes to the object-native metastore.
+  # The flag on, and a dataset added: the new one goes to the object-native
+  # metastore, and the one already on SQLite stops rather than moving.
   - restart:
+      ready: false
       patch:
         spicepod:
           runtime: { params: { cayenne_vnext: enabled } }
@@ -53,58 +53,62 @@ steps:
               name: after_flag
               params: ${sources.src.params}
               acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
-  - assert-log:
-      contains:
-        - "Dataset 'before_flag' stays on its existing SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled"
-        - 'Created the Cayenne object-native metastore'
-      lacks: ["Dataset 'after_flag' stays on"]
-  - query: SELECT * FROM before_flag
+  - assert-status: { dataset: before_flag, status: Error, message-contains: "Dataset 'before_flag' is accelerated in the SQLite Cayenne metastore, but `runtime.params.cayenne_vnext` is enabled" }
     eventually: 60s
   - query: SELECT * FROM after_flag
     eventually: 60s
+  - assert-log: { contains: ['Created the Cayenne object-native metastore'] }
   - source-exec: { src: "UPDATE after_flag SET v = 'changed' WHERE id % 7 = 0; DELETE FROM after_flag WHERE id > 2900" }
   - refresh: after_flag
   - query: SELECT * FROM after_flag
     eventually: 60s
 
-  # The flag off: SQLite for every dataset, so after_flag rebuilds there.
+  # Starting before_flag once with `mode: file_create` reloads it into the
+  # object-native metastore, and it stays there across a restart.
+  - source-exec: { src: "UPDATE before_flag SET v = 'moved' WHERE id % 3 = 0" }
   - restart:
-      patch: { spicepod: { runtime: { params: { cayenne_vnext: disabled } } } }
-  - query: SELECT * FROM after_flag
-    eventually: 60s
+      patch: { datasets: { before_flag: { acceleration: { mode: file_create } } } }
   - query: SELECT * FROM before_flag
     eventually: 60s
-  - assert-log: { lacks: ['Opened the Cayenne object-native metastore'] }
-
-  # The flag on again: after_flag is now in SQLite and stays there, never back
-  # on its older object-native copy.
-  - source-exec: { src: "UPDATE after_flag SET v = 'after toggle' WHERE id % 5 = 0" }
+  - source-exec: { src: "UPDATE before_flag SET v = 'post move' WHERE id % 11 = 0" }
   - restart:
-      patch: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
-  - assert-log:
-      contains:
-        - "Dataset 'after_flag' stays on its existing SQLite Cayenne metastore"
-        - "Dataset 'after_flag' had an older copy in the object-native Cayenne metastore from before it was rebuilt on SQLite; removed that copy"
-  - refresh: after_flag
-  - query: SELECT * FROM after_flag
+      patch: { datasets: { before_flag: { acceleration: { mode: file } } } }
+  - refresh: before_flag
+  - query: SELECT * FROM before_flag
     eventually: 60s
 
-  # Recreating after_flag moves it to the object-native metastore as a new
-  # table, not onto the older copy, and it stays there across a restart.
-  - source-exec: { src: "UPDATE after_flag SET v = 'recreated' WHERE id % 3 = 0" }
+  # The flag off: both datasets are in the object-native metastore, so both
+  # stop rather than moving to SQLite.
   - restart:
+      ready: false
+      patch: { spicepod: { runtime: { params: { cayenne_vnext: disabled } } } }
+  - assert-status: { dataset: after_flag, status: Error, message-contains: "Dataset 'after_flag' is accelerated in the object-native Cayenne metastore, but `runtime.params.cayenne_vnext` is not enabled" }
+    eventually: 60s
+  - assert-status: { dataset: before_flag, status: Error, message-contains: "Dataset 'before_flag' is accelerated in the object-native Cayenne metastore" }
+    eventually: 60s
+
+  # `mode: file_create` reloads after_flag into SQLite; before_flag still stops.
+  - source-exec: { src: "UPDATE after_flag SET v = 'to sqlite' WHERE id % 5 = 0" }
+  - restart:
+      ready: false
       patch: { datasets: { after_flag: { acceleration: { mode: file_create } } } }
-  - refresh: after_flag
   - query: SELECT * FROM after_flag
     eventually: 60s
-  - source-exec: { src: "UPDATE after_flag SET v = 'post restart' WHERE id % 11 = 0" }
+  - assert-status: { dataset: before_flag, status: Error, message-contains: "Dataset 'before_flag' is accelerated in the object-native Cayenne metastore" }
+    eventually: 60s
+
+  # The flag on again: before_flag is served from the object-native metastore,
+  # and after_flag, now on SQLite, stops. Its object-native copy is gone, so the
+  # recreate left nothing for it to fall back to.
   - restart:
-      patch: { datasets: { after_flag: { acceleration: { mode: file } } } }
-  # The log covers every start: only the start with the flag on again said it
-  # stays; the recreate and the start after it moved it.
-  - assert-log: { count: { "Dataset 'after_flag' stays on": 1 } }
-  - refresh: after_flag
-  - query: SELECT * FROM after_flag
+      ready: false
+      patch:
+        spicepod: { runtime: { params: { cayenne_vnext: enabled } } }
+        datasets: { after_flag: { acceleration: { mode: file } } }
+  - refresh: before_flag
+  - query: SELECT * FROM before_flag
+    eventually: 60s
+  - assert-status: { dataset: after_flag, status: Error, message-contains: "Dataset 'after_flag' is accelerated in the SQLite Cayenne metastore" }
     eventually: 60s
 
   # A value the flag does not take.

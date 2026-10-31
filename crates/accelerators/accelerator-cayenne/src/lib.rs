@@ -2932,11 +2932,13 @@ impl CayenneAccelerator {
     }
 
     /// The metastore holding `source`'s file-mode acceleration. An explicit
-    /// `cayenne_metastore: turso` keeps Turso. With `cayenne_vnext` disabled every
-    /// dataset uses SQLite, as before the flag existed, and nothing is looked up.
-    /// With it enabled, a new dataset goes to the object-native metastore and a
-    /// dataset already in SQLite stays there, so enabling the flag never moves
-    /// one and disabling it again never returns one to a stale SQLite copy.
+    /// `cayenne_metastore: turso` keeps Turso. A new dataset goes to the metastore
+    /// `cayenne_vnext` names: object-native when enabled, SQLite otherwise. An
+    /// existing dataset is never moved: one whose metastore differs from the flag
+    /// is an error naming the dataset and the fix, except under `mode: file_create`,
+    /// which recreates it from its source in the metastore the flag names. With the
+    /// flag disabled, an instance that never used the object-native metastore checks
+    /// only its local metadata directory.
     async fn metastore_type_for(
         &self,
         source: &dyn AccelerationSource,
@@ -2950,42 +2952,52 @@ impl CayenneAccelerator {
             return Ok("turso");
         }
         // A `mode: memory` table keeps its metastore in RAM.
-        if !source.is_file_accelerated() || !Self::vnext_enabled(source)? {
+        if !source.is_file_accelerated() {
             return Ok("sqlite");
         }
+        let vnext = Self::vnext_enabled(source)?;
+        let recreated = source
+            .acceleration()
+            .is_some_and(|acceleration| acceleration.mode == Mode::FileCreate);
         let table_name = source.name().to_string();
-        if path_exists(format!("{metadata_dir}/cayenne.db")).await
+        // The local `object_native` directory holds the catalog, or records that this
+        // instance uses one in `runtime.state.location`.
+        let in_native = (vnext || path_exists(format!("{metadata_dir}/object_native")).await)
+            && self.native_catalog_exists(metadata_dir, source).await?
+            && self
+                .catalog_holds(metadata_dir, "object_native", source, &table_name)
+                .await?;
+        // Without the flag, an instance that never used the object-native metastore
+        // keeps SQLite after one local check.
+        if !vnext && !in_native {
+            return Ok("sqlite");
+        }
+        let in_sqlite = path_exists(format!("{metadata_dir}/cayenne.db")).await
             && self
                 .catalog_holds(metadata_dir, "sqlite", source, &table_name)
-                .await?
-        {
-            // A dataset in both metastores was created under the flag, then rebuilt
-            // on SQLite while it was disabled, so the object-native copy is the
-            // older one and its files may be gone. Dropping its rows (files are
-            // left alone) keeps it from being reopened once the SQLite copy is
-            // dropped, by a recreate or by the dataset's removal.
-            if self.native_catalog_exists(metadata_dir, source).await?
-                && self
-                    .catalog_holds(metadata_dir, "object_native", source, &table_name)
-                    .await?
-            {
-                self.get_or_create_catalog(metadata_dir, "object_native", source)
-                    .await?
-                    .drop_table(&table_name)
-                    .await
-                    .boxed()
-                    .context(AccelerationInitializationFailedSnafu)?;
-                tracing::info!(target: "spiced::acceleration::cayenne", "Dataset '{table_name}' had an older copy in the object-native Cayenne metastore from before it was rebuilt on SQLite; removed that copy, so only the SQLite one is served.");
-            }
+                .await?;
+        if in_sqlite {
+            ensure!(
+                !vnext || recreated,
+                InvalidConfigurationSnafu {
+                    detail: Arc::from(format!(
+                        "Dataset '{table_name}' is accelerated in the SQLite Cayenne metastore, but `runtime.params.{CAYENNE_VNEXT_PARAM}` is enabled, and an existing acceleration is not moved to the object-native metastore. Set `runtime.params.{CAYENNE_VNEXT_PARAM}: disabled` to keep serving it, or start it once with `acceleration.mode: file_create` to reload it from its source into the object-native metastore."
+                    )),
+                }
+            );
             // `mode: file_create` drops this copy and recreates the table, which then
-            // lands on the object-native metastore, so it does not stay.
-            if !source
-                .acceleration()
-                .is_some_and(|acceleration| acceleration.mode == Mode::FileCreate)
-            {
-                self.vnext_notice(&table_name, "stays on its existing SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled: existing datasets keep their metastore. To move it, delete its acceleration so it rebuilds from the source.");
-            }
+            // lands in the object-native metastore.
             return Ok("sqlite");
+        }
+        if in_native {
+            ensure!(
+                vnext || recreated,
+                InvalidConfigurationSnafu {
+                    detail: Arc::from(format!(
+                        "Dataset '{table_name}' is accelerated in the object-native Cayenne metastore, but `runtime.params.{CAYENNE_VNEXT_PARAM}` is not enabled, and an existing acceleration is not moved to the SQLite metastore. Set `runtime.params.{CAYENNE_VNEXT_PARAM}: enabled` to keep serving it, or start it once with `acceleration.mode: file_create` to reload it from its source into the SQLite metastore."
+                    )),
+                }
+            );
         }
         if source
             .acceleration()
@@ -2995,10 +3007,7 @@ impl CayenneAccelerator {
             // One already in it is refused rather than moved to a new, empty
             // SQLite table that would strand its rows.
             ensure!(
-                !(self.native_catalog_exists(metadata_dir, source).await?
-                    && self
-                        .catalog_holds(metadata_dir, "object_native", source, &table_name)
-                        .await?),
+                !in_native,
                 InvalidConfigurationSnafu {
                     detail: Arc::from(format!(
                         "Dataset '{table_name}' is in the object-native Cayenne metastore, which does not support `partition_by` yet. Remove `partition_by` to keep serving it, or delete its acceleration so it rebuilds on SQLite."
@@ -3008,6 +3017,8 @@ impl CayenneAccelerator {
             self.vnext_notice(&table_name, "uses the SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled, because the new metastore does not support `partition_by` yet.");
             return Ok("sqlite");
         }
+        // `mode: file_create` with the flag disabled drops the object-native copy
+        // and recreates the table, which then lands in SQLite.
         Ok("object_native")
     }
 
@@ -3139,14 +3150,29 @@ impl CayenneAccelerator {
                     .await
                     .boxed()
                     .context(AccelerationInitializationFailedSnafu)?;
-                    cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
-                        store,
-                        object_store::path::Path::from(prefix)
-                            .join("v1")
-                            .join("catalog"),
-                        &format!("{}/cayenne/v1", state.location.trim_end_matches('/')),
-                    )
-                    .await
+                    let native =
+                        cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_at(
+                            store,
+                            object_store::path::Path::from(prefix)
+                                .join("v1")
+                                .join("catalog"),
+                            &format!("{}/cayenne/v1", state.location.trim_end_matches('/')),
+                        )
+                        .await;
+                    if native.is_ok() {
+                        // A local record that this instance uses the catalog in the state
+                        // location, so a start with `cayenne_vnext` disabled finds it on
+                        // local disk and asks the state location only then.
+                        tokio::fs::create_dir_all(&directory)
+                            .await
+                            .boxed()
+                            .context(AccelerationInitializationFailedSnafu)?;
+                        tokio::fs::write(directory.join("state_location"), &state.location)
+                            .await
+                            .boxed()
+                            .context(AccelerationInitializationFailedSnafu)?;
+                    }
+                    native
                 }
                 None => {
                     cayenne::metastore::object_native::ObjectNativeCatalog::open_or_create_local(

@@ -7,7 +7,7 @@ description: >
   naming the state location, and dataset b keeps its catalog: after a restart
   it is reopened, not created again, and its answers still match the
   PostgreSQL source. With the flag disabled, a loads as it did before the
-  flag existed.
+  flag existed, and b stops rather than moving to SQLite.
 
 sources:
   src: { kind: postgres }
@@ -69,10 +69,13 @@ steps:
     eventually: 60s
 
   # With the flag disabled the state location is not a metastore, so nothing is
-  # refused: a loads on SQLite as it did before the flag existed.
+  # refused for it: a loads on SQLite as it did before the flag existed, and b,
+  # whose acceleration is in the object-native metastore, stops rather than
+  # moving to SQLite.
   - restart:
+      ready: false
       patch: { spicepod: { runtime: { params: { cayenne_vnext: disabled } } }, datasets: { a_ds: { acceleration: { mode: file } } } }
   - query: SELECT * FROM a_ds
     eventually: 60s
-  - query: SELECT * FROM b_ds
+  - assert-status: { dataset: b_ds, status: Error, message-contains: "Dataset 'b_ds' is accelerated in the object-native Cayenne metastore, but `runtime.params.cayenne_vnext` is not enabled" }
     eventually: 60s
