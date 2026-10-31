@@ -2959,7 +2959,32 @@ impl CayenneAccelerator {
                 .catalog_holds(metadata_dir, "sqlite", source, &table_name)
                 .await?
         {
-            self.vnext_notice(&table_name, "stays on its existing SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled: existing datasets keep their metastore. To move it, delete its acceleration so it rebuilds from the source.");
+            // A dataset in both metastores was created under the flag, then rebuilt
+            // on SQLite while it was disabled, so the object-native copy is the
+            // older one and its files may be gone. Dropping its rows (files are
+            // left alone) keeps it from being reopened once the SQLite copy is
+            // dropped, by a recreate or by the dataset's removal.
+            if self.native_catalog_exists(metadata_dir, source).await?
+                && self
+                    .catalog_holds(metadata_dir, "object_native", source, &table_name)
+                    .await?
+            {
+                self.get_or_create_catalog(metadata_dir, "object_native", source)
+                    .await?
+                    .drop_table(&table_name)
+                    .await
+                    .boxed()
+                    .context(AccelerationInitializationFailedSnafu)?;
+                tracing::info!(target: "spiced::acceleration::cayenne", "Dataset '{table_name}' had an older copy in the object-native Cayenne metastore from before it was rebuilt on SQLite; removed that copy, so only the SQLite one is served.");
+            }
+            // `mode: file_create` drops this copy and recreates the table, which then
+            // lands on the object-native metastore, so it does not stay.
+            if !source
+                .acceleration()
+                .is_some_and(|acceleration| acceleration.mode == Mode::FileCreate)
+            {
+                self.vnext_notice(&table_name, "stays on its existing SQLite Cayenne metastore although `runtime.params.cayenne_vnext` is enabled: existing datasets keep their metastore. To move it, delete its acceleration so it rebuilds from the source.");
+            }
             return Ok("sqlite");
         }
         if source

@@ -5,7 +5,8 @@ description: >
   created before the flag stays on SQLite and says so, and one added after it
   is created in the object-native metastore. Turning the flag off is SQLite as
   before the flag: that dataset rebuilds there from its source, and turning the
-  flag on again keeps it on SQLite rather than returning to its old copy. Every
+  flag on again keeps it on SQLite and removes its old object-native copy, so a
+  later recreate moves it to the object-native metastore as a new table. Every
   answer matches the PostgreSQL source throughout, and a value other than
   `enabled` or `disabled` stops the dataset with a message naming the param.
 
@@ -81,7 +82,27 @@ steps:
   - restart:
       patch: { spicepod: { runtime: { params: { cayenne_vnext: enabled } } } }
   - assert-log:
-      contains: ["Dataset 'after_flag' stays on its existing SQLite Cayenne metastore"]
+      contains:
+        - "Dataset 'after_flag' stays on its existing SQLite Cayenne metastore"
+        - "Dataset 'after_flag' had an older copy in the object-native Cayenne metastore from before it was rebuilt on SQLite; removed that copy"
+  - refresh: after_flag
+  - query: SELECT * FROM after_flag
+    eventually: 60s
+
+  # Recreating after_flag moves it to the object-native metastore as a new
+  # table, not onto the older copy, and it stays there across a restart.
+  - source-exec: { src: "UPDATE after_flag SET v = 'recreated' WHERE id % 3 = 0" }
+  - restart:
+      patch: { datasets: { after_flag: { acceleration: { mode: file_create } } } }
+  - refresh: after_flag
+  - query: SELECT * FROM after_flag
+    eventually: 60s
+  - source-exec: { src: "UPDATE after_flag SET v = 'post restart' WHERE id % 11 = 0" }
+  - restart:
+      patch: { datasets: { after_flag: { acceleration: { mode: file } } } }
+  # The log covers every start: only the start with the flag on again said it
+  # stays; the recreate and the start after it moved it.
+  - assert-log: { count: { "Dataset 'after_flag' stays on": 1 } }
   - refresh: after_flag
   - query: SELECT * FROM after_flag
     eventually: 60s
