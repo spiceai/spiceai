@@ -41,6 +41,9 @@ pub struct Script {
     /// templates as `${matrix.<key>}`.
     #[serde(default)]
     pub matrix: IndexMap<String, Vec<Value>>,
+    /// The OSS release each combination starts on before an `upgrade`.
+    #[serde(default)]
+    pub from: Option<String>,
     /// Named spicepod patches. Every variant of a run must return identical
     /// rows for every query.
     #[serde(default)]
@@ -914,6 +917,15 @@ impl Script {
         }
     }
 
+    pub fn render_from(&self, combo: &Map<String, Value>) -> Result<Option<String>> {
+        self.from
+            .as_deref()
+            .map(|from| {
+                crate::template::substitute_text(from, &serde_json::json!({ "matrix": combo }))
+            })
+            .transpose()
+    }
+
     #[cfg(test)]
     pub fn parse(text: &str) -> Result<Self> {
         Self::parse_in(text, Path::new("."), &SharedVariants::default())
@@ -963,6 +975,30 @@ impl Script {
             }
         }
         script.steps = expanded;
+        if script.from.is_some() {
+            ensure!(
+                script
+                    .steps
+                    .iter()
+                    .any(|s| matches!(s.action, Action::Restart { upgrade: true, .. })),
+                "`from:` names a release to upgrade from, but the script has no `upgrade` step, so it would run entirely on that release"
+            );
+            // Check placeholders even when a matrix dimension is empty.
+            if let Some(from) = &script.from {
+                for tail in from.split("${matrix.").skip(1) {
+                    let key = tail.split('}').next().unwrap_or(tail);
+                    ensure!(
+                        script.matrix.contains_key(key),
+                        "`from:` placeholder '${{matrix.{key}}}' names unknown matrix key '{key}'"
+                    );
+                }
+            }
+            for combo in matrix_combinations(&script.matrix) {
+                if let Some(from) = script.render_from(&combo)? {
+                    crate::release::validate(&from)?;
+                }
+            }
+        }
         let mut ids = std::collections::BTreeSet::new();
         for step in &script.steps {
             if let Action::Query(q) = &step.action {
@@ -2333,6 +2369,34 @@ mod tests {
             step_key("tlp", &arg),
             r#"tlp: {"options":{"a":1,"z":2},"queries":200,"seed":1,"table":"t"}"#,
         );
+    }
+
+    #[test]
+    fn from_validation_names_the_problem() {
+        for (from, steps, expected) in [
+            (
+                "v2.4.0",
+                "upgrade: {}",
+                "invalid `from:` release 'v2.4.0'; expected MAJOR.MINOR.PATCH or MAJOR.MINOR.x (digits only, no leading v or pre-release)",
+            ),
+            (
+                "${matrix.missing}",
+                "upgrade: {}",
+                "`from:` placeholder '${matrix.missing}' names unknown matrix key 'missing'",
+            ),
+            (
+                "2.4.0",
+                "start: {}",
+                "`from:` names a release to upgrade from, but the script has no `upgrade` step, so it would run entirely on that release",
+            ),
+        ] {
+            let text =
+                format!("name: upgrade\nfrom: '{from}'\nspicepod: {{}}\nsteps: [{{ {steps} }}]");
+            assert_eq!(
+                Script::parse(&text).expect_err("invalid from").to_string(),
+                expected
+            );
+        }
     }
 
     #[test]

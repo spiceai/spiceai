@@ -545,6 +545,10 @@ impl HiddenMessages {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl Chat for ToolUsingChat {
+    async fn token_limits(&self) -> llms::chat::TokenLimits {
+        self.inner_chat.token_limits().await
+    }
+
     async fn run(&self, prompt: String) -> ChatResult<Option<String>> {
         self.inner_chat.run(prompt).await
     }
