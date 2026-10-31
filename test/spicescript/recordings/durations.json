@@ -152,6 +152,7 @@
   "unparse-projected-exists": 4,
   "unparse-pruned-aggregate": 15,
   "unparse-set-operations": 5,
+  "unparse-sort-keys": 14,
   "unsigned-negation": 5,
   "views": 11
 }
