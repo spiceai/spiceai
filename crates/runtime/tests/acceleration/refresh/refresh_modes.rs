@@ -19,12 +19,17 @@ limitations under the License.
 //! [`test_refresh_append_for_engine`] and [`test_refresh_full_for_engine`] compare the rows
 //! Spice returns with the same SQL executed by `PostgreSQL`: the table projection, one
 //! aggregation, and one self-join. `created_at` is compared as UTC epoch milliseconds.
-//! The other tests in this file still assert a row count.
+//!
+//! [`upsert_history_matches_postgres_source`] drives append refresh with `on_conflict: upsert`
+//! through inserts and primary-key updates, including NULL transitions, and compares the
+//! rows after each refresh with the same SQL executed by `PostgreSQL`.
+//!
+//! The ISO8601 and Unix-seconds append tests still assert a row count.
 
 use crate::acceleration::refresh::common::{
-    execute_rt_sql, get_acceleration_config_append, get_acceleration_config_full,
-    initialize_postgres_labeled, refresh_table, start_test_runtime, test_append_iso8601_for_engine,
-    test_append_unix_seconds_for_engine,
+    execute_ps_sql, execute_rt_sql, get_acceleration_config_append, get_acceleration_config_full,
+    initialize_postgres_labeled, initialize_postgres_with_value_column, refresh_table,
+    start_test_runtime, test_append_iso8601_for_engine, test_append_unix_seconds_for_engine,
 };
 use crate::postgres::common;
 use crate::{init_tracing, utils::test_request_context};
@@ -45,6 +50,13 @@ use tokio_postgres::types::Type;
 const PROJECTION_SQL: &str = "SELECT * FROM test_table";
 const AGG_SQL: &str = "SELECT COUNT(*) AS row_count, SUM(n) AS sum_n, MIN(n) AS min_n, MAX(n) AS max_n FROM test_table";
 const JOIN_SQL: &str = "SELECT a.id AS id, a.n AS left_n, b.label AS right_label FROM test_table AS a INNER JOIN test_table AS b ON a.id = b.id";
+
+/// The upsert history's statements, over `initialize_postgres_with_value_column`'s table.
+/// The same rules hold: no `ORDER BY`, no integer division. `GROUP BY value` puts the NULL
+/// values in one group on both engines.
+const UPSERT_PROJECTION_SQL: &str = "SELECT id, created_at, value FROM test_table";
+const UPSERT_AGG_SQL: &str = "SELECT COUNT(*) AS row_count, COUNT(DISTINCT id) AS distinct_ids, COUNT(value) AS non_null_values, MIN(id) AS min_id, MAX(id) AS max_id FROM test_table";
+const UPSERT_GROUP_SQL: &str = "SELECT value, COUNT(*) AS row_count FROM test_table GROUP BY value";
 
 #[derive(Clone, Copy)]
 pub(crate) enum RefreshCase {
@@ -180,6 +192,174 @@ pub(crate) async fn refresh_matches_postgres_source(
             Ok(())
         })
         .await
+}
+
+/// Append refresh with `on_conflict: upsert` on `id`, against the `PostgreSQL` source.
+///
+/// The source history is the initial row, then two inserts (one with a NULL `value`), then
+/// three updates that reuse primary keys: text replaced by text, text replaced by NULL, and
+/// NULL replaced by text. Each change moves `created_at` past every earlier one, so the append
+/// refresh fetches it. After the load and after each refresh, the projection, one
+/// aggregation, and one grouped count must match `PostgreSQL` as a schema and a row multiset.
+/// A probe row inserted after the last refresh must stay out of the acceleration.
+pub(crate) async fn upsert_history_matches_postgres_source(
+    engine: &str,
+    configure: impl FnOnce(usize) -> Acceleration,
+) -> Result<(), anyhow::Error> {
+    test_request_context()
+        .scope(async move {
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
+            let db_conn = initialize_postgres_with_value_column(port).await?;
+
+            let rt = start_test_runtime(port, configure(port)).await?;
+            let stage = |name| Stage {
+                engine,
+                mode: "append-upsert",
+                name,
+            };
+
+            compare_upsert_stage(
+                &stage("initial"),
+                &db_conn,
+                &rt,
+                &[(1, Some("initial_value"))],
+            )
+            .await?;
+
+            execute_ps_sql(
+                &db_conn,
+                "INSERT INTO test_table (created_at, value) VALUES \
+                 (date_trunc('milliseconds', now()) + interval '1 second', 'second_value'), \
+                 (date_trunc('milliseconds', now()) + interval '2 seconds', NULL)",
+            )
+            .await?;
+            refresh_table(Arc::clone(&rt), "test_table").await?;
+            compare_upsert_stage(
+                &stage("inserted"),
+                &db_conn,
+                &rt,
+                &[
+                    (1, Some("initial_value")),
+                    (2, Some("second_value")),
+                    (3, None),
+                ],
+            )
+            .await?;
+
+            execute_ps_sql(
+                &db_conn,
+                "UPDATE test_table SET \
+                 created_at = date_trunc('milliseconds', now()) + interval '3 seconds' + id * interval '1 second', \
+                 value = CASE id WHEN 1 THEN 'updated_value' WHEN 2 THEN NULL ELSE 'third_value' END",
+            )
+            .await?;
+            refresh_table(Arc::clone(&rt), "test_table").await?;
+            let snapshot = compare_upsert_stage(
+                &stage("upserted"),
+                &db_conn,
+                &rt,
+                &[
+                    (1, Some("updated_value")),
+                    (2, None),
+                    (3, Some("third_value")),
+                ],
+            )
+            .await?;
+
+            execute_ps_sql(
+                &db_conn,
+                "INSERT INTO test_table (created_at, value) VALUES \
+                 (date_trunc('milliseconds', now()) + interval '10 seconds', 'not-refreshed')",
+            )
+            .await?;
+            let postgres = answer_from_postgres(&db_conn, UPSERT_PROJECTION_SQL).await?;
+            let spice = answer_from_spice(&rt, UPSERT_PROJECTION_SQL).await?;
+            anyhow::ensure!(
+                id_value_pairs(&postgres)?.contains(&(4, Some("not-refreshed".to_string()))),
+                "{engine} append-upsert: the probe row did not land in PostgreSQL\n  postgres: {postgres:?}"
+            );
+            assert_eq!(
+                sorted_rows(&spice),
+                sorted_rows(&snapshot),
+                "{engine} append-upsert: Spice returned the row inserted into PostgreSQL after refresh, so this query did not read the acceleration\n  spice: {spice:?}\n  snapshot: {snapshot:?}\n  postgres: {postgres:?}"
+            );
+            eprintln!(
+                "compared engine={engine} mode=append-upsert stage=post-refresh-probe rows={} held acceleration snapshot",
+                spice.rows.len()
+            );
+
+            running_container.cleanup().await;
+            Ok(())
+        })
+        .await
+}
+
+async fn compare_upsert_stage(
+    stage: &Stage<'_>,
+    db_conn: &PostgresConnection,
+    rt: &Arc<Runtime>,
+    expected_pairs: &[(i64, Option<&str>)],
+) -> Result<Answer, anyhow::Error> {
+    let postgres_projection = answer_from_postgres(db_conn, UPSERT_PROJECTION_SQL).await?;
+    let spice_projection = answer_from_spice(rt, UPSERT_PROJECTION_SQL).await?;
+    let expected: Vec<(i64, Option<String>)> = expected_pairs
+        .iter()
+        .map(|(id, value)| (*id, value.map(str::to_string)))
+        .collect();
+    let pairs = id_value_pairs(&postgres_projection)?;
+    anyhow::ensure!(
+        pairs == expected,
+        "{} {} {}: PostgreSQL does not hold the written (id, value) rows\n  postgres: {pairs:?}\n  written: {expected:?}",
+        stage.engine,
+        stage.mode,
+        stage.name
+    );
+    assert_same_multiset(
+        stage.engine,
+        stage.mode,
+        stage.name,
+        "projection",
+        UPSERT_PROJECTION_SQL,
+        &spice_projection,
+        &postgres_projection,
+    );
+
+    for (query_name, sql) in [("aggregation", UPSERT_AGG_SQL), ("group", UPSERT_GROUP_SQL)] {
+        let postgres = answer_from_postgres(db_conn, sql).await?;
+        let spice = answer_from_spice(rt, sql).await?;
+        assert_same_multiset(
+            stage.engine,
+            stage.mode,
+            stage.name,
+            query_name,
+            sql,
+            &spice,
+            &postgres,
+        );
+    }
+
+    Ok(spice_projection)
+}
+
+/// `(id, value)` from a projection, sorted by `id`. A NULL `value` is `None`.
+fn id_value_pairs(answer: &Answer) -> Result<Vec<(i64, Option<String>)>, anyhow::Error> {
+    let id_idx = column_index(answer, "id")?;
+    let value_idx = column_index(answer, "value")?;
+    let mut pairs = Vec::with_capacity(answer.rows.len());
+    for row in &answer.rows {
+        let Cell::Int(id) = row[id_idx] else {
+            anyhow::bail!("column 'id' is not an integer: {row:?}");
+        };
+        let value = match &row[value_idx] {
+            Cell::Text(value) => Some(value.clone()),
+            Cell::Null => None,
+            Cell::Int(_) => anyhow::bail!("column 'value' is not text: {row:?}"),
+        };
+        pairs.push((id, value));
+    }
+    pairs.sort();
+    Ok(pairs)
 }
 
 fn acceleration_for(
@@ -837,6 +1017,15 @@ async fn test_acceleration_refresh_arrow_append_iso8601() -> Result<(), anyhow::
 }
 
 #[tokio::test]
+async fn test_acceleration_refresh_arrow_append_upsert_history() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    upsert_history_matches_postgres_source("arrow", |_port| {
+        get_acceleration_config_append("arrow", None)
+    })
+    .await
+}
+
+#[tokio::test]
 async fn test_acceleration_refresh_arrow_full_variant() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_refresh_full_for_engine("arrow").await
@@ -848,6 +1037,16 @@ async fn test_acceleration_refresh_arrow_full_variant() -> Result<(), anyhow::Er
 async fn test_acceleration_refresh_duckdb_append_variant() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_refresh_append_for_engine("duckdb").await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn test_acceleration_refresh_duckdb_append_upsert_history() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    upsert_history_matches_postgres_source("duckdb", |_port| {
+        get_acceleration_config_append("duckdb", None)
+    })
+    .await
 }
 
 #[cfg(feature = "duckdb")]
@@ -867,6 +1066,16 @@ async fn test_acceleration_refresh_sqlite_append_variant() -> Result<(), anyhow:
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
+async fn test_acceleration_refresh_sqlite_append_upsert_history() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    upsert_history_matches_postgres_source("sqlite", |_port| {
+        get_acceleration_config_append("sqlite", None)
+    })
+    .await
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
 async fn test_acceleration_refresh_sqlite_full_variant() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_refresh_full_for_engine("sqlite").await
@@ -878,6 +1087,16 @@ async fn test_acceleration_refresh_sqlite_full_variant() -> Result<(), anyhow::E
 async fn test_acceleration_refresh_postgres_append_variant() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_refresh_append_for_engine("postgres").await
+}
+
+#[cfg(feature = "postgres-accel")]
+#[tokio::test]
+async fn test_acceleration_refresh_postgres_append_upsert_history() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    upsert_history_matches_postgres_source("postgres", |port| {
+        get_acceleration_config_append("postgres", Some(get_postgres_acceleration_params(port)))
+    })
+    .await
 }
 
 #[cfg(feature = "postgres-accel")]
