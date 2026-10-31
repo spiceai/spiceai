@@ -2906,3 +2906,13 @@ pub fn run(name: &str) -> Result<(), String> {
         Err(format!("Unexpected outcome for {name}"))
     }
 }
+
+/// The head the window run named `run` leaves after `actions`: each listed batch's
+/// end (commit numbers count from 1) and each inline record's symbolic size.
+/// `None` for an unknown run, a run of another family, or an action the run does
+/// not enable at that point.
+#[must_use]
+pub fn window_head_after(run: &str, actions: &[String]) -> Option<(Vec<usize>, Vec<usize>)> {
+    let run = runs().into_iter().find(|r| r.name == run && r.family == "window")?;
+    window::head_after(run.mode, run.bound, actions)
+}

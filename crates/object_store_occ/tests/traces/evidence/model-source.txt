@@ -7,30 +7,12 @@ PROPERTY HOLDS I10 complete source state matches logged prefix
 PROPERTY HOLDS I2 source acknowledgement covered
 PROPERTY REACHED source redelivery skipped after turnover
 TRACE_INITIAL index=Some(0)
-MINIMIZED enabled=true steps=5 [Receive, Issue, Deliver(0, 0), Takeover, Receive]
+MINIMIZED enabled=true steps=7 [Receive, Issue, Resolve, Crash, Deliver(0, 1), Acquire, Receive]
 PROPERTY REACHED source ambiguous accepted outcome
 TRACE_INITIAL index=Some(0)
 MINIMIZED enabled=true steps=4 [Receive, Issue, Unknown, Deliver(0, 0)]
 PROPERTY REACHED source grouped two changes
 TRACE_INITIAL index=Some(0)
-MINIMIZED enabled=true steps=4 [Receive, Receive, Issue, Deliver(0, 0)]
-RESULT source-positions expected=holds matched=true seconds=0.081
-        0.08 real         0.08 user         0.00 sys
-             6881280  maximum resident set size
-                   0  average shared memory size
-                   0  average unshared data size
-                   0  average unshared stack size
-                 740  page reclaims
-                  17  page faults
-                   0  swaps
-                   0  block input operations
-                   0  block output operations
-                   0  messages sent
-                   0  messages received
-                   0  signals received
-                   0  voluntary context switches
-                  24  involuntary context switches
-          1872034786  instructions retired
-           363217412  cycles elapsed
-             4817304  peak memory footprint
+MINIMIZED enabled=true steps=5 [Receive, Receive, Issue, Resolve, Deliver(0, 1)]
+RESULT source-positions expected=holds matched=true seconds=0.033
 WALKS source-positions seed=42 count=20 max_steps=40 good=true

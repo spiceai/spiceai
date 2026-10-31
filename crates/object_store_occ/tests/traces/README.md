@@ -1,8 +1,11 @@
 # Head-log fault injection and model trace replay
 
-Traces generated from the `cayenne-metastore-model` driver at branch ben/metastore1
-cbd2f28b9a (the model merged from ben/metastore-protocol-model cf5af83b40), 2026-10-29
-UTC. The commit containing this file identifies the replay sources.
+Traces regenerated from the `cayenne-metastore-model` driver at ben/metastore1
+4801c84660 (model source last changed at 8556561b4f), 2026-10-31 UTC. The commit
+containing this file identifies the replay sources. The driver's witness choice is
+not deterministic between runs (two consecutive `source-positions` runs chose
+different witnesses), so regenerating changes the files; every set must still
+replay.
 
 The fault-store, commit, source and window replays run against InMemory and
 LocalConditionalPut::new_durable. The window replay maps every model action except
@@ -16,9 +19,9 @@ the next accepted commit publishes the floor, as in the model.
   Canceled caller futures do not erase captured requests.
 - ../fault.rs: two integration tests, each on both backends; every fault, caller
   cancellation, real before-hook I/O, forwarding and operation-log order.
-- ../headlog_replay.rs: three positive replay tests, four negative-control tests,
+- ../headlog_replay.rs: three positive replay tests, five negative-control tests,
   and listed-but-missing batch checks for cold open and lagging poll.
-- *.jsonl: seven driver-generated trace sets; positive sets include walks.
+- *.jsonl: eight driver-generated trace sets; positive sets include walks.
 - evidence/: the driver's verbatim output per trace set (model-*.txt), the replay
   output (replay-and-controls.txt), and the checkpoint-root control
   (replay-control-checkpoint-root.txt). Temporary directories are shown as <tmp>.
@@ -40,16 +43,17 @@ initial_index=0. Walks use seed 42, count 20, max_steps 40.
 | window-storage / window | 3 | 20 | 0 |
 | source-positions | 3 | 20 | 0 |
 | commits-no-persist / commits | 6 | 0 | 2 |
-| window-no-exists / window | 5 | 0 | 3 |
+| window-no-exists / window | 4 | 0 | 3 |
 | source-ack-early / source-positions | 7 | 0 | 4 |
 | source-no-skip / source-positions | 6 | 0 | 4 |
+| source-position-before-data / source-positions | 4 | 0 | 2 |
 
 The window set holds 21 Checkpoint actions (Checkpoint(1) ×3, (2) ×12, (3) ×5,
 (4) ×1), 17 Gc and 20 Query.
 
 Control tests select FAIL witnesses for the named invariant: I2 for persistence
-and early acknowledgement, I4 for batch existence, all three I10 witnesses for
-source redelivery. Other control-file witnesses remain exactly as emitted by
+and early acknowledgement, I4 for batch existence, the I10 witnesses for source
+redelivery and for a position published before its rows. Other control-file witnesses remain exactly as emitted by
 the driver but are not replayed. Each selected trace first runs with its
 safeguard enabled, then with only its matching replay-harness safeguard removed.
 The test succeeds only when the former holds and the latter reports the
@@ -106,6 +110,7 @@ batch and verifies the failed-poll cursor stays unchanged.
 | source | Crash | Abort/await and drop handles; clear volatile receipt/buffer; reset cursor to acknowledged+1. Captured requests survive. |
 | source | Takeover | Crash mapping, then take_over at next generation. |
 | source | Acquire | take_over at next generation. |
+| source (position-first control) | Issue / Acknowledge | As the model's `source-position-before-data` mode: the first Issue publishes `([], end)` and the first Acknowledge only completes that half; the next Issue publishes the rows. Crash resets the half. The safe harness always publishes rows and position together. |
 
 The source model's lease-zero initial state maps to real lease 1; later advances
 preserve lease order/fencing.
@@ -133,9 +138,29 @@ window-storage-6-exhaust: witnesses=3 walks=20 backends=memory,durable-local ski
 
 A positive-trace Append that the writer refuses fails the replay, as does a
 refused Checkpoint. Gc and Query are not replayed, so no claim is made about
-removal or about a running query's batches. The JSON carries no per-action
-head, window or floor, so the replay checks what readers see (cold open and
-incremental poll against the serial reference), not internal state alignment.
+removal or about a running query's batches.
+
+**Head alignment with the model.** After every positive window trace (witnesses
+and walks), the head's listed batch ends and inline record sizes must equal
+those of the model stepped through the same actions
+(`cayenne_metastore_model::window_head_after`, with the trace's own run), at
+10,000 bytes per symbolic byte. The expectation comes from the model, never from
+the head log. 23 traces × 2 backends compare; the `CUTS` lines in
+evidence/replay-and-controls.txt show each. Controls:
+
+- `spill_above_bytes` 15,000 instead of 20,000 (records spill, no append is
+  refused, every reader check still holds) fails only this check:
+  `expected batch ends [2, 5], window bytes [10000]; actual [3], [10000, 10000, 10000]`
+  (evidence/replay-control-spill-threshold.txt).
+- `batch_max_records` 2 and `batch_budget_bytes` 25,000 are caught earlier, as a
+  refused positive append.
+- Gap: `head_budget_bytes` 75,000 instead of 55,000 passes every check. No
+  positive trace fills the inline window by bytes alone, so the traces do not
+  distinguish the head byte budget.
+
+Only the window family checks internal state this way; the commit and source
+families still check what readers see (cold open and incremental poll against
+the serial reference).
 
 **Checkpoint control.** With the root written one record short
 (`serial[..c - 1]`), window_storage fails at the commit that publishes the floor:
@@ -156,6 +181,7 @@ same file.
     EXHAUST=1 TRACE_JSON=$R/replay-window-control.jsonl target/release/cayenne-metastore-model run window-storage-no-exists-5-exhaust
     EXHAUST=1 TRACE_JSON=$R/replay-source-ack-control.jsonl target/release/cayenne-metastore-model run source-ack-before-acceptance
     EXHAUST=1 TRACE_JSON=$R/replay-source-skip-control.jsonl target/release/cayenne-metastore-model run source-no-redelivery-skip
+    EXHAUST=1 TRACE_JSON=$R/replay-source-before-data-control.jsonl target/release/cayenne-metastore-model run source-position-before-data
     EXHAUST=1 WALK=42:20:40 TRACE_JSON=$R/replay-commits.jsonl target/release/cayenne-metastore-model run commits-restart-turnover
     EXHAUST=1 WALK=42:20:40 TRACE_JSON=$R/replay-window.jsonl target/release/cayenne-metastore-model run window-storage-6-exhaust
     EXHAUST=1 WALK=42:20:40 TRACE_JSON=$R/replay-source.jsonl target/release/cayenne-metastore-model run source-positions
@@ -171,10 +197,11 @@ Each walk run printed `WALKS <run> seed=42 count=20 max_steps=40 good=true`.
 | replay-window-control.jsonl | window-no-exists.jsonl |
 | replay-source-ack-control.jsonl | source-ack-early.jsonl |
 | replay-source-skip-control.jsonl | source-no-skip.jsonl |
+| replay-source-before-data-control.jsonl | source-position-before-data.jsonl |
 
 ## Validation
 
     cargo nextest run -p object_store_occ --test headlog_replay --no-capture --retries 0
 
-`8 tests run: 8 passed`; the replay and control lines are in
+`9 tests run: 9 passed`; the replay and control lines are in
 evidence/replay-and-controls.txt.

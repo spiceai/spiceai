@@ -1,0 +1,26 @@
+   Compiling object_store_occ v0.1.0 (<repo>/crates/object_store_occ)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.89s
+────────────
+ Nextest run ID 49eb38e8-e979-4c6d-b70b-98f2d16ce0fc with nextest profile: default
+    Starting 1 test across 1 binary (8 tests skipped)
+       START [         ] (1/1) object_store_occ::headlog_replay window_storage
+
+running 1 test
+
+thread 'window_storage' (11246810) panicked at crates/object_store_occ/tests/headlog_replay.rs:914:18:
+positive replay: "trace=window-storage-6-exhaust \"byte and count cuts\" expected batch ends [2, 5], window bytes [10000]; actual [3], [10000, 10000, 10000]"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test window_storage ... FAILED
+
+failures:
+
+failures:
+    window_storage
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.06s
+
+        FAIL [   0.071s] (1/1) object_store_occ::headlog_replay window_storage
+────────────
+     Summary [   0.072s] 1 test run: 0 passed, 1 failed, 8 skipped
+        FAIL [   0.071s] (1/1) object_store_occ::headlog_replay window_storage
+error: test run failed

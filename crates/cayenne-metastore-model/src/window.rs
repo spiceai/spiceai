@@ -151,3 +151,38 @@ impl Model for Protocol {
         ]
     }
 }
+
+/// The head a window trace leaves: each listed batch's end (the last record's
+/// commit number, counting from 1) and each inline record's symbolic size.
+/// `None` when an action does not parse or is not enabled, so a replay can take
+/// its expected cuts from the model rather than from the code it checks.
+#[must_use]
+pub fn head_after(mode: &str, bound: usize, actions: &[String]) -> Option<(Vec<usize>, Vec<usize>)> {
+    let protocol = Protocol::new(mode, bound);
+    let mut state = protocol.init_states().pop()?;
+    for action in actions {
+        let (name, argument) = match action.split_once('(') {
+            Some((name, rest)) => (name, Some(rest.strip_suffix(')')?.parse().ok()?)),
+            None => (action.as_str(), None),
+        };
+        let action = match (name, argument) {
+            ("Append", Some(z)) => Action::Append(z),
+            ("Observe", None) => Action::Observe,
+            ("Create", Some(j)) => Action::Create(j),
+            ("Checkpoint", Some(c)) => Action::Checkpoint(c),
+            ("Gc", None) => Action::Gc,
+            ("Query", None) => Action::Query,
+            _ => return None,
+        };
+        let mut enabled = vec![];
+        protocol.actions(&state, &mut enabled);
+        if !enabled.contains(&action) {
+            return None;
+        }
+        state = protocol.next_state(&state, action)?;
+    }
+    Some((
+        state.store.index.iter().map(|&(_, end)| end).collect(),
+        state.store.window.iter().map(|r| crate::core::size(*r)).collect(),
+    ))
+}

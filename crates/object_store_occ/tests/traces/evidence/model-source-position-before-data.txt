@@ -1,0 +1,21 @@
+START source-position-before-data
+CONFIG source-position-before-data mode=EXHAUSTIVE bound=2 seed=0 states=4210 unique_or_sampled_visits=2301 depth=11
+PROPERTY NOT_FOUND at most one live row per source key
+PROPERTY NOT_FOUND I10 source append prefix exactly once
+PROPERTY FAIL I10 logged source position has its rows
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=3 [Receive, Issue, Deliver(0, 0)]
+WITNESS Some(State { head: Head { pos: 1, lease: 0, floor: 0 }, rows: [], position: 1, acknowledged: 0, buffer: [1], cursor: 2, attempts: [Attempt { base: Head { pos: 0, lease: 0, floor: 0 }, rows: [], position: 1, delivered: 1, retry: false }], active: Some(0), accepted: [0], answer: 0, crashed: false, skipped: false, unknown: false, half: false, needs_lease: false })
+PROPERTY FAIL I10 complete source state matches logged prefix
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=3 [Receive, Issue, Deliver(0, 0)]
+WITNESS Some(State { head: Head { pos: 1, lease: 0, floor: 0 }, rows: [], position: 1, acknowledged: 0, buffer: [1], cursor: 2, attempts: [Attempt { base: Head { pos: 0, lease: 0, floor: 0 }, rows: [], position: 1, delivered: 1, retry: false }], active: Some(0), accepted: [0], answer: 0, crashed: false, skipped: false, unknown: false, half: false, needs_lease: false })
+PROPERTY NOT_FOUND I2 source acknowledgement covered
+PROPERTY REACHED source redelivery skipped after turnover
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=6 [Receive, Issue, Deliver(0, 0), Crash, Acquire, Receive]
+PROPERTY REACHED source ambiguous accepted outcome
+TRACE_INITIAL index=Some(0)
+MINIMIZED enabled=true steps=4 [Receive, Issue, Deliver(0, 0), Unknown]
+PROPERTY NOT_REACHED source grouped two changes
+RESULT source-position-before-data expected=I10 logged source position has its rows matched=true seconds=0.005

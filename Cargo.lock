@@ -14217,6 +14217,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "cayenne-metastore-model",
  "futures",
  "object_store 0.13.2",
  "parking_lot",

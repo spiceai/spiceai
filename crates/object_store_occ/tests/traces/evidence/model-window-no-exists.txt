@@ -1,38 +1,18 @@
 START window-storage-no-exists-5-exhaust
-CONFIG window-storage-no-exists-5-exhaust mode=EXHAUSTIVE bound=5 seed=0 states=17874 unique_or_sampled_visits=10181 depth=19
+CONFIG window-storage-no-exists-5-exhaust mode=EXHAUSTIVE bound=5 seed=0 states=3444 unique_or_sampled_visits=2599 depth=9
 PROPERTY FAIL I4 reader inline payload replay equality
 TRACE_INITIAL index=Some(0)
-MINIMIZED enabled=true steps=3 [Append(1), Append(1), Append(1)]
+MINIMIZED enabled=true steps=4 [Append(0), Append(0), Append(0), Append(1)]
 PROPERTY FAIL I8 recovery replay equality including payload bytes
 TRACE_INITIAL index=Some(0)
-MINIMIZED enabled=true steps=3 [Append(1), Append(1), Append(1)]
+MINIMIZED enabled=true steps=4 [Append(0), Append(0), Append(0), Append(1)]
 PROPERTY FAIL I7 query snapshot equals serial
 TRACE_INITIAL index=Some(0)
-MINIMIZED enabled=true steps=4 [Append(1), Append(1), Append(1), Query]
+MINIMIZED enabled=true steps=5 [Append(0), Append(0), Append(0), Append(1), Query]
 PROPERTY NOT_REACHED byte and count cuts
 PROPERTY REACHED head byte and count budgets both force drops
 TRACE_INITIAL index=Some(0)
 MINIMIZED enabled=true steps=4 [Append(1), Append(1), Append(0), Append(1)]
-PROPERTY REACHED delayed seal after GC
-TRACE_INITIAL index=Some(0)
-MINIMIZED enabled=true steps=12 [Append(1), Append(1), Observe, Append(1), Observe, Append(1), Create(0), Create(1), Checkpoint(2), Append(1), Gc, Create(1)]
+PROPERTY NOT_REACHED delayed seal after GC
 PROPERTY NOT_REACHED conflicting seal bytes
-RESULT window-storage-no-exists-5-exhaust expected=I8 recovery replay equality including payload bytes matched=true seconds=0.030
-        0.03 real         0.03 user         0.00 sys
-             8323072  maximum resident set size
-                   0  average shared memory size
-                   0  average unshared data size
-                   0  average unshared stack size
-                 845  page reclaims
-                   1  page faults
-                   0  swaps
-                   0  block input operations
-                   0  block output operations
-                   0  messages sent
-                   0  messages received
-                   0  signals received
-                   0  voluntary context switches
-                  16  involuntary context switches
-           695651797  instructions retired
-           143346545  cycles elapsed
-             6341016  peak memory footprint
+RESULT window-storage-no-exists-5-exhaust expected=I8 recovery replay equality including payload bytes matched=true seconds=0.003

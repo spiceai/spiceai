@@ -24,6 +24,7 @@ tracing.workspace = true
 uuid = { workspace = true, features = ["v4", "v7"] }
 
 [dev-dependencies]
+cayenne-metastore-model = { path = "../cayenne-metastore-model" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "fs"] }
 

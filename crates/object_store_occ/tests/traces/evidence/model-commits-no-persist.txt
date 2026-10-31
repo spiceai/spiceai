@@ -1,53 +1,35 @@
 START commits-restart-no-persist-before-send
-CONFIG commits-restart-no-persist-before-send mode=EXHAUSTIVE bound=2 seed=0 states=162913 unique_or_sampled_visits=46064 depth=25
-PROPERTY HOLDS I1 unique accepted position
+CONFIG commits-restart-no-persist-before-send mode=EXHAUSTIVE bound=2 seed=0 states=40515 unique_or_sampled_visits=15486 depth=16
+PROPERTY NOT_FOUND I1 unique accepted position
 PROPERTY FAIL I2 acknowledged logical write exactly once
 TRACE_INITIAL index=Some(0)
-MINIMIZED enabled=true steps=14 [Buffer(0), Copy(0), Issue(0), Send(0), Resolve(0), Deliver(0, 0, 1), Restart, Buffer(0), Issue(0), Send(0), Resolve(0), Deliver(0, 1, 1), Response(0), Ack(0)]
-WITNESS Some(State { pos: 4, etag: 0, lease: 1, window: [1, 2], batches: [[10, 11], [], [], [], [], [], [], []], pending: [(0, [10, 11]), (1, [1, 2])], history: [10, 11, 1, 2], requests: [[Request { base: Head { pos: 2, lease: 1, floor: 0 }, etag: 0, pos: 3, lease: 1, id: 1, window: [11, 1], floor: 0, sent: 3, done: 2, answer: 0, success: true, unreadable: false }, Request { base: Head { pos: 3, lease: 1, floor: 0 }, etag: 0, pos: 4, lease: 1, id: 2, window: [1, 2], floor: 0, sent: 3, done: 2, answer: 1, success: true, unreadable: false }], []], ack: 1, persisted: [false, false, false, false], memory: [false, true, false, false], restored: [false, false, false, false], buffers: [false, false], restarted: true, floor: 0, parts: [], root: [], stage: 0, gc: false, listed: false, plan: false, deleted: false, gc_lease: 0, query: false, query_base: 0, query_target: 0, snapshot: false, read: false, bad_read: false, bad_replay: false, bad_query: false, bad_recovery: false, bad_fence: false, bad_i1: false, revived: false, stale: false, window_resolution: false, batch_resolution: false, lagged: false, folded: false, conflict: false })
+MINIMIZED enabled=true steps=13 [Buffer(0), Copy(0), Issue(0), Send(0), Resolve(0), Deliver(0, 0, 1), Resolve(0), Ack(0), Restart, Buffer(0), Issue(0), Send(0), Deliver(0, 1, 0)]
+WITNESS Some(State { pos: 4, etag: 0, lease: 1, time: 0, times: [], evidence_floor: 0, window: [1, 2], batches: [[10, 11], [], [], [], [], [], [], []], pending: [(0, [10, 11]), (1, [1, 2])], history: [10, 11, 1, 2], requests: [[Request { base: Head { pos: 2, lease: 1, floor: 0 }, etag: 0, pos: 3, lease: 1, id: 1, window: [11, 1], floor: 0, sent: 3, done: 2, answer: 0, success: true, unreadable: false, unknown: false }, Request { base: Head { pos: 3, lease: 1, floor: 0 }, etag: 0, pos: 4, lease: 1, id: 2, window: [1, 2], floor: 0, sent: 1, done: 1, answer: 0, success: true, unreadable: false, unknown: false }], []], ack: 1, persisted: [false, false, false, false], memory: [false, true, false, false], restored: [false, false, false, false], buffers: [false, false], restarted: true, floor: 0, parts: [], root: [], stage: 0, gc: false, listed: false, plan: false, deleted: false, gc_lease: 0, query: false, query_base: 0, query_target: 0, snapshot: false, read: false, bad_read: false, bad_replay: false, bad_query: false, bad_recovery: false, bad_fence: false, bad_i1: false, revived: false, stale: false, window_resolution: true, batch_resolution: false, lagged: false, folded: false, conflict: false })
 PROPERTY FAIL logical write never applied twice
 TRACE_INITIAL index=Some(0)
 MINIMIZED enabled=true steps=11 [Buffer(0), Copy(0), Issue(0), Send(0), Resolve(0), Deliver(0, 0, 1), Restart, Buffer(0), Issue(0), Send(0), Deliver(0, 1, 0)]
-WITNESS Some(State { pos: 4, etag: 0, lease: 1, window: [1, 2], batches: [[10, 11], [], [], [], [], [], [], []], pending: [(0, [10, 11]), (1, [1, 2])], history: [10, 11, 1, 2], requests: [[Request { base: Head { pos: 2, lease: 1, floor: 0 }, etag: 0, pos: 3, lease: 1, id: 1, window: [11, 1], floor: 0, sent: 3, done: 2, answer: 0, success: true, unreadable: false }, Request { base: Head { pos: 3, lease: 1, floor: 0 }, etag: 0, pos: 4, lease: 1, id: 2, window: [1, 2], floor: 0, sent: 1, done: 1, answer: 0, success: true, unreadable: false }], []], ack: 0, persisted: [false, false, false, false], memory: [false, true, false, false], restored: [false, false, false, false], buffers: [false, false], restarted: true, floor: 0, parts: [], root: [], stage: 0, gc: false, listed: false, plan: false, deleted: false, gc_lease: 0, query: false, query_base: 0, query_target: 0, snapshot: false, read: false, bad_read: false, bad_replay: false, bad_query: false, bad_recovery: false, bad_fence: false, bad_i1: false, revived: false, stale: false, window_resolution: false, batch_resolution: false, lagged: false, folded: false, conflict: false })
-PROPERTY HOLDS I3 CAS fencing
-PROPERTY HOLDS I4 missing is error and retained references live
-PROPERTY HOLDS I5 resolution sound
-PROPERTY HOLDS I6 prefix determinism
-PROPERTY HOLDS I8 replay equality
-PROPERTY HOLDS I7 query snapshot equals serial
-PROPERTY HOLDS I8 recovery equals serial reference
+WITNESS Some(State { pos: 4, etag: 0, lease: 1, time: 0, times: [], evidence_floor: 0, window: [1, 2], batches: [[10, 11], [], [], [], [], [], [], []], pending: [(0, [10, 11]), (1, [1, 2])], history: [10, 11, 1, 2], requests: [[Request { base: Head { pos: 2, lease: 1, floor: 0 }, etag: 0, pos: 3, lease: 1, id: 1, window: [11, 1], floor: 0, sent: 3, done: 2, answer: 0, success: true, unreadable: false, unknown: false }, Request { base: Head { pos: 3, lease: 1, floor: 0 }, etag: 0, pos: 4, lease: 1, id: 2, window: [1, 2], floor: 0, sent: 1, done: 1, answer: 0, success: true, unreadable: false, unknown: false }], []], ack: 0, persisted: [false, false, false, false], memory: [false, true, false, false], restored: [false, false, false, false], buffers: [false, false], restarted: true, floor: 0, parts: [], root: [], stage: 0, gc: false, listed: false, plan: false, deleted: false, gc_lease: 0, query: false, query_base: 0, query_target: 0, snapshot: false, read: false, bad_read: false, bad_replay: false, bad_query: false, bad_recovery: false, bad_fence: false, bad_i1: false, revived: false, stale: false, window_resolution: false, batch_resolution: false, lagged: false, folded: false, conflict: false })
+PROPERTY NOT_FOUND I3 CAS fencing
+PROPERTY NOT_FOUND I4 missing is error and retained references live
+PROPERTY NOT_FOUND I5 resolution sound
+PROPERTY NOT_FOUND I6 prefix determinism
+PROPERTY NOT_FOUND I8 replay equality
+PROPERTY NOT_FOUND I7 query snapshot equals serial
+PROPERTY NOT_FOUND I8 recovery equals serial reference
 PROPERTY NOT_REACHED folded checkpoint published by commit
 PROPERTY REACHED restart and lease turnover
 TRACE_INITIAL index=Some(0)
-MINIMIZED enabled=true steps=11 [Buffer(0), Copy(0), Issue(0), Buffer(0), Send(0), Fence, Resolve(0), Issue(0), Send(0), Deliver(0, 1, 0), Restart]
+MINIMIZED enabled=true steps=8 [Buffer(0), Copy(0), Issue(0), Send(0), Resolve(0), Deliver(0, 0, 1), Restart, Fence]
 PROPERTY REACHED persisted attempt restored
 TRACE_INITIAL index=Some(0)
-MINIMIZED enabled=true steps=6 [Buffer(0), Copy(0), Issue(0), Persist(0), Restart, Restore]
+MINIMIZED enabled=true steps=5 [Copy(0), Restart, Buffer(0), Issue(0), Persist(0)]
 PROPERTY REACHED resolution from window
 TRACE_INITIAL index=Some(0)
-MINIMIZED enabled=true steps=11 [Buffer(0), Copy(0), Issue(0), Buffer(0), Send(0), Fence, Resolve(0), Issue(0), Send(0), Deliver(0, 1, 0), Resolve(0)]
+MINIMIZED enabled=true steps=7 [Buffer(0), Copy(0), Issue(0), Send(0), Resolve(0), Deliver(0, 0, 1), Resolve(0)]
 PROPERTY NOT_REACHED resolution from batch
 PROPERTY REACHED delayed identical retry accepted
 TRACE_INITIAL index=Some(0)
-MINIMIZED enabled=true steps=11 [Buffer(0), Copy(0), Issue(0), Buffer(0), Send(0), Fence, Resolve(0), Issue(0), Send(0), Resolve(0), Deliver(0, 1, 1)]
+MINIMIZED enabled=true steps=6 [Buffer(0), Copy(0), Issue(0), Send(0), Resolve(0), Deliver(0, 0, 1)]
 PROPERTY NOT_REACHED two writers each two attempts
 PROPERTY NOT_REACHED conflicting batch bytes raced
-RESULT commits-restart-no-persist-before-send expected=I2 acknowledged logical write exactly once matched=true seconds=0.183
-        0.18 real         0.18 user         0.00 sys
-            22347776  maximum resident set size
-                   0  average shared memory size
-                   0  average unshared data size
-                   0  average unshared stack size
-                1691  page reclaims
-                  10  page faults
-                   0  swaps
-                   0  block input operations
-                   0  block output operations
-                   0  messages sent
-                   0  messages received
-                   0  signals received
-                   0  voluntary context switches
-                  39  involuntary context switches
-          4481936738  instructions retired
-           814083127  cycles elapsed
-            20300208  peak memory footprint
+RESULT commits-restart-no-persist-before-send expected=I2 acknowledged logical write exactly once matched=true seconds=0.013

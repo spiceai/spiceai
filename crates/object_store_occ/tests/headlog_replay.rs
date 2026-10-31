@@ -60,6 +60,7 @@ enum Control {
     AckEarly,
     NoSkip,
     NoExists,
+    PositionFirst,
 }
 type Call = JoinHandle<(Writer, object_store_occ::headlog::Result<Outcome>)>;
 struct Attempt {
@@ -103,6 +104,7 @@ struct Replay {
     buffer: Vec<usize>,
     cursor: usize,
     acknowledged: usize,
+    position_half: bool,
     logical_ack: bool,
     skipped: BTreeMap<String, usize>,
 }
@@ -166,6 +168,7 @@ impl Replay {
             buffer: vec![],
             cursor: 1,
             acknowledged: 0,
+            position_half: false,
             logical_ack: false,
             skipped: BTreeMap::new(),
         }
@@ -603,8 +606,15 @@ impl Replay {
                     self.buffer.retain(|p| *p > position);
                 }
                 if let Some(&end) = self.buffer.last() {
-                    let payload =
-                        Bytes::from(result(serde_json::to_vec(&(self.buffer.clone(), end)))?);
+                    // The control publishes the position in a record of its own
+                    // before the rows it covers, as the model's
+                    // source-position-before-data mode does.
+                    let rows = if self.control == Control::PositionFirst && !self.position_half {
+                        vec![]
+                    } else {
+                        self.buffer.clone()
+                    };
+                    let payload = Bytes::from(result(serde_json::to_vec(&(rows, end)))?);
                     let index = self.prepare(payload).await?;
                     self.persist(index);
                     self.send(index, false).await?;
@@ -653,6 +663,12 @@ impl Replay {
                 }
             }
             "Acknowledge" => {
+                if self.control == Control::PositionFirst && !self.position_half {
+                    self.position_half = true;
+                    self.active = None;
+                    return Ok(());
+                }
+                self.position_half = false;
                 let (_, position) = Self::source_state(&self.serial()?.0)?;
                 let end = self.buffer.last().copied().unwrap_or(position);
                 if self.control == Control::AckEarly || end <= position {
@@ -664,6 +680,7 @@ impl Replay {
             "Crash" | "Takeover" => {
                 self.restart(true).await;
                 self.buffer.clear();
+                self.position_half = false;
                 self.cursor = self.acknowledged + 1;
                 if action == "Takeover" {
                     self.fence().await?;
@@ -860,19 +877,28 @@ async fn replay(
             )
         })?;
     }
-    if window && trace.property == "byte and count cuts" {
+    if window && trace.status != "FAIL" {
+        // The expected head comes from stepping the model through the same
+        // actions, never from the head log under test: listed batch ends match
+        // the model's index, and inline records its window at 10,000 bytes per
+        // symbolic byte.
+        let (ends, symbolic) =
+            cayenne_metastore_model::window_head_after(&trace.run, &trace.actions)
+                .ok_or_else(|| format!("trace={} does not replay in the model", trace.run))?;
+        let expected_sizes: Vec<_> = symbolic.iter().map(|b| b * 10_000).collect();
         let head = &replay.reader.state().head;
         let sizes: Vec<_> = head.window.iter().map(|r| r.encoded.len()).collect();
-        require(head.batches == [3, 4] && sizes == [20_000, 20_000], || {
+        let batches: Vec<_> = head.batches.iter().map(|&end| usize::try_from(end).expect("bounded trace")).collect();
+        require(batches == ends && sizes == expected_sizes, || {
             format!(
-                "trace={} expected batch ends [3, 4], window bytes [20000, 20000]; actual {:?}, {sizes:?}",
-                trace.run, head.batches
+                "trace={} {:?} expected batch ends {ends:?}, window bytes {expected_sizes:?}; actual {batches:?}, {sizes:?}",
+                trace.run, trace.property
             )
         })?;
         println!(
-            "CUTS backend={} batch_ends={:?} window_record_bytes={sizes:?} head_encoded_bytes={}",
+            "CUTS backend={} property={:?} batch_ends={batches:?} window_record_bytes={sizes:?} head_encoded_bytes={}",
             if local { "durable-local" } else { "memory" },
-            head.batches,
+            trace.property,
             head.encoded_len()
         );
     }
@@ -955,6 +981,15 @@ async fn control_redelivery_skip() {
     negative(
         include_str!("traces/source-no-skip.jsonl"),
         Control::NoSkip,
+        "I10",
+    )
+    .await;
+}
+#[tokio::test]
+async fn control_position_before_data() {
+    negative(
+        include_str!("traces/source-position-before-data.jsonl"),
+        Control::PositionFirst,
         "I10",
     )
     .await;
