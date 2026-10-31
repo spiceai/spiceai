@@ -85,7 +85,11 @@ limitations under the License.
 //! The read path automatically detects the storage format (TEXT vs INTEGER) and converts
 //! to the Arrow schema's expected timestamp type and unit.
 
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
 use arrow::{
     array::{
@@ -113,7 +117,7 @@ use datafusion::{
     catalog::Session,
     common::TableReference,
     common::{
-        SchemaExt,
+        Column, DFSchema, SchemaExt,
         tree_node::{TreeNode, TreeNodeRecursion},
         utils::quote_identifier,
     },
@@ -123,8 +127,12 @@ use datafusion::{
     },
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType, dml::InsertOp},
-    physical_expr::EquivalenceProperties,
+    logical_expr::{
+        Expr, LogicalPlan, TableProviderFilterPushDown, TableType, dml::InsertOp,
+        execution_props::ExecutionProps, expr_rewriter::unnormalize_col,
+        physical_planning_context::PhysicalPlanningContext, utils::conjunction,
+    },
+    physical_expr::{EquivalenceProperties, create_physical_expr},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
@@ -1279,7 +1287,10 @@ impl TableProvider for TursoTableProvider {
             // table this connection cannot reach. The shared helper is exhaustive
             // over `Expr`, so a new variant is a build failure rather than a filter
             // the unparser happens to render and Turso then rejects.
-            let pushdown = if util::expr::cannot_be_evaluated_at_scan(filter) {
+            let pushdown = if util::expr::cannot_be_evaluated_at_scan(filter)
+                || casts_string_column_to_timestamp(filter, |column| {
+                    is_string_field(&self.schema, &column.name)
+                }) {
                 TableProviderFilterPushDown::Unsupported
             } else {
                 match unparser.expr_to_sql(filter) {
@@ -1348,7 +1359,12 @@ impl TableProvider for TursoTableProvider {
         filters: Vec<Expr>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DeletionExec::new(Arc::new(
-            TursoDeletionSink::new(Arc::clone(&self.pool), self.table_name.clone(), &filters),
+            TursoDeletionSink::new(
+                Arc::clone(&self.pool),
+                self.table_name.clone(),
+                Arc::clone(&self.schema),
+                &filters,
+            ),
         ))))
     }
 }
@@ -1418,8 +1434,11 @@ impl SQLExecutor for TursoTableProvider {
     /// rejected with a syntax error (issue #14041). Refusing the plan makes the
     /// analyzer federate its children instead and leaves the comparison to
     /// `DataFusion`, which rewrites it into `EXISTS` form and decorrelates it.
+    ///
+    /// A cast of a string column to a timestamp is likewise left to `DataFusion`; see
+    /// [`casts_string_column_to_timestamp`].
     fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
-        !plan_contains_set_comparison(plan)
+        !plan_contains_set_comparison(plan) && !plan_casts_string_column_to_timestamp(plan)
     }
 
     fn dialect(&self) -> Arc<dyn Dialect> {
@@ -1758,18 +1777,210 @@ pub struct TursoDeletionSink {
     pool: Arc<TursoConnectionPool>,
     table_name: String,
     filters: Vec<Expr>,
+    schema: SchemaRef,
 }
 
 impl TursoDeletionSink {
     /// Creates a new deletion sink
     #[must_use]
-    pub fn new(pool: Arc<TursoConnectionPool>, table_name: String, filters: &[Expr]) -> Self {
+    pub fn new(
+        pool: Arc<TursoConnectionPool>,
+        table_name: String,
+        schema: SchemaRef,
+        filters: &[Expr],
+    ) -> Self {
         Self {
             pool,
             table_name,
             filters: filters.to_vec(),
+            schema,
         }
     }
+
+    /// Whether a filter must be evaluated by `DataFusion` rather than rendered as
+    /// Turso SQL; see [`casts_string_column_to_timestamp`].
+    fn needs_datafusion_evaluation(&self) -> bool {
+        self.filters.iter().any(|filter| {
+            casts_string_column_to_timestamp(filter, |column| {
+                is_string_field(&self.schema, &column.name)
+            })
+        })
+    }
+
+    /// Deletes the rows the filters select, evaluating them with `DataFusion`: reads
+    /// each row's `rowid` and the columns the filters reference, then deletes the
+    /// selected `rowid`s (by a name no column shadows; see [`hidden_rowid_name`]). Runs in one transaction, so the rows read are the rows
+    /// deleted.
+    async fn delete_rows_selected_by_datafusion(
+        &self,
+        conn: &Connection,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        const READ_BATCH_ROWS: usize = 8192;
+        const DELETE_CHUNK_ROWS: usize = 500;
+
+        let filters: Vec<Expr> = self.filters.iter().cloned().map(unnormalize_col).collect();
+        let referenced: HashSet<String> = filters
+            .iter()
+            .flat_map(|filter| filter.column_refs().into_iter().map(|c| c.name.clone()))
+            .collect();
+        let projected: SchemaRef = Arc::new(Schema::new(
+            self.schema
+                .fields()
+                .iter()
+                .filter(|field| referenced.contains(field.name()))
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+        let predicate = conjunction(filters).ok_or("a filtered delete has a filter")?;
+        let predicate = create_physical_expr(
+            &predicate,
+            &DFSchema::try_from(projected.as_ref().clone())?,
+            &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
+        )?;
+
+        let rowid = hidden_rowid_name(&self.schema).ok_or_else(|| {
+            format!(
+                "{} has columns named rowid, _rowid_ and oid, so no name reaches the row identifier a filtered delete needs",
+                self.table_name
+            )
+        })?;
+        let table = quote_identifier(&self.table_name);
+        let mut select = format!("SELECT {rowid}");
+        for field in projected.fields() {
+            select.push_str(", ");
+            select.push_str(&quote_identifier(field.name()));
+        }
+        select.push_str(" FROM ");
+        select.push_str(&table);
+
+        let mut selected = Vec::new();
+        let mut rowids = Vec::with_capacity(READ_BATCH_ROWS);
+        let mut values = Vec::with_capacity(READ_BATCH_ROWS);
+        let mut rows = conn.query(&select, ()).await?;
+        loop {
+            let row = rows.next().await?;
+            if let Some(row) = &row {
+                let TursoValue::Integer(rowid) = row.get_value(0)? else {
+                    return Err(format!("{table} returned a non-integer rowid").into());
+                };
+                rowids.push(rowid);
+                values.push(
+                    (1..=projected.fields().len())
+                        .map(|i| row.get_value(i))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+            if values.len() == READ_BATCH_ROWS || (row.is_none() && !values.is_empty()) {
+                let batch = TursoTableProvider::values_to_record_batch(&values, &projected)?;
+                let mask = predicate.evaluate(&batch)?.into_array(batch.num_rows())?;
+                let mask = mask
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or("a delete filter evaluates to a boolean")?;
+                selected.extend(
+                    rowids
+                        .iter()
+                        .zip(mask.iter())
+                        .filter_map(|(rowid, matched)| (matched == Some(true)).then_some(*rowid)),
+                );
+                rowids.clear();
+                values.clear();
+            }
+            if row.is_none() {
+                break;
+            }
+        }
+        drop(rows);
+
+        let mut deleted = 0;
+        for chunk in selected.chunks(DELETE_CHUNK_ROWS) {
+            let rowids = chunk
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            deleted += conn
+                .execute(
+                    &format!("DELETE FROM {table} WHERE {rowid} IN ({rowids})"),
+                    (),
+                )
+                .await?;
+        }
+        Ok(deleted)
+    }
+}
+
+/// A name for the table's hidden row identifier that no column of `schema` shadows.
+///
+/// `rowid`, `_rowid_` and `oid` all name the row identifier unless a column takes
+/// the name (compared case-insensitively); a shadowed name resolves to the column.
+fn hidden_rowid_name(schema: &Schema) -> Option<&'static str> {
+    ["rowid", "_rowid_", "oid"].into_iter().find(|name| {
+        !schema
+            .fields()
+            .iter()
+            .any(|field| field.name().eq_ignore_ascii_case(name))
+    })
+}
+
+/// Whether `expr` casts a column that `is_string_column` accepts to a timestamp.
+///
+/// A retention or refresh-window filter on an ISO 8601 text time column has this
+/// shape (`util::timestamp_filter`). `DataFusion` parses each string to the instant it
+/// names, whatever its spelling (`T` or space, `Z`, a UTC offset, any fractional
+/// precision). The `SQLite` dialect cannot say that: it renders the cast as
+/// `CAST(col AS TEXT)` against a space-separated literal, which compares spellings,
+/// and Turso's `datetime()` keeps only milliseconds. So such a filter is evaluated by
+/// `DataFusion`, never rendered as Turso SQL.
+fn casts_string_column_to_timestamp(
+    expr: &Expr,
+    is_string_column: impl Fn(&Column) -> bool,
+) -> bool {
+    expr.exists(|e| {
+        let (inner, field) = match e {
+            Expr::Cast(cast) => (&cast.expr, &cast.field),
+            Expr::TryCast(cast) => (&cast.expr, &cast.field),
+            _ => return Ok(false),
+        };
+        Ok(matches!(field.data_type(), DataType::Timestamp(..))
+            && matches!(inner.as_ref(), Expr::Column(column) if is_string_column(column)))
+    })
+    .unwrap_or(false)
+}
+
+fn is_string_field(schema: &Schema, name: &str) -> bool {
+    schema
+        .field_with_name(name)
+        .is_ok_and(|field| field.data_type().is_string())
+}
+
+/// Whether any expression of `plan`, or of its nested subqueries, casts a string
+/// column to a timestamp; see [`casts_string_column_to_timestamp`].
+fn plan_casts_string_column_to_timestamp(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    let _ = plan.apply_with_subqueries(|node| {
+        let is_string_column = |column: &Column| {
+            node.inputs().iter().any(|input| {
+                input
+                    .schema()
+                    .qualified_field_from_column(column)
+                    .is_ok_and(|(_, field)| field.data_type().is_string())
+            }) || matches!(
+                node,
+                LogicalPlan::TableScan(scan) if is_string_field(&scan.source.schema(), &column.name)
+            )
+        };
+        node.apply_expressions(|expr| {
+            found = casts_string_column_to_timestamp(expr, is_string_column);
+            if found {
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        })
+    });
+    found
 }
 
 #[async_trait]
@@ -1778,6 +1989,25 @@ impl DeletionSink for TursoDeletionSink {
         &self,
         _context: Arc<TaskContext>,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        if self.needs_datafusion_evaluation() {
+            let _schema_guard = self.pool.acquire_schema_read_lock().await;
+            let conn = self.pool.connect().await?;
+            conn.execute(BEGIN_CONCURRENT_SQL, ()).await?;
+            return match self.delete_rows_selected_by_datafusion(&conn).await {
+                Ok(deleted) => match conn.execute(COMMIT_SQL, ()).await {
+                    Ok(_) => Ok(deleted),
+                    Err(error) => {
+                        TursoDataSink::rollback_write(&conn).await;
+                        Err(error.into())
+                    }
+                },
+                Err(error) => {
+                    TursoDataSink::rollback_write(&conn).await;
+                    Err(error)
+                }
+            };
+        }
+
         // Build WHERE clause using SQLite dialect unparser
         let where_clause = if self.filters.is_empty() {
             String::new()
@@ -3367,6 +3597,215 @@ mod tests {
             .collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// An in-memory `events (id INTEGER, ts TEXT)` table holding `rows`, and its schema.
+    async fn iso_events(rows: &str) -> (Arc<TursoConnectionPool>, SchemaRef) {
+        let pool = Arc::new(
+            TursoConnectionPool::new(":memory:")
+                .await
+                .expect("in-memory Turso pool should be created"),
+        );
+        let conn = pool
+            .connect()
+            .await
+            .expect("Turso connection should be created");
+        for sql in [
+            "CREATE TABLE events (id INTEGER, ts TEXT)".to_string(),
+            format!("INSERT INTO events VALUES {rows}"),
+        ] {
+            conn.execute(&sql, ())
+                .await
+                .expect("fixture statement should execute");
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("ts", DataType::Utf8, true),
+        ]));
+        (pool, schema)
+    }
+
+    /// The filter retention builds for the ISO 8601 text column `ts`.
+    fn iso_filter(timestamp_in_nanos: u128, op: datafusion::logical_expr::Operator) -> Expr {
+        let format = util::timestamp_filter::data_type_to_timestamp_format(&DataType::Utf8, None)
+            .expect("an ISO 8601 format resolves");
+        util::timestamp_filter::TimestampFilterConvert::new("ts".to_string(), format, None, None)
+            .convert(timestamp_in_nanos, op)
+    }
+
+    async fn delete_and_list_survivors(
+        pool: &Arc<TursoConnectionPool>,
+        schema: &SchemaRef,
+        filter: Expr,
+    ) -> (u64, Vec<i64>) {
+        let deleted = TursoDeletionSink::new(
+            Arc::clone(pool),
+            "events".to_string(),
+            Arc::clone(schema),
+            &[filter],
+        )
+        .delete_from(Arc::new(TaskContext::default()))
+        .await
+        .expect("the retention delete should run");
+        let conn = pool
+            .connect()
+            .await
+            .expect("Turso connection should be created");
+        let mut rows = conn
+            .query("SELECT id FROM events ORDER BY id", ())
+            .await
+            .expect("the survivors should be readable");
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await.expect("rows should stream") {
+            match row.get_value(0).expect("id should be present") {
+                TursoValue::Integer(id) => ids.push(id),
+                other => panic!("expected integer id, got {other:?}"),
+            }
+        }
+        (deleted, ids)
+    }
+
+    /// Retention on an ISO 8601 text column deletes by instant, whatever the spelling.
+    #[tokio::test]
+    async fn retention_delete_compares_iso_text_as_instants() {
+        // The cutoff is 2021-05-03T00:00:00Z. Expired: ids 1, 2 and 4.
+        let (pool, schema) = iso_events(
+            "(1, '2021-05-02T23:59:59Z'), \
+             (2, '2021-05-03T08:00:00+09:00'), \
+             (3, '2021-05-02T23:00:00-07:00'), \
+             (4, '2021-05-02 12:00:00'), \
+             (5, '2021-05-03 00:00:01'), \
+             (6, '2021-05-03T00:00:01Z'), \
+             (7, NULL)",
+        )
+        .await;
+        let filter = iso_filter(
+            1_620_000_000_000_000_000,
+            datafusion::logical_expr::Operator::Lt,
+        );
+        assert_eq!(
+            delete_and_list_survivors(&pool, &schema, filter).await,
+            (3, vec![3, 5, 6, 7]),
+            "rows before the cutoff are deleted whatever their spelling; NULL stays"
+        );
+    }
+
+    /// An inclusive bound keeps its full precision: a row 100ns past it survives.
+    #[tokio::test]
+    async fn retention_delete_keeps_sub_millisecond_precision() {
+        let (pool, schema) =
+            iso_events("(1, '2021-05-03T12:00:00.000100Z'), (2, '2021-05-03T12:00:00.000200Z')")
+                .await;
+        let filter = iso_filter(
+            1_620_043_200_000_100_000,
+            datafusion::logical_expr::Operator::LtEq,
+        );
+        assert_eq!(
+            delete_and_list_survivors(&pool, &schema, filter).await,
+            (1, vec![2]),
+        );
+    }
+
+    /// A user column named `rowid` does not stand in for the row identifier: rows
+    /// that share its value on both sides of the cutoff keep the live one.
+    #[tokio::test]
+    async fn retention_delete_ignores_a_user_column_named_rowid() {
+        let pool = Arc::new(
+            TursoConnectionPool::new(":memory:")
+                .await
+                .expect("in-memory Turso pool should be created"),
+        );
+        let conn = pool
+            .connect()
+            .await
+            .expect("Turso connection should be created");
+        for sql in [
+            "CREATE TABLE events (\"RowId\" INTEGER, id INTEGER, ts TEXT)",
+            "INSERT INTO events VALUES (7, 1, '2021-05-02T00:00:00Z'), (7, 2, '2021-05-04T00:00:00Z')",
+        ] {
+            conn.execute(sql, ())
+                .await
+                .expect("fixture statement should execute");
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("RowId", DataType::Int64, true),
+            Field::new("id", DataType::Int64, true),
+            Field::new("ts", DataType::Utf8, true),
+        ]));
+        let filter = iso_filter(
+            1_620_000_000_000_000_000,
+            datafusion::logical_expr::Operator::Lt,
+        );
+        assert_eq!(
+            delete_and_list_survivors(&pool, &schema, filter).await,
+            (1, vec![2]),
+        );
+    }
+
+    #[test]
+    fn the_row_identifier_name_avoids_shadowing_columns() {
+        let schema = |names: &[&str]| {
+            Schema::new(
+                names
+                    .iter()
+                    .map(|name| Field::new(*name, DataType::Int64, true))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(hidden_rowid_name(&schema(&["id"])), Some("rowid"));
+        assert_eq!(hidden_rowid_name(&schema(&["ROWID"])), Some("_rowid_"));
+        assert_eq!(
+            hidden_rowid_name(&schema(&["rowid", "_ROWID_"])),
+            Some("oid")
+        );
+        assert_eq!(
+            hidden_rowid_name(&schema(&["rowid", "_rowid_", "Oid"])),
+            None
+        );
+    }
+
+    /// Reads answer an ISO 8601 timestamp filter by instant too: the scan declines it
+    /// and federation leaves it to `DataFusion`, so it is never compared as text.
+    #[tokio::test]
+    async fn an_iso_timestamp_filter_is_answered_by_instant_not_text() {
+        let (pool, schema) =
+            iso_events("(1, '2021-05-03T01:00:00Z'), (2, '2021-05-02T23:00:00-07:00')").await;
+        let filter = iso_filter(
+            1_620_003_600_000_000_000,
+            datafusion::logical_expr::Operator::Gt,
+        );
+        let provider = Arc::new(TursoTableProvider::new(
+            Arc::clone(&schema),
+            "events".to_string(),
+            Arc::clone(&pool),
+        ));
+        assert_eq!(
+            TableProvider::supports_filters_pushdown(provider.as_ref(), &[&filter])
+                .expect("pushdown support should be reported"),
+            vec![TableProviderFilterPushDown::Unsupported],
+        );
+
+        let ctx = SessionContext::new_with_state(datafusion_federation::default_session_state());
+        let federated = provider
+            .create_federated_table_provider()
+            .expect("federated table provider should be created");
+        ctx.register_table("events", Arc::new(federated))
+            .expect("the table should register");
+        let batches = ctx
+            .sql(
+                "SELECT id FROM events \
+                 WHERE CAST(ts AS TIMESTAMP) > TIMESTAMP '2021-05-03 01:00:00'",
+            )
+            .await
+            .expect("the query should plan")
+            .collect()
+            .await
+            .expect("the query should run");
+        assert_eq!(
+            sorted_ids(&batches),
+            vec![2],
+            "2021-05-02T23:00:00-07:00 is 06:00Z, after the 01:00Z bound"
+        );
     }
 
     #[tokio::test]
