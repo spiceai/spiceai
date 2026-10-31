@@ -461,11 +461,15 @@ impl Reader {
 
 /// The text of `prompt` a reply is read from ([`Reader::after`]): what the generation prompt
 /// adds after the `conversation` the template renders without it, whose messages the template
-/// closes, or, when that starts no message, as when the template writes the reply's role
-/// header whatever is asked for, from the message the conversation leaves open. The whole
+/// closes, or, when the conversation leaves a message open, as when the template writes the
+/// reply's role header whatever is asked for, from that message's `<|start|>`. The whole
 /// prompt when the template adds nothing, or renders the conversation differently without a
 /// generation prompt.
-pub(crate) fn reply_text<'p>(prompt: &'p str, conversation: Option<&str>) -> &'p str {
+pub(crate) fn reply_text<'p>(
+    markers: &Markers,
+    prompt: &'p str,
+    conversation: Option<&str>,
+) -> &'p str {
     let Some(at) = conversation
         .filter(|conversation| {
             conversation.len() < prompt.len() && prompt.starts_with(conversation)
@@ -474,13 +478,36 @@ pub(crate) fn reply_text<'p>(prompt: &'p str, conversation: Option<&str>) -> &'p
     else {
         return prompt;
     };
-    if prompt[at..].contains(START) {
-        &prompt[at..]
-    } else {
-        prompt[..at]
-            .rfind(START)
-            .map_or(&prompt[at..], |from| &prompt[from..])
+    match open_message(markers, &prompt[..at]) {
+        Some(from) => &prompt[from..],
+        None => &prompt[at..],
     }
+}
+
+/// Where the message `conversation` leaves open starts, at its `<|start|>`, or `None` when its
+/// last message is closed. The conversation is read by the rules of a reply without a
+/// grammar, under which a body ends only at its `<|end|>`, so a `<|start|>` a body spells is
+/// the body's and opens nothing.
+fn open_message(markers: &Markers, conversation: &str) -> Option<usize> {
+    let mut reader = Reader::new(*markers, Vec::new(), Held::Nothing);
+    let (mut open, mut at) = (None, 0);
+    for (token, text) in markers.spell(conversation) {
+        match token {
+            Some(token) if reader.marks(token, "") => {
+                let closed = !matches!(reader.mark(token), Mark::Next);
+                if token == markers.start {
+                    open = Some(at);
+                } else if closed || token == markers.end {
+                    open = None;
+                }
+            }
+            _ => {
+                reader.text(text);
+            }
+        }
+        at += text.len();
+    }
+    open
 }
 
 /// Where the body of a message with `header` goes.
@@ -965,21 +992,33 @@ mod tests {
 
     #[test]
     fn a_reply_is_read_from_what_the_generation_prompt_adds() {
-        let conversation = "<|start|>user<|message|>Hi<|end|>";
+        let text = |prompt: &str, conversation: Option<&str>| {
+            reply_text(&TEST_MARKERS, prompt, conversation).to_string()
+        };
+        let conversation = "<|start|>user<|message|>Say <|end|><|start|> verbatim.<|end|>";
         let added = format!("{conversation}<|start|>assistant<|channel|>final<|message|>");
         assert_eq!(
-            reply_text(&added, Some(conversation)),
+            text(&added, Some(conversation)),
             "<|start|>assistant<|channel|>final<|message|>"
         );
-        // the role header written whatever is asked for: from the message it opens
+        // the role header written whatever is asked for: from the message it opens, whatever
+        // `<|start|>` its body spells, in the conversation or in what the generation prompt adds
         let split = format!("{conversation}<|start|>assistant");
         assert_eq!(
-            reply_text(&format!("{split}<|channel|>final<|message|>"), Some(&split)),
-            "<|start|>assistant<|channel|>final<|message|>"
+            text(
+                &format!("{split}<|channel|>final<|message|>Note: <|start|>!"),
+                Some(&split)
+            ),
+            "<|start|>assistant<|channel|>final<|message|>Note: <|start|>!"
+        );
+        let always = format!("{split}<|channel|>final<|message|>Note: <|start|>");
+        assert_eq!(
+            text(&format!("{always}!"), Some(&always)),
+            "<|start|>assistant<|channel|>final<|message|>Note: <|start|>!"
         );
         // nothing added, a conversation rendered differently, or none at all: the whole prompt
         for conversation in [Some(added.as_str()), Some("<|start|>system"), None] {
-            assert_eq!(reply_text(&added, conversation), added);
+            assert_eq!(text(&added, conversation), added);
         }
     }
 

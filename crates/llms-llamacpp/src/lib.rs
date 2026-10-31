@@ -601,8 +601,11 @@ impl LlamaCpp {
             let conversation = self
                 .prompt(&req.messages, reasoning, tools.clone(), false)
                 .ok();
-            harmony::Reader::new(markers, nameable, held)
-                .after(harmony::reply_text(&prompt, conversation.as_deref()))
+            harmony::Reader::new(markers, nameable, held).after(harmony::reply_text(
+                &markers,
+                &prompt,
+                conversation.as_deref(),
+            ))
         });
         // A Harmony grammar holds the reply by the vocabulary's markers, from where the prompt
         // leaves it.
