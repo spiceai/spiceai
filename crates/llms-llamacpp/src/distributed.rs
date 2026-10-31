@@ -404,7 +404,9 @@ pub(crate) async fn reach_ranks(cfg: &DistributedConfig, name: &str) -> Result<V
 /// Where the ranks reach each other for the all-reduce: the split's device `i` first reaches device
 /// `j` at the node `nodes` lists for it, and llama.cpp moves the pair to the fastest link the two
 /// share. Device `d` is rank `d`. Every rank sums the partials in the same order in F32, so all
-/// hold the same sum. A setting already in the environment wins.
+/// hold the same sum. The head also queues its reads and writes of the ranks' tensors instead of
+/// waiting on each one's round trip, which llama.cpp leaves off for other RPC clients; only the
+/// split reaches the ranks over RPC. A setting already in the environment wins.
 fn configure_comm(cfg: &DistributedConfig) {
     let set = |key: &str, value: String| {
         if std::env::var_os(key).is_none() {
@@ -414,6 +416,8 @@ fn configure_comm(cfg: &DistributedConfig) {
         }
     };
     set("GGML_RPC_COMM_MESH", "1".to_string());
+    set("GGML_RPC_GET_ASYNC", "1".to_string());
+    set("GGML_RPC_SET_ASYNC", "1".to_string());
     let mut hosts = Vec::new();
     for i in 1..cfg.world_size() {
         for j in 0..i {
