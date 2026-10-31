@@ -311,7 +311,6 @@ fn is_permanent_tool_failure(err: &crate::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use ::tools::SpiceModelTool;
     use app::AppBuilder;
     use serde_json::json;
 
