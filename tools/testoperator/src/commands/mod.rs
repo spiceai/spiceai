@@ -88,15 +88,23 @@ pub(crate) async fn build_test_with_validation(
     args: &DatasetTestArgs,
     app: &App,
     test_builder: NotStarted,
+    parameters_from: Option<&test_framework::spiced::SpicedInstance>,
 ) -> anyhow::Result<(QuerySet, NotStarted)> {
     let query_set = args.load_query_set()?;
     let query_overrides = args
         .query_overrides
         .clone()
         .map(test_framework::queries::QueryOverrides::from);
-    let queries = query_set
+    let mut queries = query_set
         .get_queries(query_overrides, None, None, args.scale_factor)
         .await?;
+    // Scenario `parameters_from` templates become one query per parameter row. Without a running
+    // instance they stay templates, and the test refuses to start.
+    if let Some(instance) = parameters_from {
+        let client = std::sync::Arc::new(instance.spice_client(None, true).await?);
+        queries =
+            test_framework::queries::scenario::expand_parameter_rows(queries, &client).await?;
+    }
     let reference_schema = validation_reference_schema(args, app, &query_set, &queries, false);
 
     let mut test_builder = test_builder
@@ -1271,7 +1279,8 @@ mod tests {
                     let app = prepare_dataset_app(&args).await.unwrap_or_else(|e| {
                         panic!("{dispatch_name} should load its spicepod, add its reference datasets and configure its layout: {e:#}")
                     });
-                    if let Err(e) = build_test_with_validation(&args, &app, NotStarted::new()).await
+                    if let Err(e) =
+                        build_test_with_validation(&args, &app, NotStarted::new(), None).await
                     {
                         panic!("{dispatch_name} cannot validate its results: {e}");
                     }

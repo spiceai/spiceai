@@ -187,6 +187,20 @@ pub struct Query {
     pub sql: Arc<str>,
     pub overridden: bool,
     pub parameters: Option<Vec<ParameterValue>>,
+    pub parameter_rows: ParameterRows,
+}
+
+/// How a query relates to a scenario `parameters_from` template.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum ParameterRows {
+    /// The query is not from a template.
+    #[default]
+    None,
+    /// A template that must be expanded before it runs (see
+    /// [`scenario::expand_parameter_rows`]). The value is the SQL that returns the parameter rows.
+    Unexpanded(Arc<str>),
+    /// The query made from row `n` (zero-based) of its template's parameter rows.
+    Row(usize),
 }
 
 impl Query {
@@ -197,6 +211,7 @@ impl Query {
             sql,
             overridden,
             parameters: None,
+            parameter_rows: ParameterRows::None,
         }
     }
 
@@ -341,6 +356,7 @@ impl Query {
             sql: Arc::from(rewritten_sql),
             overridden: self.overridden,
             parameters: self.parameters.clone(),
+            parameter_rows: self.parameter_rows.clone(),
         })
     }
 

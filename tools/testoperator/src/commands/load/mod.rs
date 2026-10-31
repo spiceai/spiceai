@@ -156,6 +156,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             .with_query_executor(executor.clone())
             .with_query_executors(client_executors.clone())
             .with_validate(args.test_args.validate),
+        None,
     )
     .await?;
 
@@ -185,6 +186,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             .with_query_executor(executor.clone())
             .with_query_executors(client_executors.clone())
             .with_validate(args.test_args.validate),
+        None,
     )
     .await?;
 
@@ -243,7 +245,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     }
 
     let (query_set, test_builder) =
-        super::build_test_with_validation(&args.test_args, &app, test_builder).await?;
+        super::build_test_with_validation(&args.test_args, &app, test_builder, None).await?;
 
     // Use the same query overrides that were applied in build_test_with_validation
     let query_overrides = args

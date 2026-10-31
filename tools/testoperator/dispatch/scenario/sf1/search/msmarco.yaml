@@ -1,0 +1,16 @@
+# Full-text search latency benchmarks: `testoperator run bench` with a `parameters_from` scenario.
+# The corpus downloads from Hugging Face and is indexed inside the ready wait.
+tests:
+  bench:
+    - spicepod_path: search/msmarco/full_text_search-cayenne[file].yaml
+      query_set: scenario
+      scenario_query_file: search/msmarco_text_search.yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 3600
+      validate_results: false
+    - spicepod_path: search/msmarco/full_text_search-duckdb[file].yaml
+      query_set: scenario
+      scenario_query_file: search/msmarco_text_search.yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 3600
+      validate_results: false

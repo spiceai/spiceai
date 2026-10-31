@@ -260,6 +260,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             .with_validate(test_args.validate)
             .with_scale_factor(test_args.scale_factor.unwrap_or(1.0))
             .with_query_executor(executor),
+        None,
     )
     .await?;
 
