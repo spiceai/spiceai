@@ -28148,19 +28148,48 @@ impl CayenneTableProvider {
             .map(|(max_sequence, (bytes, _))| (max_sequence.to_string(), *max_sequence, *bytes))
             .collect();
         // The same per-pass input budget as a protected-snapshot merge, so a tier
-        // of large generations merges a few at a time.
+        // of large generations merges a few at a time. Subset merges can run
+        // alongside this one, so it selects within what they leave and reserves
+        // its input bytes for the whole pass: the table's merges together stay
+        // within one budget, which bounds the encode memory the pool does not
+        // account.
+        let max_pass_bytes = self.protected_merge_input_budget_bytes();
+        let remaining_bytes = self
+            .protected_merge_claims
+            .lock()
+            .view()
+            .remaining_budget(max_pass_bytes);
         let ProtectedMergeSelection::Merge(selected) = select_protected_snapshot_merge_tier(
             &runs,
             COLD_MERGE_MIN_RUNS,
             COLD_MERGE_MAX_WIDTH,
             COLD_TIER_BASE_BYTES,
             COLD_TIER_GROWTH,
-            self.protected_merge_input_budget_bytes(),
+            remaining_bytes,
             None,
         ) else {
             return Ok(false);
         };
         let selected_sequences: HashSet<i64> = selected.iter().map(|(_, seq)| *seq).collect();
+        let selected_bytes = runs
+            .iter()
+            .filter(|(_, max_sequence, _)| selected_sequences.contains(max_sequence))
+            .fold(0u64, |total, (_, _, bytes)| total.saturating_add(*bytes));
+        let Some(_budget_reservation) = ProtectedMergeClaimGuard::try_reserve(
+            &self.protected_merge_claims,
+            selected_bytes,
+            max_pass_bytes,
+        ) else {
+            // A subset merge claimed budget after the view above; a later tick
+            // retries.
+            tracing::trace!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                selected_bytes,
+                "Skipping datalake merge: running protected-snapshot merges hold the pass budget",
+            );
+            return Ok(false);
+        };
         let Some(output_max_sequence) = selected_sequences.iter().copied().max() else {
             return Ok(false);
         };
