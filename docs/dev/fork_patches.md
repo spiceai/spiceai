@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `da71801534bd1ee3fdcb04a5d7adaec8aedefa64` | `spiceai-55` |
+| [datafusion](#datafusion) | `340d69c559e59d8520a5a3d081635b2a9192a0e8` | `spiceai-55-topk-bounded-capacity` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `300acfcfb51abfa9c477f57bff3e0529ec4f5f1a` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `08947680db76482cb825861a188b5b1e6028457a` | `spiceai-55` |
@@ -228,7 +228,10 @@ negation, and conservative aggregate functional dependencies from
 [fork PR #272](https://github.com/spiceai/datafusion/pull/272). On top of #272, #275 limits
 the nesting depth of a SQL data type, on top of #275, #277 carries the end-of-input part
 of upstream apache/datafusion#25312 and #25984 ahead of any release, and #279 and #280 make
-every join's output cooperative. The pin is the merge commit of #280. These commits descend
+every join's output cooperative. On #280's merge commit, #283 sizes a grouped `TopK`
+aggregation's hash table and heap to the groups it sees rather than to its `LIMIT`. The pin is
+#283's commit, on the `spiceai-55-topk-bounded-capacity` branch, which holds #280's merge commit
+and #283 alone. These commits descend
 from #268's merge commit, so the existing patches remain in the commit ancestry. None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
@@ -357,6 +360,7 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | At end of input, the ordered partial and final aggregate tables emit the remaining groups with one `EmitTo::All` and hand the result out in `batch_size` slices (`aggregate_hash_table/common_ordered.rs`; spiceai/datafusion#277, the end-of-input part of apache/datafusion#25312 and #25984) | The remaining groups are emitted as repeated `EmitTo::First(batch_size)`, each renumbering every group still held, so an aggregate on ordered or constant-prefix input spends time quadratic in its group count emitting: TPC-DS Q78, whose `d_year` is constant under `d_year = 2000`, spent 4.3 s of `emitting_time` at SF-10 | silent (perf) | `crates/runtime-datafusion/src/fork_backport_guards.rs::an_ordered_aggregate_emits_its_remaining_groups_once`; in the fork, `aggregates::tests::ordered_aggregate_drains_remaining_groups_in_batch_size_slices` |
 | Unparser: a union input's own `ORDER BY` and `LIMIT` stay inside that input's derived table instead of being written on the union's query after its last operand, and each input keeps its own quantifier and statement clauses (fork PR #261) | The input's bound applies to the whole `UNION ALL`, so `u UNION ALL (SELECT … FROM v ORDER BY a DESC LIMIT 1)` federated to `DuckDB` returns one row instead of `u`'s rows plus one ([#14737](https://github.com/spiceai/spiceai/issues/14737)) | silent (wrong data) | `crates/runtime/tests/duckdb/mod.rs::duckdb_federated_union_keeps_each_inputs_own_bound` (`runtime::integration`, run by `integration.yml`). In the fork, the `test_union_input_*` cases in `datafusion/sql/tests/cases/plan_to_sql.rs` |
 | `HashJoinExec`, `SortMergeJoinExec`, `NestedLoopJoinExec` and `CrossJoinExec` wrap their output streams in `coop::cooperative`, so each output batch spends the cooperative budget (spiceai/datafusion#279, #280) | A join with a high fan-out yields many output batches per input batch without polling an input, so the task running it never yields: a query that times out or whose client disconnects keeps its CPU busy until the join finishes the input it holds, up to ~26 s measured on a nested-loop join ([#15741](https://github.com/spiceai/spiceai/issues/15741)) | silent (CPU / hang) | `crates/runtime-datafusion/src/fork_backport_guards.rs::every_join_yields_to_the_scheduler`; in the fork, `physical-plan/src/joins/cancellation_tests.rs` and `core/tests/execution/coop.rs::nested_loop_join_agg_yields` and `::cross_join_agg_yields` |
+| A grouped `TopK` aggregation preallocates at most 1,024 hash-table entries, grows its table and heap as groups arrive, and starts its heap and swap mapper empty (`aggregates/topk/{hash_table,heap,priority_map}.rs`; spiceai/datafusion#283) | `DISTINCT … ORDER BY … LIMIT n` or `GROUP BY … ORDER BY max(…) LIMIT n` preallocates memory in proportion to `n` outside the memory pool, whatever the input's size, and an `n` near `i64::MAX` panics on a capacity overflow | silent (memory / panic) | `crates/runtime-datafusion/src/fork_backport_guards.rs::topk_aggregation_with_a_limit_far_above_its_groups_answers` |
 
 ## arrow-rs
 
