@@ -575,7 +575,8 @@ impl RequestContextBuilder {
         };
         self.cache_control = CacheControl::from_headers(headers);
         self.client_supplied_cache_key = match self.cache_control {
-            CacheControl::Cache(CacheKeyType::ClientSupplied) => headers
+            CacheControl::Cache(CacheKeyType::ClientSupplied)
+            | CacheControl::Revalidate(CacheKeyType::ClientSupplied) => headers
                 .get("Spice-Cache-Key")
                 .and_then(|h| h.to_str().ok())
                 .map(str::to_string),
@@ -729,6 +730,10 @@ impl RequestContextBuilder {
                 let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
                 CacheControl::OnlyIfCached(cache_key_type)
             }
+            CacheControl::Revalidate(CacheKeyType::Default) => {
+                let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
+                CacheControl::Revalidate(cache_key_type)
+            }
             // If sanitized out, fall back to default
             CacheControl::Cache(CacheKeyType::ClientSupplied) if user_cache_key.is_none() => {
                 CacheControl::Cache(CacheKeyType::Default)
@@ -747,6 +752,9 @@ impl RequestContextBuilder {
                 if user_cache_key.is_none() =>
             {
                 CacheControl::OnlyIfCached(CacheKeyType::Default)
+            }
+            CacheControl::Revalidate(CacheKeyType::ClientSupplied) if user_cache_key.is_none() => {
+                CacheControl::Revalidate(CacheKeyType::Default)
             }
             cache_control => cache_control,
         };
@@ -948,6 +956,47 @@ mod tests {
             .build();
 
         assert!(ctx.client_trace_id().is_none());
+    }
+
+    /// HTTP and Flight both build their request context from the request's
+    /// headers: a client's `no-cache` revalidates under the cache key a plain
+    /// request would read, including its own `Spice-Cache-Key`.
+    #[test]
+    fn no_cache_revalidates_under_the_request_cache_key_on_http_and_flight() {
+        for protocol in [Protocol::Http, Protocol::Flight, Protocol::FlightSQL] {
+            let mut headers = HeaderMap::new();
+            headers.append("cache-control", HeaderValue::from_static("no-cache"));
+            let ctx = RequestContextBuilder::new(protocol)
+                .from_headers(&headers)
+                .build();
+            let plain = RequestContextBuilder::new(protocol)
+                .from_headers(&HeaderMap::new())
+                .build();
+            assert_eq!(
+                ctx.cache_control.cache_key_type(),
+                plain.cache_control.cache_key_type(),
+                "{protocol:?}"
+            );
+            assert!(
+                matches!(ctx.cache_control, CacheControl::Revalidate(_)),
+                "{protocol:?}"
+            );
+
+            headers.append("Spice-Cache-Key", HeaderValue::from_static("foo"));
+            let ctx = RequestContextBuilder::new(protocol)
+                .from_headers(&headers)
+                .build();
+            assert_eq!(
+                ctx.cache_control,
+                CacheControl::Revalidate(CacheKeyType::ClientSupplied),
+                "{protocol:?}"
+            );
+            assert_eq!(
+                ctx.client_supplied_cache_key,
+                Some(String::from("foo")),
+                "{protocol:?}"
+            );
+        }
     }
 
     #[test]
