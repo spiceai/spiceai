@@ -384,9 +384,6 @@ impl Service {
         for batch in batches {
             let batch = match batch {
                 Ok(batch) => batch,
-                Err(ArrowError::InvalidArgumentError(message)) => {
-                    return StoreOutcome::Rejected(message);
-                }
                 Err(e) => {
                     tracing::error!("Failed to build an OpenTelemetry metrics store batch: {e}");
                     return StoreOutcome::Failed;

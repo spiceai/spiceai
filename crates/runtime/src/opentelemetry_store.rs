@@ -401,21 +401,17 @@ fn append_u64_list(builder: &mut ListBuilder<UInt64Builder>, values: Option<&[u6
 }
 
 impl StoreBuilders {
-    /// Appends one row. `attributes_json` and `encoded_attributes` are the point's attributes
-    /// from [`serialize_attributes`].
     fn append(
         &mut self,
         ctx: &MetricContext<'_>,
-        point: &PointColumns<'_>,
-        attributes_json: &str,
-        encoded_attributes: &[u8],
+        point: &PointColumns,
+        prepared: &PreparedPoint,
         values: PointValues<'_>,
     ) {
         let PointColumns {
             time_unix_nano,
             start_time_unix_nano,
             flags,
-            ..
         } = *point;
         self.metric_name.append_value(ctx.name);
         self.metric_type.append_value(ctx.metric_type);
@@ -427,15 +423,8 @@ impl StoreBuilders {
         // OTLP uses 0 for "not set".
         self.start_time_unix_nano
             .append_option((start_time_unix_nano != 0).then_some(start_time_unix_nano));
-        self.series_hash.append_value(series_hash(
-            ctx.name,
-            &ctx.resource_attributes.encoded,
-            ctx.scope_name,
-            ctx.scope_version,
-            &ctx.scope_attributes.encoded,
-            encoded_attributes,
-        ));
-        self.attributes.append_value(attributes_json);
+        self.series_hash.append_value(prepared.series_hash);
+        self.attributes.append_value(&prepared.attributes_json);
         self.resource_attributes
             .append_value(&ctx.resource_attributes.json);
         self.scope_name.append_option(non_empty(ctx.scope_name));
@@ -522,9 +511,8 @@ pub const MAX_STORE_BATCH_ROWS: usize = 8192;
 /// Arrow offset limit when resource and scope attributes repeat across many rows.
 pub const MAX_STORE_BATCH_STRING_BYTES: usize = 256 * 1024 * 1024;
 
-/// String bytes the columns repeated on every row (metric, resource and scope) take across one
-/// export. A small export with large resource or scope attributes and many data points can
-/// otherwise expand to an unbounded size.
+/// String bytes per metrics store export, across all its batches. Resource and scope attributes
+/// repeat on every row, so a small export can otherwise expand to an unbounded size.
 pub const MAX_STORE_EXPORT_STRING_BYTES: usize = 512 * 1024 * 1024;
 
 /// One data point of an export, by reference.
@@ -534,6 +522,17 @@ enum PointRef<'a> {
     Histogram(&'a HistogramDataPoint),
     Exponential(&'a ExponentialHistogramDataPoint),
     Summary(&'a SummaryDataPoint),
+}
+
+impl<'a> PointRef<'a> {
+    fn attributes(self) -> &'a [KeyValue] {
+        match self {
+            PointRef::Number(p) => &p.attributes,
+            PointRef::Histogram(p) => &p.attributes,
+            PointRef::Exponential(p) => &p.attributes,
+            PointRef::Summary(p) => &p.attributes,
+        }
+    }
 }
 
 /// Columns shared by every point of one metric of one scope, by index into the export's
@@ -553,12 +552,19 @@ struct OwnedContext<'a> {
     string_bytes: usize,
 }
 
+/// A data point's serialized attributes, series hash and row string bytes, computed for every
+/// point before any batch is built.
+struct PreparedPoint {
+    attributes_json: String,
+    series_hash: u64,
+    string_bytes: usize,
+}
+
 /// Columns of one data point common to every point type.
 #[derive(Clone, Copy)]
-struct PointColumns<'a> {
+struct PointColumns {
     time_unix_nano: u64,
     start_time_unix_nano: u64,
-    attributes: &'a [KeyValue],
     flags: u32,
 }
 
@@ -687,73 +693,90 @@ impl<'a> StoreExport<'a> {
 
     /// Metrics store batches of at most `max_rows` rows and `max_batch_string_bytes` string
     /// bytes each, built one at a time. Returns an invalid-argument error, before building any
-    /// batch, when the columns repeated on every row take more than `max_export_string_bytes`
-    /// across the export.
+    /// batch, when one row takes more than `max_batch_string_bytes` or all rows together take
+    /// more than `max_export_string_bytes`.
     pub fn batches(
         &self,
         max_rows: usize,
         max_batch_string_bytes: usize,
         max_export_string_bytes: usize,
     ) -> Result<impl Iterator<Item = Result<RecordBatch, ArrowError>> + '_, ArrowError> {
-        let repeated_bytes = self
-            .points
-            .iter()
-            .map(|(context, _)| self.contexts[*context].string_bytes)
-            .fold(0_usize, usize::saturating_add);
-        if repeated_bytes > max_export_string_bytes {
-            return Err(ArrowError::InvalidArgumentError(format!(
-                "The OpenTelemetry metrics export expands to more than {max_export_string_bytes} string bytes, with resource and scope attributes repeated on every data point; send its data points in smaller exports"
-            )));
-        }
         let max_rows = max_rows.max(1);
         let max_batch_string_bytes = max_batch_string_bytes.max(1);
+        let prepared = self.prepare(max_batch_string_bytes, max_export_string_bytes)?;
         let mut start = 0;
         Ok(std::iter::from_fn(move || {
             if start >= self.points.len() {
                 return None;
             }
-            match self.build(start, max_rows, max_batch_string_bytes) {
-                Ok((batch, end)) => {
-                    start = end;
-                    Some(Ok(batch))
-                }
-                Err(e) => {
-                    start = self.points.len();
-                    Some(Err(e))
-                }
-            }
+            let (batch, end) = self.build(&prepared, start, max_rows, max_batch_string_bytes);
+            start = end;
+            Some(batch)
         }))
+    }
+
+    fn prepare(
+        &self,
+        max_row_string_bytes: usize,
+        max_export_string_bytes: usize,
+    ) -> Result<Vec<PreparedPoint>, ArrowError> {
+        let mut prepared = Vec::with_capacity(self.points.len());
+        let mut encoded = Vec::new();
+        let mut export_string_bytes = 0_usize;
+        for (context, point) in &self.points {
+            let c = &self.contexts[*context];
+            encoded.clear();
+            let attributes_json = serialize_attributes(point.attributes(), &mut encoded);
+            let string_bytes = c.string_bytes.saturating_add(attributes_json.len());
+            if string_bytes > max_row_string_bytes {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "The OpenTelemetry metrics export contains one data point that expands to {string_bytes} string bytes, above the per-batch limit of {max_row_string_bytes} bytes; reduce its attributes or its resource and scope attributes"
+                )));
+            }
+            export_string_bytes = export_string_bytes.saturating_add(string_bytes);
+            if export_string_bytes > max_export_string_bytes {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "The OpenTelemetry metrics export expands to more than {max_export_string_bytes} string bytes, with resource and scope attributes repeated on every data point; send its data points in smaller exports"
+                )));
+            }
+            let resource = &self.resources[c.resource];
+            let scope = &self.scopes[c.scope_attributes];
+            prepared.push(PreparedPoint {
+                series_hash: series_hash(
+                    c.name,
+                    &resource.encoded,
+                    c.scope_name,
+                    c.scope_version,
+                    &scope.encoded,
+                    &encoded,
+                ),
+                attributes_json,
+                string_bytes,
+            });
+        }
+        Ok(prepared)
     }
 
     /// Builds one batch from the points starting at `start`, returning it and the index of the
     /// first point it does not hold.
     fn build(
         &self,
+        prepared: &[PreparedPoint],
         start: usize,
         max_rows: usize,
         max_string_bytes: usize,
-    ) -> Result<(RecordBatch, usize), ArrowError> {
+    ) -> (Result<RecordBatch, ArrowError>, usize) {
         let mut builders = StoreBuilders::default();
-        let mut encoded = Vec::new();
         let mut batch_string_bytes = 0_usize;
         let mut end = start;
-        for (context, point) in &self.points[start..] {
-            if end - start == max_rows {
+        for ((context, point), prepared) in self.points[start..].iter().zip(&prepared[start..]) {
+            if end - start == max_rows
+                || (end > start
+                    && batch_string_bytes.saturating_add(prepared.string_bytes) > max_string_bytes)
+            {
                 break;
             }
             let c = &self.contexts[*context];
-            let (columns, values) = point_columns(*point);
-            encoded.clear();
-            let attributes_json = serialize_attributes(columns.attributes, &mut encoded);
-            let string_bytes = c.string_bytes.saturating_add(attributes_json.len());
-            if string_bytes > max_string_bytes {
-                return Err(ArrowError::InvalidArgumentError(format!(
-                    "The OpenTelemetry metrics export contains one data point that expands to {string_bytes} string bytes, above the per-batch limit of {max_string_bytes} bytes; reduce its attributes or its resource and scope attributes"
-                )));
-            }
-            if end > start && batch_string_bytes.saturating_add(string_bytes) > max_string_bytes {
-                break;
-            }
             let ctx = MetricContext {
                 name: c.name,
                 metric_type: c.metric_type,
@@ -766,22 +789,22 @@ impl<'a> StoreExport<'a> {
                 scope_version: c.scope_version,
                 scope_attributes: &self.scopes[c.scope_attributes],
             };
-            builders.append(&ctx, &columns, &attributes_json, &encoded, values);
-            batch_string_bytes = batch_string_bytes.saturating_add(string_bytes);
+            let (columns, values) = point_columns(*point);
+            builders.append(&ctx, &columns, prepared, values);
+            batch_string_bytes = batch_string_bytes.saturating_add(prepared.string_bytes);
             end += 1;
         }
-        Ok((builders.finish()?, end))
+        (builders.finish(), end)
     }
 }
 
 /// A data point's common columns and its type-specific values.
-fn point_columns(point: PointRef<'_>) -> (PointColumns<'_>, PointValues<'_>) {
+fn point_columns(point: PointRef<'_>) -> (PointColumns, PointValues<'_>) {
     match point {
         PointRef::Number(p) => (
             PointColumns {
                 time_unix_nano: p.time_unix_nano,
                 start_time_unix_nano: p.start_time_unix_nano,
-                attributes: &p.attributes,
                 flags: p.flags,
             },
             number_values(p.value.as_ref()),
@@ -790,7 +813,6 @@ fn point_columns(point: PointRef<'_>) -> (PointColumns<'_>, PointValues<'_>) {
             PointColumns {
                 time_unix_nano: p.time_unix_nano,
                 start_time_unix_nano: p.start_time_unix_nano,
-                attributes: &p.attributes,
                 flags: p.flags,
             },
             PointValues {
@@ -807,7 +829,6 @@ fn point_columns(point: PointRef<'_>) -> (PointColumns<'_>, PointValues<'_>) {
             PointColumns {
                 time_unix_nano: p.time_unix_nano,
                 start_time_unix_nano: p.start_time_unix_nano,
-                attributes: &p.attributes,
                 flags: p.flags,
             },
             PointValues {
@@ -839,7 +860,6 @@ fn point_columns(point: PointRef<'_>) -> (PointColumns<'_>, PointValues<'_>) {
                 PointColumns {
                     time_unix_nano: p.time_unix_nano,
                     start_time_unix_nano: p.start_time_unix_nano,
-                    attributes: &p.attributes,
                     flags: p.flags,
                 },
                 PointValues {
@@ -1345,7 +1365,7 @@ mod tests {
 
     /// Five gauge points of metric "m" whose resource attributes are `{"k":"vvv…"}` with 100
     /// `v`s. Each row's strings are "m", "gauge", the 108-byte resource attributes, "runtime",
-    /// "1.0", and "{}" for the scope and point attributes: 128 bytes, 126 of them repeated.
+    /// "1.0", and "{}" for the scope and point attributes: 128 bytes.
     fn large_resource_request() -> ExportMetricsServiceRequest {
         let points: Vec<NumberDataPoint> = (0..5)
             .map(|i| number_point(i, Value::AsInt(1), vec![]))
@@ -1401,23 +1421,44 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_data_point_after_full_batches_is_rejected_before_any_batch() {
+        let mut req = large_resource_request();
+        let Some(Data::Gauge(gauge)) = req.resource_metrics[0].scope_metrics[0].metrics[0]
+            .data
+            .as_mut()
+        else {
+            panic!("gauge");
+        };
+        gauge.data_points.push(number_point(
+            5,
+            Value::AsInt(1),
+            vec![s("k", &"v".repeat(200))],
+        ));
+        let export = StoreExport::new(&req);
+        assert!(
+            export.batches(2, 256, usize::MAX).is_err(),
+            "the sixth point is over the per-batch limit, so no batch of the first five is built"
+        );
+    }
+
+    #[test]
     fn an_export_that_expands_past_the_export_limit_is_invalid() {
         let req = large_resource_request();
         let export = StoreExport::new(&req);
         let rows: usize = export
-            .batches(2, usize::MAX, 5 * 126)
+            .batches(2, usize::MAX, 5 * 128)
             .expect("an export at the limit is stored")
             .map(|b| b.expect("batch").num_rows())
             .sum();
         assert_eq!(rows, 5);
         let Err(ArrowError::InvalidArgumentError(message)) =
-            export.batches(2, usize::MAX, 5 * 126 - 1)
+            export.batches(2, usize::MAX, 5 * 128 - 1)
         else {
             panic!("an export one byte over the limit must be an invalid argument");
         };
         assert_eq!(
             message,
-            "The OpenTelemetry metrics export expands to more than 629 string bytes, with resource and scope attributes repeated on every data point; send its data points in smaller exports"
+            "The OpenTelemetry metrics export expands to more than 639 string bytes, with resource and scope attributes repeated on every data point; send its data points in smaller exports"
         );
     }
 
