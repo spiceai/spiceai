@@ -4,7 +4,7 @@ description: >
   rows of a table equal those WHERE p, WHERE NOT (p) and WHERE (p) IS NULL
   together, its count, sum, min and max equal the parts', and each partition
   answers as PostgreSQL answers it over the same rows; federated to each
-  backend, including DuckDB through the duckdb connector and ADBC with the
+  backend, including DuckLake, and DuckDB through the duckdb connector and ADBC with the
   DuckDB driver, and accelerated into each engine.
 
 sources:
@@ -12,7 +12,7 @@ sources:
   ref: { kind: postgres }
 
 matrix:
-  backend: [postgres, mysql, clickhouse, duckdb]
+  backend: [postgres, mysql, clickhouse, duckdb, ducklake]
 
 variants:
   federated: {}
@@ -85,10 +85,10 @@ steps:
     mirror: ref
   - start: {}
   - tlp: { table: t, seed: 1, queries: 300, depth: 3, aggregate: d, oracle: ref }
-    when: { backend: [postgres, clickhouse, duckdb] }
+    when: { backend: [postgres, clickhouse, duckdb, ducklake] }
     except: [federated, adbc]
   - tlp: { table: t, seed: 1, queries: 300, depth: 3, aggregate: d, oracle: ref }
-    when: { backend: [postgres, clickhouse, duckdb] }
+    when: { backend: [postgres, clickhouse, duckdb, ducklake] }
     only: [federated, adbc]
   # MySQL's BOOLEAN reaches Spice as Int8, so `b` is left out.
   - tlp: { table: t, seed: 1, queries: 300, depth: 3, aggregate: d, oracle: ref, skip-columns: [b] }

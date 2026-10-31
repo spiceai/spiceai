@@ -3,8 +3,8 @@ description: >
   Random queries over nested subqueries (filters, groupings, DISTINCT,
   ORDER BY … LIMIT on a unique key, joins, UNION ALL) under outer queries that
   read some, none or all of their columns answer through Spice as PostgreSQL
-  answers them over the same rows: federated to PostgreSQL, MySQL and DuckDB,
-  and accelerated into each engine. DuckDB is also read through ADBC with the
+  answers them over the same rows: federated to PostgreSQL, MySQL, DuckDB and
+  DuckLake, and accelerated into each engine. DuckDB is also read through ADBC with the
   DuckDB driver.
 
 sources:
@@ -12,7 +12,7 @@ sources:
   ref: { kind: postgres }
 
 matrix:
-  backend: [postgres, mysql, duckdb]
+  backend: [postgres, mysql, duckdb, ducklake]
 
 variants:
   federated: {}
@@ -97,8 +97,8 @@ steps:
     when: { backend: mysql }
     except: federated
   - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 1, queries: 300, depth: 2, oracle: ref }
-    when: { backend: duckdb }
+    when: { backend: [duckdb, ducklake] }
   - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 2, queries: 300, depth: 3, oracle: ref }
-    when: { backend: duckdb }
+    when: { backend: [duckdb, ducklake] }
   - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 3, queries: 300, depth: 3, oracle: ref }
-    when: { backend: duckdb }
+    when: { backend: [duckdb, ducklake] }

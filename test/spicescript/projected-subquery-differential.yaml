@@ -2,13 +2,13 @@ name: projected-subquery-differential
 description: >
   Projected subquery predicates preserve expression names, correlations and
   three-valued logic over seeded nullable data with duplicates. PostgreSQL is
-  the oracle for PostgreSQL/MySQL/DuckDB sources, federated and accelerated
+  the oracle for PostgreSQL/MySQL/DuckDB/DuckLake sources, federated and accelerated
   locally. DuckDB is also read through ADBC with the DuckDB driver.
 sources:
   backend: { kind: '${matrix.backend}' }
   ref: { kind: postgres }
 matrix:
-  backend: [postgres, mysql, duckdb]
+  backend: [postgres, mysql, duckdb, ducklake]
   seed: [41, 73]
 variants:
   federated: {}

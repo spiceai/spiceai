@@ -3,8 +3,8 @@ description: >
   An extended corpus (window functions, CTEs, set operations, outer and self
   joins, grouping sets, casts, dates, strings, NULL semantics, aggregates,
   ordering, arithmetic, subqueries) answers through Spice as PostgreSQL
-  answers it over the same generated rows: federated to PostgreSQL, MySQL
-  and DuckDB, and accelerated into each engine. DuckDB is also read through
+  answers it over the same generated rows: federated to PostgreSQL, MySQL,
+  DuckDB and DuckLake, and accelerated into each engine. DuckDB is also read through
   ADBC with the DuckDB driver.
 
 sources:
@@ -12,7 +12,7 @@ sources:
   ref: { kind: postgres }
 
 matrix:
-  backend: [postgres, mysql, duckdb]
+  backend: [postgres, mysql, duckdb, ducklake]
 
 variants:
   federated: {}

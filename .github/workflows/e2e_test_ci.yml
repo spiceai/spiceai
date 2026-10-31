@@ -3025,9 +3025,9 @@ jobs:
             --log-capture "$RUNNER_TEMP/spicescript-logs" \
             ${{ matrix.args }}
 
-      # The combinations whose source is DuckDB (matrix keys backend, src and
-      # source), then the DuckDB and DuckLake scripts without such a key, on
-      # each older listed release.
+      # The combinations whose source is DuckDB or DuckLake (matrix keys
+      # backend, src and source), then the DuckDB and DuckLake scripts without
+      # such a key, on each older listed release.
       - name: Run DuckDB scripts on older DuckDB releases
         if: ${{ matrix.older_duckdb }}
         env:
@@ -3038,6 +3038,9 @@ jobs:
             for args in "--matrix backend=duckdb test/spicescript" \
               "--matrix src=duckdb test/spicescript" \
               "--matrix source=duckdb test/spicescript" \
+              "--matrix backend=ducklake test/spicescript" \
+              "--matrix src=ducklake test/spicescript" \
+              "--matrix source=ducklake test/spicescript" \
               "test/spicescript/adbc-duckdb-catalog.yaml test/spicescript/ducklake-coverage.yaml test/spicescript/ducklake-refresh.yaml"; do
               # shellcheck disable=SC2086 # args holds several words
               "${{ steps.spicescript.outputs.path }}" --jobs 4 \
