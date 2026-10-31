@@ -109,21 +109,21 @@
       "group": "other"
     }
   ],
-  "snapshots-reader-without-source": [
+  "view-over-quoted-name": [
     {
-      "run": "snapshots-reader-without-source",
-      "who": "reader",
-      "key": "query: SELECT count(*) AS n, sum(id) AS s FROM t #2",
+      "run": "view-over-quoted-name",
+      "who": "default",
+      "key": "query: SELECT id FROM recent ORDER BY id",
       "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.t' not found: table 'spice.public.t' not found",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.recent' not found: table 'spice.public.recent' not found",
       "group": "other"
     },
     {
-      "run": "snapshots-reader-without-source",
-      "who": "reader",
-      "key": "query: SELECT count(*) AS n, sum(id) AS s, count(*) FILTER (WHERE v = 'new') AS changed FROM t",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. table 'spice.public.t' not found: table 'spice.public.t' not found",
+      "run": "view-over-quoted-name",
+      "who": "default",
+      "key": "wait-ready: {\"timeout\":\"60s\"}",
+      "kind": "status",
+      "signature": "spiced not ready after <duration>; dataset status: [{\"acceleration_enabled\":false,\"from\":\"file://<path> see <path>",
       "group": "other"
     }
   ]

@@ -34,6 +34,155 @@ use std::sync::Arc;
 
 use crate::{FieldMetadata, metadata_enriched_table_provider};
 
+/// Values of secret-looking keys shorter than this are not collected: a short
+/// value under a key that merely contains `key` or `auth` is more likely a
+/// setting than a credential, and replacing it everywhere would make the
+/// message unreadable. Explicit passwords are always collected.
+const MIN_HEURISTIC_SECRET_LEN: usize = 4;
+
+/// Secrets shorter than this are only replaced where they stand alone (not
+/// inside a longer word), so a short password does not mangle the message.
+const MIN_UNBOUNDED_SECRET_LEN: usize = 4;
+
+/// Query-string and `driver_options` keys (after any `adbc.` style prefix)
+/// that name a credential outright, so their values are collected at any
+/// length. Keys that only contain `key` or `auth` keep the length cutoff.
+const CREDENTIAL_KEY_MARKERS: &[&str] =
+    &["password", "passwd", "pwd", "secret", "token", "credential"];
+
+/// Query-string and `driver_options` keys whose values are treated as secrets.
+const SECRET_KEY_MARKERS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "key",
+    "auth",
+    "credential",
+];
+
+fn percent_decoded(value: &str) -> String {
+    percent_encoding::percent_decode_str(value)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+/// The credential values an ADBC connection was configured with: the whole URI,
+/// the `password` parameter, the password (or token-only user) in the URI's
+/// userinfo, and the values of secret-looking query-string and
+/// `driver_options` keys. Each value is included both as written and
+/// percent-decoded, because a driver may echo either form.
+///
+/// Drivers do not all split a URI the way a URL parser does (`libpq` takes the
+/// userinfo up to the last `@` before the path even when the password holds a
+/// raw `?`, `#` or `\\`, and splits the query only on `&`), so the userinfo and
+/// query are collected under each reading.
+///
+/// Pass the result to [`scrub_connection_secrets`] before a driver error is
+/// shown to the user or logged.
+#[must_use]
+pub fn connection_secrets(
+    uri: &str,
+    password: Option<&str>,
+    driver_options: Option<&str>,
+) -> Vec<String> {
+    let mut secrets = Vec::new();
+    let mut push = |value: &str, min_len: usize| {
+        for candidate in [value.to_string(), percent_decoded(value)] {
+            if !candidate.is_empty() && candidate.len() >= min_len && !secrets.contains(&candidate)
+            {
+                secrets.push(candidate);
+            }
+        }
+    };
+
+    push(uri, 1);
+    if let Some(password) = password {
+        push(password, 1);
+    }
+
+    // Userinfo: everything before the last `@` of the authority that follows
+    // `://`, with the authority ending at the path (driver reading) or at the
+    // first of `/ \\ ? #` (URL reading).
+    if let Some(idx) = uri.find("://") {
+        let after = &uri[idx + "://".len()..];
+        for delimiters in [&['/'][..], &['/', '\\', '?', '#'][..]] {
+            let authority_end = after.find(delimiters).unwrap_or(after.len());
+            if let Some(at) = after[..authority_end].rfind('@') {
+                let userinfo = &after[..at];
+                match userinfo.split_once(':') {
+                    Some((_user, pass)) => push(pass, 1),
+                    // A user with no password is usually a token.
+                    None => push(userinfo, 1),
+                }
+            }
+        }
+    }
+
+    let normalized_key = |key: &str| percent_decoded(key.trim()).to_ascii_lowercase();
+    // The query both with the URL fragment removed and, as libpq reads it,
+    // with `#` kept as data.
+    let query = uri.split_once('?').map(|(_, q)| q);
+    let queries = query
+        .into_iter()
+        .flat_map(|q| [q, q.split('#').next().unwrap_or_default()]);
+    for pair in queries
+        .flat_map(|q| q.split('&').chain(q.split(['&', ';'])))
+        .chain(driver_options.into_iter().flat_map(|o| o.split(';')))
+    {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let key = normalized_key(key);
+        let key = key.rsplit('.').next().unwrap_or_default();
+        if key == "pass"
+            || CREDENTIAL_KEY_MARKERS
+                .iter()
+                .any(|marker| key.contains(marker))
+        {
+            push(value.trim(), 1);
+        } else if SECRET_KEY_MARKERS.iter().any(|marker| key.contains(marker)) {
+            push(value.trim(), MIN_HEURISTIC_SECRET_LEN);
+        }
+    }
+
+    // Longest first, so a secret that contains another is replaced whole.
+    secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    secrets
+}
+
+/// `message` with every value from [`connection_secrets`] replaced by `***`.
+/// A secret shorter than four bytes is replaced only where it is not part of a
+/// longer alphanumeric word.
+#[must_use]
+pub fn scrub_connection_secrets(message: &str, secrets: &[String]) -> String {
+    secrets.iter().fold(message.to_string(), |message, secret| {
+        if secret.len() >= MIN_UNBOUNDED_SECRET_LEN {
+            return message.replace(secret.as_str(), "***");
+        }
+        let is_word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+        let mut out = String::with_capacity(message.len());
+        let mut last = 0;
+        for (start, _) in message.match_indices(secret.as_str()) {
+            if start < last {
+                continue;
+            }
+            let end = start + secret.len();
+            if is_word(message[..start].chars().next_back())
+                || is_word(message[end..].chars().next())
+            {
+                continue;
+            }
+            out.push_str(&message[last..start]);
+            out.push_str("***");
+            last = end;
+        }
+        out.push_str(&message[last..]);
+        out
+    })
+}
+
 /// Builds the list of ADBC database options from connector parameters.
 pub fn build_db_options(
     uri: &str,
@@ -293,4 +442,100 @@ fn bigquery_information_schema_table(table_reference: &TableReference, view: &st
 
 fn bigquery_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    use super::*;
+
+    #[test]
+    fn scrub_connection_secrets_removes_uri_and_credentials() {
+        let uri = "postgresql://alice:CANARY%ZZTOKEN@db.example.com:5432/app?sslmode=require&access_token=tok-secret-1";
+        let secrets = connection_secrets(
+            uri,
+            Some("param-secret"),
+            Some("adbc.token=opt-secret;adbc.timeout=30"),
+        );
+        for message in [
+            format!("connect failed for {uri}"),
+            "invalid percent-encoded token: \"CANARY%ZZTOKEN\"".to_string(),
+            "auth failed for password param-secret".to_string(),
+            "bad token tok-secret-1 / opt-secret".to_string(),
+        ] {
+            let scrubbed = scrub_connection_secrets(&message, &secrets);
+            for secret in [
+                "CANARY",
+                "param-secret",
+                "tok-secret-1",
+                "opt-secret",
+                "alice:",
+            ] {
+                assert!(!scrubbed.contains(secret), "{secret} leaked: {scrubbed}");
+            }
+        }
+        // Non-secret query values and options are kept.
+        let message = "sslmode=require timeout 30 at db.example.com";
+        assert_eq!(scrub_connection_secrets(message, &secrets), message);
+    }
+
+    #[test]
+    fn scrub_connection_secrets_handles_token_user_and_decoded_forms() {
+        let secrets = connection_secrets("snowflake://tok%40en123@acct/db", None, None);
+        assert_eq!(
+            scrub_connection_secrets("rejected tok@en123 and tok%40en123", &secrets),
+            "rejected *** and ***"
+        );
+        // Delimiters a URL parser would stop at, but libpq keeps in the password.
+        for uri in [
+            "postgresql://alice:CANARY?SECRET%ZZ@localhost/db",
+            "postgresql://alice:CANARY#SECRET%ZZ@localhost/db",
+            "postgresql://alice:CANARY\\SECRET%ZZ@localhost/db",
+            "postgresql://localhost/db?password=CANARY;SECRET%ZZ",
+            "postgresql://localhost/db?pass%77ord=CANARY%ZZSECRET",
+        ] {
+            let secrets = connection_secrets(uri, None, None);
+            let start = uri.find("CANARY").expect("canary");
+            let echoed = &uri[start..uri[start..].find('@').map_or(uri.len(), |i| start + i)];
+            let scrubbed =
+                scrub_connection_secrets(&format!("invalid token: \"{echoed}\""), &secrets);
+            assert_eq!(scrubbed, "invalid token: \"***\"", "{uri}");
+        }
+        // Short explicit credentials, echoed on their own.
+        let secrets = connection_secrets(
+            "postgresql://localhost/db?token=t1",
+            Some("abc"),
+            Some("adbc.secret=s2;adbc.api_key=k3"),
+        );
+        assert_eq!(
+            scrub_connection_secrets(
+                "driver rejected password abc, token t1, secret s2, key k3",
+                &secrets
+            ),
+            "driver rejected password ***, token ***, secret ***, key k3"
+        );
+        // A `#` that libpq keeps as data does not hide a later password.
+        let uri = "postgresql://localhost/db?application_name=x#y&password=CANARY%ZZSECRET";
+        let secrets = connection_secrets(uri, None, None);
+        assert_eq!(
+            scrub_connection_secrets("invalid token: \"CANARY%ZZSECRET\"", &secrets),
+            "invalid token: \"***\""
+        );
+        // A short password is scrubbed where it stands alone, not inside words.
+        for uri in [
+            "postgresql://alice:%Z@localhost/db",
+            "postgresql://localhost/db?password=%Z",
+        ] {
+            let secrets = connection_secrets(uri, None, None);
+            assert_eq!(
+                scrub_connection_secrets("invalid percent-encoded token: \"%Z\" (%Zeta)", &secrets),
+                "invalid percent-encoded token: \"***\" (%Zeta)",
+                "{uri}"
+            );
+        }
+        let secrets = connection_secrets("file:test.db", None, None);
+        assert_eq!(
+            scrub_connection_secrets("cannot open test.db", &secrets),
+            "cannot open test.db"
+        );
+    }
 }

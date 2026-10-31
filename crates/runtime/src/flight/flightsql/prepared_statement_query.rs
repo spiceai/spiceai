@@ -42,15 +42,15 @@ use snafu::prelude::*;
 use tokio_stream::adapters::Peekable;
 use tonic::{Request, Response, Status, Streaming};
 
-use super::{DecodableSchema, prepared_statement_handle};
+use super::{DecodableSchema, prepared_statement_handle, within_decompression_bound};
 use crate::{
     datafusion::{
         query::{run_transaction, schema_statement, transaction_statements},
         request_context_extension::get_current_datafusion,
     },
     flight::{
-        Service, is_auth_read_only, metrics, record_batches_to_flight_stream, to_tonic_err,
-        transaction_error_to_status,
+        Service, is_auth_read_only, metrics, to_tonic_err, transaction_error_to_status,
+        transaction_outcome_to_flight_stream,
         util::{attach_cache_metadata, set_flightsql_protocol},
     },
 };
@@ -70,6 +70,12 @@ use telemetry::timing::TimedStream;
 /// Long-term fix: Update `DataFusion`'s optimizer to recognize that `CAST(Utf8 AS Utf8View)`
 /// is safe to push down. This would be the proper upstream fix, but until then we avoid
 /// the CAST for string types entirely.
+///
+/// Float and time-zone-aware timestamp types are also omitted. A CAST sets the type the
+/// parameter is compared in: `TIMESTAMP` has no time zone, so a zoned instant would be
+/// compared as a wall-clock time, and `DOUBLE` would compare a DECIMAL column as an
+/// inexact float. Without the CAST, `DataFusion` takes the type from the column the
+/// parameter is compared with, or from the bound value.
 fn arrow_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Option<&'static str> {
     use arrow::datatypes::DataType;
     match dt {
@@ -81,13 +87,11 @@ fn arrow_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Option<&'static st
         DataType::UInt16 => Some("SMALLINT UNSIGNED"),
         DataType::UInt32 => Some("INT UNSIGNED"),
         DataType::UInt64 => Some("BIGINT UNSIGNED"),
-        DataType::Float32 => Some("FLOAT"),
-        DataType::Float64 => Some("DOUBLE"),
         // String types intentionally omitted - CASTs break filter pushdown optimization
         // DataType::Utf8 | DataType::LargeUtf8 => Some("VARCHAR"),
         DataType::Boolean => Some("BOOLEAN"),
         DataType::Date32 | DataType::Date64 => Some("DATE"),
-        DataType::Timestamp(_, _) => Some("TIMESTAMP"),
+        DataType::Timestamp(_, None) => Some("TIMESTAMP"),
         _ => None,
     }
 }
@@ -389,15 +393,11 @@ pub(crate) async fn do_get(
         let context_clone = Arc::clone(&context);
         let outcome = context_clone
             .scope(async {
-                run_transaction(&datafusion, &statements, param_values, read_only).await
+                run_transaction(&datafusion, &statements, param_values, read_only, |_| 0).await
             })
             .await
             .map_err(transaction_error_to_status)?;
-        let batches = outcome
-            .result
-            .map(|(batches, _)| batches)
-            .unwrap_or_default();
-        let stream = record_batches_to_flight_stream(batches);
+        let stream = transaction_outcome_to_flight_stream(outcome);
         let timed = TimedStream::new(stream, move || start);
         return Ok(Response::new(
             Box::pin(timed) as <Service as FlightService>::DoGetStream
@@ -471,6 +471,7 @@ pub(crate) async fn do_put_query(
         move |flight_data| {
             flight_data
                 .map_err(|status| FlightError::Tonic(Box::new(status)))
+                .and_then(within_decompression_bound)
                 .map(|message| decodable.repair(message))
         }
     });
@@ -1930,10 +1931,10 @@ mod tests {
         );
     }
 
-    /// Tests that non-string types still get CAST expressions.
+    /// Tests that integer parameters get CAST expressions and float parameters do not.
     ///
-    /// Integer, float, boolean, and date/timestamp types still need CAST
-    /// for proper type inference in prepared statements like "SELECT $1 + $2".
+    /// Without a CAST, a float parameter takes the bound value's type, so
+    /// "SELECT $1 + $2" still plans.
     #[test]
     fn test_rewrite_sql_numeric_types_get_cast() {
         let sql = r"SELECT $1 + $2 AS sum, $3 * $4 AS product";
@@ -1958,27 +1959,34 @@ mod tests {
             "Int64 parameter $2 should be wrapped in CAST AS BIGINT: {rewritten}"
         );
 
-        // Float parameters should be wrapped in CAST
         assert!(
-            rewritten.contains("CAST($3 AS DOUBLE)"),
-            "Float64 parameter $3 should be wrapped in CAST AS DOUBLE: {rewritten}"
-        );
-        assert!(
-            rewritten.contains("CAST($4 AS DOUBLE)"),
-            "Float64 parameter $4 should be wrapped in CAST AS DOUBLE: {rewritten}"
+            !rewritten.contains("CAST($3 AS") && !rewritten.contains("CAST($4 AS"),
+            "Float64 parameters should NOT be wrapped in CAST: {rewritten}"
         );
     }
 
-    /// Tests mixed parameter types - strings should NOT get CAST, others should.
+    /// Tests mixed parameter types - only types whose CAST keeps the comparison exact get one.
     #[test]
     fn test_rewrite_sql_mixed_types() {
-        let sql = r"SELECT * FROM users WHERE name = $1 AND age > $2 AND score < $3";
+        let sql = r"SELECT * FROM users WHERE name = $1 AND age > $2 AND score < $3 AND created > $4 AND seen > $5";
 
-        // Mixed types: string (no CAST), int (CAST), float (CAST)
         let schema = Arc::new(Schema::new(vec![
             Field::new("$1", DataType::Utf8, true),
             Field::new("$2", DataType::Int32, true),
             Field::new("$3", DataType::Float64, true),
+            Field::new(
+                "$4",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new(
+                "$5",
+                DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond,
+                    Some("America/Los_Angeles".into()),
+                ),
+                true,
+            ),
         ]));
 
         let rewritten = rewrite_sql_with_type_casts(sql, &schema);
@@ -1999,10 +2007,17 @@ mod tests {
             "Int32 parameter $2 should be wrapped in CAST AS INT: {rewritten}"
         );
 
-        // Float64 parameter should be wrapped in CAST
         assert!(
-            rewritten.contains("CAST($3 AS DOUBLE)"),
-            "Float64 parameter $3 should be wrapped in CAST AS DOUBLE: {rewritten}"
+            !rewritten.contains("CAST($3 AS"),
+            "Float64 parameter $3 should NOT be wrapped in CAST: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("CAST($4 AS TIMESTAMP)"),
+            "Timestamp parameter $4 should be wrapped in CAST AS TIMESTAMP: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("CAST($5 AS"),
+            "Zoned timestamp parameter $5 should NOT be wrapped in CAST: {rewritten}"
         );
     }
 

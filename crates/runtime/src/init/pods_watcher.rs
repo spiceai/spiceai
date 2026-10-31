@@ -79,6 +79,7 @@ fn start_time_only_changes(
         source_rate_control,
         drasi,
         functions: _,
+        mode: _,
     } = new;
 
     [
@@ -314,6 +315,15 @@ impl Runtime {
         // mutates the app during the diff phase, so a write lock is not needed
         // until the final swap.
         let current_app = self.read_app().await;
+        let mut new_app = new_app;
+        if new_app.runtime.mode != self.mode {
+            tracing::warn!(
+                "runtime.mode changed from '{}' to '{}'. Restart spiced to apply the new mode.",
+                self.mode,
+                new_app.runtime.mode
+            );
+            Arc::make_mut(&mut new_app).runtime.mode = self.mode;
+        }
         Arc::clone(&self)
             .apply_app_diff(current_app.as_ref(), new_app)
             .await
@@ -353,11 +363,11 @@ impl Runtime {
             Arc::clone(&self)
                 .apply_catalog_diff(current_app, &new_app)
                 .await;
-            Arc::clone(&self)
+            let reloaded_datasets = Arc::clone(&self)
                 .apply_dataset_diff(current_app, &new_app)
                 .await;
             Arc::clone(&self)
-                .apply_view_diff(current_app, &new_app)
+                .apply_view_diff(current_app, &new_app, &reloaded_datasets)
                 .await;
             self.apply_model_diff(current_app, &new_app).await;
             crate::datafusion::udf::apply_function_diff(&self, current_app, &new_app).await;
