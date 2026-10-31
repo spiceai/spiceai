@@ -185,7 +185,11 @@ impl Runtime {
         let (first_attempt_done, first_attempt) = oneshot::channel();
         self.tool_loads.start(
             &tool.name,
-            Arc::clone(self).load_tool_until_loaded(tool.clone(), builtin_names, first_attempt_done),
+            Arc::clone(self).load_tool_until_loaded(
+                tool.clone(),
+                builtin_names,
+                first_attempt_done,
+            ),
         );
         // Dropped without a send when the load is stopped.
         let _ = first_attempt.await;
@@ -242,7 +246,7 @@ impl Runtime {
         match forged {
             Ok(t) => {
                 self.maybe_register_tool_as_udf(tool, &t).await;
-                if builtin_names.contains(t.name()) {
+                if builtin_names.contains(t.name().as_ref()) {
                     // A built-in of the same name takes precedence, as it always has.
                     tracing::warn!(
                         "Tool '{}' has the same name as a built-in tool; using the built-in.",
@@ -303,4 +307,117 @@ fn is_permanent_tool_failure(err: &crate::Error) -> bool {
         return true;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use ::tools::SpiceModelTool;
+    use app::AppBuilder;
+    use serde_json::json;
+
+    use super::*;
+
+    fn tool(name: &str, from: &str) -> Tool {
+        serde_json::from_value(json!({ "name": name, "from": from })).expect("a valid tool")
+    }
+
+    async fn runtime_with(spicepod_tools: Vec<Tool>) -> Arc<Runtime> {
+        let mut app = AppBuilder::new("tool_loading");
+        for spicepod_tool in spicepod_tools {
+            app = app.with_tool(spicepod_tool);
+        }
+        let rt = Arc::new(Runtime::builder().with_app(app.build()).build().await);
+        tools::factory::register_all_factories(Arc::clone(&rt)).await;
+        rt
+    }
+
+    fn tool_status(rt: &Runtime, name: &str) -> Option<status::ComponentStatus> {
+        rt.status.get_component_status(&format!("tool:{name}"))
+    }
+
+    /// A Spicepod tool that cannot load is left out, and the tools around it, including the
+    /// built-ins, still load and the runtime reports ready.
+    #[tokio::test]
+    async fn a_failing_tool_does_not_hide_the_other_tools_or_block_readiness() {
+        let rt = runtime_with(vec![
+            tool("my_sql", "builtin:sql"),
+            tool("missing", "not_a_source:anything"),
+        ])
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(30), Arc::clone(&rt).load_tools())
+            .await
+            .expect("loading the tools finishes after each tool's first attempt");
+
+        let loaded = rt.tools.read().await;
+        assert!(
+            loaded.contains_key("sql"),
+            "the built-in sql tool is missing"
+        );
+        assert!(
+            loaded.contains_key("my_sql"),
+            "the good Spicepod tool is missing"
+        );
+        assert!(!loaded.contains_key("missing"));
+        drop(loaded);
+        assert!(matches!(
+            tool_status(&rt, "missing"),
+            Some(status::ComponentStatus::Error(_))
+        ));
+        assert!(matches!(
+            tool_status(&rt, "my_sql"),
+            Some(status::ComponentStatus::Ready)
+        ));
+        assert!(
+            rt.status.is_ready(),
+            "a failed tool must not block /v1/ready"
+        );
+    }
+
+    /// A Spicepod tool named like a built-in does not replace the built-in.
+    #[tokio::test]
+    async fn a_builtin_tool_keeps_its_name() {
+        let rt = runtime_with(vec![tool("sql", "builtin:list_datasets")]).await;
+        Arc::clone(&rt).load_tools().await;
+
+        let loaded = rt.tools.read().await;
+        let description = |name: &str| match loaded.get(name) {
+            Some(Tooling::Tool(t)) => t.description().map(std::borrow::Cow::into_owned),
+            other => panic!("{name} is not a single tool: {}", other.is_some()),
+        };
+        assert_ne!(
+            description("sql"),
+            description("list_datasets"),
+            "the Spicepod tool replaced the built-in sql tool"
+        );
+    }
+
+    /// A Spicepod mistake is not retried; an unreachable server is.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn only_a_spicepod_mistake_is_permanent() {
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        let refused_from = format!(
+            "mcp:http://{}/mcp",
+            unused.local_addr().expect("the free port's address")
+        );
+        drop(unused);
+
+        let refused_tool = tool("refused", &refused_from);
+        let unknown_tool = tool("unknown", "not_a_source:anything");
+        let rt = runtime_with(vec![refused_tool.clone(), unknown_tool.clone()]).await;
+        let builtin_names = HashSet::new();
+
+        let refused = rt
+            .try_load_tool(&refused_tool, &builtin_names)
+            .await
+            .expect_err("nothing listens on the port");
+        assert!(!is_permanent_tool_failure(&refused), "{refused}");
+
+        let unknown = rt
+            .try_load_tool(&unknown_tool, &builtin_names)
+            .await
+            .expect_err("no such source");
+        assert!(is_permanent_tool_failure(&unknown), "{unknown}");
+    }
 }

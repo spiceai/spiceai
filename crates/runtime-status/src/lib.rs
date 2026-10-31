@@ -1032,13 +1032,19 @@ mod tests {
 
         // Other failed components still do.
         status.update_model("model_a", ComponentStatus::error());
-        assert!(!status.is_ready(), "a failed model still blocks OnLoad readiness");
+        assert!(
+            !status.is_ready(),
+            "a failed model still blocks OnLoad readiness"
+        );
         status.update_model("model_a", ComponentStatus::Ready);
         assert!(status.is_ready());
 
         let failed_dataset = TableReference::bare("broken");
         status.update_dataset(&failed_dataset, ComponentStatus::error());
-        assert!(!status.is_ready(), "a failed dataset still blocks OnLoad readiness");
+        assert!(
+            !status.is_ready(),
+            "a failed dataset still blocks OnLoad readiness"
+        );
     }
 
     #[test]

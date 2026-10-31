@@ -1242,7 +1242,8 @@ mod tests {
             panic!("an unresponsive server must not connect");
         };
         assert!(
-            err.to_string().contains("did not complete the connection handshake"),
+            err.to_string()
+                .contains("did not complete the connection handshake"),
             "unexpected error: {err}"
         );
         assert!(
