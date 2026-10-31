@@ -89,7 +89,7 @@ on:
         default: ''
         type: string
 
-# Serialize ALL SF100 + SF1000 CH-benCHmark runs across every variant (sqlite/turso cdc-tuned,
+# Serialize ALL SF100 + SF1000 CH-benCHmark runs across every variant (cdc-tuned,
 # adaptive, duckdb): they share ONE concurrency group keyed only by scale factor, so
 # only one runs at any time on the shared xlarge runner pool. Overlapping heavy CDC runs would
 # contend for runners and skew each other's freshness/QPH numbers. cancel-in-progress is false so

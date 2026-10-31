@@ -213,7 +213,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_dataset_registered_trace_default_acceleration_cache() {
         let acceleration = Acceleration {
@@ -279,7 +278,6 @@ mod tests {
         assert_eq!(info, "View taxi_trips_vw registered.");
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn test_view_registered_trace_with_default_acceleration() {
         let table_ref = TableReference::from("taxi_trips_vw");

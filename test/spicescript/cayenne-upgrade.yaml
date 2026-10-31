@@ -1,11 +1,14 @@
 name: cayenne-upgrade
 description: >
-  Cayenne state written by an older spiced (`--from <older spiced>`; without
-  it, a restart) is served by the binary under test: a partitioned file
-  acceleration, an append acceleration that keeps appending after the
+  Cayenne state written by each of the last two releases is served by the
+  binary under test: a partitioned file acceleration, an append acceleration that keeps appending after the
   upgrade, and an indexed acceleration answering point lookups; full
   refreshes on the new binary then replace what the old one wrote.
   (Snapshots are not in release builds, so they are not covered here.)
+
+matrix:
+  from: [2.3.x, 2.4.x]
+from: '${matrix.from}'
 
 sources:
   src: { kind: postgres }

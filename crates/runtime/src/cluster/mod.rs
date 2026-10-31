@@ -648,7 +648,6 @@ pub use runtime_cluster::{metrics_collector, pki};
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, remote_scheduler_addresses};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
-#[cfg(not(windows))]
 pub(crate) use service::discover_cayenne_tables;
 pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 
@@ -2671,7 +2670,7 @@ fn apply_distributed_execution_config(cfg: SessionConfig) -> SessionConfig {
     cfg
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 mod eager_merge_tests;
 
 #[cfg(test)]

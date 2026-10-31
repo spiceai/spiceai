@@ -316,10 +316,10 @@ jobs:
       - name: Set up the C and C++ toolchain
         uses: ./.github/actions/setup-cc
 
-      - name: Run the llama.cpp engine's model, differential, MTP, prefix-reuse and unsupported-architecture tests
+      - name: Run the llama.cpp engine's model, differential, MTP, prefix-reuse, Hugging Face resolution and unsupported-architecture tests
         env:
           # Metal runners do not have `xcrun metal`
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
         run: |
-          cargo test -p llms-llamacpp --features metal --test integration -- model:: differential:: distributed:: mtp:: prefix_reuse:: unsupported::
+          cargo test -p llms-llamacpp --features metal --test integration -- model:: differential:: distributed:: mtp:: prefix_reuse:: hf_resolution:: unsupported::
