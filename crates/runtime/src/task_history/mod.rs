@@ -16,14 +16,11 @@ limitations under the License.
 
 use crate::accelerated::refresh::Refresh;
 use crate::component::dataset::acceleration::OnConflictBehavior;
+use crate::datafusion::SPICE_RUNTIME_SCHEMA;
 use crate::dataupdate::UpdateType;
-use crate::internal_table::create_internal_accelerated_table;
+use crate::internal_table::{create_internal_accelerated_table, internal_acceleration};
 use crate::{Runtime, status};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
-use crate::{
-    component::dataset::acceleration::{Acceleration, Engine},
-    datafusion::SPICE_RUNTIME_SCHEMA,
-};
 use arrow::array::{ArrayBuilder, MapBuilder, RecordBatch, StringArray, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow_schema::ArrowError;
@@ -120,12 +117,7 @@ impl TaskSpan {
         let tbl_reference =
             TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);
 
-        // An internal table has no source, and Cayenne requires one.
-        let acceleration_settings = Acceleration {
-            engine: Engine::Arrow,
-            ..Acceleration::default()
-        }
-        .with_on_conflict(
+        let acceleration_settings = internal_acceleration().with_on_conflict(
             [(
                 ColumnReference::new(vec!["span_id".to_string()]),
                 OnConflictBehavior::Upsert(UpsertOptions::default()),

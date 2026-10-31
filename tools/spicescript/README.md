@@ -235,7 +235,7 @@ Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 | `spice-exec: <sql>` | Run a statement through `/v1/sql` (accepts `BEGIN; …; COMMIT;`); `expect-error`. |
 | `flight-put: { dataset, rows \| from-source }` | Write rows with Flight `DoPut`; `times: n` repeats it. |
 | `flight-exec: <sql>` | Flight SQL `ExecuteUpdate`; `count: n` affected rows. |
-| `http: { path, method, headers, body, api-key }` | One request; `expect: { status, headers, lacks-headers, body-contains, body-matches, body-lacks }`. |
+| `http: { path, method, query, headers, body, api-key }` | One request; `query:` maps URL parameters, which are encoded and appended to `path`. `expect: { status, headers, lacks-headers, body-contains, body-matches, body-lacks, json }`; `json` checks the body as JSON (see [JSON responses](#json-responses)). |
 | `spice: [args…]` | Run the `spice` CLI against the instance; `output-contains`, `expect-error`. |
 | `refresh: <dataset>` | Trigger a refresh and wait for it to finish; `expect-error`; `wait: false` only triggers it. |
 | `explain: <sql>` | `EXPLAIN` (`analyze: true`), requiring `contains:` fragments or the absence of `omits:` ones. |
@@ -479,6 +479,45 @@ After the run, every instance's final answer to each query is compared with the
 first instance's, so variants and binaries must agree even where a query names
 no oracle.
 
+### JSON responses
+
+`json:` under an `http` step's `expect` holds assertions on the response body
+parsed as JSON, for any endpoint that answers JSON (`/v1/sql`, `/v1/datasets`,
+`/v1/status`). Each names the values it checks with a JSON Pointer
+([RFC 6901](https://www.rfc-editor.org/rfc/rfc6901)), where a `*` segment stands
+for every element of an array or every member of an object:
+
+```yaml
+- http:
+    path: /v1/sql
+    headers: { content-type: text/plain }
+    body: SELECT task, span_id, labels FROM runtime.task_history
+  expect:
+    status: 200
+    json:
+      - { pointer: '', type: array, length: '>=1' }      # the whole body
+      - { pointer: /*/task, equals: sql_query }          # every row
+      - { pointer: /*/span_id, matches: '^[0-9a-f]{16}$' }
+      - { pointer: /*/labels/protocol, equals: http, count: '>=1' }
+      - { pointer: /0/missing, exists: false }
+```
+
+| Key | The values must |
+| --- | --- |
+| `equals` | equal this JSON value; numbers compare by value, so `7` equals `7.0` |
+| `matches` | match this regular expression (a non-string is matched as its JSON text) |
+| `type` | be `null`, `boolean`, `number`, `integer`, `string`, `array` or `object` |
+| `length` | have this many elements, members or characters: `3`, `'>=3'` or `'<=3'` |
+| `above`, `below` | be numbers strictly above or below this bound |
+| `exists: false` | not exist: the pointer reaches nothing |
+
+An assertion's keys all apply to each value. Without `count`, every value the
+pointer reaches must satisfy them, and it must reach at least one, so a pointer
+that matches nothing fails instead of passing vacuously. `count: N`, `'>=N'` or
+`'<=N'` instead requires that many of the reached values to satisfy them:
+`count: '>=1'` is "some row", `count: 0` is "no row". Like the other
+expectations, `json` retries under `eventually` and `consistently`.
+
 ### Corpora
 
 A `corpus: <file.sql>` step runs each statement in the file (relative to the
@@ -589,6 +628,7 @@ fails anywhere.
 | `runner/checks.rs` | Status, log, file and metric assertions. |
 | `runner/background.rs` | Background loops and their invariants. |
 | `runner/api.rs` | Refreshes, the `spice` CLI, HTTP steps, source queries. |
+| `json_assert.rs` | JSON Pointer predicates for the `http` step's `expect: { json }`. |
 | `runner/generators.rs` | TLP, random queries, sqllogictest. |
 | `runner/cluster.rs` | Scheduler and executors: arguments, readiness, spicepod changes. |
 | `spiced.rs` | One `spiced` process, or container: start, readiness, stop, Flight and HTTP clients. |

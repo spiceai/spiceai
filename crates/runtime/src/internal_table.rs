@@ -20,13 +20,15 @@ use std::sync::Arc;
 use arrow::datatypes::Schema;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool, TrackConsumersPool};
 use snafu::prelude::*;
+use std::num::NonZeroUsize;
 use tokio::sync::RwLock;
 
 use crate::Runtime;
 use crate::accelerated::{AcceleratedTableBuilderError, Retention};
 use crate::component::access::AccessMode;
-use crate::component::dataset::acceleration::Acceleration;
+use crate::component::dataset::acceleration::{Acceleration, Engine, Mode};
 use crate::component::dataset::builder::DatasetBuilder;
 use crate::federated::FederatedTable;
 use crate::secrets::Secrets;
@@ -35,6 +37,7 @@ use crate::{
     dataaccelerator::{self},
     dataconnector::{DataConnector, DataConnectorError, sink::SinkConnector},
 };
+use runtime_acceleration::{AccelerationSource, OnSchemaChange};
 use runtime_status as status;
 
 #[derive(Debug, Snafu)]
@@ -65,6 +68,166 @@ pub enum Error {
     UnableToBuildAcceleratedTable {
         source: AcceleratedTableBuilderError,
     },
+}
+
+/// The most memory the internal tables together hold before their memory pool
+/// refuses an allocation.
+const INTERNAL_TABLE_MEMORY_MAX_BYTES: u64 = 1 << 30;
+
+/// The memory budget of the internal tables: a tenth of `total_memory`, at most
+/// [`INTERNAL_TABLE_MEMORY_MAX_BYTES`].
+#[must_use]
+pub(crate) fn internal_table_memory_bytes(total_memory: u64) -> u64 {
+    (total_memory / 10).min(INTERNAL_TABLE_MEMORY_MAX_BYTES)
+}
+
+/// The memory pool the internal tables are created with (see
+/// [`crate::datafusion::DataFusion::internal_table_context`]), separate from the
+/// query memory pool.
+pub(crate) fn internal_table_memory_pool(total_memory: u64) -> Arc<dyn MemoryPool> {
+    let Some(top_consumers) = NonZeroUsize::new(5) else {
+        unreachable!("5 is not zero");
+    };
+    // The runtime supports only 64-bit platforms, so the cast does not truncate.
+    #[expect(clippy::cast_possible_truncation)]
+    let bytes = internal_table_memory_bytes(total_memory) as usize;
+    Arc::new(TrackConsumersPool::new(
+        GreedyMemoryPool::new(bytes),
+        top_consumers,
+    ))
+}
+
+/// The acceleration of an internal table (`runtime.task_history`,
+/// `runtime.metrics`): Cayenne in memory, so nothing it holds is written to disk.
+#[must_use]
+pub fn internal_acceleration() -> Acceleration {
+    Acceleration {
+        engine: Engine::Cayenne,
+        mode: Mode::Memory,
+        ..Acceleration::default()
+    }
+}
+
+/// The [`AccelerationSource`] of a table the runtime creates for itself rather
+/// than one a Spicepod declares. The accelerator reads it for configuration
+/// only: an internal table's rows arrive by writes to its acceleration, or by
+/// its own refresh, never through a connector the source names.
+#[derive(Clone)]
+pub struct InternalAccelerationSource {
+    app: Arc<app::App>,
+    name: TableReference,
+    acceleration: Acceleration,
+    secrets: Arc<RwLock<Secrets>>,
+}
+
+impl InternalAccelerationSource {
+    /// The source of the internal table `name`, accelerated as `acceleration`
+    /// asks, which must be in memory.
+    ///
+    /// # Errors
+    ///
+    /// When `acceleration` is file-backed, or the runtime has no app loaded.
+    pub async fn new(
+        runtime: &Runtime,
+        name: TableReference,
+        acceleration: Acceleration,
+        secrets: Arc<RwLock<Secrets>>,
+    ) -> Result<Self, Error> {
+        if acceleration.mode != Mode::Memory {
+            return Err(Error::Internal {
+                code: "IT-IAS-MODE".to_string(), // InternalTable - InternalAccelerationSource - Mode
+                source: format!("internal table {name} must be accelerated in memory").into(),
+            });
+        }
+        let app = runtime
+            .app()
+            .read()
+            .await
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                Error::Internal {
+                    code: "IT-IAS-GA".to_string(), // InternalTable - InternalAccelerationSource - GetApp
+                    source: "No App instance found in Runtime".into(),
+                }
+            })?;
+        Ok(Self {
+            app,
+            name,
+            acceleration,
+            secrets,
+        })
+    }
+}
+
+impl AccelerationSource for InternalAccelerationSource {
+    fn clone_arc(&self) -> Arc<dyn AccelerationSource> {
+        Arc::new(self.clone())
+    }
+
+    fn is_file_accelerated(&self) -> bool {
+        // `new` admits only memory mode.
+        false
+    }
+
+    fn app(&self) -> Arc<app::App> {
+        Arc::clone(&self.app)
+    }
+
+    fn secrets(&self) -> Arc<RwLock<Secrets>> {
+        Arc::clone(&self.secrets)
+    }
+
+    fn snapshot_notifications(
+        &self,
+    ) -> Option<Arc<runtime_acceleration::snapshot::notifications::SnapshotNotifications>> {
+        // An internal table is never loaded from a snapshot.
+        None
+    }
+
+    fn acceleration(&self) -> Option<&Acceleration> {
+        Some(&self.acceleration)
+    }
+
+    fn name(&self) -> &TableReference {
+        &self.name
+    }
+
+    fn connector_name(&self) -> Option<&str> {
+        // No `from:` names a connector: the runtime writes the rows itself.
+        None
+    }
+
+    fn on_schema_change(&self) -> Option<OnSchemaChange> {
+        // The runtime defines the schema, and it never changes under a running table.
+        None
+    }
+
+    fn allows_write(&self) -> bool {
+        // The runtime writes these tables directly, so a scan must read its own writes.
+        true
+    }
+
+    fn time_column(&self) -> Option<&str> {
+        // Retention is the accelerated table's (`Retention`), not the accelerator's.
+        None
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    /// An internal table has no snapshot to reconcile a checkpoint against.
+    /// Reports that rather than handing back a no-op checkpointer, which would
+    /// read as "checkpoint present and empty" to the snapshot bootstrap.
+    fn checkpointer_factory(
+        &self,
+        _snapshot_behavior: runtime_acceleration::snapshot::SnapshotBehavior,
+    ) -> runtime_acceleration::dataset_checkpoint::DatasetCheckpointerFactory {
+        runtime_acceleration::dataset_checkpoint::make_checkpointer_factory(|| async {
+            Err("an internal table has no accelerator checkpoint".into())
+        })
+    }
 }
 
 async fn get_local_table_provider(
@@ -130,6 +293,13 @@ pub async fn create_internal_accelerated_table(
 ) -> Result<Arc<AcceleratedTable>, Error> {
     let source_table_provider =
         get_local_table_provider(&name, &schema, primary_key.clone(), Arc::clone(&runtime)).await?;
+    let source = InternalAccelerationSource::new(
+        &runtime,
+        name.clone(),
+        acceleration.clone(),
+        Arc::clone(&secrets),
+    )
+    .await?;
     let federated_table = Arc::new(FederatedTable::new_unchecked(Arc::clone(
         &source_table_provider,
     )));
@@ -141,8 +311,8 @@ pub async fn create_internal_accelerated_table(
             Arc::clone(&source_table_provider).constraints(),
             &acceleration,
             secrets,
-            None,
-            Arc::clone(&runtime.df.ctx),
+            Some(&source),
+            runtime.df.internal_table_context(),
         )
         .await
         .context(UnableToCreateAcceleratedTableProviderSnafu)?;
@@ -168,4 +338,18 @@ pub async fn create_internal_accelerated_table(
         .context(UnableToBuildAcceleratedTableSnafu)?;
 
     Ok(Arc::new(accelerated_table))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::internal_table_memory_bytes;
+
+    #[test]
+    fn internal_tables_get_a_tenth_of_memory_up_to_one_gib() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(internal_table_memory_bytes(4 * GIB), 4 * GIB / 10);
+        assert_eq!(internal_table_memory_bytes(10 * GIB), GIB);
+        assert_eq!(internal_table_memory_bytes(256 * GIB), GIB);
+        assert_eq!(internal_table_memory_bytes(0), 0);
+    }
 }
