@@ -104,6 +104,90 @@ pub fn load_adbc_database(
         .context(CreateDatabaseSnafu)
 }
 
+/// Errors opening the installed `DuckDB` for a managed connector.
+#[derive(Debug, snafu::Snafu)]
+pub enum ManagedDuckDbError {
+    #[snafu(display(
+        "Failed to load the installed DuckDB library. Install libduckdb on the system library path or register the 'duckdb' ADBC driver manifest. For details, visit: https://spiceai.org/docs/components/data-connectors/{connector}"
+    ))]
+    MissingLibrary {
+        connector: &'static str,
+        source: AdbcInitError,
+    },
+    #[snafu(display(
+        "Failed to load the installed DuckDB library: version {found} is older than the minimum supported version 1.5.0. Install DuckDB 1.5.0 or later. For details, visit: https://spiceai.org/docs/components/data-connectors/{connector}"
+    ))]
+    UnsupportedVersion {
+        found: String,
+        connector: &'static str,
+    },
+    #[snafu(display(
+        "Failed to determine the installed DuckDB version '{found}'. Install DuckDB 1.5.0 or later. For details, visit: https://spiceai.org/docs/components/data-connectors/{connector}"
+    ))]
+    InvalidVersion {
+        found: String,
+        connector: &'static str,
+    },
+    #[snafu(display("Failed to query the installed DuckDB version: {source}"))]
+    QueryVersion {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+/// Compares a `DuckDB` version with the minimum supported version, 1.5.0.
+/// Returns `None` when the version cannot be parsed.
+#[must_use]
+pub fn duckdb_version_is_supported(version: &str) -> Option<bool> {
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.split('-').next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch) >= (1, 5, 0))
+}
+
+/// Checks the installed version once. Call on a blocking thread after opening
+/// a managed database; direct `adbc:` connections retain their driver defaults.
+///
+/// # Errors
+/// Returns an error for an old, unknown, or unreadable version.
+pub fn check_duckdb_version(
+    database: &adbc_driver_manager::ManagedDatabase,
+    connector: &'static str,
+) -> Result<(), ManagedDuckDbError> {
+    use adbc_core::{Connection as _, Database as _, Statement as _};
+    let query = || -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let mut connection = database.new_connection()?;
+        let mut statement = connection.new_statement()?;
+        statement.set_sql_query("SELECT version()")?;
+        let mut reader = statement.execute()?;
+        let batch = reader.next().ok_or("DuckDB returned no version")??;
+        if batch.num_rows() != 1 || batch.num_columns() != 1 {
+            return Err("DuckDB returned an invalid version result".into());
+        }
+        let column = batch.column(0);
+        if column.is_null(0) {
+            return Err("DuckDB returned a NULL version".into());
+        }
+        if let Some(values) = column.as_any().downcast_ref::<StringArray>() {
+            return Ok(values.value(0).to_owned());
+        }
+        if let Some(values) = column.as_any().downcast_ref::<LargeStringArray>() {
+            return Ok(values.value(0).to_owned());
+        }
+        Err("DuckDB returned a non-string version".into())
+    };
+    let found = query().map_err(|source| ManagedDuckDbError::QueryVersion { source })?;
+    match duckdb_version_is_supported(&found) {
+        Some(true) => Ok(()),
+        Some(false) => Err(ManagedDuckDbError::UnsupportedVersion { found, connector }),
+        None => Err(ManagedDuckDbError::InvalidVersion { found, connector }),
+    }
+}
+
 /// Bounds the wait for blocking driver initialization to two minutes.
 ///
 /// Aborting cannot interrupt FFI already executing on the blocking thread.
@@ -465,6 +549,39 @@ fn bigquery_string_literal(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn managed_duckdb_version_floor() {
+        for (version, expected) in [
+            ("v1.4.4", Some(false)),
+            ("v1.5.0", Some(true)),
+            ("v2.0.0", Some(true)),
+            ("v1.5.6-dev123", Some(true)),
+            ("unknown", None),
+        ] {
+            assert_eq!(
+                super::duckdb_version_is_supported(version),
+                expected,
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_duckdb_version_error_text() {
+        for connector in ["duckdb", "ducklake"] {
+            assert_eq!(
+                super::ManagedDuckDbError::UnsupportedVersion {
+                    found: "v1.4.4".into(),
+                    connector
+                }
+                .to_string(),
+                format!(
+                    "Failed to load the installed DuckDB library: version v1.4.4 is older than the minimum supported version 1.5.0. Install DuckDB 1.5.0 or later. For details, visit: https://spiceai.org/docs/components/data-connectors/{connector}"
+                )
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

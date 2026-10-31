@@ -709,7 +709,7 @@
       "who": "federated",
       "key": "query: SELECT id, char_length(s) AS chars, octet_length(s) AS bytes FROM t WHERE s IS NOT NULL",
       "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: No function matches the given name and argument types 'octet_length(VARCHAR)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\toctet_length(BLO",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nInternal: Binder Error: No function matches the given name and argument types 'octet_length(VARCHAR)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\toctet_",
       "group": "files-and-lakes"
     }
   ],

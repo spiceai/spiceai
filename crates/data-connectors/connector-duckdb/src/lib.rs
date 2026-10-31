@@ -182,6 +182,12 @@ impl DuckDB {
                     }
                     source => Error::Initialize { source },
                 })?;
+                data_components::adbc_helpers::check_duckdb_version(&db, "duckdb").map_err(
+                    |source| Error::Setup {
+                        component: component.clone(),
+                        source: Box::new(source),
+                    },
+                )?;
                 let joins = if database_path == ":memory:" {
                     JoinPushDown::Disallow
                 } else {

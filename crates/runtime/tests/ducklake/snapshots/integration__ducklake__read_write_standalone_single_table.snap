@@ -2,15 +2,15 @@
 source: crates/runtime/tests/ducklake/mod.rs
 expression: plan
 ---
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                                      |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Federated                                                                                                                                                                 |
-|               |  Projection: my_orders.id, my_orders.total                                                                                                                                |
-|               |   TableScan: my_orders projection=[id, total], full_filters=[my_orders.id > Int64(1)]                                                                                     |
-| physical_plan | SchemaCastScanExec                                                                                                                                                        |
-|               |   CooperativeExec                                                                                                                                                         |
-|               |     BytesProcessedExec                                                                                                                                                    |
-|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: base_sql=SELECT "orders"."id", "orders"."total" FROM "ducklake"."main"."orders" WHERE ("orders"."id" > 1) |
-|               |                                                                                                                                                                           |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                     |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                                                                |
+|               |  Projection: my_orders.id, my_orders.total                                                                                                                                               |
+|               |   TableScan: my_orders projection=[id, total], full_filters=[my_orders.id > Int64(1)]                                                                                                    |
+| physical_plan | SchemaCastScanExec                                                                                                                                                                       |
+|               |   CooperativeExec                                                                                                                                                                        |
+|               |     BytesProcessedExec                                                                                                                                                                   |
+|               |       VirtualExecutionPlan name=adbc compute_context=ducklake:<HASH> base_sql=SELECT "orders"."id", "orders"."total" FROM "ducklake"."main"."orders" WHERE ("orders"."id" > 1) |
+|               |                                                                                                                                                                                          |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

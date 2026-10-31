@@ -4650,12 +4650,12 @@ dependencies = [
 name = "connector-ducklake"
 version = "2.5.0-unstable"
 dependencies = [
+ "adbc_driver_manager",
  "async-trait",
  "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
- "duckdb",
  "linkme",
  "runtime",
  "runtime-component",
