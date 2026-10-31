@@ -66,6 +66,7 @@
   "iceberg-refresh": 11,
   "iceberg-write": 5,
   "index-equivalence": 10,
+  "int64-overflow": 1,
   "kafka": 11,
   "kafka-partitions": 11,
   "kafka-sasl": 11,
