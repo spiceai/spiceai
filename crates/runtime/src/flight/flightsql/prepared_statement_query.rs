@@ -49,8 +49,8 @@ use crate::{
         request_context_extension::get_current_datafusion,
     },
     flight::{
-        Service, is_auth_read_only, metrics, record_batches_to_flight_stream, to_tonic_err,
-        transaction_error_to_status,
+        Service, is_auth_read_only, metrics, to_tonic_err, transaction_error_to_status,
+        transaction_outcome_to_flight_stream,
         util::{attach_cache_metadata, set_flightsql_protocol},
     },
 };
@@ -393,15 +393,11 @@ pub(crate) async fn do_get(
         let context_clone = Arc::clone(&context);
         let outcome = context_clone
             .scope(async {
-                run_transaction(&datafusion, &statements, param_values, read_only).await
+                run_transaction(&datafusion, &statements, param_values, read_only, |_| 0).await
             })
             .await
             .map_err(transaction_error_to_status)?;
-        let batches = outcome
-            .result
-            .map(|(batches, _)| batches)
-            .unwrap_or_default();
-        let stream = record_batches_to_flight_stream(batches);
+        let stream = transaction_outcome_to_flight_stream(outcome);
         let timed = TimedStream::new(stream, move || start);
         return Ok(Response::new(
             Box::pin(timed) as <Service as FlightService>::DoGetStream

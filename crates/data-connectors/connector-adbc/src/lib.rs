@@ -14,11 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use adbc_core::options::AdbcVersion;
+use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
+use adbc_driver_manager::ManagedDriver;
 use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use async_trait::async_trait;
 use data_components::adbc_helpers::{
-    await_adbc_initialization, build_db_options, driver_entrypoint, load_adbc_database,
-    normalize_driver_option_key,
+    await_adbc_initialization, build_db_options, connection_secrets, driver_entrypoint,
+    normalize_driver_option_key, scrub_connection_secrets,
 };
 use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use data_connector_api::ConnectorContext;
@@ -56,11 +59,6 @@ type ManagedAdbcTableFactory = AdbcTableFactoryWithPolicy<adbc_driver_manager::M
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("{source}"))]
-    InitializeDriver {
-        source: data_components::adbc_helpers::AdbcInitError,
-    },
-
     #[snafu(display("Missing required parameter: adbc_driver"))]
     MissingAdbcDriver,
 
@@ -81,22 +79,21 @@ pub enum Error {
         source: adbc_core::error::Error,
     },
 
-    #[snafu(display(
-        "Failed to create ADBC database (driver='{driver_location}', uri='{uri}'): {source}"
-    ))]
+    /// `message` is the driver's error with the connection's credentials
+    /// scrubbed; the raw error is not kept because drivers echo the URI.
+    #[snafu(display("Failed to create ADBC database (driver='{driver_location}'): {message}"))]
     UnableToCreateDatabase {
         driver_location: String,
-        uri: String,
-        source: adbc_core::error::Error,
+        message: String,
     },
 
+    /// `message` is the pool error with the connection's credentials scrubbed.
     #[snafu(display(
-        "Failed to create ADBC connection pool (driver='{driver_location}', uri='{uri}'): {source}"
+        "Failed to create ADBC connection pool (driver='{driver_location}'): {message}"
     ))]
     UnableToCreateConnectionPool {
         driver_location: String,
-        uri: String,
-        source: datafusion_table_providers::sql::db_connection_pool::Error,
+        message: String,
     },
 
     #[snafu(display(
@@ -318,6 +315,7 @@ impl AdbcFactory {
         let driver_options = params.parameters.get("driver_options").expose().ok();
         let db_options =
             build_db_options(driver_name, &uri_str, username, password, driver_options);
+        let secrets = connection_secrets(&uri_str, password, driver_options);
 
         let pool_identity =
             resolve_pool_identity(&driver_name_owned, &uri_str, &params).map_err(|e| {
@@ -399,8 +397,24 @@ impl AdbcFactory {
         // the driver supports them for stricter cancellation.
         let entrypoint = driver_entrypoint(driver_name);
         let init_handle = tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
-            let db = load_adbc_database(&driver_location, entrypoint, db_options)
-                .context(InitializeDriverSnafu)?;
+            let mut driver = ManagedDriver::load_from_name(
+                &driver_location,
+                entrypoint,
+                AdbcVersion::V110,
+                LOAD_FLAG_DEFAULT,
+                None,
+            )
+            .context(UnableToLoadDriverSnafu {
+                driver_location: driver_location.clone(),
+            })?;
+
+            let db = driver.new_database_with_opts(db_options).map_err(|e| {
+                UnableToCreateDatabaseSnafu {
+                    driver_location: driver_location.clone(),
+                    message: scrub_connection_secrets(&e.to_string(), &secrets),
+                }
+                .build()
+            })?;
 
             let mut pool_builder = AdbcConnectionPoolBuilder::new(db)
                 .with_max_size(pool_size)
@@ -411,12 +425,13 @@ impl AdbcFactory {
                 pool_builder = pool_builder.with_conn_options(conn_opts);
             }
 
-            let pool = pool_builder
-                .build()
-                .context(UnableToCreateConnectionPoolSnafu {
+            let pool = pool_builder.build().map_err(|e| {
+                UnableToCreateConnectionPoolSnafu {
                     driver_location,
-                    uri: uri_str,
-                })?;
+                    message: scrub_connection_secrets(&e.to_string(), &secrets),
+                }
+                .build()
+            })?;
 
             Ok(Arc::new(pool))
         });

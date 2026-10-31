@@ -581,10 +581,12 @@ mod tests {
         assert!(decoded.iter().all(|&b| b == b'A'));
     }
 
-    /// Byte `i` of a body that compresses poorly for its first `PADDING` bytes and
+    /// How many bytes at the start of [`padded_bomb`] are incompressible.
+    const PADDING: usize = MIB;
+
+    /// Byte `i` of a body that compresses poorly for its first [`PADDING`] bytes and
     /// extremely well after them.
     fn padded_bomb(i: usize) -> u8 {
-        const PADDING: usize = MIB;
         if i >= PADDING {
             return b'A';
         }
@@ -615,11 +617,15 @@ mod tests {
         else {
             panic!("expected a compression ratio error, got {error:?}");
         };
-        // The padding lets the body decode well past the floor, but never past the ratio
-        // times what was received by more than the block that crossed it.
+        // Incompressible padding is received byte for byte, so it carries the body past the
+        // floor to at least the ratio times the padding, but never past the ratio times what
+        // was received by more than the block that crossed it. Where between those the
+        // refusal lands depends on the zlib the encoder links and on how much each socket
+        // read delivers, so the test bounds only these.
+        const { assert!(PADDING * MAX_COMPRESSION_RATIO > RATIO_CHECK_FLOOR_BYTES) };
         assert!(
-            decoded > 2 * RATIO_CHECK_FLOOR_BYTES,
-            "refused at {decoded} bytes"
+            decoded > PADDING * MAX_COMPRESSION_RATIO,
+            "refused at {decoded} bytes from {received} received"
         );
         assert!(decoded > received * MAX_COMPRESSION_RATIO);
         assert!(

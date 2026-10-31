@@ -21,7 +21,7 @@ limitations under the License.
 
 use std::path::{Path, PathBuf};
 
-use llms::chat::hf_files::download_model;
+use llms::chat::hf_files::{Budget, download_model};
 use llms::hf::HubParams;
 
 const REPO_ID: &str = "spiceai-test/safetensors-not-on-the-hub";
@@ -48,9 +48,15 @@ async fn a_shard_the_cache_lacks_is_reported_as_not_cached() {
         std::fs::write(snapshot.join(file), contents).expect("writes the cached file");
     }
 
-    let error = download_model(REPO_ID, &[], HubParams::default(), "test")
-        .await
-        .expect_err("the second shard is not in the cache");
+    let error = download_model(
+        REPO_ID,
+        &[],
+        Budget::Unmeasured,
+        HubParams::default(),
+        "test",
+    )
+    .await
+    .expect_err("the second shard is not in the cache");
     assert_eq!(
         error.to_string(),
         format!(

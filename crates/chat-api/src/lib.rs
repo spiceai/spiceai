@@ -45,7 +45,9 @@ use tracing_futures::Instrument;
 
 use crate::streaming_utils::generate_stream_id;
 
+pub mod model_info;
 pub mod streaming_utils;
+pub mod wire;
 
 #[derive(Debug, Snafu)]
 // Selectors are `pub`: provider crates construct e.g. `FailedToRunModelSnafu` across the
@@ -603,6 +605,31 @@ pub trait Chat: Sync + Send {
             service_tier: None,
         })
     }
+
+    /// The model's token limits, as far as it reports them: a local model's context size,
+    /// or what a hosted model's provider reports in its model metadata. Each limit is `None`
+    /// when it is not known — never an estimate, since a client sizes its context management
+    /// and its answers by them.
+    ///
+    /// Asked when the model loads and each time `/v1/models` lists it. A hosted model reads
+    /// its provider's model metadata once per endpoint and keeps it, so only the first call
+    /// may wait on the provider.
+    ///
+    /// A type that wraps another `Chat` must forward this to the model it wraps: the default
+    /// answers no limits, which would hide the inner model's.
+    async fn token_limits(&self) -> TokenLimits {
+        TokenLimits::default()
+    }
+}
+
+/// A model's token limits. Each is `None` when the model or its provider does not report it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenLimits {
+    /// The most tokens one request can hold, prompt and answer together.
+    pub context_window: Option<u64>,
+    /// The most tokens one answer can hold, where the provider or engine enforces such a
+    /// cap. Never derived from the context window.
+    pub max_output_tokens: Option<u64>,
 }
 
 #[cfg(test)]

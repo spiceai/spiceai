@@ -13,7 +13,9 @@ SELECT id, i FROM t WHERE i > 10;
 -- keeps federated: big
 -- keeps adbc: big
 SELECT id FROM t;
--- A limit, alone and under ORDER BY, with OFFSET.
+-- A limit, alone and under ORDER BY, with OFFSET. The sort names its NULL
+-- placement, which both sources can state: MySQL cannot place NULLs first in a
+-- descending sort, so Spice keeps `ORDER BY f DESC` (NULLS FIRST) local there.
 -- sends federated: LIMIT 5
 -- sends adbc: LIMIT 5
 SELECT count(*) AS n FROM (SELECT id, s FROM t LIMIT 5) AS l;
@@ -21,7 +23,7 @@ SELECT count(*) AS n FROM (SELECT id, s FROM t LIMIT 5) AS l;
 -- sends adbc: ORDER BY
 -- sends federated: LIMIT 7
 -- sends adbc: LIMIT 7
-SELECT id, f FROM t ORDER BY f DESC, id LIMIT 7;
+SELECT id, f FROM t ORDER BY f DESC NULLS LAST, id LIMIT 7;
 -- sends federated: LIMIT 5 OFFSET 10
 -- sends adbc: LIMIT 5 OFFSET 10
 SELECT id FROM t ORDER BY id LIMIT 5 OFFSET 10;

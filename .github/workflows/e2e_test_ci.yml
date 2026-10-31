@@ -3007,8 +3007,14 @@ jobs:
             --spiced "$(command -v spiced)" \
             --work-dir "$RUNNER_TEMP/spicescript/harness-checks"
 
+      # Upgrade scripts start on the release their `from:` names and upgrade
+      # to this build: spicescript resolves `X.Y.x` against the GitHub releases
+      # and downloads each release it needs into ~/.cache/spicescript, so no
+      # `--from` is passed here. The token is for the releases API's rate limit.
       - name: Run scenario scripts
         if: ${{ !matrix.older_duckdb }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           "${{ steps.spicescript.outputs.path }}" --jobs 4 \
             --partition ${{ matrix.partition }} \
@@ -3024,6 +3030,8 @@ jobs:
       # each older listed release.
       - name: Run DuckDB scripts on older DuckDB releases
         if: ${{ matrix.older_duckdb }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           status=0
           for version in $(jq -r '.versions[:-1][].version' test/duckdb_versions.json); do

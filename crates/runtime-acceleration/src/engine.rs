@@ -15,7 +15,10 @@ use std::fmt::Display;
 
 /// The acceleration engines. Every engine but [`Engine::Cayenne`] is deprecated in v2.4
 /// and will be removed in v2.5.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// The default is the engine named by [`spicepod::acceleration::DEFAULT_ENGINE`]: the
+/// one an acceleration uses when it does not set `engine`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Engine {
     Arrow,
     PartitionedArrow,
@@ -23,6 +26,7 @@ pub enum Engine {
     Sqlite,
     Turso,
     PostgreSQL,
+    #[default]
     Cayenne,
 }
 
@@ -33,18 +37,6 @@ impl Engine {
         match self {
             Engine::PartitionedArrow => Engine::Arrow,
             other => *other,
-        }
-    }
-}
-
-/// The engine named by [`spicepod::acceleration::DEFAULT_ENGINE`]: the one an
-/// acceleration uses when it does not set `engine`.
-impl Default for Engine {
-    fn default() -> Self {
-        if cfg!(windows) {
-            Engine::Arrow
-        } else {
-            Engine::Cayenne
         }
     }
 }

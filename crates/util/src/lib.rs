@@ -136,8 +136,49 @@ pub fn parse_enabled(value: &str) -> bool {
     value.eq_ignore_ascii_case("enabled")
 }
 
+/// Wait until the process is asked to shut down: SIGTERM or SIGINT, or on Windows
+/// Ctrl-C, Ctrl-Break, close or shutdown.
+///
+/// Every call waits on one process-wide latch, so a caller that starts waiting after the
+/// signal arrived still sees it. A listener per call would not: a signal reaches only the
+/// listeners that already exist, so one delivered while the runtime starts would stop the
+/// startup and never the servers that begin listening later.
 pub async fn shutdown_signal() {
-    shutdown_signal_impl().await;
+    wait_for_latch(&SHUTDOWN_REQUESTED, shutdown_signal_impl).await;
+}
+
+/// Whether the process has been asked to shut down, set once by the listener the first
+/// [`shutdown_signal`] call starts.
+static SHUTDOWN_REQUESTED: std::sync::OnceLock<tokio::sync::watch::Receiver<bool>> =
+    std::sync::OnceLock::new();
+
+/// Wait until `latch` is set. The first caller starts `listen` on its runtime, and sets
+/// the latch when it completes.
+///
+/// When that runtime ends before `listen` completes, nothing can set the latch any more,
+/// so the caller listens itself rather than report a shutdown nobody asked for.
+async fn wait_for_latch<F, Fut>(
+    latch: &'static std::sync::OnceLock<tokio::sync::watch::Receiver<bool>>,
+    listen: F,
+) where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut requested = latch
+        .get_or_init(|| {
+            let (set, requested) = tokio::sync::watch::channel(false);
+            let listening = listen();
+            tokio::spawn(async move {
+                listening.await;
+                // Every waiter may be gone already; the latch stays set for later ones.
+                set.send_replace(true);
+            });
+            requested
+        })
+        .clone();
+    if requested.wait_for(|requested| *requested).await.is_err() {
+        listen().await;
+    }
 }
 
 /// Waits for an additional Ctrl-C after the initial shutdown signal to trigger a forced shutdown.
@@ -271,6 +312,67 @@ pub const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usi
         j += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod shutdown_latch_tests {
+    use super::wait_for_latch;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, OnceLock};
+    use std::time::Duration;
+    use tokio::sync::{Notify, watch};
+
+    /// A signal stand-in: like an OS signal, `Notify::notify_waiters` reaches only the
+    /// listeners that exist when it fires, and none that start listening afterwards.
+    fn listener(
+        signal: &Arc<Notify>,
+    ) -> impl Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + use<> {
+        let signal = Arc::clone(signal);
+        move || {
+            let signal = Arc::clone(&signal);
+            Box::pin(async move { signal.notified().await })
+        }
+    }
+
+    // regression test for #15666: a shutdown signal that arrives before a caller starts
+    // waiting still reaches that caller.
+    #[tokio::test]
+    async fn a_waiter_that_starts_after_the_signal_still_sees_it() {
+        static LATCH: OnceLock<watch::Receiver<bool>> = OnceLock::new();
+        let signal = Arc::new(Notify::new());
+
+        // The first waiter starts listening, as the runtime's startup does.
+        let first = tokio::spawn(wait_for_latch(&LATCH, listener(&signal)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        signal.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("the first waiter returns once the signal arrives")
+            .expect("the first waiter does not panic");
+
+        // A waiter that starts afterwards, as the servers do, returns at once.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_latch(&LATCH, listener(&signal)),
+        )
+        .await
+        .expect("a later waiter sees the signal that already arrived");
+    }
+
+    #[tokio::test]
+    async fn no_waiter_returns_before_the_signal() {
+        static LATCH: OnceLock<watch::Receiver<bool>> = OnceLock::new();
+        let signal = Arc::new(Notify::new());
+        let waiting = tokio::spawn(wait_for_latch(&LATCH, listener(&signal)));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "no signal has arrived");
+        signal.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the waiter returns once the signal arrives")
+            .expect("the waiter does not panic");
+    }
 }
 
 #[cfg(test)]
