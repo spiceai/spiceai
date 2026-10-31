@@ -104,7 +104,8 @@ steps:
     expect: { rows: [['100']] }
 
   # The same rows over HTTP, checked as JSON where their values cannot be
-  # literal: ids, times and durations.
+  # literal: ids, times and durations. A `*` pointer reaches only the rows that
+  # carry the field, so `count: 100` is what makes every row carry it.
   - http:
       path: /v1/sql
       headers: { content-type: text/plain }
@@ -116,12 +117,12 @@ steps:
       status: 200
       json:
         - { pointer: '', type: array, length: 100 }
-        - { pointer: /*/task, equals: sql_query }
-        - { pointer: /*/trace_id, matches: '^[0-9a-f]{32}$' }
-        - { pointer: /*/span_id, matches: '^[0-9a-f]{16}$' }
-        - { pointer: /*/start_time, matches: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+' }
-        - { pointer: /*/execution_duration_ms, type: number, above: -1 }
-        - { pointer: /*/labels, type: object }
+        - { pointer: /*/task, equals: sql_query, count: 100 }
+        - { pointer: /*/trace_id, matches: '^[0-9a-f]{32}$', count: 100 }
+        - { pointer: /*/span_id, matches: '^[0-9a-f]{16}$', count: 100 }
+        - { pointer: /*/start_time, matches: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+', count: 100 }
+        - { pointer: /*/execution_duration_ms, type: number, above: -1, count: 100 }
+        - { pointer: /*/labels, type: object, count: 100 }
 
   # A trace id the client pins is written onto rows already recorded under the
   # generated one: they are replaced, not copied.

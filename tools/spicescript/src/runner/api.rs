@@ -289,7 +289,7 @@ pub(super) async fn http_step(instance: &Instance, step: &HttpStep) -> Result<St
 }
 
 /// `path` with `query` encoded and appended, after any query string `path`
-/// already carries.
+/// already carries and before any `#fragment`, which a client never sends.
 fn with_query(path: &str, query: &[(String, String)]) -> String {
     if query.is_empty() {
         return path.to_string();
@@ -298,8 +298,9 @@ fn with_query(path: &str, query: &[(String, String)]) -> String {
         .iter()
         .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
         .collect();
-    let separator = if path.contains('?') { '&' } else { '?' };
-    format!("{path}{separator}{}", encoded.join("&"))
+    let (before, fragment) = path.split_at(path.find('#').unwrap_or(path.len()));
+    let separator = if before.contains('?') { '&' } else { '?' };
+    format!("{before}{separator}{}{fragment}", encoded.join("&"))
 }
 
 /// Percent-encodes everything but RFC 3986's unreserved characters.
@@ -359,5 +360,32 @@ pub(super) async fn source_query(
             return outcome;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_query;
+
+    #[test]
+    fn query_parameters_go_before_a_fragment() {
+        let query = [
+            ("limit".to_string(), "1".to_string()),
+            ("q".to_string(), "a b&c".to_string()),
+        ];
+        assert_eq!(with_query("/v1/sql", &query), "/v1/sql?limit=1&q=a%20b%26c");
+        assert_eq!(
+            with_query("/v1/sql?a=b", &query),
+            "/v1/sql?a=b&limit=1&q=a%20b%26c"
+        );
+        assert_eq!(
+            with_query("/v1/sql#result", &query),
+            "/v1/sql?limit=1&q=a%20b%26c#result"
+        );
+        assert_eq!(
+            with_query("/v1/sql?a=b#x?y", &query),
+            "/v1/sql?a=b&limit=1&q=a%20b%26c#x?y"
+        );
+        assert_eq!(with_query("/v1/sql#result", &[]), "/v1/sql#result");
     }
 }
