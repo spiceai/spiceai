@@ -333,10 +333,15 @@ fn percent_decoded(value: &str) -> String {
 /// raw `?`, `#` or `\\`, and splits the query only on `&`), so the userinfo and
 /// query are collected under each reading.
 ///
+/// For `DuckDB` the URI is the database file's path, which a user needs in an
+/// error to fix a wrong path, so the whole URI is kept; its query-string
+/// credentials (a `MotherDuck` token) are still collected.
+///
 /// Pass the result to [`scrub_connection_secrets`] before a driver error is
 /// shown to the user or logged.
 #[must_use]
 pub fn connection_secrets(
+    driver_name: &str,
     uri: &str,
     password: Option<&str>,
     driver_options: Option<&str>,
@@ -351,7 +356,9 @@ pub fn connection_secrets(
         }
     };
 
-    push(uri, 1);
+    if driver_name != DUCKDB_DRIVER {
+        push(uri, 1);
+    }
     if let Some(password) = password {
         push(password, 1);
     }
@@ -931,6 +938,7 @@ mod scrub_tests {
     fn scrub_connection_secrets_removes_uri_and_credentials() {
         let uri = "postgresql://alice:CANARY%ZZTOKEN@db.example.com:5432/app?sslmode=require&access_token=tok-secret-1";
         let secrets = connection_secrets(
+            "postgresql",
             uri,
             Some("param-secret"),
             Some("adbc.token=opt-secret;adbc.timeout=30"),
@@ -959,7 +967,8 @@ mod scrub_tests {
 
     #[test]
     fn scrub_connection_secrets_handles_token_user_and_decoded_forms() {
-        let secrets = connection_secrets("snowflake://tok%40en123@acct/db", None, None);
+        let secrets =
+            connection_secrets("snowflake", "snowflake://tok%40en123@acct/db", None, None);
         assert_eq!(
             scrub_connection_secrets("rejected tok@en123 and tok%40en123", &secrets),
             "rejected *** and ***"
@@ -972,7 +981,7 @@ mod scrub_tests {
             "postgresql://localhost/db?password=CANARY;SECRET%ZZ",
             "postgresql://localhost/db?pass%77ord=CANARY%ZZSECRET",
         ] {
-            let secrets = connection_secrets(uri, None, None);
+            let secrets = connection_secrets("postgresql", uri, None, None);
             let start = uri.find("CANARY").expect("canary");
             let echoed = &uri[start..uri[start..].find('@').map_or(uri.len(), |i| start + i)];
             let scrubbed =
@@ -981,6 +990,7 @@ mod scrub_tests {
         }
         // Short explicit credentials, echoed on their own.
         let secrets = connection_secrets(
+            "postgresql",
             "postgresql://localhost/db?token=t1",
             Some("abc"),
             Some("adbc.secret=s2;adbc.api_key=k3"),
@@ -994,7 +1004,7 @@ mod scrub_tests {
         );
         // A `#` that libpq keeps as data does not hide a later password.
         let uri = "postgresql://localhost/db?application_name=x#y&password=CANARY%ZZSECRET";
-        let secrets = connection_secrets(uri, None, None);
+        let secrets = connection_secrets("postgresql", uri, None, None);
         assert_eq!(
             scrub_connection_secrets("invalid token: \"CANARY%ZZSECRET\"", &secrets),
             "invalid token: \"***\""
@@ -1004,17 +1014,46 @@ mod scrub_tests {
             "postgresql://alice:%Z@localhost/db",
             "postgresql://localhost/db?password=%Z",
         ] {
-            let secrets = connection_secrets(uri, None, None);
+            let secrets = connection_secrets("postgresql", uri, None, None);
             assert_eq!(
                 scrub_connection_secrets("invalid percent-encoded token: \"%Z\" (%Zeta)", &secrets),
                 "invalid percent-encoded token: \"***\" (%Zeta)",
                 "{uri}"
             );
         }
-        let secrets = connection_secrets("file:test.db", None, None);
+        let secrets = connection_secrets("sqlite", "file:test.db", None, None);
         assert_eq!(
             scrub_connection_secrets("cannot open test.db", &secrets),
             "cannot open test.db"
+        );
+    }
+
+    #[test]
+    fn scrub_connection_secrets_keeps_a_duckdb_file_path() {
+        let secrets = connection_secrets("duckdb", "/data/sales.db", Some("pw-secret"), None);
+        assert_eq!(
+            scrub_connection_secrets(
+                "IO Error: Cannot open file \"/data/sales.db\": No such file or directory (pw-secret)",
+                &secrets
+            ),
+            "IO Error: Cannot open file \"/data/sales.db\": No such file or directory (***)"
+        );
+        // A MotherDuck token in the query string is still a secret.
+        let secrets = connection_secrets(
+            "duckdb",
+            "md:sales?motherduck_token=tok-secret-1",
+            None,
+            None,
+        );
+        assert_eq!(
+            scrub_connection_secrets("rejected md:sales?motherduck_token=tok-secret-1", &secrets),
+            "rejected md:sales?motherduck_token=***"
+        );
+        // Other drivers keep the whole URI secret.
+        let secrets = connection_secrets("sqlite", "/data/sales.db", None, None);
+        assert_eq!(
+            scrub_connection_secrets("Cannot open file \"/data/sales.db\"", &secrets),
+            "Cannot open file \"***\""
         );
     }
 }

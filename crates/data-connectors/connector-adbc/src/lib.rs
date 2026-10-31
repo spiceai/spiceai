@@ -315,7 +315,7 @@ impl AdbcFactory {
         let driver_options = params.parameters.get("driver_options").expose().ok();
         let db_options =
             build_db_options(driver_name, &uri_str, username, password, driver_options);
-        let secrets = connection_secrets(&uri_str, password, driver_options);
+        let secrets = connection_secrets(driver_name, &uri_str, password, driver_options);
 
         let pool_identity =
             resolve_pool_identity(&driver_name_owned, &uri_str, &params).map_err(|e| {

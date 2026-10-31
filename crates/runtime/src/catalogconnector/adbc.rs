@@ -315,7 +315,7 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
     let password = params.parameters.get("password").expose().ok();
     let driver_options = params.parameters.get("driver_options").expose().ok();
     let db_options = build_db_options(driver_name, &uri_str, username, password, driver_options);
-    let secrets = connection_secrets(&uri_str, password, driver_options);
+    let secrets = connection_secrets(driver_name, &uri_str, password, driver_options);
 
     let parse_pool_param = |name: &str| -> Result<Option<u32>> {
         match params.parameters.get(name).expose().ok() {
