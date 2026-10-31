@@ -254,6 +254,10 @@ impl Runtime {
         };
 
         if let Some(chat) = chat {
+            // Read before the model is ready, so the first `/v1/models` that lists it as
+            // ready reports its limits too. A hosted model's come from its provider's model
+            // API, read once per endpoint and kept, so `/v1/models` reads the kept copy.
+            let _ = chat.chat.token_limits().await;
             let completion_llms = self.completion_llms();
             completion_llms
                 .write()
@@ -320,6 +324,7 @@ impl Runtime {
         let model_rate_controllers = self.model_rate_controllers();
         let mut rc_map = model_rate_controllers.write().await;
         rc_map.remove(&m.name);
+        drop(rc_map);
 
         tracing::info!("Model [{}] has been unloaded", m.name);
         let source_str = m.get_source().map(|s| s.to_string()).unwrap_or_default();

@@ -53,6 +53,9 @@ use datafusion::logical_expr::{
 /// over `rows` rows.
 type OutputBytes = fn(args: &[ColumnarValue], rows: usize) -> u128;
 
+/// Rewrites arguments into an equivalent form before the call.
+type PrepareArgs = fn(args: &mut [ColumnarValue]);
+
 fn output_bytes_for(name: &str) -> Option<OutputBytes> {
     match name {
         "repeat" => Some(repeat_bytes),
@@ -61,6 +64,13 @@ fn output_bytes_for(name: &str) -> Option<OutputBytes> {
         "array_resize" => Some(array_resize_bytes),
         "range" => Some(range_bytes::<false>),
         "generate_series" => Some(range_bytes::<true>),
+        _ => None,
+    }
+}
+
+fn prepare_args_for(name: &str) -> Option<PrepareArgs> {
+    match name {
+        "lpad" | "rpad" => Some(clamp_negative_pad_lengths),
         _ => None,
     }
 }
@@ -77,6 +87,7 @@ pub(crate) fn reserve_argument_sized_outputs(state: &mut SessionState, pool: &Ar
                 inner: Arc::clone(udf.inner()),
                 pool: Arc::clone(pool),
                 output_bytes,
+                prepare_args: prepare_args_for(udf.name()),
             })
         })
         .collect();
@@ -92,6 +103,7 @@ struct ReservedOutput {
     inner: Arc<dyn ScalarUDFImpl>,
     pool: Arc<dyn MemoryPool>,
     output_bytes: OutputBytes,
+    prepare_args: Option<PrepareArgs>,
 }
 
 impl PartialEq for ReservedOutput {
@@ -145,7 +157,10 @@ impl ScalarUDFImpl for ReservedOutput {
         self.inner.is_strict()
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if let Some(prepare_args) = self.prepare_args {
+            prepare_args(&mut args.args);
+        }
         let rows = if args
             .args
             .iter()
@@ -167,6 +182,7 @@ impl ScalarUDFImpl for ReservedOutput {
                 inner: Arc::clone(udf.inner()),
                 pool: Arc::clone(&self.pool),
                 output_bytes: self.output_bytes,
+                prepare_args: self.prepare_args,
             })
         })
     }
@@ -337,21 +353,32 @@ fn repeat_bytes(args: &[ColumnarValue], rows: usize) -> u128 {
     sum_rows(rows, |row| string.get(row).saturating_mul(count.count(row)))
 }
 
-/// `lpad`/`rpad(string, n[, fill])`: `n` characters, at least `n` bytes. With
-/// an empty fill the string is only truncated, so nothing is counted.
+/// `lpad`/`rpad(string, n[, fill])`: the functions allocate `n` bytes for each
+/// row before they pad or truncate, also when an empty fill only truncates.
 fn pad_bytes(args: &[ColumnarValue], rows: usize) -> u128 {
-    let (length, fill) = match args {
-        [_, length] => (length, None),
-        [_, length, fill] => (length, StrLens::new(fill)),
-        _ => return 0,
+    let ([_, length] | [_, length, _]) = args else {
+        return 0;
     };
     let Some(length) = Ints::new(length) else {
         return 0;
     };
-    sum_rows(rows, |row| match &fill {
-        Some(fill) if fill.get(row) == 0 => 0,
-        _ => length.count(row),
-    })
+    sum_rows(rows, |row| length.count(row))
+}
+
+/// `lpad`/`rpad` pad a negative length to an empty string, but size their
+/// output buffer from the length cast to `usize`, so negative lengths are
+/// passed as 0.
+fn clamp_negative_pad_lengths(args: &mut [ColumnarValue]) {
+    let Some(ColumnarValue::Array(lengths)) = args.get(1) else {
+        return;
+    };
+    let Some(lengths) = lengths.as_primitive_opt::<Int64Type>() else {
+        return;
+    };
+    if arrow::compute::min(lengths).is_some_and(|min| min < 0) {
+        let clamped: Int64Array = lengths.unary(|length| length.max(0));
+        args[1] = ColumnarValue::Array(Arc::new(clamped));
+    }
 }
 
 /// `array_repeat(element, n)`: `n` copies of the element.
@@ -568,8 +595,14 @@ mod tests {
     use std::sync::Arc;
 
     use crate::dataaccelerator::AcceleratorEngineRegistry;
+    use arrow::array::{AsArray, Int64Array};
+    use arrow::datatypes::{Int32Type, Int64Type};
     use arrow::util::pretty::pretty_format_batches;
+    use datafusion::common::ScalarValue;
     use datafusion::error::DataFusionError;
+    use datafusion::logical_expr::ColumnarValue;
+
+    use super::{clamp_negative_pad_lengths, pad_bytes};
 
     use crate::datafusion::builder::DataFusionBuilder;
     use crate::status;
@@ -605,6 +638,10 @@ mod tests {
             (
                 "rpad",
                 format!("SELECT length(rpad('a', 67108864 + v - v, 'b')) {one_row}"),
+            ),
+            (
+                "lpad",
+                format!("SELECT length(lpad('a', 67108864 + v - v, '')) {one_row}"),
             ),
             (
                 "array_repeat",
@@ -650,6 +687,93 @@ mod tests {
                 "{sql}: the error must name {function}, got {message}"
             );
         }
+    }
+
+    async fn pad_lengths(
+        df: &crate::datafusion::DataFusion,
+        sql: &str,
+    ) -> Result<Vec<i32>, DataFusionError> {
+        let batches = df.ctx.sql(sql).await?.collect().await?;
+        Ok(batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int32Type>()
+                    .iter()
+                    .map(|length| length.expect("a length"))
+                    .collect::<Vec<_>>()
+            })
+            .collect())
+    }
+
+    /// An empty fill only truncates, but the functions still allocate the
+    /// requested length, so it is charged like any other fill.
+    #[tokio::test]
+    async fn pad_with_an_empty_fill_is_charged_its_requested_length() {
+        let df = session();
+        let mib = 1024 * 1024;
+        let one_row = "FROM (SELECT value AS v FROM generate_series(1, 1)) t";
+        for function in ["lpad", "rpad"] {
+            let under = format!(
+                "SELECT length({function}('abc', {} + v - v, '')) {one_row}",
+                MEMORY_LIMIT - mib
+            );
+            assert_eq!(
+                pad_lengths(&df, &under).await.expect("run under the limit"),
+                vec![3]
+            );
+            let over = format!(
+                "SELECT length({function}('abc', {} + v - v, '')) {one_row}",
+                MEMORY_LIMIT + mib
+            );
+            let error = pad_lengths(&df, &over)
+                .await
+                .expect_err("an empty fill over the limit must fail");
+            assert!(
+                matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+                "{over}: expected resources exhausted, got {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pad_with_negative_lengths_returns_empty_strings() {
+        let df = session();
+        let lengths = pad_lengths(
+            &df,
+            "SELECT length(lpad('abc', v - 3)) + length(rpad('abc', v - 3, 'xy')) \
+             FROM (SELECT value AS v FROM generate_series(1, 5)) t ORDER BY v",
+        )
+        .await
+        .expect("run the query");
+        assert_eq!(lengths, vec![0, 0, 0, 2, 4]);
+    }
+
+    #[test]
+    fn pad_sizing_counts_non_negative_lengths_for_every_fill() {
+        let lengths = ColumnarValue::Array(Arc::new(Int64Array::from(vec![
+            Some(4),
+            Some(-7),
+            None,
+            Some(2),
+        ])));
+        let string = ColumnarValue::Scalar(ScalarValue::Utf8(Some("a".to_string())));
+        let empty = ColumnarValue::Scalar(ScalarValue::Utf8(Some(String::new())));
+        let fill = ColumnarValue::Scalar(ScalarValue::Utf8(Some("xy".to_string())));
+        assert_eq!(pad_bytes(&[string.clone(), lengths.clone()], 4), 6);
+        assert_eq!(pad_bytes(&[string.clone(), lengths.clone(), empty], 4), 6);
+        assert_eq!(pad_bytes(&[string.clone(), lengths.clone(), fill], 4), 6);
+
+        let mut args = [string, lengths];
+        clamp_negative_pad_lengths(&mut args);
+        let ColumnarValue::Array(clamped) = &args[1] else {
+            panic!("lengths stay an array");
+        };
+        assert_eq!(
+            clamped.as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![Some(4), Some(0), None, Some(2)])
+        );
     }
 
     #[tokio::test]

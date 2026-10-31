@@ -1,0 +1,27 @@
+[package]
+name = "gemini-chat"
+description = "Serves the Gemini API (`models/{model}:generateContent` and `:streamGenerateContent`) with any chat model: translates the request into a chat completion, and the completion, or its stream of chunks, back into Gemini responses."
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-openai.workspace = true
+chat-api = { path = "../chat-api" }
+futures.workspace = true
+gemini-api = { path = "../gemini-api" }
+rand.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+insta.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

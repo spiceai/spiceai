@@ -212,6 +212,8 @@ pub struct LlamaCpp {
     harmony: Option<harmony::Markers>,
     reasoning_support: ReasoningSupport,
     counter: AtomicUsize,
+    /// See [`Loaded::context_window`].
+    context_window: u32,
     /// How many prompt tokens the last request read from the KV cache, which the decode thread
     /// sets.
     reused_prompt_tokens: Arc<AtomicUsize>,
@@ -236,6 +238,8 @@ struct Loaded {
     special: SpecialTokens,
     /// The Harmony markers, when the vocabulary holds them.
     harmony: Option<harmony::Markers>,
+    /// The context llama.cpp created, in tokens: what one request can hold.
+    context_window: u32,
     /// How many prompt tokens each request reads from the KV cache, as the thread sets it.
     reused_prompt_tokens: Arc<AtomicUsize>,
 }
@@ -482,6 +486,7 @@ impl LlamaCpp {
             harmony,
             reasoning_support,
             counter: AtomicUsize::new(0),
+            context_window: loaded.context_window,
             reused_prompt_tokens: loaded.reused_prompt_tokens,
         })
     }
@@ -646,6 +651,15 @@ impl LlamaCpp {
 impl Chat for LlamaCpp {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         None
+    }
+
+    /// The context llama.cpp runs the model with: `context_length`, or the default. It caps
+    /// no answer below that.
+    async fn token_limits(&self) -> llms::chat::TokenLimits {
+        llms::chat::TokenLimits {
+            context_window: (self.context_window > 0).then_some(u64::from(self.context_window)),
+            max_output_tokens: None,
+        }
     }
 
     async fn health(&self) -> Result<()> {
@@ -975,6 +989,7 @@ fn serve(
             return;
         }
     };
+    let context_window = context.n_ctx();
     let mut decoder = match head {
         None => Decoder::Plain(context),
         Some((head, kind)) => match mtp(head, kind, context, mtp_len) {
@@ -1001,6 +1016,7 @@ fn serve(
         architecture: model.architecture(),
         special,
         harmony: harmony::Markers::find(vocab),
+        context_window,
         reused_prompt_tokens: Arc::clone(&cache.reused),
     };
     // Ruled out while a required tool call is outstanding.

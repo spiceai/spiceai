@@ -1,4 +1,5 @@
 {
   "flight-prepared-coalesce": 4,
+  "int64-overflow": 1,
   "qualified-outer-reference": 6
 }
