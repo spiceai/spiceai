@@ -1118,7 +1118,7 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
                     let mutex = Arc::new(Mutex::new(()));
                     let lock_guard = mutex.lock_owned().await;
                     manager
-                        .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
+                        .create_snapshot(&schema, lock_guard, runtime_acceleration::snapshot::LocalData::synced(None), None, ForceCreate(false))
                         .await
                 }
             }))
@@ -1213,7 +1213,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
             let lock_guard = mutex.lock_owned().await;
 
             manager
-                .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
+                .create_snapshot(&schema, lock_guard, runtime_acceleration::snapshot::LocalData::synced(None), None, ForceCreate(false))
                 .await
                 .context("Creating modified snapshot after deleting data")?
                 .context("Snapshot should be created")?;
@@ -1373,7 +1373,7 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
             let lock_guard = mutex.lock_owned().await;
 
             let compacted_location = manager_with_compaction
-                .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
+                .create_snapshot(&schema, lock_guard, runtime_acceleration::snapshot::LocalData::synced(None), None, ForceCreate(false))
                 .await
                 .context("Creating snapshot with compaction enabled")?
                 .context("Snapshot should be created")?;
@@ -1527,7 +1527,7 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
                 .create_snapshot(
                     &schema,
                     Arc::clone(&mutex).lock_owned().await,
-                    Some(12345),
+                    runtime_acceleration::snapshot::LocalData::synced(Some(12345)),
                     None,
                     ForceCreate(false),
                 )
@@ -1548,7 +1548,7 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
                 .create_snapshot(
                     &schema,
                     Arc::clone(&mutex).lock_owned().await,
-                    Some(12345),
+                    runtime_acceleration::snapshot::LocalData::synced(Some(12345)),
                     None,
                     ForceCreate(false),
                 )
@@ -1568,7 +1568,7 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
                 .create_snapshot(
                     &schema,
                     Arc::clone(&mutex).lock_owned().await,
-                    Some(99999),
+                    runtime_acceleration::snapshot::LocalData::synced(Some(99999)),
                     None,
                     ForceCreate(false),
                 )
