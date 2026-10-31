@@ -247,6 +247,24 @@ pub async fn is_registered(name: &str) -> bool {
     guard.contains_key(name)
 }
 
+/// The parameter prefix and parameters of the catalog connector registered
+/// under `name`.
+pub async fn parameter_specs(name: &str) -> Option<(&'static str, &'static [ParameterSpec])> {
+    let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+    guard
+        .get(name)
+        .map(|factory| (factory.prefix(), factory.parameters()))
+}
+
+/// The parameter prefix and parameters of every registered catalog connector.
+pub async fn all_parameter_specs() -> Vec<(&'static str, &'static [ParameterSpec])> {
+    let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+    guard
+        .values()
+        .map(|factory| (factory.prefix(), factory.parameters()))
+        .collect()
+}
+
 /// Names of every registered catalog connector, for "did you mean?" suggestions.
 pub async fn registered_catalog_names() -> Vec<String> {
     let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;

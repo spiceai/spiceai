@@ -1383,6 +1383,62 @@ async fn object_store_table_prefixes(
     Ok(prefixes)
 }
 
+/// Whether a table other than `table_name` that `catalog` holds keeps its data in
+/// `dir`, the directory a dataset's name maps to: one directory as the file system
+/// resolves both, through links, and in any case on a file system that ignores it.
+/// Never for a directory that does not exist, or one in an object store.
+async fn shares_data_dir(
+    catalog: &dyn cayenne::MetadataCatalog,
+    table_name: &str,
+    dir: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(dir) = resolved_data_dir(dir).await.boxed()? else {
+        return Ok(false);
+    };
+    if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
+        return Ok(false);
+    }
+    let identity = directory_identity(&dir).await;
+    for name in catalog.list_table_names().await.boxed()? {
+        if name == table_name {
+            continue;
+        }
+        let other = match catalog.get_table(&name).await {
+            Ok(other) => other,
+            Err(cayenne::CatalogError::TableNotFound { .. }) => continue,
+            Err(error) => return Err(Box::new(error)),
+        };
+        let Some(other_dir) = resolved_data_dir(&other.path).await.boxed()? else {
+            continue;
+        };
+        if other_dir == dir
+            || (identity.is_some() && directory_identity(&other_dir).await == identity)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The device and inode of the directory at `path`, which two spellings of one
+/// directory share; `None` when there is none.
+#[cfg(unix)]
+async fn directory_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    tokio::fs::metadata(path)
+        .await
+        .ok()
+        .filter(std::fs::Metadata::is_dir)
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+/// Without a file identity to compare, two spellings of one directory compare as
+/// the paths they resolve to.
+#[cfg(not(unix))]
+async fn directory_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
 /// The warning an operator reads when a dataset's acceleration was recreated, and the
 /// files of the previous one, in an object store, are left in place under `prefixes`.
 fn previous_acceleration_left_in_place_warning(table_name: &str, prefixes: &[String]) -> String {
@@ -1886,7 +1942,7 @@ impl CayenneAccelerator {
                 let local_dir = local_dir.to_string_lossy().into_owned();
                 Self::remove_acceleration_data_dir(source, &local_dir).await?;
                 tracing::info!(
-                    "Removed the Cayenne data directory '{local_dir}' of dataset '{table_name}' to recreate its acceleration"
+                    "Deleted the Cayenne acceleration data of dataset '{table_name}' in '{local_dir}'."
                 );
             }
         }
@@ -3989,13 +4045,12 @@ impl DataAccelerator for CayenneAccelerator {
             let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
             let metadata_db_path = format!("{metadata_dir}/{METASTORE_DB_FILE}");
 
-            if open_option == OpenOption::OpenExisting && !path_exists(&metadata_db_path).await {
-                return Err(CheckpointError::Store {
-                    source: format!(
-                        "Cayenne metadata directory does not exist at {metadata_db_path}"
-                    )
-                    .into(),
-                });
+            if open_option == OpenOption::OpenExisting {
+                CheckpointError::require_existing(
+                    "Cayenne metadata directory",
+                    &metadata_db_path,
+                    tokio::fs::try_exists(&metadata_db_path).await,
+                )?;
             }
 
             if let Some(parent) = std::path::Path::new(&metadata_db_path).parent() {
@@ -4908,7 +4963,25 @@ impl DataAccelerator for CayenneAccelerator {
                     };
                     stored_elsewhere = true;
                 }
-                Ok(_) | Err(cayenne::CatalogError::TableNotFound { .. }) => {}
+                // The configured directory is the one the dataset's name maps to,
+                // and another dataset's name can map to it too: `s1.t1` and `s1_t1`,
+                // or names that differ only in case on a file system that ignores
+                // case. Each table keeps its files in a directory of its own inside
+                // it, so while another table keeps its data there, only this
+                // table's directories go, and none when no table is stored under
+                // this name.
+                found @ (Ok(_) | Err(cayenne::CatalogError::TableNotFound { .. })) => {
+                    if shares_data_dir(catalog.as_ref(), table_name, &dir_path).await? {
+                        removed_dirs = match found {
+                            Ok(stored) => {
+                                object_store_table_prefixes(catalog.as_ref(), table_name, &stored)
+                                    .await
+                                    .boxed()?
+                            }
+                            Err(_) => Vec::new(),
+                        };
+                    }
+                }
                 Err(error) => return Err(Box::new(error)),
             }
             // A table stored somewhere other than the configured location loses its files
@@ -7090,6 +7163,91 @@ mod tests {
             new_file.exists(),
             "the newly configured location's contents must be left alone"
         );
+    }
+
+    /// Two dataset names can map to one data directory: `s1.t1` and `s1_t1`, or
+    /// names that differ only in case on a file system that ignores case. Each
+    /// table keeps its files in a directory of its own inside it, so dropping a
+    /// name no table is stored under, or a table stored there, leaves the other
+    /// table's files.
+    #[tokio::test]
+    async fn drop_table_leaves_another_tables_files_in_a_shared_data_directory() {
+        use cayenne::{CayenneCatalog, MetadataCatalog, metadata::CreateTableOptions};
+
+        let app = Arc::new(AppBuilder::new("test").build());
+        let base = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = base.path().join("metadata");
+        let data = base.path().join("data");
+        std::fs::create_dir_all(&metadata_dir).expect("metastore dir");
+        let catalog = CayenneCatalog::new(format!(
+            "sqlite://{}",
+            metadata_dir.join("cayenne.db").display()
+        ))
+        .expect("catalog");
+        catalog.init().await.expect("init catalog");
+        // A table stored in `dir`, with a file in its own directory there.
+        let stored = async |name: &str, dir: &str| {
+            let dir = data.join(dir);
+            let table_id = catalog
+                .create_table(CreateTableOptions {
+                    table_name: name.to_string(),
+                    schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: dir.to_string_lossy().into_owned(),
+                    partition_column: None,
+                    vortex_config: cayenne::metadata::VortexConfig::default(),
+                })
+                .await
+                .expect("create the stored table");
+            let file = dir.join(table_id).join("data.vortex");
+            std::fs::create_dir_all(file.parent().expect("parent")).expect("table dir");
+            std::fs::write(&file, b"rows").expect("table file");
+            file
+        };
+        let drop_table = async |name: &str| {
+            let mut dataset = TestAccelerationSource::new(name).with_app(Arc::clone(&app));
+            dataset.set_acceleration(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                params: [
+                    (
+                        "cayenne_file_path".to_string(),
+                        data.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "cayenne_metadata_dir".to_string(),
+                        metadata_dir.to_string_lossy().into_owned(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            });
+            CayenneAccelerator::new()
+                .drop_table(name, &dataset)
+                .await
+                .expect("drop the table");
+        };
+
+        let kept = stored("s1_t1", "s1_t1").await;
+        drop_table("s1.t1").await;
+        assert!(
+            kept.exists(),
+            "a name stored nowhere must leave s1_t1's files"
+        );
+
+        let dropped = stored("s1.t1", "s1_t1").await;
+        drop_table("s1.t1").await;
+        assert!(
+            !dropped.exists(),
+            "the dropped table's own directory must be removed"
+        );
+        assert!(kept.exists(), "s1_t1's files must be left");
+
+        let cased = stored("Mixed_c", "Mixed_c").await;
+        drop_table("mixed_c").await;
+        assert!(cased.exists(), "Mixed_c's files must be left");
     }
 
     /// A teardown that cannot remove the stored table's files keeps its rows, so a retry

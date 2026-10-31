@@ -1418,10 +1418,12 @@ impl SpicedRuntimeHandle {
         // the old load is still registering components. Persist those
         // deployments for the next start instead. Once the initial load has
         // settled with an app, the existing hot-reload path remains safe.
+        // What the Spicepods declare, without the datasets and catalogs defined
+        // with SQL: a deployment replaces the former and leaves the latter.
         let active = if self.runtime.initial_load_in_flight() {
             None
         } else {
-            self.runtime.read_app().await
+            self.runtime.read_spicepod_app().await
         };
         // The cache writer crosses into the blocking pool. Put the potentially
         // 1 MiB delivery behind an Arc once so that handoff is constant-time and

@@ -1555,6 +1555,8 @@ impl DataFusionBuilder {
             partition_load_tracker: self.partition_load_tracker,
             #[cfg(not(windows))]
             cayenne_ddl_handler,
+            component_ddl_handler: std::sync::OnceLock::new(),
+            recorded_parameter_names: std::sync::OnceLock::new(),
         }
     }
 }
@@ -2247,6 +2249,8 @@ pub(crate) fn default_extension_planners(
         Arc::new(CacheInvalidationExtensionPlanner::new()),
         // One stateless DDL planner handles all DdlExtensionNodes from any handler.
         Arc::new(datafusion_ddl::DdlExtensionPlanner),
+        // Plans the statements that define Spicepod datasets and catalogs.
+        Arc::new(datafusion_ddl::component_ddl::ComponentDdlPlanner),
         // One stateless DML planner handles all DmlExtensionNodes from any handler.
         Arc::new(datafusion_dml::DmlExtensionPlanner),
         #[cfg(feature = "duckdb")]

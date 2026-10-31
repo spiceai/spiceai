@@ -23,7 +23,10 @@ limitations under the License.
 //!
 //! Each entry is installed when a query begins execution and removed when the
 //! query completes via a RAII [`ActiveQueryGuard`]. Entries carry the
-//! cancellation token plus lightweight metadata to support listing.
+//! cancellation token plus lightweight metadata to support listing. A query
+//! that cannot stop partway refuses cancellation once it runs
+//! ([`ActiveQueryGuard::refuse_cancellation`]), and a cancel request is told
+//! so.
 
 use std::{
     sync::Arc,
@@ -55,6 +58,21 @@ pub struct ActiveQueryInfo {
 struct ActiveQueryEntry {
     info: ActiveQueryInfo,
     token: CancellationToken,
+    /// Whether a cancel request signals the query: not once it refused
+    /// cancellation.
+    cancellable: bool,
+}
+
+/// What a cancel request did to a query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// The query was signalled to stop.
+    Cancelled,
+    /// The query runs to its end, and was not signalled: see
+    /// [`ActiveQueryGuard::refuse_cancellation`].
+    NotCancellable,
+    /// The caller submitted no running query with the id.
+    NotFound,
 }
 
 /// Registry of active synchronous queries for administrative cancellation.
@@ -102,6 +120,7 @@ impl QueryCancelRegistry {
                     owner,
                 },
                 token,
+                cancellable: true,
             },
         );
         ActiveQueryGuard {
@@ -110,31 +129,36 @@ impl QueryCancelRegistry {
         }
     }
 
-    /// Cancels the active query with the given id when `caller` submitted it.
-    /// Returns `true` if a matching entry existed and was signalled.
+    /// Cancels the active query with the given id when `caller` submitted it
+    /// and it can be cancelled.
     ///
-    /// A query submitted by another scope reports the same `false` as an id
-    /// that does not exist, so a caller cannot probe for other principals'
-    /// query ids.
+    /// A query submitted by another scope reports the same
+    /// [`CancelOutcome::NotFound`] as an id that does not exist, so a caller
+    /// cannot probe for other principals' query ids.
     #[must_use]
-    pub fn cancel_owned(&self, query_id: Uuid, caller: &str) -> bool {
-        if let Some(entry) = self.entries.get(&query_id)
-            && entry.info.owner.as_ref() == caller
-        {
-            entry.token.cancel();
-            return true;
+    pub fn cancel_owned(&self, query_id: Uuid, caller: &str) -> CancelOutcome {
+        match self.entries.get(&query_id) {
+            Some(entry) if entry.info.owner.as_ref() == caller => {
+                if !entry.cancellable {
+                    return CancelOutcome::NotCancellable;
+                }
+                entry.token.cancel();
+                CancelOutcome::Cancelled
+            }
+            _ => CancelOutcome::NotFound,
         }
-        false
     }
 
-    /// Cancels every active query in this registry. Returns the number of
-    /// entries that were signalled.
+    /// Cancels every active query in this registry that can be cancelled.
+    /// Returns the number of entries that were signalled.
     #[must_use]
     pub fn cancel_all(&self) -> usize {
         let mut cancelled = 0;
         for entry in &self.entries {
-            entry.value().token.cancel();
-            cancelled += 1;
+            if entry.value().cancellable {
+                entry.value().token.cancel();
+                cancelled += 1;
+            }
         }
         cancelled
     }
@@ -225,6 +249,15 @@ impl ActiveQueryGuard {
     pub fn query_id(&self) -> Uuid {
         self.query_id
     }
+
+    /// From now on, a cancel request leaves the query running and is told it
+    /// cannot cancel it: for a statement that cannot stop partway once it
+    /// runs.
+    pub fn refuse_cancellation(&self) {
+        if let Some(mut entry) = self.registry.entries.get_mut(&self.query_id) {
+            entry.cancellable = false;
+        }
+    }
 }
 
 impl Drop for ActiveQueryGuard {
@@ -254,8 +287,43 @@ mod tests {
             registry.register(query_id, "SELECT 1", Protocol::Http, owner(), token.clone());
 
         assert_eq!(registry.len(), 1);
-        assert!(registry.cancel_owned(query_id, OWNER));
+        assert_eq!(
+            registry.cancel_owned(query_id, OWNER),
+            CancelOutcome::Cancelled
+        );
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn a_query_that_refuses_cancellation_is_left_running() {
+        let registry = Arc::new(QueryCancelRegistry::new());
+        let token = CancellationToken::new();
+        let query_id = Uuid::new_v4();
+        let guard = registry.register(
+            query_id,
+            "CREATE TABLE t",
+            Protocol::Http,
+            owner(),
+            token.clone(),
+        );
+        guard.refuse_cancellation();
+
+        assert_eq!(
+            registry.cancel_owned(query_id, OWNER),
+            CancelOutcome::NotCancellable
+        );
+        assert_eq!(
+            registry.cancel_owned(query_id, OTHER),
+            CancelOutcome::NotFound,
+            "another scope must learn nothing about the query"
+        );
+        assert_eq!(registry.cancel_all(), 0);
+        assert!(!token.is_cancelled());
+        assert_eq!(
+            registry.list_for(OWNER).len(),
+            1,
+            "the query is still listed as running"
+        );
     }
 
     #[test]
@@ -276,9 +344,12 @@ mod tests {
     }
 
     #[test]
-    fn cancel_missing_returns_false() {
+    fn cancel_missing_returns_not_found() {
         let registry = Arc::new(QueryCancelRegistry::new());
-        assert!(!registry.cancel_owned(Uuid::new_v4(), OWNER));
+        assert_eq!(
+            registry.cancel_owned(Uuid::new_v4(), OWNER),
+            CancelOutcome::NotFound
+        );
     }
 
     #[test]
@@ -367,16 +438,18 @@ mod tests {
         let _guard =
             registry.register(query_id, "SELECT 1", Protocol::Http, owner(), token.clone());
 
-        assert!(
-            !registry.cancel_owned(query_id, OTHER),
+        assert_eq!(
+            registry.cancel_owned(query_id, OTHER),
+            CancelOutcome::NotFound,
             "another scope must not cancel the query"
         );
         assert!(
             !token.is_cancelled(),
             "a refused cancellation must leave the query running"
         );
-        assert!(
+        assert_eq!(
             registry.cancel_owned(query_id, OWNER),
+            CancelOutcome::Cancelled,
             "the submitting scope may cancel its own query"
         );
         assert!(token.is_cancelled());

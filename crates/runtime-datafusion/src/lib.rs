@@ -67,6 +67,43 @@ pub fn is_spice_internal_schema(catalog: &str, schema: &str) -> bool {
             || schema == SPICE_EVAL_SCHEMA)
 }
 
+/// The start of the name of each dataset Spice keeps for a table of an
+/// accelerated catalog, `__catalog_accel_{catalog}__{schema}__{table}`. No
+/// other dataset may take such a name: it would take that table's acceleration
+/// data.
+pub const CATALOG_ACCELERATION_DATASET_PREFIX: &str = "__catalog_accel_";
+
+/// The starts of the names Spice gives tables of its own, each with the tables
+/// that take such names. No dataset may take one: it would take that table's
+/// data.
+const RESERVED_TABLE_NAME_PREFIXES: [(&str, &str); 3] = [
+    (
+        CATALOG_ACCELERATION_DATASET_PREFIX,
+        "the tables Spice keeps for accelerated catalogs",
+    ),
+    (
+        "__data_",
+        "the tables a DuckDB acceleration keeps its data in",
+    ),
+    (
+        "spice_sys_",
+        "the tables Spice keeps its own state in beside an acceleration",
+    ),
+];
+
+/// The reserved start of `table`, a dataset's table name, in any ASCII case,
+/// with the tables that take such names: see [`RESERVED_TABLE_NAME_PREFIXES`].
+#[must_use]
+pub fn reserved_table_name_prefix(table: &str) -> Option<(&'static str, &'static str)> {
+    RESERVED_TABLE_NAME_PREFIXES
+        .into_iter()
+        .find(|(prefix, _)| {
+            table
+                .get(..prefix.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+        })
+}
+
 /// Whether `dataset` names a table in one of Spice's reserved schemas. A
 /// reference with no catalog is resolved against [`SPICE_DEFAULT_CATALOG`].
 #[must_use]

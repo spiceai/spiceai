@@ -39,6 +39,7 @@ use tokio::time::Instant;
 use tracing_futures::Instrument;
 
 use crate::model::metrics::{handle_metrics, handle_token_metrics};
+use crate::model::recorded_calls;
 
 use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
@@ -329,7 +330,9 @@ impl Chat for ChatWrapper {
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let start = Instant::now();
         let req = self.prepare_req(req)?;
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
+        let tools = recorded_calls::current_tools();
+        let input = recorded_calls::recorded(&req, tools.as_ref()).unwrap_or_default();
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %input);
 
         if let Some(metadata) = &req.metadata {
             tracing::info!(target: "task_history", metadata = ?metadata);
@@ -350,6 +353,7 @@ impl Chat for ChatWrapper {
                     span.clone(),
                     self.public_name.clone(),
                     labels,
+                    tools,
                 )))
             }
             Err(e) => {
@@ -372,7 +376,9 @@ impl Chat for ChatWrapper {
         let start = Instant::now();
 
         let req = self.prepare_req(req)?;
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=false, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
+        let tools = recorded_calls::current_tools();
+        let input = recorded_calls::recorded(&req, tools.as_ref()).unwrap_or_default();
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=false, model = %req.model, input = %input);
 
         let labels = request_labels(&req);
         if let Some(metadata) = &req.metadata {
@@ -386,7 +392,7 @@ impl Chat for ChatWrapper {
                     handle_token_metrics(usage.prompt_tokens, usage.completion_tokens, &labels);
                 }
                 let captured_output: Vec<_> = resp.choices.iter().map(|c| &c.message).collect();
-                match serde_json::to_string(&captured_output) {
+                match recorded_calls::recorded(&captured_output, tools.as_ref()) {
                     Ok(output) => {
                         tracing::info!(target: "task_history", parent: &span, captured_output = %output);
                     }
@@ -438,6 +444,8 @@ struct TracedChatCompletionStream<S> {
     model_public_name: String,
     started: Instant,
     labels: Vec<KeyValue>,
+    /// The tools the call's tool calls are recorded with.
+    tools: Option<recorded_calls::ConversationTools>,
 }
 
 impl<S> TracedChatCompletionStream<S>
@@ -449,6 +457,7 @@ where
         span: tracing::Span,
         model_public_name: String,
         labels: Vec<KeyValue>,
+        tools: Option<recorded_calls::ConversationTools>,
     ) -> Self {
         Self {
             inner,
@@ -457,6 +466,7 @@ where
             model_public_name,
             started: Instant::now(),
             labels,
+            tools,
         }
     }
 }
@@ -510,7 +520,7 @@ impl<S> Drop for TracedChatCompletionStream<S> {
     fn drop(&mut self) {
         if let Ok(output) = self.accumulated_response.lock() {
             let _guard = self.span.enter();
-            if let Ok(resp_str) = serde_json::to_string(&*output) {
+            if let Ok(resp_str) = recorded_calls::recorded(&*output, self.tools.as_ref()) {
                 tracing::info!(target: "task_history", captured_output = %*resp_str);
             }
         } else {

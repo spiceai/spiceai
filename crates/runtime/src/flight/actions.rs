@@ -18,6 +18,7 @@ use std::fmt::{self, Display, Formatter};
 use tonic::{Request, Response, Status};
 
 use crate::{
+    datafusion::query::registry::CancelOutcome,
     datafusion::request_context_extension::get_current_datafusion,
     flight::{Service, async_actions, flightsql::prepared_statement_query, metrics, to_tonic_err},
 };
@@ -252,7 +253,8 @@ async fn handle_cancel_query(body: &[u8]) -> Result<Vec<u8>, Status> {
     let df = get_current_datafusion(&context);
     let cancelled = df
         .query_cancel_registry()
-        .cancel_owned(parsed, &crate::jobs::current_job_owner().await);
+        .cancel_owned(parsed, &crate::jobs::current_job_owner().await)
+        == CancelOutcome::Cancelled;
 
     let resp = CancelQueryResponse {
         query_id: req.query_id,

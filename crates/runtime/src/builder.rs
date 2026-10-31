@@ -176,6 +176,7 @@ pub struct RuntimeBuilder {
     runtime_config: Arc<Config>,
     resolved_cluster_config: Option<ResolvedClusterConfig>,
     telemetry_config: Option<Arc<tokio::sync::SetOnce<TelemetryConfig>>>,
+    instance_dir: Option<std::path::PathBuf>,
 }
 
 /// Whether SQL results-cache warmup should be armed for this config.
@@ -213,7 +214,18 @@ impl RuntimeBuilder {
             runtime_config: Arc::new(Config::default()),
             resolved_cluster_config: None,
             telemetry_config: None,
+            instance_dir: None,
         }
+    }
+
+    /// The instance directory this runtime owns: where the datasets and
+    /// catalogs defined with SQL are kept when `runtime.state.location` is
+    /// unset. Defaults to `$SPICE_CONFIG_DIR`, or `.spice` in the working
+    /// directory.
+    #[must_use]
+    pub fn with_instance_dir(mut self, instance_dir: impl Into<std::path::PathBuf>) -> Self {
+        self.instance_dir = Some(instance_dir.into());
+        self
     }
 
     #[must_use]
@@ -923,6 +935,11 @@ impl RuntimeBuilder {
             telemetry_config: self.telemetry_config,
             snapshot_sources: Arc::default(),
             state_location_check: state_location_check.clone(),
+            sql_components: Arc::new(crate::component_ddl::SqlComponents::new(
+                self.instance_dir
+                    .unwrap_or_else(crate::component_ddl::SqlComponents::default_instance_dir),
+            )),
+            catalog_loads: Arc::default(),
         };
 
         if let (Some(state), Some(check)) = (spicepod_rt.state.clone(), state_location_check) {

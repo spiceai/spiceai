@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use datafusion_ddl::component_options::{recorded_call_arguments, redact_values};
 use rmcp::{
     model::{CallToolRequestParams, CallToolResponse, CallToolResult, JsonObject, Tool, object},
     service::ServiceError,
@@ -36,6 +37,7 @@ use super::{
     catalog::{McpClient, Reconnector},
     task_name_for_exposed_tool,
 };
+use crate::builtin::sql::{is_sql_tool, recorded_input};
 
 pub struct McpToolWrapper {
     client: Arc<RwLock<McpClient>>,
@@ -121,6 +123,22 @@ impl SpiceModelTool for McpToolWrapper {
         Some(self)
     }
 
+    /// A call to another Spice's `sql` tool, such as one this Spice reaches at
+    /// its `/v1/mcp`, is recorded as `sql` records it, so a definition's
+    /// credentials stay out of this Spice's task history too; that holds for
+    /// any server's tool named `sql`, which fails closed. A tool of another
+    /// name, which may be an `sql` tool its Spicepod renamed, records each
+    /// statement in its arguments that may define a component the same way.
+    fn recorded_arguments<'a>(&self, arg: &'a str) -> (Cow<'a, str>, Vec<String>) {
+        if is_sql_tool(&self.spec.name) {
+            return recorded_input(arg);
+        }
+        match recorded_call_arguments(arg) {
+            Some((recorded, removed)) => (Cow::Owned(recorded), removed),
+            None => (Cow::Borrowed(arg), Vec::new()),
+        }
+    }
+
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         // Security: Validate input size to prevent excessive memory consumption or processing overhead
         const MAX_INPUT_SIZE: usize = 1024 * 1024; // 1 MB
@@ -133,7 +151,8 @@ impl SpiceModelTool for McpToolWrapper {
         }
 
         let (task_name, exposed_name) = Self::task_history_labels(&self.server_name, &self.spec);
-        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = %exposed_name, input = arg);
+        let (input, removed) = self.recorded_arguments(arg);
+        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = %exposed_name, input = %input);
         tracing::info!(target: "task_history", parent: &span, task_override = %task_name, mcp_server = %self.server_name, "labels");
 
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
@@ -204,11 +223,14 @@ impl SpiceModelTool for McpToolWrapper {
         match tool_use_result {
             Ok(value) => {
                 let captured_output_json = serde_json::to_string(&value).boxed()?;
-                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+                let captured_output = redact_values(&captured_output_json, &removed);
+                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output);
                 Ok(value)
             }
             Err(e) => {
-                tracing::error!(target: "task_history", parent: &span, "{e}");
+                let message = e.to_string();
+                let message = redact_values(&message, &removed);
+                tracing::error!(target: "task_history", parent: &span, "{message}");
                 Err(e)
             }
         }

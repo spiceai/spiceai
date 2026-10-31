@@ -84,6 +84,17 @@ static SNAPSHOT_S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     parameters
 });
 
+/// The parameters a state or snapshot location's `params` take, each with the
+/// prefix it is written with: an S3 location's, which include the snapshot
+/// queue, and a GCS location's.
+#[must_use]
+pub fn location_parameter_specs() -> [(&'static str, &'static [ParameterSpec]); 2] {
+    [
+        ("s3", SNAPSHOT_S3_PARAMETERS.as_slice()),
+        ("gcs", GCS_PARAMETERS.as_slice()),
+    ]
+}
+
 /// The GCS data connector's object-store parameters, so a `gs://` location takes the
 /// same names (`gcs_skip_signature`, `gcs_service_account_path`, ...).
 static GCS_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
@@ -184,17 +195,20 @@ pub enum StateFeature {
     RateControl,
     ResultsCacheWarmup,
     Snapshots,
+    /// The datasets and catalogs defined with SQL.
+    SqlDefinitions,
     /// The startup check of a `runtime.state` location, which keeps
     /// `format.json` and its probe object in the location's `_spice/` folder.
     StartupCheck,
 }
 
 impl StateFeature {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Scheduler,
         Self::RateControl,
         Self::ResultsCacheWarmup,
         Self::Snapshots,
+        Self::SqlDefinitions,
         Self::StartupCheck,
     ];
 
@@ -207,7 +221,22 @@ impl StateFeature {
             Self::RateControl => Some("rate_control"),
             Self::ResultsCacheWarmup => Some("results_cache_warmup"),
             Self::Snapshots => Some("snapshots"),
+            Self::SqlDefinitions => Some("sql_definitions"),
             Self::StartupCheck => None,
+        }
+    }
+
+    /// Whether `state_store_cleanup_deleted_total` has a series for the
+    /// feature. Not for the datasets and catalogs defined with SQL: they are
+    /// one document that cleanup never deletes, and a constant `0` would read
+    /// as a measurement.
+    #[must_use]
+    pub fn reports_cleanup(self) -> bool {
+        match self {
+            Self::Scheduler | Self::RateControl | Self::ResultsCacheWarmup | Self::Snapshots => {
+                true
+            }
+            Self::SqlDefinitions | Self::StartupCheck => false,
         }
     }
 
@@ -218,6 +247,7 @@ impl StateFeature {
             Self::RateControl => "rate-control",
             Self::ResultsCacheWarmup => "results-cache",
             Self::Snapshots => SNAPSHOTS_STATE_FOLDER,
+            Self::SqlDefinitions => "sql-definitions",
             Self::StartupCheck => "_spice",
         }
     }
@@ -228,6 +258,7 @@ impl StateFeature {
             Self::RateControl => "rate-control state",
             Self::ResultsCacheWarmup => "SQL results cache warmup state",
             Self::Snapshots => "snapshot",
+            Self::SqlDefinitions => "SQL-defined component",
             Self::StartupCheck => "shared state location check",
         }
     }
@@ -240,6 +271,7 @@ impl StateFeature {
             Self::RateControl => "source rate control",
             Self::ResultsCacheWarmup => "SQL results cache warmup",
             Self::Snapshots => "acceleration snapshots",
+            Self::SqlDefinitions => "datasets and catalogs defined with SQL",
             Self::StartupCheck => "the startup check",
         }
     }
@@ -251,7 +283,11 @@ impl StateFeature {
         match (self, source) {
             (Self::Snapshots, _) | (_, StateSource::RuntimeState) => &SNAPSHOT_S3_PARAMETERS,
             (
-                Self::Scheduler | Self::RateControl | Self::ResultsCacheWarmup | Self::StartupCheck,
+                Self::Scheduler
+                | Self::RateControl
+                | Self::ResultsCacheWarmup
+                | Self::SqlDefinitions
+                | Self::StartupCheck,
                 _,
             ) => &S3_PARAMETERS,
         }
@@ -615,6 +651,7 @@ mod tests {
             (StateFeature::RateControl, "rate-control"),
             (StateFeature::ResultsCacheWarmup, "results-cache"),
             (StateFeature::Snapshots, "snapshots"),
+            (StateFeature::SqlDefinitions, "sql-definitions"),
         ] {
             let (store, prefix) = build_object_store(
                 secrets(),
@@ -646,7 +683,13 @@ mod tests {
         root.sort();
         assert_eq!(
             root,
-            ["cluster", "rate-control", "results-cache", "snapshots"]
+            [
+                "cluster",
+                "rate-control",
+                "results-cache",
+                "snapshots",
+                "sql-definitions"
+            ]
         );
     }
 

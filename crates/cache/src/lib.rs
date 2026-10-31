@@ -79,7 +79,9 @@ pub use utils::to_cached_record_batch_stream;
 /// Keep this list in sync with:
 /// - `datafusion_ddl::DdlExtensionNode` → `"DdlExtension"`
 /// - `datafusion_dml::DmlExtensionNode` → `"DmlExtension"`
-pub const WRITE_CAPABLE_EXTENSION_NAMES: &[&str] = &["DdlExtension", "DmlExtension"];
+/// - `datafusion_ddl::component_ddl::ComponentDdlNode` → `"ComponentDdl"`
+pub const WRITE_CAPABLE_EXTENSION_NAMES: &[&str] =
+    &["DdlExtension", "DmlExtension", "ComponentDdl"];
 
 use crate::result::embeddings::CachedEmbeddingResult;
 

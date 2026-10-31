@@ -22,9 +22,7 @@ use async_trait::async_trait;
 use data_components::Read;
 use data_components::duckdb::{install_and_load_extension, with_utc_session_timezone};
 use data_components::ducklake::writer::DuckDbFederatedTableWriter;
-use data_components::ducklake::{
-    DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
-};
+use data_components::ducklake::{DuckLakeS3Params, attach_ducklake, configure_duckdb_httpfs};
 use data_connector_api::ConnectorContext;
 use data_connector_api::{
     AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
@@ -57,6 +55,11 @@ pub enum Error {
 
     #[snafu(display("Failed to initialize DuckLake extension: {source}"))]
     UnableToInitializeDuckLake { source: duckdb::Error },
+
+    /// Attaching failed: the message leaves out the connection string, which
+    /// `DuckDB` repeats with its credentials.
+    #[snafu(display("Failed to initialize DuckLake extension: {message}"))]
+    UnableToAttachDuckLake { message: String },
 
     #[snafu(display("Failed to get underlying DuckDB connection"))]
     FailedToGetDuckDbConnection,
@@ -95,9 +98,11 @@ impl DuckLakeFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
+    // Secret: a metadata database's connection string carries its password.
     ParameterSpec::component("connection_string")
         .description("The DuckLake connection string (e.g., 's3://bucket/path/metadata.ducklake').")
-        .required(),
+        .required()
+        .secret(),
     ParameterSpec::component("name").description(
         "The name to attach the DuckLake catalog as in DuckDB. Defaults to 'ducklake'.",
     ),
@@ -236,17 +241,18 @@ fn create_ducklake_factory(
             source: Box::new(e),
         })?;
 
-    let attach_sql =
-        build_ducklake_attach_sql(connection_string, catalog_name, automatic_migration);
-    duckdb_wrapper
-        .conn
-        .execute(&attach_sql, [])
-        .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
-        .map_err(|e| DataConnectorError::UnableToConnectInternal {
-            dataconnector: "ducklake".to_string(),
-            connector_component: params.component.clone(),
-            source: Box::new(e),
-        })?;
+    attach_ducklake(
+        &duckdb_wrapper.conn,
+        connection_string,
+        catalog_name,
+        automatic_migration,
+    )
+    .map_err(|message| Error::UnableToAttachDuckLake { message })
+    .map_err(|e| DataConnectorError::UnableToConnectInternal {
+        dataconnector: "ducklake".to_string(),
+        connector_component: params.component.clone(),
+        source: Box::new(e),
+    })?;
 
     // The dialect was installed without a deny-list, so every Spice-only UDF was
     // unparsed verbatim into the statement sent to DuckDB. See #10703 / #13664.
