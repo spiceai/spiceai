@@ -433,9 +433,9 @@ pub(crate) async fn refresh(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Path(dataset_name): Path<String>,
     overrides_opt: Option<Json<RefreshOverrides>>,
-    // When this is an Option<Json>, Json rejections are silenced
-    // This means malformed Json, etc, will simply return None
-    // To get around this, we would need to implement a custom extractor
+    // No body, or one without a JSON `Content-Type`, is `None`. A JSON body that does
+    // not deserialize is rejected before the handler runs: 400 for malformed JSON, 422
+    // for an unknown field value such as an unknown `refresh_mode`.
 ) -> Response {
     let app_lock = tokio::select! {
         lock = app.read() => lock,

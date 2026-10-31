@@ -1789,6 +1789,20 @@ impl AcceleratedTable {
         }
     }
 
+    /// Checks one-off refresh overrides against this dataset: the mode must be one an
+    /// on-demand refresh can run, and a `refresh_sql` must parse and select the
+    /// dataset's `time_column`, as the spicepod's `refresh_sql` must at startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRefreshOverrides`] describing the first problem found.
+    pub async fn validate_refresh_overrides(&self, overrides: &RefreshOverrides) -> Result<()> {
+        let refresh = self.refresh_params.read().await.clone();
+        overrides
+            .validate_for(&self.dataset_name, &refresh, self.federated.schema())
+            .context(InvalidRefreshOverridesSnafu)
+    }
+
     /// # Errors
     ///
     /// Returns an error if the table has no refresh trigger (it is not configured
@@ -1798,10 +1812,7 @@ impl AcceleratedTable {
             // Rejected here, before anything is queued, so the caller learns of it: the
             // worker would otherwise fail the refresh after the request was accepted.
             if let Some(overrides) = &overrides {
-                let refresh = self.refresh_params.read().await.clone();
-                overrides
-                    .validate_for(&self.dataset_name, &refresh, self.federated.schema())
-                    .context(InvalidRefreshOverridesSnafu)?;
+                self.validate_refresh_overrides(overrides).await?;
             }
             refresh_trigger
                 .send(overrides)
@@ -3288,6 +3299,93 @@ mod tests {
             .refresher()
             .refresh_completion()
             .expect("the table carries a refresh-completion signal")
+    }
+
+    /// The on-demand refresh endpoint, and the CLI's `--refresh-sql` and
+    /// `--refresh-mode`, which post to it, queue a refresh through `trigger_refresh`.
+    /// Overrides it cannot honor are refused there, so the caller gets an error
+    /// instead of a refresh that panics, fails later, or writes rows without a time.
+    #[tokio::test]
+    async fn trigger_refresh_refuses_overrides_it_cannot_honor() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, true),
+        ]));
+        let source = Arc::new(
+            data_components::arrow::write::MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source table builds"),
+        );
+        let accelerator = Arc::new(
+            data_components::arrow::write::MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator table builds"),
+        ) as Arc<dyn TableProvider>;
+        let table = Builder::new(
+            status::RuntimeStatus::new(),
+            TableReference::bare("events"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            "mem_table".to_string(),
+            accelerator,
+            refresh::Refresh::new(RefreshMode::Append)
+                .time_column("ts".to_string())
+                .time_format(TimeFormat::UnixSeconds),
+            Handle::current(),
+        )
+        .build()
+        .await
+        .expect("accelerated table builds");
+
+        let refused = |overrides: RefreshOverrides| {
+            let table = &table;
+            async move {
+                match table.trigger_refresh(Some(overrides)).await {
+                    Err(Error::InvalidRefreshOverrides { source }) => source.to_string(),
+                    other => panic!("expected the overrides to be refused, got {other:?}"),
+                }
+            }
+        };
+        for mode in [
+            RefreshMode::Changes,
+            RefreshMode::Disabled,
+            RefreshMode::Caching,
+            RefreshMode::Snapshot,
+        ] {
+            let message = refused(RefreshOverrides {
+                sql: None,
+                mode: Some(mode),
+                max_jitter: None,
+            })
+            .await;
+            assert!(
+                message.contains("Valid modes are 'full' or 'append'"),
+                "{message}"
+            );
+        }
+        let message = refused(RefreshOverrides {
+            sql: Some("SELECT id FROM events".to_string()),
+            mode: None,
+            max_jitter: None,
+        })
+        .await;
+        assert!(
+            message.contains("time_column 'ts' was not found"),
+            "{message}"
+        );
+        let message = refused(RefreshOverrides {
+            sql: Some("SELEC nonsense".to_string()),
+            mode: None,
+            max_jitter: None,
+        })
+        .await;
+        assert!(message.starts_with("Invalid refresh_sql"), "{message}");
+
+        table
+            .trigger_refresh(Some(RefreshOverrides {
+                sql: Some("SELECT id, ts FROM events".to_string()),
+                mode: Some(RefreshMode::Append),
+                max_jitter: None,
+            }))
+            .await
+            .expect("overrides that select the time column queue a refresh");
     }
 
     /// Regression test for #13086. A cluster scheduler runs no refresh locally,

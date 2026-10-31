@@ -6130,8 +6130,9 @@ impl DataFusion {
         dataset_name: &TableReference,
         overrides: Option<RefreshOverrides>,
     ) -> Result<Option<RefreshCompletionWaiter>> {
-        // Checked here as well as by the accelerated table, so a scheduler rejects a
-        // mode no executor can run instead of forwarding it.
+        // Overrides are checked before anything is queued or forwarded, so the caller
+        // learns of a mode or `refresh_sql` that cannot run. A scheduler checks against
+        // its own copy of the dataset when it has one, and always checks the mode.
         if let Some(overrides) = &overrides {
             overrides
                 .validate_mode()
@@ -6139,6 +6140,21 @@ impl DataFusion {
                     dataset_name: dataset_name.to_string(),
                     source: crate::accelerated::Error::InvalidRefreshOverrides { source },
                 })?;
+            if let Ok(table) = self
+                .get_accelerated_table_provider(dataset_name.to_string().as_str())
+                .await
+                && let Some(accelerated_table) = spice_table::find_layer::<AcceleratedTable>(
+                    table.as_ref(),
+                    spice_table::LayerWalk::Read,
+                )
+            {
+                accelerated_table
+                    .validate_refresh_overrides(overrides)
+                    .await
+                    .context(UnableToTriggerRefreshSnafu {
+                        dataset_name: dataset_name.to_string(),
+                    })?;
+            }
         }
 
         // If we're a scheduler with a partition service, forward refresh to executors

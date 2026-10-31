@@ -89,10 +89,10 @@ pub enum InvalidRefreshOverrides {
         source: runtime_datafusion::refresh_sql::Error,
     },
 
-    #[snafu(display(
-        "Invalid refresh_sql: {source}. The refresh_sql must select the dataset's time_column."
-    ))]
-    TimeColumnNotSelected { source: Error },
+    /// The `refresh_sql` leaves out the dataset's `time_column`, or selects it with a
+    /// type its `time_format` cannot read.
+    #[snafu(display("Invalid refresh_sql: {source}"))]
+    TimeColumnInvalid { source: Error },
 }
 
 /// The name a refresh mode is written with in a spicepod or a refresh request.
@@ -241,7 +241,7 @@ impl RefreshOverrides {
         .context(InvalidSqlSnafu)?;
         refresh
             .validate_time_format_inner(&dataset_name.to_string(), &refresh_schema, false)
-            .context(TimeColumnNotSelectedSnafu)
+            .context(TimeColumnInvalidSnafu)
     }
 }
 
@@ -2135,7 +2135,7 @@ mod tests {
             .validate_for(&dataset, &refresh, Arc::clone(&schema))
             .expect_err("a refresh_sql without the time column is rejected");
         assert!(
-            matches!(err, InvalidRefreshOverrides::TimeColumnNotSelected { .. })
+            matches!(err, InvalidRefreshOverrides::TimeColumnInvalid { .. })
                 && err.to_string().contains("time_column 'ts' was not found"),
             "{err}"
         );
