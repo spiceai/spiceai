@@ -15,6 +15,8 @@ on:
       - 'crates/chat-api/**'
       - 'crates/embed-api/**'
       - 'crates/rerank-api/**'
+      - 'crates/evaluate-api/**'
+      - 'crates/evaluate-chat/**'
       - 'crates/llms-llamacpp/**'
       - 'crates/llama-cpp/**'
   merge_group:
@@ -80,7 +82,7 @@ jobs:
                 needs_env: true,
                 runner,
                 // Bedrock is left out until CI has credentials that can invoke it (#13558).
-                model_allowlist: 'anthropic,openai,xai'
+                model_allowlist: 'anthropic,openai,xai,openai_decisions,typesafe'
               }
             ];
 
@@ -238,6 +240,7 @@ jobs:
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
         run: |
           # The spiceio setup action exports AWS_ENDPOINT_URL for sccache; the AWS SDK
           # honours it for every service, so leaving it set sends this suite's Bedrock
@@ -254,6 +257,10 @@ jobs:
             fi
             if [ -z "$SPICE_XAI_API_KEY" ]; then
               echo "Error: 'SPICE_XAI_API_KEY' is not defined."
+              exit 1
+            fi
+            if [ -z "$TYPESAFE_API_KEY" ]; then
+              echo "Error: 'TYPESAFE_API_KEY' is not defined."
               exit 1
             fi
           fi
