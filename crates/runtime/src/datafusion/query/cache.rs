@@ -1625,6 +1625,7 @@ impl Query {
                 datasets,
                 read_started_at,
                 Some(physical_plan),
+                df.ctx.task_ctx().memory_pool(),
             )
         } else {
             stream
