@@ -887,10 +887,9 @@ async fn test_acceleration_refresh_postgres_full_variant() -> Result<(), anyhow:
     test_refresh_full_for_engine("postgres").await
 }
 
-// Cayenne (not available on Windows)
+// Cayenne
 // Note: Cayenne requires mode: file in addition to refresh_mode: append/full.
 // These tests need custom helpers that set both mode and refresh_mode.
-#[cfg(not(windows))]
 #[tokio::test]
 #[ignore = "Cayenne requires mode: file which is not set by the generic test helpers"]
 async fn test_acceleration_refresh_cayenne_append_variant() {
@@ -900,7 +899,6 @@ async fn test_acceleration_refresh_cayenne_append_variant() {
         .expect("Test should pass when mode: file is properly configured");
 }
 
-#[cfg(not(windows))]
 #[tokio::test]
 #[ignore = "Cayenne requires mode: file which is not set by the generic test helpers"]
 async fn test_acceleration_refresh_cayenne_full_variant() {

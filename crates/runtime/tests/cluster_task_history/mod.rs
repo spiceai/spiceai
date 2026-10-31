@@ -350,7 +350,6 @@ async fn run_executor_task_history_on_peer_scheduler() -> Result<(), anyhow::Err
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn task_history_on_each_scheduler_includes_its_peer() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_request_context()
@@ -359,7 +358,6 @@ async fn task_history_on_each_scheduler_includes_its_peer() -> Result<(), anyhow
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn task_history_on_a_peer_scheduler_includes_the_executor() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_request_context()

@@ -121,12 +121,6 @@ use parking_lot::Mutex as ParkingMutex;
 use query::QueryBuilder;
 use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_acceleration::snapshot::AccelerationLayout;
-#[cfg(any(
-    feature = "duckdb",
-    feature = "sqlite",
-    feature = "postgres",
-    not(windows)
-))]
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::{EnsureSchemaError, ensure_schema_exists};
@@ -157,7 +151,6 @@ mod change_generations;
 use change_generations::{
     ChangeGenerations, GenerationOwner, GenerationPermit, PreparedGeneration,
 };
-#[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub(crate) mod output_reservation;
 pub(crate) mod query_memory_pool;
@@ -174,7 +167,6 @@ pub mod job_executor_context_extension;
 pub use runtime_datafusion::managed_runtime;
 pub use runtime_datafusion::param_utils;
 pub use runtime_datafusion::pg_catalog;
-#[cfg(not(windows))]
 pub mod planner;
 pub(crate) mod point_lookup;
 pub(crate) use runtime_datafusion::refresh_sql;
@@ -856,7 +848,6 @@ pub(crate) fn engine_to_acceleration_engine(engine: Engine) -> Option<Accelerati
         Engine::Sqlite => Some(AccelerationEngine::Sqlite),
         #[cfg(feature = "turso")]
         Engine::Turso => Some(AccelerationEngine::Turso),
-        #[cfg(not(windows))]
         Engine::Cayenne => Some(AccelerationEngine::Cayenne),
         _ => None,
     }
@@ -1606,7 +1597,6 @@ pub struct DataFusion {
     /// scheduler reflects actual data availability on executors. Only set
     /// in scheduler mode.
     pub(crate) partition_load_tracker: Option<Arc<runtime_cluster::PartitionLoadTracker>>,
-    #[cfg(not(windows))]
     pub(crate) cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
 }
 
@@ -2289,7 +2279,6 @@ impl DataFusion {
     }
 
     /// Returns `true` if any DDL-enabled catalog is Cayenne-backed.
-    #[cfg(not(windows))]
     fn has_cayenne_catalog(&self) -> bool {
         match self.ddl_enabled_catalogs.read() {
             Ok(cats) => cats.iter().any(|name| {
@@ -2313,18 +2302,9 @@ impl DataFusion {
     pub fn is_cayenne_catalog(&self, table_reference: &TableReference) -> bool {
         let catalog_name = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
 
-        #[cfg(not(windows))]
-        {
-            self.ctx
-                .catalog(catalog_name)
-                .is_some_and(|catalog| cayenne_ddl::is_cayenne_catalog(catalog.as_ref()))
-        }
-
-        #[cfg(windows)]
-        {
-            let _ = catalog_name;
-            false
-        }
+        self.ctx
+            .catalog(catalog_name)
+            .is_some_and(|catalog| cayenne_ddl::is_cayenne_catalog(catalog.as_ref()))
     }
 
     /// Returns the partition expression string for a table by querying the catalog provider.
@@ -4767,7 +4747,6 @@ impl DataFusion {
 
         // Check if this is an S3 Express One Zone acceleration (Cayenne with S3 Express config)
         // This is used for better error messages when S3 Express upload fails
-        #[cfg(not(windows))]
         let is_s3_express_acceleration = acceleration_settings.engine == Engine::Cayenne
             && (acceleration_settings
                 .params
@@ -4776,8 +4755,6 @@ impl DataFusion {
                 || acceleration_settings
                     .params
                     .contains_key("cayenne_s3_zone_ids"));
-        #[cfg(windows)]
-        let is_s3_express_acceleration = false;
         accelerated_table_builder.s3_express_acceleration(is_s3_express_acceleration);
 
         // The engine rewrites some incoming types at table creation because its storage
@@ -7066,7 +7043,6 @@ impl DataFusion {
     ///
     /// `parameters` are substituted into table-function arguments first; see
     /// [`runtime_datafusion::table_function_params`].
-    #[cfg(not(windows))]
     pub(crate) async fn create_logical_plan(
         &self,
         session: &SessionState,
@@ -7094,29 +7070,6 @@ impl DataFusion {
 
         let plan =
             planner::create_logical_plan_from_statement(sql, statement, session, &ctx).await?;
-        Ok((plan, placeholders))
-    }
-
-    /// On Windows the `planner` module is not available, so delegate
-    /// directly to DataFusion's standard logical planner.
-    #[cfg(windows)]
-    pub(crate) async fn create_logical_plan(
-        &self,
-        session: &SessionState,
-        sql: &str,
-        parameters: Option<&ParamValues>,
-    ) -> Result<(LogicalPlan, TableFunctionPlaceholders), DataFusionError> {
-        let dialect = session.config().options().sql_parser.dialect;
-        let mut statement = sql_depth_guard::sql_to_statement(session, sql, &dialect)?;
-        sql_depth_guard::ensure_statement_within_depth_limits(&statement)?;
-        let placeholders = bind_table_function_args(&mut statement, parameters)?;
-        self.resolve_pending_initializations_for_statement(session, &statement)
-            .await?;
-        let spellings =
-            runtime_datafusion::analyzer_rule::exact_float_decimal_cast::FloatLiteralSpellings::collect(
-                &statement,
-            );
-        let plan = spellings.retain(session.statement_to_plan(statement).await?)?;
         Ok((plan, placeholders))
     }
 
@@ -7753,12 +7706,6 @@ async fn build_snapshot_creation_config(
         }
     };
 
-    #[cfg(any(
-        feature = "duckdb",
-        feature = "sqlite",
-        feature = "postgres",
-        not(windows)
-    ))]
     let acceleration_engine = match acceleration_settings.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => AccelerationEngine::DuckDB,
@@ -7766,7 +7713,6 @@ async fn build_snapshot_creation_config(
         Engine::Sqlite => AccelerationEngine::Sqlite,
         #[cfg(feature = "turso")]
         Engine::Turso => AccelerationEngine::Turso,
-        #[cfg(not(windows))]
         Engine::Cayenne => AccelerationEngine::Cayenne,
         _ => {
             // This code is unreachable since build_snapshot_creation_config is
@@ -7775,24 +7721,6 @@ async fn build_snapshot_creation_config(
         }
     };
 
-    #[cfg(not(any(
-        feature = "duckdb",
-        feature = "sqlite",
-        feature = "postgres",
-        not(windows)
-    )))]
-    {
-        let _ = acceleration_layout;
-        let _ = snapshot_creation_trigger;
-        return Err(Error::UnsupportedAccelerationEngineForSnapshots);
-    }
-
-    #[cfg(any(
-        feature = "duckdb",
-        feature = "sqlite",
-        feature = "postgres",
-        not(windows)
-    ))]
     Ok(SnapshotManager::try_new(
         dataset.name.to_string(),
         acceleration_settings.snapshot_behavior.clone(),
@@ -8608,7 +8536,6 @@ mod tests {
     /// Each plan of a `CREATE TABLE` stores its options for the analyzer, which takes
     /// them: a Flight SQL client plans the statement to advertise its schema, then
     /// again to run it.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn each_plan_of_a_create_table_stores_its_options() {
         static SQL: &str = "CREATE TABLE t (id BIGINT, region VARCHAR) \
