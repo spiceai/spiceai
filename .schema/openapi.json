@@ -2909,6 +2909,182 @@
           }
         }
       }
+    },
+    "/v1beta/models": {
+      "get": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "List models",
+        "description": "Lists the Spicepod's chat models in the shape of the Gemini API's `models.list`, so Gemini\nclients can discover them.",
+        "operationId": "get_gemini_models",
+        "responses": {
+          "200": {
+            "description": "The chat models, as Gemini API models",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "models": [
+                    {
+                      "name": "models/my-model",
+                      "displayName": "my-model",
+                      "supportedGenerationMethods": [
+                        "generateContent"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1beta/models/{model}": {
+      "get": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Get a model",
+        "description": "One of the Spicepod's chat models, in the shape of the Gemini API's `models.get`.",
+        "operationId": "get_gemini_model",
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "description": "The model's name, as `spice models` lists it.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The model",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "name": "models/my-model",
+                  "displayName": "my-model",
+                  "supportedGenerationMethods": [
+                    "generateContent"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The model was not found"
+          }
+        }
+      }
+    },
+    "/v1beta/models/{model}:generateContent": {
+      "post": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Generate content",
+        "description": "Answers `models/{model}:generateContent`, `:streamGenerateContent` (with `?alt=sse`, a\nstream of server-sent events) and `:countTokens` in the shape of the Gemini API, so Gemini\nclients work by pointing their base URL at Spice. `model` names any chat model in the\nSpicepod; the request is translated into a chat completion. The request and the response\nfollow the Gemini API reference: <https://ai.google.dev/api/generate-content>.",
+        "operationId": "post_gemini_generate_content",
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "description": "The model's name, as `spice models` lists it. The method follows it: `:generateContent`, `:streamGenerateContent` or `:countTokens`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "alt",
+            "in": "query",
+            "description": "`sse` streams `:streamGenerateContent` as server-sent events; without it the stream is sent as one JSON array.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "A Gemini API `generateContent` request.",
+          "content": {
+            "application/json": {
+              "schema": {},
+              "example": {
+                "contents": [
+                  {
+                    "role": "user",
+                    "parts": [
+                      {
+                        "text": "Hello!"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The model's response, or for `:streamGenerateContent`, its stream of responses",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "candidates": [
+                    {
+                      "content": {
+                        "role": "model",
+                        "parts": [
+                          {
+                            "text": "Hello! How can I help?"
+                          }
+                        ]
+                      },
+                      "finishReason": "STOP",
+                      "index": 0
+                    }
+                  ],
+                  "usageMetadata": {
+                    "promptTokenCount": 3,
+                    "candidatesTokenCount": 6,
+                    "totalTokenCount": 9
+                  },
+                  "modelVersion": "my-model"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request is invalid, or asks for something the model cannot serve",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "error": {
+                    "code": 400,
+                    "message": "The request body is not a valid request: missing field `contents`",
+                    "status": "INVALID_ARGUMENT"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The model or method was not found"
+          },
+          "503": {
+            "description": "The model failed to load"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -11087,6 +11263,15 @@
           "owned_by"
         ],
         "properties": {
+          "context_window": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The most tokens one request can hold, prompt and answer together: a local model's\ncontext size, or what a hosted model's provider reports. Absent when it is not known.",
+            "minimum": 0
+          },
           "datasets": {
             "type": [
               "array",
@@ -11118,6 +11303,15 @@
           "id": {
             "type": "string",
             "description": "The name/identifier of the model"
+          },
+          "max_output_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The most tokens one answer can hold, where the model's provider or engine enforces\nsuch a cap. Absent when there is none to report.",
+            "minimum": 0
           },
           "metadata": {
             "oneOf": [
