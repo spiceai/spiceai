@@ -484,10 +484,11 @@ pub enum Action {
         mirror: Option<String>,
     },
     /// Require at least `min` objects under a prefix of a files or object
-    /// store source.
+    /// store source, counting only keys containing `contains` when it is set.
     AssertObjects {
         source: String,
         prefix: String,
+        contains: Option<String>,
         min: usize,
         within: Option<Duration>,
     },
@@ -1966,11 +1967,12 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
         }
         "assert-objects" => {
             let mut inner =
-                Opts::of_mapping(arg, "`assert-objects` takes `source`, `prefix` and `min`")?;
+                Opts::of_mapping(arg, "`assert-objects` takes `source`, `prefix`, `contains` and `min`")?;
             let source = inner
                 .string("source")?
                 .context("`assert-objects` needs a `source`")?;
             let prefix = inner.string("prefix")?.unwrap_or_default();
+            let contains = inner.string("contains")?;
             let min = match inner.take("min") {
                 None => 1,
                 Some(v) => v
@@ -1982,6 +1984,7 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
             Action::AssertObjects {
                 source,
                 prefix,
+                contains,
                 min,
                 within: opts.duration("eventually")?,
             }

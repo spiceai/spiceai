@@ -102,9 +102,13 @@ pub(super) fn describe(action: &Action) -> String {
         Action::AssertObjects {
             source,
             prefix,
+            contains,
             min,
             ..
-        } => format!("assert-objects {source}/{prefix} >= {min}"),
+        } => match contains {
+            Some(contains) => format!("assert-objects {source}/{prefix}*{contains}* >= {min}"),
+            None => format!("assert-objects {source}/{prefix} >= {min}"),
+        },
         Action::Generate {
             source,
             spec,
@@ -478,21 +482,28 @@ pub(super) async fn run_instance_step(
         Action::AssertObjects {
             source,
             prefix,
+            contains,
             min,
             within,
         } => {
             let namespace = namespace(instance, source)?;
             let deadline = Instant::now() + within.unwrap_or_default();
             let found = loop {
-                let found = sources.get(source)?.list(&namespace, prefix).await?;
+                let mut found = sources.get(source)?.list(&namespace, prefix).await?;
+                if let Some(contains) = contains {
+                    found.retain(|key| key.contains(contains.as_str()));
+                }
                 if found.len() >= *min || Instant::now() >= deadline {
                     break found;
                 }
                 tokio::time::sleep(POLL).await;
             };
+            let matching = contains
+                .as_ref()
+                .map_or_else(String::new, |contains| format!(" containing '{contains}'"));
             ensure!(
                 found.len() >= *min,
-                "expected at least {min} objects under '{prefix}' in '{source}', found {}: {found:?}",
+                "expected at least {min} objects under '{prefix}'{matching} in '{source}', found {}: {found:?}",
                 found.len()
             );
             return Ok(format!(" ({} objects)", found.len()));

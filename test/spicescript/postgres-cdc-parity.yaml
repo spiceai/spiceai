@@ -179,13 +179,16 @@ steps:
   - query: SELECT * FROM customers
     eventually: 30s
 
-  # The rustfs variant's metastore is in its bucket: the head, sealed batches
-  # and checkpoints under the state location's cayenne/v1/ folder.
+  # The rustfs variant's metastore is in its bucket, under the state location's
+  # cayenne/v1/ folder: the name registry's head, and each dataset's own log
+  # (datasets/<name>-<id>/) with its head, sealed batches and checkpoints.
   - assert-objects: { source: lake, prefix: state/cayenne/v1/catalog/head, min: 1 }
     only: object-native-rustfs
-  - assert-objects: { source: lake, prefix: state/cayenne/v1/catalog/wal/, min: 1 }
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /head, min: 1 }
     only: object-native-rustfs
-  - assert-objects: { source: lake, prefix: state/cayenne/v1/catalog/checkpoints/, min: 1 }
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /wal/, min: 1 }
+    only: object-native-rustfs
+  - assert-objects: { source: lake, prefix: state/cayenne/v1/datasets/orders-, contains: /checkpoints/, min: 1 }
     only: object-native-rustfs
 
   # Changes made while spiced is stopped arrive after it starts again.
