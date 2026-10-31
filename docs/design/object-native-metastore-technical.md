@@ -230,7 +230,7 @@ sequenceDiagram
 
 *Diagram 2: writing. Bursts publish locally as they arrive, and one head CAS per acknowledgement point makes them durable. The acknowledgement follows the commit, never precedes it.*
 
-Model: `commits-commit`, `commit-guards`, `commit-no-cas`, `commits-etag`, `commits-etag-repeat`.
+Model: `commits-commit*`, `commit-guards`, `commit-no-cas`, `commits-etag`, `commits-etag-repeat`.
 
 ### The copy rule
 
@@ -266,7 +266,7 @@ run checks a sparse variant.
 - **A checkpoint bounds the batch index.** The writer checkpoints before the
   index would push the head past H.
 
-Model: `window-storage`, `commit-no-copy`, `commit-no-observed`, `storage-no-exists`, `storage-no-stable-cut`, `storage-no-final`, `storage-no-range`.
+Model: `window-storage*`, `commits-commit-no-copy-2-exhaust`, `commits-commit-no-observed-2-exhaust`, `window-storage-no-exists-5-exhaust`, `window-storage-no-stable-cut-5-exhaust`, `window-storage-no-final-5-exhaust`, `window-storage-no-range-5-exhaust`.
 
 ### Uncertain writes
 
@@ -349,7 +349,7 @@ replay, and the old writer's unacknowledged buffer is discarded.
   After the holder fails, some instance is ingesting again within the lease
   duration.
 
-Model: `commit-no-lease`, `commits-commit`; standbys: `standby`, `standby-three`, `standby-early-safety` (early acquisition stays safe), `standby-no-generation` (fencing by the lease object alone accepts a stale commit), `standby-early-acquire`, `standby-no-renew`.
+Model: `commit-no-lease`, `commits-commit*`; standbys: `standby`, `standby-three`, `standby-early-safety` (early acquisition stays safe), `standby-no-generation` (fencing by the lease object alone accepts a stale commit), `standby-early-acquire`, `standby-no-renew`.
 
 ## Readers
 
@@ -389,7 +389,7 @@ Model: `commit-no-lease`, `commits-commit`; standbys: `standby`, `standby-three`
 - **A record whose guards fail on apply** is a corruption error that refuses the
   dataset, never a skipped record.
 
-Model: `retention-readers-response-time`, `storage-no-missing`, `concurrent-floor-aligned`.
+Model: `retention-readers-response-time`, `commits-storage-no-missing-2-exhaust`, `concurrent-floor-aligned*`.
 
 ## Dataset state and checkpoints
 
@@ -462,7 +462,7 @@ compaction removing files across every key range, rewrites most pages. Whether
 checkpoints need delta pages is an [open decision](#open-decisions), settled by
 step 5's measurement.
 
-Model: `naming`, `naming-no-commit-number`, `storage-no-published`, `dataset-byte-window-metadata-prefix*`.
+Model: `naming`, `naming-no-commit-number`, `commits-storage-no-published-2-exhaust`, `dataset-byte-window-metadata-prefix*`.
 
 ### What the state holds
 
@@ -541,7 +541,7 @@ file and adds the new ones; on-conflict deletions add deletion vectors and files
 together; a schema change that invalidates statistics sets the schema and clears
 them together.
 
-Model: `delete-coverage`, `delete-coverage-no-cold`, `dataset-prepare-cutoff-cap`, `dataset-prepare-no-cutoff-cap`, `pk-index`, `pk-index-checkpoint-no-refresh`, `cold-promotion`, `cold-promotion-no-input-removal`.
+Model: `delete-coverage`, `delete-coverage-no-cold`, `dataset-prepare-cutoff-cap`, `dataset-prepare-no-cutoff-cap`, `pk-index*`, `pk-index-checkpoint-no-refresh`, `cold-promotion`, `cold-promotion-no-input-removal`.
 
 **From today's tables,** for the migration:
 
@@ -617,7 +617,7 @@ token `sequence_high_water()`.
 Commits 8, 9 and 10 are three states with one `seq` high-water, which is why
 states are named by commit number.
 
-Model: `seq-order`, `seq-order-maintenance-draw`, `seq-order-drawn-cutoff`, `table-seq`, `table-seq-no-table-scope`, `naming`.
+Model: `seq-order*`, `seq-order-maintenance-draw`, `seq-order-drawn-cutoff`, `table-seq`, `table-seq-no-table-scope`, `naming`.
 
 ## Transactions and source positions
 
@@ -681,7 +681,7 @@ in one partition, and recovery that drains pending intents before ingesting
 again. Another writer on the same keys breaks it, which is the case two-phase
 commit serves (model: `intent-roll-forward*`, `intent-roll-forward-partitioned*`).
 
-Model: `transactions-txn`, `transactions-three-participants`, `window-txn`, `concurrent-txn-overlap`, `concurrent-txn-disjoint`, `dataset-prepare-*`, `txn-no-reservation`, `txn-no-roots`, `txn-no-matching`, `txn-no-create-once`, `txn-no-reader-log`.
+Model: `transactions-txn*`, `transactions-three-participants*`, `window-txn*`, `concurrent-txn-overlap*`, `concurrent-txn-disjoint*`, `dataset-prepare-*`, `transactions-txn-no-reservation-0-exhaust`, `transactions-txn-no-roots-0-exhaust`, `transactions-txn-no-matching-0-exhaust`, `transactions-txn-no-create-once-0-exhaust`, `transactions-txn-no-reader-log-0-exhaust`.
 
 ### Source positions and backfill
 
@@ -805,7 +805,7 @@ can land after failover, so the age check is needed from the start. In
 Milestone 2, GC on another node holds the GC lease (`leases/gc.json`) for its
 empty commits; the layout does not change.
 
-Model: `retention`, `retention-readers`; GC on another node: `retention-remote-gc`, `retention-readers-remote-gc`, `retention-remote-gc-blind-commit` (an unconditional empty commit resurrects a removed object); pending removals rebuilt from a checkpoint: `retention-readers-checkpoint`, `retention-readers-remote-gc-checkpoint`, `retention-readers-checkpoint-root-omits`, `retention-readers-checkpoint-tail-only`, `retention-readers-remote-gc-keep-timestamps`; and `retention-writer-clock`, `retention-list-date`, `retention-reref-published`, `retention-readers-volatile-removals`, `retention-readers-sweep-removed`, `retention-readers-response-time`, `retention-readers-keep-timestamps`, `retention-readers-stale-start`, `retention-readers-no-retention`, `retention-readers-missing-as-empty`, `retention-no-age-check`, `retention-no-margin`, `retention-reuse-found`, `dataset-lifecycle-no-query-log-retention`, `storage-no-published`.
+Model: `retention`, `retention-readers`; GC on another node: `retention-remote-gc`, `retention-readers-remote-gc`, `retention-remote-gc-blind-commit` (an unconditional empty commit resurrects a removed object); pending removals rebuilt from a checkpoint: `retention-readers-checkpoint`, `retention-readers-remote-gc-checkpoint`, `retention-readers-checkpoint-root-omits`, `retention-readers-checkpoint-tail-only`, `retention-readers-remote-gc-keep-timestamps`; and `retention-writer-clock`, `retention-list-date`, `retention-reref-published`, `retention-readers-volatile-removals`, `retention-readers-sweep-removed`, `retention-readers-response-time`, `retention-readers-keep-timestamps`, `retention-readers-stale-start`, `retention-readers-no-retention`, `retention-readers-missing-as-empty`, `retention-no-age-check`, `retention-no-margin`, `retention-reuse-found`, `dataset-lifecycle-no-query-log-retention`, `commits-storage-no-published-2-exhaust`.
 
 ## Small writes
 
@@ -835,7 +835,7 @@ Decision 1.5 sets the direction; the SQL inline tier is retired once step 5's
   commit. Rewriting instead caused a cache-rebuild herd in release-candidate
   testing.
 
-Model: `window-storage`.
+Model: `window-storage*`.
 
 ## Stored format
 
@@ -1142,7 +1142,7 @@ the mem-tier's apply path and may shrink the tier for hot keys (not measured).
 Either is independent of publishing at commit. The gate is in the
 [roadmap](#milestones-2-and-3-steps).
 
-Model: `seq-order`, `seq-order-no-shift`, `seq-order-non-uniform`, `read-rule2-stamp-at-commit`.
+Model: `seq-order*`, `seq-order-no-shift`, `seq-order-non-uniform`, `read-rule2-stamp-at-commit`.
 
 ## Future: multi-region
 
@@ -1467,7 +1467,7 @@ The direction document links here; this is the one list.
 | The backfill rule alongside live CDC | Specification, before parallel loaders exist | M3c |
 | The cluster acceleration flow under shared state | Mapping the current flow | M3d |
 | Source-version ordering (deferred, decision 3.2) | A use case: backfill alongside CDC, unpartitioned latest-state ingest, active-active upstreams | Not scheduled |
-| Atomic CDC transactions across datasets: two-phase commit per checkpoint, an exclusive-writer roll-forward fast path (two head writes, no decision object), or one log for the datasets a CDC stream feeds (atomic reads too, at the cost of sharing one head's throughput) | Needed only once CDC transactions across tables are supported; the fast path, single-writer and per-partition, is verified in the model under its preconditions (see Multi-table transactions) | When CDC transactions are supported |
+| Atomic CDC transactions across datasets: two-phase commit per checkpoint, an exclusive-writer roll-forward fast path (two head writes, no decision object), or one log for the datasets a CDC stream feeds (atomic reads too, at the cost of sharing one head's throughput) | Needed only once CDC transactions across tables are supported; the fast path, single-writer and per-partition, is verified in the model under its preconditions (model: `intent-roll-forward*`, `intent-roll-forward-partitioned*`) | When CDC transactions are supported |
 | Multi-region: how an instance is declared a regional reader (for example `runtime.state.replica_of`); readers wait for replication by default, and reading from the source is out of scope | The regional read-only replicas Enhancement | Multi-region |
 | Multi-region: whether replicated objects keep their ETags under every encryption mode, or the head carries its commit number for the source check | Measurement per mode | Multi-region |
 | Multiple data locations: whether footprint digests count as data for residency; the cost of sweeping many locations; the surface | The object-native data design | Not scheduled |
