@@ -415,7 +415,7 @@ pub struct AccelerationRequest {
                 "message": "Dataset taxi_trips not found"
             })
         ))),
-        (status = 400, description = "Dataset is not accelerated; nothing to refresh", content((
+        (status = 400, description = "Dataset is not accelerated, or the overrides are invalid: a `refresh_mode` other than `full` or `append`, or a `refresh_sql` that does not parse or omits the dataset's `time_column`", content((
             MessageResponse = "application/json",
             example = json!({
                 "message": "Dataset taxi_trips does not have acceleration enabled"
@@ -512,6 +512,18 @@ pub(crate) async fn refresh(
             status::StatusCode::CREATED,
             Json(MessageResponse {
                 message: format!("Dataset refresh triggered for {dataset_name}."),
+            }),
+        )
+            .into_response(),
+        Err(
+            err @ crate::datafusion::Error::UnableToTriggerRefresh {
+                source: crate::accelerated::Error::InvalidRefreshOverrides { .. },
+                ..
+            },
+        ) => (
+            status::StatusCode::BAD_REQUEST,
+            Json(MessageResponse {
+                message: format!("{err}"),
             }),
         )
             .into_response(),

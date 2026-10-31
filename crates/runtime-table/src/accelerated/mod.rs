@@ -185,6 +185,19 @@ pub enum Error {
     ManualRefreshIsNotSupported {},
 
     #[snafu(display(
+        "Failed to refresh dataset {dataset_name}: a refresh cannot run in refresh_mode '{mode}'. Valid modes are 'full' or 'append'."
+    ))]
+    RefreshModeCannotRun {
+        dataset_name: String,
+        mode: &'static str,
+    },
+
+    #[snafu(display("{source}"))]
+    InvalidRefreshOverrides {
+        source: refresh::InvalidRefreshOverrides,
+    },
+
+    #[snafu(display(
         "Failed to reload the partitions this executor serves: the dataset's change stream has stopped."
     ))]
     ReloadWorkerStopped {},
@@ -1782,6 +1795,14 @@ impl AcceleratedTable {
     /// for refreshes) or the refresh task has already stopped.
     pub async fn trigger_refresh(&self, overrides: Option<RefreshOverrides>) -> Result<()> {
         if let Some(refresh_trigger) = self.refresh_trigger() {
+            // Rejected here, before anything is queued, so the caller learns of it: the
+            // worker would otherwise fail the refresh after the request was accepted.
+            if let Some(overrides) = &overrides {
+                let refresh = self.refresh_params.read().await.clone();
+                overrides
+                    .validate_for(&self.dataset_name, &refresh, self.federated.schema())
+                    .context(InvalidRefreshOverridesSnafu)?;
+            }
             refresh_trigger
                 .send(overrides)
                 .await

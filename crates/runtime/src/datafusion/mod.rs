@@ -6130,6 +6130,17 @@ impl DataFusion {
         dataset_name: &TableReference,
         overrides: Option<RefreshOverrides>,
     ) -> Result<Option<RefreshCompletionWaiter>> {
+        // Checked here as well as by the accelerated table, so a scheduler rejects a
+        // mode no executor can run instead of forwarding it.
+        if let Some(overrides) = &overrides {
+            overrides
+                .validate_mode()
+                .map_err(|source| Error::UnableToTriggerRefresh {
+                    dataset_name: dataset_name.to_string(),
+                    source: crate::accelerated::Error::InvalidRefreshOverrides { source },
+                })?;
+        }
+
         // If we're a scheduler with a partition service, forward refresh to executors
         // instead of trying to refresh locally (the scheduler doesn't run refresh workers).
         if matches!(

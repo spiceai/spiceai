@@ -76,6 +76,38 @@ pub enum Error {
     },
 }
 
+/// Why the overrides of an on-demand refresh were rejected before the refresh was queued.
+#[derive(Debug, Snafu)]
+pub enum InvalidRefreshOverrides {
+    #[snafu(display(
+        "refresh_mode '{mode}' is not supported for an on-demand refresh. Valid modes are 'full' or 'append'."
+    ))]
+    UnsupportedMode { mode: &'static str },
+
+    #[snafu(display("Invalid refresh_sql: {source}"))]
+    InvalidSql {
+        source: runtime_datafusion::refresh_sql::Error,
+    },
+
+    #[snafu(display(
+        "Invalid refresh_sql: {source}. The refresh_sql must select the dataset's time_column."
+    ))]
+    TimeColumnNotSelected { source: Error },
+}
+
+/// The name a refresh mode is written with in a spicepod or a refresh request.
+#[must_use]
+pub const fn refresh_mode_name(mode: RefreshMode) -> &'static str {
+    match mode {
+        RefreshMode::Disabled => "disabled",
+        RefreshMode::Full => "full",
+        RefreshMode::Append => "append",
+        RefreshMode::Changes => "changes",
+        RefreshMode::Caching => "caching",
+        RefreshMode::Snapshot => "snapshot",
+    }
+}
+
 /// How a refresh that keeps each key's newest version by `time_column` resolves it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VersionsByTime {
@@ -126,8 +158,12 @@ pub struct RefreshOverrides {
     #[serde(default, rename = "refresh_sql")]
     pub sql: Option<String>,
 
-    /// The refresh mode to use for this refresh. Defaults to the `refresh_mode` specified in the spicepod, or `full`.
-    #[serde(default, rename = "refresh_mode")]
+    /// The refresh mode to use for this refresh: `full` or `append`. Defaults to the `refresh_mode` specified in the spicepod, or `full`.
+    #[serde(
+        default,
+        rename = "refresh_mode",
+        deserialize_with = "parse_override_mode"
+    )]
     pub mode: Option<RefreshMode>,
 
     /// The maximum amount of jitter to add to the refresh. Defaults to the `refresh_jitter_max` specified in the spicepod, or 10% of the `refresh_check_interval`.
@@ -138,6 +174,75 @@ pub struct RefreshOverrides {
     )]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, example = "10s"))]
     pub max_jitter: Option<Duration>,
+}
+
+/// Reads `refresh_mode`. An unknown value is rejected naming only the modes an
+/// on-demand refresh supports; a known but unsupported one is read, and rejected by
+/// [`RefreshOverrides::validate_mode`] with its own message.
+fn parse_override_mode<'de, D>(deserializer: D) -> Result<Option<RefreshMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    serde_json::from_value(serde_json::Value::String(value.clone()))
+        .map(Some)
+        .map_err(|_| {
+            serde::de::Error::custom(format!(
+                "unknown refresh_mode '{value}'. Valid modes are 'full' or 'append'."
+            ))
+        })
+}
+
+impl RefreshOverrides {
+    /// Checks that the requested `refresh_mode`, if any, is one an on-demand refresh can
+    /// run: `full` or `append`. The others are driven by their own workers (`changes`,
+    /// `caching`, `snapshot`) or never refresh (`disabled`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidRefreshOverrides::UnsupportedMode`] for any other mode.
+    pub fn validate_mode(&self) -> Result<(), InvalidRefreshOverrides> {
+        match self.mode {
+            None | Some(RefreshMode::Full | RefreshMode::Append) => Ok(()),
+            Some(mode) => UnsupportedModeSnafu {
+                mode: refresh_mode_name(mode),
+            }
+            .fail(),
+        }
+    }
+
+    /// Checks the overrides against the dataset they refresh, before the refresh is
+    /// queued: the mode (see [`Self::validate_mode`]), that the `refresh_sql` parses
+    /// against `source_schema`, and that the columns it selects carry the dataset's
+    /// `time_column` (and `time_partition_column`) with a compatible format, as a
+    /// spicepod `refresh_sql` must at startup. Without the time column, an append
+    /// writes rows with a NULL time that the next append reads again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidRefreshOverrides`] naming the first check that fails.
+    pub fn validate_for(
+        &self,
+        dataset_name: &TableReference,
+        refresh: &Refresh,
+        source_schema: Arc<Schema>,
+    ) -> Result<(), InvalidRefreshOverrides> {
+        self.validate_mode()?;
+        let Some(sql) = self.sql.as_deref() else {
+            return Ok(());
+        };
+        let (_, refresh_schema) = runtime_datafusion::refresh_sql::parse_refresh_sql(
+            dataset_name.clone(),
+            sql,
+            source_schema,
+        )
+        .context(InvalidSqlSnafu)?;
+        refresh
+            .validate_time_format_inner(&dataset_name.to_string(), &refresh_schema, false)
+            .context(TimeColumnNotSelectedSnafu)
+    }
 }
 
 fn parse_max_jitter<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
@@ -1945,6 +2050,126 @@ mod tests {
         let mut out = vec![];
         sql.extend_effective_partition_filters(&mut out);
         out
+    }
+
+    #[test]
+    fn an_on_demand_refresh_accepts_only_full_or_append() {
+        let with_mode = |mode| RefreshOverrides {
+            sql: None,
+            mode,
+            max_jitter: None,
+        };
+        for mode in [None, Some(RefreshMode::Full), Some(RefreshMode::Append)] {
+            with_mode(mode)
+                .validate_mode()
+                .expect("the mode is accepted");
+        }
+        for mode in [
+            RefreshMode::Disabled,
+            RefreshMode::Changes,
+            RefreshMode::Caching,
+            RefreshMode::Snapshot,
+        ] {
+            let err = with_mode(Some(mode))
+                .validate_mode()
+                .expect_err("the mode is rejected");
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!("'{}'", refresh_mode_name(mode)))
+                    && message.contains("Valid modes are 'full' or 'append'"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_override_refresh_mode_names_only_the_supported_modes() {
+        let err = serde_json::from_str::<RefreshOverrides>(r#"{"refresh_mode":"bogus"}"#)
+            .expect_err("an unknown mode does not parse");
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown refresh_mode 'bogus'")
+                && message.contains("Valid modes are 'full' or 'append'")
+                && !message.contains("changes"),
+            "{message}"
+        );
+
+        let parsed = serde_json::from_str::<RefreshOverrides>(r#"{"refresh_mode":"changes"}"#)
+            .expect("a known mode parses, to be rejected by validate_mode");
+        assert_eq!(parsed.mode, Some(RefreshMode::Changes));
+        let parsed = serde_json::from_str::<RefreshOverrides>(r#"{"refresh_mode":null}"#)
+            .expect("a null mode parses");
+        assert_eq!(parsed.mode, None);
+        let parsed = serde_json::from_str::<RefreshOverrides>("{}").expect("no mode parses");
+        assert_eq!(parsed.mode, None);
+
+        let round_trip = serde_json::to_string(&RefreshOverrides {
+            sql: None,
+            mode: Some(RefreshMode::Append),
+            max_jitter: None,
+        })
+        .expect("serializes");
+        let parsed = serde_json::from_str::<RefreshOverrides>(&round_trip)
+            .expect("a forwarded request parses");
+        assert_eq!(parsed.mode, Some(RefreshMode::Append));
+    }
+
+    #[test]
+    fn an_override_refresh_sql_must_select_the_time_column() {
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Utf8, true),
+            arrow::datatypes::Field::new("ts", arrow::datatypes::DataType::Int64, true),
+        ]));
+        let dataset = TableReference::bare("events");
+        let refresh = Refresh::new(RefreshMode::Append)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::UnixSeconds);
+        let with_sql = |sql: &str| RefreshOverrides {
+            sql: Some(sql.to_string()),
+            mode: None,
+            max_jitter: None,
+        };
+
+        let err = with_sql("SELECT id, payload FROM events")
+            .validate_for(&dataset, &refresh, Arc::clone(&schema))
+            .expect_err("a refresh_sql without the time column is rejected");
+        assert!(
+            matches!(err, InvalidRefreshOverrides::TimeColumnNotSelected { .. })
+                && err.to_string().contains("time_column 'ts' was not found"),
+            "{err}"
+        );
+        // A full refresh writes its rows with the same NULL time, as the spicepod
+        // check at startup rejects whatever the mode.
+        let full = Refresh::new(RefreshMode::Full).time_column("ts".to_string());
+        with_sql("SELECT id FROM events")
+            .validate_for(&dataset, &full, Arc::clone(&schema))
+            .expect_err("rejected in full mode too");
+
+        for sql in [
+            "SELECT * FROM events",
+            "SELECT id, ts FROM events WHERE id > 50",
+        ] {
+            with_sql(sql)
+                .validate_for(&dataset, &refresh, Arc::clone(&schema))
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        // A dataset without a time column accepts any projection.
+        with_sql("SELECT id FROM events")
+            .validate_for(
+                &dataset,
+                &Refresh::new(RefreshMode::Full),
+                Arc::clone(&schema),
+            )
+            .expect("no time column to select");
+
+        let err = with_sql("SELECT * FROM other_table")
+            .validate_for(&dataset, &refresh, Arc::clone(&schema))
+            .expect_err("a refresh_sql over another table is rejected");
+        assert!(
+            matches!(err, InvalidRefreshOverrides::InvalidSql { .. }),
+            "{err}"
+        );
     }
 
     #[test]
