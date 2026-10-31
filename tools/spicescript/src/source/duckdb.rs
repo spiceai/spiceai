@@ -14,8 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `DuckDB` files written and queried through the CLI matching Spice's
-//! embedded release. Each namespace has its own canonical database path.
+//! `DuckDB` files written and queried through the `duckdb` CLI of one
+//! release, whose library `spiced` loads to read them: the source's
+//! `version`, else `--duckdb-version`, else the newest release
+//! `test/duckdb_versions.json` lists. Each namespace has its own canonical
+//! database path.
 //!
 //! `DuckDB` permits one writer or multiple read-only processes. Writes must
 //! happen before `start` or while `spiced` is stopped; oracle queries attach
@@ -48,13 +51,13 @@ pub struct DuckDb {
 }
 
 impl DuckDb {
-    pub async fn start(dir: PathBuf) -> Result<Self> {
+    pub async fn start(version: Option<&str>, dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&dir)?;
-        let near = std::env::current_dir()?;
+        let version = duckdb_cli::version(version)?;
         Ok(Self {
             dir: std::fs::canonicalize(dir)?,
-            cli: duckdb_cli::embedded(&near, "SPICESCRIPT_DUCKDB_CLI").await?,
-            library: duckdb_cli::embedded_library(&near).await?,
+            cli: duckdb_cli::cli(&version, "SPICESCRIPT_DUCKDB_CLI").await?,
+            library: duckdb_cli::library(&version).await?,
         })
     }
 

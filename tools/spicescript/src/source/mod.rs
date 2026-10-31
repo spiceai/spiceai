@@ -182,7 +182,7 @@ pub async fn start(
         "iceberg" => Box::new(iceberg::Iceberg::start(name, run_id, dir).await?),
         "clickhouse" => Box::new(clickhouse::ClickHouse::start(name, run_id, version).await?),
         "mock-http" => Box::new(mock_http::MockHttp::start().await?),
-        "duckdb" => Box::new(duckdb::DuckDb::start(dir).await?),
+        "duckdb" => Box::new(duckdb::DuckDb::start(version, dir).await?),
         "ducklake" => Box::new(ducklake::DuckLake::start(name, run_id, version, dir).await?),
         other => anyhow::bail!(
             "unknown source kind '{other}'; expected kafka, mongodb, dynamodb, postgres, mysql, clickhouse, files, rustfs, iceberg, duckdb, ducklake, mock-http or docker"

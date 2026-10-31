@@ -147,6 +147,18 @@ struct Cli {
     #[arg(long = "log-capture", value_name = "DIR")]
     log_capture: Option<PathBuf>,
 
+    /// The `DuckDB` release `duckdb` and `ducklake` sources use when their
+    /// spec names no `version`: their `duckdb` CLI writes and checks the
+    /// data, and `spiced` loads its library. Defaults to the newest release
+    /// `test/duckdb_versions.json` lists. The expected-failures ledger is
+    /// recorded at that default, so `--record-failures` refuses another.
+    #[arg(
+        long = "duckdb-version",
+        value_name = "VERSION",
+        env = "SPICESCRIPT_DUCKDB_VERSION"
+    )]
+    duckdb_version: Option<String>,
+
     /// The widest a value is drawn in a failure report's table, in
     /// characters; a longer one keeps its start and end. 0 draws every value
     /// whole.
@@ -234,6 +246,14 @@ async fn run(cli: Cli) -> Result<bool> {
     cleanup::install_signal_handler();
     if let Some(limit) = cli.max_wait {
         runner::set_max_wait(limit);
+    }
+    if let Some(version) = cli.duckdb_version.clone() {
+        let default = source::duckdb_cli::version(None)?;
+        anyhow::ensure!(
+            !cli.record_failures || version.trim_start_matches('v') == default,
+            "--record-failures records the ledger at DuckDB {default}, the newest release test/duckdb_versions.json lists; drop --duckdb-version {version} to record"
+        );
+        source::duckdb_cli::set_default_version(version);
     }
     if let Some(from) = &cli.from {
         anyhow::ensure!(
