@@ -1073,6 +1073,9 @@ const REASONING_DOCS: &str = "https://spiceai.org/docs/components/models";
 /// The opening tag of a `<think>…</think>` reasoning block.
 const THINK_OPEN_TAG: &str = "<think>";
 
+/// The token that opens a Mistral reasoning model's `[THINK]…[/THINK]` block.
+const MISTRAL_THINK_OPEN_TAG: &str = "[THINK]";
+
 /// The token Gemma 4 chat templates add to the prompt to turn reasoning on.
 const GEMMA_THINK_TOKEN: &str = "<|think|>";
 
@@ -1150,10 +1153,13 @@ impl ReasoningSupport {
 }
 
 /// Whether a rendered prompt starts the model inside a reasoning block, by the test
-/// `mistral.rs` applies to parse the reply: a prompt that ends in `<think>`, or one that
-/// carries Gemma 4's `<|think|>`.
+/// `mistral.rs` applies to parse the reply: a prompt that ends in `<think>` or Mistral's
+/// `[THINK]`, or one that carries Gemma 4's `<|think|>`.
 fn opens_reasoning(prompt: &str) -> bool {
-    prompt.trim_end().ends_with(THINK_OPEN_TAG) || prompt.contains(GEMMA_THINK_TOKEN)
+    let end = prompt.trim_end();
+    end.ends_with(THINK_OPEN_TAG)
+        || end.ends_with(MISTRAL_THINK_OPEN_TAG)
+        || prompt.contains(GEMMA_THINK_TOKEN)
 }
 
 /// Whether `prompt` names `level` as a whole word, ignoring case, as GLM-5.3 does with
@@ -1669,6 +1675,24 @@ mod tests {
     }
 
     /// Classifies a template from one of the renders above, none of which fails.
+    /// Mistral Large 4's template: it takes `low`, `medium` and `high` in its model settings,
+    /// renders an unset effort as `high` and raises on any other level; the model opens its own
+    /// `[THINK]` block.
+    fn mistral_large_4_render(
+        _: Option<bool>,
+        effort: Option<TemplateReasoningEffort>,
+    ) -> Option<String> {
+        let level = match effort {
+            None | Some(TemplateReasoningEffort::High) => "high",
+            Some(TemplateReasoningEffort::Low) => "low",
+            Some(TemplateReasoningEffort::Medium) => "medium",
+            Some(_) => return None,
+        };
+        Some(format!(
+            "<s>[MODEL_SETTINGS]{{\"reasoning_effort\": \"{level}\"}}[/MODEL_SETTINGS][INST]Hi[/INST]"
+        ))
+    }
+
     fn classify(
         render: fn(Option<bool>, Option<TemplateReasoningEffort>) -> String,
     ) -> ReasoningSupport {
@@ -1711,6 +1735,28 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn mistral_large_4_always_reasons_and_names_low_medium_and_high() {
+        assert_eq!(
+            ReasoningSupport::from_renders(mistral_large_4_render),
+            ReasoningSupport {
+                always_reasons: true,
+                levels: Some(vec![
+                    TemplateReasoningEffort::Low,
+                    TemplateReasoningEffort::Medium,
+                    TemplateReasoningEffort::High
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn a_prompt_that_opens_a_mistral_think_block_starts_in_reasoning() {
+        assert!(opens_reasoning("[INST]Hi[/INST][THINK]"));
+        assert!(opens_reasoning("[INST]Hi[/INST][THINK]\n"));
+        assert!(!opens_reasoning("[INST]Hi[/INST]"));
     }
 
     #[test]

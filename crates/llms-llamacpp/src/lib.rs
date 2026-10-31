@@ -65,7 +65,8 @@ use mistralrs_core::reasoning_parsers::{
     TagReasoningContext,
     harmony::is_harmony_template,
     tag_based::{
-        THINK_OPEN_TAG, is_channel_tag_template, is_gemma_turn_template, is_think_tag_template,
+        MISTRAL_THINK_OPEN_TAG, THINK_OPEN_TAG, is_channel_tag_template, is_gemma_turn_template,
+        is_mistral_think_template, is_think_tag_template,
     },
 };
 use mistralrs_core::{
@@ -2202,9 +2203,9 @@ fn longest_suffix_prefix(text: &str, pattern: &str) -> usize {
 
 /// The parser that tells a reply's reasoning apart from its answer, chosen from the chat
 /// template and the rendered prompt as the mistral.rs engine chooses it: Gemma 4's channel
-/// tags, `<think>` tags (starting inside the block when the prompt opens it), or the Gemma
-/// family's `<unused94>` thought tokens. A template that marks no reasoning gets none, and
-/// the whole reply is content.
+/// tags, `<think>` tags or Mistral's `[THINK]` tokens (each starting inside the block when the
+/// prompt opens it), or the Gemma family's `<unused94>` thought tokens. A template that marks
+/// no reasoning gets none, and the whole reply is content.
 fn reasoning_parser(template: &str, prompt: &str) -> Option<TagReasoningContext> {
     let harmony = is_harmony_template(template);
     if is_channel_tag_template(template) && !harmony {
@@ -2218,6 +2219,12 @@ fn reasoning_parser(template: &str, prompt: &str) -> Option<TagReasoningContext>
             TagReasoningContext::new_in_think_block()
         } else {
             TagReasoningContext::new_think_tags()
+        })
+    } else if is_mistral_think_template(template) && !harmony {
+        Some(if prompt.trim_end().ends_with(MISTRAL_THINK_OPEN_TAG) {
+            TagReasoningContext::new_in_mistral_think_block()
+        } else {
+            TagReasoningContext::new_mistral_think()
         })
     } else if is_gemma_turn_template(template) {
         Some(TagReasoningContext::new_gemma_thought())
@@ -2973,6 +2980,28 @@ mod tests {
             ["r:plan", "c:42"]
         );
         assert_eq!(split(GEMMA4, "user\nHi", &["42"]), ["c:42"]);
+    }
+
+    /// The reasoning markers of a Mistral reasoning model's chat template: Magistral's, and
+    /// Mistral Large 4's, which writes earlier turns' reasoning as `[THINK]...[/THINK]`.
+    const MISTRAL_THINK: &str = "{{- '[THINK]' ~ block['thinking'] -}}{{- '[/THINK]' -}}";
+
+    #[test]
+    fn mistral_reasoning_is_split_at_its_think_tokens() {
+        // regression: Mistral Large 4's reasoning came back as content, its tags included
+        assert_eq!(
+            split(
+                MISTRAL_THINK,
+                "[INST]Hi[/INST]",
+                &["[TH", "INK]why[/THI", "NK]42"]
+            ),
+            ["r:why", "c:42"]
+        );
+        // a prompt that opens the block starts the reply inside it
+        assert_eq!(
+            split(MISTRAL_THINK, "[INST]Hi[/INST][THINK]", &["why[/THINK]42"]),
+            ["r:why", "c:42"]
+        );
     }
 
     #[test]
