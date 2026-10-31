@@ -191,25 +191,34 @@ steps:
   - query: SELECT count(DISTINCT v) AS d FROM (SELECT value % 100000 AS v FROM generate_series(1, 1000000))
     expect: { rows: [['100000']] }
 
-  # Retention: with the shortest period and check interval allowed (60 s
-  # each), a query's row is there at first and gone after the first check that
-  # finds it older than 60 s, while a newer query's row stays. The restart empties the in-memory tables.
+  # Retention: with a 120 s period checked every 60 s, a query's row survives
+  # until a check finds it older than 120 s, and that check keeps a row
+  # written 70 s later. The restart empties the in-memory tables.
   - restart:
       patch:
         spicepod:
           runtime:
-            task_history: { retention_period: 60s, retention_check_interval: 60s }
+            task_history: { retention_period: 120s, retention_check_interval: 60s }
   - query: SELECT 1 AS th_old
     expect: { rows: [['1']] }
   - query: SELECT count(*) AS n FROM runtime.task_history WHERE task = 'sql_query' AND input = 'SELECT 1 AS th_old'
     expect: { rows: [['1']] }
     eventually: 15s
+  # At 70 s th_old is younger than the period, so every check so far kept it.
+  - sleep: 70s
   - query: SELECT count(*) AS n FROM runtime.task_history WHERE task = 'sql_query' AND input = 'SELECT 1 AS th_old'
-    expect: { rows: [['0']] }
-    eventually: 180s
+    expect: { rows: [['1']] }
   - query: SELECT 2 AS th_new
     expect: { rows: [['2']] }
   - query: SELECT count(*) AS n FROM runtime.task_history WHERE task = 'sql_query' AND input = 'SELECT 2 AS th_new'
     expect: { rows: [['1']] }
     eventually: 15s
+  # The check that deletes th_old runs 120-180 s after it, when th_new is at
+  # most 110 s old, so th_new is still there once th_old is gone. The next
+  # check is 60 s later, which is the margin for the last query.
+  - query: SELECT count(*) AS n FROM runtime.task_history WHERE task = 'sql_query' AND input = 'SELECT 1 AS th_old'
+    expect: { rows: [['0']] }
+    eventually: 240s
+  - query: SELECT count(*) AS n FROM runtime.task_history WHERE task = 'sql_query' AND input = 'SELECT 2 AS th_new'
+    expect: { rows: [['1']] }
   - assert-log: { lacks: ['(?i)task.history.*(error|fail|invalid)', '(?i)metrics.*(error|fail)'] }
