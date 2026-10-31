@@ -32,6 +32,14 @@ limitations under the License.
 //!     (columns added on the source are not replicated, but replication
 //!     continues).
 //!
+//! In [`run_replication_e2e`], after the bootstrap and after each committed
+//! insert, update, delete, `ALTER TABLE` and `TRUNCATE`, the statements in
+//! `ORACLE_QUERIES` run on Spice and on the source, and the schema and row
+//! multiset must match: each table, an inner and a left join, a grouped
+//! aggregation, a decimal and temporal aggregation, and a `DATETIME` filter.
+//! Pausing the source container at the end proves those answers came from the
+//! acceleration.
+//!
 //! Mirrors `postgres/replication_tpch.rs` in shape.
 
 #![allow(clippy::expect_used)]
@@ -42,6 +50,9 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use app::AppBuilder;
+use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
+use arrow::datatypes::{DataType, Date32Type, Float64Type, Int64Type, TimeUnit};
+use mysql_async::consts::ColumnType;
 use mysql_async::prelude::Queryable;
 use runtime::Runtime;
 use spicepod::acceleration::{Acceleration, OnConflictBehavior, RefreshMode};
@@ -229,6 +240,415 @@ async fn wait_for_scalar_i64(
     }
 }
 
+// ---------------------------------------------------------------------------
+// MySQL as the oracle
+// ---------------------------------------------------------------------------
+
+/// Statements run with the same text on Spice and on the source. Each answer is
+/// compared as a schema and a row multiset, so no statement orders rows and
+/// collation or NULL placement cannot decide a comparison. Columns are listed
+/// rather than `*`, because the source gains `o_note` mid-test and the dataset
+/// does not replicate it. No statement sums an integer (`MySQL` widens it to
+/// `DECIMAL`), sums a `DOUBLE` (the result depends on the order rows are added
+/// in), or divides.
+const ORACLE_QUERIES: &[(&str, &str)] = &[
+    (
+        "products",
+        "SELECT p_id, p_name, p_price, p_weight, p_added_on, p_restocked FROM repl_products",
+    ),
+    (
+        "orders",
+        "SELECT o_id, o_p_id, o_qty, o_status FROM repl_orders",
+    ),
+    (
+        "orders_with_products",
+        "SELECT o.o_id, o.o_qty, o.o_status, p.p_name, p.p_price \
+         FROM repl_orders o JOIN repl_products p ON o.o_p_id = p.p_id",
+    ),
+    (
+        "products_left_orders",
+        "SELECT p.p_id, p.p_name, o.o_id, o.o_status \
+         FROM repl_products p LEFT JOIN repl_orders o ON o.o_p_id = p.p_id",
+    ),
+    (
+        "orders_by_status",
+        "SELECT o_status, COUNT(*) AS orders, MIN(o_qty) AS min_qty, MAX(o_qty) AS max_qty \
+         FROM repl_orders GROUP BY o_status",
+    ),
+    (
+        "product_totals",
+        "SELECT COUNT(*) AS products, SUM(p_price) AS total_price, \
+         MIN(p_added_on) AS first_added, MAX(p_restocked) AS last_restocked \
+         FROM repl_products",
+    ),
+    (
+        "restocked_since_mid_may",
+        "SELECT p_id, p_name, p_restocked FROM repl_products \
+         WHERE p_restocked >= TIMESTAMP '2024-05-15 00:00:00'",
+    ),
+];
+
+/// The statements that read only `repl_orders`, which `TRUNCATE` empties.
+const ORDERS_ONLY_QUERIES: &[&str] = &["orders", "orders_with_products", "orders_by_status"];
+
+/// How long a query may take to answer from the acceleration while the source
+/// is paused. A query that reads the source instead gets no response at all.
+const PAUSED_SOURCE_QUERY_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Int,
+    Float,
+    Decimal,
+    Text,
+    Date,
+    Timestamp,
+}
+
+/// `Float` holds the `f64` bits, so values compare exactly. `Decimal` is the
+/// value at its declared scale, as text (`19.99`). `Date` is days since the
+/// Unix epoch and `Timestamp` microseconds since it, read as UTC.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Cell {
+    Null,
+    Int(i64),
+    Float(u64),
+    Decimal(String),
+    Text(String),
+    Date(i32),
+    Timestamp(i64),
+}
+
+/// `rows` is sorted when the answer is built, so equal multisets compare equal.
+#[derive(Debug)]
+struct Answer {
+    columns: Vec<String>,
+    kinds: Vec<Kind>,
+    rows: Vec<Vec<Cell>>,
+}
+
+/// Fail unless Spice returns the rows the source returns for every statement in
+/// [`ORACLE_QUERIES`]. A statement named in `expect_empty` must return no rows
+/// on both sides; every other statement must return rows. Returns the source's
+/// answers.
+async fn assert_matches_source(
+    rt: &Arc<Runtime>,
+    source: &mysql_async::Pool,
+    engine: &str,
+    stage: &str,
+    expect_empty: &[&str],
+) -> Result<Vec<Answer>, anyhow::Error> {
+    let mut answers = Vec::with_capacity(ORACLE_QUERIES.len());
+    for (name, sql) in ORACLE_QUERIES {
+        let mysql = answer_from_mysql(source, sql).await?;
+        let spice = answer_from_batches(&run_query(rt, sql).await?)?;
+        assert_same_answer(
+            engine,
+            stage,
+            name,
+            sql,
+            &spice,
+            &mysql,
+            expect_empty.contains(name),
+        )?;
+        answers.push(mysql);
+    }
+    Ok(answers)
+}
+
+/// Pause the source, then fail unless every statement in [`ORACLE_QUERIES`]
+/// still answers with `expected`. A query that reads the source rather than the
+/// acceleration gets no response from a paused container, so this proves the
+/// rows compared at the earlier stages came from the acceleration.
+async fn assert_answers_from_acceleration(
+    rt: &Arc<Runtime>,
+    container: &crate::docker::RunningContainer,
+    engine: &str,
+    expected: &[Answer],
+    expect_empty: &[&str],
+) -> Result<(), anyhow::Error> {
+    container.pause().await?;
+    let outcome = async {
+        for ((name, sql), mysql) in ORACLE_QUERIES.iter().zip(expected) {
+            let batches = tokio::time::timeout(PAUSED_SOURCE_QUERY_TIMEOUT, run_query(rt, sql))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "{engine} paused-source {name}: no answer within \
+                         {PAUSED_SOURCE_QUERY_TIMEOUT:?} while the source was paused, so \
+                         the query did not read the acceleration\n  sql: {sql}"
+                    )
+                })??;
+            let spice = answer_from_batches(&batches)?;
+            assert_same_answer(
+                engine,
+                "paused-source",
+                name,
+                sql,
+                &spice,
+                mysql,
+                expect_empty.contains(name),
+            )?;
+        }
+        Ok(())
+    }
+    .await;
+    container.unpause().await?;
+    outcome
+}
+
+fn assert_same_answer(
+    engine: &str,
+    stage: &str,
+    name: &str,
+    sql: &str,
+    spice: &Answer,
+    mysql: &Answer,
+    expect_empty: bool,
+) -> Result<(), anyhow::Error> {
+    if expect_empty {
+        // Two empty answers compare nothing; this only checks that both sides
+        // saw the source emptied.
+        if !spice.rows.is_empty() || !mysql.rows.is_empty() {
+            return Err(anyhow!(
+                "{engine} {stage} {name}: expected no rows on either side\n  sql: {sql}\n  \
+                 spice: {:?}\n  mysql: {:?}",
+                spice.rows,
+                mysql.rows
+            ));
+        }
+        eprintln!("empty engine={engine} stage={stage} query={name} (not a compared cell)");
+        return Ok(());
+    }
+    if spice.rows.is_empty() || mysql.rows.is_empty() {
+        return Err(anyhow!(
+            "{engine} {stage} {name}: an empty answer compares nothing\n  sql: {sql}\n  \
+             spice: {spice:?}\n  mysql: {mysql:?}"
+        ));
+    }
+    if (&spice.columns, &spice.kinds) != (&mysql.columns, &mysql.kinds) {
+        return Err(anyhow!(
+            "{engine} {stage} {name}: schema differs\n  sql: {sql}\n  spice: {:?} {:?}\n  \
+             mysql: {:?} {:?}",
+            spice.columns,
+            spice.kinds,
+            mysql.columns,
+            mysql.kinds
+        ));
+    }
+    if spice.rows != mysql.rows {
+        return Err(anyhow!(
+            "{engine} {stage} {name}: rows differ\n  sql: {sql}\n  spice: {:?}\n  \
+             mysql: {:?}",
+            spice.rows,
+            mysql.rows
+        ));
+    }
+    eprintln!(
+        "compared engine={engine} stage={stage} query={name} rows={} columns={:?}",
+        spice.rows.len(),
+        spice.columns
+    );
+    Ok(())
+}
+
+/// Runs `sql` as a prepared statement, so the binary protocol returns typed
+/// values and the statement carries the column types even when no row returns.
+async fn answer_from_mysql(pool: &mysql_async::Pool, sql: &str) -> Result<Answer, anyhow::Error> {
+    let mut conn = pool.get_conn().await?;
+    let statement = conn
+        .prep(sql)
+        .await
+        .map_err(|e| anyhow!("prepare `{sql}` on MySQL: {e}"))?;
+    let rows: Vec<mysql_async::Row> = conn
+        .exec(&statement, ())
+        .await
+        .map_err(|e| anyhow!("query `{sql}` on MySQL: {e}"))?;
+    let columns = statement
+        .columns()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    let kinds = statement
+        .columns()
+        .iter()
+        .map(|column| mysql_kind(column.column_type()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = rows
+        .iter()
+        .map(|row| {
+            kinds
+                .iter()
+                .enumerate()
+                .map(|(idx, kind)| {
+                    let value = row
+                        .as_ref(idx)
+                        .ok_or_else(|| anyhow!("`{sql}`: MySQL row has no column {idx}"))?;
+                    mysql_cell(*kind, value)
+                        .map_err(|e| anyhow!("`{sql}` column {idx} on MySQL: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.sort();
+    Ok(Answer {
+        columns,
+        kinds,
+        rows,
+    })
+}
+
+fn mysql_kind(ty: ColumnType) -> Result<Kind, anyhow::Error> {
+    match ty {
+        ColumnType::MYSQL_TYPE_TINY
+        | ColumnType::MYSQL_TYPE_SHORT
+        | ColumnType::MYSQL_TYPE_INT24
+        | ColumnType::MYSQL_TYPE_LONG
+        | ColumnType::MYSQL_TYPE_LONGLONG => Ok(Kind::Int),
+        ColumnType::MYSQL_TYPE_DOUBLE => Ok(Kind::Float),
+        ColumnType::MYSQL_TYPE_NEWDECIMAL => Ok(Kind::Decimal),
+        ColumnType::MYSQL_TYPE_VARCHAR
+        | ColumnType::MYSQL_TYPE_VAR_STRING
+        | ColumnType::MYSQL_TYPE_STRING
+        | ColumnType::MYSQL_TYPE_TINY_BLOB
+        | ColumnType::MYSQL_TYPE_BLOB
+        | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
+        | ColumnType::MYSQL_TYPE_LONG_BLOB => Ok(Kind::Text),
+        ColumnType::MYSQL_TYPE_DATE => Ok(Kind::Date),
+        ColumnType::MYSQL_TYPE_DATETIME => Ok(Kind::Timestamp),
+        other => Err(anyhow!("unsupported MySQL column type {other:?}")),
+    }
+}
+
+fn mysql_cell(kind: Kind, value: &mysql_async::Value) -> Result<Cell, anyhow::Error> {
+    use mysql_async::Value;
+    Ok(match (kind, value) {
+        (_, Value::NULL) => Cell::Null,
+        (Kind::Int, Value::Int(v)) => Cell::Int(*v),
+        (Kind::Int, Value::UInt(v)) => Cell::Int(i64::try_from(*v)?),
+        (Kind::Float, Value::Double(v)) => Cell::Float(v.to_bits()),
+        (Kind::Decimal, Value::Bytes(bytes)) => Cell::Decimal(String::from_utf8(bytes.clone())?),
+        (Kind::Text, Value::Bytes(bytes)) => Cell::Text(String::from_utf8(bytes.clone())?),
+        (Kind::Date, Value::Date(year, month, day, 0, 0, 0, 0)) => {
+            let date = chrono::NaiveDate::from_ymd_opt(
+                i32::from(*year),
+                u32::from(*month),
+                u32::from(*day),
+            )
+            .ok_or_else(|| anyhow!("invalid DATE {value:?}"))?;
+            let days = date
+                .signed_duration_since(chrono::DateTime::UNIX_EPOCH.date_naive())
+                .num_days();
+            Cell::Date(i32::try_from(days)?)
+        }
+        (Kind::Timestamp, Value::Date(year, month, day, hour, minute, second, micros)) => {
+            let at = chrono::NaiveDate::from_ymd_opt(
+                i32::from(*year),
+                u32::from(*month),
+                u32::from(*day),
+            )
+            .and_then(|date| {
+                date.and_hms_micro_opt(
+                    u32::from(*hour),
+                    u32::from(*minute),
+                    u32::from(*second),
+                    *micros,
+                )
+            })
+            .ok_or_else(|| anyhow!("invalid DATETIME {value:?}"))?;
+            Cell::Timestamp(at.and_utc().timestamp_micros())
+        }
+        (kind, value) => return Err(anyhow!("unexpected {value:?} for a {kind:?} column")),
+    })
+}
+
+fn answer_from_batches(batches: &[RecordBatch]) -> Result<Answer, anyhow::Error> {
+    let Some(first) = batches.first() else {
+        return Ok(Answer {
+            columns: Vec::new(),
+            kinds: Vec::new(),
+            rows: Vec::new(),
+        });
+    };
+    let schema = first.schema();
+    let batch = arrow::compute::concat_batches(&schema, batches)
+        .map_err(|e| anyhow!("concat Spice batches: {e}"))?;
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    let mut kinds = Vec::with_capacity(batch.num_columns());
+    let mut column_cells = Vec::with_capacity(batch.num_columns());
+    for (field, array) in schema.fields().iter().zip(batch.columns()) {
+        let (kind, cells) = arrow_cells(field.name(), array)?;
+        columns.push(field.name().clone());
+        kinds.push(kind);
+        column_cells.push(cells);
+    }
+    let mut rows: Vec<Vec<Cell>> = (0..batch.num_rows())
+        .map(|row| {
+            column_cells
+                .iter()
+                .map(|cells| cells[row].clone())
+                .collect()
+        })
+        .collect();
+    rows.sort();
+    Ok(Answer {
+        columns,
+        kinds,
+        rows,
+    })
+}
+
+fn arrow_cells(name: &str, array: &ArrayRef) -> Result<(Kind, Vec<Cell>), anyhow::Error> {
+    let value_type = match array.data_type() {
+        DataType::Dictionary(_, value) => value.as_ref().clone(),
+        other => other.clone(),
+    };
+    let (kind, target) = match value_type {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32 => (Kind::Int, DataType::Int64),
+        DataType::Float64 => (Kind::Float, DataType::Float64),
+        // Casting a decimal to text renders it at the column's scale (`19.99`).
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => (Kind::Decimal, DataType::Utf8),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => (Kind::Text, DataType::Utf8),
+        DataType::Date32 => (Kind::Date, DataType::Date32),
+        // `MySQL` `DATETIME` has no zone; a UTC-zoned column holds the same
+        // instant, and any other zone would shift it.
+        DataType::Timestamp(_, ref tz) if tz.as_deref().is_none_or(|tz| tz == "UTC") => (
+            Kind::Timestamp,
+            DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
+        ),
+        other => return Err(anyhow!("column '{name}' has unsupported type {other}")),
+    };
+    let casted = arrow::compute::cast(array.as_ref(), &target)
+        .map_err(|e| anyhow!("cast column '{name}' to {target}: {e}"))?;
+    let cell_at = |idx: usize| -> Result<Cell, anyhow::Error> {
+        if casted.is_null(idx) {
+            return Ok(Cell::Null);
+        }
+        Ok(match kind {
+            Kind::Int => Cell::Int(casted.as_primitive::<Int64Type>().value(idx)),
+            Kind::Float => Cell::Float(casted.as_primitive::<Float64Type>().value(idx).to_bits()),
+            Kind::Decimal => Cell::Decimal(casted.as_string::<i32>().value(idx).to_string()),
+            Kind::Text => Cell::Text(casted.as_string::<i32>().value(idx).to_string()),
+            Kind::Date => Cell::Date(casted.as_primitive::<Date32Type>().value(idx)),
+            Kind::Timestamp => Cell::Timestamp(
+                casted
+                    .as_primitive::<arrow::datatypes::TimestampMicrosecondType>()
+                    .value(idx),
+            ),
+        })
+    };
+    let cells = (0..casted.len())
+        .map(cell_at)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((kind, cells))
+}
+
 async fn run_replication_e2e(engine: EngineConfig) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
         "integration=debug,runtime=debug,data_components::mysql_replication=debug,info",
@@ -314,6 +734,7 @@ async fn run_replication_e2e(engine: EngineConfig) -> Result<(), anyhow::Error> 
                 1,
                 "NULL DATETIME survived the snapshot"
             );
+            assert_matches_source(&rt, &pool, engine.engine, "bootstrap", &[]).await?;
 
             // ------------------------------------------------------------
             // 4. Live INSERT.
@@ -325,6 +746,7 @@ async fn run_replication_e2e(engine: EngineConfig) -> Result<(), anyhow::Error> 
             )
             .await?;
             wait_for_scalar_i64(&rt, "SELECT count(*) FROM repl_products", 4).await?;
+            assert_matches_source(&rt, &pool, engine.engine, "insert", &[]).await?;
 
             // ------------------------------------------------------------
             // 5. Live UPDATE applies as an upsert (no duplicate rows).
@@ -340,12 +762,14 @@ async fn run_replication_e2e(engine: EngineConfig) -> Result<(), anyhow::Error> 
                 4,
                 "UPDATE must not duplicate rows"
             );
+            assert_matches_source(&rt, &pool, engine.engine, "update", &[]).await?;
 
             // ------------------------------------------------------------
             // 6. Live DELETE.
             // ------------------------------------------------------------
             exec(&pool, "DELETE FROM repl_orders WHERE o_id = 103").await?;
             wait_for_scalar_i64(&rt, "SELECT count(*) FROM repl_orders", 3).await?;
+            assert_matches_source(&rt, &pool, engine.engine, "delete", &[]).await?;
 
             // ------------------------------------------------------------
             // 7. Compatible ALTER TABLE on the source: the stream adopts the
@@ -361,6 +785,7 @@ async fn run_replication_e2e(engine: EngineConfig) -> Result<(), anyhow::Error> 
             .await?;
             wait_for_scalar_i64(&rt, "SELECT count(*) FROM repl_orders", 4).await?;
             wait_for_scalar_i64(&rt, "SELECT o_qty FROM repl_orders WHERE o_id = 104", 3).await?;
+            assert_matches_source(&rt, &pool, engine.engine, "alter-table", &[]).await?;
 
             // ------------------------------------------------------------
             // 8. TRUNCATE propagates.
@@ -373,6 +798,17 @@ async fn run_replication_e2e(engine: EngineConfig) -> Result<(), anyhow::Error> 
                 4,
                 "TRUNCATE must only affect its own table"
             );
+            let final_answers =
+                assert_matches_source(&rt, &pool, engine.engine, "truncate", ORDERS_ONLY_QUERIES)
+                    .await?;
+            assert_answers_from_acceleration(
+                &rt,
+                &container,
+                engine.engine,
+                &final_answers,
+                ORDERS_ONLY_QUERIES,
+            )
+            .await?;
 
             pool.disconnect().await?;
             Ok(())
