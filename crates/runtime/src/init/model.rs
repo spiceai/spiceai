@@ -375,8 +375,8 @@ impl Runtime {
     }
 }
 
-/// The model loads in progress, from the first attempt through its retries, so a Spicepod
-/// change can stop the load of a configuration it replaces or removes.
+/// The model (or tool) loads in progress, from the first attempt through its retries, so a
+/// Spicepod change can stop the load of a configuration it replaces or removes.
 #[derive(Default)]
 pub(crate) struct ModelLoads {
     tasks: parking_lot::Mutex<HashMap<String, JoinHandle<()>>>,
@@ -385,7 +385,7 @@ pub(crate) struct ModelLoads {
 impl ModelLoads {
     /// Runs `load` as the load of model `name`. The task is tracked before it starts, so
     /// [`Self::stop`] cannot miss it.
-    fn start(&self, name: &str, load: impl Future<Output = ()> + Send + 'static) {
+    pub(crate) fn start(&self, name: &str, load: impl Future<Output = ()> + Send + 'static) {
         let mut tasks = self.tasks.lock();
         if let Some(previous) = tasks.insert(name.to_string(), tokio::spawn(load)) {
             previous.abort();
@@ -394,7 +394,7 @@ impl ModelLoads {
 
     /// Stops the load of model `name`. When this returns, no attempt to load it is
     /// running and none will start.
-    async fn stop(&self, name: &str) {
+    pub(crate) async fn stop(&self, name: &str) {
         let task = self.tasks.lock().remove(name);
         if let Some(task) = task {
             task.abort();

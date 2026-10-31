@@ -31,6 +31,7 @@ use runtime_tools::{
 
 use super::{Tooling, builtin::catalog::BuiltinToolCatalog};
 
+#[derive(Clone)]
 pub enum ToolFactory {
     Catalog(Arc<dyn ToolCatalogFactory>),
     Tool(Arc<dyn IndividualToolFactory>),
@@ -143,11 +144,28 @@ pub async fn forge(
         .split_once(':')
         .map_or("builtin", |(a, _b)| a);
 
-    let tool_factories = rt.tool_factories();
-    let registry = tool_factories.lock().await;
+    // Release the registry before constructing: an MCP catalog connects to its server here,
+    // and one slow server must not hold up every other tool.
+    let factory = rt.tool_factories().lock().await.get(from_source).cloned();
 
-    match registry.get(from_source) {
+    match factory {
         Some(factory) => factory.construct(component, secrets, env).await,
-        None => Err(format!("Tool factory not found for source: {from_source}").into()),
+        None => Err(Box::new(ToolFactoryNotFound {
+            from_source: from_source.to_string(),
+        })),
     }
 }
+
+/// A tool's `from` names a source no tool factory handles. No retry can clear it.
+#[derive(Debug)]
+pub struct ToolFactoryNotFound {
+    from_source: String,
+}
+
+impl std::fmt::Display for ToolFactoryNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Tool factory not found for source: {}", self.from_source)
+    }
+}
+
+impl std::error::Error for ToolFactoryNotFound {}

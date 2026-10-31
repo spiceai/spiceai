@@ -14,11 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::{
     Runtime, UnableToInitializeLlmToolSnafu, status,
-    tools::{self, Tooling, factory::default_available_catalogs},
+    tools::{
+        self, Tooling,
+        factory::{ToolFactoryNotFound, default_available_catalogs},
+    },
 };
 use futures::future::join_all;
 use opentelemetry::KeyValue;
@@ -28,36 +35,50 @@ use runtime_tools::catalog::SpiceToolCatalog;
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::tool::Tool;
-use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
+use tokio::sync::oneshot;
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 impl Runtime {
+    /// Loads the built-in tool catalogs, then every Spicepod `tools:` entry.
+    ///
+    /// The built-ins need nothing outside the runtime, so they register first: a Spicepod tool
+    /// that cannot load must not keep them (e.g. `sql`) out of the tool list. Spicepod tools
+    /// load concurrently, each in its own task, and this returns once each has made its first
+    /// attempt. A tool that fails is logged, left out of the tool list, and retried in the
+    /// background unless its configuration is invalid; it does not hold up the other tools or
+    /// `/v1/ready`.
     pub(crate) async fn load_tools(self: Arc<Self>) {
-        if let Some(app) = self.read_app().await {
-            for tool in &app.tools {
-                tracing::debug!("Loading tool [{}] from {}...", tool.name, tool.from);
-                Arc::clone(&self).load_tool(tool).await;
-            }
-        }
-
         let mut spawned_tasks = vec![];
-        let cloned_self = Arc::clone(&self);
+        let mut builtin_names = HashSet::new();
 
         // Load all built-in tools, regardless if they are in the spicepod.
         // This will enable loading each tool in the catalog, and the catalog as a whole. E.g:
         //   `tools: models, builtin`
         //   `tools: sql, load_memory`
         for ctlg in default_available_catalogs(&self) {
+            builtin_names.insert(ctlg.name().to_string());
             self.insert_tool_catalog(&ctlg).await;
             for tool in ctlg.all().await {
-                let cloned_self = Arc::clone(&cloned_self);
+                let tool: Tooling = tool.into();
+                builtin_names.insert(tool.name().to_string());
+                let cloned_self = Arc::clone(&self);
                 let handle = tokio::spawn(async move {
-                    cloned_self.insert_tool(tool.into()).await;
+                    cloned_self.insert_tool(tool).await;
                 });
                 spawned_tasks.push(handle);
             }
         }
 
         let _ = join_all(spawned_tasks).await;
+
+        let builtin_names = Arc::new(builtin_names);
+        if let Some(app) = self.read_app().await {
+            join_all(app.tools.iter().map(|tool| {
+                tracing::debug!("Loading tool [{}] from {}...", tool.name, tool.from);
+                self.load_tool(tool, Arc::clone(&builtin_names))
+            }))
+            .await;
+        }
     }
 
     async fn insert_tool_catalog(&self, t: &Arc<dyn SpiceToolCatalog>) {
@@ -154,50 +175,132 @@ impl Runtime {
         }
     }
 
-    async fn load_tool(self: Arc<Self>, tool: &Tool) {
-        let retry_strategy = FibonacciBackoffBuilder::new()
-            .max_retries(None)
-            .max_duration(Some(Duration::from_mins(1)))
-            .build();
+    /// Loads `tool` in its own task: a failed attempt is retried in the background with
+    /// backoff until it succeeds, unless the tool's configuration is invalid. Returns after the
+    /// first attempt.
+    async fn load_tool(self: &Arc<Self>, tool: &Tool, builtin_names: Arc<HashSet<String>>) {
+        self.tool_loads.stop(&tool.name).await;
+        self.status
+            .update_tool(&tool.name, status::ComponentStatus::Initializing);
+        let (first_attempt_done, first_attempt) = oneshot::channel();
+        self.tool_loads.start(
+            &tool.name,
+            Arc::clone(self).load_tool_until_loaded(tool.clone(), builtin_names, first_attempt_done),
+        );
+        // Dropped without a send when the load is stopped.
+        let _ = first_attempt.await;
+    }
 
-        let _ = retry(retry_strategy, || async {
-            self.status
-                .update_tool(&tool.name, status::ComponentStatus::Initializing);
-            let params_with_secrets: HashMap<String, SecretString> =
-                get_params_with_secrets(self.secrets(), &tool.params).await;
+    async fn load_tool_until_loaded(
+        self: Arc<Self>,
+        tool: Tool,
+        builtin_names: Arc<HashSet<String>>,
+        first_attempt_done: oneshot::Sender<()>,
+    ) {
+        let shutdown = self.status.shutdown_token();
+        let attempts = async {
+            let mut retry = needs_retry(&self.try_load_tool(&tool, &builtin_names).await);
+            let _ = first_attempt_done.send(());
+            let mut backoff = FibonacciBackoffBuilder::new()
+                .max_retries(None)
+                .max_duration(Some(Duration::from_mins(1)))
+                .build();
+            while retry && let Some(delay) = backoff.next_duration() {
+                tokio::time::sleep(delay).await;
+                retry = needs_retry(&self.try_load_tool(&tool, &builtin_names).await);
+            }
+        };
+        tokio::select! {
+            () = attempts => {}
+            () = shutdown.cancelled() => {}
+        }
+    }
 
-            let env_with_secrets: HashMap<String, SecretString> =
-                get_params_with_secrets(self.secrets(), &tool.env).await;
+    /// One attempt to load `tool`, reported in its status, metrics and logs. The status stays
+    /// as it was until the attempt finishes, so a background retry does not report the tool
+    /// as initializing again.
+    async fn try_load_tool(
+        self: &Arc<Self>,
+        tool: &Tool,
+        builtin_names: &HashSet<String>,
+    ) -> Result<(), crate::Error> {
+        let params_with_secrets: HashMap<String, SecretString> =
+            get_params_with_secrets(self.secrets(), &tool.params).await;
 
-            match tools::factory::forge(
-                tool,
-                params_with_secrets,
-                Arc::clone(&self),
-                env_with_secrets,
-            )
-            .await
-            .context(UnableToInitializeLlmToolSnafu)
-            {
-                Ok(t) => {
-                    self.maybe_register_tool_as_udf(tool, &t).await;
-                    self.insert_tool(t).await;
-                    Ok(())
-                }
-                Err(e) => {
-                    metrics::tools::LOAD_ERROR.add(1, &[]);
-                    self.status.update_tool(
-                        &tool.name,
-                        status::ComponentStatus::error_with_message(e.to_string()),
-                    );
+        let env_with_secrets: HashMap<String, SecretString> =
+            get_params_with_secrets(self.secrets(), &tool.env).await;
+
+        let forged = tools::factory::forge(
+            tool,
+            params_with_secrets,
+            Arc::clone(self),
+            env_with_secrets,
+        )
+        .await
+        .context(UnableToInitializeLlmToolSnafu);
+
+        match forged {
+            Ok(t) => {
+                self.maybe_register_tool_as_udf(tool, &t).await;
+                if builtin_names.contains(t.name()) {
+                    // A built-in of the same name takes precedence, as it always has.
                     tracing::warn!(
-                        "Unable to load tool '{}' from spicepod. Error: {}",
+                        "Tool '{}' has the same name as a built-in tool; using the built-in.",
+                        tool.name
+                    );
+                    self.status
+                        .update_tool(&tool.name, status::ComponentStatus::Ready);
+                } else {
+                    self.insert_tool(t).await;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                metrics::tools::LOAD_ERROR.add(1, &[]);
+                self.status.update_tool(
+                    &tool.name,
+                    status::ComponentStatus::error_with_message(e.to_string()),
+                );
+                if is_permanent_tool_failure(&e) {
+                    tracing::warn!(
+                        "Unable to load tool '{}' from spicepod. It is not available until its configuration is fixed. Error: {}",
                         tool.name,
                         e,
                     );
-                    Err(RetryError::transient(e))
+                } else {
+                    tracing::warn!(
+                        "Unable to load tool '{}' from spicepod; retrying in the background. Error: {}",
+                        tool.name,
+                        e,
+                    );
                 }
+                Err(e)
             }
-        })
-        .await;
+        }
     }
+}
+
+fn needs_retry(attempt: &Result<(), crate::Error>) -> bool {
+    attempt
+        .as_ref()
+        .is_err_and(|err| !is_permanent_tool_failure(err))
+}
+
+/// Returns `true` when a tool load failure is a mistake in the Spicepod, which no retry can
+/// clear: a `from` no tool factory handles, or an invalid MCP directive or `mcp_args`.
+fn is_permanent_tool_failure(err: &crate::Error) -> bool {
+    let crate::Error::UnableToInitializeLlmTool { source } = err else {
+        return false;
+    };
+    if source.downcast_ref::<ToolFactoryNotFound>().is_some() {
+        return true;
+    }
+    #[cfg(feature = "mcp")]
+    if source
+        .downcast_ref::<runtime_tools::mcp::Error>()
+        .is_some_and(runtime_tools::mcp::Error::is_configuration_error)
+    {
+        return true;
+    }
+    false
 }

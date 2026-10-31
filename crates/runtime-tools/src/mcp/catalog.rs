@@ -537,6 +537,28 @@ impl McpToolCatalog {
     }
 
     async fn create_client(cfg: &MCPConfig, tool_name: &str) -> Result<McpClient> {
+        Self::create_client_within(cfg, tool_name, MCP_STARTUP_TIMEOUT).await
+    }
+
+    /// Connects to the MCP server, failing if the handshake has not finished within `timeout`.
+    async fn create_client_within(
+        cfg: &MCPConfig,
+        tool_name: &str,
+        timeout: Duration,
+    ) -> Result<McpClient> {
+        match tokio::time::timeout(timeout, Self::connect_client(cfg, tool_name)).await {
+            Ok(client) => client,
+            Err(_) => Err(Error::UnderlyingTransportError {
+                source: format!(
+                    "the MCP server did not complete the connection handshake within {}s",
+                    timeout.as_secs_f32()
+                )
+                .into(),
+            }),
+        }
+    }
+
+    async fn connect_client(cfg: &MCPConfig, tool_name: &str) -> Result<McpClient> {
         match cfg {
             MCPConfig::Stdio { command, args, env } => {
                 // Security constants
@@ -938,6 +960,11 @@ fn client_lifecycle() -> ClientLifecycleMode {
     }
 }
 
+/// Upper bound on connecting to an MCP server. rmcp waits 10 seconds for `server/discover` and
+/// then falls back to `initialize` with no deadline, so a server that accepts the connection
+/// but never answers would otherwise keep the tool loading forever.
+const MCP_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub enum McpClient {
     Stdio(RunningService<RoleClient, ()>),
     Http(RunningService<RoleClient, InitializeRequestParams>),
@@ -1185,6 +1212,45 @@ impl SpiceToolCatalog for McpToolCatalog {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    /// A server that accepts the connection and never answers fails the load within the
+    /// startup timeout instead of hanging it.
+    #[tokio::test]
+    async fn test_unresponsive_server_fails_within_startup_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a listener");
+        let addr = listener.local_addr().expect("listener address");
+        let accepted = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let cfg = MCPConfig::StreamableHttp {
+            url: url::Url::parse(&format!("http://{addr}/mcp")).expect("valid url"),
+            auth_token: None,
+            headers: HashMap::new(),
+        };
+
+        let started = Instant::now();
+        let result =
+            McpToolCatalog::create_client_within(&cfg, "silent", Duration::from_millis(500)).await;
+        accepted.abort();
+
+        let Err(err) = result else {
+            panic!("an unresponsive server must not connect");
+        };
+        assert!(
+            err.to_string().contains("did not complete the connection handshake"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the load must give up at the startup timeout, took {:?}",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn test_dangerous_patterns_reject_parent_traversal() {
