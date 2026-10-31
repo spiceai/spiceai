@@ -2034,31 +2034,42 @@ impl Query {
                 // cancel it. A cancel, a timeout, or a client that left before
                 // this point stops it here, before it runs.
                 let running_statement = RunningStatement::of(&plan);
-                let (stream_cancel_token, timeout_timer_guard) = match running_statement {
-                    Some(_) => {
-                        active_query_guard.refuse_cancellation();
-                        drop(timeout_timer_guard);
-                        Self::ensure_not_cancelled(
-                            &query_cancel_token,
-                            &query_id_str,
-                            &timeout_state,
-                        )?;
-                        (tokio_util::sync::CancellationToken::new(), None)
-                    }
-                    None => (query_cancel_token.clone(), timeout_timer_guard),
-                };
+                let (stream_cancel_token, stream_timeout_state, timeout_timer_guard) =
+                    match running_statement {
+                        Some(_) => {
+                            active_query_guard.refuse_cancellation();
+                            drop(timeout_timer_guard);
+                            Self::ensure_not_cancelled(
+                                &query_cancel_token,
+                                &query_id_str,
+                                &timeout_state,
+                            )?;
+                            (
+                                tokio_util::sync::CancellationToken::new(),
+                                QueryTimeoutState::default(),
+                                None,
+                            )
+                        }
+                        None => (
+                            query_cancel_token.clone(),
+                            timeout_state.clone(),
+                            timeout_timer_guard,
+                        ),
+                    };
 
                 // Wrap with cancellation observation so that cancelling the
                 // query (via HTTP `/v1/sql/{id}/cancel`, the custom Flight
                 // `CancelQuery` action, or client disconnect) terminates the
                 // stream with a clear error; a statement that runs to its end
-                // passes a token nothing cancels. The active-query registry guard is held by the
-                // wrapped stream so deregistration occurs on drop.
+                // passes a token nothing cancels and no deadline, which the
+                // stream would otherwise enforce itself. The active-query
+                // registry guard is held by the wrapped stream so
+                // deregistration occurs on drop.
                 let final_stream = attach_cancellation_to_stream(
                     final_stream,
                     stream_cancel_token,
                     Arc::clone(&query_id_str),
-                    timeout_state.clone(),
+                    stream_timeout_state,
                     // Bundle the admission permit and the timeout-timer guard
                     // with the active-query guard so ALL release exactly when
                     // the result stream is fully drained (completion, error, or
