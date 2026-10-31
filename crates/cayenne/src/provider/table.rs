@@ -28081,9 +28081,11 @@ impl CayenneTableProvider {
     /// cleared, durably and in memory, at or below the newest cold file's
     /// sequence.
     ///
-    /// Locks: `compaction_lock` for the whole pass, which serializes it with
-    /// promotion and warm-tier compaction (both rewrite what the retention
-    /// decision reads); no `write_lock` while reading, encoding, and uploading;
+    /// Locks: `cold_merge_lock`, then `compaction_lock` shared for the whole
+    /// pass, which serializes it with promotion (which rewrites what the
+    /// retention decision reads) and every other pass that holds the lock
+    /// exclusively, while the protected-snapshot subset merge keeps running;
+    /// no `write_lock` while reading, encoding, and uploading;
     /// `write_lock` then `listing_fence` for writing around the swap, and
     /// `write_lock` again around the tombstone clear, so a DELETE — which
     /// captures its datalake sources and scans them inside one `write_lock`
