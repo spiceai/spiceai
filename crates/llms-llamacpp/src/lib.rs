@@ -80,8 +80,8 @@ use llms::chat::mistral::{
     ReasoningControls, ReasoningSupport, convert_tool, reasoning_controls, request_tool_choice,
 };
 use llms::chat::{
-    Chat, Error as ChatError, LocalModelOptions, PagedAttentionMode, Result, message_to_mistral,
-    nsql::SqlGeneration,
+    Chat, Error as ChatError, LocalModelOptions, PagedAttentionMode, Result, gguf_files,
+    message_to_mistral, nsql::SqlGeneration,
 };
 use llms::streaming_utils::generate_stream_id;
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
@@ -95,8 +95,15 @@ llms::register_local_chat_engine!(
         serves: serves_weights,
         distributed: Some(llama_cpp::rpc::splits_by_tensor),
         load: load_weights,
+        free_memory,
     }
 );
+
+/// The memory free for a model, for choosing a quantization: on llama.cpp's GPUs, or on a
+/// machine without one, the memory this process can still use.
+fn free_memory() -> Option<u64> {
+    llama_cpp::gpu_free_memory(Backend::get()).or_else(runtime_resources::get_available_memory)
+}
 
 /// llama.cpp serves a model whose weights are all GGUF files: shards of one model, and an
 /// optional MTP draft head.
@@ -355,16 +362,10 @@ impl LlamaCpp {
                 });
             }
         }
-        // An MTP head ships as its own GGUF (`mtp-*.gguf`); it drafts for the model, so it is
-        // loaded beside it rather than as one of its shards.
-        let (drafts, trunk): (Vec<_>, Vec<_>) = weights
-            .iter()
-            .cloned()
-            .partition(|w| is_mtp_head(w) || DraftKind::dflash_of(w).is_some());
-        let first = first_shard(&trunk).ok_or_else(|| ChatError::LocalModelNotFound {
+        let (first, draft) = model_and_draft(weights);
+        let first = first.ok_or_else(|| ChatError::LocalModelNotFound {
             expected_path: String::new(),
         })?;
-        let draft = drafts.into_iter().next();
         let n_ctx = options
             .context_length
             .and_then(|length| u32::try_from(length).ok())
@@ -2104,11 +2105,18 @@ fn truncate_to<'m>(target: &mut impl Target<'m>, n: usize) -> bool {
     i32::try_from(n).is_ok_and(|from| target.truncate(from))
 }
 
-/// Whether a file is an MTP draft head, by the `mtp-` name the GGUF publishers give them.
-fn is_mtp_head(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("mtp-"))
+/// The GGUF the model is opened from and its draft head's, from the files it resolved to. A draft
+/// head ships as its own GGUF (an MTP head, told by the name the repository's files were
+/// resolved with, or a `DFlash` drafter); it drafts for the model, so it is loaded beside it rather
+/// than as one of its shards, and a sharded one opens from its first shard.
+fn model_and_draft(weights: &[PathBuf]) -> (Option<PathBuf>, Option<PathBuf>) {
+    let (drafts, trunk): (Vec<_>, Vec<_>) = weights.iter().cloned().partition(|w| {
+        w.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(gguf_files::is_draft_head)
+            || DraftKind::dflash_of(w).is_some()
+    });
+    (first_shard(&trunk), first_shard(&drafts))
 }
 
 /// The GGUF a sharded model is opened from: the `-00001-of-` file, or the only file.
@@ -2550,6 +2558,28 @@ fn api_error(message: &str) -> OpenAIError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An MTP head named in upper case is a draft head here as in the repository's files: a
+    /// sharded one is opened as the draft, from its first shard, and never as the model ahead of
+    /// the model's own file (Copilot's case on #15590).
+    #[test]
+    fn an_upper_case_mtp_head_drafts_for_the_model() {
+        let weights: Vec<PathBuf> = [
+            "MTP/MTP-Model-Q8_0-00002-of-00002.gguf",
+            "MTP/MTP-Model-Q8_0-00001-of-00002.gguf",
+            "Model-Q4_K_M.gguf",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(
+            model_and_draft(&weights),
+            (
+                Some(PathBuf::from("Model-Q4_K_M.gguf")),
+                Some(PathBuf::from("MTP/MTP-Model-Q8_0-00001-of-00002.gguf"))
+            )
+        );
+    }
 
     /// Measured on three DGX Sparks (GLM-5.3, the PR build): a 29-token prompt read in 270 ms,
     /// and a checkpoint saved in 300 ms. A checkpoint is worth saving only over a prefix that

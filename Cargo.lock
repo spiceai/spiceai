@@ -12248,6 +12248,7 @@ dependencies = [
  "mistralrs-core",
  "rand 0.10.1",
  "runtime-request-context",
+ "runtime-resources",
  "serde_json",
  "tempfile",
  "tokio",
