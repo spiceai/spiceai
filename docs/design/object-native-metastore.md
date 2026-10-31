@@ -242,10 +242,12 @@ them possible.
   by decision 2.2.
 - **Atomic reads across datasets** through a catalog frontier of mutually
   consistent `(dataset, commit)` vectors. Kept possible by decision 1.3.
-- **Cross-node consistency.** A read that waits for the head to reach a commit
-  is linearizable for that dataset (decision 1.1); commit numbers returned
-  with acknowledgements are read-your-writes tokens (1.8); a strict read
-  excludes the buffer, or the dataset publishes at commit (1.2).
+- **Cross-node consistency.** Commit numbers returned with acknowledgements are
+  read-your-writes tokens (decision 1.8): a read that waits for the head to
+  reach a token sees that write, but may miss later commits that completed
+  before it started. A linearizable read sends a head GET after it starts and
+  serves at least the commit that GET returns (decision 1.1). Either kind of
+  strict read excludes the buffer, or the dataset publishes at commit (1.2).
 - **Tiered storage beneath the destination:** ephemeral disk, then persistent
   disk, then S3, acknowledged once data reaches the first object store tier.
   Kept possible by acknowledgement points (decision 1.2).

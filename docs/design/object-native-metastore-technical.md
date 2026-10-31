@@ -278,23 +278,26 @@ re-plans. Sending head CASes without the crate's retries would make a 412
 definite, but would not save a request: after any failed CAS the writer reads the
 head anyway to retry or re-plan, and record n + 1 is almost always inline in it.
 Timeouts would stay ambiguous, so resolution stays either way. There are three outcomes: **accepted**, **rejected**, **unresolved**.
+Two kinds of retry differ: a **resend** repeats the identical CAS, the same
+attempt, while a **new attempt** has a fresh id and may carry re-planned bytes.
 
 | Head found | Outcome |
 |---|---|
 | Past commit n, and record n + 1 (inline or in a listed batch) is ours | accepted |
 | Past commit n, and record n + 1 is another attempt | rejected |
-| Still at version V | **retry the identical CAS** (same bytes, same condition); a success is acceptance |
+| Still at version V | **resend the identical CAS** (same bytes, same condition); a success is acceptance, and a failure is as ambiguous as the first and is resolved again from the head |
 | At commit n, but a version other than V (a takeover changed the head) | rejected: V can never hold again |
 | Record n + 1 reclaimed below the checkpoint | accepted if retained evidence (attempt ids in checkpoint roots) names our attempt, else unresolved |
-| Unreadable | unresolved: read the head again later, and never retry meanwhile |
+| Unreadable | unresolved: read the head again later; never resend or send a new attempt meanwhile |
 
-- **A retry needs the original bytes and condition.** After a restart, an
+- **A resend needs the original bytes and condition.** After a restart, an
   attempt id alone can establish acceptance from evidence. A writer that did not
   persist the bytes and condition treats a head still at commit n as unresolved,
   never as a reason to send a new attempt.
-- **Never retry until the attempt has resolved as rejected.** Retrying while the
-  head is unreadable, or treating unresolved as rejected, can apply an
-  acknowledged write twice.
+- **Never send a new attempt until the attempt has resolved as rejected.** A new
+  attempt while the head is unreadable, after a failed resend, or while the
+  outcome is unresolved can apply an acknowledged write twice: the original may
+  still land.
 - **An unresolved attempt is reported at once; it is final only past the evidence
   horizon.** While an attempt is unresolved, for example because the destination
   did not respond, Spice logs **commit outcome unknown** ([#15760](https://github.com/spiceai/spiceai/issues/15760)) and resolves it
