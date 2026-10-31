@@ -1015,6 +1015,38 @@ async fn create_instances(
             let spicepod_yaml = yaml::to_string(&spicepod)?;
             let spicepod = spicepod.clone();
             let mut env = variant.env.clone();
+            // DuckDB sources install the library matching the CLI. Make it
+            // discoverable by name without changing the harness environment.
+            for entry in context["sources"]
+                .as_object()
+                .into_iter()
+                .flat_map(|sources| sources.values())
+            {
+                if let Some(dir) = entry.get("library_dir").and_then(Value::as_str) {
+                    let key = if cfg!(target_os = "macos") {
+                        "DYLD_FALLBACK_LIBRARY_PATH"
+                    } else {
+                        "LD_LIBRARY_PATH"
+                    };
+                    let previous = env.get(key).cloned().or_else(|| std::env::var(key).ok());
+                    let mut paths = vec![PathBuf::from(dir)];
+                    if let Some(previous) = previous {
+                        paths.extend(std::env::split_paths(&previous));
+                    } else if cfg!(target_os = "macos") {
+                        // Setting DYLD_FALLBACK_LIBRARY_PATH replaces its defaults.
+                        if let Some(home) = std::env::var_os("HOME") {
+                            paths.push(PathBuf::from(home).join("lib"));
+                        }
+                        paths.extend([PathBuf::from("/usr/local/lib"), PathBuf::from("/usr/lib")]);
+                    }
+                    env.insert(
+                        key.into(),
+                        std::env::join_paths(paths)?.into_string().map_err(|_| {
+                            anyhow::anyhow!("DuckDB library search path is not UTF-8")
+                        })?,
+                    );
+                }
+            }
             // Spice derives replication slot names from this, so instances
             // sharing a source do not take each other's slots.
             env.insert("SPICE_INSTANCE_ID".into(), format!("{run_id}-{index}"));
@@ -1400,7 +1432,7 @@ fn table_from(kind: &str, entry: &Map<String, Value>) -> (String, String, bool) 
             false,
         ),
         "mongodb" => ("mongodb:".into(), String::new(), false),
-        "mysql" | "clickhouse" => (format!("{kind}:"), String::new(), false),
+        "mysql" | "clickhouse" | "duckdb" => (format!("{kind}:"), String::new(), false),
         "ducklake" => ("ducklake:main.".into(), String::new(), false),
         "iceberg" => (
             format!(
@@ -1686,6 +1718,7 @@ mod table_from_tests {
         assert_eq!(named("dynamodb"), ("dynamodb:i0_x_t".into(), false));
         assert_eq!(named("mysql"), ("mysql:t".into(), false));
         assert_eq!(named("clickhouse"), ("clickhouse:t".into(), false));
+        assert_eq!(named("duckdb"), ("duckdb:t".into(), false));
         assert_eq!(named("ducklake"), ("ducklake:main.t".into(), false));
         assert_eq!(
             named("iceberg"),

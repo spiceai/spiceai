@@ -34,6 +34,260 @@ use std::sync::Arc;
 
 use crate::{FieldMetadata, metadata_enriched_table_provider};
 
+/// The `DuckDB` driver name used by ADBC connectors.
+pub const DUCKDB_DRIVER: &str = "duckdb";
+
+/// `DuckDB` exports this ADBC entry point instead of `AdbcDriverInit`.
+pub const DUCKDB_ADBC_ENTRYPOINT: &[u8] = b"duckdb_adbc_init";
+
+/// Builds raw database settings for a Spice-managed `DuckDB` source.
+///
+/// Direct `adbc:` connections use [`build_db_options`] instead, preserving the
+/// driver's access mode and host time zone defaults.
+#[must_use]
+pub fn managed_duckdb_options(
+    path: &str,
+    read_only: bool,
+) -> Vec<(OptionDatabase, adbc_core::options::OptionValue)> {
+    let mut options = vec![(OptionDatabase::Other("path".into()), path.into())];
+    if read_only {
+        options.push((
+            OptionDatabase::Other("access_mode".into()),
+            "read_only".into(),
+        ));
+    }
+    options.push((OptionDatabase::Other("TimeZone".into()), "UTC".into()));
+    options
+}
+
+/// Errors during blocking ADBC initialization.
+#[derive(Debug, snafu::Snafu)]
+pub enum AdbcInitError {
+    #[snafu(display("Failed to load ADBC driver '{driver_location}': {source}"))]
+    LoadDriver {
+        driver_location: String,
+        source: adbc_core::error::Error,
+    },
+    #[snafu(display("Failed to create ADBC database: {source}"))]
+    CreateDatabase { source: adbc_core::error::Error },
+    #[snafu(display("ADBC driver initialization timed out after 120 seconds"))]
+    Timeout,
+    #[snafu(display("ADBC initialization task failed: {source}"))]
+    Join { source: tokio::task::JoinError },
+    #[snafu(display("{source}"))]
+    Initialize {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+/// Loads an installed driver and opens one database. Call on a blocking thread.
+///
+/// # Errors
+/// Returns the driver loading or database initialization error.
+pub fn load_adbc_database(
+    driver_location: &str,
+    entrypoint: Option<&[u8]>,
+    options: Vec<(OptionDatabase, adbc_core::options::OptionValue)>,
+) -> Result<adbc_driver_manager::ManagedDatabase, AdbcInitError> {
+    use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT, options::AdbcVersion};
+    use snafu::ResultExt as _;
+    let mut driver = adbc_driver_manager::ManagedDriver::load_from_name(
+        driver_location,
+        entrypoint,
+        AdbcVersion::V110,
+        LOAD_FLAG_DEFAULT,
+        None,
+    )
+    .context(LoadDriverSnafu { driver_location })?;
+    driver
+        .new_database_with_opts(options)
+        .context(CreateDatabaseSnafu)
+}
+
+/// Errors opening the installed `DuckDB` for a managed connector.
+#[derive(Debug, snafu::Snafu)]
+pub enum ManagedDuckDbError {
+    #[snafu(display(
+        "Failed to load the installed DuckDB library. Install libduckdb on the system library path or register the 'duckdb' ADBC driver manifest. For details, visit: https://spiceai.org/docs/components/data-connectors/{connector}"
+    ))]
+    MissingLibrary {
+        connector: &'static str,
+        source: AdbcInitError,
+    },
+    #[snafu(display(
+        "Failed to load the installed DuckDB library: version {found} is older than the minimum supported version 1.5.0. Install DuckDB 1.5.0 or later. For details, visit: https://spiceai.org/docs/components/data-connectors/{connector}"
+    ))]
+    UnsupportedVersion {
+        found: String,
+        connector: &'static str,
+    },
+    #[snafu(display(
+        "Failed to determine the installed DuckDB version '{found}'. Install DuckDB 1.5.0 or later. For details, visit: https://spiceai.org/docs/components/data-connectors/{connector}"
+    ))]
+    InvalidVersion {
+        found: String,
+        connector: &'static str,
+    },
+    #[snafu(display("Failed to query the installed DuckDB version: {source}"))]
+    QueryVersion {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+/// Compares a `DuckDB` version with the minimum supported version, 1.5.0.
+/// Returns `None` when the version cannot be parsed.
+#[must_use]
+pub fn duckdb_version_is_supported(version: &str) -> Option<bool> {
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.split('-').next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch) >= (1, 5, 0))
+}
+
+/// Checks the installed version once. Call on a blocking thread after opening
+/// a managed database; direct `adbc:` connections retain their driver defaults.
+///
+/// # Errors
+/// Returns an error for an old, unknown, or unreadable version.
+pub fn check_duckdb_version(
+    database: &adbc_driver_manager::ManagedDatabase,
+    connector: &'static str,
+) -> Result<(), ManagedDuckDbError> {
+    use adbc_core::{Connection as _, Database as _, Statement as _};
+    let query = || -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let mut connection = database.new_connection()?;
+        let mut statement = connection.new_statement()?;
+        statement.set_sql_query("SELECT version()")?;
+        let mut reader = statement.execute()?;
+        let batch = reader.next().ok_or("DuckDB returned no version")??;
+        if batch.num_rows() != 1 || batch.num_columns() != 1 {
+            return Err("DuckDB returned an invalid version result".into());
+        }
+        let column = batch.column(0);
+        if column.is_null(0) {
+            return Err("DuckDB returned a NULL version".into());
+        }
+        if let Some(values) = column.as_any().downcast_ref::<StringArray>() {
+            return Ok(values.value(0).to_owned());
+        }
+        if let Some(values) = column.as_any().downcast_ref::<LargeStringArray>() {
+            return Ok(values.value(0).to_owned());
+        }
+        Err("DuckDB returned a non-string version".into())
+    };
+    let found = query().map_err(|source| ManagedDuckDbError::QueryVersion { source })?;
+    match duckdb_version_is_supported(&found) {
+        Some(true) => Ok(()),
+        Some(false) => Err(ManagedDuckDbError::UnsupportedVersion { found, connector }),
+        None => Err(ManagedDuckDbError::InvalidVersion { found, connector }),
+    }
+}
+
+/// Bounds the wait for blocking driver initialization to two minutes.
+///
+/// Aborting cannot interrupt FFI already executing on the blocking thread.
+///
+/// # Errors
+/// Returns the initialization, task, or timeout error.
+pub async fn await_adbc_initialization<T, E>(
+    handle: tokio::task::JoinHandle<Result<T, E>>,
+) -> Result<T, AdbcInitError>
+where
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let abort = handle.abort_handle();
+    match tokio::time::timeout(std::time::Duration::from_mins(2), handle).await {
+        Ok(Ok(result)) => result.map_err(|source| AdbcInitError::Initialize {
+            source: source.into(),
+        }),
+        Ok(Err(source)) => Err(AdbcInitError::Join { source }),
+        Err(_) => {
+            abort.abort();
+            Err(AdbcInitError::Timeout)
+        }
+    }
+}
+
+/// Moves driver-owned resources onto the shared blocking cleanup worker.
+pub fn offload_adbc_drop(resource: impl Send + 'static) {
+    match adbc_cleanup_sender().try_send(Box::new(resource)) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::TrySendError::Full(resource)) => offload_adbc_factory_drop(
+            resource,
+            "ADBC cleanup queue full; offloading drop to overflow thread",
+        ),
+        Err(std::sync::mpsc::TrySendError::Disconnected(resource)) => offload_adbc_factory_drop(
+            resource,
+            "ADBC cleanup channel closed; offloading drop to overflow thread",
+        ),
+    }
+}
+
+const ADBC_CLEANUP_QUEUE_CAPACITY: usize = 64;
+
+fn offload_adbc_factory_drop(factory: Box<dyn Send>, reason: &str) {
+    tracing::warn!("{reason}");
+    if std::thread::Builder::new()
+        .name("adbc-cleanup-overflow".to_string())
+        .spawn(move || {
+            drop(factory);
+        })
+        .is_err()
+    {
+        tracing::warn!("Failed to spawn overflow ADBC cleanup thread; dropping inline");
+    }
+}
+
+/// Returns a sender for offloading ADBC factory cleanup to a dedicated
+/// background thread. The worker thread is created once (on first use) and
+/// processes drop work sequentially with bounded buffering, avoiding both
+/// unbounded thread spawns and unbounded cleanup backlog growth.
+fn adbc_cleanup_sender() -> &'static std::sync::mpsc::SyncSender<Box<dyn Send>> {
+    static SENDER: std::sync::OnceLock<std::sync::mpsc::SyncSender<Box<dyn Send>>> =
+        std::sync::OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<Box<dyn Send>>(ADBC_CLEANUP_QUEUE_CAPACITY);
+        if std::thread::Builder::new()
+            .name("adbc-cleanup".to_string())
+            .spawn(move || {
+                for factory in rx {
+                    drop(factory);
+                }
+            })
+            .is_err()
+        {
+            tracing::warn!(
+                "Failed to spawn ADBC cleanup worker thread; subsequent cleanup will use the overflow thread path or be performed inline as a last resort"
+            );
+        }
+        tx
+    })
+}
+
+/// Applies the `adbc.` prefix a driver-option key takes when it is written without
+/// one. `bigquery.sql.dataset_id` and `adbc.bigquery.sql.dataset_id` name the same
+/// option, so anything matching on a key has to agree on the spelling.
+#[must_use]
+pub fn normalize_driver_option_key(key: &str) -> String {
+    if key.starts_with("adbc.") {
+        key.to_string()
+    } else {
+        format!("adbc.{key}")
+    }
+}
+
+/// Returns `duckdb_adbc_init` for `DuckDB`, which does not export `AdbcDriverInit`.
+#[must_use]
+pub fn driver_entrypoint(driver_name: &str) -> Option<&'static [u8]> {
+    (driver_name == DUCKDB_DRIVER).then_some(DUCKDB_ADBC_ENTRYPOINT)
+}
+
 /// Values of secret-looking keys shorter than this are not collected: a short
 /// value under a key that merely contains `key` or `auth` is more likely a
 /// setting than a credential, and replacing it everywhere would make the
@@ -184,13 +438,22 @@ pub fn scrub_connection_secrets(message: &str, secrets: &[String]) -> String {
 }
 
 /// Builds the list of ADBC database options from connector parameters.
+///
+/// For `DuckDB` the file is passed as `path` (1.4.4 rejects `uri`; 1.4.4 and
+/// 1.5.5 both accept `path`). Access mode and time zone retain driver defaults.
 pub fn build_db_options(
+    driver_name: &str,
     uri: &str,
     username: Option<&str>,
     password: Option<&str>,
     driver_options: Option<&str>,
 ) -> Vec<(OptionDatabase, adbc_core::options::OptionValue)> {
-    let mut opts = vec![(OptionDatabase::Uri, uri.into())];
+    let uri_option = if driver_name == DUCKDB_DRIVER {
+        OptionDatabase::Other("path".to_string())
+    } else {
+        OptionDatabase::Uri
+    };
+    let mut opts = vec![(uri_option, uri.into())];
     if let Some(u) = username {
         opts.push((OptionDatabase::Username, u.into()));
     }
@@ -209,12 +472,10 @@ pub fn build_db_options(
                     tracing::warn!("Ignoring ADBC driver option with empty key");
                     continue;
                 }
-                let key = if key.starts_with("adbc.") {
-                    key.to_string()
-                } else {
-                    format!("adbc.{key}")
-                };
-                opts.push((OptionDatabase::Other(key), value.trim().into()));
+                opts.push((
+                    OptionDatabase::Other(normalize_driver_option_key(key)),
+                    value.trim().into(),
+                ));
             } else {
                 tracing::warn!("Ignoring malformed ADBC driver option (expected 'key=value')");
             }
@@ -228,19 +489,10 @@ pub fn build_db_options(
 ///
 /// These are the stock `DataFusion` dialects, which rewrite no Spice function.
 ///
-/// Its only caller today is the ADBC **catalog** connector, which installs no
-/// federation function-support policy at all, so every Spice-only UDF in a
-/// federated plan reaches the unparser and is emitted verbatim into the remote
-/// SQL. That is a live defect, not a safe configuration
-/// ([#13664](https://github.com/spiceai/spiceai/issues/13664)); the fix is to
-/// install the policy, not to change the dialect.
-///
-/// The ADBC *dataset* connector has its own dialect, in `connector-adbc`, which
-/// rewrites the JSON extraction functions into `BigQuery` SQL. **Do not reach
-/// for that one from here.** It renders only the call shapes `BigQuery` can
-/// express and errors on the rest, and the policy paired with it is what keeps
-/// the rest from reaching the unparser at all; without that policy it turns
-/// #13664's wrong-function error into a failed query.
+/// The catalog connector uses these for drivers other than `DuckDB`. Its
+/// `DuckDB` dialect and function-support policy must stay paired in the runtime.
+/// The dataset connector's `BigQuery` dialect rewrites Spice functions and must
+/// only be used with its matching policy; the catalog keeps the stock dialect.
 #[must_use]
 pub fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
     match driver_name {
@@ -442,6 +694,233 @@ fn bigquery_information_schema_table(table_reference: &TableReference, view: &st
 
 fn bigquery_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn managed_duckdb_version_floor() {
+        for (version, expected) in [
+            ("v1.4.4", Some(false)),
+            ("v1.5.0", Some(true)),
+            ("v2.0.0", Some(true)),
+            ("v1.5.6-dev123", Some(true)),
+            ("unknown", None),
+        ] {
+            assert_eq!(
+                super::duckdb_version_is_supported(version),
+                expected,
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_duckdb_version_error_text() {
+        for connector in ["duckdb", "ducklake"] {
+            assert_eq!(
+                super::ManagedDuckDbError::UnsupportedVersion {
+                    found: "v1.4.4".into(),
+                    connector
+                }
+                .to_string(),
+                format!(
+                    "Failed to load the installed DuckDB library: version v1.4.4 is older than the minimum supported version 1.5.0. Install DuckDB 1.5.0 or later. For details, visit: https://spiceai.org/docs/components/data-connectors/{connector}"
+                )
+            );
+        }
+    }
+
+    use super::*;
+
+    #[test]
+    fn test_driver_entrypoint() {
+        assert_eq!(
+            driver_entrypoint("duckdb"),
+            Some(b"duckdb_adbc_init".as_slice())
+        );
+        for driver in ["sqlite", "postgresql", "snowflake", "other"] {
+            assert_eq!(driver_entrypoint(driver), None, "driver: {driver}");
+        }
+    }
+
+    fn assert_db_options_eq(
+        actual: Vec<(OptionDatabase, adbc_core::options::OptionValue)>,
+        expected: Vec<(OptionDatabase, &str)>,
+    ) {
+        assert_eq!(actual.len(), expected.len());
+        for ((key, value), (expected_key, expected_value)) in actual.into_iter().zip(expected) {
+            assert_eq!(key, expected_key);
+            let adbc_core::options::OptionValue::String(value) = value else {
+                panic!("expected a string database option, got {value:?}");
+            };
+            assert_eq!(value, expected_value);
+        }
+    }
+
+    #[test]
+    fn test_build_db_options_duckdb_has_no_managed_defaults() {
+        assert_db_options_eq(
+            build_db_options("duckdb", "test.db", None, None, None),
+            vec![(OptionDatabase::Other("path".into()), "test.db")],
+        );
+    }
+
+    #[test]
+    fn test_build_db_options_duckdb_driver_options_keep_the_adbc_prefix() {
+        assert_db_options_eq(
+            build_db_options(
+                "duckdb",
+                "test.db",
+                None,
+                None,
+                Some("access_mode=read_write;adbc.custom=value"),
+            ),
+            vec![
+                (OptionDatabase::Other("path".into()), "test.db"),
+                (
+                    OptionDatabase::Other("adbc.access_mode".into()),
+                    "read_write",
+                ),
+                (OptionDatabase::Other("adbc.custom".into()), "value"),
+            ],
+        );
+    }
+
+    #[test]
+    fn managed_duckdb_file_is_read_only_and_utc() {
+        assert_db_options_eq(
+            managed_duckdb_options("test.db", true),
+            vec![
+                (OptionDatabase::Other("path".into()), "test.db"),
+                (OptionDatabase::Other("access_mode".into()), "read_only"),
+                (OptionDatabase::Other("TimeZone".into()), "UTC"),
+            ],
+        );
+    }
+
+    #[test]
+    fn managed_duckdb_memory_is_writable_and_utc() {
+        assert_db_options_eq(
+            managed_duckdb_options(":memory:", false),
+            vec![
+                (OptionDatabase::Other("path".into()), ":memory:"),
+                (OptionDatabase::Other("TimeZone".into()), "UTC"),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_build_db_options_uri_only() {
+        let opts = build_db_options("snowflake", "file:test.db", None, None, None);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].0, OptionDatabase::Uri);
+        assert!(
+            matches!(&opts[0].1, adbc_core::options::OptionValue::String(s) if s == "file:test.db")
+        );
+    }
+
+    #[test]
+    fn test_build_db_options_with_username_password() {
+        let opts = build_db_options(
+            "postgresql",
+            "postgres://host/db",
+            Some("admin"),
+            Some("secret"),
+            None,
+        );
+        assert_eq!(opts.len(), 3);
+
+        assert_eq!(opts[0].0, OptionDatabase::Uri);
+        assert!(
+            matches!(&opts[0].1, adbc_core::options::OptionValue::String(s) if s == "postgres://host/db")
+        );
+
+        assert_eq!(opts[1].0, OptionDatabase::Username);
+        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "admin"));
+
+        assert_eq!(opts[2].0, OptionDatabase::Password);
+        assert!(matches!(&opts[2].1, adbc_core::options::OptionValue::String(s) if s == "secret"));
+    }
+
+    #[test]
+    fn test_build_db_options_username_only() {
+        let opts = build_db_options("sqlite", "sqlite:test.db", Some("user"), None, None);
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0].0, OptionDatabase::Uri);
+        assert_eq!(opts[1].0, OptionDatabase::Username);
+        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "user"));
+    }
+
+    #[test]
+    fn test_build_db_options_with_driver_options_unprefixed() {
+        let opts = build_db_options(
+            "snowflake",
+            "uri://db",
+            None,
+            None,
+            Some("snowflake.sql.db=MY_DB;snowflake.sql.schema=PUBLIC"),
+        );
+        assert_eq!(opts.len(), 3);
+        assert_eq!(opts[0].0, OptionDatabase::Uri);
+        assert_eq!(
+            opts[1].0,
+            OptionDatabase::Other("adbc.snowflake.sql.db".to_string())
+        );
+        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "MY_DB"));
+        assert_eq!(
+            opts[2].0,
+            OptionDatabase::Other("adbc.snowflake.sql.schema".to_string())
+        );
+        assert!(matches!(&opts[2].1, adbc_core::options::OptionValue::String(s) if s == "PUBLIC"));
+    }
+
+    #[test]
+    fn test_build_db_options_with_driver_options_prefixed() {
+        let opts = build_db_options(
+            "snowflake",
+            "uri://db",
+            None,
+            None,
+            Some("adbc.snowflake.sql.db=MY_DB;adbc.snowflake.sql.schema=PUBLIC"),
+        );
+        assert_eq!(opts.len(), 3);
+        assert_eq!(
+            opts[1].0,
+            OptionDatabase::Other("adbc.snowflake.sql.db".to_string())
+        );
+        assert_eq!(
+            opts[2].0,
+            OptionDatabase::Other("adbc.snowflake.sql.schema".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_db_options_driver_options_trailing_semicolon() {
+        let opts = build_db_options("snowflake", "uri://db", None, None, Some("key=value;"));
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[1].0, OptionDatabase::Other("adbc.key".to_string()));
+        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "value"));
+    }
+
+    #[test]
+    fn test_build_db_options_driver_options_malformed_ignored() {
+        let opts = build_db_options(
+            "snowflake",
+            "uri://db",
+            None,
+            None,
+            Some("good=val;bad_no_equals;another=ok"),
+        );
+        assert_eq!(opts.len(), 3); // uri + good + another (bad_no_equals skipped)
+    }
+
+    #[test]
+    fn test_build_db_options_driver_options_empty_key_ignored() {
+        let opts = build_db_options("snowflake", "uri://db", None, None, Some("=value;good=ok"));
+        assert_eq!(opts.len(), 2); // uri + good (empty key skipped)
+        assert_eq!(opts[1].0, OptionDatabase::Other("adbc.good".to_string()));
+    }
 }
 
 #[cfg(test)]

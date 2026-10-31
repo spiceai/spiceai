@@ -64,9 +64,9 @@ target/debug/spicescript --check test/spicescript
 ```
 
 Docker must be running. The `aws` CLI is needed for object-store sources, and
-`duckdb` for Iceberg sources and `dbgen`. The DuckLake source fetches the
-DuckDB CLI matching Spice's embedded DuckDB into `~/.cache/spicescript/`
-(override with `SPICESCRIPT_DUCKLAKE_DUCKDB`).
+`duckdb` for Iceberg sources and `dbgen`. `duckdb` and `ducklake` sources
+fetch the DuckDB release they use into `~/.cache/spicescript/` (see
+**DuckDB releases** below).
 
 | Option | Meaning |
 | --- | --- |
@@ -88,6 +88,7 @@ DuckDB CLI matching Spice's embedded DuckDB into `~/.cache/spicescript/`
 | `--keep` | Leave source containers running after the run, for debugging. |
 | `--spice-cli PATH` | The `spice` CLI that `spice` steps run. |
 | `--record-failures` | Rewrite each run script's entries in its directory's `recordings/expected-failures.json` with the failures this run saw (see [Expected failures](#expected-failures)). |
+| `--duckdb-version VERSION` | The DuckDB release `duckdb` and `ducklake` sources use when their spec names no `version` (also `SPICESCRIPT_DUCKDB_VERSION`); defaults to the newest in `test/duckdb_versions.json`. `--record-failures` refuses any other, since the ledger is recorded at the default. |
 | `--check` | Parse every script, including its corpora, and stop. Also fails on an `avoid:` whose defect no longer fails anywhere. |
 
 **Logs and cleanup.** Each failure prints the step, what was expected and what
@@ -158,9 +159,29 @@ steps:
 | `rustfs` | An S3-compatible store with conditional writes, with a bucket per instance, managed with the `aws` CLI. `${sources.<name>.params}` holds the `s3_*` parameters. `.bucket`, `.endpoint`, `.key` and `.secret` serve other uses, such as a Cayenne data tier or a state location. `.shared_bucket` is one bucket every instance shares, for two variants that act as replicas over one state location. |
 | `files` | A directory per instance (`${sources.<name>.path}`) holding generated Parquet or CSV part files. |
 | `iceberg` | An Iceberg REST catalog over rustfs. `source-exec` and oracle queries run through the `duckdb` CLI attached to the catalog, so a script writes Iceberg with plain SQL and checks Spice against DuckDB reading the same tables. |
-| `ducklake` | A DuckLake catalog written with the DuckDB CLI matching Spice's embedded DuckDB. |
+| `duckdb` | A DuckDB file per instance, written before `start` or while Spice is stopped. `${sources.<name>.params}` holds `duckdb_open`; `.path` is the file path and `.adbc_params` holds the DuckDB ADBC parameters. CLI and library are one DuckDB release (see **DuckDB releases**). |
+| `ducklake` | A DuckLake lake with its catalog in PostgreSQL, written with the CLI of one DuckDB release (see **DuckDB releases**). `version` is that release; the catalog runs the default PostgreSQL image. |
 | `docker` | Any image: `image`, `ports`, `env` (`${port.N}` is the host port of container port N), `command`, and `ready` (a shell command that succeeds once the container is ready). `source-exec` runs a shell command inside it and `source-query` returns the lines it prints. `host-network: true` lets the container reach `spiced` and the other sources on the host: on Linux it shares the host's network, elsewhere Docker routes to the host, and `${sources.<name>.host_from_container}` is the host's address from inside the container either way. Useful for services such as Debezium Server. |
 | `mock-http` | An HTTP server whose routes the script sets with `source-exec`: `path`, and optionally `method`, `query`, `headers-match`, `status`, `headers`, `body`, `delay-ms` and `times`; `reset` removes them all. `source-query` reads what it received: `count <path>`, `log <path>`, `header <path> <name>`. |
+
+**DuckDB releases.** `spiced` reads `duckdb:` and `ducklake:` through the
+DuckDB library installed on the host, so each `duckdb` or `ducklake` source
+writes its data and checks answers with the `duckdb` CLI of one release and
+lends `spiced` that release's library. The release is the source's `version`
+(which may be a `${matrix.<key>}` placeholder, so a script can run each
+release as a combination of its own), else `--duckdb-version`, else the
+newest release `test/duckdb_versions.json` lists. The CLI and library are
+downloaded once into `~/.cache/spicescript/duckdb-<version>/`;
+`SPICESCRIPT_DUCKDB_CLI` (`duckdb` sources), `SPICESCRIPT_DUCKLAKE_DUCKDB`
+(`ducklake` sources) and `SPICESCRIPT_DUCKDB_LIBRARY` name local builds
+instead.
+
+For `duckdb` and `ducklake` sources, the runner adds the library directory to the
+`spiced` process's `LD_LIBRARY_PATH` (Linux) or `DYLD_FALLBACK_LIBRARY_PATH`
+(macOS), keeping existing search paths. This lets `duckdb:` load `libduckdb`
+by name. Its read-only file connection can coexist with CLI oracle queries.
+Direct `adbc:` opens read-write and holds the file lock: check the CLI oracle
+before `start` or after `stop`, or mirror the data to another source.
 
 Files and object stores answer no queries themselves, so a script mirrors their
 rows into a database to have an oracle (`generate: … mirror: <source>`).
