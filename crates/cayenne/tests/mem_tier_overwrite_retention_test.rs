@@ -603,6 +603,8 @@ test_with_backends!(a_checkpoint_commits_its_metastore_changes_before_acknowledg
 /// a source's position store does, and records the epoch it acknowledges.
 struct PositionSavingAdvancer {
     catalog: Arc<cayenne::metastore::object_native::ObjectNativeCatalog>,
+    /// `<store>/<dataset>`, as a source's position store names it.
+    key: String,
     durable: std::sync::atomic::AtomicU64,
 }
 
@@ -614,23 +616,37 @@ impl SlotAdvancer for PositionSavingAdvancer {
 
     async fn record_position(&self, durable_epoch: u64) -> Result<(), String> {
         self.catalog
-            .set_sidecar_value("position", Some(durable_epoch.to_be_bytes().to_vec()))
+            .set_sidecar_value(&self.key, Some(durable_epoch.to_be_bytes().to_vec()))
             .await
             .map_err(|error| error.to_string())
     }
 }
 
-/// The action kinds of each record committed after `after`, oldest first.
+/// The prefix of `dataset`'s log in the catalog at `catalog/`.
+async fn dataset_log(
+    store: &Arc<dyn object_store::ObjectStore>,
+    dataset: &str,
+) -> TestResult<object_store::path::Path> {
+    Ok(cayenne::metastore::object_native::dataset_log_at(
+        Arc::clone(store),
+        &object_store::path::Path::from("catalog"),
+        dataset,
+    )
+    .await?
+    .ok_or("the dataset has a log")?)
+}
+
+/// The action kinds of each record committed to `dataset`'s log after `after`,
+/// oldest first.
 async fn records_after(
     store: &Arc<dyn object_store::ObjectStore>,
+    dataset: &str,
     after: u64,
 ) -> TestResult<Vec<Vec<&'static str>>> {
     use prost::Message;
-    let (_, opened) = object_store_occ::headlog::Reader::open(
-        Arc::clone(store),
-        object_store::path::Path::from("catalog"),
-    )
-    .await?;
+    let (_, opened) =
+        object_store_occ::headlog::Reader::open(Arc::clone(store), dataset_log(store, dataset).await?)
+            .await?;
     let mut records = Vec::new();
     for entry in opened
         .records
@@ -678,14 +694,13 @@ async fn an_object_native_checkpoint_commits_its_position_with_its_data() -> Tes
     );
     let advancer = Arc::new(PositionSavingAdvancer {
         catalog: Arc::clone(&catalog),
+        key: format!("spice_sys_applied_lsn/{NAME}"),
         durable: std::sync::atomic::AtomicU64::new(0),
     });
     table.install_slot_advancer(Arc::clone(&advancer) as Arc<dyn SlotAdvancer>);
-    let (reader, _) = object_store_occ::headlog::Reader::open(
-        Arc::clone(&store),
-        object_store::path::Path::from("catalog"),
-    )
-    .await?;
+    let (reader, _) =
+        object_store_occ::headlog::Reader::open(Arc::clone(&store), dataset_log(&store, NAME).await?)
+            .await?;
     let before = reader.state().head.commit;
 
     cdc_apply(&table, id_value_batch(&[(1, 10), (2, 20)])?).await?;
@@ -696,7 +711,7 @@ async fn an_object_native_checkpoint_commits_its_position_with_its_data() -> Tes
         "precondition: the checkpoint must acknowledge the source"
     );
 
-    let records = records_after(&store, before).await?;
+    let records = records_after(&store, NAME, before).await?;
     let with_position: Vec<_> = records
         .iter()
         .filter(|kinds| kinds.contains(&"AdvanceSourcePosition"))
@@ -709,7 +724,9 @@ async fn an_object_native_checkpoint_commits_its_position_with_its_data() -> Tes
         "the position must commit with the data it covers, records: {records:?}"
     );
     assert_eq!(
-        catalog.sidecar_value("position").await?,
+        catalog
+            .sidecar_value(&format!("spice_sys_applied_lsn/{NAME}"))
+            .await?,
         Some(durable.to_be_bytes().to_vec())
     );
     Ok(())
@@ -741,14 +758,13 @@ async fn an_object_native_seal_commits_its_position_with_its_data() -> TestResul
     );
     let advancer = Arc::new(PositionSavingAdvancer {
         catalog: Arc::clone(&catalog),
+        key: format!("spice_sys_applied_lsn/{NAME}"),
         durable: std::sync::atomic::AtomicU64::new(0),
     });
     table.install_slot_advancer(Arc::clone(&advancer) as Arc<dyn SlotAdvancer>);
-    let (reader, _) = object_store_occ::headlog::Reader::open(
-        Arc::clone(&store),
-        object_store::path::Path::from("catalog"),
-    )
-    .await?;
+    let (reader, _) =
+        object_store_occ::headlog::Reader::open(Arc::clone(&store), dataset_log(&store, NAME).await?)
+            .await?;
     let before = reader.state().head.commit;
 
     cdc_apply(&table, id_value_batch(&[(1, 10), (2, 20)])?).await?;
@@ -762,7 +778,7 @@ async fn an_object_native_seal_commits_its_position_with_its_data() -> TestResul
         "precondition: the seal must acknowledge the source"
     );
 
-    let records = records_after(&store, before).await?;
+    let records = records_after(&store, NAME, before).await?;
     let with_position: Vec<_> = records
         .iter()
         .filter(|kinds| kinds.contains(&"AdvanceSourcePosition"))

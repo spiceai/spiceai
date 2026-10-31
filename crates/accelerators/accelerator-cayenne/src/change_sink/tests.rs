@@ -650,15 +650,32 @@ async fn cache_replacements_by_key_match_the_scope_delete() {
     );
 }
 
-/// The action names of each object-native commit after `after`, oldest first.
+/// The prefix of `dataset`'s object-native log in the catalog at `catalog/`.
+async fn object_native_log(
+    store: &Arc<dyn object_store::ObjectStore>,
+    dataset: &str,
+) -> object_store::path::Path {
+    cayenne::metastore::object_native::dataset_log_at(
+        Arc::clone(store),
+        &object_store::path::Path::from("catalog"),
+        dataset,
+    )
+    .await
+    .expect("read the registry")
+    .expect("the dataset has a log")
+}
+
+/// The action names of each commit to `dataset`'s object-native log after
+/// `after`, oldest first.
 async fn object_native_records_after(
     store: &Arc<dyn object_store::ObjectStore>,
+    dataset: &str,
     after: u64,
 ) -> Vec<Vec<&'static str>> {
     use prost::Message;
     let (_, opened) = object_store_occ::headlog::Reader::open(
         Arc::clone(store),
-        object_store::path::Path::from("catalog"),
+        object_native_log(store, dataset).await,
     )
     .await
     .expect("open head log");
@@ -752,7 +769,7 @@ async fn an_object_native_durable_cdc_write_commits_its_position_with_its_data()
     .expect("source changes");
     let (reader, _) = object_store_occ::headlog::Reader::open(
         Arc::clone(&store),
-        object_store::path::Path::from("catalog"),
+        object_native_log(&store, "positions").await,
     )
     .await
     .expect("open head log");
@@ -761,7 +778,7 @@ async fn an_object_native_durable_cdc_write_commits_its_position_with_its_data()
     let saver = Arc::clone(&catalog);
     let position: runtime_acceleration::change_sink::PositionWrite = Box::pin(async move {
         saver
-            .set_sidecar_value("position", Some(b"lsn 7".to_vec()))
+            .set_sidecar_value("spice_sys_applied_lsn/positions", Some(b"lsn 7".to_vec()))
             .await
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
     });
@@ -784,7 +801,7 @@ async fn an_object_native_durable_cdc_write_commits_its_position_with_its_data()
     receipt.published().await.expect("CDC publication");
     assert_eq!(receipt.durability, StorageDurability::Durable);
 
-    let records = object_native_records_after(&store, before).await;
+    let records = object_native_records_after(&store, "positions", before).await;
     let with_position: Vec<_> = records
         .iter()
         .filter(|kinds| kinds.contains(&"AdvanceSourcePosition"))
@@ -797,7 +814,7 @@ async fn an_object_native_durable_cdc_write_commits_its_position_with_its_data()
         "the position must commit with the data it covers, records: {records:?}"
     );
     assert_eq!(
-        catalog.sidecar_value("position").await.expect("read"),
+        catalog.sidecar_value("spice_sys_applied_lsn/positions").await.expect("read"),
         Some(b"lsn 7".to_vec())
     );
 }

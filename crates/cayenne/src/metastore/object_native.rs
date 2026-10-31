@@ -34,18 +34,22 @@ use prost::Message;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Notify;
 
-/// A serial writer and its last acknowledged state. No database is used.
-pub struct ObjectNativeCatalog {
+mod catalog;
+pub use catalog::{ObjectNativeCatalog, dataset_log_at};
+
+/// One head log: a serial writer and its last acknowledged state. The catalog
+/// keeps one for its name registry and one per dataset. No database is used.
+struct Domain {
     inner: StateSlot,
     opened: OpenSummary,
+    /// The dataset folder this log is in; empty for the name registry.
+    folder: String,
 }
 
 /// What opening the catalog found, for the startup log.
 #[derive(Clone, Copy, Debug)]
 struct OpenSummary {
-    checkpoint: u64,
     replayed: usize,
-    tables: usize,
     lease: u64,
 }
 struct Inner {
@@ -66,6 +70,8 @@ struct Inner {
     /// next change to one of them made outside a deferred scope; another table's
     /// commit never publishes it.
     pending: Vec<Pending>,
+    /// Commit every change when it is made, even inside a deferred scope.
+    immediate: bool,
 }
 
 /// Buffered changes for a set of tables. Actions on different tables commute,
@@ -100,6 +106,22 @@ impl Default for NativeCatalogConfig {
         }
     }
 }
+/// What a sidecar write does to the value under its key.
+enum ValueChange {
+    Keep,
+    Set(Vec<u8>),
+    Remove,
+}
+
+/// Set (`Some`) or remove (`None`) the value under `(source, partition)`.
+fn position(source: &str, partition: &str, value: Option<Vec<u8>>) -> Action {
+    Action::new(Kind::AdvanceSourcePosition(proto::AdvanceSourcePosition {
+        source: source.to_string(),
+        partition: partition.to_string(),
+        clear: value.is_none(),
+        position: value.unwrap_or_default(),
+    }))
+}
 fn invalid(error: impl std::fmt::Display) -> CatalogError {
     CatalogError::InvalidOperationNoSource {
         message: error.to_string(),
@@ -110,6 +132,10 @@ fn invalid(error: impl std::fmt::Display) -> CatalogError {
 struct StateSlot {
     inner: Mutex<Option<Inner>>,
     available: Notify,
+    /// Held by a transaction across datasets from its `Prepare` to its
+    /// `Resolve`: every other caller waits, so nothing on this log is refused
+    /// by the reservation.
+    reserved: std::sync::atomic::AtomicBool,
 }
 struct StateLease<'a> {
     slot: &'a StateSlot,
@@ -117,11 +143,25 @@ struct StateLease<'a> {
 }
 impl StateSlot {
     async fn take(&self) -> StateLease<'_> {
+        self.take_as(false).await
+    }
+
+    /// The state for the transaction holding the reservation.
+    async fn take_reserved(&self) -> StateLease<'_> {
+        self.take_as(true).await
+    }
+
+    async fn take_as(&self, holder: bool) -> StateLease<'_> {
+        use std::sync::atomic::Ordering;
         loop {
             let notified = self.available.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let inner = self.inner.lock().take();
+            let inner = if holder || !self.reserved.load(Ordering::Acquire) {
+                self.inner.lock().take()
+            } else {
+                None
+            };
             if let Some(inner) = inner {
                 return StateLease {
                     slot: self,
@@ -130,6 +170,26 @@ impl StateSlot {
             }
             notified.await;
         }
+    }
+
+    /// Wait for the reservation and hold it until the returned guard drops.
+    async fn reserve(&self) -> Reservation<'_> {
+        use std::sync::atomic::Ordering;
+        let lease = self.take().await;
+        self.reserved.store(true, Ordering::Release);
+        drop(lease);
+        Reservation { slot: self }
+    }
+}
+struct Reservation<'a> {
+    slot: &'a StateSlot,
+}
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.slot
+            .reserved
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.slot.available.notify_waiters();
     }
 }
 impl std::ops::Deref for StateLease<'_> {
@@ -152,10 +212,125 @@ impl std::ops::DerefMut for StateLease<'_> {
 impl Drop for StateLease<'_> {
     fn drop(&mut self) {
         *self.slot.inner.lock() = self.inner.take();
-        self.slot.available.notify_one();
+        // Every waiter re-checks: one may wait on the reservation, not the state.
+        self.slot.available.notify_waiters();
     }
 }
-impl ObjectNativeCatalog {
+impl Domain {
+    /// This log's part of a transaction across datasets: commit its buffered
+    /// changes, then a `Prepare` holding the publications' actions. Returns the
+    /// footprint. The caller holds [`StateSlot::reserve`].
+    async fn prepare(
+        &self,
+        txn: &str,
+        publications: &[crate::catalog::CatalogPublication],
+    ) -> CatalogResult<Vec<String>> {
+        let mut inner = self.inner.take_reserved().await;
+        let mut batch = inner.publication_actions(publications)?;
+        inner.stamp(&mut batch);
+        let footprint: std::collections::BTreeSet<String> = batch
+            .iter()
+            .filter_map(|action| action.table_id().map(ToString::to_string))
+            .collect();
+        let footprint: Vec<String> = footprint.into_iter().collect();
+        inner
+            .commit_now(Action::new(Kind::Prepare(proto::Prepare {
+                txn: txn.to_string(),
+                footprint: footprint.clone(),
+                actions: Record { actions: batch }.encode_to_vec(),
+            })))
+            .await?;
+        Ok(footprint)
+    }
+
+    /// Commit the decided outcome of `txn` on this log.
+    async fn resolve(&self, txn: &str, footprint: Vec<String>, commit: bool) -> CatalogResult<()> {
+        self.inner
+            .take_reserved()
+            .await
+            .commit_now(Action::new(Kind::Resolve(proto::Resolve {
+                txn: txn.to_string(),
+                footprint,
+                commit,
+            })))
+            .await
+    }
+
+    /// Every table on this log: its id, its name, and whether it partitions
+    /// into child tables.
+    async fn tables(&self) -> Vec<(String, String, bool)> {
+        self.inner
+            .take()
+            .await
+            .reader
+            .state
+            .tables
+            .iter()
+            .map(|(id, table)| {
+                (
+                    id.clone(),
+                    table.name.clone(),
+                    table.partition_column.is_some(),
+                )
+            })
+            .collect()
+    }
+
+    /// The positions whose key names `dataset` (`<store>/<dataset>`), with
+    /// their counters.
+    async fn positions_of(&self, dataset: &str) -> Vec<((String, String), Vec<u8>)> {
+        self.inner
+            .take()
+            .await
+            .reader
+            .state
+            .positions
+            .iter()
+            .filter(|((source, _), _)| {
+                source
+                    .split_once('/')
+                    .is_some_and(|(_, named)| named == dataset)
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    /// The values under `source`, by partition.
+    async fn positions_under(&self, source: &str) -> Vec<(String, Vec<u8>)> {
+        self.inner
+            .take()
+            .await
+            .reader
+            .state
+            .positions
+            .iter()
+            .filter(|((key, _), _)| key == source)
+            .map(|((_, partition), value)| (partition.clone(), value.clone()))
+            .collect()
+    }
+
+    /// Commit `actions` as a change made by a catalog method.
+    async fn commit_actions(&self, actions: Vec<Action>) -> CatalogResult<()> {
+        if actions.is_empty() {
+            return Ok(());
+        }
+        self.inner.take().await.commit(actions).await
+    }
+
+    /// The transactions prepared on this log and not yet resolved, with their
+    /// footprints.
+    async fn unresolved(&self) -> Vec<(String, Vec<String>)> {
+        self.inner
+            .take()
+            .await
+            .reader
+            .state
+            .prepared
+            .iter()
+            .map(|(txn, prepared)| (txn.clone(), prepared.footprint.iter().cloned().collect()))
+            .collect()
+    }
+
     async fn read(&self) -> CatalogResult<StateLease<'_>> {
         let inner = self.inner.take().await;
         if inner.poisoned {
@@ -166,84 +341,30 @@ impl ObjectNativeCatalog {
         Ok(inner)
     }
 
-    /// Create an empty catalog at a new prefix.
+    /// Create an empty log at a new prefix.
     /// # Errors
     /// Returns an error when conditional writes are unsupported or the prefix exists.
-    pub async fn create(store: Arc<dyn ObjectStore>, prefix: Path) -> CatalogResult<Self> {
-        Self::create_with_config(store, prefix, NativeCatalogConfig::default()).await
-    }
-    /// [`Self::create`] with explicit head-log tuning.
-    /// # Errors
-    /// Returns an error when conditional writes are unsupported or the prefix exists.
-    pub async fn create_with_config(
+    async fn create_with_config(
         store: Arc<dyn ObjectStore>,
         prefix: Path,
         config: NativeCatalogConfig,
+        immediate: bool,
     ) -> CatalogResult<Self> {
         HeadLog::create(Arc::clone(&store), prefix.clone(), config.log)
             .await
             .map_err(invalid)?;
-        Self::open_with_config(store, prefix, config).await
+        Self::open_with_config(store, prefix, config, immediate).await
     }
-    /// Open the catalog kept in a local directory, creating it on first use. The
-    /// directory is an fsync'd object store with conditional writes.
-    /// # Errors
-    /// Returns an error when the directory cannot be used or the history is invalid.
-    pub async fn open_or_create_local(directory: &std::path::Path) -> CatalogResult<Self> {
-        tokio::fs::create_dir_all(directory)
-            .await
-            .map_err(invalid)?;
-        let store: Arc<dyn ObjectStore> = Arc::new(
-            object_store_occ::LocalConditionalPut::new_durable(directory).map_err(invalid)?,
-        );
-        Self::open_or_create_at(
-            store,
-            Path::from("catalog"),
-            &directory.display().to_string(),
-        )
-        .await
-    }
-
-    /// Open the catalog at `prefix` in `store`, creating it on first use.
-    /// `location` names where it is, for the startup log.
-    /// # Errors
-    /// Returns an error when the store cannot be used or the history is invalid.
-    pub async fn open_or_create_at(
-        store: Arc<dyn ObjectStore>,
-        prefix: Path,
-        location: &str,
-    ) -> CatalogResult<Self> {
-        let (catalog, verb) = match store.head(&prefix.clone().join("head")).await {
-            Ok(_) => (Self::open(store, prefix).await?, "Opened"),
-            Err(object_store::Error::NotFound { .. }) => {
-                (Self::create(store, prefix).await?, "Created")
-            }
-            Err(error) => return Err(invalid(error)),
-        };
-        let OpenSummary {
-            checkpoint,
-            replayed,
-            tables,
-            lease,
-        } = catalog.opened;
-        tracing::info!(
-            "{verb} the Cayenne object-native metastore at '{location}': {tables} tables from the checkpoint at commit {checkpoint} plus {replayed} later commits, writing as lease {lease}"
-        );
-        Ok(catalog)
-    }
-    /// Replay committed records, then fence the previous writer with the next lease.
+    /// Replay committed records, then fence the previous writer with the next
+    /// lease. An `immediate` log commits every change when it is made, even
+    /// inside a deferred scope.
     /// # Errors
     /// Returns an error on invalid history, takeover conflict, or storage failure.
-    pub async fn open(store: Arc<dyn ObjectStore>, prefix: Path) -> CatalogResult<Self> {
-        Self::open_with_config(store, prefix, NativeCatalogConfig::default()).await
-    }
-    /// [`Self::open`] with explicit head-log tuning.
-    /// # Errors
-    /// Returns an error on invalid history, takeover conflict, or storage failure.
-    pub async fn open_with_config(
+    async fn open_with_config(
         store: Arc<dyn ObjectStore>,
         prefix: Path,
         config: NativeCatalogConfig,
+        immediate: bool,
     ) -> CatalogResult<Self> {
         let (reader, opened) = Reader::open(Arc::clone(&store), prefix.clone())
             .await
@@ -281,18 +402,17 @@ impl ObjectNativeCatalog {
             state,
             floor_state,
             since_floor,
-            floor,
         } = replayed;
         let opened = OpenSummary {
-            checkpoint: floor,
             replayed: since_floor.len(),
-            tables: state.tables.len(),
             lease: generation,
         };
         Ok(Self {
             opened,
+            folder: String::new(),
             inner: StateSlot {
                 available: Notify::new(),
+                reserved: std::sync::atomic::AtomicBool::new(false),
                 inner: Mutex::new(Some(Inner {
                     reader: ShadowCatalog::from_state(state, store, prefix),
                     writer,
@@ -302,6 +422,7 @@ impl ObjectNativeCatalog {
                     since_floor,
                     staged_checkpoint: 0,
                     pending: Vec::new(),
+                    immediate,
                 })),
             },
         })
@@ -311,7 +432,6 @@ struct Replayed {
     state: DatasetState,
     floor_state: DatasetState,
     since_floor: Vec<(u64, Vec<Record>)>,
-    floor: u64,
 }
 fn replay_state(opened: Opened) -> CatalogResult<Replayed> {
     let mut state = DatasetState::default();
@@ -321,7 +441,6 @@ fn replay_state(opened: Opened) -> CatalogResult<Replayed> {
             .map_err(invalid)?;
     }
     let floor_state = state.clone();
-    let floor = opened.floor;
     let mut since_floor = Vec::with_capacity(opened.records.len());
     for entry in opened.records {
         let mut records = Vec::new();
@@ -342,7 +461,6 @@ fn replay_state(opened: Opened) -> CatalogResult<Replayed> {
         state,
         floor_state,
         since_floor,
-        floor,
     })
 }
 
@@ -428,8 +546,25 @@ impl Inner {
             ));
         }
         let mut actions = actions;
+        self.stamp(&mut actions);
+        let record = Record { actions };
+        // Applied without a copy of the state. A refused record is a guard this
+        // catalog's own checks should have caught, and leaves the state partly
+        // changed, so the catalog stops until it is reopened from the log.
+        if let Err(error) = self.reader.state.apply_in_place(&record) {
+            self.poisoned = true;
+            tracing::error!(
+                "Cayenne object-native metastore stopped accepting changes, so its datasets stop updating until spiced restarts: a change was refused: {error}"
+            );
+            return Err(invalid(error));
+        }
+        self.buffer(record).await
+    }
+
+    /// Set the commit time on the actions that keep one.
+    fn stamp(&self, actions: &mut [Action]) {
         let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        for action in &mut actions {
+        for action in actions {
             match action.kind.as_mut() {
                 Some(Kind::AddInlinedData(row)) => {
                     row.created_at.clone_from(&timestamp);
@@ -447,17 +582,11 @@ impl Inner {
                 _ => {}
             }
         }
-        let record = Record { actions };
-        // Applied without a copy of the state. A refused record is a guard this
-        // catalog's own checks should have caught, and leaves the state partly
-        // changed, so the catalog stops until it is reopened from the log.
-        if let Err(error) = self.reader.state.apply_in_place(&record) {
-            self.poisoned = true;
-            tracing::error!(
-                "Cayenne object-native metastore stopped accepting changes, so its datasets stop updating until spiced restarts: a change was refused: {error}"
-            );
-            return Err(invalid(error));
-        }
+    }
+
+    /// Buffer an applied record with the buffers it shares a table with, or
+    /// commit it now outside a deferred scope.
+    async fn buffer(&mut self, record: Record) -> CatalogResult<()> {
         let mut tables = self.tables_of(&record.actions);
         // Creating or dropping a table changes which table a name refers to, which
         // table ids alone do not order: a create under a name whose drop is still
@@ -493,7 +622,7 @@ impl Inner {
         // Inside one it waits for the scope's acknowledgement point however large
         // or old it grows, so the position staged last shares its record; every
         // deferred scope ends at such a point.
-        if !crate::catalog::commits_deferred() {
+        if self.immediate || !crate::catalog::commits_deferred() {
             return self.publish_buffers(vec![merged]).await;
         }
         self.pending.push(merged);
@@ -597,56 +726,35 @@ impl Inner {
         }
     }
 
-    /// Publish `attempt`, resolving an uncertain outcome by reading the head back
-    /// and retrying only the same bytes under the same condition, so a transient
-    /// store error neither loses nor duplicates the commit. `Rejected` and
-    /// `Fenced` are final: another writer owns the log.
-    async fn publish(
-        &mut self,
-        attempt: &object_store_occ::headlog::PreparedAttempt,
-    ) -> CatalogResult<Outcome> {
-        const ATTEMPTS: u32 = 8;
-        let mut outcome = self.writer.commit(attempt).await;
-        for retry in 1..=ATTEMPTS {
-            let error = match outcome {
-                Ok(Outcome::Unresolved) => "the outcome was unresolved".to_string(),
-                Ok(final_outcome) => return Ok(final_outcome),
-                Err(error) => error.to_string(),
-            };
-            let delay = std::time::Duration::from_millis(100 * 2_u64.pow(retry.min(6)));
-            tracing::warn!(
-                "Cayenne object-native metastore could not confirm a commit ({error}), so it is checking whether the commit landed and retrying it in {} ms (attempt {retry} of {ATTEMPTS})",
-                delay.as_millis()
-            );
-            tokio::time::sleep(delay).await;
-            outcome = self.writer.resolve(attempt).await;
+    /// Commit a transaction's `Prepare` or `Resolve` now, as its own record,
+    /// after every buffered change. A record whose guard fails is refused and
+    /// leaves the state as it was.
+    async fn commit_now(&mut self, action: Action) -> CatalogResult<()> {
+        if self.poisoned {
+            return Err(invalid(
+                "catalog requires reopening after an uncertain or fenced commit",
+            ));
         }
-        outcome.map_err(invalid)
-    }
-}
-
-#[async_trait]
-impl MetadataCatalog for ObjectNativeCatalog {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    async fn commit_pending(&self) -> CatalogResult<()> {
-        self.inner.take().await.flush().await
+        self.flush().await?;
+        let record = Record {
+            actions: vec![action],
+        };
+        self.reader.state.apply(&record).map_err(invalid)?;
+        self.publish_buffers(vec![Pending {
+            tables: std::collections::BTreeSet::new(),
+            actions: record.actions,
+        }])
+        .await
     }
 
-    async fn commit_pending_for(&self, table_id: &str) -> CatalogResult<()> {
-        self.inner.take().await.flush_table(table_id).await
-    }
-
-    async fn commit_publications(
+    /// The actions that publish `publications` in one record.
+    fn publication_actions(
         &self,
         publications: &[crate::catalog::CatalogPublication],
-    ) -> CatalogResult<()> {
-        let mut inner = self.inner.take().await;
+    ) -> CatalogResult<Vec<Action>> {
         let mut batch = Vec::new();
         for publication in publications {
-            batch.extend(inner.conflict_batch(
+            batch.extend(self.conflict_batch(
                 publication.delete_files.clone(),
                 &publication.table_id,
                 &publication.insert_pk_bytes,
@@ -685,6 +793,57 @@ impl MetadataCatalog for ObjectNativeCatalog {
                 })));
             }
         }
+        Ok(batch)
+    }
+
+    /// Publish `attempt`, resolving an uncertain outcome by reading the head back
+    /// and retrying only the same bytes under the same condition, so a transient
+    /// store error neither loses nor duplicates the commit. `Rejected` and
+    /// `Fenced` are final: another writer owns the log.
+    async fn publish(
+        &mut self,
+        attempt: &object_store_occ::headlog::PreparedAttempt,
+    ) -> CatalogResult<Outcome> {
+        const ATTEMPTS: u32 = 8;
+        let mut outcome = self.writer.commit(attempt).await;
+        for retry in 1..=ATTEMPTS {
+            let error = match outcome {
+                Ok(Outcome::Unresolved) => "the outcome was unresolved".to_string(),
+                Ok(final_outcome) => return Ok(final_outcome),
+                Err(error) => error.to_string(),
+            };
+            let delay = std::time::Duration::from_millis(100 * 2_u64.pow(retry.min(6)));
+            tracing::warn!(
+                "Cayenne object-native metastore could not confirm a commit ({error}), so it is checking whether the commit landed and retrying it in {} ms (attempt {retry} of {ATTEMPTS})",
+                delay.as_millis()
+            );
+            tokio::time::sleep(delay).await;
+            outcome = self.writer.resolve(attempt).await;
+        }
+        outcome.map_err(invalid)
+    }
+}
+
+#[async_trait]
+impl MetadataCatalog for Domain {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    async fn commit_pending(&self) -> CatalogResult<()> {
+        self.inner.take().await.flush().await
+    }
+
+    async fn commit_pending_for(&self, table_id: &str) -> CatalogResult<()> {
+        self.inner.take().await.flush_table(table_id).await
+    }
+
+    async fn commit_publications(
+        &self,
+        publications: &[crate::catalog::CatalogPublication],
+    ) -> CatalogResult<()> {
+        let mut inner = self.inner.take().await;
+        let batch = inner.publication_actions(publications)?;
         if batch.is_empty() {
             return Ok(());
         }
@@ -1836,7 +1995,7 @@ fn rewrite_inline(
     }
     Ok(batch)
 }
-impl ObjectNativeCatalog {
+impl Domain {
     /// The runtime's bookkeeping value under `key` (a CDC position, a dataset
     /// checkpoint), kept in the catalog beside the data it describes.
     /// # Errors
@@ -1872,31 +2031,20 @@ impl ObjectNativeCatalog {
             .collect()
     }
 
-    /// Move each named counter under `key` up to its given value, keeping the
-    /// larger of the stored and given values, in one commit (or in the enclosing
-    /// deferred record). Names must not be empty: the empty name is the value of
-    /// [`Self::set_sidecar_value`].
-    /// # Errors
-    /// Returns an error when a name is empty or the commit is not accepted.
-    pub async fn advance_sidecar_counters(
-        &self,
-        key: &str,
-        counters: &[(String, i64)],
-    ) -> CatalogResult<()> {
-        self.set_sidecar_value_and_counters(key, None, counters)
-            .await
-    }
-
-    /// [`Self::set_sidecar_value`] (when `value` is `Some`) and
-    /// [`Self::advance_sidecar_counters`] in the same commit.
+    /// Change the value under `key` and advance its counters in the same commit.
     /// # Errors
     /// Returns an error when a counter name is empty or the commit is not accepted.
-    pub async fn set_sidecar_value_and_counters(
+    async fn set_sidecar_value_and_counters(
         &self,
         key: &str,
-        value: Option<Option<Vec<u8>>>,
+        value: ValueChange,
         counters: &[(String, i64)],
     ) -> CatalogResult<()> {
+        let value = match value {
+            ValueChange::Keep => None,
+            ValueChange::Set(value) => Some(Some(value)),
+            ValueChange::Remove => Some(None),
+        };
         let mut highest = std::collections::BTreeMap::<&str, i64>::new();
         for (name, count) in counters {
             if name.is_empty() {

@@ -65,8 +65,9 @@ fn traces(text: &str) -> Vec<Trace> {
         .collect()
 }
 
+/// The head of a dataset's log (the replay has one dataset), not the registry's.
 fn is_head(path: &Path) -> bool {
-    path.as_ref() == "catalog/head"
+    path.as_ref().starts_with("datasets/") && path.as_ref().ends_with("/head")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -101,7 +102,15 @@ struct Replay {
 
 /// The logged rows and position, from storage alone.
 async fn logged(store: &Arc<dyn ObjectStore>, table_id: &str) -> Result<(Vec<usize>, usize), String> {
-    let (_, opened) = Reader::open(Arc::clone(store), Path::from("catalog"))
+    let log = cayenne::metastore::object_native::dataset_log_at(
+        Arc::clone(store),
+        &Path::from("catalog"),
+        TABLE,
+    )
+    .await
+    .map_err(|e| format!("I4 expected readable registry; actual {e}"))?
+    .ok_or("I4 expected the dataset's log in the registry")?;
+    let (_, opened) = Reader::open(Arc::clone(store), log)
         .await
         .map_err(|e| format!("I4 expected readable log; actual {e}"))?;
     if opened.checkpoint_root.is_some() {

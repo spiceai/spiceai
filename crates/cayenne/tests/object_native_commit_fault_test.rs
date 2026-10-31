@@ -166,11 +166,20 @@ async fn a_fenced_catalog_stops_and_its_change_is_absent() {
     );
 }
 
-/// The source positions each committed record holds, oldest first, from the
-/// head's window (these tests commit too few records to seal a batch).
-async fn committed_positions(store: &Arc<dyn ObjectStore>) -> Vec<Vec<String>> {
+/// The source positions each record committed to `dataset`'s log holds, oldest
+/// first, from the head's window (these tests commit too few records to seal a
+/// batch).
+async fn committed_positions(store: &Arc<dyn ObjectStore>, dataset: &str) -> Vec<Vec<String>> {
     use prost::Message;
-    let (reader, _) = Reader::open(Arc::clone(store), Path::from("catalog"))
+    let log = cayenne::metastore::object_native::dataset_log_at(
+        Arc::clone(store),
+        &Path::from("catalog"),
+        dataset,
+    )
+    .await
+    .expect("read the registry")
+    .expect("the dataset has a log");
+    let (reader, _) = Reader::open(Arc::clone(store), log)
         .await
         .expect("open the head log");
     reader
@@ -247,17 +256,22 @@ async fn another_datasets_commit_leaves_a_datasets_buffered_changes_pending() {
         .set_sidecar_value("spice_sys_applied_lsn/audit", Some(b"7".to_vec()))
         .await
         .expect("audit commits");
-    let records = committed_positions(&store).await;
+    let records = committed_positions(&store, "audit").await;
     assert_eq!(
         records.last(),
         Some(&vec!["spice_sys_applied_lsn/audit".to_string()]),
+        "audit's commit did not commit its position: {records:?}"
+    );
+    let records = committed_positions(&store, "orders").await;
+    assert!(
+        records.iter().all(Vec::is_empty),
         "audit's commit published orders' buffered changes: {records:?}"
     );
     catalog
         .commit_pending_for(&orders)
         .await
         .expect("orders' acknowledgement point");
-    let records = committed_positions(&store).await;
+    let records = committed_positions(&store, "orders").await;
     assert_eq!(
         records.last(),
         Some(&vec![
@@ -288,5 +302,55 @@ async fn a_name_dropped_in_a_deferred_scope_can_be_created_again() {
     assert_eq!(
         reopened.get_table("orders").await.expect("orders").table_id,
         second
+    );
+}
+
+/// Datasets commit independently: with one dataset's head CAS held in flight,
+/// another dataset's commit completes.
+#[tokio::test]
+async fn a_dataset_commits_while_another_datasets_commit_is_in_flight() {
+    let (faults, _store, catalog) = setup().await;
+    create(&catalog, "orders").await;
+    create(&catalog, "audit").await;
+    let catalog = Arc::new(catalog);
+    let orders_head = catalog
+        .dataset_log("orders")
+        .expect("orders has a log")
+        .join("head");
+    faults.arm(
+        Op::Cas,
+        move |path: &Path| path == &orders_head,
+        Fault::Hold,
+    );
+    let orders = tokio::spawn({
+        let catalog = Arc::clone(&catalog);
+        async move {
+            catalog
+                .set_sidecar_value("spice_sys_applied_lsn/orders", Some(b"1".to_vec()))
+                .await
+        }
+    });
+    let held = faults.wait_held(None).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        catalog.set_sidecar_value("spice_sys_applied_lsn/audit", Some(b"2".to_vec())),
+    )
+    .await
+    .expect("audit's commit waited for orders' head CAS")
+    .expect("audit commits");
+    assert!(!orders.is_finished(), "orders' commit is still held");
+    faults.clear_rules();
+    faults.deliver(held).await.expect("deliver orders' CAS");
+    faults.respond(held).expect("release orders' response");
+    orders
+        .await
+        .expect("orders' task")
+        .expect("orders commits once its CAS is delivered");
+    assert_eq!(
+        catalog
+            .sidecar_value("spice_sys_applied_lsn/orders")
+            .await
+            .expect("read orders"),
+        Some(b"1".to_vec())
     );
 }
