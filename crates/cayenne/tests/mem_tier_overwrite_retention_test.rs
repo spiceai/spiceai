@@ -714,3 +714,63 @@ async fn an_object_native_checkpoint_commits_its_position_with_its_data() -> Tes
     );
     Ok(())
 }
+
+/// A seal writes the in-memory tier's unsealed rows to the durable inline store
+/// and then acknowledges the source, so with the object-native metastore it too
+/// commits the position in the same record as those rows.
+#[tokio::test]
+async fn an_object_native_seal_commits_its_position_with_its_data() -> TestResult<()> {
+    const NAME: &str = "seal_position_with_data";
+    let fixture = TestFixture::new(common::BackendType::Sqlite).await?;
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let catalog = Arc::new(
+        cayenne::metastore::object_native::ObjectNativeCatalog::create(
+            Arc::clone(&store),
+            object_store::path::Path::from("catalog"),
+        )
+        .await?,
+    );
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            memory_tier_options(&fixture, NAME, &id_value_schema()),
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    let advancer = Arc::new(PositionSavingAdvancer {
+        catalog: Arc::clone(&catalog),
+        durable: std::sync::atomic::AtomicU64::new(0),
+    });
+    table.install_slot_advancer(Arc::clone(&advancer) as Arc<dyn SlotAdvancer>);
+    let (reader, _) = object_store_occ::headlog::Reader::open(
+        Arc::clone(&store),
+        object_store::path::Path::from("catalog"),
+    )
+    .await?;
+    let before = reader.state().head.commit;
+
+    cdc_apply(&table, id_value_batch(&[(1, 10), (2, 20)])?).await?;
+    let sealed = table.seal_mem_tier_durable().await?;
+    assert!(
+        sealed > 0,
+        "precondition: the seal must write the unsealed rows"
+    );
+    assert!(
+        advancer.durable.load(Ordering::SeqCst) > 0,
+        "precondition: the seal must acknowledge the source"
+    );
+
+    let records = records_after(&store, before).await?;
+    let with_position: Vec<_> = records
+        .iter()
+        .filter(|kinds| kinds.contains(&"AdvanceSourcePosition"))
+        .collect();
+    assert_eq!(with_position.len(), 1, "records: {records:?}");
+    assert!(
+        with_position[0].contains(&"AddInlinedData"),
+        "the position must commit with the rows the seal wrote, records: {records:?}"
+    );
+    Ok(())
+}

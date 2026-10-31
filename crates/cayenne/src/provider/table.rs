@@ -36967,6 +36967,21 @@ impl CayenneTableProvider {
     /// it from the background tick via [`Self::seal_due`].
     #[doc(hidden)]
     pub async fn seal_mem_tier_durable(&self) -> Result<u64> {
+        // The seal's metastore changes and the source position it acknowledges
+        // commit as one record, as a checkpoint's do: `fire_slot_advancer` stages
+        // the position into this scope and commits the table's changes.
+        let result =
+            crate::catalog::with_deferred_commits(self.seal_mem_tier_durable_inner()).await;
+        match (
+            result,
+            self.catalog().commit_pending_for(self.table_id()).await,
+        ) {
+            (Ok(_), Err(error)) => Err(error.into()),
+            (result, _) => result,
+        }
+    }
+
+    async fn seal_mem_tier_durable_inner(&self) -> Result<u64> {
         // Memory mode (`mode: memory`) never seals to the durable inline corpus: the
         // in-memory metastore is itself ephemeral (so the recovery shadow is
         // pointless), and sealing advances the source slot — which would break the
