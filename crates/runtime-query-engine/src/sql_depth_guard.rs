@@ -35,7 +35,9 @@ limitations under the License.
 
 use std::ops::ControlFlow;
 
+use datafusion::common::config::Dialect as SqlDialect;
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::session_state::SessionState;
 use datafusion::sql::parser::{CopyToSource, DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
     AccessExpr, Expr, FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArguments,
@@ -43,7 +45,9 @@ use datafusion::sql::sqlparser::ast::{
     SelectItem, SetExpr, Statement as SQLStatement, Subscript, Value, Visit, Visitor,
     WindowFrameBound, WindowType,
 };
-use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+use datafusion::sql::sqlparser::dialect::{Dialect, PostgreSqlDialect, dialect_from_str};
+use datafusion::sql::sqlparser::keywords::Keyword;
+use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
 
 /// Maximum nesting depth of a SQL expression tree accepted before planning.
 ///
@@ -102,9 +106,38 @@ pub const MAX_ARROW_TYPE_DEPTH: usize = 64;
 /// wide, not deep, and is unaffected.
 pub const MAX_QUERY_NESTING_DEPTH: usize = 64;
 
+/// Maximum nesting depth of a data type in SQL text, such as
+/// `ARRAY<ARRAY<INT>>` or `Nullable(Nullable(Int64))`, accepted before parsing.
+///
+/// `sqlparser` parses a nested data type by recursion that its own
+/// `recursion_limit` does not count, so the depth is bounded on the tokens
+/// before the parser runs. 32 is far above any real nested type.
+pub const MAX_SQL_DATA_TYPE_DEPTH: usize = 32;
+
+/// Maximum number of table references one query may read through common table
+/// expressions, counted after each CTE reference is expanded to the full body
+/// of that CTE.
+///
+/// The planner inlines a separate copy of a CTE's plan for every reference to
+/// it, so CTEs that each read an earlier one several times multiply in size:
+/// ten CTEs that each read the one before twice expand to 1024 copies of the
+/// first. Each CTE reference counts the table references in its expanded body,
+/// or one if the body reads no table. Table references written directly in the
+/// query, outside any CTE, do not count.
+pub const MAX_CTE_EXPANDED_REFERENCES: usize = 4096;
+
+/// Maximum number of grouping sets one `GROUP BY` may produce, counted before
+/// planning expands `CUBE`, `ROLLUP` and `GROUPING SETS`.
+///
+/// `CUBE` of `n` expressions produces `2^n` sets, and the planner materializes
+/// every set before it applies a limit. Separate grouping elements multiply.
+/// The limit matches PostgreSQL's, which admits `CUBE` of up to 12 expressions.
+pub const MAX_GROUPING_SETS: usize = 4096;
+
 /// Reject `statement` if its queries, any of its expression trees, or any
 /// `arrow_cast` type string it carries, is nested more deeply than the fixed
-/// limits above.
+/// limits above, or if its CTE references expand past
+/// [`MAX_CTE_EXPANDED_REFERENCES`].
 ///
 /// Handles the `sqlparser` statement, the `EXPLAIN` wrapper, and a query
 /// nested in `COPY (query) TO`. `COPY <table> TO`, `CREATE EXTERNAL TABLE`,
@@ -141,11 +174,109 @@ pub fn ensure_statement_within_depth_limits(statement: &DFStatement) -> DFResult
 /// Returns the parser's error, or [`DataFusionError::Plan`] naming the
 /// exceeded limit.
 pub fn ensure_sql_within_depth_limits(sql: &str) -> DFResult<()> {
+    ensure_data_types_within_depth_limit(sql, &PostgreSqlDialect {})?;
     let statements = DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {})?;
     for statement in &statements {
         ensure_statement_within_depth_limits(statement)?;
     }
     Ok(())
+}
+
+/// Reject `sql` if a data type in it is nested more deeply than
+/// [`MAX_SQL_DATA_TYPE_DEPTH`]. Call it before `sqlparser` parses `sql` with
+/// `dialect`.
+///
+/// Text that `dialect` cannot tokenize is accepted; the parser reports it.
+///
+/// # Errors
+///
+/// Returns [`DataFusionError::Plan`] naming the limit.
+pub fn ensure_data_types_within_depth_limit(sql: &str, dialect: &dyn Dialect) -> DFResult<()> {
+    let Ok(tokens) = Tokenizer::new(dialect, sql).tokenize() else {
+        return Ok(());
+    };
+    if data_type_depth(&tokens) > MAX_SQL_DATA_TYPE_DEPTH {
+        return Err(DataFusionError::Plan(format!(
+            "Query rejected: a data type is nested more than {MAX_SQL_DATA_TYPE_DEPTH} levels \
+             deep. Simplify the type."
+        )));
+    }
+    Ok(())
+}
+
+/// [`SessionState::sql_to_statement`] after
+/// [`ensure_data_types_within_depth_limit`].
+///
+/// # Errors
+///
+/// Returns [`DataFusionError::Plan`] naming the limit, or the parser's error.
+pub fn sql_to_statement(
+    session: &SessionState,
+    sql: &str,
+    dialect: &SqlDialect,
+) -> DFResult<DFStatement> {
+    if let Some(parser_dialect) = dialect_from_str(dialect) {
+        ensure_data_types_within_depth_limit(sql, parser_dialect.as_ref())?;
+    }
+    session.sql_to_statement(sql, dialect)
+}
+
+/// Deepest nesting of brackets that each open right after a nested data type
+/// keyword, such as the `<` in `ARRAY<` or the `(` in `NULLABLE(`.
+///
+/// A `)` closes back to its `(`, and a `>` or `>>` closes an open type `<`.
+/// Other parentheses are tracked only so that a `)` closes the right bracket.
+fn data_type_depth(tokens: &[Token]) -> usize {
+    // Open brackets, innermost last: whether each is a `<`, and whether it opens a data type.
+    let mut open: Vec<(bool, bool)> = Vec::new();
+    let mut depth = 0_usize;
+    let mut max_depth = 0_usize;
+    let mut after_type_keyword = false;
+    for token in tokens {
+        match token {
+            Token::Whitespace(_) => continue,
+            Token::LParen => open.push((false, after_type_keyword)),
+            Token::Lt if after_type_keyword => open.push((true, true)),
+            Token::RParen => {
+                while let Some((is_angle, opens_type)) = open.pop() {
+                    depth -= usize::from(opens_type);
+                    if !is_angle {
+                        break;
+                    }
+                }
+            }
+            Token::Gt | Token::ShiftRight => {
+                let closes = if matches!(token, Token::Gt) { 1 } else { 2 };
+                for _ in 0..closes {
+                    if matches!(open.last(), Some((true, _))) {
+                        open.pop();
+                        depth -= 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if after_type_keyword && matches!(token, Token::LParen | Token::Lt) {
+            depth += 1;
+            max_depth = max_depth.max(depth);
+        }
+        after_type_keyword = matches!(
+            token,
+            Token::Word(word) if matches!(
+                word.keyword,
+                Keyword::ARRAY
+                    | Keyword::STRUCT
+                    | Keyword::MAP
+                    | Keyword::NULLABLE
+                    | Keyword::LOWCARDINALITY
+                    | Keyword::TUPLE
+                    | Keyword::NESTED
+                    | Keyword::UNION
+                    | Keyword::TABLE
+            )
+        );
+    }
+    max_depth
 }
 
 /// Reject a standalone filter expression, such as a `/v1/search` `where`
@@ -189,11 +320,21 @@ impl Default for DepthCollector {
 }
 
 struct QueryFrame {
-    /// The CTEs this query's `WITH` defines, with each one's depth once its
+    /// The CTEs this query's `WITH` defines, with each one's size once its
     /// body has been visited. The pointer only identifies the body query.
-    ctes: Vec<(String, *const Query, Option<usize>)>,
+    ctes: Vec<(String, *const Query, Option<CteSize>)>,
     /// Depth of the deepest subquery or CTE this query reads.
     deepest_read: usize,
+    /// Table references this query reads with every CTE reference expanded.
+    expanded_references: usize,
+    /// The part of `expanded_references` read through CTE references.
+    cte_references: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CteSize {
+    depth: usize,
+    expanded_references: usize,
 }
 
 impl DepthCollector {
@@ -224,6 +365,8 @@ impl Visitor for DepthCollector {
         self.queries.push(QueryFrame {
             ctes,
             deepest_read: 0,
+            expanded_references: 0,
+            cte_references: 0,
         });
         ControlFlow::Continue(())
     }
@@ -236,39 +379,63 @@ impl Visitor for DepthCollector {
         if depth > MAX_QUERY_NESTING_DEPTH {
             return self.reject(too_deep_query_error());
         }
-        if let Some(parent) = self.queries.last_mut() {
-            let body: *const Query = query;
-            match parent
-                .ctes
-                .iter_mut()
-                .find(|(_, b, _)| std::ptr::eq(*b, body))
-            {
-                Some((_, _, cte_depth)) => *cte_depth = Some(depth),
-                None => parent.deepest_read = parent.deepest_read.max(depth),
-            }
+        let Some(parent) = self.queries.last_mut() else {
+            return ControlFlow::Continue(());
+        };
+        let body: *const Query = query;
+        if let Some((_, _, size)) = parent
+            .ctes
+            .iter_mut()
+            .find(|(_, b, _)| std::ptr::eq(*b, body))
+        {
+            *size = Some(CteSize {
+                depth,
+                expanded_references: frame.expanded_references,
+            });
+            return ControlFlow::Continue(());
+        }
+        parent.deepest_read = parent.deepest_read.max(depth);
+        parent.expanded_references = parent
+            .expanded_references
+            .saturating_add(frame.expanded_references);
+        parent.cte_references = parent.cte_references.saturating_add(frame.cte_references);
+        if parent.cte_references > MAX_CTE_EXPANDED_REFERENCES {
+            return self.reject(too_many_cte_references_error());
         }
         ControlFlow::Continue(())
     }
 
-    // A single-part name reads the deepest CTE in scope it could resolve to.
+    // A single-part name reads the largest CTE in scope it could resolve to.
     // Names match case-insensitively in every enclosing query, which can only
-    // overstate the depth.
+    // overstate the depth and size.
     fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<()> {
-        let [part] = relation.0.as_slice() else {
+        let cte_size = match relation.0.as_slice() {
+            [part] => part.as_ident().and_then(|ident| {
+                self.queries
+                    .iter()
+                    .flat_map(|frame| &frame.ctes)
+                    .filter(|(cte, _, _)| cte.eq_ignore_ascii_case(&ident.value))
+                    .filter_map(|(_, _, size)| *size)
+                    .reduce(|a, b| CteSize {
+                        depth: a.depth.max(b.depth),
+                        expanded_references: a.expanded_references.max(b.expanded_references),
+                    })
+            }),
+            _ => None,
+        };
+        let Some(frame) = self.queries.last_mut() else {
             return ControlFlow::Continue(());
         };
-        let Some(name) = part.as_ident().map(|ident| ident.value.as_str()) else {
+        let Some(size) = cte_size else {
+            frame.expanded_references = frame.expanded_references.saturating_add(1);
             return ControlFlow::Continue(());
         };
-        let cte_depth = self
-            .queries
-            .iter()
-            .flat_map(|frame| &frame.ctes)
-            .filter(|(cte, _, _)| cte.eq_ignore_ascii_case(name))
-            .filter_map(|(_, _, depth)| *depth)
-            .max();
-        if let (Some(depth), Some(frame)) = (cte_depth, self.queries.last_mut()) {
-            frame.deepest_read = frame.deepest_read.max(depth);
+        let references = size.expanded_references.max(1);
+        frame.deepest_read = frame.deepest_read.max(size.depth);
+        frame.expanded_references = frame.expanded_references.saturating_add(references);
+        frame.cte_references = frame.cte_references.saturating_add(references);
+        if frame.cte_references > MAX_CTE_EXPANDED_REFERENCES {
+            return self.reject(too_many_cte_references_error());
         }
         ControlFlow::Continue(())
     }
@@ -283,7 +450,8 @@ impl Visitor for DepthCollector {
 }
 
 /// Bound the expressions of `query` that become column names by
-/// [`MAX_UNPROTECTED_EXPR_DEPTH`].
+/// [`MAX_UNPROTECTED_EXPR_DEPTH`], and each `GROUP BY` by
+/// [`MAX_GROUPING_SETS`].
 ///
 /// A subquery in `FROM` or in an expression is a [`Query`] of its own, which
 /// the statement visitor reaches and checks separately.
@@ -315,6 +483,7 @@ fn check_named_expr_depths(query: &Query) -> DFResult<()> {
                     for expr in group_by {
                         check(expr)?;
                     }
+                    ensure_grouping_sets_within_limit(group_by)?;
                 }
             }
             SetExpr::SetOperation { left, right, .. } => {
@@ -335,6 +504,36 @@ fn check_named_expr_depths(query: &Query) -> DFResult<()> {
             | SetExpr::Merge(_)
             | SetExpr::Table(_) => {}
         }
+    }
+    Ok(())
+}
+
+/// Reject a `GROUP BY` list that expands to more than [`MAX_GROUPING_SETS`]
+/// grouping sets.
+///
+/// # Errors
+///
+/// Returns [`DataFusionError::Plan`] naming the limit.
+pub fn ensure_grouping_sets_within_limit(group_by: &[Expr]) -> DFResult<()> {
+    let mut count: usize = 1;
+    for expr in group_by {
+        let sets = match expr {
+            Expr::Cube(exprs) => u32::try_from(exprs.len())
+                .ok()
+                .and_then(|n| 1_usize.checked_shl(n))
+                .unwrap_or(usize::MAX),
+            Expr::Rollup(exprs) => exprs.len().saturating_add(1),
+            Expr::GroupingSets(sets) => sets.len(),
+            _ => 1,
+        };
+        count = count.saturating_mul(sets);
+    }
+    if count > MAX_GROUPING_SETS {
+        return Err(DataFusionError::Plan(format!(
+            "Query rejected: GROUP BY expands to more than {MAX_GROUPING_SETS} grouping sets. \
+             CUBE of n expressions produces 2^n sets, and separate CUBE, ROLLUP and GROUPING SETS \
+             elements multiply. Group by fewer expressions."
+        )));
     }
     Ok(())
 }
@@ -377,6 +576,15 @@ fn too_deep_query_error() -> DataFusionError {
         "Query rejected: queries are nested more than {MAX_QUERY_NESTING_DEPTH} levels deep, \
          counting subqueries and common table expressions that read one another. Simplify the \
          query (for example, combine steps of a long WITH chain)."
+    ))
+}
+
+fn too_many_cte_references_error() -> DataFusionError {
+    DataFusionError::Plan(format!(
+        "Query rejected: common table expressions expand to more than \
+         {MAX_CTE_EXPANDED_REFERENCES} table references, because each reference to a WITH query \
+         plans its own copy of that query. Simplify the query (for example, read each WITH query \
+         fewer times from later WITH queries)."
     ))
 }
 
@@ -816,6 +1024,7 @@ fn push_window_bound<'a>(bound: &'a WindowFrameBound, out: &mut Vec<&'a Expr>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
 
     fn parse(sql: &str) -> DFStatement {
         DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {})
@@ -1237,6 +1446,118 @@ mod tests {
         .expect("ordinary CTEs pass");
     }
 
+    /// One CTE read `n` times from a single `FROM` list.
+    fn cte_read_times(n: usize) -> String {
+        let reads: Vec<String> = (0..n).map(|i| format!("c a{i}")).collect();
+        format!(
+            "WITH c AS (SELECT 1 AS x) SELECT 1 FROM {}",
+            reads.join(", ")
+        )
+    }
+
+    #[test]
+    fn cte_references_are_bounded_at_the_expansion_cap() {
+        depth_check(&cte_read_times(MAX_CTE_EXPANDED_REFERENCES)).expect("reads at the cap pass");
+        let err = depth_check(&cte_read_times(MAX_CTE_EXPANDED_REFERENCES + 1))
+            .expect_err("one read over the cap is rejected");
+        assert_eq!(err.to_string(), too_many_cte_references_error().to_string());
+    }
+
+    /// CTEs that each read the one before twice double in expanded size, and
+    /// a CTE reference counts the tables its body reads.
+    #[test]
+    fn cte_references_count_their_expanded_body() {
+        let doubling = |levels: usize, table: &str| {
+            let mut ctes = vec![format!("c0 AS (SELECT x FROM {table})")];
+            ctes.extend(
+                (1..=levels).map(|i| format!("c{i} AS (SELECT a.x FROM c{0} a, c{0} b)", i - 1)),
+            );
+            format!("WITH {} SELECT x FROM c{levels}", ctes.join(", "))
+        };
+        let levels = MAX_CTE_EXPANDED_REFERENCES.ilog2() as usize;
+        depth_check(&doubling(levels, "(SELECT 1 AS x) t"))
+            .expect("an expansion at the cap passes");
+        let err = depth_check(&doubling(levels, "t, t"))
+            .expect_err("two tables in the first CTE double the expansion");
+        assert_eq!(err.to_string(), too_many_cte_references_error().to_string());
+        let err = depth_check(&doubling(levels + 1, "(SELECT 1 AS x) t"))
+            .expect_err("one more level is over the cap");
+        assert_eq!(err.to_string(), too_many_cte_references_error().to_string());
+    }
+
+    fn cube_of(n: usize) -> String {
+        let columns: Vec<String> = (0..n).map(|i| format!("c{i}")).collect();
+        format!("CUBE({})", columns.join(", "))
+    }
+
+    fn grouping_error() -> String {
+        format!(
+            "Error during planning: Query rejected: GROUP BY expands to more than \
+             {MAX_GROUPING_SETS} grouping sets"
+        )
+    }
+
+    #[test]
+    fn cube_is_bounded_at_the_grouping_set_cap() {
+        let columns = MAX_GROUPING_SETS.ilog2() as usize;
+        depth_check(&format!("SELECT 1 FROM t GROUP BY {}", cube_of(columns)))
+            .expect("a CUBE at the cap passes");
+        let err = depth_check(&format!(
+            "SELECT 1 FROM t GROUP BY {}",
+            cube_of(columns + 1)
+        ))
+        .expect_err("one more CUBE expression is over the cap");
+        assert!(err.to_string().starts_with(&grouping_error()), "{err}");
+        let err = depth_check(&format!("SELECT 1 FROM t GROUP BY {}", cube_of(64)))
+            .expect_err("a CUBE wider than usize is rejected");
+        assert!(err.to_string().starts_with(&grouping_error()), "{err}");
+    }
+
+    /// Separate grouping elements multiply, in subqueries as well.
+    #[test]
+    fn grouping_elements_multiply_against_the_cap() {
+        let half = MAX_GROUPING_SETS.ilog2() as usize / 2;
+        let at_cap = format!("GROUP BY {0}, {0}, a", cube_of(half));
+        depth_check(&format!("SELECT 1 FROM t {at_cap}")).expect("a product at the cap passes");
+        for sql in [
+            format!("SELECT 1 FROM t {at_cap}, ROLLUP(a)"),
+            format!("SELECT 1 FROM t {at_cap}, GROUPING SETS ((a), (b))"),
+            format!("SELECT * FROM (SELECT 1 FROM t {at_cap}, ROLLUP(a)) s"),
+        ] {
+            let err = depth_check(&sql).expect_err("a product over the cap is rejected");
+            assert!(
+                err.to_string().starts_with(&grouping_error()),
+                "{sql}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_normal_grouping_sets() {
+        for sql in [
+            "SELECT a, b, SUM(x) FROM t GROUP BY GROUPING SETS ((a, b), (a), ())",
+            "SELECT a, b, SUM(x) FROM t GROUP BY CUBE(a, b)",
+            "SELECT a, b, SUM(x) FROM t GROUP BY ROLLUP(a, b)",
+            "SELECT a, b, c, SUM(x) FROM t GROUP BY a, CUBE(b, c), ROLLUP(a, b)",
+            "SELECT a, SUM(x) FROM t GROUP BY a",
+        ] {
+            depth_check(sql).expect("normal grouping passes");
+        }
+    }
+
+    /// Table references outside CTE expansion do not count.
+    #[test]
+    fn allows_many_plain_table_references() {
+        let reads: Vec<String> = (0..2 * MAX_CTE_EXPANDED_REFERENCES)
+            .map(|i| format!("t{i}"))
+            .collect();
+        depth_check(&format!(
+            "WITH c AS (SELECT 1 AS x) SELECT 1 FROM c, {}",
+            reads.join(", ")
+        ))
+        .expect("plain tables pass");
+    }
+
     #[test]
     fn max_paren_depth_counts_nesting() {
         assert_eq!(max_paren_depth(""), 0);
@@ -1244,5 +1565,122 @@ mod tests {
         assert_eq!(max_paren_depth("List(Int64)"), 1);
         assert_eq!(max_paren_depth("List(List(Int64))"), 2);
         assert_eq!(max_paren_depth("a(b)c(d(e))"), 2);
+    }
+
+    fn nested_array(depth: usize) -> String {
+        format!("{}INT{}", "ARRAY<".repeat(depth), ">".repeat(depth))
+    }
+
+    fn nested_nullable(depth: usize) -> String {
+        format!("{}Int64{}", "Nullable(".repeat(depth), ")".repeat(depth))
+    }
+
+    /// A type at the limit passes the guard and parses.
+    #[test]
+    fn allows_data_types_at_the_limit() {
+        let sql = format!(
+            "SELECT CAST(NULL AS {})",
+            nested_array(MAX_SQL_DATA_TYPE_DEPTH)
+        );
+        ensure_data_types_within_depth_limit(&sql, &GenericDialect {})
+            .expect("ARRAY<> at the limit passes");
+        DFParser::parse_sql_with_dialect(&sql, &GenericDialect {}).expect("it parses");
+
+        let sql = format!(
+            "SELECT CAST(NULL AS {})",
+            nested_nullable(MAX_SQL_DATA_TYPE_DEPTH)
+        );
+        ensure_data_types_within_depth_limit(&sql, &GenericDialect {})
+            .expect("Nullable() at the limit passes");
+        DFParser::parse_sql_with_dialect(&sql, &GenericDialect {}).expect("it parses");
+    }
+
+    #[test]
+    fn rejects_data_types_over_the_limit() {
+        for (sql, dialect) in [
+            (
+                format!(
+                    "SELECT CAST(NULL AS {})",
+                    nested_array(MAX_SQL_DATA_TYPE_DEPTH + 1)
+                ),
+                &PostgreSqlDialect {} as &dyn Dialect,
+            ),
+            (
+                format!(
+                    "SELECT CAST(NULL AS {})",
+                    nested_nullable(MAX_SQL_DATA_TYPE_DEPTH + 1)
+                ),
+                &GenericDialect {},
+            ),
+            (
+                format!(
+                    "CREATE TABLE t (c {})",
+                    nested_array(MAX_SQL_DATA_TYPE_DEPTH + 1)
+                ),
+                &PostgreSqlDialect {},
+            ),
+        ] {
+            let err = ensure_data_types_within_depth_limit(&sql, dialect)
+                .expect_err("over the limit is rejected");
+            assert!(
+                err.to_string()
+                    .contains("a data type is nested more than 32 levels deep"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    /// Types side by side, or one after another, do not add to each other's depth.
+    #[test]
+    fn data_type_depth_counts_nesting_only() {
+        let tokenize = |sql: &str| {
+            Tokenizer::new(&GenericDialect {}, sql)
+                .tokenize()
+                .expect("test SQL tokenizes")
+        };
+        assert_eq!(data_type_depth(&tokenize("SELECT 1")), 0);
+        assert_eq!(
+            data_type_depth(&tokenize("SELECT CAST(x AS ARRAY<ARRAY<INT>>)")),
+            2
+        );
+        assert_eq!(
+            data_type_depth(&tokenize(
+                "SELECT CAST(a AS MAP<STRING, ARRAY<INT>>), CAST(b AS STRUCT<x INT, y ARRAY<INT>>)"
+            )),
+            2
+        );
+        assert_eq!(
+            data_type_depth(&tokenize("SELECT CAST(x AS Nullable(Int64)) > 1 AND y < 2")),
+            1
+        );
+        let many = vec![format!("CAST(x AS {})", nested_array(2)); 100].join(", ");
+        assert_eq!(data_type_depth(&tokenize(&format!("SELECT {many}"))), 2);
+    }
+
+    /// Comparisons and ordinary parentheses are not data types.
+    #[test]
+    fn allows_normal_sql() {
+        let comparisons = vec!["a < b"; 200].join(" AND ");
+        let parens = format!("{}1{}", "(".repeat(40), ")".repeat(40));
+        for sql in [
+            "SELECT * FROM t WHERE a < 1 AND b > 2 AND c << 1 AND d >> 1".to_string(),
+            format!("SELECT * FROM t WHERE {comparisons}"),
+            format!("SELECT {parens}"),
+            "SELECT CAST(x AS INT[]), ARRAY[1, 2], struct(1, 2), map(['a'], [1]) FROM t"
+                .to_string(),
+            "SELECT 1 UNION (SELECT 2) UNION (SELECT 3)".to_string(),
+        ] {
+            ensure_data_types_within_depth_limit(&sql, &PostgreSqlDialect {})
+                .expect("normal SQL passes");
+        }
+        ensure_sql_within_depth_limits("SELECT CAST(x AS ARRAY<INT>) FROM t")
+            .expect("normal SQL passes both guards");
+    }
+
+    /// Text the dialect cannot tokenize is left for the parser to report.
+    #[test]
+    fn allows_untokenizable_sql() {
+        ensure_data_types_within_depth_limit("SELECT 'unterminated", &PostgreSqlDialect {})
+            .expect("the parser reports the error");
     }
 }

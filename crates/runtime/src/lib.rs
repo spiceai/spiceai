@@ -681,6 +681,8 @@ impl Default for InitialLoad {
 #[derive(Clone)]
 #[expect(clippy::struct_field_names)]
 pub struct Runtime {
+    /// Fixed at startup, including across app reloads and connector recreation.
+    mode: spicepod::component::runtime::RuntimeMode,
     app: Arc<RwLock<Option<Arc<App>>>>,
     /// Serializes [`Runtime::apply_app`] so that concurrent callers cannot
     /// interleave their diff-and-swap. `apply_app` computes diffs under a read

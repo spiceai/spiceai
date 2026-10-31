@@ -28,7 +28,7 @@ use tokio::sync::SetOnce;
 
 use app::spicepod::component::runtime::{
     ClientAuthMode as SpicepodClientAuthMode, OtelExporterConfig, OtelSignal,
-    Runtime as SpicepodRuntime, TelemetryConfig, validate_metric_prefix,
+    Runtime as SpicepodRuntime, RuntimeMode, TelemetryConfig, validate_metric_prefix,
 };
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser, ValueEnum};
@@ -712,7 +712,19 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         extension_factories.push(Box::new(tpc_extension_factory));
     }
 
+    // Check for explicit cluster role OR implicit executor role (scheduler_address set without explicit role)
+    let is_cluster_mode =
+        args.runtime.cluster.role.is_some() || args.runtime.cluster.scheduler_address.is_some();
+
     let runtime_config = app.as_ref().map(|app| &app.runtime);
+    if is_cluster_mode && runtime_config.is_some_and(|runtime| runtime.mode == RuntimeMode::Sidecar)
+    {
+        return Err(Error::InvalidClusterConfig {
+            source: std::io::Error::other(
+                "runtime.mode: sidecar cannot run as a cluster scheduler or executor. Remove --role and --scheduler-address, or set runtime.mode: server.",
+            ),
+        });
+    }
     let app_name = app.as_ref().map(|app| app.name.clone());
     let spicepod_tls_config = runtime_config.and_then(|rt| rt.tls.clone());
     let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
@@ -780,10 +792,6 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         .with_runtime_config(args.runtime.clone())
         .with_rate_limits(rate_limits)
         .with_io_runtime(Handle::current());
-
-    // Check for explicit cluster role OR implicit executor role (scheduler_address set without explicit role)
-    let is_cluster_mode =
-        args.runtime.cluster.role.is_some() || args.runtime.cluster.scheduler_address.is_some();
 
     // Create MetricsReader for cluster mode to enable on-demand OTLP metrics collection
     let metrics_reader = if is_cluster_mode {
@@ -1570,10 +1578,11 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
             && let Ok(built_app) = AppBuilder::build_from_path(path.clone()).await
         {
             let mut app = App::default();
-            // Copy only runtime flight, telemetry, and CPU config from the
-            // spicepod. An executor is the deployment shape most likely to be
+            // Retain mode for role validation, plus local Flight, telemetry,
+            // and CPU config. An executor is the deployment shape most likely to be
             // running under a CPU request, so `runtime.cpu` must come across
             // too — everything else it needs arrives from the scheduler.
+            app.runtime.mode = built_app.runtime.mode;
             app.runtime.flight = built_app.runtime.flight;
             app.runtime.telemetry = built_app.runtime.telemetry;
             app.runtime.cpu = built_app.runtime.cpu;
@@ -1590,8 +1599,10 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
         tracing::info!(
             "Starting as a cluster executor, without a Spicepod. The runtime will initialize its components upon joining the cluster."
         );
+        let mut app = App::default();
+        app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
         return Ok(AppBundle {
-            app: Some(Arc::new(App::default())),
+            app: Some(Arc::new(app)),
             spicepod_load_error: None,
             running_deployment: None,
             deployment_note: None,
