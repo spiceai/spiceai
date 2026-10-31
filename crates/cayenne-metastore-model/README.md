@@ -19,6 +19,15 @@ nice -n 10 cargo run --release -p cayenne-metastore-model -- run seq-order-two-w
 EXHAUST=1 nice -n 10 cargo run --release -p cayenne-metastore-model -- run seq-order-no-shift
 ```
 
+`cite-check` checks the design documents' model citations: every run cited
+after `Model:` or inside `(model: …)` exists (`prefix*` must match a run), and
+every claim of model checking cites a run in its paragraph or table row, or
+links to a section that does.
+
+```sh
+cargo run --release -p cayenne-metastore-model -- cite-check docs/design/object-native-metastore.md docs/design/object-native-metastore-technical.md
+```
+
 Checkers use 6 threads by default; set `MODEL_THREADS` to change it. Results do not depend on the thread count, and the binary uses mimalloc, because cloning states dominates checking. Models list candidate actions and reject disabled ones in `next_state`, so each successor is computed once; simulation runs, whose checker cannot replay a rejected pick, list only enabled actions. Controls require `EXHAUST=1`. A control stops once it has found its expected failure and every witness it must reach; its other safety properties print `NOT_FOUND`, not `HOLDS`, because the rest of its graph is not explored. A wrong outcome, missing
 required control failure, invalid witness, or checker timeout makes the command fail.
 A sampled run reports `NOT_FOUND`, which does not establish exhaustive safety.
@@ -57,6 +66,7 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `standby` / `standby-three` | Two or three instances of one Spicepod on one location: a lease object with an expiry on a discrete clock, renewal by the holder, crash, restart, pause and resume, acquisition only after expiry, and takeover by a head commit that raises the generation; only the generation in the head fences writers; the ingester commits source changes by exact-head CAS and then acknowledges them; standbys serve head reads. No change applied twice or acknowledged without commit, no stale-generation commit accepted, one committing instance per head generation, lease exclusivity, no lease loss by a healthy holder, and an ingester again within the lease duration of a holder failure | Exhaustive: lease duration 3 ticks, 2 source changes, 1 crash, 1 pause, at most 4 lease epochs; a running holder renews and a running standby acquires or takes over before the next tick |
 | `standby-early-safety` | The standby graph with acquisition allowed before expiry; checks only the safety properties, which do not depend on lease timing | Same bounds |
 | `object-names` | Immutable object names when several leased units create objects: the writer `w0` and maintenance units, each with its own lease generation raised by a head commit when a node takes it; create-if-absent under `<kind><unit>.<generation>-<counter>`, identical retries of a lost upload, references committed under a guard on the unit's generation, and maintenance units retired and created with ids never reused. No name created with different bytes, and every referenced object reads back with its digest; witnesses include two units at one generation, successive holders of one unit, a unit created after another retired, and a fenced holder | Exhaustive: 2 nodes, 3 lease takeovers, 2 objects per holding, 1 unit created, 1 retry |
+| `reads-linearizable` / `reads-bounded` | Read freshness against real time: a writer completes commits on a discrete clock; a reader caches the head with the time its GET was sent, answers queries from it while it is fresh for the staleness bound S and otherwise waits for a newer GET; queries share GETs, a GET observes the head when sent, and responses arrive late and out of order. A query includes every commit completed more than S before it started; with S = 0 that is linearizability for one dataset's committed state, and a query also includes the client's own acknowledged write. Witnesses: a query waits for a GET, two queries share one, a late response is ignored, a commit completes while a GET is in flight, a query is served while a newer commit exists, and (S > 0) a query is answered from the cache | Exhaustive: 2 commits, 3 GETs, 2 queries, 4 clock ticks; S = 0 and S = 1 |
 | `commits-etag` | Explicit store-version CAS and delayed retry across head changes; I1–I3, I5 | Exhaustive/control 1; one writer, one original/retry pair |
 | `commits-storage` | Checkpoint parts/root before head publication, delayed GC, a query kept by retention, lagging reopen, late seal; I4, I7, I8 | Bound 2; samples 4 |
 | `transactions-txn` | Two datasets, one transaction, competing ordinary writes, reservations, commit/abort create race, helper Resolve, uncertain CAS, checkpoint/GC; one participant writes other keys while prepared so the Prepare can reach a checkpoint; I3–I6, I8 | Exhaustive 1 (two lease generations), controls 0 except owner restriction 1; samples 2, 3 (two outstanding handles per dataset) |
@@ -227,13 +237,17 @@ as a separate maintenance process does.
 | `commit-no-lease` | Rebase a stale owner's condition without its lease check: I3 |
 | `commit-no-identical` | Retry different bytes with the original condition: I5 |
 | `commits-no-resolve-before-retry` | Treat an unreadable head as rejection and retry a fresh id: I2 acknowledged logical write exactly once |
+| `commits-failed-resend-rejects` | Read a failed identical resend as rejection and send a new attempt: the original landed, so I5 resolution is unsound and the write is applied twice (I2) |
 | `commits-retry-expiry-no-horizon` | Treat no retained evidence past the horizon as rejection and retry a fresh id: logical write never applied twice (I5 also fails) |
 | `standby-no-generation` | Takeover acquires the lease object and reads the head without raising its generation: a paused writer resumes and its stale-generation commit is accepted; two instances also commit under one head generation |
 | `standby-early-acquire` | A standby acquires before expiry while the holder renews: two instances hold unexpired leases (and a healthy holder loses its lease). `standby-early-safety` shows the generation in the head still prevents stale commits and double application |
 | `standby-no-renew` | The holder never renews: a healthy holder loses its lease; availability also fails when the standby pauses |
+| `standby-local-files` | Leave committed data files on the committing instance's disk: a standby read or a takeover needs a file it cannot read |
 | `object-names-generation-only` | Name objects by generation and counter only: two units at one generation create one name with different bytes |
 | `object-names-no-generation` | Name objects by unit and counter only: successive holders of one unit create one name with different bytes |
 | `object-names-reuse-unit-id` | Give a retired unit's id to a new unit, whose generation restarts: the new unit creates a name the retired one already holds |
+| `reads-token-wait` | Answer a query from any cached head at or past the client's commit number: read-your-writes holds, but a commit that completed before the query started is missing |
+| `reads-response-time` | Count freshness from the GET response's arrival: a late response to an old GET looks fresh and misses a completed commit |
 | `commits-etag-repeat` | Reuse an earlier store tag for a later head: I1 unique accepted position |
 | `seq-order-maintenance-draw` | Maintenance draws ahead of the buffer and publishes first, then permits the lower buffered record: I9 resurrected row after a later compaction |
 | `seq-order-no-shift` | Independent CAS loser retries its unchanged lower sequences: I9 resurrected row after compaction |
