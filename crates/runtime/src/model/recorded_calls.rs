@@ -227,8 +227,9 @@ fn rewrite_calls(value: &mut Value, record: &Recorder<'_>, removed: &mut Vec<Str
 /// holds its arguments, whatever its type, as every API Spice serves writes
 /// one: Chat Completions' `function` and legacy `function_call` (`name`,
 /// `arguments`), Responses' `function_call`, `mcp_call`, and
-/// `mcp_approval_request` (`name`, `arguments`), and Messages' `tool_use` and
-/// `mcp_tool_use` (`name`, `input`).
+/// `mcp_approval_request` (`name`, `arguments`), Messages' `tool_use` and
+/// `mcp_tool_use` (`name`, `input`), and the Gemini API's `functionCall`
+/// (`name`, `args`).
 fn rewrite_call(
     map: &mut Map<String, Value>,
     record: &Recorder<'_>,
@@ -238,6 +239,8 @@ fn rewrite_call(
         "arguments"
     } else if map.contains_key("input") {
         "input"
+    } else if map.contains_key("args") {
+        "args"
     } else {
         return false;
     };
@@ -541,6 +544,32 @@ mod tests {
             removed.iter().any(|value| value == "hunter2"),
             "{removed:?}"
         );
+    }
+
+    /// A Gemini API conversation's `functionCall` to an `sql` tool is recorded
+    /// as the tool records it, and its `functionResponse` loses the values the
+    /// statement gave up.
+    #[test]
+    fn a_gemini_conversations_sql_calls_are_recorded_as_the_tool_records_them() {
+        let statement = "CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = '627384')";
+        let payload = json!({"contents": [
+            {"role": "model", "parts": [{"functionCall": {"name": "sql", "args": {"query": statement}}}]},
+            {"role": "user", "parts": [{"functionResponse": {"name": "sql",
+                "response": {"error": "password '627384' was refused"}}}]},
+        ]});
+        let (recorded, removed) =
+            recorded_by_name(&payload.to_string()).expect("the payload changes");
+        let recorded: Value =
+            serde_json::from_str(&recorded).expect("the recorded payload is JSON");
+        assert_eq!(
+            recorded["contents"][0]["parts"][0]["functionCall"]["args"],
+            json!({"query": "CREATE TABLE t WITH (from = 'postgres:public.t', pg_pass = '<redacted>')"})
+        );
+        assert_eq!(
+            recorded["contents"][1]["parts"][0]["functionResponse"]["response"],
+            json!({"error": "password '<redacted>' was refused"})
+        );
+        assert!(removed.iter().any(|value| value == "627384"), "{removed:?}");
     }
 
     /// Another call of the conversation that repeats a value a statement gave
