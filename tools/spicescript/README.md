@@ -170,8 +170,10 @@ writes its data and checks answers with the `duckdb` CLI of one release and
 lends `spiced` that release's library. The release is the source's `version`
 (which may be a `${matrix.<key>}` placeholder, so a script can run each
 release as a combination of its own), else `--duckdb-version`, else the
-newest release `test/duckdb_versions.json` lists. The CLI and library are
-downloaded once into `~/.cache/spicescript/duckdb-<version>/`;
+newest release `test/duckdb_versions.json` lists. `spiced` loads one DuckDB
+library, so the `duckdb` and `ducklake` sources of one run must resolve to
+the same release; the runner refuses the run before starting any source
+otherwise. The CLI and library are downloaded once into `~/.cache/spicescript/duckdb-<version>/`;
 `SPICESCRIPT_DUCKDB_CLI` (`duckdb` sources), `SPICESCRIPT_DUCKLAKE_DUCKDB`
 (`ducklake` sources) and `SPICESCRIPT_DUCKDB_LIBRARY` name local builds
 instead.
