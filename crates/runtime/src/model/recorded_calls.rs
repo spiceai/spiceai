@@ -567,7 +567,7 @@ mod tests {
         );
         assert_eq!(
             recorded["contents"][1]["parts"][0]["functionResponse"]["response"],
-            json!({"error": "password '<redacted>' was refused"})
+            json!({"error": "password <redacted> was refused"})
         );
         assert!(removed.iter().any(|value| value == "627384"), "{removed:?}");
     }
