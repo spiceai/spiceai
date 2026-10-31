@@ -285,6 +285,92 @@ mod tests {
         };
     }
 
+    /// A PDF 1.5 document as many writers produce it: the page content and the
+    /// cross-reference stream are Flate streams with a PNG predictor
+    /// (`/Predictor 12`, every row tagged 0 = None).
+    fn predicted_xref_stream_pdf() -> Bytes {
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write;
+
+        fn predicted_flate(data: &[u8], columns: usize) -> Vec<u8> {
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            for row in data.chunks(columns) {
+                encoder.write_all(&[0]).expect("row tag");
+                encoder.write_all(row).expect("row");
+            }
+            encoder.finish().expect("finish deflate")
+        }
+
+        let content = predicted_flate(b"BT /F1 24 Tf 60 120 Td (Spice Hello) Tj ET\n", 8);
+        let mut content_obj = format!(
+            "<< /Length {} /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 8 >> >>\nstream\n",
+            content.len()
+        )
+        .into_bytes();
+        content_obj.extend_from_slice(&content);
+        content_obj.extend_from_slice(b"\nendstream");
+
+        let objs: [&[u8]; 5] = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+            content_obj.as_slice(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        ];
+        let mut pdf = b"%PDF-1.5\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in objs.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+
+        // Object 6 is the cross-reference stream: `/W [1 4 1]` rows for
+        // objects 0 to 6, including itself.
+        let xref_offset = pdf.len();
+        offsets.push(xref_offset);
+        let mut rows = vec![0u8, 0, 0, 0, 0, 255];
+        for offset in offsets {
+            rows.push(1);
+            rows.extend_from_slice(
+                &u32::try_from(offset)
+                    .expect("offset fits u32")
+                    .to_be_bytes(),
+            );
+            rows.push(0);
+        }
+        let xref = predicted_flate(&rows, 6);
+        pdf.extend_from_slice(
+            format!(
+                "6 0 obj\n<< /Type /XRef /Size 7 /W [1 4 1] /Root 1 0 R /Length {} /Filter /FlateDecode /DecodeParms << /Columns 6 /Predictor 12 >> >>\nstream\n",
+                xref.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&xref);
+        pdf.extend_from_slice(
+            format!("\nendstream\nendobj\nstartxref\n{xref_offset}\n%%EOF").as_bytes(),
+        );
+        Bytes::from(pdf)
+    }
+
+    /// Predictors on single Flate streams are common (every PDF 1.5
+    /// cross-reference stream has one), so such a document passes the budget
+    /// and `PDFium` extracts its text.
+    #[tokio::test]
+    async fn extracts_text_from_a_pdf_with_predicted_flate_streams() {
+        let doc = PdfParser::default()
+            .parse(&predicted_xref_stream_pdf())
+            .await
+            .expect("a PDF with predicted Flate streams should parse");
+        let text = doc.as_flat_utf8().expect("flat utf8 text");
+        assert!(
+            text.contains("Spice Hello"),
+            "expected extracted text to contain 'Spice Hello', got: {text:?}"
+        );
+    }
+
     /// A legitimate PDF whose streams are well within the budget still parses,
     /// so the scanner does not reject ordinary documents.
     #[tokio::test]
