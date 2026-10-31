@@ -3373,9 +3373,17 @@ pub struct CayenneTableProvider {
     /// exclusively and skip via `try_write` when it is held: the current-snapshot
     /// rewrite, the seq-prefix bake, the manifest rebuild, cold promotion, and
     /// the reopen drain. Key-delete subset merges take it shared, so small
-    /// merges can run during a long large-tier merge. The write lock
-    /// still serializes inserts independently.
+    /// merges can run during a long large-tier merge. A datalake merge also
+    /// takes it shared: it rewrites only datalake files, so the protected set
+    /// keeps merging while it uploads, and [`Self::cold_merge_lock`] keeps two
+    /// datalake merges apart. The write lock still serializes inserts
+    /// independently.
     compaction_lock: Arc<tokio::sync::RwLock<()>>,
+    /// Serializes datalake merges ([`Self::compact_cold_tier`]) with each
+    /// other. Taken before [`Self::compaction_lock`]. Cold promotion needs no
+    /// share of it: it holds `compaction_lock` exclusively, which already
+    /// excludes a datalake merge holding it shared.
+    cold_merge_lock: Arc<tokio::sync::Mutex<()>>,
     /// Runs claimed by in-flight subset merges, which keeps concurrent merges
     /// on disjoint inputs. See [`ProtectedMergeClaims`].
     protected_merge_claims: Arc<ParkingMutex<ProtectedMergeClaims>>,
@@ -10922,6 +10930,7 @@ impl CayenneTableProvider {
             current_dir_generation: Arc::new(AtomicU64::new(0)),
             last_moved_snapshot_files: Arc::new(ParkingMutex::new(None)),
             compaction_lock: Arc::new(tokio::sync::RwLock::new(())),
+            cold_merge_lock: Arc::new(tokio::sync::Mutex::new(())),
             protected_merge_claims: Arc::new(ParkingMutex::new(ProtectedMergeClaims::default())),
             post_write_compaction_state: Arc::new(AtomicU8::new(COALESCED_TASK_IDLE)),
             maintenance_closed: Arc::new(AtomicBool::new(false)),
@@ -13340,6 +13349,7 @@ impl CayenneTableProvider {
             // Shared so inline (write-driven) and background compaction
             // attempts on the same table coordinate, even across clones.
             compaction_lock: Arc::clone(&self.compaction_lock),
+            cold_merge_lock: Arc::clone(&self.cold_merge_lock),
             protected_merge_claims: Arc::clone(&self.protected_merge_claims),
             post_write_compaction_state: Arc::clone(&self.post_write_compaction_state),
             maintenance_closed: Arc::clone(&self.maintenance_closed),
@@ -28100,7 +28110,22 @@ impl CayenneTableProvider {
         let cold_location = vc.cold_tier_location.clone().unwrap_or_default();
         let table_id = self.table_metadata.table_id.clone();
 
-        let _compaction_guard = self.compaction_lock.write().await;
+        // A merge reads and rewrites datalake files only, and can run for a
+        // minute against a remote store, so it holds `compaction_lock` shared:
+        // the protected-snapshot subset merge, which also holds it shared,
+        // keeps folding the small snapshots appends publish meanwhile, while
+        // every pass that holds it exclusively stays out. That includes cold
+        // promotion, the other writer of the datalake manifest, and the bake
+        // and current-snapshot rewrite, which prune tombstones against it.
+        //
+        // The subset merge never prunes a tombstone and never reads the
+        // datalake, and this merge never touches a warm snapshot. The one
+        // shared state is the deletion index: the subset merge rewrites from
+        // the deletion snapshot it captured, so the clear below cannot reach
+        // into a rewrite in flight, and the clear removes only tombstones at or
+        // below the newest datalake file's sequence, which hide no warm row.
+        let _cold_merge_guard = self.cold_merge_lock.lock().await;
+        let _compaction_guard = self.compaction_lock.read().await;
         if !self.maintenance_still_admitted() {
             return Ok(false);
         }
