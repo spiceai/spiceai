@@ -55,8 +55,9 @@ steps:
     expect: { status: 200, headers: { results-cache-status: BYPASS } }
 
   # A source change reaches Spice only by refresh. The refresh leaves the
-  # cached answer to its TTL; no-cache sees the change at once; once the entry
-  # expires, the cache answers with it too.
+  # cached answer to its TTL; no-cache sees the change at once and stores it,
+  # so the next plain read is served the fresh answer; once that entry
+  # expires, the source answers again.
   - http: { path: /v1/sql, body: SELECT c_name FROM (SELECT * FROM customer) }
     expect: { status: 200, body-contains: 'Customer#000000042' }
   - source-exec: { src: "UPDATE customer SET c_name = 'Renamed' WHERE c_custkey = 42; DELETE FROM customer WHERE c_custkey > 1990" }
@@ -68,6 +69,8 @@ steps:
       body: SELECT c_name FROM (SELECT * FROM customer)
       headers: { Cache-Control: no-cache }
     expect: { status: 200, headers: { results-cache-status: BYPASS }, body-contains: Renamed }
+  - http: { path: /v1/sql, body: SELECT c_name FROM (SELECT * FROM customer) }
+    expect: { status: 200, headers: { results-cache-status: HIT }, body-contains: Renamed }
   - http: { path: /v1/sql, body: SELECT c_name FROM (SELECT * FROM customer) }
     expect: { status: 200, headers: { results-cache-status: MISS }, body-contains: Renamed }
     eventually: 30s
