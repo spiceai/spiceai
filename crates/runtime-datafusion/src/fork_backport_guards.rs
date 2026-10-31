@@ -922,3 +922,40 @@ async fn a_cast_to_a_mixed_array_and_struct_type_past_the_limit_is_refused() {
         "{error}"
     );
 }
+
+/// spiceai/datafusion#283. A grouped `TopK` aggregation sizes its hash table and
+/// heap to the groups it sees, not to its `LIMIT`, so a `LIMIT` far above the
+/// row count still answers. Unpatched, a `LIMIT` this large fails at once on a
+/// capacity overflow, before anything is allocated.
+#[tokio::test(flavor = "multi_thread")]
+async fn topk_aggregation_with_a_limit_far_above_its_groups_answers() {
+    let ctx = spice_session(|_| {});
+    run_statements(
+        &ctx,
+        &["CREATE TABLE topk_large_limit(s VARCHAR, y BIGINT) AS VALUES ('a', 1), ('b', 3), ('b', 4), ('c', 2)"],
+    )
+    .await;
+    let limit = i64::MAX;
+    for (sql, expected) in [
+        (
+            format!("SELECT DISTINCT s FROM topk_large_limit ORDER BY s DESC LIMIT {limit}"),
+            owned(&["c", "b", "a"]),
+        ),
+        (
+            format!(
+                "SELECT s, max(y) FROM topk_large_limit GROUP BY s ORDER BY max(y) DESC NULLS LAST LIMIT {limit}"
+            ),
+            owned(&["b,4", "c,2", "a,1"]),
+        ),
+    ] {
+        let plan = answer(&ctx, &format!("EXPLAIN {sql}"))
+            .await
+            .expect("plan")
+            .join("\n");
+        assert!(
+            plan.contains(&format!("lim=[{limit}]")),
+            "the query must plan a TopK aggregation:\n{plan}"
+        );
+        assert_eq!(answer(&ctx, &sql).await, Ok(expected), "{sql}");
+    }
+}
