@@ -121,9 +121,9 @@ The head is a small object, bounded by the byte budget H, holding:
 | `incarnation` | A random id fixed when the dataset is created. | A dataset recreated under the same name never mixes with the old one's objects or attempts. |
 | `commit` | The commit number of the newest accepted record. | Names the current state. Readers, recovery and GC compare commit numbers. |
 | `inline_records` | The newest accepted records, ending at `commit`, oldest first, in full. `first_inline` is the commit number of the oldest. | One-request polls, two-round-trip commits, and records leave in batches. |
-| `batches` | The last commit number of each sealed batch and its sealer's lease generation, in order, covering `checkpoint + 1 .. first_inline − 1`. A batch's name derives from its first commit and that generation. | Variable-length batches cannot be named by arithmetic, and readers fetch only what is listed. |
-| `checkpoint` | The commit number of the newest published checkpoint, and the lease generation that wrote its root. | Readers start from it, and GC reclaims below it. |
-| `lease` | The generation of the ingest writer's lease, `leases/writer.json`. Whoever takes that lease raises it, with one CAS of the head. Object names include it. | A stale writer learns it must stop, a takeover changes the head even with nothing committed, and names from different owners never collide. Other leased units, such as maintenance units and source partitions from Milestone 2, keep their generations in the dataset state ([Ownership and fencing](#ownership-and-fencing)). |
+| `batches` | The last commit number of each sealed batch and its sealer's owner, in order, covering `checkpoint + 1 .. first_inline − 1`. A batch's name derives from its first commit and that owner. | Variable-length batches cannot be named by arithmetic, and readers fetch only what is listed. |
+| `checkpoint` | The commit number of the newest published checkpoint, and the owner that wrote its root. | Readers start from it, and GC reclaims below it. |
+| `lease` | The generation of the ingest writer's lease, `leases/writer.json`. Whoever takes that lease raises it, with one CAS of the head. Object names include it, as the ingest writer's owner `w0.<generation>`. | A stale writer learns it must stop, a takeover changes the head even with nothing committed, and names from different owners never collide. Other leased units, such as maintenance units and source partitions from Milestone 2, keep their generations in the dataset state ([Ownership and fencing](#ownership-and-fencing)). |
 
 Each record holds the attempt id, the writer's lease generation, the actions with
 their guards, the BLAKE3 digest of every object they reference, and any inline
@@ -210,10 +210,10 @@ sequenceDiagram
         Note over M: queryable on this node, not yet committed
     end
     Note over W: commit trigger: a CDC position waiting to be acked (~2 s), a SQL COMMIT, or a freshness bound. Nothing is acknowledged yet
-    W->>S: PUT data/<table_id>/<write_id>_<ordinal>.vortex and objects/<kind>/<lease>-<counter> (parallel)
+    W->>S: PUT data/<table_id>/<write_id>_<ordinal>.vortex and objects/<kind>/<owner>-<counter> (parallel)
     W->>W: guards and the age check against the state at head version V
     opt inline records full
-        W->>S: ensure wal/<first commit>-<lease> exists (usually already sealed)
+        W->>S: ensure wal/<first commit>-<owner> exists (usually already sealed)
     end
     W->>S: PUT head (If-Match: V): inline records + record
     alt 200
@@ -224,7 +224,7 @@ sequenceDiagram
         W->>S: GET head and resolve the attempt
         Note over W: Milestone 1: fenced or a bug, stop<br/>Milestones 2–3: check guards and footprints against the winners' inline records, retry
     end
-    W-->>S: background: PUT wal/<first commit>-<lease> when a batch becomes final
+    W-->>S: background: PUT wal/<first commit>-<owner> when a batch becomes final
     Note over W,S: never ack before the head CAS succeeds
 ```
 
@@ -399,7 +399,7 @@ in storage is updated in place.
 
 ### State is a checkpoint plus a tail
 
-A checkpoint at commit n (`checkpoints/<n>-<lease>`) is:
+A checkpoint at commit n (`checkpoints/<n>-<owner>`) is:
 
 - **the root**: the dataset entry, each table entry, per-collection page
   references (key range, digest), recent attempt ids, and the **pending
@@ -416,7 +416,7 @@ flowchart LR
     HEAD["head<br/>checkpoint = 40 · batches [41–42] · inline [43–44]"]
 
     subgraph CKPT["checkpoint at commit 40"]
-        ROOT["checkpoints/40-&lt;lease&gt;<br/>dataset entry · table entries<br/>(schema ref, high-water, groups,<br/>stats / cold refs)"]
+        ROOT["checkpoints/40-&lt;owner&gt;<br/>dataset entry · table entries<br/>(schema ref, high-water, groups,<br/>stats / cold refs)"]
         P1["page: live files<br/>keys a…f"]
         P2["page: live files<br/>keys g…z"]
         P3["page: deletion vectors"]
@@ -427,9 +427,9 @@ flowchart LR
         ROOT -->|"5 · on first use"| P4
     end
 
-    B41["wal/41-&lt;lease&gt;<br/>records 41–42"]
+    B41["wal/41-&lt;owner&gt;<br/>records 41–42"]
 
-    OBJ["objects/&lt;kind&gt;/&lt;lease&gt;-&lt;counter&gt;<br/>stats · cold manifest"]
+    OBJ["objects/&lt;kind&gt;/&lt;owner&gt;-&lt;counter&gt;<br/>stats · cold manifest"]
     VX["data/&lt;table_id&gt;/&lt;write_id&gt;_&lt;ordinal&gt;.vortex<br/>data/&lt;table_id&gt;/delete_&lt;uuidv7&gt;.arrow"]
 
     HEAD -->|"1 · GET head"| APPLY
@@ -845,9 +845,9 @@ Model: `window-storage`.
     wal/…
   datasets/<slug>-<dataset_id>/
     head                                   # mutable, CAS only: commit number, inline records, batch index, checkpoint, lease generation
-    wal/<first commit>-<lease>             # batches: immutable records first..last, in order
-    checkpoints/<commit>-<lease>           # checkpoint root: table entries and the pages of each collection
-    objects/<kind>/<lease>-<counter>       # pages, manifests, deletion-vector lists, stats, PK index, …
+    wal/<first commit>-<owner>             # batches: immutable records first..last, in order
+    checkpoints/<commit>-<owner>           # checkpoint root: table entries and the pages of each collection
+    objects/<kind>/<owner>-<counter>       # pages, manifests, deletion-vector lists, stats, PK index, …
     data/<table_id>/<write_id>_<ordinal>.vortex
     data/<table_id>/delete_<uuidv7>.arrow
     leases/writer.json                     # object_store_occ::lease records
@@ -857,10 +857,19 @@ Model: `window-storage`.
 ```
 
 - **Fresh names.** Commit numbers in names are zero-padded to 20 digits, so
-  lexical order is numeric order. No name is reused: `<lease>` is the generation
-  of the writer that created the object, so two owners never produce the same
-  name. The head or a record names each object. References carry the object's
-  BLAKE3 digest, which checks its bytes; the digest is not the name.
+  lexical order is numeric order. No name is reused: `<owner>` is
+  `<kind><unit>.<generation>`, the leased unit that created the object and that
+  unit's lease generation. `kind` is `w` (writer), `m` (maintenance) or `g`
+  (GC); `unit` is an id the dataset state assigns when the unit is created and
+  never reuses. Milestone 1 writes only `w0`. From Milestone 2 each unit has its
+  own generation, so two units can hold the same number, and the unit id keeps
+  their names apart. A node gets no id of its own: taking a unit's lease raises
+  that unit's generation, so successive holders write different names. Names
+  never contain instance, host, disk or source identifiers, so they reveal
+  nothing the head does not already hold. Not yet checked in the model. The head
+  or a record names each object.
+  References carry the object's BLAKE3 digest, which checks its bytes; the
+  digest is not the name.
 - **Data files keep their names.** They are not content-addressed: hashing a
   large file means reading it back, and the names are already unique. The
   dataset folder follows the datalake tier's `datalake_dir_segment`, so datasets
@@ -879,10 +888,10 @@ flowchart LR
     W2["spiced instance<br/>(leased writer)"]
     subgraph DEST["destination: s3:// · file:// · mem://"]
         D2["data/&lt;table_id&gt;/&lt;write_id&gt;_&lt;ordinal&gt;.vortex<br/>data/&lt;table_id&gt;/delete_&lt;uuidv7&gt;.arrow"]
-        OBJ["objects/&lt;kind&gt;/&lt;lease&gt;-&lt;counter&gt;"]
+        OBJ["objects/&lt;kind&gt;/&lt;owner&gt;-&lt;counter&gt;"]
         HEAD["head<br/>inline records, batch index, checkpoint"]
-        WAL["wal/&lt;first commit&gt;-&lt;lease&gt;<br/>batches"]
-        CK["checkpoints/&lt;commit&gt;-&lt;lease&gt;"]
+        WAL["wal/&lt;first commit&gt;-&lt;owner&gt;<br/>batches"]
+        CK["checkpoints/&lt;commit&gt;-&lt;owner&gt;"]
     end
     R2["replacement instance<br/>or query replica"]
     W2 -->|"W1 · data files"| D2
@@ -1077,9 +1086,9 @@ flowchart LR
 
     subgraph DEST["destination"]
         L["leases<br/>leases/source-&lt;p&gt;.json: CDC writers<br/>leases/maint-&lt;unit&gt;.json: maintenance"]
-        DF["data/&lt;table_id&gt;/… Vortex + deletion files<br/>objects/&lt;kind&gt;/&lt;lease&gt;-&lt;counter&gt;"]
-        LOG["head + wal/&lt;first commit&gt;-&lt;lease&gt;<br/>… │ 41 │ 42 │ 43 │ …"]
-        CK["checkpoints/&lt;commit&gt;-&lt;lease&gt;"]
+        DF["data/&lt;table_id&gt;/… Vortex + deletion files<br/>objects/&lt;kind&gt;/&lt;owner&gt;-&lt;counter&gt;"]
+        LOG["head + wal/&lt;first commit&gt;-&lt;owner&gt;<br/>… │ 41 │ 42 │ 43 │ …"]
+        CK["checkpoints/&lt;commit&gt;-&lt;owner&gt;"]
     end
 
     W -.->|"W0 · CDC writers: hold source-partition lease"| L
@@ -1173,7 +1182,8 @@ way, is Milestone 1 ([Garbage collection](#garbage-collection)).
 - **Every step ships on its own** and keeps every SQLite-metastore dataset working
   until step 8.
 - **Metadata does not wait on data:** the flag ships with data files where they
-  are today; data placement follows and is a prerequisite for the replacement.
+  are today; data placement follows and is a prerequisite for standbys and the
+  replacement.
 - **The surface waits for its review:** the flag (2) and the replacement (8) go
   through [#15760](https://github.com/spiceai/spiceai/issues/15760), and placement (6) through [#15818](https://github.com/spiceai/spiceai/issues/15818).
 - **Exit criteria** are the runs that must pass before the next step builds on
@@ -1193,9 +1203,8 @@ flowchart LR
     S3 --> S4["4 · retention and GC"]
     S4 --> S5["5 · object stores,<br/>more sources"]
     S5 --> S6["6 · data placement ([#15818](https://github.com/spiceai/spiceai/issues/15818))"]
-    S5 --> S7["7 · standbys"]
-    S6 --> S8["8 · the replacement:<br/>SQLite removed"]
-    S7 --> S8
+    S6 --> S7["7 · standbys"]
+    S7 --> S8["8 · the replacement:<br/>SQLite removed"]
 ```
 
 *Diagram 6: the Milestone 1 roadmap. The library, then the native catalog behind the flag ([#15760](https://github.com/spiceai/spiceai/issues/15760) Stage 1), then the commit cadence, GC, object stores and more sources, then data placement and standbys, and finally the replacement ([#15760](https://github.com/spiceai/spiceai/issues/15760) Stage 2).*
@@ -1361,6 +1370,8 @@ import, and the remaining sources' positions are step 5.
   - *replay after takeover:* PostgreSQL resumes from the committed position;
     SQS redelivers undeleted messages, so the new holder skips files the log
     already records.
+- **Prerequisites:** data placement (step 6). Until then data files are on the
+  writer's local disk, so a standby could neither read them nor take over.
 - **Code:** the `crates/cayenne` provider (`provider/table.rs`, `pk_index.rs`,
   `deletion_index.rs`), replacing the slice import (`metastore/snapshot.rs`) for
   these readers; `runtime`; lease gating in `connector-postgres`

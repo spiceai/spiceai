@@ -271,7 +271,7 @@ the object store itself coordinate.
 *Details:* [The write path](object-native-metastore-technical.md#the-write-path).
 
 - *Considered: a numbered log* (`log/<pos>` per commit, as in Delta Lake and
-  SlateDB). Prototyped, model-checked and timed. A create orders a commit
+  SlateDB). Prototyped and timed. A create orders a commit
   without accepting it, so it needs a GC boundary checked after every create,
   no-op fill and fence records, about twice the reader requests per poll and
   slower cold opens. Rejected.

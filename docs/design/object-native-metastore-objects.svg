@@ -18,7 +18,7 @@
 <rect x="0" y="0" width="1790" height="779" fill="#ffffff"/>
 <text x="20" y="28" class="note">Every path is under</text>
 <text x="158" y="28" class="prefix">&lt;runtime.state.location&gt;/cayenne/v1/datasets/&lt;slug&gt;-&lt;dataset_id&gt;/</text>
-<text x="20" y="48" class="note">&lt;generation&gt; is the lease generation of the writer that created the object, so two owners never write the same name.</text>
+<text x="20" y="48" class="note">&lt;owner&gt; is the leased unit that created the object and its generation (w0.&lt;generation&gt; for the ingest writer), so two owners never write the same name.</text>
 <text x="20" y="78" class="keyhead">Key</text>
 <rect x="64" y="67" width="26" height="14" rx="3" fill="#fff4e5" stroke="#d4a72c"/>
 <text x="98" y="79" class="note">mutable · written only by CAS</text>
@@ -55,13 +55,13 @@
 <text x="72" y="441.5" class="field">incarnation</text>
 <text x="72" y="462.5" class="field">commit: newest commit number</text>
 <text x="72" y="483.5" class="field">lease: ingest writer&#x27;s generation</text>
-<text x="72" y="504.5" class="field">batches: [last commit, generation] …</text>
+<text x="72" y="504.5" class="field">batches: [last commit, owner] …</text>
 <text x="72" y="525.5" class="field">inline_records: first_inline … commit</text>
-<text x="72" y="546.5" class="field">checkpoint: commit, generation</text>
+<text x="72" y="546.5" class="field">checkpoint: commit, owner</text>
 <rect x="480" y="150" width="360" height="105" rx="8" fill="#eef6ff" stroke="#54aeff" stroke-width="1.5"/>
 <text x="492" y="172" class="title">Batch</text>
 <text x="828" y="172" class="kind" text-anchor="end">immutable · create-if-absent</text>
-<text x="492" y="192" class="path">wal/&lt;first commit&gt;-&lt;generation&gt;</text>
+<text x="492" y="192" class="path">wal/&lt;first commit&gt;-&lt;owner&gt;</text>
 <line x1="480" y1="218" x2="840" y2="218" stroke="#54aeff" stroke-width="1"/>
 <text x="492" y="240.5" class="field">records first … last, in order</text>
 <rect x="480" y="300" width="360" height="189" rx="8" fill="#f3f0ff" stroke="#a371f7" stroke-width="1.5"/>
@@ -77,7 +77,7 @@
 <rect x="480" y="550" width="360" height="189" rx="8" fill="#eef6ff" stroke="#54aeff" stroke-width="1.5"/>
 <text x="492" y="572" class="title">Checkpoint root</text>
 <text x="828" y="572" class="kind" text-anchor="end">immutable · create-if-absent</text>
-<text x="492" y="592" class="path">checkpoints/&lt;commit&gt;-&lt;generation&gt;</text>
+<text x="492" y="592" class="path">checkpoints/&lt;commit&gt;-&lt;owner&gt;</text>
 <line x1="480" y1="618" x2="840" y2="618" stroke="#54aeff" stroke-width="1"/>
 <text x="492" y="640.5" class="field">dataset entry, table entries</text>
 <text x="492" y="661.5" class="field">page refs: collection, key range, digest</text>
@@ -87,7 +87,7 @@
 <rect x="900" y="150" width="360" height="147" rx="8" fill="#eef6ff" stroke="#54aeff" stroke-width="1.5"/>
 <text x="912" y="172" class="title">Page or object</text>
 <text x="1248" y="172" class="kind" text-anchor="end">immutable · create-if-absent</text>
-<text x="912" y="192" class="path">objects/&lt;kind&gt;/&lt;generation&gt;-&lt;counter&gt;</text>
+<text x="912" y="192" class="path">objects/&lt;kind&gt;/&lt;owner&gt;-&lt;counter&gt;</text>
 <line x1="900" y1="218" x2="1260" y2="218" stroke="#54aeff" stroke-width="1"/>
 <text x="912" y="240.5" class="field">a sorted chunk of one collection:</text>
 <text x="912" y="261.5" class="field">live files, deletion vectors, PK index;</text>
