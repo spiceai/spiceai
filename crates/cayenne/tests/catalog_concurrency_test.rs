@@ -25,8 +25,8 @@ limitations under the License.
 //!
 //! 2. **Round-trip Tests**: Verify data survives create/read cycles.
 //!
-//! 3. **Backend Agnostic**: Tests run with both `SQLite` and Turso backends to
-//!    ensure consistent behavior.
+//! 3. **Backend Agnostic**: Tests run through the backend-parameterized
+//!    fixture.
 
 #![allow(clippy::expect_used)]
 
@@ -92,11 +92,8 @@ async fn create_partitioned_table(
 /// all succeed and return the same partition ID.
 /// This validates the constraint violation handling for partitions.
 ///
-/// For `SQLite`: Uses true concurrency to test race conditions.
-/// For Turso: Uses sequential calls due to single-connection architecture.
+/// Uses true concurrency to test race conditions.
 async fn test_concurrent_partition_creation_impl(fixture: TestFixture) -> TestResult<()> {
-    use common::BackendType;
-
     let table_dir = fixture.data_path.join("concurrent_partition");
     std::fs::create_dir_all(&table_dir)?;
 
@@ -110,51 +107,17 @@ async fn test_concurrent_partition_creation_impl(fixture: TestFixture) -> TestRe
     let num_calls = 5;
     let mut partition_ids = vec![];
 
-    // Turso has a single-connection architecture that doesn't support concurrent writes
-    // so we run sequentially for Turso and concurrently for SQLite
-    if matches!(fixture.backend_type, BackendType::Sqlite) {
-        // SQLite: Use true concurrency to test race conditions
-        let mut handles = vec![];
+    // Concurrent calls race on creating the same partition.
+    let mut handles = vec![];
 
-        for i in 0..num_calls {
-            let catalog_clone = Arc::clone(&fixture.catalog);
-            let table_id = table_id.clone();
-            let path = table_dir.join(format!("partition_20240101_{i}"));
+    for i in 0..num_calls {
+        let catalog_clone = Arc::clone(&fixture.catalog);
+        let table_id = table_id.clone();
+        let path = table_dir.join(format!("partition_20240101_{i}"));
 
-            let handle = tokio::spawn(async move {
-                let mut partition = PartitionMetadata::new_single(
-                    table_id,
-                    "partition_date".to_string(),
-                    "2024-01-01".to_string(), // Same value for all
-                    path.to_string_lossy().to_string(),
-                    false,
-                );
-                partition.record_count = 100;
-                partition.file_size_bytes = 1024;
-
-                catalog_clone.add_partition(partition).await
-            });
-
-            handles.push(handle);
-        }
-
-        // Wait for all tasks to complete
-        let results: Vec<_> = futures::future::join_all(handles).await;
-
-        // All tasks should succeed (either creating or finding the partition)
-        for result in results {
-            let partition_id = result
-                .expect("Task panicked")
-                .expect("add_partition failed");
-            partition_ids.push(partition_id);
-        }
-    } else {
-        // Turso: Use sequential calls to avoid database locking
-        for i in 0..num_calls {
-            let path = table_dir.join(format!("partition_20240101_{i}"));
-
+        let handle = tokio::spawn(async move {
             let mut partition = PartitionMetadata::new_single(
-                table_id.clone(),
+                table_id,
                 "partition_date".to_string(),
                 "2024-01-01".to_string(), // Same value for all
                 path.to_string_lossy().to_string(),
@@ -163,9 +126,21 @@ async fn test_concurrent_partition_creation_impl(fixture: TestFixture) -> TestRe
             partition.record_count = 100;
             partition.file_size_bytes = 1024;
 
-            let partition_id = fixture.catalog.add_partition(partition).await?;
-            partition_ids.push(partition_id);
-        }
+            catalog_clone.add_partition(partition).await
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for all tasks to complete
+    let results: Vec<_> = futures::future::join_all(handles).await;
+
+    // All tasks should succeed (either creating or finding the partition)
+    for result in results {
+        let partition_id = result
+            .expect("Task panicked")
+            .expect("add_partition failed");
+        partition_ids.push(partition_id);
     }
 
     // All calls should have gotten the same partition_id
@@ -340,8 +315,7 @@ async fn test_table_metadata_roundtrip_impl(fixture: TestFixture) -> TestResult<
 
 /// Sequential stress test for partition creation.
 /// Creates many partitions one at a time to test catalog stability.
-/// This avoids Turso's connection locking issues while still stress-testing
-/// the constraint violation recovery path.
+/// Stress-tests the constraint violation recovery path.
 async fn test_sequential_partition_stress_impl(fixture: TestFixture) -> TestResult<()> {
     let table_dir = fixture.data_path.join("stress_partition");
     std::fs::create_dir_all(&table_dir)?;

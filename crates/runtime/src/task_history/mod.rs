@@ -192,6 +192,7 @@ impl TaskSpan {
             .filter_map(|s| {
                 s.trace_id_override
                     .as_ref()
+                    .filter(|new_trace| new_trace.as_ref() != s.trace_id.as_ref())
                     .map(|new_trace| (Arc::clone(&s.trace_id), Arc::clone(new_trace)))
             })
             .collect();

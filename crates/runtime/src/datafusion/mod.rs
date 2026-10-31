@@ -1535,6 +1535,8 @@ pub struct DataFusion {
     // EXECUTE (not lightweight PREPARE/DEALLOCATE/SET) — i.e. query admission
     // control; `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
     query_admission_semaphore: Option<Arc<Semaphore>>,
+    // Permits in `query_admission_semaphore`; `None` when admission is unbounded.
+    query_admission_limit: Option<usize>,
     pub(crate) task_history_enabled: bool,
     /// Which failed queries are logged; `runtime.query.log_errors`.
     pub(crate) query_error_logging: QueryErrorLogging,
@@ -1784,6 +1786,12 @@ impl DataFusion {
     /// `acceleration_refresh_semaphore` for the read/query side.
     pub(crate) fn query_admission_semaphore(&self) -> Option<Arc<Semaphore>> {
         self.query_admission_semaphore.clone()
+    }
+
+    /// The number of permits in the query-admission semaphore; `None` when
+    /// admission is unbounded.
+    pub(crate) fn query_admission_limit(&self) -> Option<usize> {
+        self.query_admission_limit
     }
 
     #[must_use]
@@ -7124,7 +7132,7 @@ impl DataFusion {
         parameters: Option<&ParamValues>,
     ) -> Result<(LogicalPlan, TableFunctionPlaceholders), DataFusionError> {
         let dialect = session.config().options().sql_parser.dialect;
-        let mut statement = session.sql_to_statement(sql, &dialect)?;
+        let mut statement = sql_depth_guard::sql_to_statement(session, sql, &dialect)?;
         sql_depth_guard::ensure_statement_within_depth_limits(&statement)?;
         let placeholders = bind_table_function_args(&mut statement, parameters)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
@@ -7148,8 +7156,7 @@ impl DataFusion {
         // The plain parser suffices: only `CREATE TABLE ... CLUSTER BY` needs
         // `planner::parse_sql_statement`, and it has no table functions.
         let dialect = state.config().options().sql_parser.dialect;
-        state
-            .sql_to_statement(sql, &dialect)
+        sql_depth_guard::sql_to_statement(&state, sql, &dialect)
             .and_then(|mut statement| bind_table_function_args(&mut statement, None))
             .is_ok_and(|placeholders| placeholders == TableFunctionPlaceholders::Present)
     }

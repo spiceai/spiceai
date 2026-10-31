@@ -283,6 +283,70 @@ async fn projection_name_for_integer_add_is_preserved() {
     );
 }
 
+/// The checked kernels must report the nullability `DataFusion`'s operators
+/// do: a Flight SQL client compares the schema a plan advertises with the one
+/// it streams, and the two disagreed on `id + id` once the rewrite reported
+/// every result nullable.
+#[tokio::test]
+async fn checked_ops_keep_the_operators_nullability() {
+    let sql = "SELECT id + id AS a, id - 1 AS s, id * 2 AS m, big - 1 AS nullable_sub FROM t";
+    let nullability = |schema: &Schema| {
+        schema
+            .fields()
+            .iter()
+            .map(|field| (field.name().clone(), field.is_nullable()))
+            .collect::<Vec<_>>()
+    };
+
+    let vanilla = vanilla_session()
+        .sql(sql)
+        .await
+        .expect("plan vanilla arithmetic")
+        .collect()
+        .await
+        .expect("run vanilla arithmetic");
+    let expected = nullability(
+        vanilla
+            .first()
+            .expect("one vanilla batch")
+            .schema()
+            .as_ref(),
+    );
+    assert_eq!(
+        expected,
+        vec![
+            ("a".to_string(), false),
+            ("s".to_string(), false),
+            ("m".to_string(), false),
+            ("nullable_sub".to_string(), true),
+        ],
+        "DataFusion's own operators are the reference"
+    );
+
+    let ctx = checked_session();
+    let df = ctx.sql(sql).await.expect("plan checked arithmetic");
+    let plan = df
+        .clone()
+        .into_optimized_plan()
+        .expect("optimize checked arithmetic");
+    assert!(
+        format!("{}", plan.display_indent()).contains(CHECKED_SUB_UDF_NAME),
+        "the analyzer must have rewritten the operators:\n{}",
+        plan.display_indent()
+    );
+    assert_eq!(
+        nullability(plan.schema().as_arrow()),
+        expected,
+        "optimized plan schema"
+    );
+    let batches = df.collect().await.expect("run checked arithmetic");
+    assert_eq!(
+        nullability(batches.first().expect("one batch").schema().as_ref()),
+        expected,
+        "streamed schema"
+    );
+}
+
 #[tokio::test]
 async fn checked_session_errors_on_int32_same_type_add() {
     let ctx = checked_session();
