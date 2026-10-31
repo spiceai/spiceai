@@ -383,6 +383,8 @@ impl Drop for McpToolCatalog {
 
 impl McpToolCatalog {
     pub async fn try_new(cfg: MCPConfig, name: &str, description: Option<String>) -> Result<Self> {
+        // The handshake and the first `tools/list` share one startup deadline.
+        let deadline = tokio::time::Instant::now() + MCP_STARTUP_TIMEOUT;
         let client = Self::create_client(&cfg, name).await?;
         let client = Arc::new(RwLock::new(client));
 
@@ -474,13 +476,23 @@ impl McpToolCatalog {
         // list leaves the cache empty; fail construction so the existing
         // component-load retry rebuilds the catalog instead of registering
         // one that would make rmcp cache `get_tool == None`.
-        catalog
-            .list_tools()
-            .await
-            .map_err(|e| Error::CouldNotConstructTool {
-                name: name.to_string(),
-                e: e.to_string(),
-            })?;
+        match tokio::time::timeout_at(deadline, catalog.list_tools()).await {
+            Ok(listed) => {
+                listed.map_err(|e| Error::CouldNotConstructTool {
+                    name: name.to_string(),
+                    e: e.to_string(),
+                })?;
+            }
+            Err(_) => {
+                return Err(Error::UnderlyingTransportError {
+                    source: format!(
+                        "the MCP server did not answer tools/list within {}s of connecting",
+                        MCP_STARTUP_TIMEOUT.as_secs()
+                    )
+                    .into(),
+                });
+            }
+        }
         Ok(catalog)
     }
 
@@ -960,9 +972,10 @@ fn client_lifecycle() -> ClientLifecycleMode {
     }
 }
 
-/// Upper bound on connecting to an MCP server. rmcp waits 10 seconds for `server/discover` and
-/// then falls back to `initialize` with no deadline, so a server that accepts the connection
-/// but never answers would otherwise keep the tool loading forever.
+/// Upper bound on connecting to an MCP server and listing its tools. rmcp waits 10 seconds for
+/// `server/discover` and then falls back to `initialize` with no deadline, and `tools/list` has
+/// no default deadline either, so a server that accepts the connection but never answers would
+/// otherwise keep the tool loading forever.
 const MCP_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum McpClient {

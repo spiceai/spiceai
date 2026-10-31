@@ -180,8 +180,17 @@ impl Runtime {
     /// first attempt.
     async fn load_tool(self: &Arc<Self>, tool: &Tool, builtin_names: Arc<HashSet<String>>) {
         self.tool_loads.stop(&tool.name).await;
-        self.status
-            .update_tool(&tool.name, status::ComponentStatus::Initializing);
+        // A tool that already failed stays failed until an attempt succeeds, so loading the
+        // tools again (the cluster executor does it twice) does not make it block readiness.
+        let already_failed = matches!(
+            self.status
+                .get_component_status(&format!("tool:{}", tool.name)),
+            Some(status::ComponentStatus::Error(_))
+        );
+        if !already_failed {
+            self.status
+                .update_tool(&tool.name, status::ComponentStatus::Initializing);
+        }
         let (first_attempt_done, first_attempt) = oneshot::channel();
         self.tool_loads.start(
             &tool.name,
