@@ -749,8 +749,10 @@ implementations. Delivery and maintenance are covered in separate compositions.
 
 ## Measured manual suite
 
-On 2026-10-29, `EXHAUST=1 ... all` matched 299/299 declarations in 1340 s
-(about 22 minutes) with the default 6 threads, peak RSS 4.3 GB.
+On 2026-10-31, `EXHAUST=1 ... all` matched 309/309 declarations; checker time
+summed to 1350 s (about 23 minutes) with the default 6 threads, peak memory
+footprint 3.1 GB. The profile rows below are from the 2026-10-29 run of 299
+declarations.
 
 | Representative exhaustive profile | Bound | Visits / unique states | Wall s |
 |---|---:|---:|---:|
@@ -765,8 +767,8 @@ On 2026-10-29, `EXHAUST=1 ... all` matched 299/299 declarations in 1340 s
 | `position-delete` | 1 | 62 / 53 | 0.000 |
 | `remote-maintenance-clear-retry` | 4 | 3,492 / 2,637 | 0.012 |
 
-The longest completed checker was `transactions-three-participants-symmetry-0-exhaust` at
-311.349 s. All exhaustive declarations completed below the 540-second watchdog.
+The longest completed checker on 2026-10-31 was
+`dataset-prepare-query-expiry-byte-window` at 395.281 s. All exhaustive declarations completed below the 540-second watchdog.
 The original four-selection statement, three-selection delivery and two-selection
 unknown-as-loss budget probes remain incomplete evidence at their captured source;
 they are not declarations silently marked safe. New transactions exhaust two
