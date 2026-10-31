@@ -3437,6 +3437,7 @@ mod tests {
             harmony: Some(HARMONY_MARKERS),
             reasoning_support: ReasoningSupport::default(),
             counter: AtomicUsize::new(0),
+            context_window: 0,
             reused_prompt_tokens: Arc::default(),
         };
         let mut req = serde_json::json!({
