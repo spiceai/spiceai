@@ -107,7 +107,7 @@ fn rewrite_integer_arith(expr: Expr, schema: &DFSchema) -> Transformed<Expr> {
 /// # Errors
 ///
 /// Returns an error when the expression tree cannot be traversed.
-pub fn restore_integer_operators(expr: Expr) -> Result<Expr> {
+pub(crate) fn restore_integer_operators(expr: Expr) -> Result<Expr> {
     expr.transform_up(|expr| Ok(restore_integer_operator(expr)))
         .map(|transformed| transformed.data)
 }

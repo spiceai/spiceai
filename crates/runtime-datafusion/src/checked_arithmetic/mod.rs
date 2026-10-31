@@ -31,7 +31,8 @@ mod op;
 mod single_distinct;
 mod sum;
 
-pub use analyzer::{CheckedIntegerOverflow, restore_integer_operators};
+pub use analyzer::CheckedIntegerOverflow;
+pub(crate) use analyzer::restore_integer_operators;
 pub use decomposability::complete_preaggregate_would_narrow_early;
 pub use dml::sql_rendered_dml;
 pub use eager::{

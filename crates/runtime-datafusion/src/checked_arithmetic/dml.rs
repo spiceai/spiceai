@@ -31,7 +31,6 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::Result;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion_federation::FederatedTableProviderAdaptor;
 use spice_table::{LayerWalk, SpiceTable, TableLayer};
 
 use super::restore_integer_operators;
@@ -43,18 +42,6 @@ use super::restore_integer_operators;
 /// federated read. Every other call reaches `provider` unchanged.
 #[must_use]
 pub fn sql_rendered_dml(provider: Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
-    // Federation finds a table by downcasting to the adaptor, so keep it
-    // outermost, as `metadata_enriched_table_provider` does.
-    if let Some(adaptor) = provider.downcast_ref::<FederatedTableProviderAdaptor>() {
-        let Some(table_provider) = &adaptor.table_provider else {
-            return provider;
-        };
-        return Arc::new(FederatedTableProviderAdaptor::new_with_provider(
-            Arc::clone(&adaptor.source),
-            sql_rendered_dml(Arc::clone(table_provider)),
-        ));
-    }
-
     SpiceTable::over(Arc::new(SqlRenderedDml), provider)
 }
 
