@@ -104,7 +104,7 @@ use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::{
-    CteMaterialization, QueryErrorLogging, SpillCompression as SpiceSpillCompression,
+    CteMaterialization, QueryErrorLogging, RuntimeMode, SpillCompression as SpiceSpillCompression,
 };
 use spicepod::metric::Metrics;
 use tokio::{
@@ -349,6 +349,7 @@ pub struct DataFusionBuilder {
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     memory_limit: Option<u64>,
     target_partitions: Option<usize>,
+    runtime_mode: RuntimeMode,
     prefer_hash_join: Option<bool>,
     eager_aggregation: Option<bool>,
     eager_aggregation_min_reduction_factor: Option<usize>,
@@ -357,6 +358,7 @@ pub struct DataFusionBuilder {
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     query_admission_semaphore: Option<Arc<Semaphore>>,
+    query_admission_limit: Option<usize>,
     task_history_enabled: bool,
     query_error_logging: QueryErrorLogging,
     output_preview: OutputPreview,
@@ -482,6 +484,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry,
             memory_limit: None,
             target_partitions: None,
+            runtime_mode: RuntimeMode::default(),
             prefer_hash_join: None,
             eager_aggregation: None,
             eager_aggregation_min_reduction_factor: None,
@@ -490,6 +493,7 @@ impl DataFusionBuilder {
             temp_directory: None,
             accelerated_refresh_semaphore: None,
             query_admission_semaphore: None,
+            query_admission_limit: None,
             task_history_enabled: true,
             query_error_logging: QueryErrorLogging::default(),
             output_preview: OutputPreview::Build,
@@ -594,6 +598,13 @@ impl DataFusionBuilder {
         self
     }
 
+    /// Selects the defaults for settings the Spicepod leaves unset.
+    #[must_use]
+    pub fn runtime_mode(mut self, runtime_mode: RuntimeMode) -> Self {
+        self.runtime_mode = runtime_mode;
+        self
+    }
+
     #[must_use]
     pub fn prefer_hash_join(mut self, prefer_hash_join: Option<bool>) -> Self {
         self.prefer_hash_join = prefer_hash_join;
@@ -683,6 +694,7 @@ impl DataFusionBuilder {
             }
         };
         self.query_admission_semaphore = permits.map(|n| Arc::new(Semaphore::new(n)));
+        self.query_admission_limit = permits;
         self
     }
 
@@ -988,7 +1000,11 @@ impl DataFusionBuilder {
             // pod with a CPU request and no limit would fan every query out
             // across the whole node. Size from the CPU budget instead, which is
             // the same number wherever detection was already correct.
-            let target_partitions = cpu_budget::cpu_budget().target_partitions();
+            let budget = cpu_budget::cpu_budget();
+            let target_partitions = match self.runtime_mode {
+                RuntimeMode::Server => budget.target_partitions(),
+                RuntimeMode::Sidecar => budget.sidecar_target_partitions(),
+            };
             config = config.with_target_partitions(target_partitions);
             tracing::info!(
                 target_partitions,
@@ -1512,6 +1528,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             query_admission_semaphore: self.query_admission_semaphore,
+            query_admission_limit: self.query_admission_limit,
             task_history_enabled: self.task_history_enabled,
             query_error_logging: self.query_error_logging,
             task_history_captured_output: self.output_preview == OutputPreview::Build,

@@ -25,6 +25,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::App;
+use app::spicepod::component::runtime::RuntimeMode;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_http_rate_control::HttpRateControlRegistry;
@@ -78,6 +79,10 @@ pub trait ConnectorContext: Send + Sync {
     /// The loaded app, for the runtime-level configuration a connector consults
     /// (e.g. `runtime.params`, `runtime.flight`).
     fn app(&self) -> Arc<App>;
+
+    /// The deployment profile the runtime started with. A reload cannot change
+    /// it, so it can differ from the loaded app's `runtime.mode`.
+    fn runtime_mode(&self) -> RuntimeMode;
 
     /// The process-wide per-origin HTTP rate-control registry, so connectors
     /// sharing an origin share one limiter.

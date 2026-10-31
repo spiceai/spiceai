@@ -333,22 +333,6 @@
     {
       "run": "clickhouse-literals",
       "who": "federated",
-      "key": "query: SELECT id FROM c WHERE d IN (-999999999999.999999, -0.5) ORDER BY id",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (69): DB::Exception: Number is too big to place in Decimal(18, 6)`\": code: 'Client specified an invalid argu",
-      "group": "clickhouse"
-    },
-    {
-      "run": "clickhouse-literals",
-      "who": "federated",
-      "key": "query: SELECT id FROM c WHERE d IN (2.5, 999999999999.999999) ORDER BY id",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Server error: `ERROR DB::Exception (69): DB::Exception: Number is too big to place in Decimal(18, 6)`\": code: 'Client specified an invalid argu",
-      "group": "clickhouse"
-    },
-    {
-      "run": "clickhouse-literals",
-      "who": "federated",
       "key": "query: SELECT id FROM c WHERE dtm = TIMESTAMP '1900-01-01 00:00:00' ORDER BY id",
       "kind": "empty",
       "signature": "Spice returned no rows, expected 1",
@@ -3084,9 +3068,9 @@
       "run": "surface",
       "who": "duckdb",
       "key": "query: SELECT id, to_char(dt, 'YYYY-MM-DD') AS c FROM ev WHERE id < 40",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nCatalog Error: Scalar Function with name to_char does not exist!\\nDid you mean \\\"to_hours\\\"?\\n\\nLINE 1: WITH fetch_schema AS ( SELECT \\\"ev\\\".\\\"id\\\", to_char(\\\"ev\\\".\\\"dt\\\", 'YYYY-M",
-      "group": "duckdb"
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"c\", row_number: 1, expected: \"\\\"2024-01-12\\\"\", actual: \"\\\"YYYY-MM-DD\\\"\" }",
+      "group": "datafusion"
     },
     {
       "run": "surface",

@@ -79,6 +79,7 @@ fn start_time_only_changes(
         source_rate_control,
         drasi,
         functions: _,
+        mode: _,
     } = new;
 
     [
@@ -308,6 +309,18 @@ impl Runtime {
         // Serialize the entire diff-and-swap so concurrent callers apply
         // one-at-a-time. Must be the first statement.
         let _serialize = self.apply_app_lock.lock().await;
+
+        // Pinned before the SQL definitions are added, so the Spicepod app that
+        // later statements are applied over keeps the running mode too.
+        let mut new_app = new_app;
+        if new_app.runtime.mode != self.mode {
+            tracing::warn!(
+                "runtime.mode changed from '{}' to '{}'. Restart spiced to apply the new mode.",
+                self.mode,
+                new_app.runtime.mode
+            );
+            Arc::make_mut(&mut new_app).runtime.mode = self.mode;
+        }
 
         // `new_app` is built from the Spicepods; the datasets and catalogs
         // defined with SQL are served beside theirs.

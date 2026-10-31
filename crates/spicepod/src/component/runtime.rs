@@ -36,6 +36,11 @@ pub const DEFAULT_FLIGHT_ADAPTIVE_BATCH_SIZE_MAX: usize = 131_072;
 #[serde(deny_unknown_fields)]
 #[serde(try_from = "RuntimeDeserializer")]
 pub struct Runtime {
+    /// Deployment profile. Sidecars plan remote Spice reads locally and favor
+    /// concurrent application queries; servers retain the standard defaults.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub mode: RuntimeMode,
+
     #[serde(default, skip_serializing_if = "is_default")]
     pub caching: Caching,
 
@@ -171,6 +176,77 @@ impl Runtime {
             Ok(Some(duration))
         } else {
             Ok(None)
+        }
+    }
+}
+
+/// Selects the deployment profile without changing cluster membership.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeMode {
+    #[default]
+    Server,
+    Sidecar,
+}
+
+impl std::fmt::Display for RuntimeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Server => "server",
+            Self::Sidecar => "sidecar",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for RuntimeMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "server" => Ok(Self::Server),
+            "sidecar" => Ok(Self::Sidecar),
+            _ => Err(serde::de::Error::custom(format!(
+                "Invalid runtime.mode '{value}'. Use 'server' (default) or 'sidecar'."
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::{Runtime, RuntimeMode};
+
+    #[test]
+    fn mode_roundtrip_and_validation() {
+        let default: Runtime = yaml::from_str("{}").expect("default runtime");
+        assert_eq!(default.mode, RuntimeMode::Server);
+        assert_eq!(
+            serde_json::to_value(&default)
+                .expect("serialize")
+                .get("mode"),
+            None
+        );
+        for (name, mode) in [
+            ("server", RuntimeMode::Server),
+            ("sidecar", RuntimeMode::Sidecar),
+        ] {
+            let config: Runtime = yaml::from_str(&format!("mode: {name}\n")).expect("valid mode");
+            assert_eq!(config.mode, mode);
+            let json = serde_json::to_string(&config).expect("serialize");
+            assert_eq!(
+                serde_json::from_str::<Runtime>(&json)
+                    .expect("roundtrip")
+                    .mode,
+                mode
+            );
+        }
+        for value in ["cluster", "Sidecar", "sidecar ", ""] {
+            let error = serde_json::from_value::<Runtime>(serde_json::json!({"mode": value}))
+                .expect_err("invalid mode");
+            assert_eq!(
+                error.to_string(),
+                format!("Invalid runtime.mode '{value}'. Use 'server' (default) or 'sidecar'.")
+            );
         }
     }
 }
@@ -1936,6 +2012,8 @@ pub fn default_rate_control_refresh_interval() -> String {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeDeserializer {
     #[serde(default)]
+    pub mode: RuntimeMode,
+    #[serde(default)]
     #[deprecated(since = "2.0.0", note = "Use `runtime.caching.sql_results` instead.")]
     pub results_cache: Option<ResultsCache>,
     #[serde(default)]
@@ -2073,6 +2151,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
         }
 
         Ok(Runtime {
+            mode: deserializer.mode,
             caching,
             dataset_load_parallelism: deserializer.dataset_load_parallelism,
             tls: deserializer.tls,

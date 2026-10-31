@@ -23,6 +23,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::App;
+use app::spicepod::component::runtime::RuntimeMode;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 pub(crate) use data_connector_api::parameters::{ConnectorContext, ConnectorParams, Validator};
@@ -103,6 +104,10 @@ impl RuntimeConnectorContext {
 impl ConnectorContext for RuntimeConnectorContext {
     fn app(&self) -> Arc<App> {
         Arc::clone(&self.app)
+    }
+
+    fn runtime_mode(&self) -> RuntimeMode {
+        self.runtime.mode
     }
 
     fn http_rate_control_registry(&self) -> Arc<HttpRateControlRegistry> {
