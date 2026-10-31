@@ -3412,18 +3412,14 @@ mod tests {
     /// A gpt-oss-style template whose generation prompt goes on from `<|start|>assistant` with
     /// `OPENS`, as a custom template may. An earlier turn's reply is a final message, closed
     /// with `<|end|>`, as gpt-oss's own template renders one.
-    const HARMONY_OPENS: &str = "{% for m in messages %}<|start|>{{ m.role }}{% if m.role == 'assistant' %}<|channel|>final{% endif %}<|message|>{{ m.content }}<|end|>{% endfor %}<|start|>assistantOPENS";
+    const HARMONY_OPENS: &str = "{% for m in messages %}<|start|>{{ m.role }}{% if m.role == 'assistant' %}<|channel|>final{% endif %}<|message|>{{ m.content }}<|end|>{% endfor %}{% if add_generation_prompt %}<|start|>assistantOPENS{% endif %}";
 
-    /// What a Harmony model's `reply` sends when the template's generation prompt goes on from
-    /// `<|start|>assistant` with `opens`, for a request with the fields `request` sets, or why
-    /// the request fails, and the `root` rule of the request's grammar, if it has one. The
-    /// request is queued as the engine queues it, so the reply is read from where the engine
-    /// starts reading it.
-    fn harmony_reply_after(
-        opens: &str,
+    /// The engine serving `template`, and the job it queues for a request with the fields
+    /// `request` sets (a question about France's capital, by default), and what that job sends.
+    fn harmony_job(
+        template: String,
         request: serde_json::Value,
-        reply: &str,
-    ) -> (std::result::Result<Vec<String>, String>, Option<String>) {
+    ) -> (LlamaCpp, String, Sampling, Output, mpsc::Receiver<Event>) {
         let (jobs, queued) = std_mpsc::channel();
         let llama = LlamaCpp {
             decoder: DecodeThread {
@@ -3433,7 +3429,7 @@ mod tests {
                 freed: None,
             },
             model_name: "gpt-oss".to_string(),
-            template: Either::Left(HARMONY_OPENS.replace("OPENS", opens)),
+            template: Either::Left(template),
             special: SpecialTokens::default(),
             harmony: Some(HARMONY_MARKERS),
             reasoning_support: ReasoningSupport::default(),
@@ -3453,7 +3449,22 @@ mod tests {
             .submit(&req, &CacheNamespace::Public)
             .expect("the request is queued");
         let rx = receivers.into_iter().next().expect("one choice");
-        let (prompt, sampling, mut out) = Output::new(queued.try_recv().expect("its job"));
+        let (prompt, sampling, out) = Output::new(queued.try_recv().expect("its job"));
+        (llama, prompt, sampling, out, rx)
+    }
+
+    /// What a Harmony model's `reply` sends when the template's generation prompt goes on from
+    /// `<|start|>assistant` with `opens`, for a request with the fields `request` sets, or why
+    /// the request fails, and the `root` rule of the request's grammar, if it has one. The
+    /// request is queued as the engine queues it, so the reply is read from where the engine
+    /// starts reading it.
+    fn harmony_reply_after(
+        opens: &str,
+        request: serde_json::Value,
+        reply: &str,
+    ) -> (std::result::Result<Vec<String>, String>, Option<String>) {
+        let (_llama, prompt, sampling, mut out, rx) =
+            harmony_job(HARMONY_OPENS.replace("OPENS", opens), request);
         // These cases leave the grammar nothing to be advanced over, which the decode thread
         // would do before the reply starts.
         assert_eq!(out.pending(), "", "{opens:?}");
@@ -3642,6 +3653,58 @@ mod tests {
                 .into_iter()
                 .map(|(sent, root)| (Ok(sent), Some(root)))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// The reply goes on from what the template's generation prompt adds after the
+    /// conversation, whose messages the template closes: an earlier turn's final message ends
+    /// there, and the markers a prefill's JSON spells, `<|end|><|start|>` included, are the
+    /// prefill's, for a structured reply and a required call alike. A template that adds its
+    /// opened message whether or not a generation prompt is asked for is read whole.
+    #[test]
+    fn a_harmony_prefill_after_earlier_turns_keeps_the_markers_its_json_spells() {
+        let second_turn = |mut request: serde_json::Value| {
+            request["messages"] = serde_json::json!([
+                { "role": "user", "content": "What is the capital of France?" },
+                { "role": "assistant", "content": "{\"capital\":\"Paris\"}" },
+                { "role": "user", "content": "And of Italy?" },
+            ]);
+            request
+        };
+        let structured = serde_json::json!({ "response_format": { "type": "json_object" } });
+        let required = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                    },
+                },
+            }],
+            "tool_choice": "required",
+        });
+        let prefill = "<|channel|>final<|message|>{\"note\":\"<|end|><|start|>\",\"capital\":\"Ro";
+        let call = "<|channel|>commentary to=functions.get_weather<|message|>{\"city\":\"<|end|><|start|>Ro";
+        let pending = |template: String, request: serde_json::Value| {
+            let (_llama, _, _, out, _) = harmony_job(template, request);
+            out.pending().to_string()
+        };
+        let opens = |opened: &str| HARMONY_OPENS.replace("OPENS", opened);
+        // always adds `<|start|>assistant` and the prefill
+        let ignores_generation_prompt = |opened: &str| {
+            format!(
+                "{{% for m in messages %}}<|start|>{{{{ m.role }}}}<|message|>{{{{ m.content }}}}<|end|>{{% endfor %}}<|start|>assistant{opened}"
+            )
+        };
+        assert_eq!(
+            [
+                pending(opens(prefill), second_turn(structured.clone())),
+                pending(opens(call), second_turn(required)),
+                pending(ignores_generation_prompt(prefill), structured),
+            ],
+            [prefill, call, prefill]
         );
     }
 

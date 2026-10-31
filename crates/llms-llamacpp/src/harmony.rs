@@ -944,30 +944,35 @@ mod tests {
         assert_eq!(free.route, Route::Reasoning);
     }
 
-    /// A structured reply's final body reads `<|end|>` as text, since its JSON may spell one.
-    /// In the prompt, an `<|end|>` the next message's `<|start|>` follows is where the template
-    /// closed a message, as it closes an earlier turn's final message, so the reply still goes on
-    /// from the message the prompt leaves open, `<|end|>` in its JSON included.
+    /// What a generation prompt adds is read by a reply's rules, so the markers a prefill's
+    /// JSON spells are the prefill's, `<|end|><|start|>` included: in a structured reply's final
+    /// message, which reads `<|end|>` as text, and in a call's unfinished arguments.
     #[test]
-    fn an_earlier_turn_closes_where_the_next_message_starts() {
-        let history = "<|start|>user<|message|>Capital?<|end|><|start|>assistant<|channel|>final<|message|>{\"answer\":\"Paris\"}<|end|><|start|>user<|message|>Second city?<|end|>";
-        let after = |opened: &str| {
-            Reader::new(TEST_MARKERS, Vec::new(), Held::Reply)
-                .after(&format!("{history}<|start|>assistant{opened}"))
-        };
-        let begun = after("<|channel|>final<|message|>{\"note\":\"<|end|>\",\"answer\":\"Ly");
+    fn a_prefill_keeps_the_markers_its_json_spells() {
+        let structured = Reader::new(TEST_MARKERS, Vec::new(), Held::Reply).after(
+            "<|start|>assistant<|channel|>final<|message|>{\"note\":\"<|end|><|start|>\",\"answer\":\"Ly",
+        );
         assert_eq!(
-            (begun.route.clone(), begun.pending(), begun.begun.as_str()),
+            (
+                structured.route.clone(),
+                structured.pending(),
+                structured.begun.as_str()
+            ),
             (
                 Route::Content { last: true },
-                "<|channel|>final<|message|>{\"note\":\"<|end|>\",\"answer\":\"Ly",
-                "{\"note\":\"<|end|>\",\"answer\":\"Ly"
+                "<|channel|>final<|message|>{\"note\":\"<|end|><|start|>\",\"answer\":\"Ly",
+                "{\"note\":\"<|end|><|start|>\",\"answer\":\"Ly"
             )
         );
-        let opened = after("<|channel|>final<|message|>");
+        let call = Reader::new(TEST_MARKERS, vec!["f".to_string()], Held::Call).after(
+            "<|start|>assistant<|channel|>commentary to=functions.f<|message|>{\"a\":\"<|end|><|start|>",
+        );
         assert_eq!(
-            (opened.route.clone(), opened.opened(), opened.pending()),
-            (Route::Content { last: true }, &Opened::Final, "")
+            call.route,
+            Route::Call {
+                name: "f".to_string(),
+                arguments: "{\"a\":\"<|end|><|start|>".to_string()
+            }
         );
     }
 
