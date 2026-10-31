@@ -65,6 +65,7 @@ pub mod file_schema_drift;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
+pub mod fresh_file_listing;
 pub mod function_support;
 pub mod iceberg;
 pub mod incremental_append;

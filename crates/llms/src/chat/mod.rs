@@ -40,6 +40,7 @@ use async_openai::types::chat::{
 #[cfg(feature = "local_llm")]
 pub mod engine;
 #[cfg(feature = "local_llm")]
+pub mod gguf_files;
 mod gguf_header;
 #[cfg(feature = "local_llm")]
 pub mod hf_files;
@@ -362,9 +363,11 @@ use crate::hf::HubParams;
 /// the cache's snapshot directory: it never downloads anything itself.
 /// `model_type` is the type of model, if needed to be explicit. Often this can
 ///    be inferred from the `.model_type` key in a HF's `config.json`, or from the GGUF metadata.
-/// `gguf_files` are the GGUF files within the huggingface model repo to load the model from,
-///    in the order the model lists them: every shard, and any MTP draft head. A registered
-///    engine that serves them gets them all; mistral.rs loads the first.
+/// `files` are the model's `files`, as the Spicepod lists them: GGUF files within the repo,
+///    or a quantization by name (`UD-Q4_K_XL`), resolved against the repo
+///    ([`gguf_files::resolve`]); with none, a GGUF repo's largest quantization that fits the
+///    memory the engine reports. A registered engine that serves the GGUF files gets them all,
+///    every shard and any draft head; mistral.rs loads the first.
 /// `hub` is the model's `hf_token` and `hf_endpoint`.
 /// `distributed` optionally runs the model tensor-parallel across multiple nodes.
 /// `reasoning` names the model and its `reasoning_effort` default for the load-time check.
@@ -372,50 +375,55 @@ use crate::hf::HubParams;
 pub async fn create_hf_model(
     model_id: &str,
     model_type: Option<&str>,
-    gguf_files: &[PathBuf],
+    files: &[&str],
     hub: HubParams<'_>,
     chat_template_literal: Option<&str>,
     distributed: Option<DistributedConfig>,
     reasoning: ReasoningDefault<'_>,
 ) -> Result<Arc<dyn Chat>> {
-    let gguf = gguf_files
-        .iter()
-        .map(|file| {
-            file.to_str().ok_or_else(|| Error::FailedToLoadModel {
-                source: format!("the GGUF path '{}' is not valid UTF-8", file.display()).into(),
-            })
-        })
-        .collect::<Result<Vec<&str>>>()?;
     let download_error = |error: huggingface_hub::DownloadError| Error::FailedToDownloadModel {
         configuration: error.is_configuration_error(),
         source: Box::new(error),
     };
+    // Every node of a split model resolves the files itself, and each would choose by its own
+    // memory, so a split model takes only a repository's one quantization: every node must name
+    // the same files.
+    let budget = if distributed.is_some() {
+        hf_files::Budget::Split
+    } else {
+        engine::free_memory().map_or(hf_files::Budget::Unmeasured, hf_files::Budget::Free)
+    };
     // A rank other than 0 of a model an engine splits across nodes never reads the weights (the
-    // head sends each rank its share), so it doesn't download them. It reads the first shard's
-    // header from the Hub instead, to decide as the head does.
+    // head sends each rank its share), so it doesn't download them. It resolves the files from
+    // the Hub's listing and reads the first shard's header instead, to decide as the head does.
     if let Some(cfg) = distributed.as_ref()
         && cfg.node_rank > 0
-        && let Some(engine) = engine::engine_for(gguf_files)
-        && engine.distributed.is_some()
     {
-        let architecture = hf_files::model_architecture(model_id, &gguf, hub, reasoning.model_name)
-            .await
-            .map_err(download_error)?;
-        if engine.splits(architecture.as_deref()) {
+        let resolved =
+            hf_files::model_architecture(model_id, files, budget, hub, reasoning.model_name)
+                .await
+                .map_err(download_error)?;
+        let gguf_files: Vec<PathBuf> = resolved.gguf.iter().map(PathBuf::from).collect();
+        if let Some(engine) = engine::engine_for(&gguf_files)
+            && engine.distributed.is_some()
+            && engine.splits(resolved.architecture.as_deref())
+        {
             ensure_distributed_build()?;
             let options = LocalModelOptions {
                 reasoning,
                 distributed: Some(cfg),
                 ..LocalModelOptions::default()
             };
-            return (engine.load)(gguf_files, options).await;
+            return (engine.load)(&gguf_files, options).await;
         }
     }
-    let dir = hf_files::download_model(model_id, &gguf, hub, reasoning.model_name)
-        .await
-        .map_err(download_error)?;
+    let hf_files::Downloaded { dir, gguf } =
+        hf_files::download_model(model_id, files, budget, hub, reasoning.model_name)
+            .await
+            .map_err(download_error)?;
+    let gguf_files: Vec<PathBuf> = gguf.iter().map(PathBuf::from).collect();
     let weights: Vec<PathBuf> = gguf_files.iter().map(|file| dir.join(file)).collect();
-    if let Some(engine) = engine::engine_for(gguf_files)
+    if let Some(engine) = engine::engine_for(&gguf_files)
         && (distributed.is_none() || engine.splits_weights(&weights).await)
     {
         if distributed.is_some() {
@@ -447,7 +455,7 @@ pub async fn create_hf_model(
     mistral::MistralLlama::from_snapshot(
         &dir,
         model_type,
-        gguf.first().copied(),
+        gguf.first().map(String::as_str),
         chat_template_literal,
         ring_config,
         reasoning,
