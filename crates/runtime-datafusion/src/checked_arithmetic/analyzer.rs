@@ -25,13 +25,13 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DFSchema, Result};
 use datafusion::config::ConfigOptions;
-use datafusion::logical_expr::expr::BinaryExpr;
+use datafusion::logical_expr::expr::{BinaryExpr, ScalarFunction};
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
 use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan};
 use datafusion::optimizer::AnalyzerRule;
 
 use super::is_integer_arith_type;
-use super::op::checked_op_udf;
+use super::op::{checked_op_udf, checked_udf_operator};
 
 /// Analyzer rule that replaces integer `+` / `-` / `*` with checked kernels.
 #[derive(Debug, Default)]
@@ -93,4 +93,38 @@ fn rewrite_integer_arith(expr: Expr, schema: &DFSchema) -> Transformed<Expr> {
         return Transformed::no(Expr::BinaryExpr(BinaryExpr { left, op, right }));
     }
     Transformed::yes(udf.call(vec![*left, *right]))
+}
+
+/// Puts back the integer `+` / `-` / `*` that [`CheckedIntegerOverflow`]
+/// replaced with checked kernels.
+///
+/// This is for an expression that leaves `DataFusion` for a source that
+/// evaluates it itself, such as an `UPDATE`'s assignments or a `DELETE`'s
+/// filters written through to the federated source. The source does not know
+/// the `__spice_checked_*` names and applies its own overflow rules, as it
+/// does for a federated read.
+///
+/// # Errors
+///
+/// Returns an error when the expression tree cannot be traversed.
+pub fn restore_integer_operators(expr: Expr) -> Result<Expr> {
+    expr.transform_up(|expr| Ok(restore_integer_operator(expr)))
+        .map(|transformed| transformed.data)
+}
+
+fn restore_integer_operator(expr: Expr) -> Transformed<Expr> {
+    let Expr::ScalarFunction(ScalarFunction { func, args }) = expr else {
+        return Transformed::no(expr);
+    };
+    let Some(op) = checked_udf_operator(&func) else {
+        return Transformed::no(Expr::ScalarFunction(ScalarFunction { func, args }));
+    };
+    match <[Expr; 2]>::try_from(args) {
+        Ok([left, right]) => Transformed::yes(Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(left),
+            op,
+            Box::new(right),
+        ))),
+        Err(args) => Transformed::no(Expr::ScalarFunction(ScalarFunction { func, args })),
+    }
 }

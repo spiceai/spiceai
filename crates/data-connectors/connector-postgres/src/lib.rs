@@ -1299,6 +1299,9 @@ impl DataConnector for Postgres {
         {
             Ok(provider) => {
                 let provider = enrich_with_postgres_metadata(&self.pool, dataset, provider).await;
+                // The writer renders `UPDATE` / `DELETE` expressions as SQL, and
+                // PostgreSQL has no `__spice_checked_*` functions.
+                let provider = runtime_datafusion::checked_arithmetic::sql_rendered_dml(provider);
                 Some(ensure_changes_primary_key(dataset, &provider).map(|()| provider))
             }
             Err(e) => {

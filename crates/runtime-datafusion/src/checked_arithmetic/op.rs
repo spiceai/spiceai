@@ -72,6 +72,14 @@ pub(crate) fn checked_op_udf(op: Operator) -> Option<Arc<ScalarUDF>> {
     }
 }
 
+/// The operator `udf` replaced, when it is one of the checked kernels.
+#[must_use]
+pub(crate) fn checked_udf_operator(udf: &ScalarUDF) -> Option<Operator> {
+    udf.inner()
+        .downcast_ref::<CheckedIntegerOp>()
+        .map(|checked| checked.op)
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedIntegerOp {
     op: Operator,

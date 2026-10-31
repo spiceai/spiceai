@@ -20,17 +20,20 @@ limitations under the License.
 //! kernels (`apache/datafusion#3520`). Spice replaces `sum` with [`CheckedSum`]
 //! and rewrites integer `+` / `-` / `*` to kernels that fail on overflow.
 //! Federation still sees the original operators: the federation analyzer runs
-//! before this rewrite.
+//! before this rewrite. A table that renders `UPDATE` / `DELETE` expressions as
+//! SQL gets them back through [`sql_rendered_dml`].
 
 mod analyzer;
 mod decomposability;
+mod dml;
 mod eager;
 mod op;
 mod single_distinct;
 mod sum;
 
-pub use analyzer::CheckedIntegerOverflow;
+pub use analyzer::{CheckedIntegerOverflow, restore_integer_operators};
 pub use decomposability::complete_preaggregate_would_narrow_early;
+pub use dml::sql_rendered_dml;
 pub use eager::{
     CheckedEagerAggregation, install_checked_eager_aggregation,
     install_checked_eager_aggregation_for_distributed,

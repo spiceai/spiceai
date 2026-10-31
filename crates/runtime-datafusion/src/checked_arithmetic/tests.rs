@@ -35,7 +35,7 @@ use crate::checked_arithmetic::op::checked_op_udf;
 use crate::checked_arithmetic::{
     CHECKED_ADD_UDF_NAME, CHECKED_MUL_UDF_NAME, CHECKED_SUB_UDF_NAME, CheckedIntegerOverflow,
     install_checked_eager_aggregation, install_checked_single_distinct,
-    register_checked_arithmetic,
+    register_checked_arithmetic, restore_integer_operators,
 };
 use crate::session_config::get_df_default_config;
 
@@ -233,6 +233,63 @@ fn checked_ops_are_registered_for_plus_minus_multiply_only() {
         checked_op_udf(Operator::Multiply).expect("mul").name(),
         CHECKED_MUL_UDF_NAME
     );
+}
+
+#[test]
+fn restore_integer_operators_puts_back_what_the_analyzer_replaced() {
+    use datafusion::config::ConfigOptions;
+    use datafusion::datasource::provider_as_source;
+    use datafusion::functions::expr_fn::{abs, power};
+    use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder};
+    use datafusion::prelude::{col, lit};
+
+    let batch = overflow_table();
+    let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).expect("mem table");
+    let original = vec![
+        (col("big") + lit(1_i64)) * (col("id") - col("big")),
+        // Inside a function the rewrite leaves alone.
+        abs(col("big") + col("id")),
+        // Neither is rewritten, so neither may change.
+        col("big") / col("id"),
+        power(col("big"), col("id")),
+    ];
+    let plan = LogicalPlanBuilder::scan("t", provider_as_source(Arc::new(table)), None)
+        .and_then(|builder| builder.project(original.clone()))
+        .and_then(LogicalPlanBuilder::build)
+        .expect("projection plan");
+    // The builder qualifies the columns (`t.big`), so compare against what it built.
+    let LogicalPlan::Projection(built) = &plan else {
+        panic!("the builder makes a projection: {plan}");
+    };
+    let expected = built
+        .expr
+        .iter()
+        .cloned()
+        .map(Expr::unalias)
+        .collect::<Vec<_>>();
+
+    let analyzed = CheckedIntegerOverflow::new()
+        .analyze(plan, &ConfigOptions::default())
+        .expect("analyze");
+    let LogicalPlan::Projection(projection) = analyzed else {
+        panic!("the rule keeps the projection: {analyzed}");
+    };
+    let checked = projection.expr;
+    let rendered = checked.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert!(
+        rendered[0].contains(CHECKED_MUL_UDF_NAME)
+            && rendered[0].contains(CHECKED_ADD_UDF_NAME)
+            && rendered[0].contains(CHECKED_SUB_UDF_NAME)
+            && rendered[1].contains(CHECKED_ADD_UDF_NAME),
+        "the analyzer must have rewritten the integer operators first: {rendered:?}"
+    );
+
+    let restored = checked
+        .into_iter()
+        .map(|expr| restore_integer_operators(expr).map(Expr::unalias))
+        .collect::<datafusion::common::Result<Vec<_>>>()
+        .expect("restore");
+    assert_eq!(restored, expected);
 }
 
 #[tokio::test]
