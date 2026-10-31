@@ -74,6 +74,7 @@ use futures::{StreamExt, TryStreamExt};
 use opentelemetry::global;
 use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
 use runtime::{Runtime, auth::EndpointAuth, config::Config, datafusion::query::QueryBuilder};
+use runtime_auth::{HttpAuth, api_key::ApiKeyAuth};
 use spicepod::param::Params;
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
@@ -969,6 +970,14 @@ async fn start_flight_server() -> Result<Channel, anyhow::Error> {
 /// Starts a runtime with no datasets and returns its HTTP port and a channel to
 /// its Flight server that sends `user_agent`.
 async fn start_servers(user_agent: &str) -> Result<(u16, Channel), anyhow::Error> {
+    start_servers_with_auth(user_agent, EndpointAuth::default()).await
+}
+
+/// [`start_servers`], with the HTTP and Flight endpoints guarded by `auth`.
+async fn start_servers_with_auth(
+    user_agent: &str,
+    auth: EndpointAuth,
+) -> Result<(u16, Channel), anyhow::Error> {
     // Both listeners are bound before either is dropped, so the two ports are
     // guaranteed to differ — freeing the first before binding the second would let
     // the OS hand back the same ephemeral port.
@@ -987,9 +996,7 @@ async fn start_servers(user_agent: &str) -> Result<(u16, Channel), anyhow::Error
         .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
         .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
 
-    tokio::spawn(async move {
-        Box::pin(rt.start_servers(api_config, None, EndpointAuth::default())).await
-    });
+    tokio::spawn(async move { Box::pin(rt.start_servers(api_config, None, auth)).await });
 
     // Poll for the bind rather than sleeping: the server binds asynchronously and a
     // connection refused before it does is not a failure.
@@ -2021,6 +2028,165 @@ async fn request_header_values_do_not_add_metric_series() -> Result<(), anyhow::
     assert!(
         (series[0].get_counter().value() - f64::from(REQUESTS)).abs() < f64::EPSILON,
         "every request must still be counted"
+    );
+
+    Ok(())
+}
+
+/// The API key [`unauthenticated_requests_carry_no_client_dimension`] accepts.
+const METRICS_401_API_KEY: &str = "metrics-401-key";
+
+/// The labels of every `http_requests` series recorded for `path`, keyed by `status`.
+fn http_requests_series_for(
+    registry: &prometheus::Registry,
+    path: &str,
+) -> Vec<(HashMap<String, String>, f64)> {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == "http_requests")
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .filter(|metric| {
+            metric
+                .get_label()
+                .iter()
+                .any(|label| label.name() == "path" && label.value() == path)
+        })
+        .map(|metric| {
+            let labels = metric
+                .get_label()
+                .iter()
+                .map(|label| (label.name().to_string(), label.value().to_string()))
+                .collect();
+            (labels, metric.get_counter().value())
+        })
+        .collect()
+}
+
+/// A request that fails authentication is recorded with only the labels the
+/// runtime defines: no `client` (or `runtime*`) dimension derived from headers
+/// the caller chose before proving who it is.
+///
+/// Sends 5,000 requests to an authenticated route, each with a unique
+/// `User-Agent` and `baggage`, half without an API key. The `401`s must share one
+/// series with no `client` label, the authenticated half one series, no series
+/// may overflow the SDK's cardinality limit, and a later authenticated request
+/// must still be recorded under its own `path` and `status`.
+#[tokio::test]
+async fn unauthenticated_requests_carry_no_client_dimension() -> Result<(), anyhow::Error> {
+    const REQUESTS: u32 = 5_000;
+    const CONCURRENCY: usize = 64;
+    // Only this test hits this route, so its series are this test's alone.
+    const PATH: &str = "/v1/datasets";
+
+    let registry = &*PROMETHEUS;
+    let api_key_auth = Arc::new(ApiKeyAuth::new(vec![
+        spicepod::component::runtime::ApiKey::parse_str(METRICS_401_API_KEY),
+    ])) as Arc<dyn HttpAuth + Send + Sync>;
+    let (http_port, _channel) = start_servers_with_auth(
+        "spice-dotnet/1.0",
+        EndpointAuth::default().with_http_auth(api_key_auth),
+    )
+    .await?;
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{http_port}{PATH}");
+
+    let statuses: Vec<u16> = futures::stream::iter(0..REQUESTS)
+        .map(|i| {
+            let mut request = client
+                .get(&url)
+                .header("user-agent", format!("probe-{i}/{i} (system-{i})"))
+                .header("baggage", format!("request-{i}={i}"));
+            if i % 2 == 1 {
+                request = request.header("X-API-Key", METRICS_401_API_KEY);
+            }
+            async move {
+                request
+                    .send()
+                    .await
+                    .map(|response| response.status().as_u16())
+            }
+        })
+        .buffer_unordered(CONCURRENCY)
+        .try_collect()
+        .await?;
+    let unauthenticated = REQUESTS / 2;
+    assert_eq!(
+        statuses.iter().filter(|&&status| status == 401).count(),
+        usize::try_from(unauthenticated)?,
+        "every request without the API key must be rejected"
+    );
+
+    let series = http_requests_series_for(registry, PATH);
+    let rejected: Vec<_> = series
+        .iter()
+        .filter(|(labels, _)| labels.get("status").map(String::as_str) == Some("401"))
+        .collect();
+    assert_eq!(
+        rejected.len(),
+        1,
+        "{unauthenticated} rejected requests with unique headers must share one series, got {rejected:?}"
+    );
+    let (labels, count) = rejected[0];
+    for header_derived in ["client", "runtime", "runtime_version", "runtime_system"] {
+        assert!(
+            !labels.contains_key(header_derived),
+            "a 401 must not carry the `{header_derived}` label: {labels:?}"
+        );
+    }
+    assert!(
+        (count - f64::from(unauthenticated)).abs() < f64::EPSILON,
+        "every rejected request must still be counted, got {count}"
+    );
+
+    let accepted: Vec<_> = series
+        .iter()
+        .filter(|(labels, _)| labels.get("status").map(String::as_str) != Some("401"))
+        .collect();
+    assert_eq!(
+        accepted.len(),
+        1,
+        "authenticated requests with unique headers must share one series, got {accepted:?}"
+    );
+    assert_eq!(
+        accepted[0].0.get("client").map(String::as_str),
+        Some("other")
+    );
+
+    let overflowed: Vec<_> = registry
+        .gather()
+        .iter()
+        .filter(|family| family.name().starts_with("http_"))
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .filter(|metric| {
+            metric
+                .get_label()
+                .iter()
+                .any(|label| label.name() == "otel_metric_overflow")
+        })
+        .cloned()
+        .collect();
+    assert!(
+        overflowed.is_empty(),
+        "no http_* series may overflow the cardinality limit: {overflowed:?}"
+    );
+
+    let before = accepted[0].1;
+    client
+        .get(&url)
+        .header("user-agent", "spice-dotnet/1.0")
+        .header("X-API-Key", METRICS_401_API_KEY)
+        .send()
+        .await?
+        .error_for_status()?;
+    let after: f64 = http_requests_series_for(registry, PATH)
+        .iter()
+        .filter(|(labels, _)| labels.get("status").map(String::as_str) != Some("401"))
+        .map(|(_, count)| count)
+        .sum();
+    assert!(
+        (after - before - 1.0).abs() < f64::EPSILON,
+        "a later authenticated request must be recorded under path {PATH}"
     );
 
     Ok(())
