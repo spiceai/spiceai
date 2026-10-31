@@ -2,6 +2,7 @@
 name = "cayenne-metastore-model"
 version.workspace = true
 edition = "2024"
+license = "Apache-2.0"
 publish = false
 
 [dependencies]
