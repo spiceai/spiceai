@@ -304,6 +304,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpubits",
  "cpufeatures 0.3.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -3572,7 +3573,7 @@ dependencies = [
  "log",
  "quick-xml 0.42.0",
  "serde",
- "zip 9.1.2",
+ "zip 9.1.3",
 ]
 
 [[package]]
@@ -3626,7 +3627,7 @@ dependencies = [
  "tokenizers 0.23.2",
  "yoke",
  "zerocopy",
- "zip 9.1.2",
+ "zip 9.1.3",
 ]
 
 [[package]]
@@ -4845,7 +4846,7 @@ dependencies = [
  "url",
  "util",
  "wiremock",
- "zip 9.1.2",
+ "zip 9.1.3",
 ]
 
 [[package]]
@@ -6585,7 +6586,7 @@ dependencies = [
  "util",
  "uuid 1.23.2",
  "wiremock",
- "zip 9.1.2",
+ "zip 9.1.3",
  "zstd 0.13.3",
 ]
 
@@ -8010,7 +8011,7 @@ dependencies = [
  "tar",
  "tokio",
  "ureq 2.12.1",
- "zip 9.1.2",
+ "zip 9.1.3",
 ]
 
 [[package]]
@@ -8024,7 +8025,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "xml-rs",
- "zip 9.1.2",
+ "zip 9.1.3",
 ]
 
 [[package]]
@@ -15156,7 +15157,7 @@ dependencies = [
  "spicepod",
  "tracing",
  "yaml",
- "zip 9.1.2",
+ "zip 9.1.3",
 ]
 
 [[package]]
@@ -20763,7 +20764,7 @@ dependencies = [
  "wiremock",
  "yaml",
  "zeroize",
- "zip 9.1.2",
+ "zip 9.1.3",
 ]
 
 [[package]]
@@ -26571,18 +26572,18 @@ dependencies = [
 
 [[package]]
 name = "zeroize"
-version = "1.8.2"
+version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
+checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 dependencies = [
  "zeroize_derive",
 ]
 
 [[package]]
 name = "zeroize_derive"
-version = "1.4.3"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85a5b4158499876c763cb03bc4e49185d3cccbabb15b33c627f7884f43db852e"
+checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -26677,9 +26678,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.1.2"
+version = "9.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec2e3161de27091f18a831d9494e9c53378a34833af5c1dda35ad85849da18d6"
+checksum = "1156b39d142a34b999c2310a50455e0cb3760bf7efad0122f796d813bee26ccb"
 dependencies = [
  "aes 0.9.1",
  "bzip2",
