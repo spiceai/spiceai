@@ -20,6 +20,7 @@ arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
+ballista-core = { workspace = true }
 base64.workspace = true
 bytes = { workspace = true }
 chrono = { workspace = true }

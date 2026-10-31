@@ -255,6 +255,30 @@ impl VortexSource {
         )
     }
 
+    /// Splits one scan partition may have in flight, when that exceeds
+    /// [`Self::resolved_scan_concurrency`], or `None` for the plain concurrency.
+    ///
+    /// A scan of files in a remote object store spends most of each split waiting for
+    /// bytes, so holding only `resolved_scan_concurrency` splits in flight leaves the store
+    /// idle between a split's reads. The extra splits only fetch: decoding stays within
+    /// `resolved_scan_concurrency` because a split gives up its decode permit while it waits
+    /// on a read (see `ScanBuilder::with_split_io_overlap`). Local and in-memory stores have
+    /// no latency to hide. An unfiltered limit stays serial so it does not read ahead past
+    /// the requested rows, and an explicit `scan_concurrency` is taken at its word.
+    #[must_use]
+    pub fn resolved_scan_io_overlap(&self, base_config: &FileScanConfig) -> Option<usize> {
+        if !matches!(self.options.scan_concurrency, ScanConcurrency::Auto)
+            || (base_config.limit.is_some() && self.vortex_predicate.is_none())
+            || !reads_remote_store(base_config.object_store_url.as_str())
+        {
+            return None;
+        }
+        Some(
+            self.resolved_scan_concurrency(base_config)
+                .saturating_mul(REMOTE_SPLIT_IO_OVERLAP),
+        )
+    }
+
     /// Partition count the concurrency derivation divides across the planned files:
     /// the count the physical optimizer pushed in through [`Self::repartitioned`],
     /// falling back to the planned group count when the scan was never repartitioned.
@@ -281,16 +305,24 @@ impl FileSource for VortexSource {
             .map_or_else(|| Arc::new(DefaultPhysicalExprAdapterFactory), Arc::clone);
 
         let vortex_reader_factory = self.vortex_reader_factory.as_ref().map_or_else(
-            || Arc::new(DefaultVortexReaderFactory::new(object_store)),
+            || {
+                Arc::new(
+                    DefaultVortexReaderFactory::new(object_store).with_remote_io_wait(
+                        reads_remote_store(base_config.object_store_url.as_str()),
+                    ),
+                )
+            },
             Arc::clone,
         );
 
         let planned_file_count = planned_file_count(&base_config.file_groups);
         let target_partitions = self.effective_target_partitions(base_config);
         let scan_concurrency = self.resolved_scan_concurrency(base_config);
+        let scan_io_overlap = self.resolved_scan_io_overlap(base_config);
 
         tracing::debug!(
             scan_concurrency,
+            scan_io_overlap,
             mode = %self.options.scan_concurrency,
             target_partitions,
             planned_partitions = base_config.file_groups.len(),
@@ -321,6 +353,7 @@ impl FileSource for VortexSource {
             object_store_url: Arc::from(base_config.object_store_url.as_str()),
             projection_pushdown: self.options.projection_pushdown.enabled(),
             scan_concurrency: Some(scan_concurrency),
+            scan_io_overlap,
             runtime_access_plan_provider: self
                 .runtime_access_plan_provider
                 .as_ref()
@@ -495,6 +528,15 @@ impl FileSource for VortexSource {
     }
 }
 
+/// How many times the decoding concurrency a scan of a remote store keeps splits in flight.
+const REMOTE_SPLIT_IO_OVERLAP: usize = 8;
+
+/// Whether reads from the object store at `url` cross a network, so that a split waits on
+/// them. The local filesystem and the in-memory store answer without that wait.
+fn reads_remote_store(url: &str) -> bool {
+    !(url.starts_with("file:") || url.starts_with("memory:"))
+}
+
 fn planned_file_count(file_groups: &[FileGroup]) -> usize {
     file_groups.iter().map(FileGroup::len).sum::<usize>().max(1)
 }
@@ -538,6 +580,21 @@ mod tests {
 
     /// A ceiling high enough not to bind, for the cases under test.
     const UNCAPPED: usize = usize::MAX;
+
+    #[test]
+    fn only_remote_stores_overlap_split_io() {
+        for remote in [
+            "s3://bucket/",
+            "gs://bucket/",
+            "abfss://c@a/",
+            "http://host/",
+        ] {
+            assert!(reads_remote_store(remote), "{remote}");
+        }
+        for local in ["file:///", "memory:///"] {
+            assert!(!reads_remote_store(local), "{local}");
+        }
+    }
 
     #[test]
     fn auto_scan_concurrency_uses_file_count() {
