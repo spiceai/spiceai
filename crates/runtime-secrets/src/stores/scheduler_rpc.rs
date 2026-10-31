@@ -35,22 +35,30 @@ pub trait ClusterSecretExpander: Send + Sync {
     async fn expand_secret(
         &self,
         executor_id: &str,
+        store: &str,
         key: &str,
     ) -> Result<Option<SecretString>, String>;
 }
 
 /// Used by cluster mode to resolve secrets declared in the scheduler
-/// via the internal cluster gRPC service.
+/// via the internal cluster gRPC service. Each instance stands for one store
+/// of the scheduler, which it names in every request.
 pub struct SchedulerRPCSecretStore {
     executor_id: String,
+    store: String,
     expander: Arc<dyn ClusterSecretExpander>,
 }
 
 impl SchedulerRPCSecretStore {
     #[must_use]
-    pub fn new(expander: Arc<dyn ClusterSecretExpander>, executor_id: String) -> Self {
+    pub fn new(
+        expander: Arc<dyn ClusterSecretExpander>,
+        executor_id: String,
+        store: String,
+    ) -> Self {
         Self {
             executor_id,
+            store,
             expander,
         }
     }
@@ -59,10 +67,14 @@ impl SchedulerRPCSecretStore {
 #[async_trait]
 impl SecretStore for SchedulerRPCSecretStore {
     async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
-        tracing::trace!("SchedulerRPCSecretStore: Requesting secret {}", key);
+        tracing::trace!(
+            "SchedulerRPCSecretStore: Requesting secret {} from store {}",
+            key,
+            self.store
+        );
 
         self.expander
-            .expand_secret(&self.executor_id, key)
+            .expand_secret(&self.executor_id, &self.store, key)
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
     }

@@ -189,8 +189,9 @@ fn load_filename_into_map(filename: &str, values: &mut HashMap<String, String>) 
 
 /// Iterates parsed entries from a [`dotenv`] iterator into `values`.
 /// Keys already present are preserved, so earlier-loaded files win.
-/// Malformed lines are logged with their line number and content so users
-/// can fix them. I/O-level errors (e.g. missing file) are reported at debug
+/// Malformed lines are logged with their line number and key so users can
+/// fix them; the rest of the line can hold a secret value and is never
+/// logged. I/O-level errors (e.g. missing file) are reported at debug
 /// level because the file is optional.
 fn collect_iter<I>(iter: I, label: &str, values: &mut HashMap<String, String>)
 where
@@ -202,9 +203,7 @@ where
                 values.entry(key).or_insert(val);
             }
             Err(dotenv::Error::LineParse(line_num, content)) => {
-                tracing::warn!(
-                    "{label}: line {line_num} is malformed and was skipped: `{content}`"
-                );
+                tracing::warn!("{}", malformed_line_message(label, line_num, &content));
             }
             Err(err) => {
                 tracing::debug!("{label}: {err}");
@@ -239,11 +238,37 @@ fn export_without_overwrite(values: &HashMap<String, String>) {
     }
 }
 
+/// Names the key of a malformed `KEY=value` line, never its value. Text
+/// before `=` that is not a valid key (for example a line inside a multi-line
+/// value) is not logged.
+fn malformed_line_message(label: &str, line_num: usize, content: &str) -> String {
+    let key = content.split_once('=').map(|(key, _)| {
+        let key = key.trim();
+        key.strip_prefix("export ").unwrap_or(key).trim()
+    });
+    match key {
+        Some(key) if is_dotenv_key(key) => {
+            format!("{label}: line {line_num} (key `{key}`) is malformed and was skipped")
+        }
+        _ => format!("{label}: line {line_num} is malformed and was skipped"),
+    }
+}
+
+/// The key grammar of the `.env` parser: an ASCII letter or `_`, then ASCII
+/// alphanumerics, `_` or `.`.
+fn is_dotenv_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+}
+
 /// Iterates parsed entries from a [`dotenv`] iterator, setting each valid
 /// key-value pair into the environment. Variables already present in the
 /// environment are preserved, so earlier-loaded files take priority over later
-/// ones. Malformed lines are logged with their line number and content so users
-/// can fix them. I/O-level errors (e.g. missing file) are reported at debug
+/// ones. Malformed lines are logged with their line number and key so users can
+/// fix them. I/O-level errors (e.g. missing file) are reported at debug
 /// level because the file is optional.
 ///
 /// # Safety
@@ -308,6 +333,23 @@ mod tests {
     use secrecy::ExposeSecret;
 
     const C1_KEY: &str = "C1_PREC_KEY";
+
+    #[test]
+    fn a_malformed_line_is_reported_by_key_without_its_value() {
+        for line in ["DB_PASS=O'Brien1", "export DB_PASS=correct horse"] {
+            let message = malformed_line_message(".env", 3, line);
+            assert_eq!(
+                message,
+                ".env: line 3 (key `DB_PASS`) is malformed and was skipped"
+            );
+        }
+        for line in ["hunter2", r#"  \"private_key\": \"abc+/def==\""#] {
+            assert_eq!(
+                malformed_line_message(".env", 4, line),
+                ".env: line 4 is malformed and was skipped"
+            );
+        }
+    }
 
     fn write_env_file(path: &Path, contents: &str) {
         let mut file = std::fs::File::create(path).expect("Failed to create test .env file");

@@ -66,21 +66,23 @@ impl Iterator for SecretReplacementMatcher<'_> {
 
             let start_span = self.lexer.span().start;
 
-            let SecretReplacementToken::Identifier(store_name) = self.lexer.next()?.ok()? else {
+            // A reference that does not parse is skipped, and the search goes
+            // on to the next `${`.
+            let Some(Ok(SecretReplacementToken::Identifier(store_name))) = self.lexer.next() else {
                 continue;
             };
 
-            if self.lexer.next()?.ok()? != SecretReplacementToken::Colon {
-                continue;
-            }
-
-            let SecretReplacementToken::Identifier(key) = self.lexer.next()?.ok()? else {
+            let Some(Ok(SecretReplacementToken::Colon)) = self.lexer.next() else {
                 continue;
             };
 
-            if self.lexer.next()?.ok()? != SecretReplacementToken::End {
+            let Some(Ok(SecretReplacementToken::Identifier(key))) = self.lexer.next() else {
                 continue;
-            }
+            };
+
+            let Some(Ok(SecretReplacementToken::End)) = self.lexer.next() else {
+                continue;
+            };
 
             let end_span = self.lexer.span().end;
             return Some(ReplacementMatch {
@@ -97,6 +99,22 @@ impl Iterator for SecretReplacementMatcher<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reference_that_does_not_parse_leaves_later_references_found() {
+        let input = "postgres://${ secrets:pg.user }:${ secrets:PG_PASS }@db/app";
+        let found: Vec<(String, String, &str)> = SecretReplacementMatcher::new(input)
+            .map(|m| (m.store_name, m.key, &input[m.span]))
+            .collect();
+        assert_eq!(
+            found,
+            vec![(
+                "secrets".to_string(),
+                "PG_PASS".to_string(),
+                "${ secrets:PG_PASS }"
+            )]
+        );
+    }
 
     #[test]
     fn test_secret_lexer_basic() {
