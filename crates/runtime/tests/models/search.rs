@@ -731,7 +731,14 @@ pub async fn start_app(app: App) -> Result<Config, anyhow::Error> {
     let rt_ref_copy = Arc::clone(&rt);
     let api_config_clone = api_config.clone();
     tokio::spawn(async move {
-        Box::pin(rt_ref_copy.start_servers(api_config_clone, None, EndpointAuth::no_auth())).await
+        // `eprintln!`, not `tracing`: the test subscriber is thread-local and this task
+        // may run on another worker thread, where a bind failure would vanish.
+        if let Err(e) =
+            Box::pin(rt_ref_copy.start_servers(api_config_clone, None, EndpointAuth::no_auth()))
+                .await
+        {
+            eprintln!("Test runtime servers failed to start: {e}");
+        }
     });
 
     tokio::select! {

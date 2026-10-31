@@ -153,28 +153,24 @@ mod nsql {
     }
 }
 
-/// How long a port [`reserve_local_ports`] handed out stays off-limits to later calls:
+/// How long a port [`reserve_local_port`] handed out stays off-limits to later calls:
 /// long enough for the runtime it was promised to to build and bind it, short enough
 /// that a full test run cannot use up the range it picks from.
 const PORT_RESERVATION_TTL: Duration = Duration::from_mins(5);
 
-/// The ports [`reserve_local_ports`] handed out in this process, and when.
-///
-/// `cargo test` runs this binary's tests as threads of one process, so two runtimes
-/// started together must never be given the same port. A port is still free when it
-/// is handed out, and stays free until its runtime has finished building and binds
-/// it, so only this record keeps another test from picking it in the meantime.
+/// The ports [`reserve_local_port`] handed out in this process, and when.
 static RESERVED_PORTS: LazyLock<Mutex<HashMap<u16, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Returns `N` distinct loopback ports in `50000..60000` that no call in this process
-/// returned within [`PORT_RESERVATION_TTL`] and that nothing was listening on when
-/// checked.
+/// Returns a loopback port in `50000..60000` that no call in this process returned
+/// within [`PORT_RESERVATION_TTL`] and that nothing was listening on when checked.
 ///
-/// A port this process already handed out is skipped without being bound, so the
-/// check never occupies, even briefly, a port another test's runtime is about to
-/// bind.
-fn reserve_local_ports<const N: usize>() -> [u16; N] {
+/// `cargo test` runs this binary's tests as threads of one process, so two runtimes
+/// started together must never be given the same port. A port stays free from when
+/// it is handed out until its runtime has finished building and binds it, so only
+/// [`RESERVED_PORTS`] keeps another test from picking it in the meantime; a reserved
+/// port is skipped without being bound, so the check never occupies it either.
+fn reserve_local_port() -> u16 {
     const MAX_ATTEMPTS: usize = 1024;
 
     let mut reserved = RESERVED_PORTS
@@ -183,32 +179,24 @@ fn reserve_local_ports<const N: usize>() -> [u16; N] {
     let now = Instant::now();
     reserved.retain(|_, reserved_at| now.duration_since(*reserved_at) < PORT_RESERVATION_TTL);
     let mut rng = rand::rng();
-    let mut ports = Vec::with_capacity(N);
     for _ in 0..MAX_ATTEMPTS {
-        if ports.len() == N {
-            break;
-        }
         let port: u16 = rng.random_range(50000..60000);
         let Entry::Vacant(entry) = reserved.entry(port) else {
             continue;
         };
         // Another process listening on the port would fail the runtime's bind.
-        if std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err() {
-            continue;
+        if std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            entry.insert(now);
+            return port;
         }
-        entry.insert(now);
-        ports.push(port);
     }
-    ports.try_into().unwrap_or_else(|ports: Vec<u16>| {
-        panic!(
-            "found only {} of {N} free loopback ports in 50000..60000 after {MAX_ATTEMPTS} attempts",
-            ports.len()
-        )
-    })
+    panic!("found no free loopback port in 50000..60000 after {MAX_ATTEMPTS} attempts")
 }
 
 pub(crate) fn create_api_bindings_config() -> Config {
-    let [http_port, flight_port, metrics_port] = reserve_local_ports();
+    let http_port = reserve_local_port();
+    let flight_port = reserve_local_port();
+    let metrics_port = reserve_local_port();
 
     let localhost: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
