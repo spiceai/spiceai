@@ -462,6 +462,7 @@ impl LlamaCpp {
                         enable_thinking,
                         effort,
                         Vec::new(),
+                        true,
                     )
                     .ok()
                 })
@@ -499,11 +500,14 @@ impl LlamaCpp {
         self.reused_prompt_tokens.load(Ordering::Relaxed)
     }
 
+    /// The conversation as the chat template renders it, with its generation prompt when
+    /// `generation_prompt`.
     fn prompt(
         &self,
         messages: &[ChatCompletionRequestMessage],
         reasoning: ReasoningControls,
         tools: Vec<Tool>,
+        generation_prompt: bool,
     ) -> std::result::Result<String, OpenAIError> {
         render(
             &self.template,
@@ -512,6 +516,7 @@ impl LlamaCpp {
             reasoning.enable_thinking,
             reasoning.reasoning_effort,
             tools,
+            generation_prompt,
         )
         .map_err(|e| {
             OpenAIError::InvalidArgument(format!("Failed to render the chat template: {e}"))
@@ -587,10 +592,23 @@ impl LlamaCpp {
         } else {
             harmony::Held::Nothing
         };
-        let prompt = self.prompt(&req.messages, reasoning, tools.clone())?;
-        // Every choice's reply starts where the prompt leaves it, so the prompt is read once.
-        let reader =
-            markers.map(|markers| harmony::Reader::new(markers, nameable, held).after(&prompt));
+        let prompt = self.prompt(&req.messages, reasoning, tools.clone(), true)?;
+        // Every choice's reply starts where the prompt leaves it, so the prompt is read once:
+        // what the generation prompt adds after the conversation, whose messages the template
+        // closes, so that only the generation prompt's own markers open or close anything. A
+        // template that adds the same either way, or renders the conversation differently
+        // without a generation prompt, is read whole.
+        let reader = markers.map(|markers| {
+            let conversation = self
+                .prompt(&req.messages, reasoning, tools.clone(), false)
+                .ok();
+            let generation = conversation
+                .as_deref()
+                .and_then(|conversation| prompt.strip_prefix(conversation))
+                .filter(|generation| !generation.is_empty())
+                .unwrap_or(&prompt);
+            harmony::Reader::new(markers, nameable, held).after(generation)
+        });
         // A Harmony grammar holds the reply by the vocabulary's markers, from where the prompt
         // leaves it.
         let grammar = match &reader {
@@ -871,7 +889,8 @@ fn tool_call(call: &ToolCallResponse) -> ChatCompletionMessageToolCalls {
     })
 }
 
-/// Renders a conversation the way the mistral.rs engine does.
+/// Renders a conversation the way the mistral.rs engine does, with the template's generation
+/// prompt when `generation_prompt`.
 fn render(
     template: &Template,
     special: &SpecialTokens,
@@ -879,10 +898,11 @@ fn render(
     enable_thinking: Option<bool>,
     reasoning_effort: Option<TemplateReasoningEffort>,
     tools: Vec<Tool>,
+    generation_prompt: bool,
 ) -> std::result::Result<String, String> {
     apply_chat_template_to(
         messages,
-        true,
+        generation_prompt,
         enable_thinking,
         reasoning_effort,
         &ChatTemplateValue(template.clone()),
