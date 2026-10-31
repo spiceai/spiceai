@@ -128,6 +128,15 @@ async fn test_refresh_matches_source(engine: &str, mode: RefreshCase) -> Result<
     .await
 }
 
+async fn test_upsert_history_for_engine(engine: &str) -> Result<(), anyhow::Error> {
+    upsert_history_matches_postgres_source(engine, |port| {
+        let acceleration_params =
+            (engine == "postgres").then(|| get_postgres_acceleration_params(port));
+        get_acceleration_config_append(engine, acceleration_params)
+    })
+    .await
+}
+
 /// Append or full refresh of `engine` against the labeled `PostgreSQL` source.
 ///
 /// `configure` builds the acceleration after the container port is known. The
@@ -186,7 +195,16 @@ pub(crate) async fn refresh_matches_postgres_source(
             // The source moves again and Spice is not refreshed. A scan of the acceleration
             // still returns `snapshot`. A scan of the federated source returns the probe row.
             insert_labeled(&db_conn, instants.probe, -1, "not-refreshed").await?;
-            assert_acceleration_held(engine, mode_name, &db_conn, &rt, &snapshot).await?;
+            assert_acceleration_held(
+                engine,
+                mode_name,
+                PROJECTION_SQL,
+                &db_conn,
+                &rt,
+                &snapshot,
+                |answer| column_has_int(answer, "n", -1),
+            )
+            .await?;
 
             running_container.cleanup().await;
             Ok(())
@@ -273,21 +291,19 @@ pub(crate) async fn upsert_history_matches_postgres_source(
                  (date_trunc('milliseconds', now()) + interval '10 seconds', 'not-refreshed')",
             )
             .await?;
-            let postgres = answer_from_postgres(&db_conn, UPSERT_PROJECTION_SQL).await?;
-            let spice = answer_from_spice(&rt, UPSERT_PROJECTION_SQL).await?;
-            anyhow::ensure!(
-                id_value_pairs(&postgres)?.contains(&(4, Some("not-refreshed".to_string()))),
-                "{engine} append-upsert: the probe row did not land in PostgreSQL\n  postgres: {postgres:?}"
-            );
-            assert_eq!(
-                sorted_rows(&spice),
-                sorted_rows(&snapshot),
-                "{engine} append-upsert: Spice returned the row inserted into PostgreSQL after refresh, so this query did not read the acceleration\n  spice: {spice:?}\n  snapshot: {snapshot:?}\n  postgres: {postgres:?}"
-            );
-            eprintln!(
-                "compared engine={engine} mode=append-upsert stage=post-refresh-probe rows={} held acceleration snapshot",
-                spice.rows.len()
-            );
+            assert_acceleration_held(
+                engine,
+                "append-upsert",
+                UPSERT_PROJECTION_SQL,
+                &db_conn,
+                &rt,
+                &snapshot,
+                |answer| {
+                    Ok(int_text_pairs(answer, "id", "value")?
+                        .contains(&(4, Some("not-refreshed".to_string()))))
+                },
+            )
+            .await?;
 
             running_container.cleanup().await;
             Ok(())
@@ -303,18 +319,7 @@ async fn compare_upsert_stage(
 ) -> Result<Answer, anyhow::Error> {
     let postgres_projection = answer_from_postgres(db_conn, UPSERT_PROJECTION_SQL).await?;
     let spice_projection = answer_from_spice(rt, UPSERT_PROJECTION_SQL).await?;
-    let expected: Vec<(i64, Option<String>)> = expected_pairs
-        .iter()
-        .map(|(id, value)| (*id, value.map(str::to_string)))
-        .collect();
-    let pairs = id_value_pairs(&postgres_projection)?;
-    anyhow::ensure!(
-        pairs == expected,
-        "{} {} {}: PostgreSQL does not hold the written (id, value) rows\n  postgres: {pairs:?}\n  written: {expected:?}",
-        stage.engine,
-        stage.mode,
-        stage.name
-    );
+    assert_inserted_pairs(stage, &postgres_projection, ("id", "value"), expected_pairs)?;
     assert_same_multiset(
         stage.engine,
         stage.mode,
@@ -340,26 +345,6 @@ async fn compare_upsert_stage(
     }
 
     Ok(spice_projection)
-}
-
-/// `(id, value)` from a projection, sorted by `id`. A NULL `value` is `None`.
-fn id_value_pairs(answer: &Answer) -> Result<Vec<(i64, Option<String>)>, anyhow::Error> {
-    let id_idx = column_index(answer, "id")?;
-    let value_idx = column_index(answer, "value")?;
-    let mut pairs = Vec::with_capacity(answer.rows.len());
-    for row in &answer.rows {
-        let Cell::Int(id) = row[id_idx] else {
-            anyhow::bail!("column 'id' is not an integer: {row:?}");
-        };
-        let value = match &row[value_idx] {
-            Cell::Text(value) => Some(value.clone()),
-            Cell::Null => None,
-            Cell::Int(_) => anyhow::bail!("column 'value' is not text: {row:?}"),
-        };
-        pairs.push((id, value));
-    }
-    pairs.sort();
-    Ok(pairs)
 }
 
 fn acceleration_for(
@@ -410,13 +395,11 @@ async fn compare_stage(
 ) -> Result<Answer, anyhow::Error> {
     let postgres_projection = answer_from_postgres(db_conn, PROJECTION_SQL).await?;
     let spice_projection = answer_from_spice(rt, PROJECTION_SQL).await?;
-    assert_inserted_pairs(
-        stage.engine,
-        stage.mode,
-        stage.name,
-        &postgres_projection,
-        expected_pairs,
-    )?;
+    let expected_pairs: Vec<(i64, Option<&str>)> = expected_pairs
+        .iter()
+        .map(|(n, label)| (*n, Some(*label)))
+        .collect();
+    assert_inserted_pairs(stage, &postgres_projection, ("n", "label"), &expected_pairs)?;
     assert_epochs(
         stage.engine,
         stage.mode,
@@ -469,22 +452,26 @@ async fn compare_stage(
     Ok(spice_projection)
 }
 
+/// `has_probe` recognizes the probe row inserted into `PostgreSQL` after the last refresh.
+/// `sql` must be the statement that produced `snapshot`.
 async fn assert_acceleration_held(
     engine: &str,
     mode: &str,
+    sql: &str,
     db_conn: &PostgresConnection,
     rt: &Arc<Runtime>,
     snapshot: &Answer,
+    has_probe: impl Fn(&Answer) -> Result<bool, anyhow::Error>,
 ) -> Result<(), anyhow::Error> {
-    let postgres = answer_from_postgres(db_conn, PROJECTION_SQL).await?;
-    let spice = answer_from_spice(rt, PROJECTION_SQL).await?;
+    let postgres = answer_from_postgres(db_conn, sql).await?;
+    let spice = answer_from_spice(rt, sql).await?;
     anyhow::ensure!(
-        column_has_int(&postgres, "n", -1)?,
+        has_probe(&postgres)?,
         "{engine} {mode}: the probe row did not land in PostgreSQL\n  postgres: {postgres:?}"
     );
     anyhow::ensure!(
-        !column_has_int(snapshot, "n", -1)?,
-        "{engine} {mode}: the pre-probe snapshot already contained n = -1\n  snapshot: {snapshot:?}"
+        !has_probe(snapshot)?,
+        "{engine} {mode}: the pre-probe snapshot already contained the probe row\n  snapshot: {snapshot:?}"
     );
     assert!(
         !spice.rows.is_empty(),
@@ -546,21 +533,23 @@ fn assert_same_multiset(
 }
 
 fn assert_inserted_pairs(
-    engine: &str,
-    mode: &str,
-    stage: &str,
+    stage: &Stage<'_>,
     postgres: &Answer,
-    expected_pairs: &[(i64, &str)],
+    (int_column, text_column): (&str, &str),
+    expected_pairs: &[(i64, Option<&str>)],
 ) -> Result<(), anyhow::Error> {
-    let pairs = int_text_pairs(postgres, "n", "label")?;
-    let mut expected: Vec<(i64, String)> = expected_pairs
+    let pairs = int_text_pairs(postgres, int_column, text_column)?;
+    let mut expected: Vec<(i64, Option<String>)> = expected_pairs
         .iter()
-        .map(|(n, label)| (*n, (*label).to_string()))
+        .map(|(n, text)| (*n, text.map(str::to_string)))
         .collect();
     expected.sort();
     anyhow::ensure!(
         pairs == expected,
-        "{engine} {mode} {stage}: PostgreSQL does not hold the inserted (n, label) rows\n  postgres: {pairs:?}\n  inserted: {expected:?}"
+        "{} {} {}: PostgreSQL does not hold the written ({int_column}, {text_column}) rows\n  postgres: {pairs:?}\n  written: {expected:?}",
+        stage.engine,
+        stage.mode,
+        stage.name
     );
     Ok(())
 }
@@ -669,11 +658,12 @@ fn int_at(answer: &Answer, row: &[Cell], name: &str) -> Result<i64, anyhow::Erro
     }
 }
 
+/// `(int, text)` pairs sorted by value. A NULL text cell is `None`.
 fn int_text_pairs(
     answer: &Answer,
     int_column: &str,
     text_column: &str,
-) -> Result<Vec<(i64, String)>, anyhow::Error> {
+) -> Result<Vec<(i64, Option<String>)>, anyhow::Error> {
     let int_idx = column_index(answer, int_column)?;
     let text_idx = column_index(answer, text_column)?;
     let mut pairs = Vec::with_capacity(answer.rows.len());
@@ -681,10 +671,12 @@ fn int_text_pairs(
         let Cell::Int(n) = row[int_idx] else {
             anyhow::bail!("column '{int_column}' is not an integer: {row:?}");
         };
-        let Cell::Text(label) = &row[text_idx] else {
-            anyhow::bail!("column '{text_column}' is not text: {row:?}");
+        let text = match &row[text_idx] {
+            Cell::Text(text) => Some(text.clone()),
+            Cell::Null => None,
+            Cell::Int(_) => anyhow::bail!("column '{text_column}' is not text: {row:?}"),
         };
-        pairs.push((n, label.clone()));
+        pairs.push((n, text));
     }
     pairs.sort();
     Ok(pairs)
@@ -1019,10 +1011,7 @@ async fn test_acceleration_refresh_arrow_append_iso8601() -> Result<(), anyhow::
 #[tokio::test]
 async fn test_acceleration_refresh_arrow_append_upsert_history() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    upsert_history_matches_postgres_source("arrow", |_port| {
-        get_acceleration_config_append("arrow", None)
-    })
-    .await
+    test_upsert_history_for_engine("arrow").await
 }
 
 #[tokio::test]
@@ -1043,10 +1032,7 @@ async fn test_acceleration_refresh_duckdb_append_variant() -> Result<(), anyhow:
 #[tokio::test]
 async fn test_acceleration_refresh_duckdb_append_upsert_history() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    upsert_history_matches_postgres_source("duckdb", |_port| {
-        get_acceleration_config_append("duckdb", None)
-    })
-    .await
+    test_upsert_history_for_engine("duckdb").await
 }
 
 #[cfg(feature = "duckdb")]
@@ -1068,10 +1054,7 @@ async fn test_acceleration_refresh_sqlite_append_variant() -> Result<(), anyhow:
 #[tokio::test]
 async fn test_acceleration_refresh_sqlite_append_upsert_history() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    upsert_history_matches_postgres_source("sqlite", |_port| {
-        get_acceleration_config_append("sqlite", None)
-    })
-    .await
+    test_upsert_history_for_engine("sqlite").await
 }
 
 #[cfg(feature = "sqlite")]
@@ -1093,10 +1076,7 @@ async fn test_acceleration_refresh_postgres_append_variant() -> Result<(), anyho
 #[tokio::test]
 async fn test_acceleration_refresh_postgres_append_upsert_history() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    upsert_history_matches_postgres_source("postgres", |port| {
-        get_acceleration_config_append("postgres", Some(get_postgres_acceleration_params(port)))
-    })
-    .await
+    test_upsert_history_for_engine("postgres").await
 }
 
 #[cfg(feature = "postgres-accel")]
