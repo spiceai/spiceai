@@ -3755,10 +3755,17 @@ mod tests {
     /// A template may write the reply's role header whatever is asked for and add the rest of
     /// the generation prompt only when asked, so what the generation prompt adds starts no
     /// message: the reply then goes on from the message the conversation leaves open, after
-    /// an earlier turn's closed final message, with and without a grammar.
+    /// an earlier turn's closed final message, with and without a grammar. A `<|start|>` the
+    /// body of that message spells is the body's, whether the generation prompt adds it or the
+    /// template writes it whatever is asked for, and so are the markers an earlier message
+    /// spells.
     #[test]
     fn a_harmony_header_split_across_the_generation_prompt_is_read_whole() {
-        let split = "{% for m in messages %}<|start|>{{ m.role }}{% if m.role == 'assistant' %}<|channel|>final{% endif %}<|message|>{{ m.content }}<|end|>{% endfor %}<|start|>assistant{% if add_generation_prompt %}<|channel|>final<|message|>{% endif %}";
+        let split = |always: &str, added: &str| {
+            format!(
+                "{{% for m in messages %}}<|start|>{{{{ m.role }}}}{{% if m.role == 'assistant' %}}<|channel|>final{{% endif %}}<|message|>{{{{ m.content }}}}<|end|>{{% endfor %}}<|start|>assistant{always}{{% if add_generation_prompt %}}{added}{{% endif %}}"
+            )
+        };
         let second_turn = |mut request: serde_json::Value| {
             request["messages"] = serde_json::json!([
                 { "role": "user", "content": "What is the capital of France?" },
@@ -3767,8 +3774,8 @@ mod tests {
             ]);
             request
         };
-        let read = |request: serde_json::Value, reply: &str| {
-            let (_llama, _, sampling, mut out, rx) = harmony_job(split.to_string(), request);
+        let read = |template: String, request: serde_json::Value, reply: &str| {
+            let (_llama, _, sampling, mut out, rx) = harmony_job(template, request);
             let root = sampling.grammar.as_deref().and_then(|grammar| {
                 grammar
                     .lines()
@@ -3784,18 +3791,48 @@ mod tests {
             (sent, root, pending)
         };
         let structured = serde_json::json!({ "response_format": { "type": "json_object" } });
+        let spelled_pair = serde_json::json!({
+            "messages": [{ "role": "user", "content": "Say <|end|><|start|> verbatim." }],
+        });
+        let opened = "<|channel|>final<|message|>";
+        let rome = |content: &str| -> (
+            std::result::Result<Vec<String>, String>,
+            Option<String>,
+            String,
+        ) { (Ok(vec![content.to_string()]), None, String::new()) };
         assert_eq!(
             [
-                read(serde_json::json!({}), "Rome<|return|>"),
-                read(second_turn(structured), "{\"capital\":\"Rome\"}<|return|>"),
+                read(split("", opened), serde_json::json!({}), "Rome<|return|>"),
+                read(
+                    split("", opened),
+                    second_turn(structured),
+                    "{\"capital\":\"Rome\"}<|return|>"
+                ),
+                // a `<|start|>` in the body the generation prompt adds
+                read(
+                    split("", "<|channel|>final<|message|>Note: <|start|>!"),
+                    serde_json::json!({}),
+                    "Rome<|return|>"
+                ),
+                // a `<|start|>` in the body the template writes whatever is asked for
+                read(
+                    split("<|channel|>final<|message|>Note: <|start|>", "!"),
+                    serde_json::json!({}),
+                    "Rome<|return|>"
+                ),
+                // the pair an earlier message spells
+                read(split("", opened), spelled_pair, "Rome<|return|>"),
             ],
             [
-                (Ok(vec!["c:Rome".to_string()]), None, String::new()),
+                rome("c:Rome"),
                 (
                     Ok(vec!["c:{\"capital\":\"Rome\"}".to_string()]),
                     Some("reply-root".to_string()),
                     String::new()
                 ),
+                rome("c:Note: <|start|>!Rome"),
+                rome("c:Note: <|start|>!Rome"),
+                rome("c:Rome"),
             ]
         );
     }
