@@ -125,7 +125,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1f0744b900e69e1b3fafa721aa4283bd4b048a61` | `spiceai-0.11.0-df-55` |
 | [llama.cpp](#llamacpp) | `a337bb5ce3590beb8763494b4381fe830bac0bc8` | `spiceai-b11803` |
-| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `1404d00e3a46acc640c345de826ccd8962db5710` | `lukim/mistral-think-tags` (TEMPORARY: spiceai/mistral.rs#58) |
+| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [orc-rust](#orc-rust) | `d9632e7ae973456c81c660c04e5f55cc86489bcb` | `spiceai-0.9` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
@@ -736,8 +736,8 @@ GLM-5.3 decode speedups on top of that, spiceai/mistral.rs#50, squash-merged as
 as `aa8e8d43`, the tool-call parser, spiceai/mistral.rs#53, squash-merged as `fcd94520`,
 ring collectives over RDMA, spiceai/mistral.rs#54, squash-merged as `2f58f444`, the
 DeepSeek-V4 DSML tool-call parser, spiceai/mistral.rs#55, squash-merged as
-`e40436e4`, the candle pin at `zip` 9.1, and spiceai/mistral.rs#58, pinned at its head
-`1404d00e` until it merges, Mistral's `[THINK]` reasoning, so `git diff v0.9.4 1404d00e`
+`e40436e4`, the candle pin at `zip` 9.1, and spiceai/mistral.rs#58, squash-merged as
+`d7ddf3bb`, Mistral's `[THINK]` reasoning, so `git diff v0.9.4 d7ddf3bb`
 is the whole fork delta. #47 built it in 32 commits. The first replays the Spice patches from the
 `v0.9.0` line: `glm-dsa`
 GGUF loading, the i-quant MoE fallback, ring tensor parallelism past two ranks,
