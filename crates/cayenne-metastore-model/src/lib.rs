@@ -12,6 +12,7 @@ mod dataset_lifecycle;
 mod floors;
 mod intent_partitioned;
 mod intent_roll_forward;
+mod object_names;
 mod position_deletes;
 mod read_programs;
 mod replicas;
@@ -159,6 +160,38 @@ pub fn runs() -> Vec<Run> {
             bound: 2,
             seed: None,
             failure: "I10 source append prefix exactly once",
+        },
+        Run {
+            name: "object-names",
+            family: "object-names",
+            mode: "object-names",
+            bound: 2,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "object-names-generation-only",
+            family: "object-names",
+            mode: "object-names-generation-only",
+            bound: 2,
+            seed: None,
+            failure: "no name created with different bytes",
+        },
+        Run {
+            name: "object-names-no-generation",
+            family: "object-names",
+            mode: "object-names-no-generation",
+            bound: 2,
+            seed: None,
+            failure: "no name created with different bytes",
+        },
+        Run {
+            name: "object-names-reuse-unit-id",
+            family: "object-names",
+            mode: "object-names-reuse-unit-id",
+            bound: 2,
+            seed: None,
+            failure: "no name created with different bytes",
         },
         Run {
             name: "standby",
@@ -2490,8 +2523,9 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
         && run.failure.is_empty()
         && (run.mode.contains("remote-gc") || run.mode.contains("checkpoint"))
         && *expectation == Expectation::Sometimes;
-    let standby_required =
-        run.family == "standby" && run.failure.is_empty() && *expectation == Expectation::Sometimes;
+    let standby_required = matches!(run.family, "standby" | "object-names")
+        && run.failure.is_empty()
+        && *expectation == Expectation::Sometimes;
     let promotion_required = run.family == "cold-promotion"
         && run.failure.is_empty()
         && *expectation == Expectation::Sometimes;
@@ -2686,6 +2720,7 @@ where
                 || run.name.starts_with("source-")
                 || run.family == "retention"
                 || run.family == "standby"
+                || run.family == "object-names"
                 || run.family == "intent-roll-forward"
                 || run.family == "replicas"
                 || run.mode.contains("restart")
@@ -2741,6 +2776,7 @@ pub fn run(name: &str) -> Result<(), String> {
         "dataset-lifecycle" => check(dataset_lifecycle::Protocol::new(r.mode, r.bound), r),
         "source-positions" => check(source_positions::Protocol::new(r.mode, r.bound), r),
         "standby" => check(standby::Protocol::new(r.mode), r),
+        "object-names" => check(object_names::Protocol::new(r.mode, r.bound), r),
         "action-compatibility" => check(action_compatibility::Protocol::new(r.mode), r),
         "retention" => check(retention::Protocol::new(r.mode), r),
         "replicas" => check(replicas::Protocol::new(r.mode), r),

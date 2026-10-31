@@ -33,6 +33,7 @@ fn main() -> Result<(), String> {
                 "commits-restart-turnover",
                 "unknown-action-refusal",
                 "naming",
+                "object-names",
                 "table-seq",
                 "delete-coverage",
                 "pk-index-checkpoint",
