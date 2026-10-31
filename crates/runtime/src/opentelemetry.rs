@@ -39,6 +39,7 @@ use arrow::array::new_null_array;
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::TableReference;
 use indexmap::IndexMap;
@@ -63,7 +64,8 @@ use tonic::codec::CompressionEncoding;
 
 use crate::Runtime;
 use crate::opentelemetry_store::{
-    MAX_STORE_BATCH_ROWS, OTLP_METRICS_PARAM, StoreExport, is_otlp_metrics_store_param,
+    MAX_STORE_BATCH_ROWS, MAX_STORE_BATCH_STRING_BYTES, MAX_STORE_EXPORT_STRING_BYTES,
+    OTLP_METRICS_PARAM, StoreExport, is_otlp_metrics_store_param,
 };
 use runtime_query_engine::query_engine::{QueryEngine, UpdateType};
 use util::tracers::OnceTracer;
@@ -189,6 +191,9 @@ impl MetricsService for Service {
         // succeeds every data point is stored, so a metric without its own dataset is not
         // rejected, and its per-metric dataset, if any, still receives it below.
         let store_outcome = self.write_to_metrics_store(&request).await;
+        if let StoreOutcome::Rejected(message) = &store_outcome {
+            return Err(Status::invalid_argument(message.clone()));
+        }
         let stored_in_metrics_store = store_outcome == StoreOutcome::Stored;
         let resource_metrics = request.resource_metrics;
         tracing::debug!(
@@ -276,7 +281,7 @@ impl MetricsService for Service {
 }
 
 /// Outcome of writing an export to the metrics store tables.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum StoreOutcome {
     /// No writable metrics store table, or nothing to write.
     NotConfigured,
@@ -284,6 +289,8 @@ enum StoreOutcome {
     Stored,
     /// A table failed to store a batch.
     Failed,
+    /// The export is too large to store, so it is rejected without being retried.
+    Rejected(String),
 }
 
 /// Outcome of one attempt to build and write a metric's batch.
@@ -359,10 +366,27 @@ impl Service {
         if export.rows() == 0 {
             return StoreOutcome::NotConfigured;
         }
+        let batches = match export.batches(
+            MAX_STORE_BATCH_ROWS,
+            MAX_STORE_BATCH_STRING_BYTES,
+            MAX_STORE_EXPORT_STRING_BYTES,
+        ) {
+            Ok(batches) => batches,
+            Err(ArrowError::InvalidArgumentError(message)) => {
+                return StoreOutcome::Rejected(message);
+            }
+            Err(e) => {
+                tracing::error!("Failed to build an OpenTelemetry metrics store batch: {e}");
+                return StoreOutcome::Failed;
+            }
+        };
         let mut failed = false;
-        for batch in export.batches(MAX_STORE_BATCH_ROWS) {
+        for batch in batches {
             let batch = match batch {
                 Ok(batch) => batch,
+                Err(ArrowError::InvalidArgumentError(message)) => {
+                    return StoreOutcome::Rejected(message);
+                }
                 Err(e) => {
                     tracing::error!("Failed to build an OpenTelemetry metrics store batch: {e}");
                     return StoreOutcome::Failed;
