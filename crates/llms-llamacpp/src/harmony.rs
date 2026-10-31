@@ -459,6 +459,30 @@ impl Reader {
     }
 }
 
+/// The text of `prompt` a reply is read from ([`Reader::after`]): what the generation prompt
+/// adds after the `conversation` the template renders without it, whose messages the template
+/// closes, or, when that starts no message, as when the template writes the reply's role
+/// header whatever is asked for, from the message the conversation leaves open. The whole
+/// prompt when the template adds nothing, or renders the conversation differently without a
+/// generation prompt.
+pub(crate) fn reply_text<'p>(prompt: &'p str, conversation: Option<&str>) -> &'p str {
+    let Some(at) = conversation
+        .filter(|conversation| {
+            conversation.len() < prompt.len() && prompt.starts_with(conversation)
+        })
+        .map(str::len)
+    else {
+        return prompt;
+    };
+    if prompt[at..].contains(START) {
+        &prompt[at..]
+    } else {
+        prompt[..at]
+            .rfind(START)
+            .map_or(&prompt[at..], |from| &prompt[from..])
+    }
+}
+
 /// Where the body of a message with `header` goes.
 fn route(header: &str, tools: &[String]) -> Route {
     let channel = header
@@ -937,6 +961,26 @@ mod tests {
         assert_eq!(free.pending(), "");
         assert_eq!(free.begin(true), "Think: ");
         assert_eq!(free.route, Route::Reasoning);
+    }
+
+    #[test]
+    fn a_reply_is_read_from_what_the_generation_prompt_adds() {
+        let conversation = "<|start|>user<|message|>Hi<|end|>";
+        let added = format!("{conversation}<|start|>assistant<|channel|>final<|message|>");
+        assert_eq!(
+            reply_text(&added, Some(conversation)),
+            "<|start|>assistant<|channel|>final<|message|>"
+        );
+        // the role header written whatever is asked for: from the message it opens
+        let split = format!("{conversation}<|start|>assistant");
+        assert_eq!(
+            reply_text(&format!("{split}<|channel|>final<|message|>"), Some(&split)),
+            "<|start|>assistant<|channel|>final<|message|>"
+        );
+        // nothing added, a conversation rendered differently, or none at all: the whole prompt
+        for conversation in [Some(added.as_str()), Some("<|start|>system"), None] {
+            assert_eq!(reply_text(&added, conversation), added);
+        }
     }
 
     /// What a generation prompt adds is read by a reply's rules, so the markers a prefill's

@@ -593,21 +593,15 @@ impl LlamaCpp {
             harmony::Held::Nothing
         };
         let prompt = self.prompt(&req.messages, reasoning, tools.clone(), true)?;
-        // Every choice's reply starts where the prompt leaves it, so the prompt is read once:
-        // what the generation prompt adds after the conversation, whose messages the template
-        // closes, so that only the generation prompt's own markers open or close anything. A
-        // template that adds the same either way, or renders the conversation differently
-        // without a generation prompt, is read whole.
+        // Every choice's reply starts where the prompt leaves it, so the prompt is read once,
+        // from what the generation prompt adds after the conversation the template renders
+        // without it (`harmony::reply_text`).
         let reader = markers.map(|markers| {
             let conversation = self
                 .prompt(&req.messages, reasoning, tools.clone(), false)
                 .ok();
-            let generation = conversation
-                .as_deref()
-                .and_then(|conversation| prompt.strip_prefix(conversation))
-                .filter(|generation| !generation.is_empty())
-                .unwrap_or(&prompt);
-            harmony::Reader::new(markers, nameable, held).after(generation)
+            harmony::Reader::new(markers, nameable, held)
+                .after(harmony::reply_text(&prompt, conversation.as_deref()))
         });
         // A Harmony grammar holds the reply by the vocabulary's markers, from where the prompt
         // leaves it.
