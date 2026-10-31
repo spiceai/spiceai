@@ -3728,6 +3728,54 @@ mod tests {
         );
     }
 
+    /// A template may write the reply's role header whatever is asked for and add the rest of
+    /// the generation prompt only when asked, so what the generation prompt adds starts no
+    /// message: the reply then goes on from the message the conversation leaves open, after
+    /// an earlier turn's closed final message, with and without a grammar.
+    #[test]
+    fn a_harmony_header_split_across_the_generation_prompt_is_read_whole() {
+        let split = "{% for m in messages %}<|start|>{{ m.role }}{% if m.role == 'assistant' %}<|channel|>final{% endif %}<|message|>{{ m.content }}<|end|>{% endfor %}<|start|>assistant{% if add_generation_prompt %}<|channel|>final<|message|>{% endif %}";
+        let second_turn = |mut request: serde_json::Value| {
+            request["messages"] = serde_json::json!([
+                { "role": "user", "content": "What is the capital of France?" },
+                { "role": "assistant", "content": "{\"capital\":\"Paris\"}" },
+                { "role": "user", "content": "And of Italy?" },
+            ]);
+            request
+        };
+        let read = |request: serde_json::Value, reply: &str| {
+            let (_llama, _, sampling, mut out, rx) = harmony_job(split.to_string(), request);
+            let root = sampling.grammar.as_deref().and_then(|grammar| {
+                grammar
+                    .lines()
+                    .find_map(|line| line.strip_prefix("root ::= "))
+                    .map(ToString::to_string)
+            });
+            let pending = out.pending().to_string();
+            out.begin(true);
+            let finish = generate_harmony(&mut out, reply)
+                .0
+                .expect("the reply ends at `<|return|>`");
+            let sent = out.finish(finish, 1).map(|_| joined(sent(rx)));
+            (sent, root, pending)
+        };
+        let structured = serde_json::json!({ "response_format": { "type": "json_object" } });
+        assert_eq!(
+            [
+                read(serde_json::json!({}), "Rome<|return|>"),
+                read(second_turn(structured), "{\"capital\":\"Rome\"}<|return|>"),
+            ],
+            [
+                (Ok(vec!["c:Rome".to_string()]), None, String::new()),
+                (
+                    Ok(vec!["c:{\"capital\":\"Rome\"}".to_string()]),
+                    Some("reply-root".to_string()),
+                    String::new()
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn a_harmony_call_ends_the_reply_with_its_arguments() {
         let (mut out, rx) = harmony_output(&["get_weather"], &[], None);
