@@ -902,6 +902,9 @@ async fn metastore_shadow_reader_inline_and_blobs() -> TestResult<()> {
         );
         // Blob round trips use catalog bytes without requiring them to be valid
         // optimizer/index formats. No query consumes these synthetic payloads.
+        // The table's background statistics pass would replace them with real
+        // statistics, so it is stopped first.
+        table.quiesce().await;
         let bytes = vec![1, 2, 3, 4];
         catalog.upsert_pk_index(&id, "snapshot", &bytes).await?;
         catalog
