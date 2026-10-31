@@ -71,8 +71,11 @@ metastore records where each file lives.
   view only moves forward.
 - **Across nodes, staleness is bounded.** A node sees another's commit once it
   refreshes its cached head, which a query does when the copy is older than
-  the staleness bound S. While the destination is unreachable, a node answers
-  from the last state it read. With several writers (Milestones 2 and 3),
+  the staleness bound S. While the destination is unreachable, a node keeps
+  answering from the last state it read, which can be older than S. Such a
+  query has no retention protection: GC may already have deleted objects it
+  needs, and then it fails with an error, never other rows (model:
+  `dataset-query-expiry*`). With several writers (Milestones 2 and 3),
   nodes can briefly see different recent states.
 - **Read-your-writes holds on the node that wrote.** There, buffered writes are
   queryable before they commit, as today, so a read can see a value a crash,
@@ -263,8 +266,9 @@ carries the newest commit records, so a CAS on its version both orders and
 accepts a commit, and a stale writer's CAS fails. Guards are checked locally
 against the exact version the CAS replaces, and acceptance is all-or-nothing.
 A lost response resolves to *accepted*, *rejected* or *unresolved* by reading
-the head or retrying the identical CAS; while the head is unreadable, the
-writer retries the read, never the write. Older records move into immutable
+the head, or by resending the identical CAS while the head is still at the
+version it replaces; a failed resend is resolved again from the head. While
+the head is unreadable, the writer retries the read, never the write. Older records move into immutable
 batches the head lists. This extends the commit point of the existing
 `object_store_occ` WAL so that a poll is one request and a cold open is two
 dependent steps: the head, then the checkpoint root and batches in parallel.
@@ -398,8 +402,8 @@ decides only which long queries can fail, never which rows a query returns.
   One that outlives that may fail, with an error saying to rerun it; it never
   gets other rows. A read-only node needs only read access.
 - *Uploads that never committed* are collected by age on the store's clock.
-  Every object has a fresh name (its identity plus the creating writer's lease
-  generation). GC deletes an unreferenced upload once the head's
+  Every object has a fresh name (its identity plus its owner: the leased unit
+  that created it and that unit's generation). GC deletes an unreferenced upload once the head's
   `LastModified` is T_O (about a day) past the upload's. A writer references
   only objects live in its CAS base or its own never-published uploads, and
   refuses an upload once its base's store time is T_O minus a margin past the
