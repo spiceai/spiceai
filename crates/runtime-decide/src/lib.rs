@@ -23,6 +23,9 @@ limitations under the License.
 //! `ai_if(x, 'c', on_error => 'null')` arrives with as many arguments as
 //! `ai_if(x, 'c', 'jev')`, and the parameter name a named literal carries tells them
 //! apart. Constants are checked while the query is planned, before any model is called.
+//! A required constant, such as `ai_classify`'s `labels`, can also be an uncorrelated
+//! scalar subquery: `DataFusion` computes it once when the query runs, and the function
+//! checks it by the same rules before it calls a model.
 //!
 //! [`DecisionPlacement`] (an optimizer rule) lowers every call to `ai_decide` computed
 //! in a projection below the node that uses it. Typed calls on the same input and
