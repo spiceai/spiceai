@@ -709,14 +709,6 @@
     {
       "run": "edge-values",
       "who": "arrow",
-      "key": "query: SELECT id, -i8 AS neg FROM e WHERE id = 3",
-      "kind": "error",
-      "signature": "the query succeeded, but the script expected an error:",
-      "group": "datafusion"
-    },
-    {
-      "run": "edge-values",
-      "who": "arrow",
       "key": "query: SELECT id, octet_length(bin) AS n FROM e",
       "kind": "error",
       "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
@@ -728,14 +720,6 @@
       "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
-      "group": "cayenne"
-    },
-    {
-      "run": "edge-values",
-      "who": "cayenne",
-      "key": "query: SELECT id, -i8 AS neg FROM e WHERE id = 3",
-      "kind": "error",
-      "signature": "the query succeeded, but the script expected an error:",
       "group": "cayenne"
     },
     {
@@ -1811,14 +1795,6 @@
     {
       "run": "postgres-cdc-edge-values[identity=default]",
       "who": "cayenne",
-      "key": "query: SELECT id, -i8 AS neg FROM e WHERE id = 3",
-      "kind": "error",
-      "signature": "the query succeeded, but the script expected an error:",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-edge-values[identity=default]",
-      "who": "cayenne",
       "key": "query: SELECT id, octet_length(bin) AS n FROM e",
       "kind": "error",
       "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
@@ -1830,14 +1806,6 @@
       "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-edge-values[identity=default]",
-      "who": "cayenne",
-      "key": "query: SELECT id, -i8 AS neg FROM e WHERE id = 3 #2",
-      "kind": "error",
-      "signature": "the query succeeded, but the script expected an error:",
       "group": "cayenne"
     },
     {
@@ -1923,14 +1891,6 @@
     {
       "run": "postgres-cdc-edge-values[identity=full]",
       "who": "cayenne",
-      "key": "query: SELECT id, -i8 AS neg FROM e WHERE id = 3",
-      "kind": "error",
-      "signature": "the query succeeded, but the script expected an error:",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-edge-values[identity=full]",
-      "who": "cayenne",
       "key": "query: SELECT id, octet_length(bin) AS n FROM e",
       "kind": "error",
       "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
@@ -1942,14 +1902,6 @@
       "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-edge-values[identity=full]",
-      "who": "cayenne",
-      "key": "query: SELECT id, -i8 AS neg FROM e WHERE id = 3 #2",
-      "kind": "error",
-      "signature": "the query succeeded, but the script expected an error:",
       "group": "cayenne"
     },
     {
@@ -2559,22 +2511,6 @@
       "kind": "error",
       "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
       "group": "duckdb"
-    },
-    {
-      "run": "query-coverage[backend=mysql]",
-      "who": "federated",
-      "key": "query: SELECT id, b, rank() OVER (PARTITION BY b ORDER BY i NULLS LAST, id) AS r FROM t",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"r\", row_number: 1, expected: \"\\\"75\\\"\", actual: \"\\\"90\\\"\" }",
-      "group": "federation-mysql"
-    },
-    {
-      "run": "query-coverage[backend=mysql]",
-      "who": "federated",
-      "key": "query: SELECT t.id, u.id AS uid FROM t FULL OUTER JOIN u ON t.id = u.t_id WHERE coalesce(t.id, 0) < 30 OR u.id < 10",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 1054 (42S22): Unknown column 't.id' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/",
-      "group": "federation-mysql"
     },
     {
       "run": "query-coverage[backend=mysql]",
