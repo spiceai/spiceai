@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -89,12 +90,14 @@ def archive_url(version: str, release: str) -> str:
 
 def download(url: str, version: str, attempts: int = 5) -> bytes:
     """The archive at `url`, retried with backoff so a transient release-CDN
-    5xx or connection reset does not fail a sign-off."""
+    5xx, connection reset or truncated body does not fail a sign-off. A
+    truncated body raises `http.client.IncompleteRead`, which is not an
+    `OSError`."""
     for attempt in range(1, attempts + 1):
         try:
             with urllib.request.urlopen(url, timeout=300) as response:
                 return response.read()
-        except OSError as e:
+        except (OSError, http.client.HTTPException) as e:
             if attempt == attempts:
                 raise Error(
                     f"Failed to download DuckDB {version} from {url} after {attempts} attempts: {e}"
