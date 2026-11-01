@@ -269,6 +269,7 @@ impl RetentionBackoff {
     }
 
     /// Failures since the last completed pass.
+    #[cfg(test)]
     pub(crate) fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures
     }
