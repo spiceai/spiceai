@@ -19,8 +19,10 @@ nice -n 10 cargo run --release -p cayenne-metastore-model -- run seq-order-two-w
 EXHAUST=1 nice -n 10 cargo run --release -p cayenne-metastore-model -- run seq-order-no-shift
 ```
 
-`cite-check` checks the design documents' model citations: every run cited
-after `Model:` or inside `(model: …)` exists (`prefix*` must match a run), and
+`cite-check` checks the design documents' model citations: every code span
+after `Model:` (in any case) names a run (`prefix*` must match one), to the end
+of the paragraph, row or item when the marker opens it, to the closing
+parenthesis inside parentheses, and otherwise to the end of the sentence; and
 every claim of model checking cites a run in its paragraph or table row, or
 links to a section that does.
 

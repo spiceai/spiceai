@@ -25,8 +25,8 @@ against RustFS behind a proxy that injects a 20 ms median request latency (P99
 five times the median), arms interleaved. These numbers compare designs on one
 rig. They are not S3 performance, which roadmap step 1 measures.
 
-**How model runs are cited.** A section ends with one line, "Model: `run`,
-`run`", naming the runs that check it. A run named for a removed safeguard, such
+**How model runs are cited.** A section ends with a line that starts with
+"Model:" and names, in backticks, the runs that check it. A run named for a removed safeguard, such
 as `retention-list-date`, is a negative control and must fail. The model README
 gives each run's bounds and limits. `dataset-lifecycle` composes Milestone 1's
 mechanisms for one dataset, and its siblings add a transaction, query expiry and

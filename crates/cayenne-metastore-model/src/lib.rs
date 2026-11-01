@@ -2993,26 +2993,35 @@ fn sections(blocks: &[(usize, String)]) -> Vec<(String, Vec<String>)> {
 }
 /// Run names cited in one block.
 fn citations(block: &str) -> Vec<String> {
+    // ASCII lowercasing keeps byte offsets, so they index `block` too.
+    let lower = block.to_ascii_lowercase();
     let mut scopes = Vec::new();
-    if let Some(rest) = block.strip_prefix("Model:") {
-        scopes.push(rest);
-    }
-    if let Some(rest) = block.strip_prefix("- **Model:**") {
-        scopes.push(rest);
-    }
-    let lower = block.to_lowercase();
-    for (i, _) in lower.match_indices("(model:") {
+    for (i, _) in lower.match_indices("model:") {
+        let starts_word = block[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '-');
+        if !starts_word {
+            continue;
+        }
+        // A citation inside parentheses ends at their close, one opening the
+        // block runs to its end, and one within a sentence ends with it.
         let rest = &block[i..];
-        scopes.push(rest.split_once(')').map_or(rest, |(s, _)| s));
+        let open = block[..i].matches('(').count() > block[..i].matches(')').count();
+        let opens_block = block[..i].trim_start_matches(['-', '*', ' ']).is_empty();
+        scopes.push(if open {
+            rest.split_once(')').map_or(rest, |(s, _)| s)
+        } else if opens_block {
+            rest
+        } else {
+            rest.split_once(". ").map_or(rest, |(s, _)| s)
+        });
     }
     let mut out = Vec::new();
     for scope in scopes {
+        // Every code span in a citation names a run.
         for (k, part) in scope.split('`').enumerate() {
-            let name_like = !part.is_empty()
-                && part
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '*');
-            if k % 2 == 1 && name_like {
+            if k % 2 == 1 {
                 out.push(part.to_string());
             }
         }
