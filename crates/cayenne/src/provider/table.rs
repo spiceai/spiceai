@@ -23776,7 +23776,19 @@ impl CayenneTableProvider {
                 .scheduled
                 .load(Ordering::Acquire)
             {
-                return Ok(());
+                // The background loop may have failed, recorded retry debt,
+                // and released `scheduled` between the reads above and this
+                // one. Only return once the loop is idle *and* nothing is
+                // owed or queued; otherwise drain again.
+                let owed_now = self
+                    .post_write_maintenance
+                    .retention_backoff
+                    .lock()
+                    .retry_owed();
+                if !owed_now && self.post_write_maintenance.state.lock().is_empty() {
+                    return Ok(());
+                }
+                continue;
             }
             // The background loop has the state lock and is mid-iteration.
             // Wait briefly and re-check; we cannot drain its work from here,

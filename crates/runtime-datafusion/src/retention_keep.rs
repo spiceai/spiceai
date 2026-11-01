@@ -99,15 +99,76 @@ pub fn fallible_implicit_string_cast(
         ExprSimplifier::new(SimplifyContext::builder().with_schema(Arc::clone(&df_schema)).build());
     let coerced = simplifier.coerce(delete_pred.clone(), &df_schema)?;
 
-    // Explicit casts survive coercion as `Expr::Cast` nodes, so the implicit
-    // ones are those in `coerced` without a matching node in `delete_pred`.
-    // Coercion may insert casts *inside* an explicit cast (around a `NULL`
-    // branch of a `CASE`, say), so nodes are matched on target type and on
-    // their operand with every cast stripped, not on whole-subtree equality.
+    // Coercion keeps the shape of the predicate and only wraps operands in
+    // `Expr::Cast` nodes, so walking `delete_pred` and `coerced` side by side
+    // tells each cast's provenance: a cast in `coerced` that lines up with a
+    // cast of the same target type in `delete_pred` was written by the author;
+    // any other cast was inserted by coercion.
+    implicit_string_cast(delete_pred, &coerced, df_schema.as_ref())
+}
+
+fn implicit_string_cast(
+    original: &Expr,
+    coerced: &Expr,
+    schema: &datafusion::common::DFSchema,
+) -> Result<Option<FallibleImplicitCast>, DataFusionError> {
+    if let Expr::Cast(Cast { expr: inner, field }) = coerced {
+        if let Expr::Cast(Cast {
+            expr: original_inner,
+            field: original_field,
+        }) = original
+            && original_field.data_type() == field.data_type()
+        {
+            return implicit_string_cast(original_inner, inner, schema);
+        }
+        let to = field.data_type();
+        if !inner.column_refs().is_empty() && !is_string(to) {
+            let from = inner.get_type(schema)?;
+            if is_string(&from) {
+                return Ok(Some(FallibleImplicitCast {
+                    expr: inner.to_string(),
+                    from,
+                    to: to.clone(),
+                }));
+            }
+        }
+        return implicit_string_cast(original, inner, schema);
+    }
+
+    let original_children = children(original)?;
+    let coerced_children = children(coerced)?;
+    if original_children.len() == coerced_children.len() {
+        for (o, c) in original_children.into_iter().zip(coerced_children) {
+            if let Some(found) = implicit_string_cast(o, c, schema)? {
+                return Ok(Some(found));
+            }
+        }
+        return Ok(None);
+    }
+    // Coercion reshaped this node, so provenance is lost below it. Pair the
+    // casts by target type and cast-stripped operand, consuming each written
+    // cast at most once.
+    fallback_by_operand(original, coerced, schema)
+}
+
+fn children(expr: &Expr) -> Result<Vec<&Expr>, DataFusionError> {
+    let mut out = Vec::new();
+    expr.apply_children(|child| {
+        out.push(child);
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(out)
+}
+
+fn fallback_by_operand(
+    original: &Expr,
+    coerced: &Expr,
+    schema: &datafusion::common::DFSchema,
+) -> Result<Option<FallibleImplicitCast>, DataFusionError> {
     let mut explicit: Vec<(DataType, Expr)> = Vec::new();
-    delete_pred.apply(|expr| {
+    original.apply(|expr| {
         if let Expr::Cast(Cast { expr: inner, field }) = expr {
-            explicit.push((field.data_type().clone(), strip_casts(inner)?));
+            explicit.push((field.data_type().clone(), inner.as_ref().clone()));
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
@@ -119,17 +180,16 @@ pub fn fallible_implicit_string_cast(
         };
         let data_type = field.data_type();
         let stripped = strip_casts(inner)?;
-        if let Some(pos) = explicit
-            .iter()
-            .position(|(to, operand)| to == data_type && *operand == stripped)
-        {
+        if let Some(pos) = explicit.iter().position(|(to, operand)| {
+            to == data_type && strip_casts(operand).is_ok_and(|o| o == stripped)
+        }) {
             explicit.swap_remove(pos);
             return Ok(TreeNodeRecursion::Continue);
         }
         if inner.column_refs().is_empty() || is_string(data_type) {
             return Ok(TreeNodeRecursion::Continue);
         }
-        let from = inner.get_type(df_schema.as_ref())?;
+        let from = inner.get_type(schema)?;
         if is_string(&from) {
             found = Some(FallibleImplicitCast {
                 expr: inner.to_string(),
@@ -256,6 +316,21 @@ mod tests {
             &string_schema(),
         )
         .expect("the cast plans; it only fails per row at execution");
+    }
+
+    #[test]
+    fn explicit_cast_elsewhere_does_not_hide_an_implicit_one() {
+        use datafusion::prelude::cast;
+        let pred = col("status").gt(lit(5_i64)).or(cast(
+            cast(col("status"), DataType::Boolean),
+            DataType::Int64,
+        )
+        .eq(lit(1_i64)));
+        let found = fallible_implicit_string_cast(&pred, &string_schema())
+            .expect("coerces")
+            .expect("`status > 5` still casts status to a number");
+        assert_eq!(found.expr, "status");
+        assert_eq!(found.to, DataType::Int64);
     }
 
     #[test]
