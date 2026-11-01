@@ -629,14 +629,27 @@ Model: `seq-order*`, `seq-order-maintenance-draw`, `seq-order-drawn-cutoff`, `ta
 Within a dataset, a transaction is one record. Across datasets, it is two-phase
 commit, each participant's records written by its own head CAS:
 
-1. Write `transactions/<id>/intent.json`, listing the participants and a deadline.
-2. **Prepare:** a record on each participant.
-3. **Decide** by create-if-absent of `transactions/<id>/decision.json`: `commit`
-   from the coordinator, or `abort` from anyone after the deadline. Exactly one
-   outcome. Clock skew moves only when an abort can happen, and the deadline
-   bounds how long a dead coordinator holds a reservation.
+1. Write `transactions/<id>/intent`, listing each participant with the lease
+   generation the coordinator holds on it, and a deadline.
+2. **Prepare:** a record on each participant, written only by the coordinator
+   under the generation the intent names. A takeover fences it, so no other
+   process ever prepares the transaction.
+3. **Decide** by create-if-absent of `transactions/<id>/decision`: `commit`
+   from the coordinator, or `abort` from anyone after the deadline, or once
+   every participant's head lease is past the one the intent names (no
+   `Prepare` can land any more). Exactly one outcome. Clock skew moves only
+   when an abort can happen, and the deadline bounds how long a dead
+   coordinator holds a reservation.
 4. **Resolve:** a record on each participant, by the coordinator or any process
    that finds the decision.
+5. **Remove the records**, intent first, then decision. The coordinator removes
+   them once every participant it prepared has resolved and none of its
+   `Prepare`s is in flight. Any other process removes them once storage shows a
+   decision, every participant's head lease past the one the intent names, and
+   no participant holding the transaction prepared, so whoever finishes a dead
+   coordinator's transaction also removes its records, with no clock involved.
+   A decision created after the removal (a late abort) has no intent and no
+   prepared participant, so nothing applies it, and it is removed the same way.
 
 The critical path is 4 round trips to the decision and 5 to both `Resolve`s
 (counted, not measured). This path is rare.
@@ -660,8 +673,11 @@ The critical path is 4 round trips to the decision and 5 to both `Resolve`s
   else, and copies the decision into the record so replay never reads the
   decision object.
 - **Rejected and late `Prepare`s.** A rejected `Prepare` leads to abort. One that
-  lands after the abort keeps its reservation and roots until a matching abort
-  `Resolve`. Recovery resolves every unresolved id against its decision.
+  lands after the abort (the coordinator's, under its lease) keeps its
+  reservation and roots until a matching abort `Resolve`, and the records stay
+  until then. Recovery resolves every unresolved id against its decision. A
+  participant that holds a transaction prepared while its records are gone is
+  an error, not an abort: its outcome is unknown.
 - **GC and checkpoints.** GC treats an unresolved `Prepare`'s objects as
   referenced, and `Resolve` adds no references. Checkpoints carry unresolved
   `Prepare`s.
@@ -669,7 +685,7 @@ The critical path is 4 round trips to the decision and 5 to both `Resolve`s
   open longer than T may fail and is retried.
 - **Ownership changes** do not invalidate an accepted `Prepare`. The new owner
   inherits every unresolved one, resolves each from its decision, and may abort
-  one past its deadline.
+  one past its deadline or once every participant has been taken over.
 
 Today CDC applies each dataset separately, and this path serves SQL
 `BEGIN … COMMIT` (code inspection). Making a CDC transaction that spans datasets
@@ -684,7 +700,7 @@ in one partition, and recovery that drains pending intents before ingesting
 again. Another writer on the same keys breaks it, which is the case two-phase
 commit serves (model: `intent-roll-forward*`, `intent-roll-forward-partitioned*`).
 
-Model: `transactions-txn*`, `transactions-three-participants*`, `window-txn*`, `concurrent-txn-overlap*`, `concurrent-txn-disjoint*`, `dataset-prepare-*`, `transactions-txn-no-reservation-0-exhaust`, `transactions-txn-no-roots-0-exhaust`, `transactions-txn-no-matching-0-exhaust`, `transactions-txn-no-create-once-0-exhaust`, `transactions-txn-no-reader-log-0-exhaust`.
+Model: `transactions-txn*`, `transactions-three-participants*`, `window-txn*`, `concurrent-txn-overlap*`, `concurrent-txn-disjoint*`, `dataset-prepare-*`, `transactions-txn-no-reservation-0-exhaust`, `transactions-txn-no-roots-0-exhaust`, `transactions-txn-no-fence-check-0-exhaust`, `transactions-txn-no-prepared-check-1-exhaust`, `transactions-txn-no-coordinator-wait-0-exhaust`, `transactions-txn-no-matching-0-exhaust`, `transactions-txn-no-create-once-0-exhaust`, `transactions-txn-no-reader-log-0-exhaust`.
 
 ### Source positions and backfill
 
@@ -858,8 +874,8 @@ Model: `window-storage*`.
     data/<table_id>/delete_<uuidv7>.arrow
     leases/writer.json                     # object_store_occ::lease records
     leases/gc.json
-  transactions/<id>/intent.json            # cross-dataset transactions
-  transactions/<id>/decision.json          # create-if-absent
+  transactions/<id>/intent                 # cross-dataset transactions: participants, their leases, deadline
+  transactions/<id>/decision               # create-if-absent
 ```
 
 - **Fresh names.** Commit numbers in names are zero-padded to 20 digits, so
@@ -918,7 +934,9 @@ flowchart LR
 ### Encoding
 
 The head, records, batches, checkpoint roots and small pages are **Protocol
-Buffers**, through `prost`. Leases and transaction objects stay JSON. Large
+Buffers**, through `prost`, and so are a transaction's intent and decision,
+which recovery reads to decide what to resolve and remove. Leases stay JSON:
+they are `object_store_occ`'s lease records, shared with its other users. Large
 checkpoint collections (file lists, deletion-vector lists, the PK index) are
 Arrow IPC pages, as delete files are today. Numbered fields give explicit
 evolution rules (add fields, never renumber, reserve removed numbers), digests
