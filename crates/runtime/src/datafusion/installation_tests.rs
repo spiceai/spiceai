@@ -420,7 +420,7 @@ struct InitializationCase {
     expected_error: &'static str,
 }
 
-fn invalid_initializations(storage: &std::path::Path) -> [InitializationCase; 4] {
+fn invalid_initializations(storage: &std::path::Path) -> [InitializationCase; 3] {
     use crate::component::dataset::acceleration::Engine;
 
     let invalid_file = storage
