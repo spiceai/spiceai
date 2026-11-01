@@ -9,6 +9,10 @@ import subprocess
 import tempfile
 
 
+# The key both the upstream and a `.env` above the sidecar hold.
+DOTENV_KEY = "harness-dotenv-key"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runner", type=Path, required=True)
@@ -44,20 +48,39 @@ def main():
     ]
     args.work_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="spicescript-harness-") as directory:
-        for name, steps, error in fixtures:
+        fixtures = [(name, steps, error, {}) for name, steps, error in fixtures]
+        # A sidecar whose dataset names no key presents none, even with one in a
+        # `.env` above its directory (as in a checkout): the upstream refuses it.
+        # With the key set through `sidecar.env`, the same sidecar reads it.
+        numbers = Path(directory) / "numbers.csv"
+        numbers.write_text("n\n1\n2\n3\n")
+        upstream = {"runtime": {"auth": {"api-key": {"enabled": True, "keys": [DOTENV_KEY]}}},
+                    "datasets": [{"from": f"file:{numbers}", "name": "numbers", "params": {"file_format": "csv"}}]}
+        sidecar_pod = {"version": "v1", "kind": "Spicepod", "name": "harness-app", "datasets": [
+            {"from": "spice.ai:numbers", "name": "numbers",
+             "params": {"spiceai_endpoint": "http://127.0.0.1:${instance.flight_port}"}}]}
+        count = [{"query": "SELECT count(*) AS n FROM numbers", "expect": {"rows": [["3"]]}}]
+        for name, sidecar, error in [("sidecar-dotenv", {"spicepod": sidecar_pod}, "dataset.auth"),
+                                     ("sidecar-env-key", {"spicepod": sidecar_pod,
+                                                          "env": {"SPICEAI_API_KEY": DOTENV_KEY}}, None)]:
+            (args.work_dir / name).mkdir(parents=True, exist_ok=True)
+            (args.work_dir / name / ".env").write_text(f"SPICEAI_API_KEY={DOTENV_KEY}\n")
+            fixtures.append((name, count, error, {"spicepod": upstream, "sidecar": sidecar,
+                                                  "defaults": {"api-key": DOTENV_KEY}}))
+        for name, steps, error, extra in fixtures:
             fixture = Path(directory) / f"{name}.yaml"
-            fixture.write_text(json.dumps({"name": name,
-                "spicepod": {"version": "v1", "kind": "Spicepod", "name": name},
-                "steps": [{"start": {}}] + steps}))
+            spicepod = {"version": "v1", "kind": "Spicepod", "name": name, **extra.pop("spicepod", {})}
+            fixture.write_text(json.dumps({"name": name, "spicepod": spicepod,
+                "steps": [{"start": {}}] + steps, **extra}))
             result = subprocess.run([str(args.runner.resolve()), "--record-durations", "--spiced",
                 str(args.spiced.resolve()), "--work-dir", str(args.work_dir.resolve() / name), str(fixture)],
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
             (args.work_dir / f"{name}.log").write_text(result.stdout)
             if error is not None:
                 if result.returncode != 1 or error not in result.stdout:
-                    raise SystemExit(f"{name}: expected a value-mismatch rejection containing {error!r}; "
+                    raise SystemExit(f"{name}: expected a failure containing {error!r}; "
                                      f"exit={result.returncode}\n{result.stdout}")
-                print(f"{name}: rejected the incorrect answer")
+                print(f"{name}: failed with {error!r}, as it should")
             elif result.returncode != 0:
                 raise SystemExit(f"{name}: equivalent answers were rejected\n{result.stdout}")
             else:

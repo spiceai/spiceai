@@ -1259,7 +1259,8 @@ fn new_sidecar(
     env.insert("SPICE_INSTANCE_ID".into(), instance_id.to_string());
     let mut spiced = Spiced::new(binary.to_path_buf(), dir.join("sidecar"), env)?;
     // A `spice.ai:` dataset without a key would take this one from the
-    // environment, and present it to an upstream that may require another.
+    // environment, or from a dotenv file above the run directory, and present
+    // it to an upstream that may require another.
     if !spec.env.contains_key(SPICEAI_API_KEY) {
         spiced.remove_env(SPICEAI_API_KEY);
     }

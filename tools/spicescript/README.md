@@ -459,8 +459,10 @@ Authentication: the runner presents `defaults.api-key` to the upstream and
 presents the `spiceai_api_key` its spicepod gives it; an upstream without
 auth refuses a key with `Unauthorized`, so give the upstream and the
 dataset a key both or neither. The sidecar does not inherit
-`SPICEAI_API_KEY` from the runner's environment (unless `sidecar.env` sets
-it), which a dataset without a key would otherwise pick up. An upstream with
+`SPICEAI_API_KEY` from the runner's environment, which a dataset without a
+key would otherwise pick up, unless `sidecar.env` sets it. Nor does it read a
+`.env` or `.env.local` above its directory, such as the checkout's: its
+directory gets empty files of both names. An upstream with
 API keys refuses Flight queries after its 10,000th handshake
 ([known-failing](../../test/spicescript/known-failing/flight-auth/flight-auth-handshake-limit.yaml)),
 so a script that loads a sidecar runs its upstream without them.

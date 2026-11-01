@@ -166,8 +166,9 @@ pub struct SidecarSpec {
     #[serde(default)]
     pub args: Vec<String>,
     /// The sidecar's environment. `SPICEAI_API_KEY` is removed from what it
-    /// inherits unless set here, so a `spice.ai:` dataset authenticates with
-    /// the key its spicepod names and no other.
+    /// inherits unless set here, and no `.env` or `.env.local` above its
+    /// directory is read, so a `spice.ai:` dataset authenticates with the key
+    /// its spicepod names and no other.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// The API key the sidecar requires, which the runner presents to it;

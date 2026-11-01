@@ -261,6 +261,9 @@ impl Spiced {
                 for key in &self.env_removed {
                     command.env_remove(key);
                 }
+                if !self.env_removed.is_empty() {
+                    shadow_dotenv_files(&self.dir)?;
+                }
                 command.current_dir(&self.dir).envs(&self.env);
                 command
             }
@@ -1037,6 +1040,22 @@ impl Drop for Spiced {
             crate::cleanup::remove_if_tracked(&run.name);
         }
     }
+}
+
+/// Writes an empty `.env` and `.env.local` into `dir` unless it has them.
+/// `spiced` reads each name from its working directory or the nearest ancestor
+/// that has it, so a variable kept out of its environment would come back from
+/// a file above the run directory, such as a checkout's `.env`. Variables a
+/// script sets reach it through its environment, as before.
+fn shadow_dotenv_files(dir: &Path) -> Result<()> {
+    for name in [".env", ".env.local"] {
+        let path = dir.join(name);
+        if !path.exists() {
+            std::fs::write(&path, "")
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// The names of the datasets a spicepod declares.

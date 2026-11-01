@@ -33,7 +33,7 @@ spicepod:
 
 # The application's sidecar reads the upstream's datasets over Flight with no
 # key, as the upstream requires none; the runner keeps SPICEAI_API_KEY out of
-# its environment, so none is picked up from there either.
+# its environment and dotenv files, so none is picked up from there either.
 sidecar:
   spicepod:
     version: v1
