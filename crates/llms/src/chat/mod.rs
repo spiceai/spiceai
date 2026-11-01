@@ -41,6 +41,7 @@ use async_openai::types::chat::{
 pub mod engine;
 #[cfg(feature = "local_llm")]
 pub mod gguf_files;
+#[cfg(feature = "local_llm")]
 mod gguf_header;
 #[cfg(feature = "local_llm")]
 pub mod hf_files;

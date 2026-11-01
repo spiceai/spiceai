@@ -16,6 +16,13 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 #![recursion_limit = "256"]
 
+// Windows users run `spiced` under WSL or in Docker, and the Windows `spice` CLI
+// connects to it.
+#[cfg(windows)]
+compile_error!(
+    "spiced does not build for native Windows. Run it under WSL or in Docker. See: https://spiceai.org/docs/installation"
+);
+
 use ::tools::SpiceModelTool;
 use ::tools::naming::{decode_tool_name, encode_tool_name};
 use ::tools::rename::with_name;
@@ -1460,11 +1467,8 @@ impl Runtime {
             // are cayenne *catalog* tables (not spice.public datasets), so the
             // dataset partition-assignment map doesn't cover them; enumerate the
             // cayenne catalog directly. Also include any dataset assignments.
-            let mut tables: Vec<TableReference> = Vec::new();
-            #[cfg(not(windows))]
-            {
-                tables.extend(crate::cluster::discover_cayenne_tables(&df).await);
-            }
+            let mut tables: Vec<TableReference> =
+                crate::cluster::discover_cayenne_tables(&df).await;
             if let Some(assignments_lock) = self.partition_assignments() {
                 for resolved in assignments_lock.read().await.keys() {
                     tables.push(TableReference::full(

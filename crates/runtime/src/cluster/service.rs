@@ -986,7 +986,6 @@ impl ClusterService for ClusterServiceImpl {
 
             // Register Cayenne tables as single unpartitioned entries (empty filter expressions).
             // This tells the scheduler that queries targeting these tables should be forwarded to this executor.
-            #[cfg(not(windows))]
             for table_ref in discover_cayenne_tables(&self.datafusion).await {
                 partition_map.entry(table_ref).or_default();
             }
@@ -1484,7 +1483,6 @@ pub(crate) async fn evaluate_acked_tables_readiness(datafusion: &DataFusion) {
 /// fully qualified [`TableReference`]s for each table found. These are used to
 /// register unpartitioned entries in the executor's partition map so that queries
 /// for Cayenne tables are forwarded to the executor.
-#[cfg(not(windows))]
 pub(crate) async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
     use crate::datafusion::cayenne_ddl::is_cayenne_catalog;
     use cayenne::CayenneSchemaProvider;

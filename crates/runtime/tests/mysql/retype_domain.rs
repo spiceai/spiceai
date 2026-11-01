@@ -163,7 +163,6 @@ async fn alter_outcome(
     })
 }
 
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_retype_classification_matches_what_mysql_stores() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
