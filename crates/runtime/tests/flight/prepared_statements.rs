@@ -79,6 +79,16 @@ mod flight_prepared_statements {
                         )?,
                     ),
                     ("SELECT 1 + $1 AS x", int_param()?),
+                    (
+                        "SELECT $1 AS x",
+                        create_param_batch(
+                            vec![("$1", arrow::datatypes::DataType::Date64, true)],
+                            vec![
+                                Arc::new(arrow::array::Date64Array::from(vec![1_768_498_200_000]))
+                                    as ArrayRef,
+                            ],
+                        )?,
+                    ),
                 ];
 
                 for (sql, params) in cases {
@@ -1207,14 +1217,17 @@ mod flight_prepared_statements {
     /// A bound parameter compared with a column takes the column's type, as it
     /// does over HTTP. Comparing in the parameter's type instead loses the time
     /// zone of a zoned timestamp, and compares a DECIMAL column as an inexact
-    /// float, so the matching row is not returned.
+    /// float, so the matching row is not returned. A `Date64` parameter keeps
+    /// its time of day: as a `DATE` it would be truncated to midnight, which
+    /// misses the same instant and equals midnight of that day. A `Date64` at
+    /// midnight still matches a `DATE` column.
     #[tokio::test]
     async fn test_parameter_compared_with_column_matches() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(Some("integration=debug,info"));
 
         test_request_context()
             .scope(async {
-                use arrow::array::{Float64Array, TimestampMicrosecondArray};
+                use arrow::array::{Date64Array, Float64Array, TimestampMicrosecondArray};
                 use arrow::datatypes::{DataType, TimeUnit};
 
                 let (channel, _df) = start_spice_test_app(None, None, None).await?;
@@ -1223,6 +1236,15 @@ mod flight_prepared_statements {
                 let zone = "America/Los_Angeles";
                 // 2026-01-15T09:30:00-08:00
                 let instant_us = 1_768_498_200_000_000_i64;
+                // The same instant as a `Date64` is 17:30 into 2026-01-15 UTC.
+                let instant_ms = instant_us / 1000;
+                let midnight_ms = 1_768_435_200_000_i64;
+                let date64 = |ms: i64| {
+                    create_param_batch(
+                        vec![("$1", DataType::Date64, false)],
+                        vec![Arc::new(Date64Array::from(vec![ms])) as ArrayRef],
+                    )
+                };
                 let cases = [
                     (
                         "WITH t(c) AS (SELECT arrow_cast('2026-01-15T09:30:00-08:00', 'Timestamp(µs, \"America/Los_Angeles\")')) \
@@ -1245,6 +1267,21 @@ mod flight_prepared_statements {
                             vec![("$1", DataType::Float64, false)],
                             vec![Arc::new(Float64Array::from(vec![0.1])) as ArrayRef],
                         )?,
+                    ),
+                    (
+                        "WITH t(c) AS (SELECT arrow_cast(1768498200000, 'Date64')) \
+                         SELECT count(*) AS n FROM t WHERE c = $1",
+                        date64(instant_ms)?,
+                    ),
+                    (
+                        "WITH t(c) AS (SELECT arrow_cast(1768435200000, 'Date64')) \
+                         SELECT count(*) AS n FROM t WHERE c <> $1",
+                        date64(instant_ms)?,
+                    ),
+                    (
+                        "WITH t(c) AS (SELECT CAST('2026-01-15' AS DATE)) \
+                         SELECT count(*) AS n FROM t WHERE c = $1",
+                        date64(midnight_ms)?,
                     ),
                 ];
 
