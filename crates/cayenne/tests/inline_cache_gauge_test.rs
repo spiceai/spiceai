@@ -33,7 +33,6 @@ limitations under the License.
 //! charged for — because what has to be caught is an over-report by an order of
 //! magnitude, not a rounding difference.
 
-#![cfg(not(windows))]
 #![allow(clippy::expect_used)]
 
 use crate::common;

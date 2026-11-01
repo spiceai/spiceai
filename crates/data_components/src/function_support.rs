@@ -53,6 +53,31 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn scan_filter_capability_uses_full_source_schema() {
+        use datafusion::logical_expr::ExprSchemable as _;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        let source = Arc::new(LogicalTableSource::new(schema));
+        let plan = LogicalPlanBuilder::scan_with_filters(
+            "t",
+            source,
+            Some(vec![0]),
+            vec![udf_expr("typed_guard")],
+        )
+        .expect("scan filter reads a column omitted by projection")
+        .build()
+        .expect("build scan");
+        let support = FunctionSupport::new(None, None, None).with_scalar_call_support(Arc::new(
+            |call, schema| {
+                schema.and_then(|scope| call.args[0].get_type(scope).ok()) == Some(DataType::Utf8)
+            },
+        ));
+        assert!(!contains_unsupported_functions(&plan, &support).expect("check typed scan filter"));
+    }
+
     fn stub_udf(name: &str) -> Arc<ScalarUDF> {
         Arc::new(create_udf(
             name,

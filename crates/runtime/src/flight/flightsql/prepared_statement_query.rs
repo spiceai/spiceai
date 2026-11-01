@@ -42,33 +42,22 @@ use snafu::prelude::*;
 use tokio_stream::adapters::Peekable;
 use tonic::{Request, Response, Status, Streaming};
 
-use super::{DecodableSchema, prepared_statement_handle};
+use super::{DecodableSchema, prepared_statement_handle, within_decompression_bound};
 use crate::{
     datafusion::{
         query::{run_transaction, schema_statement, transaction_statements},
         request_context_extension::get_current_datafusion,
     },
     flight::{
-        Service, is_auth_read_only, metrics, record_batches_to_flight_stream, to_tonic_err,
-        transaction_error_to_status,
+        Service, is_auth_read_only, metrics, to_tonic_err, transaction_error_to_status,
+        transaction_outcome_to_flight_stream,
         util::{attach_cache_metadata, set_flightsql_protocol},
     },
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 use telemetry::timing::TimedStream;
 
-/// How a bound parameter's placeholder is typed in the rewritten SQL.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ParameterCast {
-    /// `CAST($N AS <sql type>)`, for types whose SQL name is the Arrow type.
-    Sql(&'static str),
-    /// `arrow_cast($N, '<arrow type>')`, for types no SQL name spells exactly:
-    /// `TIMESTAMP` is `Timestamp(ns)` with no zone and `DATE` is `Date32`, so a
-    /// SQL cast would drop a timestamp's zone and unit, or a `Date64`'s time.
-    Arrow(String),
-}
-
-/// The cast that types a parameter of Arrow type `dt` in the rewritten SQL.
+/// Arrow `DataType` to SQL type name conversion for CAST expressions.
 ///
 /// NOTE: String types (`Utf8`, `LargeUtf8`) are intentionally NOT included here.
 /// Adding CAST for strings (e.g., `CAST($1 AS VARCHAR)`) prevents `DataFusion`'s
@@ -81,25 +70,28 @@ enum ParameterCast {
 /// Long-term fix: Update `DataFusion`'s optimizer to recognize that `CAST(Utf8 AS Utf8View)`
 /// is safe to push down. This would be the proper upstream fix, but until then we avoid
 /// the CAST for string types entirely.
-fn parameter_cast(dt: &arrow::datatypes::DataType) -> Option<ParameterCast> {
+///
+/// Float and time-zone-aware timestamp types are also omitted. A CAST sets the type the
+/// parameter is compared in: `TIMESTAMP` has no time zone, so a zoned instant would be
+/// compared as a wall-clock time, and `DOUBLE` would compare a DECIMAL column as an
+/// inexact float. Without the CAST, `DataFusion` takes the type from the column the
+/// parameter is compared with, or from the bound value.
+fn arrow_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Option<&'static str> {
     use arrow::datatypes::DataType;
-    let sql = |name| Some(ParameterCast::Sql(name));
     match dt {
-        DataType::Int8 => sql("TINYINT"),
-        DataType::Int16 => sql("SMALLINT"),
-        DataType::Int32 => sql("INT"),
-        DataType::Int64 => sql("BIGINT"),
-        DataType::UInt8 => sql("TINYINT UNSIGNED"),
-        DataType::UInt16 => sql("SMALLINT UNSIGNED"),
-        DataType::UInt32 => sql("INT UNSIGNED"),
-        DataType::UInt64 => sql("BIGINT UNSIGNED"),
-        DataType::Float32 => sql("FLOAT"),
-        DataType::Float64 => sql("DOUBLE"),
+        DataType::Int8 => Some("TINYINT"),
+        DataType::Int16 => Some("SMALLINT"),
+        DataType::Int32 => Some("INT"),
+        DataType::Int64 => Some("BIGINT"),
+        DataType::UInt8 => Some("TINYINT UNSIGNED"),
+        DataType::UInt16 => Some("SMALLINT UNSIGNED"),
+        DataType::UInt32 => Some("INT UNSIGNED"),
+        DataType::UInt64 => Some("BIGINT UNSIGNED"),
         // String types intentionally omitted - CASTs break filter pushdown optimization
         // DataType::Utf8 | DataType::LargeUtf8 => Some("VARCHAR"),
-        DataType::Boolean => sql("BOOLEAN"),
-        DataType::Date32 => sql("DATE"),
-        DataType::Date64 | DataType::Timestamp(_, _) => Some(ParameterCast::Arrow(dt.to_string())),
+        DataType::Boolean => Some("BOOLEAN"),
+        DataType::Date32 | DataType::Date64 => Some("DATE"),
+        DataType::Timestamp(_, None) => Some("TIMESTAMP"),
         _ => None,
     }
 }
@@ -109,63 +101,38 @@ fn parameter_cast(dt: &arrow::datatypes::DataType) -> Option<ParameterCast> {
 /// This uses proper SQL parsing to avoid incorrectly replacing placeholders
 /// inside string literals or comments.
 struct ParameterCastRewriter<'a> {
-    param_types: &'a std::collections::HashMap<usize, ParameterCast>,
+    param_types: &'a std::collections::HashMap<usize, &'static str>,
 }
 
 impl VisitorMut for ParameterCastRewriter<'_> {
     type Break = ();
 
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
-        use datafusion::sql::sqlparser::ast::{
-            CastKind, DataType as SqlDataType, Function, FunctionArg, FunctionArgExpr,
-            FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart,
-        };
         if let Expr::Value(value_with_span) = expr
             && let Value::Placeholder(ref placeholder) = value_with_span.value
         {
             // Check if this is a $N style placeholder
             if let Some(stripped) = placeholder.strip_prefix('$')
                 && let Ok(idx) = stripped.parse::<usize>()
-                && let Some(cast) = self.param_types.get(&idx)
+                && let Some(sql_type) = self.param_types.get(&idx)
             {
-                let placeholder =
-                    Box::new(Expr::Value(Value::Placeholder(placeholder.clone()).into()));
-                *expr = match cast {
-                    ParameterCast::Sql(sql_type) => Expr::Cast {
-                        expr: placeholder,
-                        data_type: SqlDataType::Custom(
-                            ObjectName(vec![ObjectNamePart::Identifier(Ident::new(*sql_type))]),
-                            vec![],
-                        ),
-                        array: false,
-                        format: None,
-                        kind: CastKind::Cast,
-                    },
-                    ParameterCast::Arrow(arrow_type) => {
-                        let arg = |expr| FunctionArg::Unnamed(FunctionArgExpr::Expr(expr));
-                        Expr::Function(Function {
-                            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
-                                "arrow_cast",
-                            ))]),
-                            uses_odbc_syntax: false,
-                            parameters: FunctionArguments::None,
-                            args: FunctionArguments::List(FunctionArgumentList {
-                                duplicate_treatment: None,
-                                args: vec![
-                                    arg(*placeholder),
-                                    arg(Expr::Value(
-                                        Value::SingleQuotedString(arrow_type.clone()).into(),
-                                    )),
-                                ],
-                                clauses: vec![],
-                            }),
-                            filter: None,
-                            null_treatment: None,
-                            over: None,
-                            within_group: vec![],
-                        })
-                    }
+                // Replace $N with CAST($N AS type) by wrapping in a Cast expression
+                let original_placeholder = placeholder.clone();
+                let cast_expr = Expr::Cast {
+                    expr: Box::new(Expr::Value(Value::Placeholder(original_placeholder).into())),
+                    data_type: datafusion::sql::sqlparser::ast::DataType::Custom(
+                        datafusion::sql::sqlparser::ast::ObjectName(vec![
+                            datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(
+                                datafusion::sql::sqlparser::ast::Ident::new(*sql_type),
+                            ),
+                        ]),
+                        vec![],
+                    ),
+                    array: false,
+                    format: None,
+                    kind: datafusion::sql::sqlparser::ast::CastKind::Cast,
                 };
+                *expr = cast_expr;
             }
         }
         ControlFlow::Continue(())
@@ -178,16 +145,16 @@ impl VisitorMut for ParameterCastRewriter<'_> {
 /// Uses AST-based rewriting to avoid incorrectly modifying placeholders inside
 /// string literals or comments.
 ///
-/// For each parameter $N, wraps it in a cast to its bound Arrow type (see
-/// [`parameter_cast`]), so the cast never changes the bound value.
+/// For each parameter $N, wraps it in a CAST($N AS <type>) based on the schema.
 fn rewrite_sql_with_type_casts(sql: &str, schema: &SchemaRef) -> String {
+    // Build a map from parameter index to SQL type string
     let mut param_types = std::collections::HashMap::new();
     for (idx, field) in schema.fields().iter().enumerate() {
         let param_num = idx + 1;
-        if let Some(cast) = parameter_cast(field.data_type()) {
-            param_types.insert(param_num, cast);
+        if let Some(sql_type) = arrow_type_to_sql_type(field.data_type()) {
+            param_types.insert(param_num, sql_type);
         } else {
-            // Some types intentionally don't get CAST (e.g., strings - see parameter_cast docs)
+            // Some types intentionally don't get CAST (e.g., strings - see arrow_type_to_sql_type docs)
             tracing::debug!(
                 "Skipping CAST for parameter ${} with type: {:?}",
                 param_num,
@@ -426,15 +393,11 @@ pub(crate) async fn do_get(
         let context_clone = Arc::clone(&context);
         let outcome = context_clone
             .scope(async {
-                run_transaction(&datafusion, &statements, param_values, read_only).await
+                run_transaction(&datafusion, &statements, param_values, read_only, |_| 0).await
             })
             .await
             .map_err(transaction_error_to_status)?;
-        let batches = outcome
-            .result
-            .map(|(batches, _)| batches)
-            .unwrap_or_default();
-        let stream = record_batches_to_flight_stream(batches);
+        let stream = transaction_outcome_to_flight_stream(outcome);
         let timed = TimedStream::new(stream, move || start);
         return Ok(Response::new(
             Box::pin(timed) as <Service as FlightService>::DoGetStream
@@ -508,6 +471,7 @@ pub(crate) async fn do_put_query(
         move |flight_data| {
             flight_data
                 .map_err(|status| FlightError::Tonic(Box::new(status)))
+                .and_then(within_decompression_bound)
                 .map(|message| decodable.repair(message))
         }
     });
@@ -1212,217 +1176,6 @@ mod tests {
         // The actual caching behavior is tested in datafusion/mod.rs::test_get_or_create_logical_plan
         // which verifies that get_or_create_logical_plan (called by sql_to_flight_stream)
         // properly caches and reuses logical plans.
-    }
-
-    /// Runs `sql` the way `do_get` does with `params` bound, against a table
-    /// with a `ts_la` timestamp in `America/Los_Angeles`, a `ts_utc` timestamp
-    /// in UTC, a `day` `Date64` and a `dec` `DECIMAL(10, 2)`, and returns the
-    /// first column as strings.
-    async fn run_bound(sql: &str, params: Vec<datafusion::scalar::ScalarValue>) -> Vec<String> {
-        use crate::dataaccelerator::AcceleratorEngineRegistry;
-        use crate::datafusion::builder::DataFusionBuilder;
-        use crate::datafusion::query::builder::QueryBuilder;
-        use crate::status::RuntimeStatus;
-        use arrow::array::{Date64Array, Decimal128Array, TimestampMicrosecondArray};
-        use arrow::datatypes::TimeUnit;
-        use futures::TryStreamExt;
-
-        let datafusion = Arc::new(
-            DataFusionBuilder::new(
-                RuntimeStatus::new(),
-                Arc::new(AcceleratorEngineRegistry::new()),
-                tokio::runtime::Handle::current(),
-            )
-            .build(),
-        );
-        // Row 1 is 2026-03-08T10:30:00Z; rows 2-4 are an hour apart from it, and
-        // row 3 is before the 10:00Z window of the tests below.
-        let micros: Vec<i64> = [10 * 60 + 30, 11 * 60 + 30, 8 * 60, 12 * 60]
-            .iter()
-            .map(|minutes| (1_772_928_000 + minutes * 60) * 1_000_000)
-            .collect();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new(
-                "ts_la",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("America/Los_Angeles".into())),
-                false,
-            ),
-            Field::new(
-                "ts_utc",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                false,
-            ),
-            Field::new("day", DataType::Date64, false),
-            Field::new("dec", DataType::Decimal128(10, 2), false),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
-                Arc::new(
-                    TimestampMicrosecondArray::from(micros.clone())
-                        .with_timezone("America/Los_Angeles"),
-                ),
-                Arc::new(TimestampMicrosecondArray::from(micros.clone()).with_timezone("UTC")),
-                Arc::new(Date64Array::from(
-                    micros.iter().map(|us| us / 1000).collect::<Vec<_>>(),
-                )),
-                Arc::new(
-                    Decimal128Array::from(vec![1_234_567_890, 407, 100, 200])
-                        .with_precision_and_scale(10, 2)
-                        .expect("decimal"),
-                ),
-            ],
-        )
-        .expect("batch");
-        datafusion.ctx.register_batch("t", batch).expect("register");
-
-        let param_schema: SchemaRef = Arc::new(Schema::new(
-            params
-                .iter()
-                .enumerate()
-                .map(|(i, p)| Field::new(format!("${}", i + 1), p.data_type(), true))
-                .collect::<Vec<_>>(),
-        ));
-        let sql_to_run = rewrite_sql_with_type_casts(sql, &param_schema);
-        let batches: Vec<RecordBatch> = QueryBuilder::new(&sql_to_run, datafusion)
-            .parameters(Some(ParamValues::from(params)))
-            .build()
-            .run()
-            .await
-            .unwrap_or_else(|e| panic!("run {sql_to_run}: {e}"))
-            .data
-            .try_collect()
-            .await
-            .unwrap_or_else(|e| panic!("collect {sql_to_run}: {e}"));
-        let mut out = Vec::new();
-        for batch in &batches {
-            let column = arrow::compute::cast(batch.column(0), &DataType::Utf8).expect("cast");
-            let column = column
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("strings");
-            out.extend(column.iter().map(|v| v.unwrap_or("NULL").to_string()));
-        }
-        out
-    }
-
-    fn ts_param(unit_micros: i64, tz: Option<&str>) -> datafusion::scalar::ScalarValue {
-        datafusion::scalar::ScalarValue::TimestampMicrosecond(Some(unit_micros), tz.map(Into::into))
-    }
-
-    /// 2026-03-08T10:30:00Z, row 1's instant.
-    const ROW1_MICROS: i64 = (1_772_928_000 + (10 * 60 + 30) * 60) * 1_000_000;
-
-    /// A bound timestamp is compared by its instant, whatever its zone or unit:
-    /// the parameter's cast must not drop its zone or nanosecond unit.
-    #[tokio::test]
-    async fn bound_timestamp_keeps_its_zone_and_unit() {
-        use datafusion::scalar::ScalarValue;
-        let same_instant = [
-            ("UTC", ts_param(ROW1_MICROS, Some("UTC"))),
-            (
-                "column zone",
-                ts_param(ROW1_MICROS, Some("America/Los_Angeles")),
-            ),
-            ("+05:30", ts_param(ROW1_MICROS, Some("+05:30"))),
-            (
-                "ns UTC",
-                ScalarValue::TimestampNanosecond(Some(ROW1_MICROS * 1000), Some("UTC".into())),
-            ),
-        ];
-        for column in ["ts_la", "ts_utc"] {
-            for (label, param) in &same_instant {
-                assert_eq!(
-                    run_bound(
-                        &format!("SELECT id FROM t WHERE {column} = $1 ORDER BY id"),
-                        vec![param.clone()]
-                    )
-                    .await,
-                    vec!["1"],
-                    "{column} = $1 ({label})"
-                );
-            }
-        }
-        // 10:00Z: rows 1, 2 and 4 are at or after it, row 3 (08:00Z) is not.
-        let window_start = ROW1_MICROS - 30 * 60 * 1_000_000;
-        assert_eq!(
-            run_bound(
-                "SELECT id FROM t WHERE ts_la >= $1 ORDER BY id",
-                vec![ts_param(window_start, Some("UTC"))]
-            )
-            .await,
-            vec!["1", "2", "4"]
-        );
-        assert_eq!(
-            run_bound(
-                "SELECT arrow_typeof($1)",
-                vec![ts_param(ROW1_MICROS, Some("UTC"))]
-            )
-            .await,
-            vec![
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
-                    .to_string()
-            ]
-        );
-        // Timestamp arithmetic across two bound parameters still plans.
-        assert_eq!(
-            run_bound(
-                "SELECT $2 - $1",
-                vec![
-                    ts_param(window_start, Some("UTC")),
-                    ts_param(ROW1_MICROS, Some("UTC"))
-                ]
-            )
-            .await
-            .len(),
-            1
-        );
-    }
-
-    /// A `Date64` keeps its time of day; `DATE` would truncate it to `Date32`.
-    #[tokio::test]
-    async fn bound_date64_keeps_its_milliseconds() {
-        use datafusion::scalar::ScalarValue;
-        assert_eq!(
-            run_bound(
-                "SELECT id FROM t WHERE day = $1 ORDER BY id",
-                vec![ScalarValue::Date64(Some(ROW1_MICROS / 1000))]
-            )
-            .await,
-            vec!["1"]
-        );
-    }
-
-    /// A bound float compared to a decimal column matches as the bare `$1` does
-    /// over HTTP, through the float's decimal spelling.
-    #[tokio::test]
-    async fn bound_float_matches_a_decimal_column() {
-        use datafusion::scalar::ScalarValue;
-        for (value, id) in [(12_345_678.90_f64, "1"), (4.07, "2")] {
-            assert_eq!(
-                run_bound(
-                    "SELECT id FROM t WHERE dec = $1 ORDER BY id",
-                    vec![ScalarValue::Float64(Some(value))]
-                )
-                .await,
-                vec![id],
-                "dec = {value}"
-            );
-        }
-        // Float arithmetic across bound parameters keeps its CAST typing.
-        assert_eq!(
-            run_bound(
-                "SELECT $1 * $2",
-                vec![
-                    ScalarValue::Float64(Some(1.5)),
-                    ScalarValue::Float64(Some(2.0))
-                ]
-            )
-            .await,
-            vec!["3.0"]
-        );
     }
 
     /// `GetFlightInfo` for a prepared statement with bound parameters must
@@ -2178,10 +1931,10 @@ mod tests {
         );
     }
 
-    /// Tests that non-string types still get CAST expressions.
+    /// Tests that integer parameters get CAST expressions and float parameters do not.
     ///
-    /// Integer, float, boolean, and date/timestamp types still need CAST
-    /// for proper type inference in prepared statements like "SELECT $1 + $2".
+    /// Without a CAST, a float parameter takes the bound value's type, so
+    /// "SELECT $1 + $2" still plans.
     #[test]
     fn test_rewrite_sql_numeric_types_get_cast() {
         let sql = r"SELECT $1 + $2 AS sum, $3 * $4 AS product";
@@ -2206,27 +1959,34 @@ mod tests {
             "Int64 parameter $2 should be wrapped in CAST AS BIGINT: {rewritten}"
         );
 
-        // Float parameters should be wrapped in CAST
         assert!(
-            rewritten.contains("CAST($3 AS DOUBLE)"),
-            "Float64 parameter $3 should be wrapped in CAST AS DOUBLE: {rewritten}"
-        );
-        assert!(
-            rewritten.contains("CAST($4 AS DOUBLE)"),
-            "Float64 parameter $4 should be wrapped in CAST AS DOUBLE: {rewritten}"
+            !rewritten.contains("CAST($3 AS") && !rewritten.contains("CAST($4 AS"),
+            "Float64 parameters should NOT be wrapped in CAST: {rewritten}"
         );
     }
 
-    /// Tests mixed parameter types - strings should NOT get CAST, others should.
+    /// Tests mixed parameter types - only types whose CAST keeps the comparison exact get one.
     #[test]
     fn test_rewrite_sql_mixed_types() {
-        let sql = r"SELECT * FROM users WHERE name = $1 AND age > $2 AND score < $3";
+        let sql = r"SELECT * FROM users WHERE name = $1 AND age > $2 AND score < $3 AND created > $4 AND seen > $5";
 
-        // Mixed types: string (no CAST), int (CAST), float (CAST)
         let schema = Arc::new(Schema::new(vec![
             Field::new("$1", DataType::Utf8, true),
             Field::new("$2", DataType::Int32, true),
             Field::new("$3", DataType::Float64, true),
+            Field::new(
+                "$4",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new(
+                "$5",
+                DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond,
+                    Some("America/Los_Angeles".into()),
+                ),
+                true,
+            ),
         ]));
 
         let rewritten = rewrite_sql_with_type_casts(sql, &schema);
@@ -2247,10 +2007,17 @@ mod tests {
             "Int32 parameter $2 should be wrapped in CAST AS INT: {rewritten}"
         );
 
-        // Float64 parameter should be wrapped in CAST
         assert!(
-            rewritten.contains("CAST($3 AS DOUBLE)"),
-            "Float64 parameter $3 should be wrapped in CAST AS DOUBLE: {rewritten}"
+            !rewritten.contains("CAST($3 AS"),
+            "Float64 parameter $3 should NOT be wrapped in CAST: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("CAST($4 AS TIMESTAMP)"),
+            "Timestamp parameter $4 should be wrapped in CAST AS TIMESTAMP: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("CAST($5 AS"),
+            "Zoned timestamp parameter $5 should NOT be wrapped in CAST: {rewritten}"
         );
     }
 

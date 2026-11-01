@@ -39,6 +39,7 @@ mod ai_udf;
 mod anthropic;
 mod bedrock;
 mod embedding;
+mod embedding_filter_limit;
 #[cfg(feature = "duckdb")]
 mod fts_caching_restart;
 #[cfg(feature = "duckdb")]

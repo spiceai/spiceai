@@ -45,7 +45,9 @@ use tracing_futures::Instrument;
 
 use crate::streaming_utils::generate_stream_id;
 
+pub mod model_info;
 pub mod streaming_utils;
+pub mod wire;
 
 #[derive(Debug, Snafu)]
 // Selectors are `pub`: provider crates construct e.g. `FailedToRunModelSnafu` across the
@@ -182,14 +184,19 @@ pub enum Error {
         "The tool '{tool}' was not found. Verify the Spicepod configuration, and view the tools documentation at https://spiceai.org/docs/components/tools"
     ))]
     ToolNotFound { tool: String },
+
+    #[snafu(display(
+        "Model '{model}' is split across nodes over connections that are neither authenticated nor encrypted, so it loads only when spiced runs with `--allow-insecure-connections`. Start spiced with `--allow-insecure-connections` on every node in `nodes`, and only on a trusted private network: any host that reaches a node's GPU server can use that GPU."
+    ))]
+    InsecureConnectionsNotAllowed { model: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl Error {
-    /// Whether the error is a mistake in the model's Spicepod configuration, which only a
-    /// change to the Spicepod can clear. A refusal from the provider is not one: a missing
-    /// model, a bad key or an exhausted quota can be fixed on the provider's side.
+    /// Whether the error is a mistake in the model's Spicepod configuration, or in how spiced
+    /// was started, which only a change to either can clear. A refusal from the provider is not
+    /// one: a missing model, a bad key or an exhausted quota can be fixed on the provider's side.
     #[must_use]
     pub fn is_configuration_error(&self) -> bool {
         match self {
@@ -207,7 +214,9 @@ impl Error {
             | Self::ModelMissingWeights { .. }
             | Self::UnsafePickleWeight { .. }
             | Self::ModelParameterFailed { .. }
-            | Self::ResponsesNotSupported { .. } => true,
+            | Self::ResponsesNotSupported { .. }
+            // Only restarting spiced with `--allow-insecure-connections` clears it.
+            | Self::InsecureConnectionsNotAllowed { .. } => true,
             Self::FailedToDownloadModel { configuration, .. } => *configuration,
             // A loader can wrap a configuration error, such as rejected pickle weights.
             Self::FailedToLoadModel { source } => source
@@ -596,6 +605,31 @@ pub trait Chat: Sync + Send {
             service_tier: None,
         })
     }
+
+    /// The model's token limits, as far as it reports them: a local model's context size,
+    /// or what a hosted model's provider reports in its model metadata. Each limit is `None`
+    /// when it is not known — never an estimate, since a client sizes its context management
+    /// and its answers by them.
+    ///
+    /// Asked when the model loads and each time `/v1/models` lists it. A hosted model reads
+    /// its provider's model metadata once per endpoint and keeps it, so only the first call
+    /// may wait on the provider.
+    ///
+    /// A type that wraps another `Chat` must forward this to the model it wraps: the default
+    /// answers no limits, which would hide the inner model's.
+    async fn token_limits(&self) -> TokenLimits {
+        TokenLimits::default()
+    }
+}
+
+/// A model's token limits. Each is `None` when the model or its provider does not report it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenLimits {
+    /// The most tokens one request can hold, prompt and answer together.
+    pub context_window: Option<u64>,
+    /// The most tokens one answer can hold, where the provider or engine enforces such a
+    /// cap. Never derived from the context window.
+    pub max_output_tokens: Option<u64>,
 }
 
 #[cfg(test)]

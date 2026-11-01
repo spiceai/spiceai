@@ -25,28 +25,29 @@ use app::AppBuilder;
 use axum::{
     Json, Router,
     body::Body,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, Request, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use spicepod::component::model::Model;
 use spicepod::component::runtime::{ApiKey, CorsConfig};
+use spicepod::component::worker::Worker;
 use tower::ServiceExt;
 
 use crate::{Runtime, config::Config};
 
 /// A request a mock provider received.
 #[derive(Clone, Debug)]
-struct Received {
-    path: String,
-    headers: HeaderMap,
-    body: Value,
+pub(super) struct Received {
+    pub(super) path: String,
+    pub(super) headers: HeaderMap,
+    pub(super) body: Value,
 }
 
-type Seen = Arc<Mutex<Vec<Received>>>;
+pub(super) type Seen = Arc<Mutex<Vec<Received>>>;
 
 fn record(seen: &Seen, path: &str, headers: HeaderMap, body: &Value) {
     seen.lock().expect("seen lock").push(Received {
@@ -258,8 +259,23 @@ async fn openai_chat(
     .into_response()
 }
 
-async fn start_provider(seen: &Seen) -> String {
+/// An OpenAI-compatible model listing, with the limits gateways report: `gpt-4o`'s window
+/// and output cap in `OpenRouter`'s shape.
+async fn openai_models() -> Json<Value> {
+    Json(json!({"object": "list", "data": [
+        {"id": "gpt-4o", "object": "model", "context_length": 128_000, "top_provider": {"max_completion_tokens": 16_384}},
+    ]}))
+}
+
+/// Anthropic's Models API, for one model.
+async fn anthropic_model(Path(model): Path<String>) -> Json<Value> {
+    Json(json!({"type": "model", "id": model, "max_input_tokens": 200_000, "max_tokens": 64_000}))
+}
+
+pub(super) async fn start_provider(seen: &Seen) -> String {
     let app = Router::new()
+        .route("/v1/models", get(openai_models))
+        .route("/v1/models/{model}", get(anthropic_model))
         .route("/v1/messages", post(anthropic))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route("/v1/chat/completions", post(openai_chat))
@@ -272,7 +288,7 @@ async fn start_provider(seen: &Seen) -> String {
     format!("http://{address}")
 }
 
-fn model(name: &str, from: &str, endpoint: &str, extra: &[(&str, &str)]) -> Model {
+pub(super) fn model(name: &str, from: &str, endpoint: &str, extra: &[(&str, &str)]) -> Model {
     let mut model = Model::new(from, name);
     let params: Vec<(&str, String)> = match from.split(':').next() {
         Some("anthropic") => vec![
@@ -295,22 +311,38 @@ fn model(name: &str, from: &str, endpoint: &str, extra: &[(&str, &str)]) -> Mode
     model
 }
 
-async fn runtime_with(models: Vec<Model>) -> Router {
+pub(super) async fn runtime_with(models: Vec<Model>) -> Router {
     runtime_with_cors(models, &CorsConfig::default()).await
 }
 
 async fn runtime_with_cors(models: Vec<Model>, cors: &CorsConfig) -> Router {
-    runtime_with_options(models, cors, None).await
+    runtime_with_options(models, Vec::new(), cors, None).await
+}
+
+/// A runtime serving `models` and the router `workers` over them.
+pub(super) async fn runtime_with_workers(models: Vec<Model>, workers: Vec<Worker>) -> Router {
+    runtime_with_options(models, workers, &CorsConfig::default(), None).await
 }
 
 /// A runtime whose routes accept only requests carrying `api_key`, as `runtime.auth.api_key`
 /// configures.
-async fn runtime_with_api_key(models: Vec<Model>, api_key: &str) -> Router {
+pub(super) async fn runtime_with_api_key(models: Vec<Model>, api_key: &str) -> Router {
+    runtime_with_cors_and_api_key(models, &CorsConfig::default(), api_key).await
+}
+
+/// A runtime that answers browsers as `cors` configures, and whose routes accept only
+/// requests carrying `api_key`.
+pub(super) async fn runtime_with_cors_and_api_key(
+    models: Vec<Model>,
+    cors: &CorsConfig,
+    api_key: &str,
+) -> Router {
     let auth =
         runtime_auth::api_key::ApiKeyAuth::new(vec![ApiKey::parse_str(&format!("{api_key}:rw"))]);
     runtime_with_options(
         models,
-        &CorsConfig::default(),
+        Vec::new(),
+        cors,
         Some(runtime_auth::layer::http::AuthLayer::new(Arc::new(auth))),
     )
     .await
@@ -318,6 +350,7 @@ async fn runtime_with_api_key(models: Vec<Model>, api_key: &str) -> Router {
 
 async fn runtime_with_options(
     models: Vec<Model>,
+    workers: Vec<Worker>,
     cors: &CorsConfig,
     auth: Option<runtime_auth::layer::http::AuthLayer>,
 ) -> Router {
@@ -325,8 +358,12 @@ async fn runtime_with_options(
     for model in models {
         app = app.with_model(model);
     }
+    for worker in workers {
+        app = app.with_worker(worker);
+    }
     let rt = Arc::new(Runtime::builder().with_app(app.build()).build().await);
     Arc::clone(&rt).load_models().await;
+    Arc::clone(&rt).load_workers().await;
     let search = Arc::new(runtime_search::search_engine::SearchEngine::new(
         Arc::clone(&rt.df) as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
         runtime_search::search_engine::parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
@@ -345,7 +382,7 @@ async fn runtime_with_options(
 }
 
 /// What a route answered: the status, the headers, and the body.
-async fn send(
+pub(super) async fn send(
     routes: &Router,
     path: &str,
     headers: &[(&str, &str)],
@@ -380,7 +417,7 @@ async fn send(
 }
 
 /// The events of an SSE body, as (name, data) pairs.
-fn sse_events(body: &str) -> Vec<(String, Value)> {
+pub(super) fn sse_events(body: &str) -> Vec<(String, Value)> {
     body.split("\n\n")
         .filter(|block| block.lines().any(|line| line.starts_with("data:")))
         .map(|block| {
@@ -405,7 +442,7 @@ fn header_of<'a>(received: &'a Received, name: &str) -> Option<&'a str> {
         .and_then(|value| value.to_str().ok())
 }
 
-fn taken(seen: &Seen) -> Vec<Received> {
+pub(super) fn taken(seen: &Seen) -> Vec<Received> {
     std::mem::take(&mut *seen.lock().expect("seen lock"))
 }
 

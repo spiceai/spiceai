@@ -18,7 +18,6 @@ use crate::Runtime;
 use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
 use arrow_schema::Schema;
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
-#[cfg(not(windows))]
 use cayenne::provider::CayenneAccelerationExec;
 use data_components::http::provider::{HttpExec, HttpTableProvider};
 use data_connector_api::listing::{
@@ -31,13 +30,12 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::Partitioning;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
+use datafusion_datasource::source::DataSourceExec;
 use datafusion_expr::ScalarUDF;
 use datafusion_proto::bytes::Serializeable;
 use datafusion_proto::generated::datafusion_common;
-#[cfg(not(windows))]
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::physical_plan::{PhysicalExtensionCodec, PhysicalProtoConverterExtension};
-#[cfg(not(windows))]
 use datafusion_proto::protobuf::PhysicalPlanNode;
 use iceberg_datafusion::IcebergTableProvider;
 use prost::Message;
@@ -53,6 +51,7 @@ use runtime_proto::{
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use super::header_projected_csv::{decode_header_projected_csv, encode_header_projected_csv};
 use super::spice_logical_codec::SpiceLogicalCodec;
 
 /// Serialization support for custom Spice execution nodes
@@ -131,18 +130,9 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                 )
                 .fallback_to_new_context(),
             )),
-            Some(spice_physical_plan_node::Node::CayenneAcceleration(_)) => {
-                #[cfg(not(windows))]
-                {
-                    Ok(Arc::new(CayenneAccelerationExec::new(Arc::clone(
-                        &inputs[0],
-                    ))))
-                }
-                #[cfg(windows)]
-                {
-                    exec_err!("CayenneAccelerationExec is not supported on Windows")
-                }
-            }
+            Some(spice_physical_plan_node::Node::CayenneAcceleration(_)) => Ok(Arc::new(
+                CayenneAccelerationExec::new(Arc::clone(&inputs[0])),
+            )),
             Some(spice_physical_plan_node::Node::Udtf(node)) => {
                 // Decode the UdtfExec by re-invoking the UDTF
                 let runtime = self.runtime()?;
@@ -227,6 +217,9 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                     partitions,
                     limit,
                 )))
+            }
+            Some(spice_physical_plan_node::Node::HeaderProjectedCsvScan(node)) => {
+                decode_header_projected_csv(&node, ctx, self, proto_converter)
             }
             Some(spice_physical_plan_node::Node::IcebergTableScan(node)) => {
                 let runtime = self.runtime()?;
@@ -329,7 +322,6 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                 )))
             }
             None => {
-                #[cfg(not(windows))]
                 if let Ok(plan) = Self::try_decode_nested_physical_plan(buf, ctx) {
                     return Ok(plan);
                 }
@@ -344,6 +336,15 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
         buf: &mut Vec<u8>,
         proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<()> {
+        if let Some(exec) = node.downcast_ref::<DataSourceExec>()
+            && let Some(wrapper) = encode_header_projected_csv(exec, self, proto_converter)?
+        {
+            wrapper
+                .encode(buf)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            return Ok(());
+        }
+
         let wrapper = if let Some(concrete) = node.downcast_ref::<SchemaCastScanExec>() {
             let mut schema_buf = vec![];
             let serialized_schema = datafusion_common::Schema::try_from(concrete.schema())?;
@@ -471,21 +472,14 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                     },
                 )),
             }
+        } else if node.is::<CayenneAccelerationExec>() {
+            SpicePhysicalPlanNode {
+                node: Some(spice_physical_plan_node::Node::CayenneAcceleration(
+                    CayenneAccelerationExecNode {},
+                )),
+            }
         } else {
-            #[cfg(not(windows))]
-            if node.is::<CayenneAccelerationExec>() {
-                SpicePhysicalPlanNode {
-                    node: Some(spice_physical_plan_node::Node::CayenneAcceleration(
-                        CayenneAccelerationExecNode {},
-                    )),
-                }
-            } else {
-                return self.inner.try_encode(node, buf, proto_converter);
-            }
-            #[cfg(windows)]
-            {
-                return self.inner.try_encode(node, buf, proto_converter);
-            }
+            return self.inner.try_encode(node, buf, proto_converter);
         };
 
         wrapper
@@ -635,7 +629,6 @@ fn decode_partitioning(partitioning: Option<&IcebergPartitioning>) -> Result<Par
     })
 }
 
-#[cfg(not(windows))]
 impl SpicePhysicalCodec {
     fn try_decode_nested_physical_plan(
         buf: &[u8],
@@ -653,7 +646,6 @@ impl SpicePhysicalCodec {
 }
 
 #[cfg(test)]
-#[cfg(not(windows))]
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
@@ -1038,6 +1030,261 @@ mod tests {
             }
             other => panic!("expected an IcebergTableScan recipe node, got {other:?}"),
         }
+    }
+
+    fn csv_text(header: &str, rows: &[&str]) -> String {
+        let mut text = String::new();
+        text.push_str(header);
+        text.push('\n');
+        for row in rows {
+            text.push_str(row);
+            text.push('\n');
+        }
+        text
+    }
+
+    fn write_csv(path: &std::path::Path, header: &str, rows: &[&str]) {
+        std::fs::write(path, csv_text(header, rows)).expect("write csv");
+    }
+
+    fn write_gzip_csv(path: &std::path::Path, header: &str, rows: &[&str]) {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(csv_text(header, rows).as_bytes())
+            .expect("gzip write");
+        std::fs::write(path, encoder.finish().expect("gzip finish")).expect("write gz");
+    }
+
+    fn header_projected_listing_table_with_format(
+        dir: &std::path::Path,
+        format: Arc<dyn datafusion::datasource::file_format::FileFormat>,
+        extension: &str,
+    ) -> Arc<dyn TableProvider> {
+        use datafusion::datasource::listing::{
+            ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::Int64, true),
+            Field::new("user_id", DataType::Int64, true),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("amount_cents", DataType::Int64, true),
+            Field::new("ts", DataType::Utf8, true),
+        ]));
+        let url = ListingTableUrl::parse(format!("file://{}/", dir.display())).expect("url");
+        let config = ListingTableConfig::new(url)
+            .with_listing_options(ListingOptions::new(format).with_file_extension(extension))
+            .with_schema(schema);
+        Arc::new(ListingTable::try_new(config).expect("listing table"))
+    }
+
+    fn header_projected_listing_table(dir: &std::path::Path) -> Arc<dyn TableProvider> {
+        use data_components::csv_header_projection::HeaderProjectedCsvFormat;
+        use datafusion::datasource::file_format::csv::CsvFormat;
+
+        header_projected_listing_table_with_format(
+            dir,
+            HeaderProjectedCsvFormat::wrap(Arc::new(CsvFormat::default().with_has_header(true))),
+            ".csv",
+        )
+    }
+
+    fn header_projected_gzip_listing_table(dir: &std::path::Path) -> Arc<dyn TableProvider> {
+        use data_components::csv_header_projection::HeaderProjectedCsvFormat;
+        use datafusion::datasource::file_format::csv::CsvFormat;
+        use datafusion_datasource::file_compression_type::FileCompressionType;
+
+        header_projected_listing_table_with_format(
+            dir,
+            HeaderProjectedCsvFormat::wrap(Arc::new(
+                CsvFormat::default()
+                    .with_has_header(true)
+                    .with_file_compression_type(FileCompressionType::GZIP),
+            )),
+            ".csv.gz",
+        )
+    }
+
+    fn plan_has_header_projected_csv(plan: &dyn ExecutionPlan) -> bool {
+        use data_components::csv_header_projection::HeaderProjectedCsvSource;
+        use datafusion_datasource::source::DataSourceExec;
+
+        if let Some(exec) = plan.downcast_ref::<DataSourceExec>()
+            && exec
+                .downcast_to_file_source::<HeaderProjectedCsvSource>()
+                .is_some()
+        {
+            return true;
+        }
+        plan.children()
+            .into_iter()
+            .any(|child| plan_has_header_projected_csv(child.as_ref()))
+    }
+
+    fn plan_file_compression(
+        plan: &dyn ExecutionPlan,
+    ) -> Option<datafusion_datasource::file_compression_type::FileCompressionType> {
+        use data_components::csv_header_projection::HeaderProjectedCsvSource;
+        use datafusion_datasource::source::DataSourceExec;
+
+        if let Some(exec) = plan.downcast_ref::<DataSourceExec>()
+            && let Some((conf, _)) = exec.downcast_to_file_source::<HeaderProjectedCsvSource>()
+        {
+            return Some(conf.file_compression_type);
+        }
+        plan.children()
+            .into_iter()
+            .find_map(|child| plan_file_compression(child.as_ref()))
+    }
+
+    fn plan_csv_file_etags(plan: &dyn ExecutionPlan) -> Vec<Option<String>> {
+        use data_components::csv_header_projection::HeaderProjectedCsvSource;
+        use datafusion_datasource::file_groups::FileGroup;
+        use datafusion_datasource::source::DataSourceExec;
+
+        if let Some(exec) = plan.downcast_ref::<DataSourceExec>()
+            && let Some((conf, _)) = exec.downcast_to_file_source::<HeaderProjectedCsvSource>()
+        {
+            return conf
+                .file_groups
+                .iter()
+                .flat_map(FileGroup::files)
+                .map(|file| file.object_meta.e_tag.clone())
+                .collect();
+        }
+        plan.children()
+            .into_iter()
+            .find_map(|child| {
+                let etags = plan_csv_file_etags(child.as_ref());
+                (!etags.is_empty()).then_some(etags)
+            })
+            .unwrap_or_default()
+    }
+
+    async fn round_trip_header_projected_csv(
+        table: Arc<dyn TableProvider>,
+    ) -> (
+        Arc<dyn ExecutionPlan>,
+        datafusion::arrow::array::RecordBatch,
+    ) {
+        use datafusion::physical_plan::collect;
+        use datafusion_proto::physical_plan::AsExecutionPlan;
+
+        let ctx = SessionContext::new();
+        ctx.register_table("events", table).expect("register");
+        let plan = ctx
+            .sql("SELECT sum(amount_cents) AS amount_cents, sum(user_id) AS user_id FROM events")
+            .await
+            .expect("sql")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        assert!(
+            plan_has_header_projected_csv(plan.as_ref()),
+            "planned scan must use HeaderProjectedCsvSource"
+        );
+        let planned_etags = plan_csv_file_etags(plan.as_ref());
+        assert!(
+            planned_etags.iter().any(Option::is_some),
+            "local listing must report an ETag so the codec has a generation to carry"
+        );
+        let codec = SpicePhysicalCodec {
+            inner: Arc::new(BallistaPhysicalExtensionCodec::default()),
+            runtime: None,
+        };
+        let proto = PhysicalPlanNode::try_from_physical_plan(Arc::clone(&plan), &codec)
+            .expect("headered CSV scan must serialize through SpicePhysicalCodec");
+        let decoded = proto
+            .try_into_physical_plan(ctx.task_ctx().as_ref(), &codec)
+            .expect("headered CSV scan must deserialize to HeaderProjectedCsvSource");
+        assert!(
+            plan_has_header_projected_csv(decoded.as_ref()),
+            "decoded scan must stay HeaderProjectedCsvSource, not CsvSource"
+        );
+        assert_eq!(
+            plan_csv_file_etags(decoded.as_ref()),
+            planned_etags,
+            "FileGeneration must restore the listed ETag; DataFusion PartitionedFile proto drops it"
+        );
+        let batches = collect(Arc::clone(&decoded), ctx.task_ctx())
+            .await
+            .expect("execute decoded plan");
+        (decoded, batches[0].clone())
+    }
+
+    fn assert_name_bound_sums(batch: &datafusion::arrow::array::RecordBatch) {
+        use arrow::array::{Array, Int64Array};
+
+        let amounts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("amount_cents");
+        let users = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("user_id");
+        assert_eq!(
+            (
+                (!amounts.is_null(0)).then(|| amounts.value(0)),
+                (!users.is_null(0)).then(|| users.value(0)),
+            ),
+            (Some(300), Some(30)),
+            "reordered headers must still bind by name after the codec round-trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn header_projected_csv_codec_round_trip_keeps_name_binding() {
+        use datafusion_datasource::file_compression_type::FileCompressionType;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_csv(
+            &dir.path().join("events.csv"),
+            "event_id,amount_cents,region,user_id,ts",
+            &["1,100,us,10,t0", "2,200,eu,20,t1"],
+        );
+
+        let (decoded, batch) =
+            round_trip_header_projected_csv(header_projected_listing_table(dir.path())).await;
+        assert_eq!(
+            plan_file_compression(decoded.as_ref()),
+            Some(FileCompressionType::UNCOMPRESSED),
+            "plain CSV must decode as uncompressed"
+        );
+        assert_name_bound_sums(&batch);
+    }
+
+    #[tokio::test]
+    async fn header_projected_csv_codec_round_trip_keeps_gzip_name_binding() {
+        use datafusion_datasource::file_compression_type::FileCompressionType;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_gzip_csv(
+            &dir.path().join("events.csv.gz"),
+            "event_id,amount_cents,region,user_id,ts",
+            &["1,100,us,10,t0", "2,200,eu,20,t1"],
+        );
+        let gzip_bytes = std::fs::read(dir.path().join("events.csv.gz")).expect("read gz");
+        assert_eq!(
+            gzip_bytes.get(..2),
+            Some(&[0x1f, 0x8b][..]),
+            "the fixture must be gzip so a UNCOMPRESSED decode fails"
+        );
+
+        let (decoded, batch) =
+            round_trip_header_projected_csv(header_projected_gzip_listing_table(dir.path())).await;
+        assert_eq!(
+            plan_file_compression(decoded.as_ref()),
+            Some(FileCompressionType::GZIP),
+            "gzip CSV must keep FileScanConfig.file_compression_type across the codec"
+        );
+        assert_name_bound_sums(&batch);
     }
 
     #[tokio::test]

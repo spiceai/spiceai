@@ -1291,6 +1291,64 @@ mod flight_prepared_statements {
             .await
     }
 
+    /// A bound parameter compared with a column takes the column's type, as it
+    /// does over HTTP. Comparing in the parameter's type instead loses the time
+    /// zone of a zoned timestamp, and compares a DECIMAL column as an inexact
+    /// float, so the matching row is not returned.
+    #[tokio::test]
+    async fn test_parameter_compared_with_column_matches() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+
+        test_request_context()
+            .scope(async {
+                use arrow::array::{Float64Array, TimestampMicrosecondArray};
+                use arrow::datatypes::{DataType, TimeUnit};
+
+                let (channel, _df) = start_spice_test_app(None, None, None).await?;
+                let mut client = FlightSqlServiceClient::new(channel);
+
+                let zone = "America/Los_Angeles";
+                // 2026-01-15T09:30:00-08:00
+                let instant_us = 1_768_498_200_000_000_i64;
+                let cases = [
+                    (
+                        "WITH t(c) AS (SELECT arrow_cast('2026-01-15T09:30:00-08:00', 'Timestamp(µs, \"America/Los_Angeles\")')) \
+                         SELECT count(*) AS n FROM t WHERE c = $1",
+                        create_param_batch(
+                            vec![(
+                                "$1",
+                                DataType::Timestamp(TimeUnit::Microsecond, Some(zone.into())),
+                                false,
+                            )],
+                            vec![Arc::new(
+                                TimestampMicrosecondArray::from(vec![instant_us]).with_timezone(zone),
+                            ) as ArrayRef],
+                        )?,
+                    ),
+                    (
+                        "WITH t(c) AS (SELECT CAST('0.1' AS DECIMAL(38, 37))) \
+                         SELECT count(*) AS n FROM t WHERE c = $1",
+                        create_param_batch(
+                            vec![("$1", DataType::Float64, false)],
+                            vec![Arc::new(Float64Array::from(vec![0.1])) as ArrayRef],
+                        )?,
+                    ),
+                ];
+
+                for (sql, params) in cases {
+                    let results = execute_parameterized_query(&mut client, sql, params).await?;
+                    let n = results
+                        .first()
+                        .and_then(|batch| batch.column(0).as_any().downcast_ref::<Int64Array>())
+                        .map(|n| n.value(0));
+                    assert_eq!(n, Some(1), "{sql}");
+                }
+
+                Ok(())
+            })
+            .await
+    }
+
     /// A stale-while-revalidate revalidation of a Flight SQL prepared statement
     /// must re-bind its parameter values.
     ///

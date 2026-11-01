@@ -280,7 +280,6 @@ fn single_i64(rows: &[RecordBatch]) -> i64 {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_query_records_parent_and_stage_rows() -> Result<(), anyhow::Error> {
     // Serialize against other tests in this module — shared DF_SLOT +
     // global subscriber would race otherwise.
@@ -457,7 +456,6 @@ async fn test_distributed_query_records_parent_and_stage_rows() -> Result<(), an
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_query_records_error_on_failure() -> Result<(), anyhow::Error> {
     let _serial = test_lock().lock().await;
     test_request_context()
@@ -525,7 +523,6 @@ async fn test_distributed_query_records_error_on_failure() -> Result<(), anyhow:
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_query_captures_plan_from_executed_graph() -> Result<(), anyhow::Error> {
     let _serial = test_lock().lock().await;
     test_request_context()
@@ -651,7 +648,6 @@ async fn test_distributed_query_captures_plan_from_executed_graph() -> Result<()
 /// Task history is read only on the scheduler, so a distributed query that
 /// reads it is rejected before it is submitted.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_query_rejects_task_history() -> Result<(), anyhow::Error> {
     let _serial = test_lock().lock().await;
     test_request_context()

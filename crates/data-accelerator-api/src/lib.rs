@@ -60,6 +60,7 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
 pub mod keep_first;
+pub mod pk_write_guard;
 pub mod snapshots;
 pub mod storage;
 pub mod swappable;
@@ -727,20 +728,12 @@ pub trait DataAccelerator: Send + Sync {
     /// connection pool, which is what keeps the engine crates off `runtime`'s
     /// dependency graph.
     ///
-    /// `registry` is passed rather than captured because one engine's sidecar can live
-    /// in another engine's database: a Cayenne accelerator configured with
-    /// `cayenne_metastore: turso` must take the *`Turso`* accelerator's path-keyed pool
-    /// for `cayenne.db`, since the lock serializing sidecar DDL against concurrent
-    /// writes lives on that pool instance — a pool of its own would hold a lock no
-    /// other sidecar observes.
-    ///
     /// Deliberately has no default: an engine that hosts nothing must say so with
     /// [`runtime_acceleration::sidecar::unsupported_sidecar`], because a defaulted
     /// no-op would silently disable checkpointing for it.
     async fn sidecar(
         &self,
         source: &dyn AccelerationSource,
-        registry: Arc<AcceleratorEngineRegistry>,
         open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError>;
 
@@ -799,36 +792,6 @@ pub trait DataAccelerator: Send + Sync {
         _app: Option<&Arc<app::App>>,
     ) -> runtime_acceleration::memory_budget::DuckDbBudgetInputs {
         runtime_acceleration::memory_budget::DuckDbBudgetInputs::default()
-    }
-
-    /// A sidecar over a database this engine owns at `path`, for state that belongs to
-    /// the runtime rather than to a dataset — the Cayenne metastore's `cayenne.db`.
-    ///
-    /// Distinct from [`Self::sidecar`], which derives the path from a source. The
-    /// caller has a path and no source to derive one from, and asks the owning engine
-    /// rather than opening the file itself: the lock that serializes sidecar DDL
-    /// against a concurrent write lives on the engine's pool instance, so a second
-    /// pool over the same file would hold a lock nothing else observes.
-    ///
-    /// Asking through this method is what keeps one engine from naming another's
-    /// concrete type. Defaults to unsupported, which is the true answer for an engine
-    /// that keeps no path-keyed databases of its own.
-    ///
-    /// `dataset_name` names the dataset whose state this sidecar holds — the sidecar
-    /// stores it as such and namespaces rows by it. It is NOT a `spice_sys_*` table
-    /// name; passing one would file a dataset's checkpoints under a table.
-    async fn sidecar_for_path(
-        &self,
-        path: &str,
-        _dataset_name: &str,
-    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
-        Err(CheckpointError::Store {
-            source: format!(
-                "the {} accelerator does not host databases of its own, so it cannot open '{path}'",
-                self.name()
-            )
-            .into(),
-        })
     }
 
     /// Drops an existing table from the acceleration engine.

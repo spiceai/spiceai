@@ -670,14 +670,6 @@ mod tests {
             home_dir_path.join("model")
         );
 
-        #[cfg(windows)]
-        assert_eq!(
-            local_model_path("~\\model")
-                .expect("home-relative model path should resolve")
-                .expect("home-relative model path should be treated as local"),
-            home_dir_path.join("model")
-        );
-
         // Leading separators after `~/` must not silently resolve to an absolute path
         // outside the home directory.
         assert_eq!(

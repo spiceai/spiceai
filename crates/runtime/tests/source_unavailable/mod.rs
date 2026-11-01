@@ -601,6 +601,64 @@ async fn a_dataset_whose_source_refuses_reads_at_startup_loads_once_the_source_i
     .await
 }
 
+/// A Spicepod change to an accelerated dataset whose source is down cannot load the
+/// new configuration. The dataset loads it once the source is reachable again.
+#[tokio::test]
+async fn a_dataset_changed_while_its_source_is_down_loads_once_the_source_is_reachable()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let source = UnreachableSource::new("changed-while-down", 7);
+    source.refuse_reads_instead_of_connecting();
+    source.register().await;
+    source.bring_up();
+
+    let app = |refresh_check_interval: &str| {
+        let mut dataset = SpicepodDataset::new(format!("{}://orders", source.prefix), "orders");
+        dataset.acceleration = Some(spicepod::acceleration::Acceleration {
+            enabled: true,
+            engine: Some("arrow".to_string()),
+            refresh_check_interval: Some(refresh_check_interval.to_string()),
+            ..Default::default()
+        });
+        AppBuilder::new("source_unavailable")
+            .with_dataset(dataset)
+            .build()
+    };
+    configure_test_datafusion();
+    let rt = Arc::new(Runtime::builder().with_app(app("30s")).build().await);
+    let loader = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        async move { rt.load_components().await }
+    });
+    let ready = wait_until_true(Duration::from_secs(30), || async {
+        run_query(&rt, "SELECT COUNT(*) FROM orders").await.is_ok()
+    })
+    .await;
+    assert!(ready, "the dataset must load while its source is up");
+
+    source.take_down();
+    assert!(Arc::clone(&rt).apply_app(Arc::new(app("60s"))).await);
+    assert!(
+        run_query(&rt, "SELECT COUNT(*) FROM orders").await.is_err(),
+        "the new configuration cannot load while the source is down"
+    );
+
+    source.bring_up();
+    let queryable = wait_until_true(Duration::from_secs(30), || async {
+        run_query(&rt, "SELECT COUNT(*) FROM orders").await.is_ok()
+    })
+    .await;
+    assert!(
+        queryable,
+        "the dataset must load once its source is reachable; status {:?}",
+        dataset_status(&rt, "orders")
+    );
+
+    loader.abort();
+    rt.shutdown().await;
+    Ok(())
+}
+
 /// Accelerated datasets whose acceleration is already on disk when the runtime
 /// starts with the source down or slow (#14610).
 #[cfg(feature = "duckdb")]
@@ -2103,6 +2161,48 @@ mod served_from_acceleration {
         Ok(())
     }
 
+    /// A cron-scheduled dataset whose first load fails is still refreshed on its schedule,
+    /// so it loads once the source answers again.
+    #[tokio::test]
+    async fn a_cron_scheduled_dataset_whose_first_load_failed_loads_on_schedule()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("cron-after-failed-load").await?;
+        let source = &fixture.source;
+        source.bring_up();
+        source.read_lazily();
+        source.set_scans_failing(true);
+        let mut dataset = with_refresh_cron(fixture.dataset(ReadyState::OnLoad), "*/2 * * * * *");
+        if let Some(acceleration) = dataset.acceleration.as_mut() {
+            acceleration.refresh_jitter_enabled = false;
+            acceleration.refresh_retry_enabled = false;
+        }
+        let (rt, loader) = start(dataset).await;
+        let failed = wait_until_true(Duration::from_secs(15), || async {
+            source.failed_scans() > 0
+                && matches!(
+                    dataset_status(&rt, "orders"),
+                    Some(ComponentStatus::Error(_))
+                )
+        })
+        .await;
+
+        source.set_scans_failing(false);
+        let recovered = wait_until_true(Duration::from_secs(15), || async {
+            sum_and_count(&rt).await == Some((3, 3))
+                && dataset_status(&rt, "orders") == Some(ComponentStatus::Ready)
+        })
+        .await;
+        let observed = (sum_and_count(&rt).await, dataset_status(&rt, "orders"));
+        stop(rt, loader).await;
+        assert!(failed, "the first load fails while scans fail");
+        assert!(
+            recovered,
+            "a scheduled refresh loads the dataset once scans succeed, got {observed:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn synchronized_child_uses_parent_refresh_deadline() -> Result<(), anyhow::Error> {
         assert_synchronized_deadline("sync-child-deadline", false, Some("10m")).await
@@ -2895,8 +2995,7 @@ mod served_from_acceleration {
 }
 
 /// `append` datasets with a `time_column` and acceleration snapshots enabled.
-// Cayenne does not build on Windows.
-#[cfg(all(feature = "snapshots", not(windows)))]
+#[cfg(feature = "snapshots")]
 mod served_with_snapshots_enabled {
     use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
