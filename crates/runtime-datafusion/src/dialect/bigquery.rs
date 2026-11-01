@@ -1738,6 +1738,10 @@ impl Dialect for SpiceBigQueryDialect {
         self.inner.derived_table_evaluates_volatile_outputs_once()
     }
 
+    fn identifier_max_length(&self) -> Option<usize> {
+        self.inner.identifier_max_length()
+    }
+
     fn requires_derived_table_alias(&self) -> bool {
         self.inner.requires_derived_table_alias()
     }
