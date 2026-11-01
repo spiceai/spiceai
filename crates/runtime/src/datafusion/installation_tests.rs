@@ -452,13 +452,7 @@ fn invalid_initializations(storage: &std::path::Path) -> [InitializationCase; 4]
         InitializationCase {
             engine: Engine::Sqlite,
             accelerator: Arc::new(accelerator_sqlite::SqliteAccelerator::new()),
-            params: vec![("sqlite_file", invalid_file.clone())],
-            expected_error: "extension",
-        },
-        InitializationCase {
-            engine: Engine::Turso,
-            accelerator: Arc::new(accelerator_turso::TursoAccelerator::new()),
-            params: vec![("turso_file", invalid_file)],
+            params: vec![("sqlite_file", invalid_file)],
             expected_error: "extension",
         },
     ]

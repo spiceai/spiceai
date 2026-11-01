@@ -7,7 +7,9 @@ description: >
   another table, a missing file, a missing table — while a healthy dataset
   beside them serves. A Cayenne dataset that still names the retired Turso
   metastore loads on the SQLite metastore it shares with a healthy one, and
-  is warned once to drop the param.
+  is warned once to drop the param. A dataset and a view that set the removed
+  `turso` acceleration engine each fail to load with one error naming the fix,
+  and are never switched to Cayenne.
 
 sources:
   src: { kind: postgres }
@@ -29,6 +31,9 @@ spicepod:
     - { from: 'postgres:public.t', name: healthy_cayenne, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file, params: { cayenne_metastore: sqlite, cayenne_file_path: '${instance.dir}/healthy_cayenne', cayenne_metadata_dir: '${instance.dir}/meta' } } }
     - { from: 'postgres:public.t', name: turso_param, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file, params: { cayenne_metastore: turso, cayenne_file_path: '${instance.dir}/turso_param', cayenne_metadata_dir: '${instance.dir}/meta' } } }
     - { from: 'postgres:public.t', name: turso_param_memory, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: memory, params: { cayenne_metastore: turso } } }
+    - { from: 'postgres:public.t', name: turso_engine, params: '${sources.src.params}', acceleration: { enabled: true, engine: turso } }
+  views:
+    - { name: turso_view, sql: 'SELECT * FROM healthy', acceleration: { enabled: true, engine: turso } }
 steps:
   - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'a')" }
   - start: { ready: false }
@@ -70,3 +75,16 @@ steps:
         "Dataset 'turso_param' sets `cayenne_metastore: turso`, which is no longer supported and has no effect: the dataset uses the built-in metastore. Remove `cayenne_metastore` from this dataset. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration": 1
         "Dataset 'turso_param_memory' sets `cayenne_metastore: turso`, which is no longer supported and has no effect": 1
   - assert-files: { contains: ['^meta/cayenne\.db$'], lacks: ['^meta/cayenne\.db-log$'] }
+  # The `turso` acceleration engine is removed. Only the dataset and the view
+  # that set it fail to load, each with one error, and neither is rebuilt on
+  # Cayenne behind the user's back: a dataset that falls back to Cayenne would
+  # answer this query.
+  - query: SELECT * FROM turso_engine
+    expect-error: turso_engine
+  - query: SELECT * FROM turso_view
+    expect-error: turso_view
+  - assert-log:
+      count:
+        "ERROR .*Failed to load dataset 'turso_engine': the acceleration engine `turso` is no longer supported as of v2\\.5 and cannot be used\\. Set `acceleration\\.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots\\. See: https://spiceai\\.org/docs/components/data-accelerators/cayenne/migration dataset=\"turso_engine\"$": 1
+        "ERROR .*Failed to load view 'turso_view': the acceleration engine `turso` is no longer supported as of v2\\.5 and cannot be used\\. Set `acceleration\\.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots\\. See: https://spiceai\\.org/docs/components/data-accelerators/cayenne/migration view=\"turso_view\"$": 1
+      lacks: ["deprecated .*turso_(engine|view)", "Unknown acceleration engine 'turso'"]

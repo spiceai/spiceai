@@ -54,7 +54,6 @@ tar = "0.4"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["fs", "sync"] }
 tracing.workspace = true
-turso = { workspace = true, optional = true }
 url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 utoipa = { workspace = true, optional = true }
@@ -71,7 +70,6 @@ snapshots = []
 sqlite = ["dep:rusqlite"]
 # An `AccelerationSource` the engine crates can build in their own tests.
 test-support = []
-turso = ["dep:turso"]
 
 [dev-dependencies]
 anyhow = { workspace = true }

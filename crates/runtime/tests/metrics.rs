@@ -50,8 +50,6 @@ use accelerator_duckdb as _;
 use accelerator_postgres as _;
 #[cfg(feature = "sqlite")]
 use accelerator_sqlite as _;
-#[cfg(feature = "turso")]
-use accelerator_turso as _;
 
 use std::{
     collections::{HashMap, HashSet},

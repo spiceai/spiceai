@@ -118,7 +118,7 @@ async fn restored_checkpoint(dataset: &Dataset) -> Option<Arc<dyn DatasetCheckpo
 /// its source, including those its `refresh_sql` leaves out, so no schema the dataset
 /// could register describes both the stored table and the newer snapshots it must accept.
 ///
-/// Only the `DuckDB`, `SQLite` and Turso snapshots carry the publisher's checkpoint, and
+/// Only the `DuckDB` and `SQLite` snapshots carry the publisher's checkpoint, and
 /// with it the SQL; a Cayenne snapshot's is rebuilt from the metadata, which does not.
 pub(crate) async fn publisher_column_projection(dataset: &Dataset) -> Option<String> {
     let checkpoint = restored_checkpoint(dataset).await?;

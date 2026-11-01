@@ -556,7 +556,7 @@ pub enum Error {
     UnsupportedSnapshotTriggerForCaching,
 
     #[snafu(display(
-        "Invalid snapshot configuration: Only DuckDB, Turso and SQlite support snapshots"
+        "Invalid snapshot configuration: Only DuckDB and SQlite support snapshots"
     ))]
     UnsupportedAccelerationEngineForSnapshots,
 
@@ -570,7 +570,7 @@ pub enum Error {
 
     #[snafu(display(
         "refresh_mode: snapshot requires a snapshot-capable file-based engine \
-         (DuckDB, SQLite, Cayenne, or Turso); engine '{engine}' is not supported."
+         (DuckDB, SQLite, or Cayenne); engine '{engine}' is not supported."
     ))]
     SnapshotRefreshModeUnsupportedEngine { engine: String },
 
@@ -846,8 +846,6 @@ pub(crate) fn engine_to_acceleration_engine(engine: Engine) -> Option<Accelerati
         Engine::DuckDB => Some(AccelerationEngine::DuckDB),
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => Some(AccelerationEngine::Sqlite),
-        #[cfg(feature = "turso")]
-        Engine::Turso => Some(AccelerationEngine::Turso),
         Engine::Cayenne => Some(AccelerationEngine::Cayenne),
         _ => None,
     }
@@ -4910,7 +4908,7 @@ impl DataFusion {
 
         let needs_dict_normalization = matches!(
             acceleration_settings.engine.to_unpartitioned(),
-            Engine::DuckDB | Engine::Sqlite | Engine::Turso
+            Engine::DuckDB | Engine::Sqlite
         );
         let normalized_refresh_schema = if needs_dict_normalization
             && arrow_tools::schema::has_dictionary_types(refresh_schema)
@@ -5122,7 +5120,7 @@ impl DataFusion {
                             dataset = %dataset.name,
                             "Schema change detected that cannot be evolved under `on_schema_change: {policy}`: {reason}.{fallback}",
                             fallback = if policy_recreates_on_incompatible(policy) {
-                                " `drop_and_recreate` recreates the table only with `refresh_mode: full` on a supported engine (DuckDB, SQLite, Turso, Cayenne); the new schema is not applied. Use `refresh_mode: full`, or revert the source schema change, to recover"
+                                " `drop_and_recreate` recreates the table only with `refresh_mode: full` on a supported engine (DuckDB, SQLite, Cayenne); the new schema is not applied. Use `refresh_mode: full`, or revert the source schema change, to recover"
                             } else {
                                 " The new schema is not applied; revert the source schema change to recover"
                             },
@@ -7738,8 +7736,6 @@ async fn build_snapshot_creation_config(
         Engine::DuckDB => AccelerationEngine::DuckDB,
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => AccelerationEngine::Sqlite,
-        #[cfg(feature = "turso")]
-        Engine::Turso => AccelerationEngine::Turso,
         Engine::Cayenne => AccelerationEngine::Cayenne,
         _ => {
             // This code is unreachable since build_snapshot_creation_config is
@@ -9200,19 +9196,6 @@ mod tests {
         }
 
         #[test]
-        fn turso_rejected_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
-            let result = validate_distributed_engine(&config, Engine::Turso, "my_dataset");
-            assert!(
-                matches!(
-                    result,
-                    Err(Error::UnsupportedDistributedAccelerationEngine { .. })
-                ),
-                "Expected UnsupportedDistributedAccelerationEngine, got: {result:?}",
-            );
-        }
-
-        #[test]
         fn any_engine_allowed_in_non_distributed_mode() {
             let config = make_non_distributed_config();
             validate_distributed_engine(&config, Engine::DuckDB, "ds")
@@ -9221,8 +9204,6 @@ mod tests {
                 .expect("sqlite should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::PostgreSQL, "ds")
                 .expect("postgresql should be allowed when not in distributed mode");
-            validate_distributed_engine(&config, Engine::Turso, "ds")
-                .expect("turso should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Arrow, "ds")
                 .expect("arrow should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Cayenne, "ds")

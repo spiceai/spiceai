@@ -200,7 +200,6 @@ enum Engine {
     DuckDb,
     Postgres,
     Sqlite,
-    Turso,
 }
 
 impl Engine {
@@ -211,7 +210,6 @@ impl Engine {
             "duckdb" => Self::DuckDb,
             "postgres" => Self::Postgres,
             "sqlite" => Self::Sqlite,
-            "turso" => Self::Turso,
             other => bail!("layouts do not support the '{other}' acceleration engine"),
         })
     }
@@ -223,7 +221,7 @@ impl Engine {
             Self::Cayenne => Some(("cayenne_sort_columns", "")),
             Self::DuckDb => Some(("on_refresh_sort_columns", " ASC")),
             Self::Arrow => Some(("arrow_sort_columns", " ASC")),
-            Self::Postgres | Self::Sqlite | Self::Turso => None,
+            Self::Postgres | Self::Sqlite => None,
         }
     }
 

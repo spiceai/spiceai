@@ -55,6 +55,9 @@ pub enum ParseError {
     #[snafu(display("Unknown acceleration engine '{name}'"))]
     AcceleratorEngineNotAvailable { name: String },
 
+    #[snafu(display("{}", crate::removed_engine_message(name)))]
+    AcceleratorEngineRemoved { name: &'static str },
+
     #[snafu(display("Invalid acceleration configuration: {detail}"))]
     InvalidAccelerationConfiguration { detail: String },
 
@@ -1067,9 +1070,14 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             .engine
             .as_deref()
             .unwrap_or(spicepod_acceleration::DEFAULT_ENGINE);
-        let engine = match Engine::try_from(engine_str).map_err(|_| {
-            ParseError::AcceleratorEngineNotAvailable {
-                name: engine_str.to_string(),
+        let engine = match Engine::try_from(engine_str).map_err(|err| match err {
+            crate::Error::AcceleratorEngineRemoved { name } => {
+                ParseError::AcceleratorEngineRemoved { name }
+            }
+            crate::Error::AcceleratorEngineNotAvailable { .. } => {
+                ParseError::AcceleratorEngineNotAvailable {
+                    name: engine_str.to_string(),
+                }
             }
         })? {
             Engine::Arrow if !acceleration.partition_by.is_empty() => Engine::PartitionedArrow,

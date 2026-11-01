@@ -902,12 +902,12 @@ tests:
         let yaml = "
 tests:
     bench:
-        spicepod_path: s3[parquet]-turso[file].yaml
+        spicepod_path: s3[parquet]-cayenne[file].yaml
         query_set: tpch
         ready_wait: 300
         runner_type: spiceai-dev-runners
     load:
-        spicepod_path: s3[parquet]-turso[file].yaml
+        spicepod_path: s3[parquet]-cayenne[file].yaml
         query_set: tpch
         ready_wait: 300
         runner_type: spiceai-dev-runners
@@ -929,7 +929,7 @@ tests:
         assert_eq!(test_file.tests.bench.len(), 1);
         assert_eq!(
             test_file.tests.bench[0].spicepod_path.to_string_lossy(),
-            "s3[parquet]-turso[file].yaml"
+            "s3[parquet]-cayenne[file].yaml"
         );
         assert_eq!(test_file.tests.bench[0].query_set, QuerySet::Tpch);
         assert_eq!(test_file.tests.bench[0].ready_wait, Some(300));
@@ -941,7 +941,7 @@ tests:
                 .bench_args
                 .spicepod_path
                 .to_string_lossy(),
-            "s3[parquet]-turso[file].yaml"
+            "s3[parquet]-cayenne[file].yaml"
         );
         assert_eq!(test_file.tests.load[0].bench_args.query_set, QuerySet::Tpch);
         assert_eq!(test_file.tests.load[0].bench_args.ready_wait, None); // stripped by load deserializer
@@ -970,14 +970,14 @@ tests:
         let yaml = "
 tests:
   load:
-    - spicepod_path: s3[parquet]-turso[file].yaml
+    - spicepod_path: s3[parquet]-cayenne[file].yaml
       query_set: tpch
       ready_wait: 300
       runner_type: spiceai-dev-runners
       concurrency: 128
       duration: 1800
       random_param_set_count: 1000
-    - spicepod_path: s3[parquet]-turso[file].yaml
+    - spicepod_path: s3[parquet]-cayenne[file].yaml
       query_set: tpch
       ready_wait: 600
       runner_type: spiceai-dev-large-runners
@@ -1004,7 +1004,7 @@ tests:
                 .bench_args
                 .spicepod_path
                 .to_string_lossy(),
-            "s3[parquet]-turso[file].yaml"
+            "s3[parquet]-cayenne[file].yaml"
         );
         assert_eq!(test_file.tests.load[0].bench_args.query_set, QuerySet::Tpch);
         assert_eq!(test_file.tests.load[0].bench_args.ready_wait, None); // stripped by load deserializer
@@ -1018,7 +1018,7 @@ tests:
                 .bench_args
                 .spicepod_path
                 .to_string_lossy(),
-            "s3[parquet]-turso[file].yaml"
+            "s3[parquet]-cayenne[file].yaml"
         );
         assert_eq!(test_file.tests.load[1].bench_args.query_set, QuerySet::Tpch);
         assert_eq!(test_file.tests.load[1].bench_args.ready_wait, None); // stripped by load deserializer

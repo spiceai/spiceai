@@ -58,11 +58,6 @@ fn accelerator_crates_register_their_engines() {
         engines.iter().any(|engine| engine == "sqlite"),
         "the sqlite accelerator is not registered in this test binary; linked engines: {engines:?}"
     );
-    #[cfg(feature = "turso")]
-    assert!(
-        engines.iter().any(|engine| engine == "turso"),
-        "the turso accelerator is not registered in this test binary; linked engines: {engines:?}"
-    );
     #[cfg(feature = "duckdb")]
     assert!(
         engines.iter().any(|engine| engine == "duckdb"),
@@ -188,8 +183,7 @@ mod s3_parquet_overwrite;
 #[cfg(any(
     feature = "postgres",
     feature = "duckdb",
-    feature = "sqlite",
-    feature = "turso"
+    feature = "sqlite"
 ))]
 mod schema_evolution;
 #[cfg(feature = "sharepoint")]

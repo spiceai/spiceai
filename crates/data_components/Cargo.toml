@@ -125,8 +125,6 @@ tokio-postgres = { workspace = true, features = [
 tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true }
 tracing.workspace = true
-turso = { workspace = true, optional = true }
-turso-shared = { workspace = true, optional = true }
 twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
@@ -191,7 +189,6 @@ sqlite = [
     "datafusion-table-providers/sqlite",
     "datafusion-table-providers/sqlite-federation",
 ]
-turso = ["dep:turso", "dep:turso-shared", "datafusion-table-providers/sqlite-federation"]
 
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }

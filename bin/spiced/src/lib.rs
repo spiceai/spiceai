@@ -115,8 +115,6 @@ use accelerator_duckdb as _;
 use accelerator_postgres as _;
 #[cfg(feature = "sqlite")]
 use accelerator_sqlite as _;
-#[cfg(feature = "turso")]
-use accelerator_turso as _;
 use connector_spiceai as _;
 // The llama.cpp engine registers itself for GGUF models through `llms::register_local_chat_engine!`.
 #[cfg(feature = "llamacpp")]

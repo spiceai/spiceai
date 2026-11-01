@@ -72,7 +72,7 @@ tokio-stream.workspace = true
 uuid.workspace = true
 vortex-datafusion.workspace = true
 rusqlite.workspace = true
-turso-shared.workspace = true
+write-retry.workspace = true
 itertools.workspace = true
 snafu.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "fs"] }

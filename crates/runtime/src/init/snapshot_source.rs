@@ -36,8 +36,8 @@ use crate::component::dataset::{
     Dataset,
     builder::DatasetBuilder,
     snapshot_source::{
-        SnapshotSource, cannot_load_snapshot_message, resolved_message, unavailable_engine_cause,
-        waiting_for_snapshot_message,
+        SnapshotSource, cannot_load_snapshot_message, removed_engine_snapshot_message,
+        resolved_message, unavailable_engine_cause, waiting_for_snapshot_message,
     },
 };
 use crate::dataaccelerator::acceleration_file_path;
@@ -290,8 +290,16 @@ impl Runtime {
         match current {
             Ok(current) => {
                 let Some(engine) = self.snapshot_engine(&current.engine).await else {
-                    let cause = unavailable_engine_cause(source.location(), &current.engine);
-                    self.refuse_snapshot_source(name, &cannot_load_snapshot_message(name, &cause));
+                    let message = match Engine::try_from(current.engine.as_str()) {
+                        Err(runtime_acceleration::Error::AcceleratorEngineRemoved {
+                            name: removed,
+                        }) => removed_engine_snapshot_message(name, source.location(), removed),
+                        _ => cannot_load_snapshot_message(
+                            name,
+                            &unavailable_engine_cause(source.location(), &current.engine),
+                        ),
+                    };
+                    self.refuse_snapshot_source(name, &message);
                     return Err(RetryError::permanent(()));
                 };
                 self.snapshot_sources()
@@ -374,12 +382,11 @@ impl Runtime {
         };
         let datasets = Arc::clone(self).get_valid_datasets(&dataset.app(), LogErrors(false));
 
-        // Restoring a `DuckDB`, `SQLite` or Turso snapshot replaces the whole file, so a
+        // Restoring a `DuckDB` or `SQLite` snapshot replaces the whole file, so a
         // file two datasets share would serve whichever restored last to both.
         let param = match acceleration.engine {
             Engine::DuckDB => "duckdb_file",
             Engine::Sqlite => "sqlite_file",
-            Engine::Turso => "turso_file",
             _ => return Ok(()),
         };
         let registry = self.accelerator_engine_registry();
