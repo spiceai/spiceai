@@ -1,4 +1,4 @@
-# Known failing: when a watched Spicepod changes a `mode: file_create` Cayenne
+# Known failing (#15919): when a watched Spicepod changes a `mode: file_create` Cayenne
 # dataset, the reload deletes the acceleration's data directory and registers
 # the dataset again, but no refresh runs, so the dataset answers with no rows
 # until something else refreshes it. The warning it logs says the acceleration
