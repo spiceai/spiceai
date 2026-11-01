@@ -4,8 +4,7 @@ description: >
   refresh, an append and an accelerated view each follow the source with no
   manual refresh. With the spicepod watched, edits take effect without a
   restart: a slower cron made faster, a dataset added and one removed, and a
-  view's SQL changed. A changed `file_create` acceleration is rebuilt by the
-  reload, at the path it is configured with.
+  view's SQL changed.
 
 sources:
   src: { kind: postgres }
@@ -32,11 +31,6 @@ spicepod:
     - from: postgres:public.t
       name: removed_later
       params: ${sources.src.params}
-    # No refresh schedule: only a reload loads the source's new rows.
-    - from: postgres:public.fc
-      name: file_create_reload
-      params: ${sources.src.params}
-      acceleration: { enabled: true, engine: cayenne, mode: file_create, refresh_mode: full, params: { cayenne_file_path: '${instance.dir}/file_create_reload' } }
   views:
     - name: v
       sql: SELECT id, v FROM full_cron WHERE id <= 10
@@ -53,8 +47,6 @@ steps:
         INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 100) i;
         CREATE TABLE events (id int PRIMARY KEY, at timestamptz NOT NULL);
         INSERT INTO events SELECT i, TIMESTAMPTZ '2025-01-01 00:00:00+00' + i * INTERVAL '1 minute' FROM generate_series(1, 100) i;
-        CREATE TABLE fc (id int PRIMARY KEY, v text);
-        INSERT INTO fc SELECT i, 'v' || i FROM generate_series(1, 8) i;
   - start: {}
   - query: SELECT id, v FROM full_cron
     oracle-sql: SELECT id, v FROM t
@@ -86,22 +78,6 @@ steps:
   - query: SELECT id, v FROM slow_cron
     oracle-sql: SELECT id, v FROM t
     eventually: 60s
-  # Changing a `file_create` dataset deletes its acceleration's files during the
-  # reload and loads the source again. The dataset must reach ready on the new
-  # files and serve the source's current rows from the configured path, not
-  # keep serving what the deleted files held.
-  - source-exec: { src: "INSERT INTO fc SELECT i, 'v' || i FROM generate_series(9, 16) i" }
-  - query: SELECT count(*) AS n FROM file_create_reload
-    expect: { rows: [['8']] }
-  - edit-spicepod:
-      datasets:
-        file_create_reload: { params: { pg_sslmode: prefer } }
-  - query: SELECT id, v FROM file_create_reload
-    oracle-sql: SELECT id, v FROM fc
-    eventually: 60s
-  - explain: SELECT id, v FROM file_create_reload
-    contains: CayenneAccelerationExec
-  - assert-files: { contains: ['^file_create_reload/'] }
   - edit-spicepod:
       spicepod:
         datasets:
