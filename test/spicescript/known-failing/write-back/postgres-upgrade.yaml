@@ -129,7 +129,8 @@ steps:
   - source-query:
       src: >-
         SELECT count(pg_replication_slot_advance(slot_name, pg_current_wal_lsn())) AS advanced
-        FROM pg_replication_slots WHERE slot_name LIKE 'spice\_accounts\_%' AND NOT active
+        FROM pg_replication_slots
+          WHERE database = current_database() AND slot_name LIKE 'spice\_accounts\_%' AND NOT active
     expect: { rows: [['1']] }
     when: { from: 2.3.x }
   - upgrade: {}
