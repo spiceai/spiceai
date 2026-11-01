@@ -227,6 +227,14 @@ pub fn runs() -> Vec<Run> {
             failure: "query includes every commit completed more than S before it started",
         },
         Run {
+            name: "reads-tick-only",
+            family: "reads",
+            mode: "reads-tick-only",
+            bound: 0,
+            seed: None,
+            failure: "query includes every commit completed more than S before it started",
+        },
+        Run {
             name: "standby",
             family: "standby",
             mode: "standby",

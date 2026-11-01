@@ -366,7 +366,8 @@ Model: `commit-no-lease`, `commits-commit*`; standbys: `standby`, `standby-three
 - **Freshness counts from when the GET was sent,** not when the response arrived,
   so a stalled response cannot make an old head look fresh (model:
   `reads-bounded`, `reads-linearizable`; counting from the response fails:
-  `reads-response-time`).
+  `reads-response-time`, and with S = 0 so does serving a GET sent before the
+  query started: `reads-tick-only`).
 - **Datasets in use refresh in the background** if queried within the last one
   or two intervals. Refreshing early is always safe. A dataset nobody queries
   costs nothing, and a writer never polls its own datasets.

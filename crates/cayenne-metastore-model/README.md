@@ -66,7 +66,7 @@ transaction and byte-storage compositions use the same variable-size `Store`.
 | `standby` / `standby-three` | Two or three instances of one Spicepod on one location: a lease object with an expiry on a discrete clock, renewal by the holder, crash, restart, pause and resume, acquisition only after expiry, and takeover by a head commit that raises the generation; only the generation in the head fences writers; the ingester commits source changes by exact-head CAS and then acknowledges them; standbys serve head reads. No change applied twice or acknowledged without commit, no stale-generation commit accepted, one committing instance per head generation, lease exclusivity, no lease loss by a healthy holder, and an ingester again within the lease duration of a holder failure | Exhaustive: lease duration 3 ticks, 2 source changes, 1 crash, 1 pause, at most 4 lease epochs; a running holder renews and a running standby acquires or takes over before the next tick |
 | `standby-early-safety` | The standby graph with acquisition allowed before expiry; checks only the safety properties, which do not depend on lease timing | Same bounds |
 | `object-names` | Immutable object names when several leased units create objects: the writer `w0` and maintenance units, each with its own lease generation raised by a head commit when a node takes it; create-if-absent under `<kind><unit>.<generation>-<counter>`, identical retries of a lost upload, references committed under a guard on the unit's generation, and maintenance units retired and created with ids never reused. No name created with different bytes, and every referenced object reads back with its digest; witnesses include two units at one generation, successive holders of one unit, a unit created after another retired, and a fenced holder | Exhaustive: 2 nodes, 3 lease takeovers, 2 objects per holding, 1 unit created, 1 retry |
-| `reads-linearizable` / `reads-bounded` | Read freshness against real time: a writer completes commits on a discrete clock; a reader caches the head with the time its GET was sent, answers queries from it while it is fresh for the staleness bound S and otherwise waits for a newer GET; queries share GETs, a GET observes the head when sent, and responses arrive late and out of order. A query includes every commit completed more than S before it started; with S = 0 that is linearizability for one dataset's committed state, and a query also includes the client's own acknowledged write. Witnesses: a query waits for a GET, two queries share one, a late response is ignored, a commit completes while a GET is in flight, a query is served while a newer commit exists, and (S > 0) a query is answered from the cache | Exhaustive: 2 commits, 3 GETs, 2 queries, 4 clock ticks; S = 0 and S = 1 |
+| `reads-linearizable` / `reads-bounded` | Read freshness against real time: a writer completes commits on a discrete clock; a reader caches the head with the time its GET was sent, answers queries from it while it is fresh for the staleness bound S and otherwise waits for a newer GET; queries share GETs, a GET observes the head when sent, and responses arrive late and out of order. With S = 0, events within a tick are ordered, so a commit that completes earlier in a query's tick counts as before it; with S > 0, times compare by tick. A query includes every commit completed more than S before it started; with S = 0 that is linearizability for one dataset's committed state, and a query also includes the client's own acknowledged write. Witnesses: a query waits for a GET, two queries share one, a late response is ignored, a commit completes while a GET is in flight, a query is served while a newer commit exists, and (S > 0) a query is answered from the cache | Exhaustive: 2 commits, 3 GETs, 2 queries, 4 clock ticks; S = 0 and S = 1 |
 | `commits-etag` | Explicit store-version CAS and delayed retry across head changes; I1–I3, I5 | Exhaustive/control 1; one writer, one original/retry pair |
 | `commits-storage` | Checkpoint parts/root before head publication, delayed GC, a query kept by retention, lagging reopen, late seal; I4, I7, I8 | Bound 2; samples 4 |
 | `transactions-txn` | Two datasets, one transaction, competing ordinary writes, reservations, commit/abort create race, helper Resolve, uncertain CAS, checkpoint/GC; one participant writes other keys while prepared so the Prepare can reach a checkpoint; I3–I6, I8 | Exhaustive 1 (two lease generations), controls 0 except owner restriction 1; samples 2, 3 (two outstanding handles per dataset) |
@@ -248,6 +248,7 @@ as a separate maintenance process does.
 | `object-names-reuse-unit-id` | Give a retired unit's id to a new unit, whose generation restarts: the new unit creates a name the retired one already holds |
 | `reads-token-wait` | Answer a query from any cached head at or past the client's commit number: read-your-writes holds, but a commit that completed before the query started is missing |
 | `reads-response-time` | Count freshness from the GET response's arrival: a late response to an old GET looks fresh and misses a completed commit |
+| `reads-tick-only` | Compare freshness by tick alone with S = 0: a head fetched earlier in the query's tick answers it and misses a commit that completed before the query started |
 | `commits-etag-repeat` | Reuse an earlier store tag for a later head: I1 unique accepted position |
 | `seq-order-maintenance-draw` | Maintenance draws ahead of the buffer and publishes first, then permits the lower buffered record: I9 resurrected row after a later compaction |
 | `seq-order-no-shift` | Independent CAS loser retries its unchanged lower sequences: I9 resurrected row after compaction |
@@ -749,9 +750,9 @@ implementations. Delivery and maintenance are covered in separate compositions.
 
 ## Measured manual suite
 
-On 2026-10-31, `EXHAUST=1 ... all` matched 309/309 declarations; checker time
-summed to 1350 s (about 23 minutes) with the default 6 threads, peak memory
-footprint 3.1 GB. The profile rows below are from the 2026-10-29 run of 299
+On 2026-10-31, `EXHAUST=1 ... all` matched 310/310 declarations; checker time
+summed to 1097 s (about 18 minutes) with the default 6 threads, peak memory
+footprint 2.9 GB. The profile rows below are from the 2026-10-29 run of 299
 declarations.
 
 | Representative exhaustive profile | Bound | Visits / unique states | Wall s |
@@ -768,7 +769,7 @@ declarations.
 | `remote-maintenance-clear-retry` | 4 | 3,492 / 2,637 | 0.012 |
 
 The longest completed checker on 2026-10-31 was
-`dataset-prepare-query-expiry-byte-window` at 395.281 s. All exhaustive declarations completed below the 540-second watchdog.
+`dataset-prepare-query-expiry-byte-window` at 268.241 s. All exhaustive declarations completed below the 540-second watchdog.
 The original four-selection statement, three-selection delivery and two-selection
 unknown-as-loss budget probes remain incomplete evidence at their captured source;
 they are not declarations silently marked safe. New transactions exhaust two

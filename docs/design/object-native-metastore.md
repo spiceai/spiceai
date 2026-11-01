@@ -250,7 +250,8 @@ them possible.
   reach a token sees that write, but may miss later commits that completed
   before it started. A linearizable read sends a head GET after it starts and
   serves at least the commit that GET returns (decision 1.1; model:
-  `reads-linearizable`, `reads-token-wait`). Either kind of
+  `reads-linearizable`, `reads-token-wait`; serving a GET sent before the query
+  started fails: `reads-tick-only`). Either kind of
   strict read excludes the buffer, or the dataset publishes at commit (1.2).
 - **Tiered storage beneath the destination:** ephemeral disk, then persistent
   disk, then S3, acknowledged once data reaches the first object store tier.
