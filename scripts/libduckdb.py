@@ -132,7 +132,7 @@ def install(version: str | None, cache_dir: Path) -> Path:
         )
 
     target = cache_dir / version
-    if installed(target, expected):
+    if installed(target, library, expected):
         return target
 
     url = archive_url(version, release)
@@ -160,7 +160,7 @@ def install(version: str | None, cache_dir: Path) -> Path:
         (staging / ".sha256").write_text(expected + "\n")
         # Another run may have installed the release while this one downloaded
         # it. Its caller may already be loading that copy, so keep it.
-        if installed(target, expected):
+        if installed(target, library, expected):
             return target
         # A stale or partial install is renamed aside, not deleted in place, so
         # the directory is only ever absent between two renames.
@@ -170,7 +170,7 @@ def install(version: str | None, cache_dir: Path) -> Path:
         try:
             staging.rename(target)
         except OSError:
-            if not installed(target, expected):
+            if not installed(target, library, expected):
                 raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -179,12 +179,15 @@ def install(version: str | None, cache_dir: Path) -> Path:
     return target
 
 
-def installed(target: Path, expected: str) -> bool:
+def installed(target: Path, library: str, expected: str) -> bool:
     """Whether `target` holds a complete install of the archive with SHA-256
-    `expected`. The stamp is written last, so it marks a finished install."""
+    `expected`. The stamp is written last, so it marks a finished install; the
+    library is checked too, so an install whose library was deleted since is
+    replaced rather than reused."""
     stamp = target / ".sha256"
     return (
-        (target / MANIFEST).is_file()
+        (target / library).is_file()
+        and (target / MANIFEST).is_file()
         and stamp.is_file()
         and stamp.read_text().strip() == expected
     )
