@@ -196,8 +196,6 @@ impl Https {
         }
 
         // Vortex is a structured columnar format handled by the listing connector.
-        // It is only built on non-Windows targets (see `get_file_format_and_extension`).
-        #[cfg(not(windows))]
         if file_format == "vortex" {
             return true;
         }
@@ -227,8 +225,6 @@ impl Https {
                 return true;
             }
 
-            // Vortex is only built on non-Windows targets.
-            #[cfg(not(windows))]
             if extension.as_deref() == Some("vortex") {
                 return true;
             }
@@ -1509,9 +1505,8 @@ const OAUTH_PARAM_KEYS: &[&str] = &[
 ];
 
 /// File formats served by the listing connector rather than the dynamic JSON
-/// API provider. `vortex` is handled separately because it is only built on
-/// non-Windows targets, and `json` because it is structured only when no
-/// dynamic-API param is set.
+/// API provider. `vortex` is handled separately, and `json` because it is
+/// structured only when no dynamic-API param is set.
 const STRUCTURED_FILE_FORMATS: &[&str] = &[
     "parquet", "csv", "tsv", "arrow", "avro", "jsonl", "ndjson", "ldjson", "soda", "socrata",
 ];
@@ -3279,7 +3274,6 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         assert!(connector.is_structured_format(&dataset));
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_http_structured_format_detects_explicit_vortex() {
         let connector = test_connector(Some("vortex")).await;
@@ -3289,7 +3283,6 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         assert!(connector.is_structured_format(&dataset));
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_http_auto_structured_format_detects_vortex_extension() {
         let connector = test_connector(None).await;

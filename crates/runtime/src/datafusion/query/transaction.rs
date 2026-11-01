@@ -46,6 +46,7 @@ use cache::result::CacheStatus;
 use cayenne::{CayenneTableProvider, CayenneTransaction};
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, ParamValues, TableReference};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::{ast::Statement as SqlStatement, dialect::PostgreSqlDialect};
@@ -58,11 +59,14 @@ use crate::accelerated::{
     write::{CayenneWriteTarget, dual_write::extract_cayenne_write_target},
 };
 use crate::datafusion::DataFusion;
+use crate::egress::collect_reserved;
 
 /// The result of a committed transaction: the final statement's batches and
 /// cache status, or `None` for a body that produced no result (bare COMMIT).
 pub struct TransactionOutcome {
     pub result: Option<(Vec<RecordBatch>, CacheStatus)>,
+    /// The query memory pool's reservation for `result`'s batches.
+    pub reservation: MemoryReservation,
 }
 
 /// A transaction failure, carrying enough to let each transport pick its own
@@ -185,14 +189,17 @@ pub fn schema_statement(sql: &str) -> String {
 /// # Errors
 ///
 /// Returns a [`TransactionError`] if the body is not a valid v1 transaction, a
-/// statement fails to plan or execute, the optimistic-concurrency re-check
-/// loses (retryable [`TransactionError::Conflict`]), or the staged writes fail
-/// to publish.
+/// statement fails to plan or execute, the final result (plus the
+/// `render_bytes` the caller needs to encode it) cannot be reserved from the
+/// query memory pool, the optimistic-concurrency re-check loses (retryable
+/// [`TransactionError::Conflict`]), or the staged writes fail to publish. Every
+/// one of these is raised before anything is published.
 pub async fn run_transaction(
     df: &Arc<DataFusion>,
     statements: &[String],
     parameters: Option<ParamValues>,
     read_only: bool,
+    render_bytes: impl Fn(&[RecordBatch]) -> usize + Send,
 ) -> Result<TransactionOutcome, TransactionError> {
     // Prepare the transaction: identify every participant table, validate the
     // write targets, capture their begin tokens, and install the transaction on
@@ -201,6 +208,8 @@ pub async fn run_transaction(
     let handle = prepare_transaction(df, statements, parameters.as_ref()).await?;
 
     let mut last: Option<(Vec<RecordBatch>, CacheStatus)> = None;
+    let reservation =
+        MemoryConsumer::new("transaction_result").register(&df.ctx.runtime_env().memory_pool);
     let statement_count = statements.len();
     for (index, statement) in statements.iter().enumerate() {
         let query_res =
@@ -221,9 +230,12 @@ pub async fn run_transaction(
         // here and returned after commit. Intermediate statements (the gate,
         // earlier writes) are drained without keeping their batches.
         let consume = if index + 1 == statement_count {
-            query_res.collect_batches().await.map(|batches| {
-                last = Some((batches, cache_status));
-            })
+            match collect_reserved(query_res.into_record_batch_stream(), &reservation).await {
+                Ok(batches) => reservation
+                    .try_grow(render_bytes(&batches))
+                    .map(|()| last = Some((batches, cache_status))),
+                Err(e) => Err(e),
+            }
         } else {
             query_res.drain().await
         };
@@ -257,7 +269,10 @@ pub async fn run_transaction(
         }
     }
 
-    Ok(TransactionOutcome { result: last })
+    Ok(TransactionOutcome {
+        result: last,
+        reservation,
+    })
 }
 
 /// Makes positional parameters reusable across transaction statements.

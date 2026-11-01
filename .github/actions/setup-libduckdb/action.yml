@@ -1,0 +1,44 @@
+name: Setup libduckdb
+description: >-
+  Download the DuckDB shared library that duckdb: and ducklake: datasets load
+  through ADBC, and register it as the 'duckdb' ADBC driver for the rest of the
+  job. The library goes in the job's temporary directory and is found through a
+  driver manifest on ADBC_DRIVER_PATH, so nothing is installed system-wide and
+  the setting survives macOS, which strips DYLD_* variables from /bin/bash.
+
+inputs:
+  version:
+    description: 'DuckDB release to install; defaults to the newest in test/duckdb_versions.json.'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install libduckdb
+      shell: bash
+      env:
+        DUCKDB_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        version="${DUCKDB_VERSION:-$(jq -r '.versions[-1].version' test/duckdb_versions.json)}"
+        version="${version#v}"
+        case "$(uname -s)/$(uname -m)" in
+          Darwin/*) platform=osx-universal; library=libduckdb.dylib ;;
+          Linux/x86_64) platform=linux-amd64; library=libduckdb.so ;;
+          Linux/aarch64) platform=linux-arm64; library=libduckdb.so ;;
+          *) echo "::error::No DuckDB library download for $(uname -s)/$(uname -m)"; exit 1 ;;
+        esac
+        # Releases from 2.0 ship the library as duckdb-shared-libs-<platform>.tar.gz.
+        dir="${RUNNER_TEMP}/libduckdb-${version}"
+        mkdir -p "$dir"
+        if [ "${version%%.*}" -ge 2 ]; then
+          curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${version}/duckdb-shared-libs-${platform}.tar.gz" | tar -xz -C "$dir"
+        else
+          curl -fsSL -o "$dir/libduckdb.zip" "https://github.com/duckdb/duckdb/releases/download/v${version}/libduckdb-${platform}.zip"
+          unzip -o -q "$dir/libduckdb.zip" -d "$dir"
+        fi
+        test -f "$dir/$library"
+        printf '[Driver]\nshared = "%s"\nentrypoint = "duckdb_adbc_init"\n' "$dir/$library" > "$dir/duckdb.toml"
+        echo "ADBC_DRIVER_PATH=${dir}${ADBC_DRIVER_PATH:+:${ADBC_DRIVER_PATH}}" >> "$GITHUB_ENV"
+        echo "Registered DuckDB ${version} (${dir}/${library}) as the 'duckdb' ADBC driver"

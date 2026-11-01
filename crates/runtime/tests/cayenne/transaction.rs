@@ -146,7 +146,7 @@ pub(crate) async fn run_txn(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>,
     );
     let df = rt.datafusion();
     context
-        .scope(async move { run_transaction(&df, &statements, None, false).await })
+        .scope(async move { run_transaction(&df, &statements, None, false, |_| 0).await })
         .await
         .map(|outcome| {
             outcome
@@ -231,7 +231,6 @@ async fn read_sum(rt: &Runtime, table: &str) -> i64 {
 /// `BEGIN; SELECT assert((SELECT n …) < 5); UPDATE … n=n+1; COMMIT;` on `a=0`
 /// leaves `a=1`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_txn_commit_applies_update() -> Result<(), String> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -282,7 +281,6 @@ async fn test_txn_commit_applies_update() -> Result<(), String> {
 /// path is not reading the transaction back (staging not wired), the UPDATE
 /// publishes immediately and the final assertion — that `a` is still `0` — fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_txn_gate_fail_rolls_back() -> Result<(), String> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -323,7 +321,6 @@ async fn test_txn_gate_fail_rolls_back() -> Result<(), String> {
 /// cap enforcement: a `< cap` gate admits exactly `cap` commits, aborts the rest,
 /// and leaves the counter pinned at `cap`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_txn_cap_enforcement() -> Result<(), String> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -399,7 +396,6 @@ async fn test_txn_cap_enforcement() -> Result<(), String> {
 /// reservation system has — "is there room left, and if so take some" — and they
 /// reach the staged commit path differently from a single-key counter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_txn_quota_reservation_admits_only_what_fits() -> Result<(), String> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -484,7 +480,6 @@ async fn test_txn_quota_reservation_admits_only_what_fits() -> Result<(), String
 /// — because a concurrent attempt may legitimately lose either at the gate or to
 /// a conflict, and pinning the exact commit count would make the test a race.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(not(target_os = "windows"))]
 async fn test_txn_quota_holds_under_concurrent_reservations() -> Result<(), String> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -553,7 +548,6 @@ async fn test_txn_quota_holds_under_concurrent_reservations() -> Result<(), Stri
 /// Deliberately uses a value comparison (`< 5`) against a missing row — NOT
 /// `IS NOT NULL`, which is the known-deferred bug #11832.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_txn_null_gate_fail_safe() -> Result<(), String> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -600,7 +594,6 @@ async fn test_txn_null_gate_fail_safe() -> Result<(), String> {
 /// `CayenneAccelerator` per engine, so both tables resolve to the same metastore
 /// catalog and the commit fuses their publishes into one metastore transaction.
 #[test]
-#[cfg(not(target_os = "windows"))]
 fn test_txn_multi_table_atomic() -> Result<(), String> {
     // The two-table fused commit plans/unparses deeper than the ~2 MiB default
     // test-thread stack in debug builds (single-table txns stay under it); run
@@ -701,7 +694,6 @@ async fn run_test_txn_multi_table_atomic() -> Result<(), String> {
 /// commits cleanly) proves the conflict is caused by the stale token, not a
 /// broken harness.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_txn_occ_conflict_stale_token() -> Result<(), anyhow::Error> {
     use cayenne::metadata::{CreateTableOptions, VortexConfig};
     use cayenne::provider::Error as CayenneError;
@@ -944,7 +936,6 @@ async fn row_a_value(ctx: &SessionContext, table: &str) -> Result<Option<i64>, a
 /// regression (e.g. accidentally publishing synchronously per statement or an
 /// O(n) commit), not against fine-grained perf drift.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(not(target_os = "windows"))]
 async fn bench_txn_gated_commit_throughput() -> Result<(), String> {
     let _tracing = crate::init_tracing(Some("integration=info"));
 

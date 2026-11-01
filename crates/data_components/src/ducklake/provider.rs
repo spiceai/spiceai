@@ -22,21 +22,68 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use super::{DuckLakePool, query_strings};
 use crate::catalog_filter::TableSelector;
+use adbc_driver_manager::ManagedDatabase;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::common::TableReference;
 use datafusion::error::Result as DFResult;
 use datafusion::sql::unparser::dialect::Dialect;
-use datafusion_table_providers::duckdb::DuckDBTableFactory;
-use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
-use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use snafu::prelude::*;
 use tokio::sync::Mutex;
 
 use super::writer::DuckDbFederatedTableWriter;
 use crate::RefreshableCatalogProvider;
+
+// CatalogProvider's DDL hooks are synchronous. Yield the runtime worker while
+// the actual database call runs on Tokio's blocking pool.
+fn execute_ddl(pool: Arc<DuckLakePool>, sql: String) -> DFResult<()> {
+    let execute = move || -> DFResult<()> {
+        let connection = pool
+            .adbc_pool()
+            .map_err(|source| datafusion::error::DataFusionError::External(Box::new(source)))?
+            .connect_sync()
+            .map_err(datafusion::error::DataFusionError::External)?;
+        connection
+            .as_sync()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution(
+                    "DuckDB does not support synchronous DDL".into(),
+                )
+            })?
+            .execute(&sql, &[])
+            .map_err(datafusion::error::DataFusionError::External)?;
+        Ok(())
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(tokio::task::spawn_blocking(execute)))
+                .map_err(|source| datafusion::error::DataFusionError::External(Box::new(source)))?
+        }
+        // A synchronous hook cannot yield on a current-thread runtime. The
+        // database work still runs on the blocking pool, independently of it.
+        Ok(_) => futures::executor::block_on(tokio::task::spawn_blocking(execute))
+            .map_err(|source| datafusion::error::DataFusionError::External(Box::new(source)))?,
+        Err(_) => execute(),
+    }
+}
+
+/// A table factory paired with its catalog's SQL dialect.
+pub struct DuckLakeTableFactory {
+    factory: Option<AdbcTableFactory<ManagedDatabase>>,
+    dialect: Arc<dyn Dialect + Send + Sync>,
+}
+
+impl Drop for DuckLakeTableFactory {
+    fn drop(&mut self) {
+        if let Some(factory) = self.factory.take() {
+            crate::adbc_helpers::offload_adbc_drop(factory);
+        }
+    }
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -71,9 +118,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// using a dedicated `DuckDB` instance with the `ducklake` extension.
 pub struct DuckLakeCatalogProvider {
     /// `DuckDB` connection pool with `ducklake` extension loaded and catalog attached
-    pool: Arc<DuckDbConnectionPool>,
+    pool: Arc<DuckLakePool>,
     /// `DuckDB` table factory for creating table providers (uses the same pool)
-    duckdb_factory: Arc<DuckDBTableFactory>,
+    duckdb_factory: Arc<DuckLakeTableFactory>,
     /// The catalog name as attached in `DuckDB`
     catalog_name: String,
     /// Cached schemas (`schema_name` -> `SchemaProvider`)
@@ -133,26 +180,34 @@ impl DuckLakeCatalogProvider {
     ///   and the rest of the JSON set, the embedding/distance UDFs, every
     ///   user-registered function) is unparsed verbatim into the statement sent
     ///   to `DuckDB`, where it does not exist. See issues #10703 and #13664.
-    #[must_use]
+    ///
+    /// # Errors
+    /// Returns an error if the connection pool is closed.
     pub fn new(
-        pool: Arc<DuckDbConnectionPool>,
+        pool: Arc<DuckLakePool>,
         catalog_name: String,
         writable: bool,
         ddl_enabled: bool,
         selector: TableSelector,
         federation: DuckLakeFederation,
-    ) -> Self {
+    ) -> Result<Self> {
         // Create a table factory that uses the same pool (with ducklake already attached)
         #[expect(
             clippy::disallowed_methods,
             reason = "installs the catalog's `DuckLakeFederation` deny-list below"
         )]
-        let duckdb_factory = Arc::new(
-            DuckDBTableFactory::new(Arc::clone(&pool))
-                .with_dialect(federation.dialect)
+        let duckdb_factory = Arc::new(DuckLakeTableFactory {
+            factory: Some(
+                AdbcTableFactory::new(pool.adbc_pool().map_err(|source| {
+                    Error::ConnectionFailed {
+                        source: Box::new(source),
+                    }
+                })?)
                 .with_function_support(federation.function_support),
-        );
-        Self {
+            ),
+            dialect: federation.dialect,
+        });
+        Ok(Self {
             pool,
             duckdb_factory,
             catalog_name,
@@ -161,7 +216,7 @@ impl DuckLakeCatalogProvider {
             ddl_enabled,
             selector,
             write_lock: Arc::new(Mutex::new(())),
-        }
+        })
     }
 
     /// Returns whether write operations are allowed.
@@ -183,42 +238,8 @@ impl DuckLakeCatalogProvider {
 
         // Query schemas from the attached `DuckLake` catalog using `information_schema`
         let schema_names = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
-            let conn = pool
-                .connect_sync()
-                .map_err(|e| Error::ConnectionFailed { source: e })?;
-
-            let duckdb_wrapper = conn
-                .as_any()
-                .downcast_ref::<DuckDbConnection>()
-                .ok_or_else(|| Error::ConnectionFailed {
-                    source: "Failed to downcast to DuckDbConnection during schema refresh".into(),
-                })?;
-
-            // Query the global information_schema, filtering by catalog name.
-            // DuckLake catalogs don't expose information_schema under their own catalog prefix.
-            let sql = r"SELECT DISTINCT schema_name 
-                   FROM information_schema.schemata 
-                   WHERE catalog_name = ?
-                   ORDER BY schema_name";
-
-            let mut stmt = duckdb_wrapper
-                .conn
-                .prepare(sql)
-                .boxed()
-                .context(QueryFailedSnafu)?;
-            let rows = stmt
-                .query_map([&catalog_name], |row| row.get::<_, String>(0))
-                .boxed()
-                .context(QueryFailedSnafu)?;
-
-            let mut names = Vec::new();
-            for row_result in rows {
-                let name: String = row_result.boxed().context(QueryFailedSnafu)?;
-                if name != "information_schema" && name != "pg_catalog" {
-                    names.push(name);
-                }
-            }
-            Ok(names)
+            let sql = format!("SELECT DISTINCT schema_name FROM information_schema.schemata WHERE catalog_name = '{}' AND schema_name NOT IN ('information_schema', 'pg_catalog') ORDER BY schema_name", catalog_name.replace('\'', "''"));
+            query_strings(&pool, &sql).map_err(|source| Error::QueryFailed { source })
         })
         .await
         .map_err(|e| Error::ConnectionFailed {
@@ -288,29 +309,12 @@ impl CatalogProvider for DuckLakeCatalogProvider {
         let catalog_name = self.catalog_name.clone();
         let schema_name = name.to_string();
 
-        let conn = pool
-            .connect_sync()
-            .map_err(datafusion::error::DataFusionError::External)?;
-
-        let duckdb_wrapper = conn
-            .as_any()
-            .downcast_ref::<DuckDbConnection>()
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(
-                    "Failed to downcast DuckLake connection to DuckDbConnection when registering schema"
-                        .to_string(),
-                )
-            })?;
-
         let escaped_catalog_name = catalog_name.replace('"', "\"\"");
         let escaped_schema_name = schema_name.replace('"', "\"\"");
         let sql = format!(
             r#"CREATE SCHEMA IF NOT EXISTS "{escaped_catalog_name}"."{escaped_schema_name}""#
         );
-        duckdb_wrapper
-            .conn
-            .execute(&sql, [])
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        execute_ddl(pool, sql)?;
 
         // Downcast to our schema type if possible, otherwise create a new one
         let schema_provider =
@@ -388,20 +392,6 @@ impl CatalogProvider for DuckLakeCatalogProvider {
         let catalog_name = self.catalog_name.clone();
         let schema_name = name.to_string();
 
-        let conn = pool
-            .connect_sync()
-            .map_err(datafusion::error::DataFusionError::External)?;
-
-        let duckdb_wrapper = conn
-            .as_any()
-            .downcast_ref::<DuckDbConnection>()
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(
-                    "Failed to downcast DuckLake connection to DuckDbConnection when deregistering schema"
-                        .to_string(),
-                )
-            })?;
-
         let escaped_catalog_name = catalog_name.replace('"', "\"\"");
         let escaped_schema_name = schema_name.replace('"', "\"\"");
         let mut sql =
@@ -409,10 +399,7 @@ impl CatalogProvider for DuckLakeCatalogProvider {
         if cascade {
             sql.push_str(" CASCADE");
         }
-        duckdb_wrapper
-            .conn
-            .execute(&sql, [])
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        execute_ddl(pool, sql)?;
 
         // Remove from cache
         let mut guard = match self.schemas.write() {
@@ -434,9 +421,9 @@ impl RefreshableCatalogProvider for DuckLakeCatalogProvider {
 /// A schema provider for `DuckLake` that discovers tables within a schema.
 pub struct DuckLakeSchemaProvider {
     /// `DuckDB` connection pool for querying catalog metadata
-    pool: Arc<DuckDbConnectionPool>,
+    pool: Arc<DuckLakePool>,
     /// `DuckDB` table factory for creating table providers
-    duckdb_factory: Arc<DuckDBTableFactory>,
+    duckdb_factory: Arc<DuckLakeTableFactory>,
     /// The catalog name as attached in `DuckDB`
     catalog_name: String,
     /// Schema name
@@ -484,8 +471,8 @@ impl DuckLakeSchemaProvider {
         reason = "schema provider requires all these configuration parameters"
     )]
     pub fn new(
-        pool: Arc<DuckDbConnectionPool>,
-        duckdb_factory: Arc<DuckDBTableFactory>,
+        pool: Arc<DuckLakePool>,
+        duckdb_factory: Arc<DuckLakeTableFactory>,
         catalog_name: String,
         schema_name: String,
         writable: bool,
@@ -514,41 +501,8 @@ impl DuckLakeSchemaProvider {
 
         // Query tables from the attached `DuckLake` catalog using `information_schema`
         let table_names = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
-            let conn = pool
-                .connect_sync()
-                .map_err(|e| Error::ConnectionFailed { source: e })?;
-
-            let duckdb_wrapper = conn
-                .as_any()
-                .downcast_ref::<DuckDbConnection>()
-                .ok_or_else(|| Error::ConnectionFailed {
-                    source: "Failed to downcast to DuckDbConnection during table refresh".into(),
-                })?;
-
-            // Query the global information_schema, filtering by catalog and schema name.
-            // DuckLake catalogs don't expose information_schema under their own catalog prefix.
-            let sql = r"SELECT DISTINCT table_name 
-                   FROM information_schema.tables 
-                   WHERE table_catalog = ?
-                     AND table_schema = ?
-                   ORDER BY table_name";
-
-            let mut stmt = duckdb_wrapper
-                .conn
-                .prepare(sql)
-                .boxed()
-                .context(QueryFailedSnafu)?;
-            let rows = stmt
-                .query_map([&catalog_name, &schema_name], |row| row.get::<_, String>(0))
-                .boxed()
-                .context(QueryFailedSnafu)?;
-
-            let mut names = Vec::new();
-            for row_result in rows {
-                let name = row_result.boxed().context(QueryFailedSnafu)?;
-                names.push(name);
-            }
-            Ok(names)
+            let sql = format!("SELECT DISTINCT table_name FROM information_schema.tables WHERE table_catalog = '{}' AND table_schema = '{}' ORDER BY table_name", catalog_name.replace('\'', "''"), schema_name.replace('\'', "''"));
+            query_strings(&pool, &sql).map_err(|source| Error::QueryFailed { source })
         })
         .await
         .map_err(|e| Error::ConnectionFailed {
@@ -575,7 +529,18 @@ impl DuckLakeSchemaProvider {
             // Use the DuckDB table factory to get a read provider, then wrap with
             // DuckDbFederatedTableWriter when writable. The writer properly
             // handles multi-part table references (catalog.schema.table) in SQL generation.
-            let provider_result = self.duckdb_factory.table_provider(table_ref.clone()).await;
+            let provider_result = self
+                .duckdb_factory
+                .factory
+                .as_ref()
+                .ok_or_else(|| Error::ConnectionFailed {
+                    source: Box::new(super::Error::Closed),
+                })?
+                .table_provider(
+                    table_ref.clone(),
+                    Some(Arc::clone(&self.duckdb_factory.dialect)),
+                )
+                .await;
             match provider_result {
                 Ok(provider) => {
                     let provider: Arc<dyn TableProvider> = if self.writable {
@@ -689,30 +654,13 @@ impl SchemaProvider for DuckLakeSchemaProvider {
         let schema_name = self.schema_name.clone();
         let table_name = name.to_string();
 
-        let conn = pool
-            .connect_sync()
-            .map_err(datafusion::error::DataFusionError::External)?;
-
-        let duckdb_wrapper = conn
-            .as_any()
-            .downcast_ref::<DuckDbConnection>()
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(
-                    "Failed to downcast DuckLake connection to DuckDbConnection when deregistering table"
-                        .to_string(),
-                )
-            })?;
-
         let escaped_catalog_name = catalog_name.replace('"', "\"\"");
         let escaped_schema_name = schema_name.replace('"', "\"\"");
         let escaped_table_name = table_name.replace('"', "\"\"");
         let sql = format!(
             r#"DROP TABLE IF EXISTS "{escaped_catalog_name}"."{escaped_schema_name}"."{escaped_table_name}""#
         );
-        duckdb_wrapper
-            .conn
-            .execute(&sql, [])
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        execute_ddl(pool, sql)?;
 
         // Remove from cache
         let mut guard = match self.tables.write() {

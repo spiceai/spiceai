@@ -1,10 +1,17 @@
+# Known failing (#15550) from 2.3.x only: v2.3.3 acknowledges the
+# replication slot past what it recorded as applied, so the upgraded runtime
+# rebuilds the write-back acceleration from the source, and a rebuild loses the
+# write-back write still pending at the upgrade. From 2.4.x it passes.
 name: postgres-upgrade
 description: >
-  A runtime upgraded in place (`--from <older spiced>`; without it, a
-  restart) keeps serving what it held: file accelerations on Cayenne, DuckDB
+  A runtime upgraded in place from each of the last two releases keeps serving what it held: file accelerations on Cayenne, DuckDB
   and SQLite answer as before and as the source does, a CDC acceleration
   applies the changes made while it was down, and a write-back write still
   pending at the upgrade is delivered once afterwards.
+
+matrix:
+  from: [2.3.x, 2.4.x]
+from: '${matrix.from}'
 
 sources:
   src: { kind: postgres }
