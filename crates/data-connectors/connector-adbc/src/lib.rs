@@ -14,12 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use adbc_core::options::{AdbcVersion, OptionDatabase};
+use adbc_core::options::AdbcVersion;
 use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::ManagedDriver;
 use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use async_trait::async_trait;
-use data_components::adbc_helpers::{connection_secrets, scrub_connection_secrets};
+use data_components::adbc_helpers::{
+    await_adbc_initialization, build_db_options, connection_secrets, driver_entrypoint,
+    normalize_driver_option_key, scrub_connection_secrets,
+};
 use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use data_connector_api::ConnectorContext;
 use datafusion::common::TableReference;
@@ -38,7 +41,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -119,67 +122,9 @@ impl std::fmt::Debug for Adbc {
 impl Drop for Adbc {
     fn drop(&mut self) {
         if let Some(factory) = self.factory.take() {
-            // Send to the dedicated cleanup thread so we don't stall the Tokio
-            // runtime. If the bounded queue is full or the worker is gone,
-            // offload to a dedicated overflow thread instead of dropping inline.
-            match adbc_cleanup_sender().try_send(factory) {
-                Ok(()) => {}
-                Err(std::sync::mpsc::TrySendError::Full(factory)) => {
-                    offload_adbc_factory_drop(
-                        factory,
-                        "ADBC cleanup queue full; offloading drop to overflow thread",
-                    );
-                }
-                Err(std::sync::mpsc::TrySendError::Disconnected(factory)) => {
-                    offload_adbc_factory_drop(
-                        factory,
-                        "ADBC cleanup channel closed; offloading drop to overflow thread",
-                    );
-                }
-            }
+            data_components::adbc_helpers::offload_adbc_drop(factory);
         }
     }
-}
-
-const ADBC_CLEANUP_QUEUE_CAPACITY: usize = 64;
-
-fn offload_adbc_factory_drop(factory: ManagedAdbcTableFactory, reason: &str) {
-    tracing::warn!("{reason}");
-    if std::thread::Builder::new()
-        .name("adbc-cleanup-overflow".to_string())
-        .spawn(move || {
-            drop(factory);
-        })
-        .is_err()
-    {
-        tracing::warn!("Failed to spawn overflow ADBC cleanup thread; dropping inline");
-    }
-}
-
-/// Returns a sender for offloading ADBC factory cleanup to a dedicated
-/// background thread. The worker thread is created once (on first use) and
-/// processes drop work sequentially with bounded buffering, avoiding both
-/// unbounded thread spawns and unbounded cleanup backlog growth.
-fn adbc_cleanup_sender() -> &'static std::sync::mpsc::SyncSender<ManagedAdbcTableFactory> {
-    static SENDER: OnceLock<std::sync::mpsc::SyncSender<ManagedAdbcTableFactory>> = OnceLock::new();
-    SENDER.get_or_init(|| {
-        let (tx, rx) =
-            std::sync::mpsc::sync_channel::<ManagedAdbcTableFactory>(ADBC_CLEANUP_QUEUE_CAPACITY);
-        if std::thread::Builder::new()
-            .name("adbc-cleanup".to_string())
-            .spawn(move || {
-                for factory in rx {
-                    drop(factory);
-                }
-            })
-            .is_err()
-        {
-            tracing::warn!(
-                "Failed to spawn ADBC cleanup worker thread; subsequent cleanup will use the overflow thread path or be performed inline as a last resort"
-            );
-        }
-        tx
-    })
 }
 
 type ConnectorCache = parking_lot::Mutex<HashMap<String, Arc<ConnectorCacheEntry>>>;
@@ -368,8 +313,9 @@ impl AdbcFactory {
         let username = params.parameters.get("username").expose().ok();
         let password = params.parameters.get("password").expose().ok();
         let driver_options = params.parameters.get("driver_options").expose().ok();
-        let db_options = build_db_options(&uri_str, username, password, driver_options);
-        let secrets = connection_secrets(&uri_str, password, driver_options);
+        let db_options =
+            build_db_options(driver_name, &uri_str, username, password, driver_options);
+        let secrets = connection_secrets(driver_name, &uri_str, password, driver_options);
 
         let pool_identity =
             resolve_pool_identity(&driver_name_owned, &uri_str, &params).map_err(|e| {
@@ -449,10 +395,11 @@ impl AdbcFactory {
         // background. The timeout bounds only the *await*, not the actual
         // blocking execution. Use driver-level/connect-level timeouts where
         // the driver supports them for stricter cancellation.
+        let entrypoint = driver_entrypoint(driver_name);
         let init_handle = tokio::task::spawn_blocking(move || -> Result<Arc<ADBCPool<_>>> {
             let mut driver = ManagedDriver::load_from_name(
                 &driver_location,
-                None,
+                entrypoint,
                 AdbcVersion::V110,
                 LOAD_FLAG_DEFAULT,
                 None,
@@ -488,40 +435,23 @@ impl AdbcFactory {
 
             Ok(Arc::new(pool))
         });
-        let abort_handle = init_handle.abort_handle();
-
-        let pool = tokio::time::timeout(std::time::Duration::from_mins(2), init_handle)
-            .await
-            .map_err(|_elapsed| {
-                abort_handle.abort();
+        let pool = await_adbc_initialization(init_handle).await.map_err(|e| {
+            let error_string = e.to_string();
+            if is_auth_or_permission_error(&error_string) {
+                let hint = auth_permission_hint(&driver_name_owned);
+                DataConnectorError::UnableToConnectInternal {
+                    dataconnector: format!("adbc ({driver_name_owned})"),
+                    connector_component: component,
+                    source: format!("{error_string}. {hint}").into(),
+                }
+            } else {
                 DataConnectorError::UnableToConnectInternal {
                     dataconnector: "adbc".to_string(),
-                    connector_component: component.clone(),
-                    source: "ADBC driver initialization timed out after 120 seconds".into(),
+                    connector_component: component,
+                    source: Box::new(e),
                 }
-            })?
-            .map_err(|e| DataConnectorError::UnableToConnectInternal {
-                dataconnector: "adbc".to_string(),
-                connector_component: component.clone(),
-                source: Box::new(e),
-            })?
-            .map_err(|e| {
-                let error_string = e.to_string();
-                if is_auth_or_permission_error(&error_string) {
-                    let hint = auth_permission_hint(&driver_name_owned);
-                    DataConnectorError::UnableToConnectInternal {
-                        dataconnector: format!("adbc ({driver_name_owned})"),
-                        connector_component: component,
-                        source: format!("{error_string}. {hint}").into(),
-                    }
-                } else {
-                    DataConnectorError::UnableToConnectInternal {
-                        dataconnector: "adbc".to_string(),
-                        connector_component: component,
-                        source: Box::new(e),
-                    }
-                }
-            })?;
+            }
+        })?;
 
         let adbc_factory = AdbcTableFactoryWithPolicy::new(
             Arc::clone(&pool),
@@ -873,55 +803,6 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
     }
 
     hasher.finalize().to_hex().to_string()
-}
-
-/// Builds the list of ADBC database options from connector parameters.
-/// Applies the `adbc.` prefix a driver-option key takes when it is written without
-/// one. `bigquery.sql.dataset_id` and `adbc.bigquery.sql.dataset_id` name the same
-/// option, so anything matching on a key has to agree on the spelling.
-fn normalize_driver_option_key(key: &str) -> String {
-    if key.starts_with("adbc.") {
-        key.to_string()
-    } else {
-        format!("adbc.{key}")
-    }
-}
-
-pub(crate) fn build_db_options(
-    uri: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-    driver_options: Option<&str>,
-) -> Vec<(OptionDatabase, adbc_core::options::OptionValue)> {
-    let mut opts = vec![(OptionDatabase::Uri, uri.into())];
-    if let Some(u) = username {
-        opts.push((OptionDatabase::Username, u.into()));
-    }
-    if let Some(p) = password {
-        opts.push((OptionDatabase::Password, p.into()));
-    }
-    if let Some(options_str) = driver_options {
-        for pair in options_str.split(';') {
-            let pair = pair.trim();
-            if pair.is_empty() {
-                continue;
-            }
-            if let Some((key, value)) = pair.split_once('=') {
-                let key = key.trim();
-                if key.is_empty() {
-                    tracing::warn!("Ignoring ADBC driver option with empty key");
-                    continue;
-                }
-                opts.push((
-                    OptionDatabase::Other(normalize_driver_option_key(key)),
-                    value.trim().into(),
-                ));
-            } else {
-                tracing::warn!("Ignoring malformed ADBC driver option (expected 'key=value')");
-            }
-        }
-    }
-    opts
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1480,109 +1361,6 @@ mod tests {
         let factory = AdbcFactory::new();
         let debug_str = format!("{factory:?}");
         assert!(debug_str.contains("AdbcFactory"));
-    }
-
-    #[test]
-    fn test_build_db_options_uri_only() {
-        let opts = build_db_options("file:test.db", None, None, None);
-        assert_eq!(opts.len(), 1);
-        assert_eq!(opts[0].0, OptionDatabase::Uri);
-        assert!(
-            matches!(&opts[0].1, adbc_core::options::OptionValue::String(s) if s == "file:test.db")
-        );
-    }
-
-    #[test]
-    fn test_build_db_options_with_username_password() {
-        let opts = build_db_options("postgres://host/db", Some("admin"), Some("secret"), None);
-        assert_eq!(opts.len(), 3);
-
-        assert_eq!(opts[0].0, OptionDatabase::Uri);
-        assert!(
-            matches!(&opts[0].1, adbc_core::options::OptionValue::String(s) if s == "postgres://host/db")
-        );
-
-        assert_eq!(opts[1].0, OptionDatabase::Username);
-        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "admin"));
-
-        assert_eq!(opts[2].0, OptionDatabase::Password);
-        assert!(matches!(&opts[2].1, adbc_core::options::OptionValue::String(s) if s == "secret"));
-    }
-
-    #[test]
-    fn test_build_db_options_username_only() {
-        let opts = build_db_options("sqlite:test.db", Some("user"), None, None);
-        assert_eq!(opts.len(), 2);
-        assert_eq!(opts[0].0, OptionDatabase::Uri);
-        assert_eq!(opts[1].0, OptionDatabase::Username);
-        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "user"));
-    }
-
-    #[test]
-    fn test_build_db_options_with_driver_options_unprefixed() {
-        let opts = build_db_options(
-            "uri://db",
-            None,
-            None,
-            Some("snowflake.sql.db=MY_DB;snowflake.sql.schema=PUBLIC"),
-        );
-        assert_eq!(opts.len(), 3);
-        assert_eq!(opts[0].0, OptionDatabase::Uri);
-        assert_eq!(
-            opts[1].0,
-            OptionDatabase::Other("adbc.snowflake.sql.db".to_string())
-        );
-        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "MY_DB"));
-        assert_eq!(
-            opts[2].0,
-            OptionDatabase::Other("adbc.snowflake.sql.schema".to_string())
-        );
-        assert!(matches!(&opts[2].1, adbc_core::options::OptionValue::String(s) if s == "PUBLIC"));
-    }
-
-    #[test]
-    fn test_build_db_options_with_driver_options_prefixed() {
-        let opts = build_db_options(
-            "uri://db",
-            None,
-            None,
-            Some("adbc.snowflake.sql.db=MY_DB;adbc.snowflake.sql.schema=PUBLIC"),
-        );
-        assert_eq!(opts.len(), 3);
-        assert_eq!(
-            opts[1].0,
-            OptionDatabase::Other("adbc.snowflake.sql.db".to_string())
-        );
-        assert_eq!(
-            opts[2].0,
-            OptionDatabase::Other("adbc.snowflake.sql.schema".to_string())
-        );
-    }
-
-    #[test]
-    fn test_build_db_options_driver_options_trailing_semicolon() {
-        let opts = build_db_options("uri://db", None, None, Some("key=value;"));
-        assert_eq!(opts.len(), 2);
-        assert_eq!(opts[1].0, OptionDatabase::Other("adbc.key".to_string()));
-        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "value"));
-    }
-
-    #[test]
-    fn test_build_db_options_driver_options_malformed_ignored() {
-        let opts = build_db_options(
-            "uri://db",
-            None,
-            None,
-            Some("good=val;bad_no_equals;another=ok"),
-        );
-        assert_eq!(opts.len(), 3); // uri + good + another (bad_no_equals skipped)
-    }
-
-    #[test]
-    fn test_build_db_options_driver_options_empty_key_ignored() {
-        let opts = build_db_options("uri://db", None, None, Some("=value;good=ok"));
-        assert_eq!(opts.len(), 2); // uri + good (empty key skipped)
-        assert_eq!(opts[1].0, OptionDatabase::Other("adbc.good".to_string()));
     }
 
     #[test]
@@ -3079,14 +2857,7 @@ mod function_support_tests {
     /// connector builds for `driver_name` — its own factory path, so the
     /// policy it installs is the one under test.
     async fn federates_via_catalog(driver_name: &str, expr: Expr) -> bool {
-        let pool = Arc::new(
-            ADBCPool::new(StubDatabase::default(), None).expect("build the stub ADBC pool"),
-        );
-        let provider =
-            runtime::catalogconnector::adbc::build_table_factory(pool, true, driver_name)
-                .table_provider(TableReference::bare("t"), dialect_for_driver(driver_name))
-                .await
-                .expect("build the catalog-registered ADBC table provider");
+        let provider = stub_catalog_table_provider(true, driver_name).await;
         let adaptor = (provider.as_ref() as &dyn std::any::Any)
             .downcast_ref::<FederatedTableProviderAdaptor>()
             .expect("a federation-enabled factory must produce a federated provider");
@@ -3490,6 +3261,50 @@ mod function_support_tests {
                 .analyzer(&scan_aggregate(&provider, expr)),
             Some(FederationAnalyzerForLogicalPlan::With(_))
         )
+    }
+
+    async fn federates_aggregate_via_catalog(driver_name: &str, expr: Expr) -> bool {
+        let provider = stub_catalog_table_provider(true, driver_name).await;
+        let adaptor = (provider.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .expect("a federation-enabled factory must produce a federated provider");
+        matches!(
+            adaptor
+                .source
+                .federation_provider()
+                .analyzer(&scan_aggregate(&provider, expr)),
+            Some(FederationAnalyzerForLogicalPlan::With(_))
+        )
+    }
+
+    /// Regression test for #14492: the catalog route keeps decimal `avg` local
+    /// while allowing integer `avg` to federate to `DuckDB`.
+    #[tokio::test]
+    async fn a_decimal_avg_stays_local_on_the_duckdb_catalog_route() {
+        use datafusion::functions_aggregate::expr_fn::avg;
+        use datafusion::prelude::cast;
+
+        assert!(
+            !federates_aggregate_via_catalog(
+                "duckdb",
+                avg(cast(col("id"), DataType::Decimal128(10, 2))),
+            )
+            .await
+        );
+        assert!(federates_aggregate_via_catalog("duckdb", avg(col("id"))).await);
+    }
+
+    /// Regression test for #14492: `DuckDB` returns `DOUBLE` for decimal `avg`,
+    /// so the dataset route must evaluate it locally.
+    #[tokio::test]
+    async fn a_decimal_avg_stays_local_on_the_duckdb_dataset_route() {
+        use datafusion::functions_aggregate::expr_fn::avg;
+        use datafusion::prelude::cast;
+
+        assert!(
+            !federates_aggregate("duckdb", avg(cast(col("id"), DataType::Decimal128(10, 2)))).await
+        );
+        assert!(federates_aggregate("duckdb", avg(col("id"))).await);
     }
 
     /// `BigQuery` refuses exactly the filtered-aggregate shapes its dialect cannot
@@ -4060,7 +3875,10 @@ mod function_support_tests {
             ADBCPool::new(StubDatabase::default(), None).expect("build the stub ADBC pool"),
         );
         runtime::catalogconnector::adbc::build_table_factory(pool, federation_enabled, driver_name)
-            .table_provider(TableReference::bare("t"), dialect_for_driver(driver_name))
+            .table_provider(
+                TableReference::bare("t"),
+                runtime::catalogconnector::adbc::catalog_dialect_for_driver(driver_name),
+            )
             .await
             .expect("build the ADBC catalog table provider")
     }

@@ -1,12 +1,12 @@
 name: Setup libduckdb
 description: >-
-  Install the DuckDB shared library that the DuckDB test oracles and
-  testoperator load through ADBC, and register it as the 'duckdb' ADBC driver
-  for the rest of the job. scripts/libduckdb.py downloads the release,
-  checks it against the SHA-256 recorded in test/duckdb_versions.json, and
-  writes a driver manifest, which is found through ADBC_DRIVER_PATH, so nothing
-  is installed system-wide and the setting survives macOS, which strips DYLD_*
-  variables from /bin/bash.
+  Install the DuckDB shared library that duckdb: and ducklake: datasets, the
+  DuckDB test oracles and testoperator load through ADBC, and register it as
+  the 'duckdb' ADBC driver for the rest of the job. scripts/libduckdb.py
+  downloads the release, checks it against the SHA-256 recorded in
+  test/duckdb_versions.json, and writes a driver manifest, which is found
+  through ADBC_DRIVER_PATH, so nothing is installed system-wide and the
+  setting survives macOS, which strips DYLD_* variables from /bin/bash.
 
 inputs:
   version:
