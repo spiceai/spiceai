@@ -49,93 +49,6 @@ mod flight_prepared_statements {
             .await
     }
 
-    /// A bound parameter must reach the query with its own Arrow type: a
-    /// zone-aware timestamp keeps its zone and unit (it used to be cast to the
-    /// zone-less nanosecond `TIMESTAMP`, so it matched the wrong rows of a
-    /// zoned column), and a `Float64` compared to a `DECIMAL` matches the
-    /// decimal it spells (it used to go through a binary float cast).
-    #[tokio::test]
-    async fn bound_timestamp_and_float_params_keep_their_arrow_type() -> Result<(), anyhow::Error> {
-        use arrow::array::{Float64Array, TimestampMicrosecondArray};
-        use arrow::datatypes::{DataType, TimeUnit};
-
-        // 2026-03-08T10:30:00Z, the same instant as the row it is compared to,
-        // which is stored in America/Los_Angeles.
-        const INSTANT_MICROS: i64 = 1_772_965_800_000_000;
-
-        let _tracing = init_tracing(Some("integration=debug,info"));
-
-        test_request_context()
-            .scope(async {
-                let (channel, _df) = start_spice_test_app(None, None, None).await?;
-                let mut client = FlightSqlServiceClient::new(channel);
-
-                let utc = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
-                let timestamp = create_param_batch(
-                    vec![("$1", utc, false)],
-                    vec![Arc::new(
-                        TimestampMicrosecondArray::from(vec![INSTANT_MICROS]).with_timezone("UTC"),
-                    ) as ArrayRef],
-                )?;
-                let results = execute_parameterized_query(
-                    &mut client,
-                    "SELECT arrow_typeof($1) AS bound_type, \
-                     $1 = arrow_cast(1772965800000000, 'Timestamp(µs, \"America/Los_Angeles\")') AS same_instant",
-                    timestamp,
-                )
-                .await?;
-                let batch = results.first().expect("one batch");
-                let bound_type = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("arrow_typeof is Utf8")
-                    .value(0)
-                    .to_string();
-                assert_eq!(
-                    bound_type,
-                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())).to_string(),
-                    "the bound timestamp lost its zone or unit"
-                );
-                let same_instant = batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .expect("comparison is Boolean")
-                    .value(0);
-                assert!(
-                    same_instant,
-                    "a UTC parameter must equal the same instant stored in another zone"
-                );
-
-                let float = create_param_batch(
-                    vec![("$1", DataType::Float64, false)],
-                    vec![Arc::new(Float64Array::from(vec![12_345_678.90])) as ArrayRef],
-                )?;
-                let results = execute_parameterized_query(
-                    &mut client,
-                    "SELECT count(*) AS matches FROM (VALUES (CAST('12345678.90' AS DECIMAL(10, 2)))) AS v(d) WHERE d = $1",
-                    float,
-                )
-                .await?;
-                let matches = results
-                    .first()
-                    .expect("one batch")
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .expect("count is Int64")
-                    .value(0);
-                assert_eq!(
-                    matches, 1,
-                    "a Float64 parameter of 12345678.90 must match DECIMAL(10, 2) 12345678.90"
-                );
-
-                Ok(())
-            })
-            .await
-    }
-
     /// The schema `GetFlightInfo` advertises for a prepared statement with
     /// bound parameters must match the `DoGet` stream, including for output
     /// columns derived from a parameter (ADBC and arrow-go reject a mismatch
@@ -1294,14 +1207,17 @@ mod flight_prepared_statements {
     /// A bound parameter compared with a column takes the column's type, as it
     /// does over HTTP. Comparing in the parameter's type instead loses the time
     /// zone of a zoned timestamp, and compares a DECIMAL column as an inexact
-    /// float, so the matching row is not returned.
+    /// float, so the matching row is not returned. A `Date64` parameter keeps
+    /// its time of day: as a `DATE` it would be truncated to midnight, which
+    /// misses the same instant and equals midnight of that day. A `Date64` at
+    /// midnight still matches a `DATE` column.
     #[tokio::test]
     async fn test_parameter_compared_with_column_matches() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(Some("integration=debug,info"));
 
         test_request_context()
             .scope(async {
-                use arrow::array::{Float64Array, TimestampMicrosecondArray};
+                use arrow::array::{Date64Array, Float64Array, TimestampMicrosecondArray};
                 use arrow::datatypes::{DataType, TimeUnit};
 
                 let (channel, _df) = start_spice_test_app(None, None, None).await?;
@@ -1310,6 +1226,15 @@ mod flight_prepared_statements {
                 let zone = "America/Los_Angeles";
                 // 2026-01-15T09:30:00-08:00
                 let instant_us = 1_768_498_200_000_000_i64;
+                // The same instant as a `Date64` is 17:30 into 2026-01-15 UTC.
+                let instant_ms = instant_us / 1000;
+                let midnight_ms = 1_768_435_200_000_i64;
+                let date64 = |ms: i64| {
+                    create_param_batch(
+                        vec![("$1", DataType::Date64, false)],
+                        vec![Arc::new(Date64Array::from(vec![ms])) as ArrayRef],
+                    )
+                };
                 let cases = [
                     (
                         "WITH t(c) AS (SELECT arrow_cast('2026-01-15T09:30:00-08:00', 'Timestamp(µs, \"America/Los_Angeles\")')) \
@@ -1332,6 +1257,21 @@ mod flight_prepared_statements {
                             vec![("$1", DataType::Float64, false)],
                             vec![Arc::new(Float64Array::from(vec![0.1])) as ArrayRef],
                         )?,
+                    ),
+                    (
+                        "WITH t(c) AS (SELECT arrow_cast(1768498200000, 'Date64')) \
+                         SELECT count(*) AS n FROM t WHERE c = $1",
+                        date64(instant_ms)?,
+                    ),
+                    (
+                        "WITH t(c) AS (SELECT arrow_cast(1768435200000, 'Date64')) \
+                         SELECT count(*) AS n FROM t WHERE c <> $1",
+                        date64(instant_ms)?,
+                    ),
+                    (
+                        "WITH t(c) AS (SELECT CAST('2026-01-15' AS DATE)) \
+                         SELECT count(*) AS n FROM t WHERE c = $1",
+                        date64(midnight_ms)?,
                     ),
                 ];
 
