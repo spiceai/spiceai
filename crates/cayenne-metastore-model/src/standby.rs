@@ -92,6 +92,11 @@ pub(crate) struct State {
     fenced_resume: bool,
     standby_read: bool,
     bad_read: bool,
+    /// (change, instance) of each committed data file left on the committing
+    /// instance's local disk; only the local-files control records any.
+    local_files: Vec<(usize, usize)>,
+    /// A standby read or a takeover needed a file on another instance's disk.
+    unreadable_file: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -186,6 +191,8 @@ impl Model for Protocol {
             fenced_resume: false,
             standby_read: false,
             bad_read: false,
+            local_files: vec![],
+            unreadable_file: false,
         }]
     }
     fn actions(&self, s: &State, a: &mut Vec<Action>) {
@@ -277,6 +284,7 @@ impl Model for Protocol {
                     next.head.generation = n.epoch;
                 }
                 next.crash_takeover |= s.lease.epoch == n.epoch && s.lease.cause == 1;
+                next.unreadable_file |= s.local_files.iter().any(|&(_, o)| o != i);
                 next.fenced = n.epoch;
                 let m = &mut next.instances[i];
                 m.generation = n.epoch;
@@ -309,6 +317,10 @@ impl Model for Protocol {
                 if s.head == c.base {
                     next.head.pos += 1;
                     next.rows.push(c.change);
+                    if self.has("local-files") {
+                        // Data files stay on the committing instance's disk.
+                        next.local_files.push((c.change, i));
+                    }
                     if !next.committers.contains(&(s.head.generation, i)) {
                         next.committers.push((s.head.generation, i));
                         next.committers.sort_unstable();
@@ -383,6 +395,7 @@ impl Model for Protocol {
                 // A standby reads the committed head without writing.
                 next.standby_read = true;
                 next.bad_read |= s.rows != (1..=s.head.pos).collect::<Vec<_>>();
+                next.unreadable_file |= s.local_files.iter().any(|&(_, o)| o != i);
             }
         }
         if Self::ingesting(&next) {
@@ -413,6 +426,10 @@ impl Model for Protocol {
             Property::always("standby reads a committed prefix", |_, s: &State| {
                 !s.bad_read
             }),
+            Property::always(
+                "standbys and new owners read every committed file",
+                |_, s: &State| !s.unreadable_file,
+            ),
             Property::sometimes("takeover after holder crash", |_, s: &State| {
                 s.crash_takeover
             }),
