@@ -284,7 +284,7 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
                     50151,
                 )),
                 cluster: ClusterConfig {
-                    role: Some(runtime::config::ClusterRole::Scheduler),
+                    role: Some(runtime::config::Role::Scheduler),
                     node_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
                         Ipv4Addr::LOCALHOST,
                         50152,
@@ -341,7 +341,7 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
                     50153,
                 )),
                 cluster: ClusterConfig {
-                    role: Some(runtime::config::ClusterRole::Executor),
+                    role: Some(runtime::config::Role::Executor),
                     node_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
                         Ipv4Addr::LOCALHOST,
                         50154,

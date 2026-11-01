@@ -27,7 +27,10 @@ use super::{
 use crate::accelerated::AcceleratedTable;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
-use crate::{config::ClusterRole, status};
+use crate::{
+    config::{ClusterRole, Role},
+    status,
+};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
 use cayenne::optimizer_rules::{
@@ -97,7 +100,7 @@ use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use spicepod::component::runtime::{
-    CteMaterialization, QueryErrorLogging, RuntimeMode, SpillCompression as SpiceSpillCompression,
+    CteMaterialization, QueryErrorLogging, SpillCompression as SpiceSpillCompression,
 };
 use spicepod::metric::Metrics;
 use tokio::{
@@ -342,7 +345,7 @@ pub struct DataFusionBuilder {
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     memory_limit: Option<u64>,
     target_partitions: Option<usize>,
-    runtime_mode: RuntimeMode,
+    role: Role,
     prefer_hash_join: Option<bool>,
     eager_aggregation: Option<bool>,
     eager_aggregation_min_reduction_factor: Option<usize>,
@@ -477,7 +480,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry,
             memory_limit: None,
             target_partitions: None,
-            runtime_mode: RuntimeMode::default(),
+            role: Role::default(),
             prefer_hash_join: None,
             eager_aggregation: None,
             eager_aggregation_min_reduction_factor: None,
@@ -591,10 +594,11 @@ impl DataFusionBuilder {
         self
     }
 
-    /// Selects the defaults for settings the Spicepod leaves unset.
+    /// The `--role` this runtime started with, which selects the defaults for
+    /// settings the Spicepod leaves unset.
     #[must_use]
-    pub fn runtime_mode(mut self, runtime_mode: RuntimeMode) -> Self {
-        self.runtime_mode = runtime_mode;
+    pub fn role(mut self, role: Role) -> Self {
+        self.role = role;
         self
     }
 
@@ -994,9 +998,9 @@ impl DataFusionBuilder {
             // across the whole node. Size from the CPU budget instead, which is
             // the same number wherever detection was already correct.
             let budget = cpu_budget::cpu_budget();
-            let target_partitions = match self.runtime_mode {
-                RuntimeMode::Server => budget.target_partitions(),
-                RuntimeMode::Sidecar => budget.sidecar_target_partitions(),
+            let target_partitions = match self.role {
+                Role::Sidecar => budget.sidecar_target_partitions(),
+                Role::Server | Role::Scheduler | Role::Executor => budget.target_partitions(),
             };
             config = config.with_target_partitions(target_partitions);
             tracing::info!(
@@ -1177,7 +1181,9 @@ impl DataFusionBuilder {
         )));
 
         if matches!(
-            self.cluster_config.as_ref().and_then(|cfg| cfg.role()),
+            self.cluster_config
+                .as_ref()
+                .and_then(|cfg| cfg.effective_role()),
             Some(ClusterRole::Scheduler)
         ) {
             // Pushes partial aggregates into per-executor Flight SQL. Checked
@@ -1519,6 +1525,7 @@ impl DataFusionBuilder {
             metrics: self.metrics,
             resource_monitor: self.resource_monitor,
             cluster_config: self.cluster_config.unwrap_or_default(),
+            role: self.role,
             scheduler_server: RwLock::new(None),
             executor: RwLock::new(None),
             executor_stream_registry: RwLock::new(None),

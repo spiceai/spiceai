@@ -12,14 +12,13 @@ sources:
   src: { kind: postgres }
 
 matrix:
-  runtime_mode: [server, sidecar]
+  role: [server, sidecar]
 
 spicepod:
   version: v1
   kind: Spicepod
   name: results-cache
   runtime:
-    mode: '${matrix.runtime_mode}'
     caching:
       sql_results:
         enabled: true
@@ -33,6 +32,7 @@ spicepod:
       acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
 
 defaults:
+  spiced-args: [--role, '${matrix.role}']
   # A cluster buckets each acceleration on this column (--cluster).
   cluster-partition-by: { '*': c_custkey }
   expect: { oracle: src }

@@ -979,6 +979,8 @@ async fn create_instances(
                 .with_context(|| format!("variant '{variant_name}'"))?;
             let mut spicepod = template::substitute(&spicepod, &context)?;
             disable_results_cache_unless_configured(&mut spicepod);
+            let spiced_args = template::substitute(&json!(script.defaults.spiced_args), &context)?;
+            let mut spiced_args: Vec<String> = serde_json::from_value(spiced_args)?;
             let cluster = (options.cluster || script.defaults.cluster.is_some())
                 && script.defaults.executor_args.is_none();
             let containers = cluster
@@ -988,11 +990,15 @@ async fn create_instances(
                     .as_ref()
                     .is_some_and(|c| c.containers);
             if cluster {
-                if spicepod.pointer("/runtime/mode").and_then(Value::as_str) == Some("sidecar") {
-                    say!(
-                        "   skip {label:<20} runtime.mode: sidecar does not run as a cluster node"
-                    );
-                    continue;
+                // The cluster run gives the instance its scheduler role, which
+                // replaces the default `--role server` but no other role.
+                match role_arg(&spiced_args) {
+                    Some("server") => strip_role_arg(&mut spiced_args),
+                    Some(role) => {
+                        say!("   skip {label:<20} `--role {role}` does not run as a cluster node");
+                        continue;
+                    }
+                    None => {}
                 }
                 if let Some(engine) = undistributed_engine(&spicepod) {
                     // A cluster accelerates only into Cayenne and Arrow.
@@ -1090,8 +1096,7 @@ async fn create_instances(
             }
             spiced.set_api_key(script.defaults.api_key.clone())?;
             spiced.set_tls(script.defaults.tls.as_ref().map(|t| script.dir.join(&t.ca)))?;
-            let args = template::substitute(&json!(script.defaults.spiced_args), &context)?;
-            let mut args: Vec<String> = serde_json::from_value(args)?;
+            let mut args = spiced_args;
             if let Some((scheduler, _)) = &cluster_args {
                 args.extend(scheduler.iter().cloned());
             }
@@ -1427,6 +1432,34 @@ fn when_matches(when: &Map<String, Value>, combo: &Map<String, Value>) -> bool {
         })
 }
 
+/// The value of a `--role` in `spiced` arguments, given as `--role <role>` or
+/// `--role=<role>`.
+fn role_arg(args: &[String]) -> Option<&str> {
+    args.iter()
+        .enumerate()
+        .find_map(|(i, arg)| match arg.strip_prefix("--role") {
+            Some("") => args.get(i + 1).map(String::as_str),
+            Some(value) => value.strip_prefix('='),
+            None => None,
+        })
+}
+
+/// Removes every `--role` from `spiced` arguments, with its value.
+fn strip_role_arg(args: &mut Vec<String>) {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].strip_prefix("--role") {
+            Some("") => {
+                args.drain(i..(i + 2).min(args.len()));
+            }
+            Some(value) if value.starts_with('=') => {
+                args.remove(i);
+            }
+            _ => i += 1,
+        }
+    }
+}
+
 fn disable_results_cache_unless_configured(spicepod: &mut Value) {
     let Some(root) = spicepod.as_object_mut() else {
         return;
@@ -1563,6 +1596,30 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn role_args_are_found_and_stripped_in_both_spellings() {
+        let args = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for (given, role, stripped) in [
+            (
+                &["--role", "server", "--http", "x"][..],
+                Some("server"),
+                &["--http", "x"][..],
+            ),
+            (
+                &["--http", "x", "--role=sidecar"][..],
+                Some("sidecar"),
+                &["--http", "x"][..],
+            ),
+            (&["--roles", "x"][..], None, &["--roles", "x"][..]),
+            (&[][..], None, &[][..]),
+        ] {
+            let mut given = args(given);
+            assert_eq!(role_arg(&given), role);
+            strip_role_arg(&mut given);
+            assert_eq!(given, args(stripped));
+        }
+    }
 
     #[test]
     fn a_corpus_shares_one_eventually_limit_and_nothing_else_does() {

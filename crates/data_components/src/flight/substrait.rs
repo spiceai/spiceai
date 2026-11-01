@@ -50,8 +50,8 @@ use datafusion_substrait::{
     logical_plan::producer::{SubstraitProducer, from_table_scan},
     substrait::{
         proto::{
-            Expression, Plan, PlanRel, Rel, RelRoot, expression::RexType, plan_rel,
-            read_rel::ReadType, rel::RelType,
+            Expression, ExtensionLeafRel, Plan, PlanRel, Rel, RelRoot, expression::RexType,
+            plan_rel, read_rel::ReadType, rel::RelType,
         },
         version::version_with_producer,
     },
@@ -61,7 +61,11 @@ use futures::StreamExt;
 use prost::Message;
 use runtime_request_context::{SPICE_TRACE_ID_HEADER, TRACEPARENT_HEADER};
 
-use super::{FlightTable, normalized_batches};
+use super::{
+    FlightTable,
+    delegated_search::{SEARCH_CALL_TYPE_URL, SearchCallNode},
+    normalized_batches,
+};
 
 pub(super) fn federated_provider(table: Arc<FlightTable>) -> FederatedTableProviderAdaptor {
     let provider = Arc::new(SpiceFederation {
@@ -85,6 +89,25 @@ struct SpiceProducer {
 }
 
 impl SubstraitProducer for SpiceProducer {
+    fn handle_extension(&mut self, plan: &Extension) -> Result<Box<Rel>> {
+        // The only extension sent upstream is a delegated search's leaf.
+        let Some(search) = plan.node.as_any().downcast_ref::<SearchCallNode>() else {
+            return Err(DataFusionError::NotImplemented(format!(
+                "'{}' is evaluated in the sidecar",
+                plan.node.name()
+            )));
+        };
+        Ok(Box::new(Rel {
+            rel_type: Some(RelType::ExtensionLeaf(ExtensionLeafRel {
+                common: None,
+                detail: Some(pbjson_types::Any {
+                    type_url: SEARCH_CALL_TYPE_URL.to_string(),
+                    value: search.call.clone().into(),
+                }),
+            })),
+        }))
+    }
+
     fn handle_in_subquery(
         &mut self,
         _expression: &datafusion::logical_expr::expr::InSubquery,
@@ -219,7 +242,7 @@ impl SubstraitProducer for SpiceProducer {
                 }
             }
         };
-        let mut rel = from_table_scan(self, scan)?;
+        let mut rel = from_table_scan(self, &read_columns(scan)?)?;
         if let Some(RelType::Read(read)) = &mut rel.rel_type
             && let Some(ReadType::NamedTable(table)) = &mut read.read_type
         {
@@ -227,6 +250,48 @@ impl SubstraitProducer for SpiceProducer {
         }
         Ok(rel)
     }
+}
+
+/// `scan` over a source with only the columns it reads: its projection and the
+/// columns its filters reference. The upstream matches a read's base schema to
+/// its table by name, so a read never encodes a column it does not need, such
+/// as an embedding column, whose fixed-size list type Substrait cannot express.
+/// A scan of every column is returned unchanged.
+fn read_columns(scan: &TableScan) -> Result<TableScan> {
+    let Some(projection) = &scan.projection else {
+        return Ok(scan.clone());
+    };
+    let source = scan.source.schema();
+    let mut read: std::collections::BTreeSet<usize> = projection.iter().copied().collect();
+    for filter in &scan.filters {
+        for column in filter.column_refs() {
+            if let Ok(index) = source.index_of(&column.name) {
+                read.insert(index);
+            }
+        }
+    }
+    if read.len() == source.fields().len() {
+        return Ok(scan.clone());
+    }
+    let read: Vec<usize> = read.into_iter().collect();
+    let projection = projection
+        .iter()
+        .map(|index| {
+            read.binary_search(index).map_err(|_| {
+                DataFusionError::Internal("a projected column is missing from the read".into())
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    datafusion::logical_expr::TableScanBuilder::new(
+        scan.table_name.clone(),
+        datafusion::datasource::provider_as_source(Arc::new(EmptyTable::new(Arc::new(
+            source.project(&read)?,
+        )))),
+    )
+    .with_projection(Some(projection))
+    .with_filters(scan.filters.clone())
+    .with_fetch(scan.fetch)
+    .build()
 }
 
 /// The Substrait relation, root names and extensions for `plan`. Fails when any
@@ -246,7 +311,7 @@ fn produce(plan: &LogicalPlan, direct_scan: bool) -> Result<(Rel, Vec<String>, E
     Ok((input, names, producer.get_extensions()))
 }
 
-fn encode_plan(plan: &LogicalPlan, direct_scan: bool) -> Result<Bytes> {
+pub(super) fn encode_plan(plan: &LogicalPlan, direct_scan: bool) -> Result<Bytes> {
     let (input, names, extensions) = produce(plan, direct_scan)?;
     // Extension maps do not have a stable iteration order. Serialize anchors
     // deterministically so identical fragments have identical wire cache keys.
@@ -418,7 +483,7 @@ pub(super) fn scan(
 }
 
 #[derive(Debug)]
-struct SubstraitExec {
+pub(super) struct SubstraitExec {
     client: FlightClient,
     plan: Bytes,
     schema: SchemaRef,
@@ -430,7 +495,12 @@ struct SubstraitExec {
 }
 
 impl SubstraitExec {
-    fn new(client: FlightClient, plan: Bytes, schema: SchemaRef, datasets: String) -> Self {
+    pub(super) fn new(
+        client: FlightClient,
+        plan: Bytes,
+        schema: SchemaRef,
+        datasets: String,
+    ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
@@ -575,7 +645,7 @@ impl ExecutionPlan for SubstraitExec {
                 .map_err(|error| match error {
                     flight_client::Error::SubstraitUnsupported { source } => {
                         DataFusionError::Execution(format!(
-                            "The upstream Spice runtime for dataset '{datasets}' does not support the required Substrait plan: {source}. Upgrade the upstream runtime, or set runtime.mode: server to use SQL federation."
+                            "The upstream Spice runtime for dataset '{datasets}' does not support the required Substrait plan: {source}. Upgrade the upstream runtime, or restart this runtime with `--role server` to use SQL federation."
                         ))
                     }
                     other => DataFusionError::External(Box::new(other)),
@@ -599,7 +669,78 @@ mod tests {
         datatypes::{DataType, Field, Schema},
     };
 
-    use super::conform_batch;
+    use super::{conform_batch, encode_plan};
+
+    /// A read names only the columns it uses: its projection and the columns
+    /// its filters reference. An embedding column the scan does not read is
+    /// never encoded; reading it is still refused, since Substrait has no
+    /// fixed-size list type.
+    #[test]
+    fn a_read_encodes_only_the_columns_it_uses() {
+        use datafusion::{
+            datasource::{empty::EmptyTable, provider_as_source},
+            logical_expr::{LogicalPlanBuilder, col, lit},
+        };
+        use datafusion_substrait::substrait::proto::{
+            Plan, plan_rel::RelType as PlanRelType, read_rel::ReadType, rel::RelType,
+        };
+        use prost::Message;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, true),
+            Field::new(
+                "label_embedding",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 64),
+                true,
+            ),
+        ]));
+        let scan = |projection: Option<Vec<usize>>| {
+            LogicalPlanBuilder::scan_with_filters(
+                "docs",
+                provider_as_source(Arc::new(EmptyTable::new(Arc::clone(&schema)))),
+                projection,
+                vec![col("value").gt(lit(0_i64))],
+            )
+            .expect("scan")
+            .build()
+            .expect("plan")
+        };
+
+        let plan = Plan::decode(encode_plan(&scan(Some(vec![0])), true).expect("encodes"))
+            .expect("decodes");
+        let Some(PlanRelType::Root(root)) = &plan.relations[0].rel_type else {
+            panic!("a root relation: {plan:?}");
+        };
+        let Some(RelType::Read(read)) = root
+            .input
+            .as_ref()
+            .and_then(|input| input.rel_type.as_ref())
+        else {
+            panic!("a read: {root:?}");
+        };
+        assert!(
+            matches!(read.read_type, Some(ReadType::NamedTable(_))),
+            "{read:?}"
+        );
+        let base = read.base_schema.as_ref().expect("a base schema");
+        assert_eq!(base.names, vec!["id".to_string(), "value".to_string()]);
+        let select = read
+            .projection
+            .as_ref()
+            .and_then(|mask| mask.select.as_ref());
+        let fields: Vec<i32> = select
+            .expect("a projection")
+            .struct_items
+            .iter()
+            .map(|item| item.field)
+            .collect();
+        assert_eq!(fields, vec![0]);
+
+        let error = encode_plan(&scan(Some(vec![0, 2])), true)
+            .expect_err("Substrait has no fixed-size list type");
+        assert!(error.to_string().contains("FixedSizeList"), "{error}");
+    }
 
     fn batch(nullable: bool, values: Vec<Option<i64>>) -> RecordBatch {
         let schema = Schema::new(vec![Field::new("n", DataType::Int64, nullable)]);

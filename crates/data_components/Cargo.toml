@@ -87,6 +87,7 @@ rustc-hash = "2"
 oracle = { version = "0.6", optional = true }
 native-tls = { workspace = true, optional = true }
 percent-encoding.workspace = true
+pbjson-types = "0.8.0"
 prost.workspace = true
 pgwire-replication = { workspace = true, optional = true }
 postgres-native-tls = { workspace = true, optional = true }

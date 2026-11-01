@@ -20,7 +20,7 @@ use crate::cluster::partition::{
     executor_request_initial_partitions,
     scheduler_task::{PartitionAssignmentConfig, PartitionAssignmentTask},
 };
-use crate::config::{ClusterConfig, ClusterRole};
+use crate::config::{ClusterConfig, ClusterRole, Role};
 use crate::jobs::JobExecutor;
 use crate::{
     CLUSTER_INTERNAL_SERVER, CLUSTER_PARTITION_ASSIGNMENT_TASK, CLUSTER_SCHEDULER_REGISTRY,
@@ -884,8 +884,8 @@ impl ResolvedClusterConfig {
             }
         };
 
-        // Determine effective cluster role (explicit or implicit from scheduler_address)
-        let is_cluster_role = config.role.is_some() || config.scheduler_address.is_some();
+        // A scheduler or executor, explicit or implied by `--scheduler-address`.
+        let is_cluster_role = config.cluster_role().is_some();
 
         // Validate all cluster role requirements at once
         if is_cluster_role {
@@ -1014,10 +1014,11 @@ impl ResolvedClusterConfig {
         }
     }
 
-    /// Returns the cluster role.
+    /// The role this runtime runs as, including the executor role implied by
+    /// `--scheduler-address`.
     #[must_use]
-    pub fn role(&self) -> Option<&ClusterRole> {
-        self.config.role.as_ref()
+    pub fn role(&self) -> Role {
+        self.config.effective_role()
     }
 
     /// Returns the fully qualified URL that this node advertises to other
@@ -1033,20 +1034,13 @@ impl ResolvedClusterConfig {
         )
     }
 
-    /// Returns the effective cluster role.
+    /// Returns the effective cluster role, `None` for a server or sidecar.
     ///
     /// This accounts for the implicit executor role: if `--scheduler-address` is set
     /// but no explicit `--role` is specified, this returns `ClusterRole::Executor`.
     #[must_use]
     pub fn effective_role(&self) -> Option<ClusterRole> {
-        if let Some(role) = &self.config.role {
-            return Some(role.clone());
-        }
-        // If scheduler_address is set, implicitly assume executor role
-        if self.config.scheduler_address.is_some() {
-            return Some(ClusterRole::Executor);
-        }
-        None
+        self.config.cluster_role()
     }
 
     /// Returns the cluster bind address.
@@ -2733,15 +2727,15 @@ mod tests {
     #[test]
     fn cluster_roles_require_cluster_mtls_files() {
         use super::ResolvedClusterConfig;
-        use crate::config::{ClusterConfig, ClusterRole};
+        use crate::config::{ClusterConfig, Role};
 
         let advertised = || ClusterConfig {
             node_advertise_address: Some("127.0.0.1".to_string()),
             ..ClusterConfig::default()
         };
         for (node, config) in [
-            ("scheduler", advertised().with_role(ClusterRole::Scheduler)),
-            ("executor", advertised().with_role(ClusterRole::Executor)),
+            ("scheduler", advertised().with_role(Role::Scheduler)),
+            ("executor", advertised().with_role(Role::Executor)),
             (
                 "executor implied by --scheduler-address",
                 ClusterConfig {
@@ -2768,7 +2762,7 @@ mod tests {
     #[test]
     fn insecure_connections_flag_starts_a_node_without_mtls() {
         use super::ResolvedClusterConfig;
-        use crate::config::{ClusterConfig, ClusterRole};
+        use crate::config::{ClusterConfig, Role};
         use clap::Parser;
 
         let config = ClusterConfig::try_parse_from([
@@ -2781,11 +2775,82 @@ mod tests {
         ])
         .expect("--allow-insecure-connections should parse");
         assert!(config.allow_insecure_connections);
-        assert_eq!(config.role, Some(ClusterRole::Scheduler));
+        assert_eq!(config.role, Some(Role::Scheduler));
 
         let resolved = ResolvedClusterConfig::try_new(config)
             .expect("a node started with the insecure flag should start");
         assert!(!resolved.tls_enabled());
+    }
+
+    /// `--role` selects every role; omitted, it is `server`, or `executor` when
+    /// `--scheduler-address` is set. A server or sidecar is not a cluster node,
+    /// so it starts without the cluster flags a scheduler or executor requires.
+    #[test]
+    fn role_flag_selects_the_runtime_role() {
+        use super::ResolvedClusterConfig;
+        use crate::config::{ClusterConfig, ClusterRole, Role};
+        use clap::Parser;
+
+        let parse = |args: &[&str]| {
+            ClusterConfig::try_parse_from(std::iter::once("spiced").chain(args.iter().copied()))
+                .expect("arguments should parse")
+        };
+        for (args, role, cluster_role) in [
+            (&[][..], Role::Server, None),
+            (&["--role", "server"][..], Role::Server, None),
+            (&["--role", "sidecar"][..], Role::Sidecar, None),
+            (
+                &["--role", "scheduler"][..],
+                Role::Scheduler,
+                Some(ClusterRole::Scheduler),
+            ),
+            (
+                &["--role", "executor"][..],
+                Role::Executor,
+                Some(ClusterRole::Executor),
+            ),
+            (
+                &["--scheduler-address", "https://127.0.0.1:50052"][..],
+                Role::Executor,
+                Some(ClusterRole::Executor),
+            ),
+        ] {
+            let config = parse(args);
+            assert_eq!(config.effective_role(), role, "{args:?}");
+            assert_eq!(config.cluster_role(), cluster_role, "{args:?}");
+            assert_eq!(config.validate_role(), Ok(()), "{args:?}");
+            if cluster_role.is_none() {
+                let resolved = ResolvedClusterConfig::try_new(config)
+                    .expect("a server or sidecar needs no cluster flags");
+                assert_eq!(resolved.role(), role, "{args:?}");
+                assert_eq!(resolved.effective_role(), None, "{args:?}");
+            }
+        }
+
+        let error = ClusterConfig::try_parse_from(["spiced", "--role", "cluster"])
+            .expect_err("an unknown role must not parse");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        assert!(
+            error
+                .to_string()
+                .contains("[possible values: server, sidecar, scheduler, executor]"),
+            "{error}"
+        );
+
+        for role in ["server", "sidecar"] {
+            let config = parse(&[
+                "--role",
+                role,
+                "--scheduler-address",
+                "https://127.0.0.1:50052",
+            ]);
+            assert_eq!(
+                config.validate_role(),
+                Err(format!(
+                    "`--scheduler-address` joins a cluster as an executor and cannot be used with `--role {role}`. Remove `--scheduler-address`, or use `--role executor`."
+                ))
+            );
+        }
     }
 
     #[test]

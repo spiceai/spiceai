@@ -23,7 +23,6 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::App;
-use app::spicepod::component::runtime::RuntimeMode;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 pub(crate) use data_connector_api::parameters::{ConnectorContext, ConnectorParams, Validator};
@@ -34,7 +33,7 @@ use runtime_checkpoint_api::{
     BlobCheckpointStore, CheckpointError, debezium::DebeziumCheckpointStore,
     kafka::KafkaCheckpointStore, mongodb::MongoCheckpointStore, mysql_binlog::MySqlBinlogStore,
 };
-use runtime_component::dataset::DatasetSpec;
+use runtime_component::{Role, dataset::DatasetSpec};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::{runtime::Handle, sync::RwLock};
 
@@ -106,8 +105,8 @@ impl ConnectorContext for RuntimeConnectorContext {
         Arc::clone(&self.app)
     }
 
-    fn runtime_mode(&self) -> RuntimeMode {
-        self.runtime.mode
+    fn role(&self) -> Role {
+        self.runtime.role
     }
 
     fn http_rate_control_registry(&self) -> Arc<HttpRateControlRegistry> {

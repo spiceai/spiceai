@@ -35,7 +35,7 @@ use datafusion::common::TableReference;
 use futures::TryStreamExt;
 use runtime::auth::EndpointAuth;
 use runtime::cluster::ResolvedClusterConfig;
-use runtime::config::{ClusterConfig, ClusterRole, Config};
+use runtime::config::{ClusterConfig, Config, Role};
 use runtime::dataupdate::{DataUpdate, UpdateType};
 use runtime::{Result as RuntimeResult, Runtime};
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
@@ -60,7 +60,7 @@ struct Node {
 async fn start_node(
     name: &str,
     pki: &PkiConfig,
-    role: ClusterRole,
+    role: Role,
     scheduler_address: Option<&str>,
     runtime: SpicepodRuntime,
 ) -> Result<Node, anyhow::Error> {
@@ -117,7 +117,7 @@ async fn start_scheduler(
         }),
         ..SpicepodRuntime::default()
     };
-    let scheduler = start_node(name, pki, ClusterRole::Scheduler, None, runtime).await?;
+    let scheduler = start_node(name, pki, Role::Scheduler, None, runtime).await?;
     Arc::clone(&scheduler.rt).load_components().await;
     runtime_ready_check(&scheduler.rt).await;
     Ok(scheduler)
@@ -146,7 +146,7 @@ async fn start_executor(
     let executor = start_node(
         name,
         pki,
-        ClusterRole::Executor,
+        Role::Executor,
         Some(&scheduler.cluster_addr),
         SpicepodRuntime::default(),
     )

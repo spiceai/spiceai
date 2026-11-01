@@ -3,11 +3,15 @@ description: >
   Client mistakes over HTTP are answered 4xx with a message naming the
   mistake: SQL that does not parse, an unknown table or column, an error
   evaluating the query, a write to a read-only dataset, DDL outside a
-  writable catalog, an empty query, search over a dataset with nothing to
-  search, malformed JSON bodies, an unknown model, and an unknown dataset.
+  writable catalog (any DDL at all on a sidecar), an empty query, search over
+  a dataset with nothing to search, malformed JSON bodies, an unknown model,
+  and an unknown dataset.
 
 sources:
   src: { kind: postgres }
+
+matrix:
+  role: [server, sidecar]
 
 spicepod:
   version: v1
@@ -17,6 +21,7 @@ spicepod:
     - { from: postgres:public.t, name: t, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file } }
 
 defaults:
+  spiced-args: [--role, '${matrix.role}']
   cluster-partition-by: { '*': id }
 
 steps:
@@ -35,7 +40,14 @@ steps:
   - http: { method: POST, path: /v1/sql, body: "INSERT INTO t VALUES (2, 'b')" }
     expect: { status: 400, body-matches: ["read-only dataset 't'", 'read_write'] }
   - http: { method: POST, path: /v1/sql, body: 'DROP TABLE t' }
+    when: { role: server }
     expect: { status: 400, body-matches: ['read_write_create'] }
+  - http: { method: POST, path: /v1/sql, body: 'DROP TABLE t' }
+    when: { role: sidecar }
+    expect: { status: 400, body-matches: ['DDL is not allowed on a sidecar', 'without `--role sidecar`'] }
+  - http: { method: POST, path: /v1/sql, body: 'CREATE TABLE t2 (id INT)' }
+    when: { role: sidecar }
+    expect: { status: 400, body-matches: ['DDL is not allowed on a sidecar'] }
   - http: { method: POST, path: /v1/sql, body: '' }
     expect: { status: 400, body-matches: ['No SQL statements'] }
   - http: { method: POST, path: /v1/search, headers: { content-type: application/json }, body: '{"text": "a", "datasets": ["t"]}' }

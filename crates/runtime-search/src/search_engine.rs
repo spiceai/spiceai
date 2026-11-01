@@ -188,6 +188,13 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
             }
         }
 
+        // A sidecar's Spice table is searched by the upstream that embeds it.
+        if embedding_columns.is_empty() {
+            embedding_columns.extend(crate::delegated::delegated_embedding_columns(
+                table_provider.as_ref(),
+            ));
+        }
+
         Some(embedding_columns.into_iter().collect())
     }
 
@@ -358,6 +365,19 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                 table_provider.as_ref(),
                 spice_table::LayerWalk::Read,
             ) else {
+                // `vector_search` over a sidecar's Spice table runs on the
+                // upstream that embeds the column.
+                if crate::delegated::delegated_embedding_columns(table_provider.as_ref())
+                    .iter()
+                    .any(|column| column == embedding_column)
+                {
+                    return Ok(Arc::new(VectorUDTFGeneration::new(
+                        &self.df,
+                        tbl,
+                        embedding_column,
+                        false,
+                    )));
+                }
                 return Err(Error::CannotVectorSearchDataset {
                     data_source: tbl.clone(),
                 });

@@ -21,8 +21,8 @@ use crate::cluster::PartitionStore;
 use crate::cluster::ResolvedClusterConfig;
 use crate::cluster::SchedulerHeartbeatStore;
 use crate::cluster::partition::service::PartitionService;
-use crate::config::ClusterRole;
 use crate::config::Config;
+use crate::config::{ClusterRole, Role};
 use crate::datafusion::builder::{CayenneOptimizerRules, OutputPreview};
 use crate::datafusion::udf::register_udfs;
 use crate::{
@@ -42,7 +42,6 @@ use runtime_acceleration::acceleration::{RefreshMode, unset_refresh_mode_for_con
 use runtime_metrics as metrics;
 use spicepod::component::caching::CacheKeyType;
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
-use spicepod::component::runtime::RuntimeMode;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;
 use spicepod::component::runtime::TelemetryConfig;
@@ -375,9 +374,15 @@ impl RuntimeBuilder {
         document_parse::register_all().await;
 
         let query = spicepod_rt.query.clone().unwrap_or_default();
-        if spicepod_rt.mode == RuntimeMode::Sidecar {
+        // A resolved cluster configuration carries the `--role` it was resolved
+        // from; a runtime built without one takes the role from its config.
+        let role = self.resolved_cluster_config.as_ref().map_or_else(
+            || self.runtime_config.cluster.effective_role(),
+            ResolvedClusterConfig::role,
+        );
+        if role == Role::Sidecar {
             tracing::info!(
-                "Runtime mode: sidecar. Remote Spice reads use Substrait plans created locally."
+                "Starting as a sidecar. Remote Spice reads use Substrait plans created locally."
             );
         }
 
@@ -804,7 +809,7 @@ impl RuntimeBuilder {
         )
         .memory_limit(memory_limit)
         .target_partitions(target_partitions)
-        .runtime_mode(spicepod_rt.mode)
+        .role(role)
         .max_concurrent_queries(max_concurrent_queries)
         .prefer_hash_join(query.prefer_hash_join)
         .eager_aggregation(query.eager_aggregation)
@@ -879,7 +884,7 @@ impl RuntimeBuilder {
         };
 
         let mut rt = Runtime {
-            mode: spicepod_rt.mode,
+            role,
             app: shared_app,
             apply_app_lock: Arc::new(tokio::sync::Mutex::new(())),
             initial_load: Arc::new(crate::InitialLoad::default()),

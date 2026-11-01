@@ -532,14 +532,25 @@ impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchTableFu
             return Self::call_with_es_indexes(&es_indexes, &args, Arc::clone(&table_provider));
         }
 
-        let fts_indexes = fts_indexes
-            .ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "Table '{}' does not have a full text search index.",
-                    args.tbl.clone()
-                ))
-            })?
-            .0;
+        let Some((fts_indexes, _)) = fts_indexes else {
+            // A sidecar's Spice table is searched by the upstream that indexes it.
+            if let Some(delegated) = crate::delegated::delegated_search(
+                table_provider.as_ref(),
+                &args.tbl,
+                &crate::delegated::DelegatedSearchCall::Text {
+                    query: args.query.clone(),
+                    column: args.column.clone(),
+                    limit: args.limit,
+                    include_score: args.include_score,
+                },
+            ) {
+                return Ok(delegated);
+            }
+            return Err(DataFusionError::Plan(format!(
+                "Table '{}' does not have a full text search index.",
+                args.tbl.clone()
+            )));
+        };
 
         if fts_indexes.is_empty() {
             return Err(DataFusionError::Plan(format!(

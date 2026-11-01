@@ -20,7 +20,10 @@ use crate::metric::Metrics;
 
 use super::{
     Nameable, WithDependsOn,
-    model::{HUGGINGFACE_PATH_REGEX, ModelFile, ModelFileType, huggingface_model_id},
+    model::{
+        HUGGINGFACE_PATH_REGEX, ModelFile, ModelFileType, ModelSource, SPICEAI_PREFIXES,
+        huggingface_model_id,
+    },
 };
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
@@ -157,6 +160,8 @@ impl Embeddings {
                 let from = &self.from;
                 from.strip_prefix("model2vec:").map(ToString::to_string)
             }
+            // Parsed as a `spiceai` model's id is, so `from` reads the same for both.
+            Some(EmbeddingPrefix::SpiceAi) => ModelSource::SpiceAI.parse_from(&self.from),
             None => None,
         }
     }
@@ -190,6 +195,9 @@ pub enum EmbeddingPrefix {
     Databricks,
     Bedrock,
     Model2Vec,
+    /// An embedding model served by the Spice.ai Cloud Platform or by another
+    /// Spice runtime, such as the cluster an application sidecar reads from.
+    SpiceAi,
 }
 
 impl TryFrom<&str> for EmbeddingPrefix {
@@ -212,6 +220,11 @@ impl TryFrom<&str> for EmbeddingPrefix {
             Ok(EmbeddingPrefix::Bedrock)
         } else if value.starts_with("model2vec") {
             Ok(EmbeddingPrefix::Model2Vec)
+        } else if SPICEAI_PREFIXES
+            .iter()
+            .any(|prefix| value.starts_with(prefix))
+        {
+            Ok(EmbeddingPrefix::SpiceAi)
         } else {
             Err("Unknown prefix")
         }
@@ -229,6 +242,7 @@ impl Display for EmbeddingPrefix {
             EmbeddingPrefix::Databricks => write!(f, "databricks"),
             EmbeddingPrefix::Bedrock => write!(f, "bedrock"),
             EmbeddingPrefix::Model2Vec => write!(f, "model2vec"),
+            EmbeddingPrefix::SpiceAi => write!(f, "spiceai"),
         }
     }
 }
@@ -346,6 +360,31 @@ mod tests {
 
     fn embedding(from: &str) -> Embeddings {
         Embeddings::new(from, "test")
+    }
+
+    /// Both Spice spellings select the Spice source, and the id is what follows
+    /// the prefix, as for a `spiceai` model. A bare prefix names no model.
+    #[test]
+    fn spiceai_embeddings_parse_like_spiceai_models() {
+        for (from, id) in [
+            ("spiceai:text_embed", Some("text_embed")),
+            ("spice.ai:text_embed", Some("text_embed")),
+            (
+                "spice.ai/org/app/embeddings/text_embed",
+                Some("org/app/embeddings/text_embed"),
+            ),
+            ("spiceai: text_embed ", Some("text_embed")),
+            ("spiceai:", None),
+            ("spice.ai:  ", None),
+        ] {
+            let embedding = embedding(from);
+            assert!(
+                matches!(embedding.get_prefix(), Some(EmbeddingPrefix::SpiceAi)),
+                "{from}"
+            );
+            assert_eq!(embedding.get_model_id().as_deref(), id, "{from}");
+        }
+        assert_eq!(EmbeddingPrefix::SpiceAi.to_string(), "spiceai");
     }
 
     #[test]

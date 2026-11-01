@@ -546,16 +546,32 @@ impl TableFunctionImpl for VectorSearchTableFunc {
         }
 
         // If an embedding column is defined, fallback to JIT or.
-        let embedding_table_provider = spice_table::find_layer::<EmbeddingTable>(
+        let Some(embedding_table_provider) = spice_table::find_layer::<EmbeddingTable>(
             table_provider.as_ref(),
             spice_table::LayerWalk::Read,
-        )
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!(
+        ) else {
+            // A sidecar's Spice table is searched by the upstream that holds its
+            // embeddings. One call carries one query.
+            if args.queries.len() <= 1
+                && let Some(delegated) = runtime_search::delegated::delegated_search(
+                    table_provider.as_ref(),
+                    &args.tbl,
+                    &runtime_search::delegated::DelegatedSearchCall::Vector {
+                        query: args.query.clone(),
+                        column: args.column.clone(),
+                        limit: args.limit,
+                        include_score: args.include_score,
+                        distance_metric: args.distance_metric.map(|m| m.as_str().to_string()),
+                    },
+                )
+            {
+                return Ok(delegated);
+            }
+            return Err(DataFusionError::Plan(format!(
                 "Table '{}' does not have an embedding index.",
                 args.tbl.clone()
-            ))
-        })?;
+            )));
+        };
 
         let (col, _) = args.get_column_and_config(&embedding_table_provider.embedded_columns)?;
         // Both chunked-scalar and multi-vector (list-typed) columns use
