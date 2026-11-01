@@ -80,7 +80,6 @@ vortex-btrblocks = { workspace = true, features = ["zstd"] }
 vortex-datafusion = { workspace = true }
 vortex-scan = { workspace = true }
 vortex-session = { workspace = true }
-duckdb = { workspace = true, features = ["bundled"], optional = true }
 chdb-rust = { version = "1", optional = true }
 # Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
@@ -107,15 +106,16 @@ libc = "0.2"
 default = []
 partition-table-provider = ["dep:runtime-table-partition"]
 # Criterion *performance* comparison benches (`benches/vs_duckdb_*`, `vs_chdb_*`).
-duckdb-bench = ["dep:duckdb"]
+duckdb-bench = []
 chdb-bench = ["dep:chdb-rust"]
-# *Result correctness* gates (`tests/result_correctness_*`). Same optional
-# engines, separate feature names so CI/docs never conflate correctness with
+# *Result correctness* gates (`tests/result_correctness_*`). Installed DuckDB
+# is dev-only; separate feature names keep correctness distinct from
 # the perf matrix in docs/dev/cayenne_vs_duckdb_benchmarks.md.
-result-correctness-duckdb = ["dep:duckdb"]
+result-correctness-duckdb = []
 result-correctness-chdb = ["dep:chdb-rust"]
 
 [dev-dependencies]
+duckdb-oracle = { path = "../duckdb-oracle" }
 # getrusage for the `wide_column_point_lookup` bench, and the allocators it can run under: the
 # two `spiced` can be built with (`snmalloc-rs` is its default).
 libc = "0.2"

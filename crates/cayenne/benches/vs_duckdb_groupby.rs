@@ -6,7 +6,7 @@
 //
 //     https://www.apache.org/licenses/LICENSE-2.0
 
-//! GROUP BY aggregation throughput: Cayenne vs DuckDB.
+//! GROUP BY aggregation throughput: Cayenne vs `DuckDB`.
 //!
 //! Aggregation kernels are sensitive to group cardinality: low-cardinality
 //! groups stay in CPU caches and stress hash-aggregate intrinsics;
@@ -17,7 +17,7 @@
 //!
 //! Lanes:
 //! - `cayenne`       — Cayenne with the SQLite metastore
-//! - `duckdb`        — DuckDB file-mode
+//! - `duckdb`        — `DuckDB` file-mode
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::cast_possible_wrap)]

@@ -110,6 +110,10 @@ jobs:
       - name: Display spiced commit
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
 
+      # testoperator generates and checks its data with the DuckDB library installed on the host.
+      - name: Set up libduckdb
+        uses: ./.github/actions/setup-libduckdb
+
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
         with:

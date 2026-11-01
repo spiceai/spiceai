@@ -6,17 +6,17 @@
 //
 //     https://www.apache.org/licenses/LICENSE-2.0
 
-//! Scan + aggregate throughput: Cayenne vs DuckDB.
+//! Scan + aggregate throughput: Cayenne vs `DuckDB`.
 //!
 //! Each table is loaded once with a deterministic dataset (outside the
 //! timed region) and then exercised with three representative read
 //! shapes:
 //! * `count_star`  — `SELECT COUNT(*) FROM t`. Pure cardinality.
 //! * `sum_value`   — `SELECT SUM(value) FROM t`. Numeric column scan +
-//!                    aggregate; exercises decompression and SIMD paths.
+//!   aggregate; exercises decompression and SIMD paths.
 //! * `filter_sum`  — `SELECT SUM(value) FROM t WHERE id BETWEEN ? AND ?`.
-//!                    Exercises filter pushdown and predicate evaluation
-//!                    in both engines.
+//!   Exercises filter pushdown and predicate evaluation
+//!   in both engines.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::cast_possible_wrap)]
@@ -304,12 +304,12 @@ fn bench_scan(c: &mut Criterion) {
 }
 
 /// Run one whole-table aggregate shape across every Cayenne lane (cold +
-/// `cayenne_warm`) and DuckDB. Uses `duckdb_exec` so any result shape — a
+/// `cayenne_warm`) and `DuckDB`. Uses `duckdb_exec` so any result shape — a
 /// `Float64` `AVG` scalar or a multi-column rollup — is handled, unlike the
 /// `i64`-typed [`duckdb_query_scalar`] used by the hand-written scalar shapes
-/// above. The Cayenne and DuckDB SQL differ only in table name (`t` vs
+/// above. The Cayenne and `DuckDB` SQL differ only in table name (`t` vs
 /// `scan_bench`).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn bench_metadata_shape(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     rt: &Runtime,

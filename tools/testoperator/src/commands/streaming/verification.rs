@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use duckdb::Connection;
+use duckdb_oracle::Connection;
 use test_framework::TestType;
 use test_framework::anyhow::{Context, Result};
 use test_framework::execution::FlightExecutor;
@@ -236,22 +236,12 @@ fn generate_expected_results(
     for query in queries {
         let sql = query.to_sql_with_inlined_params();
 
-        match conn.prepare(&sql) {
-            Ok(mut stmt) => match stmt.query_arrow([]) {
-                Ok(arrow_result) => {
-                    let batches: Vec<RecordBatch> = arrow_result.collect();
-                    let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
-                    println!("  {}: {row_count} rows", query.name);
-                    validation_data.insert(Arc::clone(&query.name), batches);
-                }
-                Err(e) => {
-                    eprintln!("  Warning: Failed to execute {}: {e}", query.name);
-                }
-            },
-            Err(e) => {
-                eprintln!("  Warning: Failed to prepare {}: {e}", query.name);
-            }
-        }
+        let batches = conn
+            .query(&sql)
+            .with_context(|| format!("Failed to generate oracle results for {}", query.name))?;
+        let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        println!("  {}: {row_count} rows", query.name);
+        validation_data.insert(Arc::clone(&query.name), batches);
     }
 
     Ok(validation_data)
