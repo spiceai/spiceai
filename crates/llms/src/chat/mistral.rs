@@ -681,8 +681,9 @@ impl MistralLlama {
     }
 
     /// `req`'s messages as the chat template reads them: [`message_to_mistral`]'s, fitted to
-    /// the template by [`ContentSupport::rewrite`].
-    fn template_messages(
+    /// the template by [`ContentSupport::rewrite`]. Public for tests.
+    #[doc(hidden)]
+    pub fn template_messages(
         &self,
         req: &CreateChatCompletionRequest,
     ) -> Result<Vec<IndexMap<String, MessageContent>>, OpenAIError> {

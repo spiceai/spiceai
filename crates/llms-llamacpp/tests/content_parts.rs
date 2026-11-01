@@ -28,7 +28,7 @@ use llms::chat::{Chat, LocalModelOptions, ReasoningDefault};
 use llms_llamacpp::LlamaCpp;
 use serde_json::{Value, json};
 
-use crate::{mtp::qwen35_gguf, qwen3_gguf, request};
+use crate::{mtp::qwen35_gguf, prefix_reuse::gemma_gguf, qwen3_gguf, request};
 
 const A: &str = "The secret word is PLUM.";
 const B: &str = "Be brief.";
@@ -188,6 +188,17 @@ async fn qwen3_renders_text_parts_joined_with_newlines() {
         model.render_prompt(user).expect("the user message renders"),
         "<|im_start|>user\nThe secret word is PLUM.\nBe brief.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     );
+}
+
+/// Gemma 3's chat template reads every part of a user or assistant message but only the first
+/// part of a system message, so a system message's parts reach it joined with newlines and keep
+/// all their text. llama-server, which probes a user message alone, sends the system message's
+/// parts as they are, and its prompt holds only the first.
+#[tokio::test]
+async fn gemma_3_gets_a_system_message_s_parts_joined() {
+    let model = load(&gemma_gguf().await, "gemma-3").await;
+    assert_parts_render_as(&model, &["system"], &[A, B], &format!("{A}\n{B}"));
+    assert_parts_render_as(&model, &["user", "assistant"], &[A, B], &format!("{A}{B}"));
 }
 
 /// Qwen3-0.6B with the chat template in `file` (a `.jinja` file or a `tokenizer_config.json`),

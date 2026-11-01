@@ -127,8 +127,9 @@ async fn prompt_tokens(model: &dyn Chat, messages: Value) -> u32 {
 }
 
 /// A message's text parts reach either engine's chat template as llama-server gives them:
-/// Qwen3-0.6B's reads only strings, so as the parts' text joined with newlines. Each engine's
-/// prompt for the parts is as long as its prompt for the joined text, and as the other's.
+/// Qwen3-0.6B's reads only strings, so as the parts' text joined with newlines. mistral.rs sends
+/// its template the same messages for the parts as for the joined text, and each engine's prompt
+/// for the parts is as long as its prompt for the joined text, and as the other's.
 #[tokio::test]
 async fn both_engines_read_text_parts_as_their_joined_text() {
     let (llama, mistral) = both_engines().await;
@@ -138,11 +139,25 @@ async fn both_engines_read_text_parts_as_their_joined_text() {
     ]);
     let joined = json!("The secret word is PLUM.\nBe brief.");
     let hi = json!({ "role": "user", "content": "hi" });
-    for role in ["system", "user"] {
+    for role in ["system", "user", "assistant"] {
         let conversation = |content: &Value| match role {
             "system" => json!([{ "role": "system", "content": content }, hi]),
+            "assistant" => json!([hi, { "role": "assistant", "content": content }, hi]),
             _ => json!([{ "role": "user", "content": content }]),
         };
+        let sent = |content: &Value| {
+            mistral
+                .template_messages(&request(json!({
+                    "model": "qwen3",
+                    "messages": conversation(content),
+                })))
+                .unwrap_or_else(|e| panic!("mistral.rs takes the {role} message: {e}"))
+        };
+        assert_eq!(
+            sent(&parts),
+            sent(&joined),
+            "mistral.rs sends a {role} message of text parts as its joined text"
+        );
         let from_llama = prompt_tokens(&*llama, conversation(&joined)).await;
         let from_mistral = prompt_tokens(&mistral, conversation(&joined)).await;
         assert_eq!(
