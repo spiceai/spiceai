@@ -635,11 +635,12 @@ commit, each participant's records written by its own head CAS:
    under the generation the intent names. A takeover fences it, so no other
    process ever prepares the transaction.
 3. **Decide** by create-if-absent of `transactions/<id>/decision`: `commit`
-   from the coordinator, or `abort` from anyone after the deadline, or once
+   from the coordinator, or `abort` from the coordinator when its deadline
+   passes with no commit recorded, from anyone after the deadline, or once
    every participant's head lease is past the one the intent names (no
    `Prepare` can land any more). Exactly one outcome. Clock skew moves only
-   when an abort can happen, and the deadline bounds how long a dead
-   coordinator holds a reservation.
+   when an abort can happen, and the deadline bounds how long a coordinator,
+   live or dead, holds a reservation.
 4. **Resolve:** a record on each participant, by the coordinator or any process
    that finds the decision.
 5. **Remove the records**, intent first, then decision. The coordinator removes
@@ -653,6 +654,41 @@ commit, each participant's records written by its own head CAS:
 
 The critical path is 4 round trips to the decision and 5 to both `Resolve`s
 (counted, not measured). This path is rare.
+
+**The coordinator's answer.** `COMMIT` answers within the deadline plus a few
+attempts to record an abort, whatever storage does:
+
+- The coordinator retries recording its commit until the deadline, an internal
+  constant (60 s in the prototype), not a setting. Then it records an abort
+  instead. An attempt still in flight at the deadline is abandoned. If it lands
+  later, the recorded abort refuses it. If it lands after the records are
+  removed, it is a decision with no intent, which nothing applies.
+- It reports the decision it reads while the intent exists. The intent is
+  written once, before any decision, and removed before the decision. So a
+  decision read before the intent is seen is the transaction's only one. A
+  decision read once the intent is gone may have been created after the
+  removal. Without this check, a coordinator whose delayed commit lands after
+  another process aborted the transaction, resolved it and removed its records
+  reports a commit that never happened (model control
+  `transactions-txn-no-intent-check-1-exhaust`).
+- The answers are:
+  - *committed*;
+  - *aborted*: an abort is recorded, or the coordinator never tried to commit,
+    since only it records a commit;
+  - *outcome unknown*: storage confirmed no decision in time, or another
+    process finished the transaction. The error names the transaction and tells
+    the client to check whether its changes are visible before retrying.
+- An unknown outcome leaves the participants prepared. The process keeps their
+  reservations, so other changes to those datasets wait rather than fail. Once
+  storage answers, it finishes the transaction in the background: it records
+  an abort unless a decision exists, resolves each participant, and removes the
+  records. A `Resolve` that fails stops the dataset until a restart applies it,
+  like any uncertain commit, and the recorded outcome stands.
+- **Follow-up, not planned:** a lookup of a transaction's outcome by id, for
+  the case the data cannot answer: a blind update such as
+  `balance = balance - 30` that the client cannot safely retry. It needs
+  decisions kept for a retention window after the records are removed. See
+  [Future work](object-native-metastore.md#future-work-not-planned).
 
 - **Visibility changes only through the head.** Prepared actions become visible
   only at the `Resolve` record, and readers never consult the decision object, so
@@ -700,7 +736,7 @@ in one partition, and recovery that drains pending intents before ingesting
 again. Another writer on the same keys breaks it, which is the case two-phase
 commit serves (model: `intent-roll-forward*`, `intent-roll-forward-partitioned*`).
 
-Model: `transactions-txn*`, `transactions-three-participants*`, `window-txn*`, `concurrent-txn-overlap*`, `concurrent-txn-disjoint*`, `dataset-prepare-*`, `transactions-txn-no-reservation-0-exhaust`, `transactions-txn-no-roots-0-exhaust`, `transactions-txn-no-fence-check-0-exhaust`, `transactions-txn-no-prepared-check-1-exhaust`, `transactions-txn-no-coordinator-wait-0-exhaust`, `transactions-txn-no-matching-0-exhaust`, `transactions-txn-no-create-once-0-exhaust`, `transactions-txn-no-reader-log-0-exhaust`.
+Model: `transactions-txn*`, `transactions-three-participants*`, `window-txn*`, `concurrent-txn-overlap*`, `concurrent-txn-disjoint*`, `dataset-prepare-*`, `transactions-txn-no-reservation-0-exhaust`, `transactions-txn-no-roots-0-exhaust`, `transactions-txn-no-fence-check-0-exhaust`, `transactions-txn-no-prepared-check-1-exhaust`, `transactions-txn-no-coordinator-wait-0-exhaust`, `transactions-txn-no-intent-check-1-exhaust`, `transactions-txn-no-matching-0-exhaust`, `transactions-txn-no-create-once-0-exhaust`, `transactions-txn-no-reader-log-0-exhaust`.
 
 ### Source positions and backfill
 
