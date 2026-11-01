@@ -1,0 +1,20 @@
+{
+  "flight-auth-handshake-limit": [
+    {
+      "run": "flight-auth-handshake-limit",
+      "who": "default",
+      "key": "load: {\"clients\":8,\"count\":11000,\"queries\":[\"SELECT count(*) AS n, sum(amount) AS total FROM orders\"]}",
+      "kind": "other",
+      "signature": "load query 1 failed: Query execution failed. Invalid credentials: Invalid credentials",
+      "group": "flight-auth"
+    },
+    {
+      "run": "flight-auth-handshake-limit",
+      "who": "default",
+      "key": "query: SELECT count(*) AS n FROM orders",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Invalid credentials: Invalid credentials",
+      "group": "flight-auth"
+    }
+  ]
+}

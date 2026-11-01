@@ -132,6 +132,8 @@
   "search-hybrid": 6,
   "served-while-source-down": 48,
   "settings-evolution": 54,
+  "sidecar-cluster": 129,
+  "sidecar-substrait-field-metadata": 3,
   "slow-refresh-warning": 52,
   "slt-strings": 8,
   "source-down-at-start": 36,

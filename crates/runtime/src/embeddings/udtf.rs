@@ -67,7 +67,7 @@ use std::{
 };
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
-use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
+use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields, provider::UdtfSource};
 use snafu::ResultExt;
 
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
@@ -82,9 +82,8 @@ use runtime_search::{
 
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
 use {
-    crate::search::util::find_index_in_table_provider,
-    search::index::SearchIndex,
-    search::provider::{SearchQueryProvider, UdtfSource},
+    crate::search::util::find_index_in_table_provider, search::index::SearchIndex,
+    search::provider::SearchQueryProvider,
 };
 
 #[cfg(feature = "elasticsearch")]
@@ -546,16 +545,32 @@ impl TableFunctionImpl for VectorSearchTableFunc {
         }
 
         // If an embedding column is defined, fallback to JIT or.
-        let embedding_table_provider = spice_table::find_layer::<EmbeddingTable>(
+        let Some(embedding_table_provider) = spice_table::find_layer::<EmbeddingTable>(
             table_provider.as_ref(),
             spice_table::LayerWalk::Read,
-        )
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!(
+        ) else {
+            // A sidecar's Spice table is searched by the upstream that holds its
+            // embeddings. One call carries one query.
+            if args.queries.len() <= 1
+                && let Some(delegated) = runtime_search::delegated::delegated_search(
+                    table_provider.as_ref(),
+                    &UdtfSource::VectorSearch {
+                        table: args.tbl.to_string(),
+                        query: args.query.clone(),
+                        column: args.column.clone(),
+                        limit: args.limit,
+                        include_score: args.include_score,
+                        distance_metric: args.distance_metric.map(|m| m.as_str().to_string()),
+                    },
+                )
+            {
+                return Ok(delegated);
+            }
+            return Err(DataFusionError::Plan(format!(
                 "Table '{}' does not have an embedding index.",
-                args.tbl.clone()
-            ))
-        })?;
+                args.tbl
+            )));
+        };
 
         let (col, _) = args.get_column_and_config(&embedding_table_provider.embedded_columns)?;
         // Both chunked-scalar and multi-vector (list-typed) columns use

@@ -1,0 +1,134 @@
+name: sidecar-cluster
+description: >
+  An application sidecar (`spiced --role sidecar`) in front of a Spice
+  upstream (a server, or with --cluster a scheduler and its executor)
+  accelerating PostgreSQL answers point, aggregate, join, top-k and NULL
+  queries as PostgreSQL does, sending each remote fragment upstream as
+  Substrait; keeps every answer right from 128 concurrent clients; and when
+  the upstream loses its executor (--cluster) or is killed and restarted
+  (otherwise) under load, fails queries only until it recovers, and never
+  answers wrong.
+
+sources:
+  src: { kind: postgres }
+
+# The upstream: PostgreSQL tables accelerated into Cayenne, which --cluster
+# partitions across the executors. It requires no API key: an API-key
+# upstream refuses every query after its 10,000th handshake
+# (known-failing/flight-auth/flight-auth-handshake-limit.yaml), and the load
+# below sends many more.
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: sidecar-cluster-upstream
+  datasets:
+    - from: 'postgres:public.orders'
+      name: orders
+      params: '${sources.src.params}'
+      acceleration: { enabled: true, engine: cayenne, mode: file, primary_key: id }
+    - from: 'postgres:public.customers'
+      name: customers
+      params: '${sources.src.params}'
+      acceleration: { enabled: true, engine: cayenne, mode: file, primary_key: id }
+
+# The application's sidecar reads the upstream's datasets over Flight with no
+# key, as the upstream requires none; the runner keeps SPICEAI_API_KEY out of
+# its environment and dotenv files, so none is picked up from there either.
+sidecar:
+  spicepod:
+    version: v1
+    kind: Spicepod
+    name: sidecar-cluster-app
+    datasets:
+      - from: spice.ai:orders
+        name: orders
+        params: { spiceai_endpoint: 'http://127.0.0.1:${instance.flight_port}' }
+      - from: spice.ai:customers
+        name: customers
+        params: { spiceai_endpoint: 'http://127.0.0.1:${instance.flight_port}' }
+
+defaults:
+  expect: { oracle: src }
+  # 128 clients would slow the scripts beside this one, and theirs its
+  # recovery from the faults.
+  exclusive: true
+
+steps:
+  - generate:
+      src:
+        table: customers
+        rows: 300
+        seed: 11
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: name, text: [4, 16] }
+          - { name: region, choice: [north, south, east, west], nulls: 0.1 }
+          - { name: tier, int: [1, 3], nulls: 0.2 }
+  - generate:
+      src:
+        table: orders
+        rows: 5000
+        seed: 12
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          # Some orders have no customer, and some name one that does not exist.
+          - { name: customer_id, int: [1, 320], nulls: 0.05 }
+          - { name: amount, decimal: { range: [0, 1000], scale: 2 } }
+          - { name: status, choice: [open, shipped, returned] }
+          - { name: placed, date: ['2024-01-01', '2024-12-31'] }
+  - start: {}
+
+  # The sidecar runs as one, and plans each read of the upstream as Substrait;
+  # the upstream itself federates to PostgreSQL.
+  - assert-log: { contains: 'Starting as a sidecar' }
+  - assert-log: { lacks: 'Starting as a sidecar' }
+    on: upstream
+  - explain: SELECT id, amount FROM orders WHERE id = 1234
+    contains: SubstraitExec
+  - explain: SELECT c.region, count(*) AS n FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.region
+    contains: SubstraitExec
+  - explain: SELECT id, amount FROM orders WHERE id = 1234
+    on: upstream
+    omits: SubstraitExec
+  # In a cluster the scheduler reads the acceleration from its executor, so
+  # losing the executor below is felt.
+  - explain: SELECT status, count(*) AS n FROM orders GROUP BY status
+    on: upstream
+    cluster: true
+    contains: FlightSqlExec
+
+  # Every answer through the sidecar is PostgreSQL's.
+  - corpus: corpus/sidecar.sql
+  # The upstream answered directly is an oracle too.
+  - query: SELECT status, count(*) AS n, sum(amount) AS total FROM orders GROUP BY status
+    on: upstream
+    id: upstream-by-status
+  - query: SELECT status, count(*) AS n, sum(amount) AS total FROM orders GROUP BY status
+    expect: { same-as: upstream-by-status }
+
+  # Sustained load: every answer from every client is PostgreSQL's.
+  - load:
+      corpus: corpus/sidecar.sql
+      clients: 128
+      duration: 30s
+      query-timeout: 30s
+
+  # Faults under load: the upstream loses its only executor, which comes
+  # back five seconds later (--cluster), or is killed and restarted. Queries
+  # may fail from the fault until 30 s after it ends; never wrong, and every
+  # query after that window must answer.
+  - load:
+      corpus: corpus/sidecar.sql
+      clients: 32
+      duration: 75s
+      query-timeout: 20s
+      recover-within: 30s
+      faults:
+        - { at: 10s, kill-executor: 0, cluster: true }
+        - { at: 15s, start-executors: {}, cluster: true }
+        - { at: 10s, restart: { kill: KILL }, cluster: false }
+
+  # And one at a time again, after the faults.
+  - corpus: corpus/sidecar.sql

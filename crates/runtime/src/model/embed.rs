@@ -253,7 +253,50 @@ pub async fn try_to_embedding(
         EmbeddingPrefix::Model2Vec => Err(EmbedError::UnknownModelSource {
             from: "model2vec".to_string(),
         }),
+        EmbeddingPrefix::SpiceAi => {
+            let typed = embedding_params::spiceai::SpiceAiEmbeddingParams::try_from_params_with_secret_sources(
+                &component_name,
+                params,
+                &secrets,
+                &secret_sources,
+            )
+            .await
+            .map_err(params_err)?;
+            spiceai(model_id, &typed, embeddings_cache.clone())
+        }
     }
+}
+
+/// An embedding model served by the Spice.ai Cloud Platform, or by another Spice runtime, such as
+/// the cluster an application sidecar reads from. Both serve the `OpenAI`-compatible
+/// `/v1/embeddings`, so the model is driven through the same client as `from: spiceai` chat
+/// models.
+fn spiceai(
+    model_id: Option<String>,
+    params: &embedding_params::spiceai::SpiceAiEmbeddingParams,
+    embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
+) -> Result<Arc<dyn Embed>, EmbedError> {
+    let Some(model_id) = model_id else {
+        return Err(EmbedError::ModelNotProvided {
+            model_source: "spiceai".to_string(),
+        });
+    };
+    let endpoint = params.endpoint.as_str();
+    let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
+    // A self-hosted Spice runtime may not require authentication, but the Spice.ai Cloud Platform
+    // always does, so an unset key there is a misconfiguration.
+    if api_key.is_none() && llms::spiceai::is_cloud_platform(Some(endpoint)) {
+        return Err(EmbedError::FailedToInstantiateEmbeddingModel {
+            source: "Missing `spiceai_api_key`. Embedding models served by the Spice.ai Cloud Platform require an API key. Set `spiceai_api_key`, or set `spiceai_endpoint` to the Spice runtime serving the model. See: https://spiceai.org/docs/components/embeddings".into(),
+        });
+    }
+    Ok(Arc::new(
+        OpenaiEmbed::new(
+            llms::spiceai::new_spiceai_client(model_id, Some(endpoint), api_key),
+            None,
+        )
+        .set_cache(embeddings_cache),
+    ))
 }
 
 #[cfg(feature = "models")]

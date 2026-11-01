@@ -322,9 +322,55 @@ mod tests {
 }
 pub mod schema_evolution;
 
-/// Which role this runtime plays in a cluster deployment. Parsed from the CLI, so
-/// it carries clap's `ValueEnum`.
-#[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum)]
+/// The role a `spiced` process runs as, selected once at startup with `--role`.
+/// A Spicepod reload cannot change it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum Role {
+    /// The default: serves queries over its own datasets.
+    #[default]
+    Server,
+    /// Serves an application's queries beside it, and sends reads from a
+    /// remote Spice runtime as Substrait plans created locally.
+    Sidecar,
+    /// Plans distributed queries and assigns their tasks to executors.
+    Scheduler,
+    /// Joins a scheduler's cluster and runs the tasks it assigns. Implied by
+    /// `--scheduler-address`.
+    Executor,
+}
+
+impl Role {
+    /// The role's cluster membership: `None` for a server or sidecar, which
+    /// do not join a cluster.
+    #[must_use]
+    pub const fn cluster_role(self) -> Option<ClusterRole> {
+        match self {
+            Self::Server | Self::Sidecar => None,
+            Self::Scheduler => Some(ClusterRole::Scheduler),
+            Self::Executor => Some(ClusterRole::Executor),
+        }
+    }
+
+    /// The role as `--role` spells it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Sidecar => "sidecar",
+            Self::Scheduler => "scheduler",
+            Self::Executor => "executor",
+        }
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The part of a [`Role`] that joins a cluster: a scheduler or an executor.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClusterRole {
     Scheduler,
     Executor,

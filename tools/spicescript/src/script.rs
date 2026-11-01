@@ -50,6 +50,12 @@ pub struct Script {
     pub variants: IndexMap<String, VariantSpec>,
     /// The spicepod, as YAML, with `${…}` placeholders.
     pub spicepod: Value,
+    /// An application sidecar beside every instance: a second `spiced`, run
+    /// with `--role sidecar` on its own spicepod, whose datasets read the
+    /// instance (the *upstream*). Steps reach it unless they say
+    /// `on: upstream`.
+    #[serde(default)]
+    pub sidecar: Option<SidecarSpec>,
     #[serde(default)]
     pub defaults: Defaults,
     #[serde(skip)]
@@ -147,6 +153,38 @@ pub struct SourceSpec {
     /// either way.
     #[serde(default)]
     pub host_network: bool,
+}
+
+/// `sidecar:`: the application sidecar each instance runs beside it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct SidecarSpec {
+    /// The sidecar's spicepod, with the placeholders the instance's takes;
+    /// `${instance.flight_port}` is the port the upstream serves Flight on.
+    pub spicepod: Value,
+    /// Arguments after `--role sidecar`, each placeholder rendered as text.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// The sidecar's environment. `SPICEAI_API_KEY` is removed from what it
+    /// inherits unless set here, and no `.env` or `.env.local` above its
+    /// directory is read, so a `spice.ai:` dataset authenticates with the key
+    /// its spicepod names and no other.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// The API key the sidecar requires, which the runner presents to it;
+    /// none by default, whatever `defaults.api-key` says of the upstream.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+/// Which `spiced` of an instance with a sidecar a step reaches (`on:`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tier {
+    /// The application sidecar.
+    Sidecar,
+    /// The instance's own `spiced`: a server, or a cluster's scheduler.
+    Upstream,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -336,6 +374,12 @@ pub struct Step {
     pub except: Vec<String>,
     /// Run the step only in matrix combinations with these values.
     pub when: Map<String, Value>,
+    /// Run the step only when the instance runs as a cluster (`true`: it
+    /// has executors) or only when it does not (`false`).
+    pub cluster: Option<bool>,
+    /// With a `sidecar:`, which `spiced` the step reaches; unset, the one
+    /// [`Action::default_tier`] names.
+    pub on: Option<Tier>,
     /// For a query from a `corpus`, the position of that corpus in the
     /// script's steps: its queries share one `eventually` limit, counted from
     /// when the first of them starts, rather than taking one each.
@@ -498,7 +542,91 @@ pub enum Action {
     WaitMetric(MetricWait),
     /// Keep a `/metrics` scrape to measure later changes from.
     MarkMetrics(String),
+    /// Queries from many clients at once, every answer checked, with faults
+    /// applied while they run.
+    Load(LoadStep),
     Sleep(Duration),
+}
+
+impl Action {
+    /// Whether the step starts, stops or waits on processes: on an
+    /// instance with a sidecar these reach the upstream unless they say
+    /// `on: sidecar`, and every other step reaches the sidecar.
+    pub fn is_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Self::Start { .. }
+                | Self::Stop
+                | Self::Kill { .. }
+                | Self::Restart { .. }
+                | Self::WaitReady { .. }
+                | Self::KillExecutor(_)
+                | Self::StartExecutors
+                | Self::AddExecutor
+                | Self::EditSpicepod(_)
+        )
+    }
+
+    /// The `spiced` a step reaches on an instance with a sidecar when it
+    /// names none: the application talks to the sidecar, and processes are
+    /// started and stopped from the upstream.
+    pub fn default_tier(&self) -> Tier {
+        if self.is_lifecycle() {
+            Tier::Upstream
+        } else {
+            Tier::Sidecar
+        }
+    }
+}
+
+/// `load`: queries from `clients` concurrent clients until `end`, every
+/// answer compared with its expected one, and `faults` run at their offsets
+/// while the load goes on.
+#[derive(Debug, Clone)]
+pub struct LoadStep {
+    pub queries: Vec<LoadQuery>,
+    /// The corpus file the queries came from, for reports.
+    pub corpus: Option<String>,
+    pub clients: usize,
+    pub end: LoadEnd,
+    /// The expectation of every query that names none; default
+    /// `defaults.expect`.
+    pub expect: Option<Expect>,
+    /// How long one query may take before it counts as failed; default
+    /// `defaults.query-timeout`, else 120 s.
+    pub query_timeout: Option<Duration>,
+    /// Steps run while the load goes on, in order of their offsets.
+    pub faults: Vec<Fault>,
+    /// How long after each fault ends errors are still allowed.
+    pub recover_within: Option<Duration>,
+    pub min_qps: Option<f64>,
+    pub max_p99: Option<Duration>,
+    pub max_p999: Option<Duration>,
+}
+
+/// One query of a load, with what its answers must be.
+#[derive(Debug, Clone)]
+pub struct LoadQuery {
+    pub sql: String,
+    pub oracle_sql: Option<String>,
+    pub expect: Option<Expect>,
+    pub expect_empty: bool,
+}
+
+/// When a load stops starting queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadEnd {
+    /// After this long.
+    Duration(Duration),
+    /// After this many queries, across all clients.
+    Count(u64),
+}
+
+/// A step a load runs `at` this long after it started.
+#[derive(Debug, Clone)]
+pub struct Fault {
+    pub at: Duration,
+    pub step: Step,
 }
 
 #[derive(Debug, Clone)]
@@ -960,7 +1088,7 @@ impl Script {
                         }),
                 );
             } else {
-                expanded.push(parse_step(0, step).with_context(context)?);
+                expanded.push(parse_step(0, step, base).with_context(context)?);
             }
         }
         // Number after expanding, so a corpus's queries report and compare
@@ -968,6 +1096,12 @@ impl Script {
         let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for (i, step) in expanded.iter_mut().enumerate() {
             step.index = i + 1;
+            // A fault reports as part of its load.
+            if let Action::Load(load) = &mut step.action {
+                for fault in &mut load.faults {
+                    fault.step.index = i + 1;
+                }
+            }
             let n = seen.entry(step.key.clone()).or_default();
             *n += 1;
             if *n > 1 {
@@ -999,8 +1133,47 @@ impl Script {
                 }
             }
         }
+        if let Some(sidecar) = &script.sidecar {
+            ensure!(
+                !sidecar
+                    .args
+                    .iter()
+                    .any(|a| a == "--role" || a.starts_with("--role=")),
+                "`sidecar.args` cannot choose a `--role`: the sidecar runs with `--role sidecar`"
+            );
+        }
         let mut ids = std::collections::BTreeSet::new();
-        for step in &script.steps {
+        // A load's faults are steps too, checked as the steps around them.
+        let nested: Vec<&Step> = script
+            .steps
+            .iter()
+            .flat_map(|step| {
+                let faults = match &step.action {
+                    Action::Load(load) => load.faults.iter().map(|f| &f.step).collect(),
+                    _ => Vec::new(),
+                };
+                std::iter::once(step).chain(faults)
+            })
+            .collect();
+        for step in nested {
+            if step.on.is_some() && script.sidecar.is_none() {
+                bail!(
+                    "step {} says `on:`, which chooses between an instance and its sidecar, but the script declares no `sidecar:`",
+                    step.index
+                );
+            }
+            if let Action::Load(load) = &step.action {
+                for q in &load.queries {
+                    if let Some(target) = q.expect.as_ref().and_then(|e| e.same_as.as_ref())
+                        && !ids.contains(target)
+                    {
+                        bail!(
+                            "step {} expects `same-as: {target}`, but no earlier query has that id",
+                            step.index
+                        );
+                    }
+                }
+            }
             if let Action::Query(q) = &step.action {
                 if let Some(target) = q.expect.as_ref().and_then(|e| e.same_as.as_ref())
                     && !ids.contains(target)
@@ -1199,6 +1372,25 @@ fn avoid_list(names: &[String]) -> Result<crate::tlp::Avoid> {
 /// every query.
 fn expand_corpus(corpus: &Value, step: &Value, base: &Path) -> Result<Vec<Step>> {
     let file = corpus.as_str().context("`corpus` takes a file path")?;
+    let (path, text) = corpus_text(base, file)?;
+    let Value::Object(template) = step else {
+        bail!("a step must be a mapping");
+    };
+    let mut steps = Vec::new();
+    for statement in corpus_statements(&text, &path)? {
+        let mut query = template.clone();
+        query.remove("corpus");
+        query.extend(statement);
+        steps.push(
+            parse_step(0, Value::Object(query), base)
+                .with_context(|| format!("in corpus {}", path.display()))?,
+        );
+    }
+    Ok(steps)
+}
+
+/// The text of the corpus `file` names, relative to `base`, and its path.
+fn corpus_text(base: &Path, file: &str) -> Result<(std::path::PathBuf, String)> {
     let mut path = base.join(file);
     // A directory, or `dir/prefix*suffix`, is a corpus of one statement per
     // matching `.sql` file, in file-name order (as testoperator's query sets
@@ -1235,13 +1427,15 @@ fn expand_corpus(corpus: &Value, step: &Value, base: &Path) -> Result<Vec<Step>>
         std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read corpus {}", path.display()))?
     };
-    let Value::Object(template) = step else {
-        bail!("a step must be a mapping");
-    };
-    let mut steps = Vec::new();
+    Ok((path, text))
+}
+
+/// Each statement of a corpus's text as the keys of a `query` step: `query`
+/// and the options its comments give it.
+fn corpus_statements(text: &str, path: &Path) -> Result<Vec<Map<String, Value>>> {
+    let mut statements = Vec::new();
     let mut sql = String::new();
     let mut directives = Map::new();
-    let template = template.clone();
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(comment) = trimmed.strip_prefix("--") {
@@ -1310,14 +1504,10 @@ fn expand_corpus(corpus: &Value, step: &Value, base: &Path) -> Result<Vec<Step>>
         sql.push('\n');
         if trimmed.ends_with(';') {
             let statement = sql.trim().trim_end_matches(';').trim().to_string();
-            let mut query = template.clone();
-            query.remove("corpus");
+            let mut query = Map::new();
             query.insert("query".into(), Value::String(statement));
             query.extend(std::mem::take(&mut directives));
-            steps.push(
-                parse_step(0, Value::Object(query))
-                    .with_context(|| format!("in corpus {}", path.display()))?,
-            );
+            statements.push(query);
             sql.clear();
         }
     }
@@ -1327,11 +1517,11 @@ fn expand_corpus(corpus: &Value, step: &Value, base: &Path) -> Result<Vec<Step>>
         path.display()
     );
     ensure!(
-        !steps.is_empty(),
+        !statements.is_empty(),
         "corpus {} has no statements",
         path.display()
     );
-    Ok(steps)
+    Ok(statements)
 }
 
 const ACTIONS: &[&str] = &[
@@ -1374,7 +1564,48 @@ const ACTIONS: &[&str] = &[
     "wait-metric",
     "mark-metrics",
     "generate",
+    "load",
     "sleep",
+];
+
+/// Steps that act on sources or the runner alone, so reach no `spiced` for
+/// `on:` to choose.
+const REACH_NO_SPICED: &[&str] = &[
+    "start-source",
+    "stop-source",
+    "pause-source",
+    "unpause-source",
+    "source-exec",
+    "write",
+    "generate",
+    "dbgen",
+    "source-query",
+    "assert-objects",
+    "sleep",
+];
+
+/// Steps that act on the upstream's processes or spicepod, which a sidecar
+/// has none of.
+const UPSTREAM_ONLY: &[&str] = &[
+    "upgrade",
+    "kill-executor",
+    "start-executors",
+    "add-executor",
+    "edit-spicepod",
+];
+
+/// What a load's `faults:` may run: steps that start, stop or wait on
+/// processes.
+const FAULT_ACTIONS: &[&str] = &[
+    "start",
+    "stop",
+    "kill-spiced",
+    "restart",
+    "upgrade",
+    "wait-ready",
+    "kill-executor",
+    "start-executors",
+    "add-executor",
 ];
 
 /// Replaces `source-exec: { <source>: { file: <path> } }` with the file's
@@ -1413,7 +1644,9 @@ fn step_key(name: &str, arg: &Value) -> String {
     )
 }
 
-fn parse_step(index: usize, step: Value) -> Result<Step> {
+/// Parses one step; files it names (a load's `corpus`) are relative to
+/// `base`.
+fn parse_step(index: usize, step: Value, base: &Path) -> Result<Step> {
     let Value::Object(mut map) = step else {
         bail!("a step must be a mapping with one action key");
     };
@@ -1442,6 +1675,21 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
         Some(Value::Object(m)) => m,
         Some(_) => bail!("`when` must map matrix keys to values"),
     };
+    let cluster = match map.remove("cluster") {
+        None => None,
+        Some(Value::Bool(b)) => Some(b),
+        Some(_) => bail!("`cluster` must be true (only in a cluster) or false (never in one)"),
+    };
+    let on: Option<Tier> = match map.remove("on") {
+        None => None,
+        Some(v) => Some(serde_json::from_value(v).context("`on` must be sidecar or upstream")?),
+    };
+    if on.is_some() && REACH_NO_SPICED.contains(&name) {
+        bail!("`on` chooses which `spiced` a step reaches, and `{name}` reaches none");
+    }
+    if on == Some(Tier::Sidecar) && UPSTREAM_ONLY.contains(&name) {
+        bail!("`{name}` acts on the upstream; it takes no `on: sidecar`");
+    }
     let mut opts = Opts(map);
     let action = match name {
         "start" => Action::Start {
@@ -2123,10 +2371,19 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
             })
         }
         "mark-metrics" => Action::MarkMetrics(string_arg(&arg, name)?),
+        "load" => Action::Load(parse_load(arg, base)?),
         "sleep" => Action::Sleep(parse_duration(&arg)?),
         _ => unreachable!("every name in ACTIONS is handled"),
     };
     opts.finish()?;
+    if on == Some(Tier::Sidecar)
+        && matches!(
+            action,
+            Action::Start { patch: Some(_), .. } | Action::Restart { patch: Some(_), .. }
+        )
+    {
+        bail!("`patch` changes the upstream's spicepod, so it takes no `on: sidecar`");
+    }
     Ok(Step {
         index,
         key,
@@ -2134,7 +2391,151 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
         only,
         except,
         when,
+        cluster,
+        on,
         corpus: None,
+    })
+}
+
+/// `load: { queries | corpus, clients, duration | count, expect,
+/// query-timeout, faults, recover-within, min-qps, max-p99, max-p999 }`.
+fn parse_load(arg: Value, base: &Path) -> Result<LoadStep> {
+    let mut inner = Opts::of_mapping(arg, "`load` takes a mapping with `queries` or `corpus`")?;
+    let listed: Option<Vec<Value>> = inner.parse(
+        "queries",
+        "`queries` is a list of SQL strings or mappings with `sql`",
+    )?;
+    let corpus = inner.string("corpus")?;
+    let entries: Vec<Map<String, Value>> = match (listed, &corpus) {
+        (Some(listed), None) => listed
+            .into_iter()
+            .map(|entry| match entry {
+                Value::String(sql) => Ok(Map::from_iter([("sql".to_string(), Value::String(sql))])),
+                Value::Object(m) => Ok(m),
+                other => bail!("a load query is SQL or a mapping with `sql`, not {other}"),
+            })
+            .collect::<Result<_>>()?,
+        (None, Some(file)) => {
+            let (path, text) = corpus_text(base, file)?;
+            corpus_statements(&text, &path)?
+                .into_iter()
+                .map(|mut statement| {
+                    if let Some(sql) = statement.remove("query") {
+                        statement.insert("sql".into(), sql);
+                    }
+                    statement
+                })
+                .collect()
+        }
+        _ => bail!("`load` takes one of `queries` or `corpus`"),
+    };
+    let queries = entries
+        .into_iter()
+        .enumerate()
+        .map(|(i, entry)| load_query(entry).with_context(|| format!("load query {}", i + 1)))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(!queries.is_empty(), "`load` needs at least one query");
+    let clients: usize = inner
+        .parse("clients", "`clients` must be a number")?
+        .unwrap_or(8);
+    ensure!(clients > 0, "`clients` must be at least 1");
+    let end = match (
+        inner.duration("duration")?,
+        inner.parse::<u64>("count", "`count` must be a number of queries")?,
+    ) {
+        (Some(d), None) if !d.is_zero() => LoadEnd::Duration(d),
+        (None, Some(n)) if n > 0 => LoadEnd::Count(n),
+        _ => bail!("`load` takes one of `duration` (longer than 0) or `count` (at least 1)"),
+    };
+    let expect = inner.parse("expect", "invalid `expect`")?;
+    let query_timeout = inner.duration("query-timeout")?;
+    let recover_within = inner.duration("recover-within")?;
+    let min_qps = inner.parse::<f64>("min-qps", "`min-qps` must be a number")?;
+    let max_p99 = inner.duration("max-p99")?;
+    let max_p999 = inner.duration("max-p999")?;
+    let faults = match inner.take("faults") {
+        None => Vec::new(),
+        Some(Value::Array(list)) => list
+            .into_iter()
+            .enumerate()
+            .map(|(i, fault)| parse_fault(fault, base).with_context(|| format!("fault {}", i + 1)))
+            .collect::<Result<Vec<_>>>()?,
+        Some(_) => bail!("`faults` is a list of steps, each with an `at`"),
+    };
+    inner.finish()?;
+    let mut faults = faults;
+    // Run in the order of their offsets; listed order breaks ties.
+    faults.sort_by_key(|f| f.at);
+    if !faults.is_empty() {
+        let LoadEnd::Duration(duration) = end else {
+            bail!("`faults` need a load with a `duration` to run within");
+        };
+        ensure!(
+            recover_within.is_some(),
+            "`faults` need `recover-within`: how long after each fault ends errors are still allowed"
+        );
+        if let Some(late) = faults.iter().find(|f| f.at >= duration) {
+            bail!(
+                "a fault at {:?} is not within the load's {duration:?}",
+                late.at
+            );
+        }
+    }
+    ensure!(
+        recover_within.is_none() || !faults.is_empty(),
+        "`recover-within` applies to `faults`, and the load has none"
+    );
+    Ok(LoadStep {
+        queries,
+        corpus,
+        clients,
+        end,
+        expect,
+        query_timeout,
+        faults,
+        recover_within,
+        min_qps,
+        max_p99,
+        max_p999,
+    })
+}
+
+/// One load query: `sql`, with the `oracle-sql`, `expect` and
+/// `expect-empty` a `query` step takes.
+fn load_query(entry: Map<String, Value>) -> Result<LoadQuery> {
+    let mut entry = Opts(entry);
+    let sql = entry.string("sql")?.context("a load query needs `sql`")?;
+    let query = LoadQuery {
+        sql,
+        oracle_sql: entry.string("oracle-sql")?,
+        expect: entry.parse("expect", "invalid `expect`")?,
+        expect_empty: entry.bool("expect-empty")?,
+    };
+    if let Some(key) = entry.0.keys().next() {
+        bail!(
+            "a load query takes `sql`, `oracle-sql`, `expect` and `expect-empty`, not `{key}`: every answer is checked the same way, so errors, plans and prepared statements belong in `query` steps"
+        );
+    }
+    Ok(query)
+}
+
+/// A fault: a step mapping with `at`, its offset from the load's start.
+fn parse_fault(fault: Value, base: &Path) -> Result<Fault> {
+    let Value::Object(mut map) = fault else {
+        bail!("a fault is a step mapping with an `at`");
+    };
+    let at = parse_duration(&map.remove("at").context("a fault needs `at`")?)?;
+    if let Some(name) = ACTIONS.iter().find(|a| map.contains_key(**a))
+        && !FAULT_ACTIONS.contains(name)
+    {
+        bail!(
+            "a fault runs one of {}, not `{name}`",
+            FAULT_ACTIONS.join(", ")
+        );
+    }
+    Ok(Fault {
+        at,
+        step: parse_step(0, Value::Object(map), base)?,
     })
 }
 
@@ -2624,6 +3025,240 @@ steps:
                 .expect_err("an invalid entry is refused");
             assert!(format!("{err:#}").contains(message), "{text}: {err:#}");
         }
+    }
+
+    #[test]
+    fn steps_choose_the_sidecar_or_the_upstream() {
+        let sidecar = "sidecar: { spicepod: {} }\n";
+        let script = Script::parse(&format!(
+            "name: s\nspicepod: {{}}\n{sidecar}steps:\n  - start: {{}}\n  - query: SELECT 1\n  - query: SELECT 1\n    on: upstream\n  - kill-spiced: {{}}\n    on: sidecar\n  - kill-executor: 0\n    cluster: true\n"
+        ))
+        .expect("script parses");
+        let on: Vec<Option<Tier>> = script.steps.iter().map(|s| s.on).collect();
+        assert_eq!(
+            on,
+            [None, None, Some(Tier::Upstream), Some(Tier::Sidecar), None]
+        );
+        let defaults: Vec<Tier> = script
+            .steps
+            .iter()
+            .map(|s| s.action.default_tier())
+            .collect();
+        assert_eq!(
+            defaults,
+            [
+                Tier::Upstream,
+                Tier::Sidecar,
+                Tier::Sidecar,
+                Tier::Upstream,
+                Tier::Upstream
+            ],
+            "lifecycle steps reach the upstream, the rest the sidecar"
+        );
+        assert_eq!(script.steps[4].cluster, Some(true));
+        assert_eq!(script.steps[1].cluster, None);
+        for (text, message) in [
+            (
+                "steps: [{ query: SELECT 1, on: upstream }]".to_string(),
+                "step 1 says `on:`, which chooses between an instance and its sidecar, but the script declares no `sidecar:`",
+            ),
+            (
+                format!("{sidecar}steps: [{{ kill-executor: 0, on: sidecar }}]"),
+                "`kill-executor` acts on the upstream; it takes no `on: sidecar`",
+            ),
+            (
+                format!("{sidecar}steps: [{{ source-exec: {{ src: 'SELECT 1' }}, on: sidecar }}]"),
+                "`on` chooses which `spiced` a step reaches, and `source-exec` reaches none",
+            ),
+            (
+                format!(
+                    "{sidecar}steps: [{{ start: {{ patch: {{ spicepod: {{ name: x }} }} }}, on: sidecar }}]"
+                ),
+                "`patch` changes the upstream's spicepod, so it takes no `on: sidecar`",
+            ),
+            (
+                format!("{sidecar}steps: [{{ query: SELECT 1, on: app }}]"),
+                "`on` must be sidecar or upstream",
+            ),
+            (
+                format!("{sidecar}steps: [{{ query: SELECT 1, cluster: yes }}]"),
+                "`cluster` must be true (only in a cluster) or false (never in one)",
+            ),
+            (
+                "sidecar: { spicepod: {}, args: [--role, server] }\nsteps: [{ start: {} }]"
+                    .to_string(),
+                "`sidecar.args` cannot choose a `--role`: the sidecar runs with `--role sidecar`",
+            ),
+        ] {
+            let err = Script::parse(&format!("name: s\nspicepod: {{}}\n{text}"))
+                .expect_err("an invalid script is refused");
+            assert!(format!("{err:#}").contains(message), "{text}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn a_load_takes_queries_or_a_corpus_and_faults_in_order() {
+        let script = Script::parse(
+            r"
+name: l
+spicepod: {}
+sidecar: { spicepod: {} }
+steps:
+  - start: {}
+  - load:
+      queries:
+        - SELECT 1 AS a
+        - { sql: SELECT 2 AS b, oracle-sql: SELECT 2 AS b FROM dual, expect: { rows: [['2']] }, expect-empty: false }
+      clients: 16
+      duration: 20s
+      query-timeout: 5s
+      recover-within: 10s
+      min-qps: 50
+      max-p99: 100ms
+      faults:
+        - { at: 12s, start-executors: {}, cluster: true }
+        - { at: 5s, kill-executor: 0, cluster: true }
+        - { at: 5s, restart: { kill: KILL }, cluster: false }
+",
+        )
+        .expect("script parses");
+        let Action::Load(load) = &script.steps[1].action else {
+            panic!("expected a load, got {:?}", script.steps[1].action);
+        };
+        let sqls: Vec<&str> = load.queries.iter().map(|q| q.sql.as_str()).collect();
+        assert_eq!(sqls, ["SELECT 1 AS a", "SELECT 2 AS b"]);
+        assert_eq!(
+            load.queries[1].oracle_sql.as_deref(),
+            Some("SELECT 2 AS b FROM dual")
+        );
+        assert!(load.queries[1].expect.is_some() && load.queries[0].expect.is_none());
+        assert_eq!(
+            (load.clients, load.end, load.query_timeout, load.min_qps),
+            (
+                16,
+                LoadEnd::Duration(Duration::from_secs(20)),
+                Some(Duration::from_secs(5)),
+                Some(50.0)
+            )
+        );
+        assert_eq!(load.max_p99, Some(Duration::from_millis(100)));
+        // In order of their offsets, the listed order breaking ties; each
+        // reports as the load's step.
+        let faults: Vec<(u64, String, Option<bool>, usize)> = load
+            .faults
+            .iter()
+            .map(|f| {
+                (
+                    f.at.as_secs(),
+                    f.step.key.clone(),
+                    f.step.cluster,
+                    f.step.index,
+                )
+            })
+            .collect();
+        assert_eq!(
+            faults,
+            [
+                (5, "kill-executor: 0".to_string(), Some(true), 2),
+                (5, r#"restart: {"kill":"KILL"}"#.to_string(), Some(false), 2),
+                (12, "start-executors: {}".to_string(), Some(true), 2),
+            ]
+        );
+
+        // A corpus gives one query per statement, with its `expect-empty`.
+        let suite = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/spicescript");
+        let script = Script::parse_in(
+            "name: c\nspicepod: {}\nsteps:\n  - load: { corpus: corpus/sidecar.sql, count: 100 }\n",
+            &suite,
+            &SharedVariants::default(),
+        )
+        .expect("script parses");
+        let Action::Load(load) = &script.steps[0].action else {
+            panic!("expected a load");
+        };
+        assert_eq!(load.corpus.as_deref(), Some("corpus/sidecar.sql"));
+        assert_eq!(load.end, LoadEnd::Count(100));
+        assert_eq!(load.clients, 8, "the default");
+        let empty: Vec<&str> = load
+            .queries
+            .iter()
+            .filter(|q| q.expect_empty)
+            .map(|q| q.sql.as_str())
+            .collect();
+        assert_eq!(empty, ["SELECT amount FROM orders WHERE id = -1"]);
+        assert_eq!(
+            script.steps[0].key,
+            "load: {\"corpus\":\"corpus/sidecar.sql\",\"count\":100}"
+        );
+    }
+
+    #[test]
+    fn a_load_refuses_what_it_cannot_check_or_time() {
+        for (load, message) in [
+            (
+                "{ duration: 5s }",
+                "`load` takes one of `queries` or `corpus`",
+            ),
+            (
+                "{ queries: [SELECT 1], corpus: x.sql, duration: 5s }",
+                "`load` takes one of `queries` or `corpus`",
+            ),
+            (
+                "{ queries: [SELECT 1] }",
+                "`load` takes one of `duration` (longer than 0) or `count` (at least 1)",
+            ),
+            (
+                "{ queries: [SELECT 1], duration: 5s, count: 3 }",
+                "`load` takes one of `duration` (longer than 0) or `count` (at least 1)",
+            ),
+            (
+                "{ queries: [SELECT 1], duration: 5s, clients: 0 }",
+                "`clients` must be at least 1",
+            ),
+            (
+                "{ queries: [{ sql: SELECT 1, expect-error: true }], duration: 5s }",
+                "a load query takes `sql`, `oracle-sql`, `expect` and `expect-empty`, not `expect-error`",
+            ),
+            (
+                "{ queries: [SELECT 1], count: 5, recover-within: 1s, faults: [{ at: 1s, kill-executor: 0 }] }",
+                "`faults` need a load with a `duration` to run within",
+            ),
+            (
+                "{ queries: [SELECT 1], duration: 5s, faults: [{ at: 1s, kill-executor: 0 }] }",
+                "`faults` need `recover-within`",
+            ),
+            (
+                "{ queries: [SELECT 1], duration: 5s, recover-within: 1s, faults: [{ at: 5s, kill-executor: 0 }] }",
+                "a fault at 5s is not within the load's 5s",
+            ),
+            (
+                "{ queries: [SELECT 1], duration: 5s, recover-within: 1s, faults: [{ at: 1s, query: SELECT 1 }] }",
+                "a fault runs one of start, stop, kill-spiced, restart, upgrade, wait-ready, kill-executor, start-executors, add-executor, not `query`",
+            ),
+            (
+                "{ queries: [SELECT 1], duration: 5s, recover-within: 1s, faults: [{ kill-executor: 0 }] }",
+                "a fault needs `at`",
+            ),
+            (
+                "{ queries: [SELECT 1], duration: 5s, recover-within: 1s }",
+                "`recover-within` applies to `faults`, and the load has none",
+            ),
+        ] {
+            let err = Script::parse(&format!(
+                "name: l\nspicepod: {{}}\nsteps: [{{ load: {load} }}]"
+            ))
+            .expect_err("an invalid load is refused");
+            assert!(format!("{err:#}").contains(message), "{load}: {err:#}");
+        }
+        // A fault's `on` needs a sidecar like any step's.
+        let err = Script::parse(
+            "name: l\nspicepod: {}\nsteps: [{ load: { queries: [SELECT 1], duration: 5s, recover-within: 1s, faults: [{ at: 1s, restart: {}, on: upstream }] } }]",
+        )
+        .expect_err("`on` without a sidecar");
+        assert!(
+            format!("{err:#}").contains("but the script declares no `sidecar:`"),
+            "{err:#}"
+        );
     }
 
     #[test]

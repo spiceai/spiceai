@@ -56,7 +56,7 @@ use arrow::datatypes::Int64Type;
 use ballista_scheduler::state::executor_manager::ExecutorManager;
 use runtime::auth::EndpointAuth;
 use runtime::cluster::ResolvedClusterConfig;
-use runtime::config::{ClusterConfig, ClusterRole, Config};
+use runtime::config::{ClusterConfig, Config, Role};
 use runtime::http_types::SubmitQueryRequest;
 use runtime::jobs::{JobExecutor, JobState, JobStatus};
 use runtime::{Result as RuntimeResult, Runtime};
@@ -140,7 +140,7 @@ async fn build_scheduler(
         http_bind_address: format!("127.0.0.1:{http}").parse().expect("http addr"),
         flight_bind_address: format!("127.0.0.1:{flight}").parse().expect("flight addr"),
         cluster: ClusterConfig {
-            role: Some(ClusterRole::Scheduler),
+            role: Some(Role::Scheduler),
             node_bind_address: cluster_addr.parse().expect("cluster addr"),
             node_advertise_address: Some("127.0.0.1".to_string()),
             node_mtls_ca_certificate_file: Some(pki.ca_cert_path.to_string_lossy().to_string()),
@@ -195,7 +195,7 @@ async fn build_executor(
         http_bind_address: format!("127.0.0.1:{http}").parse().expect("http addr"),
         flight_bind_address: format!("127.0.0.1:{flight}").parse().expect("flight addr"),
         cluster: ClusterConfig {
-            role: Some(ClusterRole::Executor),
+            role: Some(Role::Executor),
             node_bind_address: format!("127.0.0.1:{cluster}")
                 .parse()
                 .expect("cluster addr"),
