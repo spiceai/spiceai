@@ -1045,18 +1045,6 @@ jobs:
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
             { engine: cayenne, mode: file },
-            {
-              engine: postgres,
-              params:
-                {
-                  pg_host: localhost,
-                  pg_port: 5432,
-                  pg_db: testdb_acc,
-                  pg_user: postgres,
-                  pg_pass: postgres,
-                  pg_sslmode: disable,
-                },
-            },
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
@@ -1074,13 +1062,6 @@ jobs:
         run: |
           psql -h localhost -U postgres -d testdb < test/scripts/setup-data-postgresql.sql
           psql -h localhost -U postgres -d testdb -c 'SELECT * FROM test_postgresql_table;'
-
-      - name: Create Postgres Accelerator Test Database
-        if: matrix.acceleration.engine == 'postgres'
-        env:
-          PGPASSWORD: postgres
-        run: |
-          createdb -h localhost -U postgres testdb_acc
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -1225,29 +1206,11 @@ jobs:
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
             { engine: cayenne, mode: file },
-            {
-              engine: postgres,
-              params:
-                {
-                  pg_host: localhost,
-                  pg_port: 5432,
-                  pg_db: testdb,
-                  pg_user: postgres,
-                  pg_pass: postgres,
-                  pg_sslmode: disable,
-                },
-            },
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install PostgreSQL
-        if: matrix.acceleration.engine == 'postgres'
-        uses: ./.github/actions/install-postgres
-        with:
-          pg-db: testdb
 
       - name: Configure apt mirrors (Linux)
         if: matrix.target.target_os == 'linux'
@@ -1674,7 +1637,6 @@ jobs:
             { engine: sqlite, mode: file },
             { engine: turso, mode: memory },
             { engine: turso, mode: file },
-            # { engine: postgres},
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
