@@ -3,6 +3,8 @@ description: >
   Tables read from Parquet and CSV files answer the extended corpus and
   ternary logic partitioning as PostgreSQL answers them over the same
   generated rows: read in place, and accelerated into Cayenne and DuckDB.
+  An ungrouped count over a NOT IN whose subquery yields a NULL is 0 in
+  each, including where eager aggregation rewrites it over Cayenne.
 
 sources:
   lake: { kind: files }
@@ -90,3 +92,21 @@ steps:
   - start: {}
   - corpus: corpus/queries-extended.sql
   - tlp: { table: t, seed: 2, queries: 200, depth: 3, aggregate: d, oracle: ref, avoid: [not] }
+  # An ungrouped count over a NOT IN whose subquery yields a NULL is 0: the
+  # null-aware anti join keeps no row, and a count over no rows is 0, not NULL.
+  # Cayenne reports each column's distinct count, so eager aggregation pushes a
+  # partial count below that join and merges it above with a SUM, which is NULL
+  # over no rows unless the merge maps it back to 0. The subqueries read `s`
+  # itself: a NULL literal is a `Utf8View`, and the cast it puts on the join key
+  # keeps the rule from firing.
+  - explain: SELECT count(id) FROM t WHERE s NOT IN (SELECT s FROM t WHERE s IS NULL)
+    contains: __eager_p0_0
+    only: cayenne
+  - query: SELECT count(*) FROM t WHERE s NOT IN (SELECT s FROM t WHERE s IS NULL)
+    expect: { rows: [['0']] }
+  - query: SELECT count(id) FROM t WHERE s NOT IN (SELECT s FROM t WHERE s IS NULL)
+    expect: { rows: [['0']] }
+  - query: SELECT coalesce(count(*), 42) FROM t WHERE s NOT IN (SELECT s FROM t WHERE s IS NULL OR id <= 5)
+    expect: { rows: [['0']] }
+  # The same rewrite over an anti join that keeps rows still counts them.
+  - query: SELECT count(*), count(id) FROM t WHERE s NOT IN (SELECT s FROM t WHERE s IS NOT NULL AND id <= 5)
