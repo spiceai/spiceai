@@ -49,6 +49,7 @@ use tokio::{
     sync::RwLock,
     time::{MissedTickBehavior, interval},
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::catalog::SpiceToolCatalog;
 use tools::SpiceModelTool;
@@ -558,8 +559,17 @@ impl McpToolCatalog {
         tool_name: &str,
         timeout: Duration,
     ) -> Result<McpClient> {
-        match tokio::time::timeout(timeout, Self::connect_client(cfg, tool_name)).await {
-            Ok(client) => client,
+        // An attempt that ends without a client (it timed out, failed, or the load was
+        // stopped) cancels `abandoned`, which ends the requests its handshake left open.
+        let abandoned = CancellationToken::new();
+        let release_on_drop = abandoned.clone().drop_guard();
+        match tokio::time::timeout(timeout, Self::connect_client(cfg, tool_name, &abandoned)).await
+        {
+            Ok(Ok(client)) => {
+                release_on_drop.disarm();
+                Ok(client)
+            }
+            Ok(Err(e)) => Err(e),
             Err(_) => Err(Error::UnderlyingTransportError {
                 source: format!(
                     "the MCP server did not complete the connection handshake within {}s",
@@ -570,7 +580,11 @@ impl McpToolCatalog {
         }
     }
 
-    async fn connect_client(cfg: &MCPConfig, tool_name: &str) -> Result<McpClient> {
+    async fn connect_client(
+        cfg: &MCPConfig,
+        tool_name: &str,
+        abandoned: &CancellationToken,
+    ) -> Result<McpClient> {
         match cfg {
             MCPConfig::Stdio { command, args, env } => {
                 // Security constants
@@ -665,12 +679,13 @@ impl McpToolCatalog {
                     );
                 }
 
-                let http_client = BoundedHttpClient::new(tool_name).map_err(|e| {
-                    Error::CouldNotConstructTool {
-                        name: "mcp_streamable_http".to_string(),
-                        e: format!("Failed to create the HTTP client for '{url}': {e}"),
-                    }
-                })?;
+                let http_client =
+                    BoundedHttpClient::new(tool_name, abandoned.clone()).map_err(|e| {
+                        Error::CouldNotConstructTool {
+                            name: "mcp_streamable_http".to_string(),
+                            e: format!("Failed to create the HTTP client for '{url}': {e}"),
+                        }
+                    })?;
                 let mut transport_config =
                     StreamableHttpClientTransportConfig::with_uri(url.to_string())
                         .custom_headers(headers.clone())
@@ -1263,6 +1278,50 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "the load must give up at the startup timeout, took {:?}",
             started.elapsed()
+        );
+    }
+
+    /// A handshake that timed out closes its connection. rmcp sends the first handshake
+    /// request outside its own cancellation, so without that each retry against a server
+    /// that never answers would leave one more connection, and the task waiting on it, open.
+    #[tokio::test]
+    async fn test_timed_out_handshake_closes_its_connection() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a listener");
+        let addr = listener.local_addr().expect("listener address");
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept the handshake");
+            // Read the request and never answer. A read of 0 bytes is the client closing.
+            let mut buf = [0_u8; 4096];
+            while socket.read(&mut buf).await.is_ok_and(|read| read > 0) {}
+            let _ = closed_tx.send(());
+        });
+        let cfg = MCPConfig::StreamableHttp {
+            url: url::Url::parse(&format!("http://{addr}/mcp")).expect("valid url"),
+            auth_token: None,
+            headers: HashMap::new(),
+        };
+
+        let result =
+            McpToolCatalog::create_client_within(&cfg, "silent", Duration::from_millis(500)).await;
+        let Err(err) = result else {
+            panic!("an unresponsive server must not connect");
+        };
+        assert!(
+            err.to_string()
+                .contains("did not complete the connection handshake"),
+            "unexpected error: {err}"
+        );
+
+        let closed = tokio::time::timeout(Duration::from_secs(5), closed_rx).await;
+        server.abort();
+        assert!(
+            matches!(closed, Ok(Ok(()))),
+            "the timed-out handshake left its connection open"
         );
     }
 

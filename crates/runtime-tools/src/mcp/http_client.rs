@@ -61,6 +61,7 @@ use rmcp::{
 };
 use snafu::Snafu;
 use sse_stream::{Sse, SseStream};
+use tokio_util::sync::CancellationToken;
 
 use super::MAX_TOOL_RESULT_SIZE;
 
@@ -92,10 +93,15 @@ pub(crate) struct BoundedHttpClient {
     inner: reqwest::Client,
     /// Spicepod name of the MCP tool catalog, for the over-limit message.
     server_name: Arc<str>,
+    /// Cancelled when the connection attempt that built this client is given up on. rmcp
+    /// sends the first request of a handshake outside its own cancellation, so without this
+    /// a handshake that timed out would keep that request, the task waiting on it, and its
+    /// connection open for as long as the server stays silent.
+    abandoned: CancellationToken,
 }
 
 impl BoundedHttpClient {
-    pub(crate) fn new(server_name: &str) -> reqwest::Result<Self> {
+    pub(crate) fn new(server_name: &str, abandoned: CancellationToken) -> reqwest::Result<Self> {
         // The same settings rmcp's default client uses: no idle pooling (a
         // pooled connection whose previous body was not fully read stalls on
         // delayed ACK), and no redirects, so custom headers such as an API key
@@ -107,6 +113,7 @@ impl BoundedHttpClient {
         Ok(Self {
             inner,
             server_name: server_name.into(),
+            abandoned,
         })
     }
 
@@ -287,38 +294,16 @@ fn legacy_discover_response(
     ))
 }
 
-impl StreamableHttpClient for BoundedHttpClient {
-    type Error = reqwest::Error;
-
-    async fn post_message(
+impl BoundedHttpClient {
+    /// Sends one POST and reads its response, never buffering more than
+    /// [`MAX_TOOL_RESULT_SIZE`] of it.
+    async fn post_bounded(
         &self,
         uri: Arc<str>,
         message: ClientJsonRpcMessage,
         session_id: Option<Arc<str>>,
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
-    ) -> HttpResult<StreamableHttpPostResponse> {
-        self.post_message_with_max_sse_event_size(
-            uri,
-            message,
-            session_id,
-            auth_header,
-            custom_headers,
-            MAX_TOOL_RESULT_SIZE,
-        )
-        .await
-    }
-
-    async fn post_message_with_max_sse_event_size(
-        &self,
-        uri: Arc<str>,
-        message: ClientJsonRpcMessage,
-        session_id: Option<Arc<str>>,
-        auth_header: Option<String>,
-        custom_headers: HashMap<HeaderName, HeaderValue>,
-        // The whole response is bounded by `MAX_TOOL_RESULT_SIZE`, which the
-        // transport config also sets as its event limit.
-        _max_sse_event_size: usize,
     ) -> HttpResult<StreamableHttpPostResponse> {
         let mut request = self
             .inner
@@ -422,7 +407,12 @@ impl StreamableHttpClient for BoundedHttpClient {
                     _ => None,
                 };
                 let bytes = BoundedByteStream {
-                    inner: response.bytes_stream().boxed(),
+                    // A handshake waits on this stream for its answer, so it ends with the
+                    // attempt like the POST does.
+                    inner: response
+                        .bytes_stream()
+                        .take_until(self.abandoned.clone().cancelled_owned())
+                        .boxed(),
                     client: self.clone(),
                     request_id,
                     received: 0,
@@ -453,6 +443,48 @@ impl StreamableHttpClient for BoundedHttpClient {
                 }
             }
             _ => Err(StreamableHttpError::UnexpectedContentType(content_type)),
+        }
+    }
+}
+
+impl StreamableHttpClient for BoundedHttpClient {
+    type Error = reqwest::Error;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> HttpResult<StreamableHttpPostResponse> {
+        self.post_message_with_max_sse_event_size(
+            uri,
+            message,
+            session_id,
+            auth_header,
+            custom_headers,
+            MAX_TOOL_RESULT_SIZE,
+        )
+        .await
+    }
+
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        // The whole response is bounded by `MAX_TOOL_RESULT_SIZE`, which the
+        // transport config also sets as its event limit.
+        _max_sse_event_size: usize,
+    ) -> HttpResult<StreamableHttpPostResponse> {
+        tokio::select! {
+            () = self.abandoned.cancelled() => Err(StreamableHttpError::TransportChannelClosed),
+            response = self.post_bounded(uri, message, session_id, auth_header, custom_headers) => {
+                response
+            }
         }
     }
 
