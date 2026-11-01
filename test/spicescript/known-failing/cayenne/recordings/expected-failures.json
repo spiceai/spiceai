@@ -6,7 +6,10 @@
       "key": "query: SELECT count(*) AS n FROM t WHERE d * 2 > 10",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to bind the Vortex filter to the file's type: Other error: incompatible types for arithmetic operation: decimal(10,2)? decimal(20,0)?\": code: 'Client specified an invalid argument', message: \"Failed",
-      "group": "cayenne"
+      "group": "cayenne",
+      "labels": [
+        "decimal-int"
+      ]
     },
     {
       "run": "cayenne-decimal-int-filter",
@@ -14,7 +17,10 @@
       "key": "query: SELECT count(*) AS n FROM t WHERE d + 1 > 10",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to bind the Vortex filter to the file's type: Other error: incompatible types for arithmetic operation: decimal(10,2)? decimal(20,0)?\": code: 'Client specified an invalid argument', message: \"Failed",
-      "group": "cayenne"
+      "group": "cayenne",
+      "labels": [
+        "decimal-int"
+      ]
     },
     {
       "run": "cayenne-decimal-int-filter",
@@ -22,7 +28,10 @@
       "key": "query: SELECT count(*) AS n FROM t WHERE d * big > 10",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to bind the Vortex filter to the file's type: Other error: incompatible types for arithmetic operation: decimal(10,2)? decimal(20,0)?\": code: 'Client specified an invalid argument', message: \"Failed",
-      "group": "cayenne"
+      "group": "cayenne",
+      "labels": [
+        "decimal-int"
+      ]
     }
   ],
   "cayenne-file-durability-date-key": [

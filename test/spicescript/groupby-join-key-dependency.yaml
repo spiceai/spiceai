@@ -1,0 +1,42 @@
+name: groupby-join-key-dependency
+description: >
+  Grouping a DISTINCT over a join by a column of each side counts every
+  distinct pair, whichever side's primary key the pair includes.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  federated: {}
+  arrow: arrow
+  cayenne: cayenne-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: groupby-join-key-dependency
+  datasets:
+    - { from: 'postgres:public.t', name: t, params: '${sources.src.params}' }
+    - { from: 'postgres:public.u', name: u, params: '${sources.src.params}' }
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  # t (id is the primary key) has many u rows per id, with different labels;
+  # t rows 26-40 have none.
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, s text);
+        INSERT INTO t SELECT i, 'v' || (i % 4) FROM generate_series(1, 40) i;
+        CREATE TABLE u (id int PRIMARY KEY, t_id int, label text);
+        INSERT INTO u SELECT i, 1 + i % 25, (ARRAY['red', 'blue', 'green'])[1 + i % 3] FROM generate_series(1, 60) i;
+  - start: {}
+  # Controls: the same grouping without the DISTINCT, and with its keys read.
+  - query: SELECT count(*) AS n FROM (SELECT l, id FROM (SELECT b.label AS l, a.id AS id FROM u b JOIN t a ON a.id = b.t_id) x GROUP BY l, id) g
+  - query: SELECT l, id FROM (SELECT DISTINCT b.label AS l, a.id AS id FROM u b JOIN t a ON a.id = b.t_id) x GROUP BY l, id
+  # One-to-many inner join: t.id does not determine the label.
+  - query: SELECT count(*) AS n FROM (SELECT l, id FROM (SELECT DISTINCT b.label AS l, a.id AS id FROM u b JOIN t a ON a.id = b.t_id) x GROUP BY l, id) g
+  # Outer join: u.id is NULL for every t row with no u row, whatever its s.
+  - query: SELECT count(*) AS n FROM (SELECT s, id FROM (SELECT DISTINCT a.s AS s, b.id AS id FROM t a LEFT JOIN u b ON a.id = b.t_id) x GROUP BY s, id) g

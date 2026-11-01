@@ -132,12 +132,6 @@ endif
 # built and never run. None needs excluding today; one whose tests could not
 # run in the gate would be excluded by name here, with the reason beside it.
 #
-# Running cayenne's integration tests under the workspace resolve rather than
-# `-p cayenne` enables its `turso` feature, which puts 304 `*_turso` variants in
-# the gate alongside their SQLite siblings. They need more stack than the 2 MiB
-# std gives a thread; `test_with_backends!` reserves it (see
-# `crates/cayenne/tests/common/mod.rs`), so no name needs excluding here.
-#
 # Shared so `nextest` and `verify-cli` cannot drift onto different selections:
 # a different selection resolves different features, which would make verify-cli
 # recompile instead of reading the build nextest just did.
@@ -167,7 +161,7 @@ endif
 # selected for the same reason: each stands a local one-shot HTTP server up on an
 # ephemeral port and drives a provider adapter against it, so they exercise the
 # real client's error mapping with no credentials and no external service, as
-# does `model2vec_hf_cache` against a local Hugging Face cache. They are modules
+# do `model2vec_hf_cache`, `safetensors_hf_cache` and `gguf_hf_cache` against a local Hugging Face cache. They are modules
 # of `llms`'s `integration` binary; its `llms` module calls the live provider
 # APIs and needs a `.env`, so it stays in the nightly gate.
 #
@@ -240,7 +234,7 @@ print-rust-gate-features:
 # large to load (dyld aborts before `main`, failing the whole run).
 # `runtime`'s `chat_tool_use` binary drives `/v1/chat/completions` through the
 # tool-use loop against an in-process mock of the Anthropic Messages API.
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use))
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache|safetensors_hf_cache|gguf_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would

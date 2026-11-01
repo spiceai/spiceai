@@ -52,6 +52,10 @@ jobs:
           "$RUNNER_TEMP/hf-cli/bin/python" -m pip install 'huggingface_hub==2.2.0'
           echo "$RUNNER_TEMP/hf-cli/bin" >> "$GITHUB_PATH"
       - name: Compare Spice's cache with the hf CLI's
+        # The Hub rate-limits anonymous requests per IP, and the jobs on the self-hosted pool share
+        # one, so the tools and the script authenticate with HF_TOKEN. Both tools redact it.
+        env:
+          HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: scripts/hf_cache_differential.sh "$RUNNER_TEMP/hf_cache_differential"
       # The tools' output for each repository; the caches themselves are gigabytes.
       - name: Upload the tools' output

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod header_projected_csv;
 pub mod spice_logical_codec;
 pub mod spice_physical_codec;
 pub mod udtf_args;

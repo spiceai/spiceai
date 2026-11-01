@@ -177,7 +177,6 @@ async fn sanitized_plan_when_persisted(
 /// 2. Queries with filters on the partition column use partition pruning
 /// 3. Physical plans show `CayenneTableScan` with appropriate partition filters
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -321,7 +320,6 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
 /// This test verifies that multiple partition expressions work together:
 /// - `partition_by`: [bucket(3, id), bucket(2, score)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -464,7 +462,6 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
 /// 3. Partitions can be correctly re-inferred after creation with NULL values
 /// 4. Data with NULL partition values can be queried correctly
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -620,7 +617,6 @@ async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Err
 ///
 /// This test verifies NULL handling specifically for numeric partition columns
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_partition_by_bucket_numeric_nulls() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -776,7 +772,6 @@ async fn test_cayenne_partition_by_bucket_numeric_nulls() -> Result<(), anyhow::
 /// 2. Queries with filters on the partition expression use partition pruning
 /// 3. Physical plans show correct partition structure with month-based partitions
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_partition_by_date_part() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -917,7 +912,6 @@ async fn test_cayenne_partition_by_date_part() -> Result<(), anyhow::Error> {
 ///
 /// `SELECT * FROM bucket_refresh_test WHERE bucket(5, id) = 0` executes without errors
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_refresh_sql_with_bucket_function() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -1007,7 +1001,6 @@ async fn test_refresh_sql_with_bucket_function() -> Result<(), anyhow::Error> {
 /// rows, so shrinking the source to one row left the other buckets' rows visible,
 /// and an empty refresh changed nothing at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_partition_by_full_refresh_removes_rows_missing_from_source()
 -> Result<(), anyhow::Error> {
     use std::sync::atomic::{AtomicI64, Ordering};
