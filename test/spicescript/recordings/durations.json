@@ -31,6 +31,7 @@
   "distinct-on-scopes": 5,
   "duckdb-nested-union-all": 4,
   "duckdb-timestamp-deletes": 4,
+  "duckdb-types-acceleration": 6,
   "ducklake-coverage": 25,
   "ducklake-refresh": 28,
   "duplicate-keys": 7,

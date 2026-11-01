@@ -1,0 +1,112 @@
+name: duckdb-types-known
+description: >
+  The types `duckdb-types-acceleration.yaml` leaves out because some engine or
+  protocol cannot carry them yet. An INTERVAL column answers as the DuckDB CLI
+  answers over Flight and Flight SQL, but Cayenne and SQLite refuse to
+  accelerate it, and HTTP JSON writes it as text (`1.000000000 secs`) that
+  does not read back as an interval. A millisecond timestamp before 1970 fails
+  Turso's refresh (`Invalid timestamp value: -2208988799999 Millisecond`).
+  SQLite keeps a decimal as a double, so a 20-digit DECIMAL(20, 4) no longer
+  fits its column when read back (#14662).
+
+sources:
+  src: { kind: duckdb }
+
+variants:
+  federated: {}
+  arrow: arrow-memory
+  duckdb: duckdb-file
+  cayenne: cayenne-file
+  sqlite: sqlite-file
+  turso: turso-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: duckdb-types-known
+  datasets:
+    - from: duckdb:main.iv
+      name: iv
+      params: ${sources.src.params}
+      acceleration:
+        enabled: false
+    - from: duckdb:main.ts
+      name: ts
+      params: ${sources.src.params}
+      acceleration:
+        enabled: false
+    - from: duckdb:main.dec
+      name: dec
+      params: ${sources.src.params}
+      acceleration:
+        enabled: false
+
+defaults:
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE iv (id INTEGER, t_interval INTERVAL);
+        INSERT INTO iv VALUES
+          (1, INTERVAL '1 second'), (2, INTERVAL '2 seconds'), (3, INTERVAL '0 seconds'), (4, NULL);
+        CREATE TABLE ts (id INTEGER, t_timestamp_ms TIMESTAMP_MS);
+        INSERT INTO ts VALUES
+          (1, TIMESTAMP_MS '2024-01-15 21:00:33.999'), (2, TIMESTAMP_MS '1900-01-01 00:00:00.001'),
+          (3, TIMESTAMP_MS '1970-01-01 00:00:00'), (4, NULL);
+        CREATE TABLE dec (id INTEGER, t_decimal_20_4 DECIMAL(20, 4), t_decimal_38_10 DECIMAL(38, 10));
+        INSERT INTO dec VALUES
+          (1, 9999999999999999.9999, 9999999999999999999999999999.9999999999),
+          (2, -9999999999999999.9999, -9999999999999999999999999999.9999999999),
+          (3, 0.0000, 0.0000000000), (4, NULL, NULL);
+  - source-query:
+      src: SELECT id, t_interval FROM iv ORDER BY id
+    expect:
+      rows:
+        - [1, '00:00:01']
+        - [2, '00:00:02']
+        - [3, '00:00:00']
+        - [4, null]
+  - source-query:
+      src: SELECT id, t_decimal_20_4, t_decimal_38_10 FROM dec ORDER BY id
+    expect:
+      rows: &decimals
+        - [1, '9999999999999999.9999', '9999999999999999999999999999.9999999999']
+        - [2, '-9999999999999999.9999', '-9999999999999999999999999999.9999999999']
+        - [3, '0.0000', '0.0000000000']
+        - [4, null, null]
+  - source-query:
+      src: SELECT id, t_timestamp_ms FROM ts ORDER BY id
+    expect:
+      rows: &timestamps
+        - [1, '2024-01-15 21:00:33.999']
+        - [2, '1900-01-01 00:00:00.001']
+        - [3, '1970-01-01 00:00:00']
+        - [4, null]
+
+  # Some accelerations fail to load one dataset; wait only for HTTP, so each
+  # dataset's failure is its own query's.
+  - start: { ready: false }
+
+  # The same intervals, written as Arrow parses them.
+  - query: SELECT id, t_interval FROM iv ORDER BY id
+    protocols: [flight, flightsql]
+    eventually: 30s
+    expect:
+      rows:
+        - [1, 1 second]
+        - [2, 2 seconds]
+        - [3, 0 seconds]
+        - [4, null]
+  - query: SELECT id, t_interval FROM iv ORDER BY id
+    protocols: [flight, http]
+    eventually: 30s
+  - query: SELECT id, t_timestamp_ms FROM ts ORDER BY id
+    protocols: [flight, flightsql, http]
+    eventually: 30s
+    expect: { rows: *timestamps }
+  - query: SELECT id, t_decimal_20_4, t_decimal_38_10 FROM dec ORDER BY id
+    protocols: [flight, flightsql, http]
+    eventually: 30s
+    expect: { rows: *decimals }
