@@ -371,7 +371,9 @@ mod tests {
         for keep_expr in keep.keep_filters(&schema).expect("coerces") {
             validate_keep_expr(&keep_expr, &schema).expect("the inverse plans");
         }
-        let err = keep.validate(&schema).expect_err("implicit Utf8 -> Int64 cast");
+        let err = keep
+            .validate(&schema)
+            .expect_err("implicit Utf8 -> Int64 cast");
         assert!(matches!(err, Error::FallibleImplicitCast { .. }), "{err}");
         let message = err.to_string();
         assert!(message.contains("`status` is Utf8"), "{message}");
