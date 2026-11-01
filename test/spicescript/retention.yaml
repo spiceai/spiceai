@@ -1,8 +1,8 @@
 name: retention
 description: >
-  Time retention keeps rows newer than `retention_period` by the time column
-  (and, as it stands, removes rows with no time),
-  and `retention_sql` deletes the rows its predicate matches, leaving rows the
+  Time retention keeps rows newer than `retention_period` by the time column,
+  and rows with no time, which the refresh window that `retention_period` implies
+  loads and retention never removes; `retention_sql` deletes the rows its predicate matches, leaving rows the
   predicate cannot evaluate (NULL); both apply again after every full refresh
   reloads the source's old rows; and a query that finds no rows in the
   acceleration under `on_zero_results: use_source` does not bring the removed
@@ -59,11 +59,11 @@ steps:
         INSERT INTO events VALUES (901, NULL, 'live', 1), (902, now()::timestamp + INTERVAL '1 day', 'live', 2);
   - start: {}
 
-  # Time retention also removes a row whose time is NULL, unlike retention_sql,
-  # which keeps a row its predicate cannot evaluate (an open question, asserted here
-  # as it stands).
+  # Time retention keeps a row whose time is NULL (row 901), as retention_sql keeps
+  # a row its predicate cannot evaluate: the refresh loads it, and retention removes
+  # only rows older than the period.
   - query: SELECT * FROM by_time
-    oracle-sql: SELECT * FROM events WHERE ts >= now()::timestamp - INTERVAL '30 days'
+    oracle-sql: SELECT * FROM events WHERE ts >= now()::timestamp - INTERVAL '30 days' OR ts IS NULL
     eventually: 30s
   - query: SELECT * FROM by_sql
     oracle-sql: SELECT * FROM events WHERE NOT coalesce(kind = 'expired' OR v < 0, false)
@@ -88,7 +88,7 @@ steps:
   - refresh: by_time
   - refresh: by_sql
   - query: SELECT * FROM by_time
-    oracle-sql: SELECT * FROM events WHERE ts >= now()::timestamp - INTERVAL '30 days'
+    oracle-sql: SELECT * FROM events WHERE ts >= now()::timestamp - INTERVAL '30 days' OR ts IS NULL
     eventually: 30s
   - query: SELECT * FROM by_sql
     oracle-sql: SELECT * FROM events WHERE NOT coalesce(kind = 'expired' OR v < 0, false)
