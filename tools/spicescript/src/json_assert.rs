@@ -354,7 +354,7 @@ fn resolve<'a>(root: &'a Value, pointer: &str) -> Vec<&'a Value> {
                 (Value::Array(items), "*") => next.extend(items),
                 (Value::Object(members), "*") => next.extend(members.values()),
                 (Value::Array(items), _) => {
-                    if let Some(item) = segment.parse::<usize>().ok().and_then(|i| items.get(i)) {
+                    if let Some(item) = array_index(&segment).and_then(|i| items.get(i)) {
                         next.push(item);
                     }
                 }
@@ -369,6 +369,18 @@ fn resolve<'a>(root: &'a Value, pointer: &str) -> Vec<&'a Value> {
         current = next;
     }
     current
+}
+
+/// A JSON Pointer array index: `0`, or digits without a leading zero (RFC 6901).
+/// `parse::<usize>` alone would also take `01` and `+1`.
+fn array_index(segment: &str) -> Option<usize> {
+    let canonical = segment == "0"
+        || (segment.bytes().all(|b| b.is_ascii_digit()) && !segment.starts_with('0'));
+    if canonical {
+        segment.parse().ok()
+    } else {
+        None
+    }
 }
 
 fn one_value(value: &Value) -> String {
@@ -448,6 +460,22 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    #[test]
+    fn an_array_index_is_zero_or_digits_without_a_leading_zero_or_sign() {
+        let body = rows();
+        assert_eq!(
+            assertion("{ pointer: /1/ms, equals: 0.25 }").check(&body),
+            None
+        );
+        for index in ["01", "+1", "1 ", "-0"] {
+            assert_eq!(
+                assertion(&format!("{{ pointer: '/{index}/ms', exists: false }}")).check(&body),
+                None,
+                "index '{index}'"
+            );
+        }
     }
 
     #[test]
