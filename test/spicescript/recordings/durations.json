@@ -1,11 +1,13 @@
 {
   "append-embeddings": 13,
+  "append-iso-offset": 6,
   "append-kill": 7,
   "append-time-column": 8,
   "append-time-partition": 4,
   "auth": 3,
   "builtins": 4,
   "case-mixed-widths": 5,
+  "cayenne-delete-signed-zero": 4,
   "cayenne-upgrade": 8,
   "cayenne-writes": 30,
   "cdc-chaos": 91,

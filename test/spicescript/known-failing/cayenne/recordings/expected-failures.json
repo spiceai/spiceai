@@ -510,17 +510,9 @@
     {
       "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=none]",
       "who": "none-partitioned",
-      "key": "spice-exec: DELETE FROM ev WHERE id > 1000 AND id % 2 = 0",
-      "kind": "error",
-      "signature": "Spice rejected the statement: 400 Bad Request: External error: External error: Failed to convert filter to Vortex expression. Filter: id@0 % 2 = 0",
-      "group": "cayenne"
-    },
-    {
-      "run": "cayenne-writes-known[layout=partitioned,mode=file,policy=none]",
-      "who": "none-partitioned",
       "key": "query: SELECT id, region, name, v, f, ts FROM ev #13",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: RowCountMismatch { expected: 514, actual: 1021 }",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 514, actual: 521 }",
       "group": "cayenne"
     },
     {
@@ -536,7 +528,7 @@
       "who": "none-partitioned",
       "key": "query: SELECT count(*) AS n FROM ev",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"0\\\"\", actual: \"\\\"1021\\\"\" }",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"0\\\"\", actual: \"\\\"521\\\"\" }",
       "group": "cayenne"
     },
     {
@@ -544,7 +536,7 @@
       "who": "none-partitioned",
       "key": "query: SELECT id, region, name, v, f, ts FROM ev #14",
       "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1, actual: 1022 }",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 1, actual: 688 }",
       "group": "cayenne"
     },
     {
