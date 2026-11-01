@@ -237,7 +237,7 @@ impl PropertyRow {
                 .enum_values
                 .iter()
                 .flatten()
-                .map(String::len)
+                .map(|v| v.len() + size_of::<String>())
                 .sum::<usize>()
             + self.path.len()
             + self.parent_path.len()
@@ -1955,6 +1955,30 @@ mod tests {
         }"#;
         let rows = flatten_with_options(json, &opts);
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn enum_entries_are_charged_to_the_output_budget() {
+        let enum_values = vec!["\"\""; 512].join(",");
+        let properties = (0..64)
+            .map(|i| format!(r##""p{i}": {{"$ref": "#/$defs/e"}}"##))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{"$defs": {{"e": {{"type": "string", "enum": [{enum_values}]}}}}, "properties": {{{properties}}}}}"#
+        );
+        let opts = FlattenOptions {
+            max_bytes: 8 * 1024,
+            ..FlattenOptions::default()
+        };
+        assert!(json.len() <= opts.max_bytes);
+        let rows = flatten_with_options(&json, &opts);
+        assert!(!rows.is_empty());
+        assert!(
+            rows.len() < 64,
+            "{} rows of 512 empty enum values each",
+            rows.len()
+        );
     }
 
     #[test]
