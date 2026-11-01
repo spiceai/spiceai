@@ -509,10 +509,13 @@ impl RuntimeStatus {
 
                 // OnLoad readiness: a component counts as ready if it has been ready at least once.
                 // All registered components must appear in the ever-ready set before we report ready,
-                // except disabled ones: a component removed from the Spicepod never loads.
+                // except disabled ones (a component removed from the Spicepod never loads) and
+                // tools whose load failed (a failing tool is left out of the tool list and retried
+                // in the background; it does not hold back the rest of the runtime).
                 statuses
                     .iter()
                     .filter(|(_, state)| !matches!(state.status, ComponentStatus::Disabled))
+                    .filter(|(component, state)| !is_failed_tool(component, &state.status))
                     .all(|(component, _)| ever_ready.contains(component))
             }
             // OnRegistration readiness: treat Error/Disabled/Initializing as ready-enough.
@@ -913,6 +916,12 @@ pub fn unavailable_model_message(
     }
 }
 
+/// A Spicepod tool whose last load attempt failed. Tools are optional: a failing tool is
+/// absent from the tool list, but it does not keep `/v1/ready` from reporting ready.
+fn is_failed_tool(component: &str, status: &ComponentStatus) -> bool {
+    component.starts_with("tool:") && matches!(status, ComponentStatus::Error(_))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1002,6 +1011,40 @@ mod tests {
 
         status.release_dataset_ready();
         assert!(status.is_ready());
+    }
+
+    #[test]
+    fn test_is_ready_on_load_ignores_failed_tools() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("orders");
+
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        status.update_tool_catalog("builtin", ComponentStatus::Ready);
+        status.update_tool("good", ComponentStatus::Ready);
+
+        // A tool still loading holds readiness back until its first attempt finishes.
+        status.update_tool("bad", ComponentStatus::Initializing);
+        assert!(!status.is_ready());
+
+        // A failed tool does not.
+        status.update_tool("bad", ComponentStatus::error_with_message("unreachable"));
+        assert!(status.is_ready(), "a failed tool must not block readiness");
+
+        // Other failed components still do.
+        status.update_model("model_a", ComponentStatus::error());
+        assert!(
+            !status.is_ready(),
+            "a failed model still blocks OnLoad readiness"
+        );
+        status.update_model("model_a", ComponentStatus::Ready);
+        assert!(status.is_ready());
+
+        let failed_dataset = TableReference::bare("broken");
+        status.update_dataset(&failed_dataset, ComponentStatus::error());
+        assert!(
+            !status.is_ready(),
+            "a failed dataset still blocks OnLoad readiness"
+        );
     }
 
     #[test]

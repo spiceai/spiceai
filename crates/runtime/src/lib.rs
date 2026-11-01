@@ -762,6 +762,9 @@ pub struct Runtime {
     /// The model loads in progress, so a Spicepod change can stop the load of a
     /// configuration it replaces or removes.
     model_loads: Arc<init::model::ModelLoads>,
+    /// The Spicepod tool loads in progress, from the first attempt through its background
+    /// retries, so loading the tools again replaces them instead of adding to them.
+    tool_loads: Arc<init::model::ModelLoads>,
     /// Startup view registrations still waiting, cancelled when a Spicepod change replaces or removes the view.
     view_loads: Arc<init::view_loads::ViewLoads>,
 
