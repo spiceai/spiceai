@@ -28,7 +28,7 @@ use llms::chat::{Chat, LocalModelOptions, ReasoningDefault};
 use llms_llamacpp::LlamaCpp;
 use serde_json::{Value, json};
 
-use crate::{mtp::qwen35_gguf, prefix_reuse::gemma_gguf, qwen3_gguf, request};
+use crate::{fixture, harmony, mtp::qwen35_gguf, prefix_reuse::gemma_gguf, qwen3_gguf, request};
 
 const A: &str = "The secret word is PLUM.";
 const B: &str = "Be brief.";
@@ -295,6 +295,46 @@ async fn named_templates_each_get_the_content_they_read() {
     assert_eq!(user_prompt(&model, &parts, false), format!("{A}\n{B}"));
     assert_eq!(user_prompt(&model, &parts, true), format!("{A}{B}"));
     assert_eq!(user_prompt(&model, &json!(A), true), A);
+}
+
+/// A gpt-oss model renders with a Harmony template and reads its replies by their markers. The
+/// template here, like gpt-oss's own, reads only a string (`+ message.content`), so a message's
+/// parts reach it joined with newlines, as on any other template, and the request decodes.
+#[tokio::test]
+async fn a_harmony_template_gets_parts_joined() {
+    let scratch = tempfile::tempdir().expect("a scratch directory");
+    let gguf = fixture::copy_with_tokens(&qwen3_gguf().await, scratch.path(), &harmony::MARKERS);
+    fixture::rename_string_key(&gguf, "tokenizer.chat_template", "tokenizer.no_chat_templ");
+    let template = harmony::template("");
+    let model = LlamaCpp::from(
+        &[gguf],
+        LocalModelOptions {
+            chat_template_literal: Some(&template),
+            reasoning: ReasoningDefault {
+                model_name: "harmony",
+                effort: None,
+            },
+            ..LocalModelOptions::default()
+        },
+    )
+    .await
+    .expect("the Harmony copy loads");
+    let parts = text_parts(&[A, B]);
+    assert_eq!(
+        user_prompt(&model, &parts, false),
+        "<|start|>user<|message|>The secret word is PLUM.\nBe brief.<|end|><|start|>assistant<|channel|>final<|message|>"
+    );
+    let ask = |content: &Value| {
+        request(json!({
+            "model": "harmony",
+            "messages": [{ "role": "user", "content": content }],
+            "max_tokens": 1,
+        }))
+    };
+    assert_eq!(
+        prompt_tokens(&model, &ask(&parts)).await,
+        prompt_tokens(&model, &ask(&json!(format!("{A}\n{B}")))).await
+    );
 }
 
 /// A part other than text is refused, since the engine gives the chat template only text: an
