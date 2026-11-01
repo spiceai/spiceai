@@ -3690,14 +3690,17 @@ mod tests {
         );
     }
 
-    /// An inclusive bound keeps its full precision: a row 100ns past it survives.
+    /// An inclusive bound keeps its full precision: a row 100ns past it survives, which
+    /// a comparison rounded to the millisecond or truncated to the microsecond would
+    /// delete with the row at the bound.
     #[tokio::test]
-    async fn retention_delete_keeps_sub_millisecond_precision() {
-        let (pool, schema) =
-            iso_events("(1, '2021-05-03T12:00:00.000100Z'), (2, '2021-05-03T12:00:00.000200Z')")
-                .await;
+    async fn retention_delete_keeps_nanosecond_precision() {
+        let (pool, schema) = iso_events(
+            "(1, '2021-05-03T12:00:00.000000100Z'), (2, '2021-05-03T12:00:00.000000200Z')",
+        )
+        .await;
         let filter = iso_filter(
-            1_620_043_200_000_100_000,
+            1_620_043_200_000_000_100,
             datafusion::logical_expr::Operator::LtEq,
         );
         assert_eq!(

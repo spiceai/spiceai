@@ -43,10 +43,17 @@ echo "spiced: $($SPICED --version 2>&1 | head -1)  TZ=$SPICED_TZ  workdir: $W"
     acceleration: {enabled: true, engine: $e, mode: $(mode $e), retention_check_enabled: true, retention_period: 24h, retention_check_interval: 1h}
 Y
   done; done; } | pod iso
+# Every load starts after this, so a row older than the window at this moment was
+# outside it at every load. A row that ages out after its load stays until the next
+# hourly check on engines that do not hide expired rows, so the expired count is
+# taken against this moment, not the time of the query.
+LOAD_START=$(date -u +%s)
+# A plain timestamp literal, so an engine the filter is pushed to needs no function for it.
+EXPIRED_BEFORE=$($PY -c "import datetime as d, sys; print((d.datetime.fromtimestamp(int(sys.argv[1]), d.timezone.utc) - d.timedelta(hours=24, seconds=5)).strftime('%Y-%m-%d %H:%M:%S'))" "$LOAD_START")
 run_pod iso
 for e in $ENGINES; do for c in ts_iso ts_iso_off ts_iso_naive; do
   t=${c}_$e
-  out=$(q "select count(*) filter (where ts < now() - interval '24 hours' - interval '5 seconds'), count(*) filter (where ts >= now() - interval '24 hours' + interval '5 seconds'), count(*) filter (where ts is null) from $t")
+  out=$(q "select count(*) filter (where ts < TIMESTAMP '$EXPIRED_BEFORE'), count(*) filter (where ts >= now() - interval '24 hours' + interval '5 seconds'), count(*) filter (where ts is null) from $t")
   IFS=, read -r expired live nulls <<<"$out"
   want_live=$($PY - "$DATA" <<'P'
 import sys, datetime as dt, pyarrow.parquet as pq

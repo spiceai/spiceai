@@ -17,8 +17,10 @@ For each engine in `ENGINES` (default `arrow duckdb sqlite cayenne`), with
 reads an offset-free string in the host zone shows up):
 
 1. **ISO 8601 retention.** One dataset per string column, `time_format: iso8601`,
-   `retention_period: 24h`. No row older than `now - 24h` stays, the live count is
-   within 10 rows of the parquet, and the 4 NULL-time rows remain. A text compare
+   `retention_period: 24h`. No row older than `24h` before the loads start stays
+   (a row that ages out after its load waits for the hourly check on engines that
+   do not hide expired rows), the live count is within 10 rows of the parquet, and
+   the 4 NULL-time rows remain. A text compare
    of the cutoff keeps or drops rows by string order. On Cayenne it failed with
    `LargeUtf8 >= Utf8`. An engine-side parse of the string drops `ts_iso_off`'s
    offsets (`DuckDB`) or reads `ts_iso_naive` in the host zone (`SQLite`), which
