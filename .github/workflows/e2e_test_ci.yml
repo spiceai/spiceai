@@ -1611,6 +1611,10 @@ jobs:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
+      # duckdb: datasets load the DuckDB library installed on the host.
+      - name: Set up libduckdb
+        uses: ./.github/actions/setup-libduckdb
+
       - name: Install Spice
         uses: ./.github/actions/install-spice
         with:
@@ -2553,6 +2557,10 @@ jobs:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
+      # duckdb: datasets load the DuckDB library installed on the host.
+      - name: Set up libduckdb
+        uses: ./.github/actions/setup-libduckdb
+
       - name: Install spice
         uses: ./.github/actions/install-spice
         with:
@@ -2771,6 +2779,10 @@ jobs:
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
+
+      # duckdb: datasets load the DuckDB library installed on the host.
+      - name: Set up libduckdb
+        uses: ./.github/actions/setup-libduckdb
 
       - name: Install spice
         uses: ./.github/actions/install-spice
