@@ -3530,6 +3530,7 @@ mod tests {
             special: SpecialTokens::default(),
             harmony: Some(HARMONY_MARKERS),
             reasoning_support: ReasoningSupport::default(),
+            content_support: ContentSupport::default(),
             counter: AtomicUsize::new(0),
             context_window: 0,
             reused_prompt_tokens: Arc::default(),
