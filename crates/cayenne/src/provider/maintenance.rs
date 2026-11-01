@@ -268,6 +268,11 @@ impl RetentionBackoff {
         self.retry_at.is_some_and(|retry_at| now < retry_at)
     }
 
+    /// Failures since the last completed pass.
+    pub(crate) fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
     /// Whether a failed pass still owes a retry.
     pub(crate) fn retry_owed(&self) -> bool {
         self.retry_at.is_some()
