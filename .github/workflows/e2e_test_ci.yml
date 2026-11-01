@@ -2987,7 +2987,7 @@ jobs:
       # Sources run in containers; log in so image pulls are not rate limited.
       - name: Login to DockerHub
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
