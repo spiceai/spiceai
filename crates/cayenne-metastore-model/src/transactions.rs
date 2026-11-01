@@ -54,6 +54,18 @@ pub struct State {
     bad_fence: bool,
     bad_resolution: bool,
     nonowner: bool,
+    /// The transaction's records (its intent and decision objects) exist.
+    records: bool,
+    /// The decision object's outcome while it exists: 0 none, 1 commit, 2
+    /// abort. `decision` keeps the first outcome ever recorded.
+    recorded: u8,
+    /// The coordinator removed the records and stops: it prepares and decides
+    /// nothing more.
+    coordinator_done: bool,
+    /// Who removed records: 1 the coordinator, 2 another process after every
+    /// participant's lease moved past the coordinator's, 4 a decision object
+    /// recreated after the records went.
+    removed: u8,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -70,7 +82,16 @@ pub enum Action {
     Observe(usize),
     Advance(usize),
     Create(usize, usize),
+    /// Remove the transaction's records: 0 by the coordinator once every
+    /// participant it prepared has resolved and no `Prepare` of its is in
+    /// flight; 1 by any other process once every participant's lease has moved
+    /// past the coordinator's and none holds the transaction prepared, or a
+    /// decision object left with no intent.
+    Forget(usize),
 }
+/// The lease the coordinator holds on every participant when the transaction
+/// begins. A `Prepare` is written only under it.
+const COORDINATOR_LEASE: u8 = 1;
 fn reference(log: &[Record]) -> View {
     let mut accepted = vec![];
     let mut pending = false;
@@ -133,6 +154,7 @@ impl Protocol {
             Action::Create(i, k) => Action::Create(index(i)?, k),
             Action::Deadline => Action::Deadline,
             Action::Decide(o) => Action::Decide(o),
+            Action::Forget(o) => Action::Forget(o),
         })
     }
     fn projection_step(&self, state: &State) -> bool {
@@ -157,6 +179,40 @@ impl Protocol {
                 enabled.contains(&projected) && pair_model.next_state(&from, projected) == Some(to)
             })
         })
+    }
+    /// Every participant's lease has moved past the coordinator's.
+    fn all_fenced(state: &State) -> bool {
+        state
+            .ds
+            .iter()
+            .all(|dataset| dataset.lease > COORDINATOR_LEASE)
+    }
+    /// The coordinator knows the decision, has no `Prepare` in flight, and every
+    /// participant it prepared has resolved.
+    fn coordinator_may_forget(&self, state: &State) -> bool {
+        let in_flight = |r: &Option<Req>| r.as_ref().is_some_and(|r| r.kind == 1);
+        !state.coordinator_done
+            && state.records
+            && state.recorded != 0
+            && state.ds.iter().all(|dataset| {
+                !fold(&dataset.log).pending
+                    && (self.has("no-coordinator-wait")
+                        || !in_flight(&dataset.req) && !in_flight(&dataset.parked))
+            })
+    }
+    /// Another process, from storage alone: the decision is recorded, every
+    /// participant's lease has moved past the coordinator's, and none holds the
+    /// transaction prepared. A decision object with no intent goes too.
+    fn other_may_forget(&self, state: &State) -> bool {
+        if !state.records {
+            return state.recorded != 0;
+        }
+        state.recorded != 0
+            && (self.has("no-fence-check") || Self::all_fenced(state))
+            && state
+                .ds
+                .iter()
+                .all(|dataset| Self::decode(dataset).is_some_and(|log| !fold(&log).pending))
     }
     fn head(dataset: &Local) -> Head {
         Head {
@@ -228,12 +284,16 @@ impl Model for Protocol {
             bad_fence: false,
             bad_resolution: false,
             nonowner: false,
+            records: true,
+            recorded: 0,
+            coordinator_done: false,
+            removed: 0,
         }]
     }
     fn actions(&self, state: &State, action: &mut Vec<Action>) {
         use Action::{
-            Advance, Check, Checkpoint, Create, Deadline, Decide, Deliver, Fence, Gc, Issue,
-            Observe, Publish, Switch,
+            Advance, Check, Checkpoint, Create, Deadline, Decide, Deliver, Fence, Forget, Gc,
+            Issue, Observe, Publish, Switch,
         };
         for i in 0..state.ds.len() {
             let dataset = &state.ds[i];
@@ -274,7 +334,11 @@ impl Model for Protocol {
                         && (dataset.issued & (1 << k) == 0
                             || (k == 3 && dataset.log.iter().filter(|r| r.0 == 3).count() < 2))
                         && (k != 1 || dataset.object)
-                        && (k != 3 || state.decision != 0)
+                        // Only the coordinator prepares, under the lease it held
+                        // when the transaction began; a takeover fences it.
+                        && (k != 1
+                            || dataset.lease == COORDINATOR_LEASE && !state.coordinator_done)
+                        && (k != 3 || state.recorded != 0)
                         && (k == 3 || !v.pending || self.has("no-reservation"))
                         && (k != 3 || v.pending || self.has("no-matching"))
                     {
@@ -311,18 +375,29 @@ impl Model for Protocol {
         if !state.deadline {
             action.push(Deadline);
         }
-        if state.deciders & 1 == 0 && state.ds.iter().all(|dataset| dataset.prepare_known) {
+        if state.deciders & 1 == 0
+            && !state.coordinator_done
+            && state.ds.iter().all(|dataset| dataset.prepare_known)
+        {
             action.push(Decide(1));
         }
-        if state.deadline && state.deciders & 2 == 0 {
+        // Anyone may abort after the deadline, or once every participant's lease
+        // has moved past the coordinator's, which can then prepare nothing more.
+        if (state.deadline || Self::all_fenced(state)) && state.deciders & 2 == 0 {
             action.push(Decide(2));
+        }
+        if self.coordinator_may_forget(state) {
+            action.push(Forget(0));
+        }
+        if self.other_may_forget(state) {
+            action.push(Forget(1));
         }
         crate::prune_for_simulation(self, state, action);
     }
     fn next_state(&self, state: &State, action: Action) -> Option<State> {
         use Action::{
-            Advance, Check, Checkpoint, Create, Deadline, Decide, Deliver, Fence, Gc, Issue,
-            Observe, Publish, Switch,
+            Advance, Check, Checkpoint, Create, Deadline, Decide, Deliver, Fence, Forget, Gc,
+            Issue, Observe, Publish, Switch,
         };
         let mut next = state.clone();
         match action {
@@ -344,7 +419,7 @@ impl Model for Protocol {
                     pos: dataset.log.len(),
                     lease: if actor == 3 { 0 } else { dataset.lease },
                     kind: u8::try_from(k).ok()?,
-                    out: if k == 3 { state.decision } else { 0 },
+                    out: if k == 3 { state.recorded } else { 0 },
                     sent: 1,
                     done: 0,
                     answer: 0,
@@ -429,9 +504,31 @@ impl Model for Protocol {
             Deadline => next.deadline = true,
             Decide(o) => {
                 next.deciders |= 1 << (o - 1);
-                if state.decision == 0 || self.has("no-create-once") {
-                    next.decision = u8::try_from(o).ok()?;
+                let o = u8::try_from(o).ok()?;
+                // Create-if-absent: it lands when no decision object exists,
+                // including after the records were removed.
+                if state.recorded == 0 || self.has("no-create-once") {
+                    next.recorded = o;
+                    if state.decision == 0 || self.has("no-create-once") {
+                        next.decision = o;
+                    }
+                    if !state.records {
+                        next.removed |= 4;
+                    }
                 }
+            }
+            Forget(0) => {
+                next.coordinator_done = true;
+                next.records = false;
+                next.recorded = 0;
+                next.removed |= 1;
+            }
+            Forget(_) => {
+                if state.records {
+                    next.removed |= 2;
+                }
+                next.records = false;
+                next.recorded = 0;
             }
             Checkpoint(i) => {
                 // A checkpoint names the newest batch end, so the floor never
@@ -478,6 +575,12 @@ impl Model for Protocol {
                         let v = fold(&dataset.log);
                         (!v.pending && v.out != 1) || dataset.object
                     })
+                },
+            ),
+            Property::always(
+                "a prepared participant keeps its transaction's records",
+                |_, state: &State| {
+                    state.records || state.ds.iter().all(|dataset| !fold(&dataset.log).pending)
                 },
             ),
             Property::always("I6 applied outcomes equal decision", |_, state: &State| {
@@ -581,6 +684,17 @@ impl Model for Protocol {
                 },
                 |_, state: &State| state.ds.iter().all(|dataset| fold(&dataset.log).out == 2),
             ),
+            Property::sometimes("the coordinator removes the records", |_, state: &State| {
+                state.removed & 1 != 0
+            }),
+            Property::sometimes(
+                "another process removes the records after a takeover",
+                |_, state: &State| state.removed & 2 != 0,
+            ),
+            Property::sometimes(
+                "a decision object recreated after removal",
+                |_, state: &State| state.removed & 4 != 0,
+            ),
             Property::sometimes("non-owner Resolve after turnover", |_, state: &State| {
                 state.nonowner
             }),
@@ -627,8 +741,10 @@ pub struct Step {
     pub refused: Option<(usize, u8, bool)>,
     /// A participant whose lease the action advanced.
     pub fenced: Option<usize>,
-    /// The recorded decision after the action: 0 none, 1 commit, 2 abort.
+    /// The decision object after the action: 0 none, 1 commit, 2 abort.
     pub decision: u8,
+    /// Whether the transaction's records exist after the action.
+    pub records: bool,
     /// Each participant's log after the action, as (kind, outcome).
     pub logs: Vec<Vec<(u8, u8)>>,
 }
@@ -665,6 +781,7 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
             ("Observe", &[i]) => Action::Observe(i),
             ("Advance", &[i]) => Action::Advance(i),
             ("Create", &[i, j]) => Action::Create(i, j),
+            ("Forget", &[o]) => Action::Forget(o),
             _ => return None,
         };
         let mut enabled = vec![];
@@ -696,7 +813,8 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
                 Action::Fence(i) => Some(i),
                 _ => None,
             },
-            decision: next.decision,
+            decision: next.recorded,
+            records: next.records,
             logs: next
                 .ds
                 .iter()

@@ -1067,6 +1067,22 @@ pub fn runs() -> Vec<Run> {
             failure: "I8 visible replay equality",
         },
         Run {
+            name: "transactions-txn-no-fence-check-0-exhaust",
+            family: "transactions",
+            mode: "resolution-txn-no-fence-check",
+            bound: 0,
+            seed: None,
+            failure: "a prepared participant keeps its transaction's records",
+        },
+        Run {
+            name: "transactions-txn-no-coordinator-wait-0-exhaust",
+            family: "transactions",
+            mode: "resolution-txn-no-coordinator-wait",
+            bound: 0,
+            seed: None,
+            failure: "a prepared participant keeps its transaction's records",
+        },
+        Run {
             name: "transactions-txn-no-roots-0-exhaust",
             family: "transactions",
             mode: "resolution-txn-no-roots",
@@ -2709,6 +2725,12 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
     let added_required = run.failure.is_empty()
         && run.seed.is_none()
         && match (run.family, name) {
+            (
+                "transactions",
+                "the coordinator removes the records"
+                | "another process removes the records after a takeover"
+                | "a decision object recreated after removal",
+            ) => run.mode == "resolution-txn" && run.bound >= 1,
             (
                 "remote-maintenance",
                 "writer retries original stamps then commits" | "maintenance retries guards",
