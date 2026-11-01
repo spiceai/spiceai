@@ -4,7 +4,8 @@ description: >
   reported while it is still running, once it passes three times their median
   duration (and at least 30 s more), naming the dataset and the baseline.
   Refreshes at their usual pace are not reported. The source is a MySQL view
-  whose per-row SLEEP sets how long a refresh takes.
+  whose per-row SLEEP sets how long a refresh takes: 35 s for a refresh that
+  starts in a window the script opens, 0.2 s otherwise.
 
 sources:
   src: { kind: mysql }
@@ -27,7 +28,11 @@ steps:
       src: |
         CREATE TABLE t (id INT PRIMARY KEY, v INT);
         INSERT INTO t VALUES (1, 10);
-        CREATE VIEW paced AS SELECT id, v, SLEEP(0.2) AS s FROM t;
+        CREATE TABLE slow_window (opened DATETIME(6), closes DATETIME(6));
+        INSERT INTO slow_window VALUES (NULL, NULL);
+        CREATE VIEW paced AS
+          SELECT id, v, SLEEP(IF(NOW(6) >= w.opened AND NOW(6) < w.closes, 35, 0.2)) AS s
+          FROM t CROSS JOIN slow_window w;
   - start: {}
   - query: SELECT id, v FROM paced
     expect: { rows: [['1', '10']] }
@@ -35,16 +40,18 @@ steps:
   - wait-metric: { name: dataset_acceleration_refresh_duration_ms_count, labels: { dataset: paced }, above: 4, timeout: 60s }
   - assert-log: { lacks: ["Refresh of dataset 'paced' has run for"] }
 
-  # The source slows down: each refresh now takes 35 s.
-  - source-exec: { src: "CREATE OR REPLACE VIEW paced AS SELECT id, v, SLEEP(35) AS s FROM t" }
+  # The source slows down for one refresh: the next to start takes 35 s, and
+  # the one after it starts at least 35 s into the 30 s window, so after it has
+  # closed. The source recovers without the script acting again, so how
+  # quickly the script reacts cannot make a second refresh slow.
+  - source-exec: { src: "UPDATE slow_window SET opened = NOW(6), closes = NOW(6) + INTERVAL 30 SECOND" }
   - assert-log:
       contains: ["WARN .*Refresh of dataset 'paced' has run for \\d+s, more than 3 times the \\d+m?s its last \\d+ full refreshes took at the median, so its accelerated data is falling further behind the source than usual\\. .*See: https://spiceai\\.org/docs/features/data-acceleration/data-refresh"]
     eventually: 60s
   # One warning per slow refresh, not one per check.
   - assert-log: { count: { "Refresh of dataset 'paced' has run for": 1 } }
 
-  # The source recovers; the slow refresh finishes and later ones are not reported.
-  - source-exec: { src: "CREATE OR REPLACE VIEW paced AS SELECT id, v, SLEEP(0.2) AS s FROM t" }
+  # The slow refresh finishes and later ones are not reported.
   - assert-log: { contains: ["Loaded 1 rows? .*for dataset paced in 3[5-9]s"] }
     eventually: 60s
   - mark-metrics: recovered

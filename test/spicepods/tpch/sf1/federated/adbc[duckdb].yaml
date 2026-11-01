@@ -1,0 +1,30 @@
+version: v1
+kind: Spicepod
+name: adbc[duckdb]-federated
+datasets:
+  - from: adbc:customer
+    name: customer
+    params: &adbc_duckdb_params
+      adbc_driver: duckdb
+      adbc_uri: ./data/tpch.db
+  - from: adbc:lineitem
+    name: lineitem
+    params: *adbc_duckdb_params
+  - from: adbc:nation
+    name: nation
+    params: *adbc_duckdb_params
+  - from: adbc:orders
+    name: orders
+    params: *adbc_duckdb_params
+  - from: adbc:part
+    name: part
+    params: *adbc_duckdb_params
+  - from: adbc:partsupp
+    name: partsupp
+    params: *adbc_duckdb_params
+  - from: adbc:region
+    name: region
+    params: *adbc_duckdb_params
+  - from: adbc:supplier
+    name: supplier
+    params: *adbc_duckdb_params

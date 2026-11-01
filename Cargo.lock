@@ -4657,12 +4657,12 @@ dependencies = [
 name = "connector-duckdb"
 version = "2.5.0-unstable"
 dependencies = [
+ "adbc_driver_manager",
  "async-trait",
  "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
- "duckdb",
  "linkme",
  "paste",
  "runtime",
@@ -4670,18 +4670,19 @@ dependencies = [
  "runtime-datafusion",
  "runtime-parameters",
  "snafu",
+ "tokio",
 ]
 
 [[package]]
 name = "connector-ducklake"
 version = "2.5.0-unstable"
 dependencies = [
+ "adbc_driver_manager",
  "async-trait",
  "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
- "duckdb",
  "linkme",
  "runtime",
  "runtime-component",
@@ -12180,8 +12181,8 @@ dependencies = [
 
 [[package]]
 name = "llama-cpp-src"
-version = "0.1.11803"
-source = "git+https://github.com/spiceai/llama.cpp?rev=a337bb5ce3590beb8763494b4381fe830bac0bc8#a337bb5ce3590beb8763494b4381fe830bac0bc8"
+version = "0.1.11999"
+source = "git+https://github.com/spiceai/llama.cpp?rev=2bedd1f734588bedf2aef43464172f2a446033cc#2bedd1f734588bedf2aef43464172f2a446033cc"
 
 [[package]]
 name = "llguidance"

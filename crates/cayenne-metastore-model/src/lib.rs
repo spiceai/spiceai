@@ -12,8 +12,10 @@ mod dataset_lifecycle;
 mod floors;
 mod intent_partitioned;
 mod intent_roll_forward;
+mod object_names;
 mod position_deletes;
 mod read_programs;
+mod reads;
 mod replicas;
 mod retention;
 mod seq_order;
@@ -161,6 +163,78 @@ pub fn runs() -> Vec<Run> {
             failure: "I10 source append prefix exactly once",
         },
         Run {
+            name: "object-names",
+            family: "object-names",
+            mode: "object-names",
+            bound: 2,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "object-names-generation-only",
+            family: "object-names",
+            mode: "object-names-generation-only",
+            bound: 2,
+            seed: None,
+            failure: "no name created with different bytes",
+        },
+        Run {
+            name: "object-names-no-generation",
+            family: "object-names",
+            mode: "object-names-no-generation",
+            bound: 2,
+            seed: None,
+            failure: "no name created with different bytes",
+        },
+        Run {
+            name: "object-names-reuse-unit-id",
+            family: "object-names",
+            mode: "object-names-reuse-unit-id",
+            bound: 2,
+            seed: None,
+            failure: "no name created with different bytes",
+        },
+        Run {
+            name: "reads-linearizable",
+            family: "reads",
+            mode: "reads",
+            bound: 0,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "reads-bounded",
+            family: "reads",
+            mode: "reads",
+            bound: 1,
+            seed: None,
+            failure: "",
+        },
+        Run {
+            name: "reads-token-wait",
+            family: "reads",
+            mode: "reads-token-wait",
+            bound: 0,
+            seed: None,
+            failure: "query includes every commit completed more than S before it started",
+        },
+        Run {
+            name: "reads-response-time",
+            family: "reads",
+            mode: "reads-response-time",
+            bound: 1,
+            seed: None,
+            failure: "query includes every commit completed more than S before it started",
+        },
+        Run {
+            name: "reads-tick-only",
+            family: "reads",
+            mode: "reads-tick-only",
+            bound: 0,
+            seed: None,
+            failure: "query includes every commit completed more than S before it started",
+        },
+        Run {
             name: "standby",
             family: "standby",
             mode: "standby",
@@ -199,6 +273,14 @@ pub fn runs() -> Vec<Run> {
             bound: 0,
             seed: None,
             failure: "lease exclusive until expiry",
+        },
+        Run {
+            name: "standby-local-files",
+            family: "standby",
+            mode: "standby-local-files",
+            bound: 0,
+            seed: None,
+            failure: "standbys and new owners read every committed file",
         },
         Run {
             name: "standby-no-renew",
@@ -719,6 +801,14 @@ pub fn runs() -> Vec<Run> {
             bound: 2,
             seed: None,
             failure: "",
+        },
+        Run {
+            name: "commits-failed-resend-rejects",
+            family: "commits",
+            mode: "commit-retry-failed-resend-rejects",
+            bound: 2,
+            seed: None,
+            failure: "I5 resolution sound",
         },
         Run {
             name: "commits-no-resolve-before-retry",
@@ -2490,8 +2580,9 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
         && run.failure.is_empty()
         && (run.mode.contains("remote-gc") || run.mode.contains("checkpoint"))
         && *expectation == Expectation::Sometimes;
-    let standby_required =
-        run.family == "standby" && run.failure.is_empty() && *expectation == Expectation::Sometimes;
+    let standby_required = matches!(run.family, "standby" | "object-names" | "reads")
+        && run.failure.is_empty()
+        && *expectation == Expectation::Sometimes;
     let promotion_required = run.family == "cold-promotion"
         && run.failure.is_empty()
         && *expectation == Expectation::Sometimes;
@@ -2686,6 +2777,8 @@ where
                 || run.name.starts_with("source-")
                 || run.family == "retention"
                 || run.family == "standby"
+                || run.family == "object-names"
+                || run.family == "reads"
                 || run.family == "intent-roll-forward"
                 || run.family == "replicas"
                 || run.mode.contains("restart")
@@ -2741,6 +2834,8 @@ pub fn run(name: &str) -> Result<(), String> {
         "dataset-lifecycle" => check(dataset_lifecycle::Protocol::new(r.mode, r.bound), r),
         "source-positions" => check(source_positions::Protocol::new(r.mode, r.bound), r),
         "standby" => check(standby::Protocol::new(r.mode), r),
+        "object-names" => check(object_names::Protocol::new(r.mode, r.bound), r),
+        "reads" => check(reads::Protocol::new(r.mode, r.bound), r),
         "action-compatibility" => check(action_compatibility::Protocol::new(r.mode), r),
         "retention" => check(retention::Protocol::new(r.mode), r),
         "replicas" => check(replicas::Protocol::new(r.mode), r),
@@ -2783,4 +2878,153 @@ pub fn run(name: &str) -> Result<(), String> {
     } else {
         Err(format!("Unexpected outcome for {name}"))
     }
+}
+
+/// Problems with the model citations in design documents: a cited run that does
+/// not exist, or a claim of model checking with no run cited. Runs are cited as
+/// backticked names after `Model:` or inside `(model: …)`, and `prefix*` must
+/// match at least one run. A claim ("model-checked", "checked in the model",
+/// "verified in the model") must cite a run in its paragraph or table row, or
+/// link to a section that does; "not yet checked in the model" is not a claim.
+#[must_use]
+pub fn cite_check(docs: &[(String, String)]) -> Vec<String> {
+    let names: Vec<&str> = runs().iter().map(|r| r.name).collect();
+    let known = |c: &str| match c.strip_suffix('*') {
+        Some(prefix) => names.iter().any(|n| n.starts_with(prefix)),
+        None => names.contains(&c),
+    };
+    let mut problems = Vec::new();
+    for (path, text) in docs {
+        let blocks = blocks(text);
+        let cited_sections: Vec<String> = sections(&blocks)
+            .into_iter()
+            .filter(|(_, b)| b.iter().any(|p| !citations(p).is_empty()))
+            .map(|(anchor, _)| anchor)
+            .collect();
+        for (line, block) in &blocks {
+            for c in citations(block) {
+                if !known(&c) {
+                    problems.push(format!("{path}:{line}: cites `{c}`, which is not a run"));
+                }
+            }
+            let lower = block.to_lowercase();
+            let claims = [
+                "model-checked",
+                "checked in the model",
+                "verified in the model",
+            ]
+            .iter()
+            .any(|phrase| {
+                lower
+                    .match_indices(phrase)
+                    .any(|(i, _)| !lower[..i].ends_with("not yet "))
+            });
+            let linked = block
+                .split("](#")
+                .skip(1)
+                .filter_map(|rest| rest.split(')').next())
+                .any(|anchor| cited_sections.iter().any(|a| a == anchor));
+            if claims && citations(block).is_empty() && !linked {
+                problems.push(format!(
+                    "{path}:{line}: claims model checking but cites no run"
+                ));
+            }
+        }
+    }
+    problems
+}
+/// Paragraphs, with each table row and list item on its own, and the line each starts on.
+fn blocks(text: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut open = false;
+    let mut fenced = false;
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("```") {
+            fenced = !fenced;
+            open = false;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let starts = t.starts_with('|')
+            || t.starts_with('#')
+            || t.starts_with("- ")
+            || t.starts_with("* ")
+            || t.split_once(". ")
+                .is_some_and(|(n, _)| n.chars().all(|c| c.is_ascii_digit()));
+        if t.is_empty() {
+            open = false;
+        } else if open && !starts {
+            if let Some(last) = out.last_mut() {
+                last.1.push(' ');
+                last.1.push_str(t);
+            }
+        } else {
+            out.push((i + 1, t.to_string()));
+            open = !t.starts_with('|') && !t.starts_with('#');
+        }
+    }
+    out
+}
+/// Each heading's GitHub anchor and the blocks under it, up to the next heading.
+fn sections(blocks: &[(usize, String)]) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for (_, b) in blocks {
+        if let Some(title) = b.strip_prefix('#') {
+            let anchor: String = title
+                .trim_start_matches('#')
+                .trim()
+                .to_lowercase()
+                .chars()
+                .filter_map(|c| match c {
+                    ' ' => Some('-'),
+                    c if c.is_alphanumeric() || c == '-' || c == '_' => Some(c),
+                    _ => None,
+                })
+                .collect();
+            out.push((anchor, Vec::new()));
+        } else if let Some(last) = out.last_mut() {
+            last.1.push(b.clone());
+        }
+    }
+    out
+}
+/// Run names cited in one block.
+fn citations(block: &str) -> Vec<String> {
+    // ASCII lowercasing keeps byte offsets, so they index `block` too.
+    let lower = block.to_ascii_lowercase();
+    let mut scopes = Vec::new();
+    for (i, _) in lower.match_indices("model:") {
+        let starts_word = block[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '-');
+        if !starts_word {
+            continue;
+        }
+        // A citation inside parentheses ends at their close, one opening the
+        // block runs to its end, and one within a sentence ends with it.
+        let rest = &block[i..];
+        let open = block[..i].matches('(').count() > block[..i].matches(')').count();
+        let opens_block = block[..i].trim_start_matches(['-', '*', ' ']).is_empty();
+        scopes.push(if open {
+            rest.split_once(')').map_or(rest, |(s, _)| s)
+        } else if opens_block {
+            rest
+        } else {
+            rest.split_once(". ").map_or(rest, |(s, _)| s)
+        });
+    }
+    let mut out = Vec::new();
+    for scope in scopes {
+        // Every code span in a citation names a run.
+        for (k, part) in scope.split('`').enumerate() {
+            if k % 2 == 1 {
+                out.push(part.to_string());
+            }
+        }
+    }
+    out
 }
