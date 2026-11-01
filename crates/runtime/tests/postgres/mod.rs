@@ -53,9 +53,9 @@ pub mod replication_tpch;
 pub mod replication_type_change;
 #[cfg(all(feature = "postgres", feature = "duckdb"))]
 pub mod schema_inference;
-#[cfg(all(feature = "postgres", feature = "sqlite", not(windows)))]
+#[cfg(all(feature = "postgres", feature = "sqlite"))]
 pub mod write_back;
-#[cfg(all(feature = "postgres", not(target_os = "windows")))]
+#[cfg(feature = "postgres")]
 pub mod write_back_delivery;
 
 #[tokio::test]

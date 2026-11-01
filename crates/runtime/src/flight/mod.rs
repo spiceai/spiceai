@@ -890,6 +890,22 @@ pub(crate) fn record_batches_to_flight_stream(
         .map_err(to_tonic_err)
 }
 
+/// Streams a committed transaction's final result, holding its memory
+/// reservation until the stream is dropped.
+pub(crate) fn transaction_outcome_to_flight_stream(
+    outcome: query::TransactionOutcome,
+) -> impl Stream<Item = Result<FlightData, Status>> {
+    let query::TransactionOutcome {
+        result,
+        reservation,
+    } = outcome;
+    let batches = result.map(|(batches, _)| batches).unwrap_or_default();
+    record_batches_to_flight_stream(batches).map(move |item| {
+        let _held = &reservation;
+        item
+    })
+}
+
 /// Returns `true` when the request has an authenticated principal that
 /// lacks write permission (`"write"` or `"read_write"` group).
 /// Returns `false` when there is no principal (auth not configured)
@@ -2171,5 +2187,34 @@ mod tests {
                 "Arrow error: Memory error: buffer too small"
             )
         );
+    }
+
+    /// A transaction result's reservation is held until its Flight stream is
+    /// dropped, not released when the stream is built.
+    #[tokio::test]
+    async fn transaction_stream_holds_its_reservation() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let reservation = MemoryConsumer::new("transaction_result").register(&pool);
+        reservation.grow(1024);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .expect("record batch");
+        let outcome = query::TransactionOutcome {
+            result: Some((vec![batch], cache::result::CacheStatus::CacheMiss)),
+            reservation,
+        };
+
+        let mut stream = Box::pin(transaction_outcome_to_flight_stream(outcome));
+        assert_eq!(pool.reserved(), 1024);
+        while let Some(item) = stream.next().await {
+            item.expect("flight data");
+            assert_eq!(pool.reserved(), 1024);
+        }
+        drop(stream);
+        assert_eq!(pool.reserved(), 0);
     }
 }

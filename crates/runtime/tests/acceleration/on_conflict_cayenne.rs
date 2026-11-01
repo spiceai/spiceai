@@ -51,7 +51,6 @@ use crate::utils::{runtime_ready_check, test_request_context, wait_until_true};
 /// This test creates a Cayenne table directly using the `CayenneTableProvider` API
 /// to test `on_conflict` behavior without going through the file connector refresh path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_on_conflict_upsert() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use cayenne::metadata::CreateTableOptions;
@@ -177,7 +176,6 @@ async fn test_cayenne_on_conflict_upsert() -> Result<(), anyhow::Error> {
 /// This test creates a Cayenne table directly using the `CayenneTableProvider` API
 /// to test `on_conflict` behavior without going through the file connector refresh path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_on_conflict_drop_keeps_the_last_version() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use cayenne::metadata::CreateTableOptions;
@@ -307,7 +305,6 @@ async fn test_cayenne_on_conflict_drop_keeps_the_last_version() -> Result<(), an
 /// - Date32
 /// - Decimal128
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_core_arrow_data_types() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -421,7 +418,6 @@ async fn test_cayenne_core_arrow_data_types() -> Result<(), anyhow::Error> {
 
 /// Test Cayenne with primary key-based deletions
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_primary_key_delete() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -557,7 +553,6 @@ async fn execute_sql(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<RecordBatch>, a
 /// Verifies that partitioned Cayenne tables correctly handle primary keys
 /// for deletion operations within each partition.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_partitioned_primary_key() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -672,7 +667,6 @@ async fn test_cayenne_partitioned_primary_key() -> Result<(), anyhow::Error> {
 /// This test creates a partitioned Cayenne table directly using the `CayenneTableProvider` API
 /// to test `on_conflict` behavior without going through the file connector refresh path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_partitioned_on_conflict_upsert() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema};
     use cayenne::metadata::CreateTableOptions;
@@ -793,7 +787,6 @@ async fn test_cayenne_partitioned_on_conflict_upsert() -> Result<(), anyhow::Err
 /// This test creates a Cayenne table directly using the `CayenneTableProvider` API
 /// to test `on_conflict` behavior without going through the file connector refresh path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_composite_primary_key() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema};
     use cayenne::metadata::CreateTableOptions;
@@ -935,7 +928,6 @@ async fn test_cayenne_composite_primary_key() -> Result<(), anyhow::Error> {
 /// This test creates a Cayenne table directly using the `CayenneTableProvider` API
 /// to test primary key behavior without going through the file connector refresh path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_primary_key_no_on_conflict() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema};
     use cayenne::metadata::CreateTableOptions;
@@ -1049,7 +1041,6 @@ async fn test_cayenne_primary_key_no_on_conflict() -> Result<(), anyhow::Error> 
 /// Integration test to verify `on_conflict` works through the runtime loading path
 /// This test uses the full runtime to load a dataset with `on_conflict` configuration
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_on_conflict_runtime_integration() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -1165,7 +1156,6 @@ async fn test_cayenne_on_conflict_runtime_integration() -> Result<(), anyhow::Er
 /// Verifies that Cayenne correctly handles large data insertions and queries
 /// with multiple iterations.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_large_batch_roundtrip() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema};
     use cayenne::metadata::CreateTableOptions;
@@ -1274,7 +1264,6 @@ async fn test_cayenne_large_batch_roundtrip() -> Result<(), anyhow::Error> {
 
 /// Test Cayenne with special characters and edge case strings
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_special_characters() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema};
     use cayenne::metadata::CreateTableOptions;
@@ -1367,7 +1356,6 @@ async fn test_cayenne_special_characters() -> Result<(), anyhow::Error> {
 
 /// Test Cayenne with NULL values across various data types
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_null_handling() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use cayenne::metadata::CreateTableOptions;
@@ -1483,7 +1471,6 @@ async fn test_cayenne_null_handling() -> Result<(), anyhow::Error> {
 
 /// Test Cayenne upsert with batch update (multiple rows at once)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_upsert_batch_update() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema};
     use cayenne::metadata::CreateTableOptions;
@@ -1610,7 +1597,6 @@ async fn test_cayenne_upsert_batch_update() -> Result<(), anyhow::Error> {
 
 /// Test Cayenne deletion followed by new insert (not re-insertion of same key)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_delete_then_insert_new() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema};
     use cayenne::metadata::CreateTableOptions;
@@ -1738,7 +1724,6 @@ async fn test_cayenne_delete_then_insert_new() -> Result<(), anyhow::Error> {
 
 /// Test Cayenne with boundary numeric values
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_boundary_values() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema};
     use cayenne::metadata::CreateTableOptions;
@@ -1850,7 +1835,6 @@ async fn test_cayenne_boundary_values() -> Result<(), anyhow::Error> {
 
 /// Test Cayenne partitioned table with deletion across partitions
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(not(target_os = "windows"))]
 async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 

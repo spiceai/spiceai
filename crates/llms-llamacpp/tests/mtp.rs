@@ -35,11 +35,13 @@ pub(crate) async fn qwen35_gguf() -> PathBuf {
     llms::chat::hf_files::download_model(
         &format!("{MODEL}:{REVISION}"),
         &[FILE],
+        llms::chat::hf_files::Budget::Unmeasured,
         HubParams::default(),
         "qwen3.5",
     )
     .await
     .expect("Qwen3.5-0.8B downloads")
+    .dir
     .join(FILE)
 }
 
