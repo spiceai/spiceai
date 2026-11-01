@@ -20,8 +20,8 @@ mod analyze;
 
 use crate::context::RuntimeContext;
 use crate::error::{
-    ConnectionFailedSnafu, InvalidResponseSnafu, ModelNotFoundSnafu, NoModelsConfiguredSnafu,
-    Result, read_response,
+    ConnectionFailedSnafu, InvalidResponseSnafu, ModelListUnauthorizedSnafu, ModelNotFoundSnafu,
+    NoModelsConfiguredSnafu, Result, read_response,
 };
 use clap::{Args, Subcommand};
 use repl::util::{Spinner, create_editor_with_history, save_history};
@@ -85,6 +85,9 @@ async fn get_or_select_model(ctx: &RuntimeContext, model: Option<&str>) -> Resul
             .build(),
             repl::util::UtilError::InvalidResponse { message } => {
                 InvalidResponseSnafu { message }.build()
+            }
+            repl::util::UtilError::Unauthorized { endpoint } => {
+                ModelListUnauthorizedSnafu { endpoint }.build()
             }
         })
 }

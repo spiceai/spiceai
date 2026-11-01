@@ -148,6 +148,12 @@ pub enum Error {
     ))]
     Unauthorized,
 
+    /// The runtime refused to list its models (401 — credentials missing/invalid)
+    #[snafu(display(
+        "could not list models from {endpoint}: unauthorized: invalid or missing Spice API key. Run `spice login` or set SPICE_API_KEY."
+    ))]
+    ModelListUnauthorized { endpoint: String },
+
     /// Forbidden (403 — authenticated but not allowed)
     #[snafu(display(
         "forbidden: your API key is valid but does not have permission for this resource. Check API key scopes or contact your org admin."
@@ -527,7 +533,7 @@ impl Error {
             return Self::AUTH_EXIT_CODE;
         }
         match self {
-            Self::Unauthorized => Self::AUTH_EXIT_CODE,
+            Self::Unauthorized | Self::ModelListUnauthorized { .. } => Self::AUTH_EXIT_CODE,
             // These are explicit CLI contract refusals: the caller has to
             // change the request. Keep the long-standing `InvalidArgument`
             // behavior on the generic failure code because that variant is
@@ -797,6 +803,20 @@ mod tests {
             err.to_string(),
             "unauthorized: invalid or missing Spice API key. Run `spice login` or set SPICE_API_KEY."
         );
+    }
+
+    /// `test/cli/spice_chat_error.exp` matches this wording for `spice chat` with a wrong key.
+    #[test]
+    fn model_list_unauthorized_names_the_models_request_and_the_key() {
+        let err = ModelListUnauthorizedSnafu {
+            endpoint: "https://data.spiceai.io/v1/models?status=true",
+        }
+        .build();
+        assert_eq!(
+            err.to_string(),
+            "could not list models from https://data.spiceai.io/v1/models?status=true: unauthorized: invalid or missing Spice API key. Run `spice login` or set SPICE_API_KEY."
+        );
+        assert_eq!(err.exit_code(), Error::AUTH_EXIT_CODE);
     }
 
     #[test]

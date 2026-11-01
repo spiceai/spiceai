@@ -51,6 +51,8 @@ pub enum UtilError {
     ModelNotFound { model: String, available: String },
     /// No models configured
     NoModelsConfigured,
+    /// The runtime refused the models request (401): the API key is missing or wrong
+    Unauthorized { endpoint: String },
 }
 
 impl std::fmt::Display for UtilError {
@@ -65,6 +67,9 @@ impl std::fmt::Display for UtilError {
                     f,
                     "Model '{model}' not found. Available models: {available}"
                 )
+            }
+            Self::Unauthorized { endpoint } => {
+                write!(f, "could not list models from {endpoint}: unauthorized")
             }
             Self::NoModelsConfigured => {
                 write!(f, "No models are configured in the runtime")
@@ -167,6 +172,10 @@ pub async fn get_available_models(
             endpoint: url.clone(),
             source: error_chain(&e),
         })?;
+
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(UtilError::Unauthorized { endpoint: url });
+    }
 
     if !response.status().is_success() {
         let status = response.status();
@@ -495,5 +504,63 @@ mod tests {
         let response: ModelsResponse =
             serde_json::from_str(json).expect("Failed to parse empty ModelsResponse");
         assert!(response.data.is_empty());
+    }
+
+    /// Answer one HTTP request with `status_line` and the JSON error body a refusing runtime sends.
+    fn serve_one_status(status_line: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind status listener");
+        let addr = listener.local_addr().expect("status listener addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept models request");
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).expect("read models request");
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            let body = r#"{"error":"unauthorized"}"#;
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write models response");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// A 401 names the refusal, so the caller can tell the user their API key is the problem
+    /// rather than print the raw status and body.
+    #[tokio::test]
+    async fn a_401_from_the_models_endpoint_is_unauthorized() {
+        let (endpoint, server) = serve_one_status("401 Unauthorized");
+        let err = get_available_models(&reqwest::Client::new(), &endpoint, &[])
+            .await
+            .expect_err("a 401 must not list models");
+        server.join().expect("status server should not panic");
+        assert!(
+            matches!(&err, UtilError::Unauthorized { endpoint: url } if url.starts_with(&endpoint)),
+            "{err:?}"
+        );
+    }
+
+    /// Only a 401 is an authentication refusal: any other failure keeps its status and body.
+    #[tokio::test]
+    async fn a_500_from_the_models_endpoint_stays_an_invalid_response() {
+        let (endpoint, server) = serve_one_status("500 Internal Server Error");
+        let err = get_available_models(&reqwest::Client::new(), &endpoint, &[])
+            .await
+            .expect_err("a 500 must not list models");
+        server.join().expect("status server should not panic");
+        assert!(
+            matches!(&err, UtilError::InvalidResponse { message } if message.contains("500")),
+            "{err:?}"
+        );
     }
 }
