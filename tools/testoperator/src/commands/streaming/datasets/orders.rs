@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use duckdb::Connection;
+use duckdb_oracle::Connection;
 use test_framework::anyhow::{Context, Result};
 
 use super::DatasetType;
@@ -71,59 +71,20 @@ impl StreamingDataset for OrdersDataset {
         conn.execute_batch(&format!("CALL dbgen(sf={scale_factor});"))
             .context("Failed to generate TPCH data")?;
 
-        let mut stmt = conn
-            .prepare(
+        let batches = conn
+            .query(
                 "SELECT o_orderkey, o_custkey, o_orderstatus,
                         CAST(o_totalprice AS DOUBLE) as o_totalprice,
                         o_orderdate::VARCHAR, o_orderpriority, o_clerk, o_shippriority, o_comment
                 FROM orders
                 ORDER BY o_orderkey",
             )
-            .context("Failed to prepare orders query")?;
+            .context("Failed to query orders query")?;
 
-        let mut o_orderkey = Vec::new();
-        let mut o_custkey = Vec::new();
-        let mut o_orderstatus = Vec::new();
-        let mut o_totalprice = Vec::new();
-        let mut o_orderdate = Vec::new();
-        let mut o_orderpriority = Vec::new();
-        let mut o_clerk = Vec::new();
-        let mut o_shippriority = Vec::new();
-        let mut o_comment = Vec::new();
-
-        let mut rows = stmt.query([]).context("Failed to query orders data")?;
-        while let Some(row) = rows.next().context("Failed to read row")? {
-            o_orderkey.push(row.get::<_, i64>(0)?);
-            o_custkey.push(row.get::<_, i64>(1)?);
-            o_orderstatus.push(row.get::<_, String>(2)?);
-            o_totalprice.push(row.get::<_, f64>(3)?);
-            o_orderdate.push(row.get::<_, String>(4)?);
-            o_orderpriority.push(row.get::<_, String>(5)?);
-            o_clerk.push(row.get::<_, String>(6)?);
-            o_shippriority.push(row.get::<_, i64>(7)?);
-            o_comment.push(row.get::<_, String>(8)?);
-        }
-
-        let record_count = o_orderkey.len();
-        println!("Generated {record_count} orders records");
-
-        let batch = RecordBatch::try_new(
-            Arc::new(Self::schema()),
-            vec![
-                Arc::new(Int64Array::from(o_orderkey)),
-                Arc::new(Int64Array::from(o_custkey)),
-                Arc::new(StringArray::from(o_orderstatus)),
-                Arc::new(Float64Array::from(o_totalprice)),
-                Arc::new(StringArray::from(o_orderdate)),
-                Arc::new(StringArray::from(o_orderpriority)),
-                Arc::new(StringArray::from(o_clerk)),
-                Arc::new(Int64Array::from(o_shippriority)),
-                Arc::new(StringArray::from(o_comment)),
-            ],
-        )
-        .context("Failed to create Arrow RecordBatch")?;
-
-        Ok(vec![batch])
+        let batches = super::with_dataset_schema(batches, Self::schema())?;
+        let record_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        println!("Generated {record_count} records");
+        Ok(batches)
     }
 
     fn marker_record(&self) -> Result<RecordBatch> {

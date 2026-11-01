@@ -48,7 +48,7 @@ use crate::support;
 use std::path::{Path, PathBuf};
 
 use arrow::array::RecordBatch;
-use duckdb::Connection;
+use duckdb_oracle::Connection;
 use support::inventory::{build_inventory, fixture};
 use support::report::{RunResult, summary_line, write_coverage_report};
 use support::{
@@ -76,12 +76,7 @@ fn env_f64(name: &str, default: f64) -> f64 {
 }
 
 fn duckdb_query_batches(conn: &Connection, sql: &str) -> Result<Vec<RecordBatch>, String> {
-    let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {e}"))?;
-    let batches: Vec<RecordBatch> = stmt
-        .query_arrow([])
-        .map_err(|e| format!("query_arrow: {e}"))?
-        .collect();
-    Ok(batches)
+    conn.query(sql).map_err(|e| e.to_string())
 }
 
 fn load_duckdb_from_parquet(
@@ -455,16 +450,18 @@ fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> Option<PathBuf> {
     std::fs::create_dir_all(out_dir).expect("tpcds out dir");
 
     // Export every base table that exists after dsdgen.
-    let mut stmt = conn
-        .prepare(
-            "SELECT table_name FROM information_schema.tables \
-             WHERE table_schema = 'main' AND table_type = 'BASE TABLE'",
-        )
-        .expect("list tables");
-    let names: Vec<String> = stmt
-        .query_map([], |row| row.get(0))
-        .expect("query tables")
-        .filter_map(Result::ok)
+    let batches = conn.query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' AND table_type = 'BASE TABLE'").expect("list tables");
+    let names: Vec<String> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("table names")
+                .iter()
+                .map(|name| name.expect("non-null table name").to_owned())
+        })
         .collect();
     for table in names {
         let path = out_dir.join(format!("{table}.parquet"));

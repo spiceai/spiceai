@@ -6,7 +6,7 @@
 //
 //     https://www.apache.org/licenses/LICENSE-2.0
 
-//! Large-IN-list `DELETE`: Cayenne vs DuckDB.
+//! Large-IN-list `DELETE`: Cayenne vs `DuckDB`.
 //!
 //! This bench exists to expose the **MERGE INTO slow path** on Cayenne PK-based
 //! tables. `crates/cayenne/src/ddl/physical_plans.rs:611-628` shows the routing:
@@ -48,8 +48,8 @@
 //!   single `DELETE FROM t WHERE id IN (10 % of rows)` followed by a
 //!   `SELECT SUM(value) FROM t` to amortize the per-scan deletion-vector
 //!   probe (iter-3's bitmap→treemap conversion lives on this path too).
-//! - **DuckDB**: the same `id BIGINT PRIMARY KEY` table with the same
-//!   `DELETE FROM t WHERE id IN (...)` and a follow-up SUM. DuckDB rewrites
+//! - **`DuckDB`**: the same `id BIGINT PRIMARY KEY` table with the same
+//!   `DELETE FROM t WHERE id IN (...)` and a follow-up SUM. `DuckDB` rewrites
 //!   the affected blocks; Cayenne writes a deletion vector and applies it
 //!   at read time. Both paths are publicly documented; this bench measures
 //!   the wall-clock cost of each end-to-end.
@@ -58,7 +58,7 @@
 //! results sit alongside it. IN-list cardinality scales with table size:
 //! 10 % of rows for the same "delete a chunk" semantics. The legacy filter
 //! path's cost is `O(N_match × N_rows)` worst case (per-row evaluation),
-//! and `build_delete_filter` allocates ~N_match `ScalarValue::lit(…)` Expr
+//! and `build_delete_filter` allocates ~`N_match` `ScalarValue::lit(…)` Expr
 //! nodes plus a `Vec<Expr>` of the same size — this overhead is visible in
 //! the `cayenne/delete_in_list/<rows>` lane.
 //!
@@ -72,7 +72,7 @@
 //! - `cayenne/scan_after_in_list_delete/<rows>` vs
 //!   `duckdb/scan_after_in_list_delete/<rows>` — full-table SUM immediately
 //!   after the delete. Cayenne pays the per-file deletion-vector
-//!   bitmap→treemap conversion (iter-3 finding); DuckDB scans the already-
+//!   bitmap→treemap conversion (iter-3 finding); `DuckDB` scans the already-
 //!   rewritten blocks.
 
 #![cfg(feature = "duckdb-bench")]
@@ -229,7 +229,7 @@ fn bench_in_list_delete(c: &mut Criterion) {
                 let remaining: usize = cayenne_query(&fixture.table, "SELECT * FROM t")
                     .await
                     .iter()
-                    .map(|b| b.num_rows())
+                    .map(arrow::array::RecordBatch::num_rows)
                     .sum();
                 assert!(
                     remaining < rows,
