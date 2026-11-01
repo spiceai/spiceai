@@ -58,8 +58,7 @@ pub mod stream;
 mod substrait;
 
 pub use delegated_search::{
-    DelegatedSearchTable, SEARCH_CALL_TYPE_URL, SEARCH_SCORE_COLUMN, delegated_search,
-    delegated_search_schema,
+    SEARCH_CALL_TYPE_URL, SEARCH_SCORE_COLUMN, delegated_search, delegated_search_schema,
 };
 pub mod write;
 

@@ -67,7 +67,7 @@ use std::{
 };
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
-use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
+use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields, provider::UdtfSource};
 use snafu::ResultExt;
 
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
@@ -82,9 +82,8 @@ use runtime_search::{
 
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
 use {
-    crate::search::util::find_index_in_table_provider,
-    search::index::SearchIndex,
-    search::provider::{SearchQueryProvider, UdtfSource},
+    crate::search::util::find_index_in_table_provider, search::index::SearchIndex,
+    search::provider::SearchQueryProvider,
 };
 
 #[cfg(feature = "elasticsearch")]
@@ -555,8 +554,8 @@ impl TableFunctionImpl for VectorSearchTableFunc {
             if args.queries.len() <= 1
                 && let Some(delegated) = runtime_search::delegated::delegated_search(
                     table_provider.as_ref(),
-                    &args.tbl,
-                    &runtime_search::delegated::DelegatedSearchCall::Vector {
+                    &UdtfSource::VectorSearch {
+                        table: args.tbl.to_string(),
                         query: args.query.clone(),
                         column: args.column.clone(),
                         limit: args.limit,
@@ -569,7 +568,7 @@ impl TableFunctionImpl for VectorSearchTableFunc {
             }
             return Err(DataFusionError::Plan(format!(
                 "Table '{}' does not have an embedding index.",
-                args.tbl.clone()
+                args.tbl
             )));
         };
 

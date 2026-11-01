@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Typed plan federation between a sidecar and an upstream Spice runtime.
 
-use std::{fmt, sync::Arc};
+use std::{borrow::Cow, fmt, sync::Arc};
 
 use arrow::{
     array::RecordBatch,
@@ -80,12 +80,27 @@ pub(super) fn federated_provider(table: Arc<FlightTable>) -> FederatedTableProvi
     FederatedTableProviderAdaptor::new_with_provider(source, table)
 }
 
+/// Which table reads a plan sent upstream may contain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Reads {
+    /// Reads of tables federated to this upstream, renamed to their remote
+    /// references. A local table is refused.
+    #[default]
+    Federated,
+    /// The plan's own scan, already named by its remote reference.
+    Direct,
+    /// No table: a delegated search reads only its search leaf. Any scan, such
+    /// as one inside a filter's subquery, is refused, so the upstream never
+    /// resolves a name the sidecar did not declare.
+    None,
+}
+
 /// Resolve remote names at serialization time. All expression binding remains
 /// against the original local schemas; Substrait refers to fields by position.
 #[derive(Default)]
 struct SpiceProducer {
     extensions: Extensions,
-    direct_scan: bool,
+    reads: Reads,
 }
 
 impl SubstraitProducer for SpiceProducer {
@@ -102,7 +117,7 @@ impl SubstraitProducer for SpiceProducer {
                 common: None,
                 detail: Some(pbjson_types::Any {
                     type_url: SEARCH_CALL_TYPE_URL.to_string(),
-                    value: search.call.clone().into(),
+                    value: search.call.clone(),
                 }),
             })),
         }))
@@ -217,7 +232,11 @@ impl SubstraitProducer for SpiceProducer {
     }
 
     fn handle_table_scan(&mut self, scan: &TableScan) -> Result<Box<Rel>> {
-        let names = if self.direct_scan {
+        let names = if self.reads == Reads::None {
+            return Err(DataFusionError::Plan(
+                "A delegated search plan reads no table".into(),
+            ));
+        } else if self.reads == Reads::Direct {
             scan.table_name.to_vec()
         } else {
             let source = get_table_source(&scan.source)?.ok_or_else(|| {
@@ -242,7 +261,8 @@ impl SubstraitProducer for SpiceProducer {
                 }
             }
         };
-        let mut rel = from_table_scan(self, &read_columns(scan)?)?;
+        let read = read_columns(scan)?;
+        let mut rel = from_table_scan(self, &read)?;
         if let Some(RelType::Read(read)) = &mut rel.rel_type
             && let Some(ReadType::NamedTable(table)) = &mut read.read_type
         {
@@ -257,9 +277,9 @@ impl SubstraitProducer for SpiceProducer {
 /// its table by name, so a read never encodes a column it does not need, such
 /// as an embedding column, whose fixed-size list type Substrait cannot express.
 /// A scan of every column is returned unchanged.
-fn read_columns(scan: &TableScan) -> Result<TableScan> {
+fn read_columns(scan: &TableScan) -> Result<Cow<'_, TableScan>> {
     let Some(projection) = &scan.projection else {
-        return Ok(scan.clone());
+        return Ok(Cow::Borrowed(scan));
     };
     let source = scan.source.schema();
     let mut read: std::collections::BTreeSet<usize> = projection.iter().copied().collect();
@@ -271,7 +291,7 @@ fn read_columns(scan: &TableScan) -> Result<TableScan> {
         }
     }
     if read.len() == source.fields().len() {
-        return Ok(scan.clone());
+        return Ok(Cow::Borrowed(scan));
     }
     let read: Vec<usize> = read.into_iter().collect();
     let projection = projection
@@ -292,13 +312,14 @@ fn read_columns(scan: &TableScan) -> Result<TableScan> {
     .with_filters(scan.filters.clone())
     .with_fetch(scan.fetch)
     .build()
+    .map(Cow::Owned)
 }
 
 /// The Substrait relation, root names and extensions for `plan`. Fails when any
 /// part of the plan cannot be represented for the upstream.
-fn produce(plan: &LogicalPlan, direct_scan: bool) -> Result<(Rel, Vec<String>, Extensions)> {
+pub(super) fn produce(plan: &LogicalPlan, reads: Reads) -> Result<(Rel, Vec<String>, Extensions)> {
     let mut producer = SpiceProducer {
-        direct_scan,
+        reads,
         ..Default::default()
     };
     let input = *producer.handle_plan(plan)?;
@@ -311,8 +332,8 @@ fn produce(plan: &LogicalPlan, direct_scan: bool) -> Result<(Rel, Vec<String>, E
     Ok((input, names, producer.get_extensions()))
 }
 
-pub(super) fn encode_plan(plan: &LogicalPlan, direct_scan: bool) -> Result<Bytes> {
-    let (input, names, extensions) = produce(plan, direct_scan)?;
+pub(super) fn encode_plan(plan: &LogicalPlan, reads: Reads) -> Result<Bytes> {
+    let (input, names, extensions) = produce(plan, reads)?;
     // Extension maps do not have a stable iteration order. Serialize anchors
     // deterministically so identical fragments have identical wire cache keys.
     let mut extensions: Vec<
@@ -407,7 +428,7 @@ impl FederationProvider for SpiceFederation {
         // A failed conversion declines this candidate so the federation analyzer
         // can try smaller subtrees, keeping unsupported operators in the sidecar.
         // The analyzer asks at every node, so this skips the wire encoding.
-        Some(if produce(plan, false).is_ok() {
+        Some(if produce(plan, Reads::Federated).is_ok() {
             Arc::new(Analyzer::with_rules(vec![Arc::new(self.clone())])).into()
         } else {
             FederationAnalyzerForLogicalPlan::Unable
@@ -441,7 +462,7 @@ impl FederationPlanner for SpiceFederation {
             .optimize(node.plan().clone(), session, |_, _| {})?;
         Ok(Arc::new(SubstraitExec::new(
             self.client.clone(),
-            encode_plan(&plan, false)?,
+            encode_plan(&plan, Reads::Federated)?,
             Arc::new(node.plan().schema().as_arrow().clone()),
             table_names(node.plan())?,
         )))
@@ -476,7 +497,7 @@ pub(super) fn scan(
     let schema = Arc::new(plan.schema().as_arrow().clone());
     Ok(Arc::new(SubstraitExec::new(
         table.client.clone(),
-        encode_plan(&plan, true)?,
+        encode_plan(&plan, Reads::Direct)?,
         schema,
         table_names(&plan)?,
     )))
@@ -525,7 +546,9 @@ impl SubstraitExec {
 ///
 /// Top-level nullability is the remote's inference, not data: a remote
 /// rewrite (checked integer arithmetic) can widen it. The planned nullability
-/// applies once Arrow confirms a non-nullable column holds no nulls.
+/// applies once Arrow confirms a non-nullable column holds no nulls. The
+/// planned descriptive field metadata applies too (see
+/// [`same_fields_except_nullability`]).
 fn conform_batch(
     batch: RecordBatch,
     expected: &SchemaRef,
@@ -553,6 +576,10 @@ fn conform_batch(
     })
 }
 
+/// Whether `actual` matches `expected` but for nullability and descriptive
+/// field metadata. Metadata such as a source's `source_type` describes a
+/// column without changing its data, and the remote need not send it back.
+/// Arrow extension metadata does change what a column means, so it must match.
 fn same_fields_except_nullability(actual: &Fields, expected: &Fields) -> bool {
     actual.len() == expected.len()
         && actual
@@ -561,8 +588,19 @@ fn same_fields_except_nullability(actual: &Fields, expected: &Fields) -> bool {
             .all(|(actual, expected)| {
                 actual.name() == expected.name()
                     && actual.data_type() == expected.data_type()
-                    && actual.metadata() == expected.metadata()
+                    && extension_metadata(actual) == extension_metadata(expected)
             })
+}
+
+/// A field's Arrow extension metadata: the `ARROW:extension:*` keys.
+fn extension_metadata(field: &Field) -> Vec<(&String, &String)> {
+    let mut keys: Vec<_> = field
+        .metadata()
+        .iter()
+        .filter(|(key, _)| key.starts_with("ARROW:extension:"))
+        .collect();
+    keys.sort();
+    keys
 }
 
 impl DisplayAs for SubstraitExec {
@@ -669,7 +707,7 @@ mod tests {
         datatypes::{DataType, Field, Schema},
     };
 
-    use super::{conform_batch, encode_plan};
+    use super::{Reads, conform_batch, encode_plan};
 
     /// A read names only the columns it uses: its projection and the columns
     /// its filters reference. An embedding column the scan does not read is
@@ -707,7 +745,7 @@ mod tests {
             .expect("plan")
         };
 
-        let plan = Plan::decode(encode_plan(&scan(Some(vec![0])), true).expect("encodes"))
+        let plan = Plan::decode(encode_plan(&scan(Some(vec![0])), Reads::Direct).expect("encodes"))
             .expect("decodes");
         let Some(PlanRelType::Root(root)) = &plan.relations[0].rel_type else {
             panic!("a root relation: {plan:?}");
@@ -737,7 +775,7 @@ mod tests {
             .collect();
         assert_eq!(fields, vec![0]);
 
-        let error = encode_plan(&scan(Some(vec![0, 2])), true)
+        let error = encode_plan(&scan(Some(vec![0, 2])), Reads::Direct)
             .expect_err("Substrait has no fixed-size list type");
         assert!(error.to_string().contains("FixedSizeList"), "{error}");
     }
@@ -759,6 +797,38 @@ mod tests {
             .expect_err("a null in a non-nullable column");
         assert!(
             error.to_string().contains("declared as non-nullable"),
+            "{error}"
+        );
+    }
+
+    /// Descriptive metadata the remote does not send back, such as a source's
+    /// `source_type`, is restored from the plan; an extension type is not
+    /// something a remote may drop or change.
+    #[test]
+    fn conform_batch_restores_descriptive_metadata_but_not_extension_types() {
+        use std::collections::HashMap;
+        let with = |metadata: &[(&str, &str)]| {
+            Arc::new(Schema::new(vec![
+                Field::new("n", DataType::Int64, true).with_metadata(
+                    metadata
+                        .iter()
+                        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                        .collect::<HashMap<_, _>>(),
+                ),
+            ]))
+        };
+        let planned = with(&[("source_type", "bigint")]);
+        let conformed = conform_batch(batch(true, vec![Some(2), None]), &planned, None)
+            .expect("metadata alone is not a mismatch");
+        assert_eq!(conformed.schema(), planned);
+
+        let extension = with(&[("ARROW:extension:name", "arrow.uuid")]);
+        let error = conform_batch(batch(true, vec![Some(2)]), &extension, None)
+            .expect_err("an extension type the remote dropped is a mismatch");
+        assert!(
+            error
+                .to_string()
+                .contains("differs from the planned schema"),
             "{error}"
         );
     }

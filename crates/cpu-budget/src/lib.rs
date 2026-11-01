@@ -157,8 +157,7 @@ pub struct CpuConfig {
 /// detected entitlement above it is capped, and so is a configured one, with a
 /// warning (see [`CpuBudget::sidecar_cap_warning`]).
 pub const SIDECAR_MAX_CORES: usize = 4;
-const SIDECAR_MAX_MILLICORES: u64 = 4_000;
-const _: () = assert!(SIDECAR_MAX_MILLICORES == SIDECAR_MAX_CORES as u64 * 1000);
+const SIDECAR_MAX_MILLICORES: u64 = SIDECAR_MAX_CORES as u64 * 1000;
 
 impl CpuConfig {
     pub const CLI_SETTING: &str = "--cpu-cores";
@@ -599,6 +598,16 @@ pub fn detect_cpu_share() -> Option<CpuShare> {
 /// is shared between a countable number of plans.
 const QUERIES_PER_CORE: usize = 4;
 
+/// Query plans an application sidecar admits concurrently per core when
+/// `runtime.query.max_concurrent_queries` is unset. A sidecar plan runs on one
+/// target partition ([`CpuBudget::sidecar_target_partitions`]) and spends most
+/// of its time waiting on the upstream it reads from, so it holds a fraction of
+/// a server plan's memory-pool reservations and CPU; admitted at
+/// [`QUERIES_PER_CORE`], a sidecar's cores idle while its queries wait. Four
+/// times that rate admits, at [`SIDECAR_MAX_CORES`], the 64 plans a 16-core
+/// server admits, each reserving one partition rather than sixteen.
+const SIDECAR_QUERIES_PER_CORE: usize = 4 * QUERIES_PER_CORE;
+
 /// How far above its CPU request a burstable pod sizes itself.
 ///
 /// A request is a scheduling floor, not a ceiling, so sizing *at* the request
@@ -757,11 +766,11 @@ impl CpuBudget {
         // available CPUs. Expressing it as "skip one rung" rather than as its own
         // `min(quota, affinity)` keeps one place that knows how to weigh a quota
         // against affinity, and needs no update when a rung is added.
-        let all_cores = matches!(configured, Some((CpuSetting::All, _)));
         let all_setting = match configured {
             Some((CpuSetting::All, setting)) => Some(setting),
             _ => None,
         };
+        let all_cores = all_setting.is_some();
         let explicit = match configured {
             Some((CpuSetting::Cores(millicores), setting)) => Some((millicores, setting)),
             _ => None,
@@ -1454,10 +1463,17 @@ impl CpuBudget {
     /// [`Self::target_partitions`] operator reservations against a fixed memory
     /// pool, so unbounded concurrency lets queries starve each other and, past a
     /// point, take the process down. A small multiple of the core count keeps
-    /// enough in flight to hide I/O stalls without that.
+    /// enough in flight to hide I/O stalls without that. A sidecar, whose plans
+    /// run on one partition and mostly wait on its upstream, admits
+    /// [`SIDECAR_QUERIES_PER_CORE`].
     #[must_use]
     pub const fn max_concurrent_queries(&self) -> usize {
-        self.cores.saturating_mul(QUERIES_PER_CORE)
+        let per_core = if self.sidecar {
+            SIDECAR_QUERIES_PER_CORE
+        } else {
+            QUERIES_PER_CORE
+        };
+        self.cores.saturating_mul(per_core)
     }
 
     // ---- Cayenne ----
@@ -2965,6 +2981,30 @@ mod tests {
     fn max_concurrent_queries_scales_with_the_budget() {
         assert_eq!(budget(1).max_concurrent_queries(), 4);
         assert_eq!(budget(16).max_concurrent_queries(), 64);
+    }
+
+    /// A sidecar's plans run on one partition and mostly wait on its upstream,
+    /// so it admits sixteen per core: at its 4-core maximum, the 64 a 16-core
+    /// server admits, rather than the 16 a 4-core server does.
+    #[test]
+    fn a_sidecar_admits_sixteen_queries_per_core() {
+        let sidecar = |host: &HostReadings| {
+            CpuBudget::resolve(&CpuConfig::default().for_sidecar(), host)
+                .expect("detection cannot fail")
+        };
+        for (cores, server, capped) in [(1, 4, 16), (2, 8, 32), (4, 16, 64), (16, 64, 64)] {
+            assert_eq!(
+                budget(cores).max_concurrent_queries(),
+                server,
+                "server, {cores} cores"
+            );
+            assert_eq!(
+                sidecar(&host(cores)).max_concurrent_queries(),
+                capped,
+                "sidecar, {cores} cores"
+            );
+        }
+        assert_eq!(sidecar(&host(16)).sidecar_target_partitions(), 1);
     }
 
     #[test]

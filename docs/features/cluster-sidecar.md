@@ -56,10 +56,10 @@ the sidecar declares. These functions run in the sidecar, never in a remote
 fragment, so a name always refers to the sidecar's own model. The embeddings
 cache (`runtime.caching.embeddings`) answers repeated inputs locally.
 
-Search runs where the indexes are. When a sidecar's Spice dataset has no
-local embeddings or full-text index, `vector_search` and `text_search` run on
-the upstream runtime, against its embeddings and indexes, with no
-configuration in the sidecar:
+Search runs where the indexes are. When a sidecar's Spice dataset is not
+accelerated and has no local embeddings or full-text index, `vector_search`
+and `text_search` run on the upstream runtime, against its embeddings and
+indexes, with no configuration in the sidecar:
 
 ```sql
 SELECT id, label, _score FROM vector_search(docs, 'snow') WHERE value > 0 LIMIT 5;
@@ -68,11 +68,17 @@ SELECT * FROM rrf(vector_search(docs, 'snow'), text_search(docs, 'snow', label))
 
 The sidecar sends each search to the upstream as one Substrait plan, with the
 filters and limit the upstream can evaluate, and receives the dataset's
-columns plus `_score`. The query is embedded upstream, so the sidecar needs no
+columns plus `_score`. A filter with a subquery is evaluated in the sidecar,
+against the sidecar's own catalog. An accelerated dataset is searched only
+through a local index, since a search on the upstream would return rows the
+working set does not hold. The query is embedded upstream, so the sidecar needs no
 embedding model. `rrf` combines delegated searches in the sidecar. `/v1/search`
 delegates vector search over every column the upstream embeds; full-text
 search through `/v1/search` needs a local full-text index, so use `text_search`
-in SQL for a delegated dataset. The upstream must be a release that accepts
+in SQL for a delegated dataset. Because of that, `/v1/search` through a sidecar
+does not fuse vector and full-text results as the upstream's own `/v1/search`
+does, and its results carry key columns in `data` rather than in
+`primary_key`. The upstream must be a release that accepts
 delegated search; an older one returns an error naming the dataset.
 
 Each remote read names only the columns the query uses. A dataset whose
@@ -90,7 +96,13 @@ For a local working set, add the existing acceleration configuration:
       mode: memory
 ```
 
-Use Cayenne's existing file mode for persistent local storage. A sidecar does
+A sidecar serves the hot and warm tiers: memory (`mode: memory`) and local
+disk (`mode: file`), which may be the pod's ephemeral disk. The cluster serves
+those and the cold tier on object storage. A sidecar refuses, at load, a
+dataset that keeps data or a search index on object storage:
+`cayenne_datalake_location`, a `cayenne_file_path` on object storage,
+`cayenne_s3_zone_ids`, or `vectors: { engine: s3_vectors }`. Search over data
+with no local index runs on the cluster, as above. A sidecar does
 not automatically replicate datasets, change refresh schedules, or replace a
 dataset's configured fallback policy. An empty accelerated result does not
 automatically trigger a remote query. Cache TTL, stale serving, invalidation,
@@ -105,8 +117,11 @@ including `all` on a larger host, is capped at 4 with a warning that names the
 setting. A value of 4 or less applies as configured. Sidecars also default local
 queries to one target partition, so independent queries share the CPU budget;
 override this with `runtime.query.target_partitions` when appropriate for your
-workload. Query admission and memory limits still apply. Explicit resource and
-cache settings take precedence over defaults.
+workload. Because those queries mostly wait on the upstream, a sidecar admits
+16 concurrent queries per core (64 on 4 cores) when
+`runtime.query.max_concurrent_queries` is unset, where a server admits 4.
+Memory limits still apply. Explicit resource and cache settings take
+precedence over defaults.
 
 The upstream results cache can key Substrait requests by a hash of their
 serialized plan when `runtime.caching.sql_results.cache_key_type: plan` is set.

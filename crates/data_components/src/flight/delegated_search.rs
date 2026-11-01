@@ -28,15 +28,16 @@ limitations under the License.
 
 use std::{cmp::Ordering, fmt, sync::Arc};
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, SchemaBuilder, SchemaRef};
 use async_trait::async_trait;
+use bytes::Bytes;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Column, DFSchema, DFSchemaRef, Result, tree_node::Transformed, tree_node::TreeNode},
+    common::{DFSchema, DFSchemaRef, Result},
     datasource::TableType,
     logical_expr::{
         Expr, Extension, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown,
-        UserDefinedLogicalNodeCore, utils::conjunction,
+        UserDefinedLogicalNodeCore, expr_rewriter::unnormalize_cols, ident, utils::conjunction,
     },
     physical_plan::ExecutionPlan,
 };
@@ -46,7 +47,7 @@ use spice_table::LayerWalk;
 
 use super::{
     FlightTable,
-    substrait::{SubstraitExec, encode_plan},
+    substrait::{Reads, SubstraitExec, encode_plan, produce},
 };
 
 /// The `ExtensionLeafRel` detail type of a delegated search: an encoded
@@ -61,7 +62,7 @@ pub const SEARCH_SCORE_COLUMN: &str = "_score";
 /// never executed locally.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct SearchCallNode {
-    pub(super) call: Vec<u8>,
+    pub(super) call: Bytes,
     schema: DFSchemaRef,
 }
 
@@ -99,9 +100,9 @@ impl UserDefinedLogicalNodeCore for SearchCallNode {
 
 /// A `vector_search` or `text_search` the upstream Spice runtime runs.
 #[derive(Debug)]
-pub struct DelegatedSearchTable {
+struct DelegatedSearchTable {
     client: FlightClient,
-    call: Vec<u8>,
+    call: Bytes,
     schema: SchemaRef,
     dataset: String,
 }
@@ -122,39 +123,23 @@ impl DelegatedSearchTable {
             }),
         });
         let mut plan = LogicalPlanBuilder::from(leaf);
-        if let Some(predicate) = conjunction(
-            filters
-                .iter()
-                .map(unqualified)
-                .collect::<Result<Vec<_>>>()?,
-        ) {
+        // A scan's filters arrive qualified with the table function's alias; the
+        // search leaf's schema is unqualified.
+        if let Some(predicate) = conjunction(unnormalize_cols(filters.iter().cloned())) {
             plan = plan.filter(predicate)?;
         }
         if let Some(projection) = projection {
-            plan = plan.project(projection.iter().map(|index| {
-                Expr::Column(Column::new_unqualified(self.schema.field(*index).name()))
-            }))?;
+            plan = plan.project(
+                projection
+                    .iter()
+                    .map(|index| ident(self.schema.field(*index).name())),
+            )?;
         }
         if let Some(limit) = limit {
             plan = plan.limit(0, Some(limit))?;
         }
         plan.build()
     }
-}
-
-/// A scan's filters arrive qualified with the table function's alias; the
-/// search leaf's schema is unqualified.
-fn unqualified(expr: &Expr) -> Result<Expr> {
-    expr.clone()
-        .transform(|expr| {
-            Ok(match expr {
-                Expr::Column(column) => {
-                    Transformed::yes(Expr::Column(Column::new_unqualified(column.name)))
-                }
-                other => Transformed::no(other),
-            })
-        })
-        .map(|transformed| transformed.data)
 }
 
 #[async_trait]
@@ -172,13 +157,14 @@ impl TableProvider for DelegatedSearchTable {
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
         // A filter the upstream can evaluate runs there, before rows cross the
-        // network; anything else (a sidecar-only function) runs here.
+        // network; anything else (a sidecar-only function) runs here. Producing
+        // the Substrait relation decides it, without the wire encoding.
         Ok(filters
             .iter()
             .map(|filter| {
                 if self
                     .plan(None, &[(*filter).clone()], None)
-                    .and_then(|plan| encode_plan(&plan, true))
+                    .and_then(|plan| produce(&plan, Reads::None))
                     .is_ok()
                 {
                     TableProviderFilterPushDown::Exact
@@ -197,10 +183,10 @@ impl TableProvider for DelegatedSearchTable {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let plan = self.plan(projection, filters, limit)?;
-        let schema = Arc::new(plan.schema().as_arrow().clone());
+        let schema = Arc::clone(plan.schema().inner());
         Ok(Arc::new(SubstraitExec::new(
             self.client.clone(),
-            encode_plan(&plan, true)?,
+            encode_plan(&plan, Reads::None)?,
             schema,
             self.dataset.clone(),
         )))
@@ -210,7 +196,11 @@ impl TableProvider for DelegatedSearchTable {
 /// The Spice table a sidecar reads `provider` from, when it delegates search to
 /// that table's upstream: a Spice table read through Substrait.
 fn delegating_table(provider: &dyn TableProvider) -> Option<&FlightTable> {
-    spice_table::find_concrete::<FlightTable>(provider, LayerWalk::Read)
+    // `Passthrough` stops at an acceleration: a search delegated past it would
+    // read the whole upstream table, not the rows and columns the accelerated
+    // dataset holds (its `refresh_sql`, for one), so an accelerated dataset is
+    // searched locally or not at all.
+    spice_table::find_concrete::<FlightTable>(provider, LayerWalk::Passthrough)
         .filter(|table| table.substrait)
 }
 
@@ -239,22 +229,14 @@ pub fn delegated_search(
         MultiPartTableReference::TableReference(reference) => reference.to_quoted_string(),
         MultiPartTableReference::Multi(_) => return None,
     };
-    let mut fields: Vec<Field> = table
-        .schema
-        .fields()
-        .iter()
-        .map(|field| field.as_ref().clone())
-        .collect();
+    let mut schema = SchemaBuilder::from(table.schema.as_ref());
     if include_score {
-        fields.push(Field::new(SEARCH_SCORE_COLUMN, DataType::Float64, false));
+        schema.push(Field::new(SEARCH_SCORE_COLUMN, DataType::Float64, false));
     }
     Some(Arc::new(DelegatedSearchTable {
         client: table.client.clone(),
-        call: call(&remote),
-        schema: Arc::new(Schema::new_with_metadata(
-            fields,
-            table.schema.metadata().clone(),
-        )),
+        call: Bytes::from(call(&remote)),
+        schema: Arc::new(schema.finish()),
         dataset: dataset.to_string(),
     }))
 }

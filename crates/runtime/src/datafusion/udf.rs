@@ -400,21 +400,18 @@ fn sidecar_refused_function_message(name: &str) -> String {
 /// logging each; on any other role, returns `functions` unchanged.
 fn refuse_sidecar_code_functions(
     runtime: &crate::Runtime,
-    functions: Vec<Function>,
+    mut functions: Vec<Function>,
 ) -> Vec<Function> {
-    if runtime.role() != crate::config::Role::Sidecar {
-        return functions;
-    }
-    functions
-        .into_iter()
-        .filter(|decl| {
+    if runtime.role() == crate::config::Role::Sidecar {
+        functions.retain(|decl| {
             let refused = sidecar_refuses_function(decl);
             if refused {
                 tracing::error!("{}", sidecar_refused_function_message(&decl.name));
             }
             !refused
-        })
-        .collect()
+        });
+    }
+    functions
 }
 
 fn enabled_function_declarations(functions: &[Function]) -> Vec<Function> {

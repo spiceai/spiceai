@@ -884,7 +884,6 @@ impl RuntimeBuilder {
         };
 
         let mut rt = Runtime {
-            role,
             app: shared_app,
             apply_app_lock: Arc::new(tokio::sync::Mutex::new(())),
             initial_load: Arc::new(crate::InitialLoad::default()),

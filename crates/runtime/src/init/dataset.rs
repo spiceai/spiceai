@@ -43,9 +43,10 @@ use crate::{
     DurableWriteBackUnsupportedBySourceSnafu, DurableWriteBackWithRetentionSnafu, Error,
     FullTextSearchRequiresAccelerationSnafu, HotReloadRefreshFailedSnafu,
     HotReloadRefreshTimedOutSnafu, LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu,
-    Result, Runtime, UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
-    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
-    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
+    Result, Runtime, SidecarColdTierSnafu, UnableToAttachDataConnectorSnafu,
+    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
+    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
+    UnknownDataConnectorSnafu,
     component::dataset::{
         Dataset,
         acceleration::{Acceleration, DurableWriteBackKey, Engine, Mode, RefreshMode},
@@ -768,7 +769,7 @@ impl Runtime {
         let bootstrap_status = bootstrap_status.into();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
-        preflight_dataset(&ds, &self.status, &spaced_tracer)?;
+        preflight_dataset(&ds, self.role(), &self.status, &spaced_tracer)?;
 
         // Deferred path. Each connector factory decides via
         // `static_schema()` whether the dataset can be registered
@@ -1973,7 +1974,7 @@ impl Runtime {
         // preflight would destroy the state of a dataset whose configuration
         // cannot deliver what it has already acknowledged. Cheap to check here,
         // and the running dataset is left as it was.
-        if preflight_dataset(&ds, &self.status, &self.spaced_tracer).is_err() {
+        if preflight_dataset(&ds, self.role(), &self.status, &self.spaced_tracer).is_err() {
             // `preflight_dataset` reported it.
             return None;
         }
@@ -3156,7 +3157,7 @@ impl Runtime {
                 // below is where a `mode: file_create` accelerator is dropped,
                 // and the refusals this checks exist to stop exactly that
                 // happening to a dataset that cannot afford it.
-                if let Err(err) = preflight_dataset(&ds, &status, &spaced_tracer) {
+                if let Err(err) = preflight_dataset(&ds, df.role(), &status, &spaced_tracer) {
                     return (ds.name.clone(), Err(err));
                 }
 
@@ -3534,6 +3535,7 @@ pub(crate) fn is_permanent_dataset_failure(err: &Error) -> bool {
         | Error::DataConnectorNotInBuild { .. }
         // Dataset-level settings that contradict each other.
         | Error::FullTextSearchRequiresAcceleration { .. }
+        | Error::SidecarColdTier { .. }
         | Error::AcceleratedWriteBackWithoutReplication { .. }
         | Error::AccelerationWriteModeWithChanges { .. }
         | Error::PkConflictDetectionDisabled { .. }
@@ -3686,10 +3688,21 @@ fn pk_conflict_detection_refusal(
 /// The decision itself is [`validate_dataset`], which touches nothing.
 fn preflight_dataset(
     ds: &Arc<Dataset>,
+    role: crate::config::Role,
     status: &status::RuntimeStatus,
     spaced_tracer: &Arc<util::tracers::SpacedTracer>,
 ) -> Result<()> {
-    let Err(err) = validate_dataset(ds) else {
+    let checked = validate_dataset(ds).and_then(|()| {
+        match sidecar_cold_tier_setting(ds).filter(|_| role == crate::config::Role::Sidecar) {
+            Some(setting) => Err(SidecarColdTierSnafu {
+                dataset_name: ds.name.to_string(),
+                setting,
+            }
+            .build()),
+            None => Ok(()),
+        }
+    });
+    let Err(err) = checked else {
         return Ok(());
     };
     // Everything `validate_dataset` raises is a pure function of the Spicepod, so
@@ -3742,6 +3755,33 @@ fn refuse_permanently(
         reason: err.to_string(),
     }
     .build()
+}
+
+/// The setting that keeps `ds`'s data or search index on object storage. A
+/// sidecar serves the memory (hot) and local-disk (warm) tiers; the cluster it
+/// reads from also serves the object-storage (cold) tier, so on a sidecar such
+/// a setting is refused rather than given a tier the sidecar does not hold.
+fn sidecar_cold_tier_setting(ds: &Dataset) -> Option<&'static str> {
+    if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) {
+        if acceleration.cayenne_datalake_location().is_some() {
+            return Some("cayenne_datalake_location");
+        }
+        // A local path, or a `file://` URL, keeps data on the sidecar's disk.
+        if acceleration
+            .params
+            .get("cayenne_file_path")
+            .is_some_and(|path| path.contains("://") && !path.trim_start().starts_with("file://"))
+        {
+            return Some("cayenne_file_path");
+        }
+        if acceleration.params.contains_key("cayenne_s3_zone_ids") {
+            return Some("cayenne_s3_zone_ids");
+        }
+    }
+    ds.vectors
+        .as_ref()
+        .is_some_and(|vectors| vectors.enabled && vectors.engine.as_deref() == Some("s3_vectors"))
+        .then_some("vectors.engine: s3_vectors")
 }
 
 fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
@@ -4324,6 +4364,103 @@ mod tests {
             primary_key: Some("id".to_string()),
             ..Default::default()
         }
+    }
+
+    /// A sidecar holds the memory and local-disk tiers only. Each setting that
+    /// keeps data or a search index on object storage is named, and a local or
+    /// `file://` path, a disabled acceleration, or no tier setting at all is not.
+    #[tokio::test]
+    async fn a_sidecar_refuses_object_storage_tiers() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let accelerated = |enabled: bool, params: &[(&str, &str)]| {
+            dataset_with_acceleration(
+                &runtime,
+                spicepod::acceleration::Acceleration {
+                    enabled,
+                    engine: Some("cayenne".to_string()),
+                    params: Some(spicepod::param::Params::from_string_map(
+                        params
+                            .iter()
+                            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                            .collect(),
+                    )),
+                    ..Default::default()
+                },
+            )
+        };
+        for (params, enabled, setting) in [
+            (
+                &[("cayenne_datalake_location", "s3://bucket/prefix")][..],
+                true,
+                Some("cayenne_datalake_location"),
+            ),
+            (&[("cayenne_datalake_location", "  ")][..], true, None),
+            (
+                &[("cayenne_file_path", "s3://bucket--use1-az4--x-s3/")][..],
+                true,
+                Some("cayenne_file_path"),
+            ),
+            (
+                &[("cayenne_file_path", "/mnt/ephemeral/spice")][..],
+                true,
+                None,
+            ),
+            (
+                &[("cayenne_file_path", "file:///mnt/ephemeral/spice")][..],
+                true,
+                None,
+            ),
+            (
+                &[("cayenne_s3_zone_ids", "use1-az4")][..],
+                true,
+                Some("cayenne_s3_zone_ids"),
+            ),
+            (
+                &[("cayenne_datalake_location", "s3://bucket/prefix")][..],
+                false,
+                None,
+            ),
+            (&[][..], true, None),
+        ] {
+            assert_eq!(
+                sidecar_cold_tier_setting(&accelerated(enabled, params)),
+                setting,
+                "{params:?}, enabled: {enabled}"
+            );
+        }
+
+        let mut spec = spicepod::component::dataset::Dataset::new("postgres:orders", "orders");
+        spec.vectors = Some(spicepod::vector::VectorStore {
+            enabled: true,
+            engine: Some("s3_vectors".to_string()),
+            ..Default::default()
+        });
+        let app = app::AppBuilder::new("sidecar_tiers")
+            .with_dataset(spec.clone())
+            .build();
+        let vectors = DatasetBuilder::try_from(spec)
+            .expect("valid dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::clone(&runtime))
+            .build()
+            .expect("valid runtime dataset");
+        assert_eq!(
+            sidecar_cold_tier_setting(&vectors),
+            Some("vectors.engine: s3_vectors")
+        );
+
+        assert_eq!(
+            SidecarColdTierSnafu {
+                dataset_name: "orders",
+                setting: "cayenne_datalake_location",
+            }
+            .build()
+            .to_string(),
+            "Dataset 'orders' sets `cayenne_datalake_location`, which keeps its data on object \
+             storage, but a sidecar serves data only from memory and local disk; the cluster it \
+             reads from serves object-storage tiers. Remove `cayenne_datalake_location` from the \
+             sidecar's Spicepod, or start Spice without `--role sidecar`."
+        );
     }
 
     fn dataset_with_acceleration(

@@ -58,7 +58,7 @@ pub fn validate_sql_query_operations(
         // Spice's planner can also represent DDL as an extension node, for
         // example `CREATE TABLE ... LIKE`.
         LogicalPlan::Extension(extension)
-            if sidecar && extension.node.name() == DDL_EXTENSION_NAME =>
+            if sidecar && extension.node.as_any().is::<datafusion_ddl::DdlExtensionNode>() =>
         {
             Err(sidecar_ddl_error())
         }
@@ -167,10 +167,6 @@ pub fn validate_sql_query_operations(
     })?;
     Ok(())
 }
-
-/// The name `datafusion_ddl::DdlExtensionNode` reports, one of
-/// [`WRITE_CAPABLE_EXTENSION_NAMES`].
-const DDL_EXTENSION_NAME: &str = "DdlExtension";
 
 /// The error for DDL sent to a sidecar. A sidecar's catalog is its
 /// application's view of data the cluster owns, so tables and schemas are

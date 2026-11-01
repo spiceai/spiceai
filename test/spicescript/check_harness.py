@@ -34,6 +34,13 @@ def main():
             {"query": "SELECT map(['a','b'], ['one', CAST(NULL AS VARCHAR)]) AS value", "id": "before", "expect": {}},
             {"query": "SELECT map(['b','a'], [CAST(NULL AS VARCHAR), 'one']) AS value", "expect": {"same-as": "before"}}],
          None),
+        # A load checks every answer of every client, not just that queries ran.
+        ("load-wrong", [{"load": {"queries": [{"sql": "SELECT 1 AS value", "expect": {"rows": [["2"]]}}],
+                                  "clients": 4, "count": 200}}],
+         "load query 1 answered wrong"),
+        ("load-right", [{"load": {"queries": [{"sql": "SELECT 1 AS value", "expect": {"rows": [["1"]]}}],
+                                  "clients": 4, "count": 200}}],
+         None),
     ]
     args.work_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="spicescript-harness-") as directory:
@@ -52,9 +59,9 @@ def main():
                                      f"exit={result.returncode}\n{result.stdout}")
                 print(f"{name}: rejected the incorrect answer")
             elif result.returncode != 0:
-                raise SystemExit(f"{name}: equivalent maps were rejected\n{result.stdout}")
+                raise SystemExit(f"{name}: equivalent answers were rejected\n{result.stdout}")
             else:
-                print(f"{name}: accepted equivalent maps")
+                print(f"{name}: accepted equivalent answers")
     print(f"{len(fixtures)} real-engine harness checks passed")
 
 

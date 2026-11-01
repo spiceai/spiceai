@@ -106,7 +106,7 @@ impl ConnectorContext for RuntimeConnectorContext {
     }
 
     fn role(&self) -> Role {
-        self.runtime.role
+        self.runtime.role()
     }
 
     fn http_rate_control_registry(&self) -> Arc<HttpRateControlRegistry> {

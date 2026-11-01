@@ -21,12 +21,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use data_components::flight::{SEARCH_CALL_TYPE_URL, SEARCH_SCORE_COLUMN};
 use datafusion::catalog::{TableFunctionArgs, TableProvider};
-use datafusion::common::{Column, DFSchema, Result, ScalarValue, TableReference, substrait_err};
+use datafusion::common::{DFSchema, Result, ScalarValue, TableReference, substrait_err};
 use datafusion::datasource::provider_as_source;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{FunctionRegistry, SessionState};
 use datafusion::logical_expr::expr::{Cast, Like, ScalarFunction as ScalarFunctionExpr, TryCast};
-use datafusion::logical_expr::{Expr, Extension, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{Expr, Extension, LogicalPlan, LogicalPlanBuilder, ident};
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
     DefaultSubstraitLambdaConsumer, SubstraitConsumer, from_scalar_function,
@@ -39,7 +39,10 @@ use datafusion_substrait::substrait::proto::{
 use parking_lot::RwLock;
 use prost::Message;
 use runtime_proto::{UdtfArgs, udtf_args::Args};
-use runtime_search::udtf::{DistanceMetric, TextSearchTableFuncArgs, VectorSearchTableFuncArgs};
+use runtime_search::udtf::{
+    DistanceMetric, TEXT_SEARCH_UDTF_NAME, TextSearchTableFuncArgs, VECTOR_SEARCH_UDTF_NAME,
+    VectorSearchTableFuncArgs,
+};
 
 /// Lowers Substrait plans the way `datafusion-substrait`'s
 /// `DefaultSubstraitConsumer` does. Spice operator declarations bind to SQL
@@ -100,7 +103,7 @@ impl SpiceSubstraitConsumer<'_> {
                         .transpose()?,
                 }
                 .to_expr()?;
-                ("vector_search", table, include_score, exprs)
+                (VECTOR_SEARCH_UDTF_NAME, table, include_score, exprs)
             }
             Some(Args::TextSearch(args)) => {
                 let table = TableReference::parse_str(&args.table);
@@ -113,7 +116,7 @@ impl SpiceSubstraitConsumer<'_> {
                     include_score: args.include_score,
                 }
                 .to_expr();
-                ("text_search", table, include_score, exprs)
+                (TEXT_SEARCH_UDTF_NAME, table, include_score, exprs)
             }
             _ => {
                 return Err(DataFusionError::NotImplemented(
@@ -128,12 +131,7 @@ impl SpiceSubstraitConsumer<'_> {
         };
         let provider =
             search.create_table_provider_with_args(TableFunctionArgs::new(&exprs, self.state))?;
-        let Some(searched) = self
-            .state
-            .schema_for_ref(table.clone())?
-            .table(table.table())
-            .await?
-        else {
+        let Some(searched) = self.resolve_table_ref(&table).await? else {
             return Err(DataFusionError::Plan(format!(
                 "Table '{table}' does not exist."
             )));
@@ -142,10 +140,10 @@ impl SpiceSubstraitConsumer<'_> {
             .schema()
             .fields()
             .iter()
-            .map(|field| Expr::Column(Column::new_unqualified(field.name())))
+            .map(|field| ident(field.name()))
             .collect();
         if include_score {
-            columns.push(Expr::Column(Column::new_unqualified(SEARCH_SCORE_COLUMN)));
+            columns.push(ident(SEARCH_SCORE_COLUMN));
         }
         LogicalPlanBuilder::scan(function, provider_as_source(provider), None)?
             .project(columns)?

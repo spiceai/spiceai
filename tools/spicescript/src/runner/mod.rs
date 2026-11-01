@@ -41,7 +41,10 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     compare,
-    script::{Action, RunVariants, Script, Step, Timing, VariantSpec, matrix_combinations},
+    script::{
+        Action, RunVariants, Script, SidecarSpec, Step, Tier, Timing, VariantSpec,
+        matrix_combinations,
+    },
     source::{self, Source},
     spiced::{ContainerRun, Spiced},
     template,
@@ -75,6 +78,7 @@ mod background;
 mod checks;
 mod cluster;
 mod generators;
+mod load;
 mod query;
 mod steps;
 
@@ -87,7 +91,7 @@ use cluster::{
 };
 use generators::{random_queries, run_slt, tlp};
 use query::{check_error_text, explain, run_query};
-use steps::{describe, one_line, run_instance_step, run_source_step};
+use steps::{describe_step, one_line, run_instance_step, run_source_step};
 
 /// Runs `work` with its output collected instead of printed, and returns
 /// both.
@@ -228,17 +232,25 @@ impl Drop for Held {
     }
 }
 
-/// The `spiced` processes one instance of `script` runs at once: itself, and
-/// its executors on a cluster.
+/// The `spiced` processes one instance of `script` runs at once: itself, its
+/// executors on a cluster, and its sidecar.
 fn instance_weight(script: &Script, options: &Options) -> u32 {
     let cluster = (options.cluster || script.defaults.cluster.is_some())
         && script.defaults.executor_args.is_none();
-    let processes = if cluster {
-        1 + script.defaults.cluster.as_ref().map_or(1, |c| c.executors)
+    let executors = if cluster {
+        script.defaults.cluster.as_ref().map_or(1, |c| c.executors)
     } else {
-        1 + usize::from(script.defaults.executor_args.is_some())
+        usize::from(script.defaults.executor_args.is_some())
     };
+    let processes = 1 + executors + usize::from(script.sidecar.is_some());
     u32::try_from(processes).unwrap_or(u32::MAX)
+}
+
+/// Whether the instances of a run have executors, which a step's
+/// `cluster:` asks about: a cluster by `--cluster` or `defaults.cluster`, or
+/// an executor started by `defaults.executor-args`.
+fn runs_executors(script: &Script, options: &Options) -> bool {
+    options.cluster || script.defaults.cluster.is_some() || script.defaults.executor_args.is_some()
 }
 
 /// How a combination's instances run.
@@ -458,6 +470,18 @@ struct Instance {
     /// When this instance began each corpus's queries, by corpus position:
     /// the start of the `eventually` limit they share.
     corpus_started: BTreeMap<usize, Instant>,
+    /// The application sidecar in front of `spiced` (`sidecar:`).
+    sidecar: Option<Sidecar>,
+}
+
+/// An instance's application sidecar: a `spiced --role sidecar` whose
+/// datasets read the instance's `spiced`, its upstream.
+struct Sidecar {
+    spiced: Spiced,
+    spicepod_yaml: String,
+    /// Where the upstream's executors wait while a step reaches the sidecar
+    /// in the upstream's place (see `steps::run_instance_step`).
+    parked_executors: Vec<Spiced>,
 }
 
 /// How long `spiced` gets to shut down after SIGTERM before `stop` and
@@ -498,6 +522,23 @@ struct BackgroundStats {
 impl Instance {
     fn sql(&self, text: &str) -> Result<String> {
         template::substitute_text(text, &self.context)
+    }
+
+    /// The `spiced` a step reaches: the one its `on:` names, else the one its
+    /// action does by default; the instance's own without a sidecar.
+    fn tier(&self, step: &Step) -> Tier {
+        if self.sidecar.is_none() {
+            return Tier::Upstream;
+        }
+        step.on.unwrap_or_else(|| step.action.default_tier())
+    }
+
+    /// The `spiced` on `tier`.
+    fn spiced_on(&mut self, tier: Tier) -> &mut Spiced {
+        match (tier, self.sidecar.as_mut()) {
+            (Tier::Sidecar, Some(sidecar)) => &mut sidecar.spiced,
+            _ => &mut self.spiced,
+        }
     }
 }
 
@@ -639,11 +680,13 @@ async fn run_combination(
             .context("base release was not fetched")?;
         say!("   from   v{} ({from})", release.version);
     }
-    // The steps of this matrix combination.
+    // The steps of this matrix combination, and of a run with or without
+    // executors.
+    let with_executors = runs_executors(script, options);
     let steps: Vec<Step> = script
         .steps
         .iter()
-        .filter(|s| when_matches(&s.when, combo))
+        .filter(|s| when_matches(&s.when, combo) && s.cluster.is_none_or(|c| c == with_executors))
         .cloned()
         .collect();
     let schedule = schedule(script, &steps);
@@ -753,6 +796,9 @@ async fn run_combination(
             for executor in &mut instance.executors {
                 stopping.push(executor.stop(TEARDOWN_TIMEOUT));
             }
+            if let Some(sidecar) = &mut instance.sidecar {
+                stopping.push(sidecar.spiced.stop(TEARDOWN_TIMEOUT));
+            }
         }
         let _ = futures::future::join_all(stopping).await;
         for instance in &mut instances {
@@ -762,6 +808,13 @@ async fn run_combination(
                     instance.label,
                     instance.spiced.log_path().display()
                 );
+                if let Some(sidecar) = &instance.sidecar {
+                    say!(
+                        "   {} sidecar log: {}",
+                        instance.label,
+                        sidecar.spiced.log_path().display()
+                    );
+                }
             }
         }
         Ok::<_, anyhow::Error>(())
@@ -970,7 +1023,8 @@ async fn create_instances(
                 "matrix": combo,
                 "variant": { "name": variant_name },
                 "instance": { "name": label, "dir": dir.display().to_string(), "port": crate::docker::free_port()?,
-                    "executor_port": crate::docker::free_port()?, "http_port": crate::docker::free_port()? },
+                    "executor_port": crate::docker::free_port()?, "http_port": crate::docker::free_port()?,
+                    "flight_port": crate::docker::free_port()? },
                 "script": { "dir": std::path::absolute(&script.dir)?.display().to_string() },
                 "pki": { "dir": options.pki.display().to_string() },
             });
@@ -1087,20 +1141,38 @@ async fn create_instances(
                 }
                 executors.push(executor);
             }
+            let sidecar = script
+                .sidecar
+                .as_ref()
+                .map(|spec| {
+                    new_sidecar(
+                        spec,
+                        &context,
+                        &dir,
+                        &target.binary,
+                        &format!("{run_id}-{index}-sidecar"),
+                    )
+                })
+                .transpose()
+                .context("the sidecar")?;
             let mut spiced = Spiced::new(first_binary, dir, env)?;
-            if let Some(port) = context["instance"]["http_port"]
-                .as_u64()
-                .and_then(|p| u16::try_from(p).ok())
-            {
+            let port = |name: &str| {
+                context["instance"][name]
+                    .as_u64()
+                    .and_then(|p| u16::try_from(p).ok())
+            };
+            if let Some(port) = port("http_port") {
                 spiced.set_http_port(port);
+            }
+            if let Some(port) = port("flight_port") {
+                spiced.set_flight_port(port);
             }
             spiced.set_api_key(script.defaults.api_key.clone())?;
             spiced.set_tls(script.defaults.tls.as_ref().map(|t| script.dir.join(&t.ca)))?;
-            let mut args = spiced_args;
             if let Some((scheduler, _)) = &cluster_args {
-                args.extend(scheduler.iter().cloned());
+                spiced_args.extend(scheduler.iter().cloned());
             }
-            spiced.set_extra_args(args);
+            spiced.set_extra_args(spiced_args);
             instances.push(Instance {
                 label,
                 variant: variant_name.clone(),
@@ -1121,11 +1193,61 @@ async fn create_instances(
                 background: BTreeMap::new(),
                 cache_dir: options.work_dir.join("cache"),
                 corpus_started: BTreeMap::new(),
+                sidecar,
             });
         }
     }
     Ok(instances)
 }
+
+/// The sidecar of the instance whose placeholders are `context`, in a
+/// directory of its own under the instance's `dir`. It runs `binary`, the
+/// binary under test, from the first start: a release an upgrade starts on
+/// may have no sidecar role.
+fn new_sidecar(
+    spec: &SidecarSpec,
+    context: &Value,
+    dir: &Path,
+    binary: &Path,
+    instance_id: &str,
+) -> Result<Sidecar> {
+    let mut env = spec.env.clone();
+    env.insert("SPICE_INSTANCE_ID".into(), instance_id.to_string());
+    let mut spiced = Spiced::new(binary.to_path_buf(), dir.join("sidecar"), env)?;
+    // A `spice.ai:` dataset without a key would take this one from the
+    // environment, and present it to an upstream that may require another.
+    if !spec.env.contains_key(SPICEAI_API_KEY) {
+        spiced.remove_env(SPICEAI_API_KEY);
+    }
+    spiced.set_api_key(spec.api_key.clone())?;
+    spiced.set_extra_args(sidecar_args(spec, context)?);
+    Ok(Sidecar {
+        spiced,
+        spicepod_yaml: sidecar_spicepod(spec, context)?,
+        parked_executors: Vec::new(),
+    })
+}
+
+/// The sidecar's spicepod with its placeholders resolved, and the results
+/// cache off unless it configures one, as for any instance.
+fn sidecar_spicepod(spec: &SidecarSpec, context: &Value) -> Result<String> {
+    let mut spicepod = template::substitute(&spec.spicepod, context)?;
+    disable_results_cache_unless_configured(&mut spicepod);
+    Ok(yaml::to_string(&spicepod)?)
+}
+
+/// The sidecar's arguments: `--role sidecar`, then its own, each placeholder
+/// rendered as text (`'${matrix.cores}'` is `2`, not a number).
+fn sidecar_args(spec: &SidecarSpec, context: &Value) -> Result<Vec<String>> {
+    let mut args = vec!["--role".to_string(), "sidecar".to_string()];
+    for arg in &spec.args {
+        args.push(template::substitute_text(arg, context)?);
+    }
+    Ok(args)
+}
+
+/// The variable a `spice.ai:` dataset's `spiceai_api_key` defaults to.
+const SPICEAI_API_KEY: &str = "SPICEAI_API_KEY";
 
 fn is_source_step(action: &Action) -> bool {
     matches!(
@@ -1257,11 +1379,14 @@ async fn run_independent(
     }
 }
 
-/// Stops an instance's `spiced` and executors together.
+/// Stops an instance's `spiced`, executors and sidecar together.
 async fn stop_processes(instance: &mut Instance) {
     let mut stopping = vec![instance.spiced.stop(TEARDOWN_TIMEOUT)];
     for executor in &mut instance.executors {
         stopping.push(executor.stop(TEARDOWN_TIMEOUT));
+    }
+    if let Some(sidecar) = &mut instance.sidecar {
+        stopping.push(sidecar.spiced.stop(TEARDOWN_TIMEOUT));
     }
     let _ = futures::future::join_all(stopping).await;
 }
@@ -1356,7 +1481,7 @@ fn base_release_feature_gap(log: &str, version: &str, spec: &str) -> Option<Stri
 }
 
 fn record(report: &mut Report, run_label: &str, who: &str, step: &Step, outcome: Result<String>) {
-    let what = describe(&step.action);
+    let what = describe_step(step);
     match outcome {
         Ok(detail) => {
             report.passed += 1;
@@ -1619,6 +1744,50 @@ mod tests {
             strip_role_arg(&mut given);
             assert_eq!(given, args(stripped));
         }
+    }
+
+    #[test]
+    fn a_sidecar_reads_the_upstream_ports_and_runs_as_a_sidecar() {
+        let script = Script::parse(
+            r"
+name: s
+spicepod: {}
+sidecar:
+  spicepod:
+    datasets:
+      - from: spice.ai:orders
+        name: orders
+        params: { spiceai_endpoint: 'http://127.0.0.1:${instance.flight_port}' }
+  args: [--cpu-cores, '${matrix.cores}']
+steps: [{ start: {} }]
+",
+        )
+        .expect("script parses");
+        let spec = script.sidecar.as_ref().expect("a sidecar");
+        let context = json!({ "instance": { "flight_port": 50061 }, "matrix": { "cores": 2 } });
+        assert_eq!(
+            sidecar_args(spec, &context).expect("args"),
+            ["--role", "sidecar", "--cpu-cores", "2"]
+        );
+        let spicepod: Value =
+            yaml::from_str(&sidecar_spicepod(spec, &context).expect("spicepod")).expect("YAML");
+        assert_eq!(
+            spicepod,
+            json!({
+                "datasets": [{
+                    "from": "spice.ai:orders",
+                    "name": "orders",
+                    "params": { "spiceai_endpoint": "http://127.0.0.1:50061" },
+                }],
+                "runtime": { "caching": { "sql_results": { "enabled": false } } },
+            })
+        );
+        let err = sidecar_spicepod(spec, &json!({ "instance": {} })).expect_err("no port");
+        assert!(
+            err.to_string()
+                .contains("unknown placeholder '${instance.flight_port}'"),
+            "{err}"
+        );
     }
 
     #[test]

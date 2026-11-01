@@ -17,12 +17,12 @@ limitations under the License.
 //! Running one step: the dispatcher for every action, and how a step is
 //! described in reports.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::Value;
 
-use crate::script::{Action, KillSignal, Script, Step};
+use crate::script::{Action, KillSignal, LoadEnd, Script, Step, Tier};
 use crate::{compare, template};
 
 use super::{
@@ -123,7 +123,33 @@ pub(super) fn describe(action: &Action) -> String {
         Action::WaitMetric(w) => format!("wait-metric {} {:?}", w.name, w.condition),
         Action::Slt(s) if s.setup => format!("slt-setup {} on {}", s.file, s.source),
         Action::Slt(s) => format!("slt {} over {}", s.file, s.source),
+        Action::Load(l) => format!(
+            "load: {} from {} clients, {}{}",
+            l.corpus
+                .clone()
+                .unwrap_or_else(|| format!("{} queries", l.queries.len())),
+            l.clients,
+            match l.end {
+                LoadEnd::Duration(d) => format!("for {d:?}"),
+                LoadEnd::Count(n) => format!("{n} queries in all"),
+            },
+            match l.faults.len() {
+                0 => String::new(),
+                n => format!(", {n} faults"),
+            }
+        ),
         Action::Sleep(d) => format!("sleep {d:?}"),
+    }
+}
+
+/// How a step is named in reports: its action, and the `spiced` it reaches
+/// when it names one.
+pub(super) fn describe_step(step: &Step) -> String {
+    let what = describe(&step.action);
+    match step.on {
+        None => what,
+        Some(Tier::Sidecar) => format!("{what} (on sidecar)"),
+        Some(Tier::Upstream) => format!("{what} (on upstream)"),
     }
 }
 
@@ -152,18 +178,134 @@ pub(super) async fn run_source_step(action: &Action, sources: &mut Sources) -> R
     .map(|()| String::new())
 }
 
+/// Runs a step on the `spiced` it reaches. Without a sidecar, that is the
+/// instance's own. With one, a lifecycle step on the upstream also starts
+/// and stops the sidecar with it (see [`run_step`]); one with `on: sidecar`
+/// acts on the sidecar alone; and any other step reaching the sidecar runs
+/// with the sidecar swapped into the instance's `spiced` place, the
+/// upstream's executors parked beside it, so that every step reaches a
+/// sidecar exactly as it reaches a lone instance.
 pub(super) async fn run_instance_step(
     script: &Script,
     instance: &mut Instance,
     step: &Step,
     sources: &Sources,
 ) -> Result<String> {
-    let ready_default = max_wait(
+    let tier = instance.tier(step);
+    if let Action::Load(load) = &step.action {
+        // A load runs its faults on the instance as it is, so it is never
+        // swapped; it reaches its tier's `spiced` by name.
+        return super::load::run_load(script, instance, load, tier, sources).await;
+    }
+    match tier {
+        Tier::Upstream => run_step(script, instance, step, sources).await,
+        Tier::Sidecar if step.action.is_lifecycle() => {
+            let started = Instant::now();
+            sidecar_lifecycle(script, instance, step).await?;
+            Ok(format!(" ({:.1}s)", started.elapsed().as_secs_f64()))
+        }
+        Tier::Sidecar => {
+            swap_sidecar(instance);
+            let outcome = run_step(script, instance, step, sources).await;
+            swap_sidecar(instance);
+            outcome
+        }
+    }
+}
+
+/// Swaps the sidecar into the instance's `spiced` place, parking the
+/// upstream's executors, or swaps them back: it undoes itself.
+fn swap_sidecar(instance: &mut Instance) {
+    if let Some(sidecar) = instance.sidecar.as_mut() {
+        std::mem::swap(&mut instance.spiced, &mut sidecar.spiced);
+        std::mem::swap(&mut instance.executors, &mut sidecar.parked_executors);
+    }
+}
+
+/// The readiness wait a start allows when it names none.
+fn ready_default(script: &Script) -> Duration {
+    max_wait(
         script
             .defaults
             .ready_timeout
             .unwrap_or(DEFAULT_READY_TIMEOUT),
-    );
+    )
+}
+
+/// Starts the sidecar unless it is running, once its upstream is up, and
+/// waits for it as the start asks.
+async fn start_sidecar(instance: &mut Instance, timeout: Duration, wait_ready: bool) -> Result<()> {
+    let Some(sidecar) = instance.sidecar.as_mut() else {
+        return Ok(());
+    };
+    if sidecar.spiced.is_running() {
+        return Ok(());
+    }
+    sidecar
+        .spiced
+        .start(&sidecar.spicepod_yaml)
+        .context("the sidecar")?;
+    if wait_ready {
+        sidecar.spiced.wait_ready(timeout).await
+    } else {
+        sidecar.spiced.wait_http(timeout).await
+    }
+    .context("the sidecar")
+}
+
+/// A lifecycle step with `on: sidecar`: it starts, stops, kills or waits on
+/// the sidecar alone, leaving the upstream as it is.
+async fn sidecar_lifecycle(script: &Script, instance: &mut Instance, step: &Step) -> Result<()> {
+    let ready_default = ready_default(script);
+    let Some(sidecar) = instance.sidecar.as_mut() else {
+        bail!("the instance has no sidecar");
+    };
+    let spiced = &mut sidecar.spiced;
+    match &step.action {
+        Action::Start {
+            ready_timeout,
+            wait_ready,
+            ..
+        } => {
+            let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
+            start_sidecar(instance, timeout, *wait_ready).await?;
+        }
+        Action::Stop => spiced.stop(STOP_TIMEOUT).await.context("the sidecar")?,
+        Action::Kill { signal } => spiced
+            .kill(*signal == KillSignal::StopThenKill)
+            .await
+            .context("the sidecar")?,
+        Action::Restart {
+            kill,
+            ready_timeout,
+            wait_ready,
+            ..
+        } => {
+            match kill {
+                Some(signal) => spiced.kill(*signal == KillSignal::StopThenKill).await,
+                None => spiced.stop(STOP_TIMEOUT).await,
+            }
+            .context("the sidecar")?;
+            let timeout = max_wait(ready_timeout.unwrap_or(ready_default));
+            start_sidecar(instance, timeout, *wait_ready).await?;
+        }
+        Action::WaitReady { timeout } => {
+            spiced.wait_ready(*timeout).await.context("the sidecar")?;
+        }
+        other => bail!("`{}` acts on the upstream only", describe(other)),
+    }
+    Ok(())
+}
+
+/// Runs a step on the instance's `spiced`, which is the sidecar while
+/// [`swap_sidecar`] has it in place.
+async fn run_step(
+    script: &Script,
+    instance: &mut Instance,
+    step: &Step,
+    sources: &Sources,
+) -> Result<String> {
+    let ready_default = ready_default(script);
     let started = Instant::now();
     match &step.action {
         Action::Start {
@@ -181,8 +323,18 @@ pub(super) async fn run_instance_step(
             if *wait_ready {
                 instance.spiced.wait_ready(timeout).await?;
             }
+            // The sidecar's datasets read the upstream, so it starts last.
+            start_sidecar(instance, timeout, *wait_ready).await?;
         }
         Action::Stop => {
+            // The sidecar is the upstream's client, so it stops first.
+            if let Some(sidecar) = instance.sidecar.as_mut() {
+                sidecar
+                    .spiced
+                    .stop(STOP_TIMEOUT)
+                    .await
+                    .context("the sidecar")?;
+            }
             instance.spiced.stop(STOP_TIMEOUT).await?;
             for executor in &mut instance.executors {
                 executor.stop(STOP_TIMEOUT).await?;
@@ -227,6 +379,9 @@ pub(super) async fn run_instance_step(
             if *wait_ready {
                 instance.spiced.wait_ready(timeout).await?;
             }
+            // A running sidecar rides out the upstream's restart, as an
+            // application's would; one a `stop` stopped starts again.
+            start_sidecar(instance, timeout, *wait_ready).await?;
         }
         Action::WaitReady { timeout } => instance.spiced.wait_ready(*timeout).await?,
         Action::KillExecutor(n) => {
@@ -609,6 +764,7 @@ pub(super) async fn run_instance_step(
                 started.elapsed().as_secs_f64()
             ));
         }
+        Action::Load(_) => unreachable!("a load is run by run_instance_step"),
         Action::StartSource(_)
         | Action::StopSource(_)
         | Action::PauseSource(_)

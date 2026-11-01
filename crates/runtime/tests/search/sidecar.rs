@@ -112,7 +112,7 @@ embeddings:
   - from: model2vec:minishlab/potion-base-2M
     name: text_embed
 datasets:
-  - from: file:{}
+  - from: file:{csv}
     name: docs
     acceleration: {{ enabled: true, engine: arrow }}
     columns:
@@ -122,8 +122,18 @@ datasets:
         full_text_search:
           enabled: true
           row_id: [id]
+  - from: file:{csv}
+    name: notes
+    acceleration: {{ enabled: true, engine: arrow }}
+    columns:
+      - name: label
+        full_text_search:
+          enabled: true
+          row_id: [id]
+  - from: file:{csv}
+    name: upstream_only_secret
 ",
-            csv.display()
+            csv = csv.display()
         ),
     )?;
     register_test_connectors().await;
@@ -220,6 +230,27 @@ async fn sidecar_delegates_search_to_the_upstream_index() -> anyhow::Result<()> 
                 assert_same_rows(&actual, &expected, sql)?;
             }
 
+            // A filter's subquery is answered by the sidecar's own catalog, never
+            // sent upstream inside the search, so the application cannot probe
+            // for an upstream table the sidecar does not declare.
+            for table in ["upstream_only_secret", "docs"] {
+                let probe = format!(
+                    "SELECT s.id FROM (SELECT d.id, EXISTS (SELECT 1 FROM information_schema.tables \
+                     WHERE table_name = '{table}') AS e FROM text_search(docs, 'snow') d) s WHERE s.e"
+                );
+                let found = rows(&sidecar, &probe).await?;
+                let local = rows(
+                    &sidecar,
+                    &format!("SELECT 1 FROM information_schema.tables WHERE table_name = '{table}'"),
+                )
+                .await?;
+                assert_eq!(
+                    found.iter().map(RecordBatch::num_rows).sum::<usize>() > 0,
+                    local.iter().map(RecordBatch::num_rows).sum::<usize>() > 0,
+                    "{probe}"
+                );
+            }
+
             // The search ran on the upstream: the sidecar plans a Substrait
             // request, with the filter inside it rather than in the sidecar.
             let explain = pretty_format_batches(
@@ -232,6 +263,76 @@ async fn sidecar_delegates_search_to_the_upstream_index() -> anyhow::Result<()> 
             .to_string();
             assert!(explain.contains("SubstraitExec"), "{explain}");
             assert!(!explain.contains("FilterExec"), "{explain}");
+
+            sidecar.shutdown().await;
+            upstream.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// A sidecar's accelerated dataset holds the rows its `refresh_sql` selects. A
+/// search is not delegated past it to the whole upstream table, which would
+/// return rows the dataset does not hold; with no local index it is refused.
+#[tokio::test]
+async fn sidecar_does_not_delegate_search_past_an_accelerated_working_set() -> anyhow::Result<()> {
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let (upstream, flight_port) = start_search_upstream(dir.path()).await?;
+            let mut dataset = Dataset::new("spice.ai:notes", "notes".to_string());
+            dataset.params = Some(Params::from_string_map(HashMap::from([
+                (
+                    "spiceai_endpoint".to_string(),
+                    format!("http://127.0.0.1:{flight_port}"),
+                ),
+                ("spiceai_api_key".to_string(), API_KEY.to_string()),
+            ])));
+            dataset.acceleration = Some(spicepod::acceleration::Acceleration {
+                enabled: true,
+                engine: Some("cayenne".to_string()),
+                mode: spicepod::acceleration::Mode::Memory,
+                refresh_sql: Some("SELECT * FROM notes WHERE id = 1".to_string()),
+                ..Default::default()
+            });
+            let sidecar = start_sidecar("scoped_sidecar", dataset).await?;
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let held = loop {
+                match rows(&sidecar, "SELECT id FROM notes ORDER BY id").await {
+                    Ok(held) => break held,
+                    Err(error) => {
+                        anyhow::ensure!(
+                            std::time::Instant::now() < deadline,
+                            "the scoped acceleration did not load within 60 s: {error}"
+                        );
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
+            };
+            assert_eq!(
+                pretty_format_batches(&held)?.to_string(),
+                "+----+\n| id |\n+----+\n| 1  |\n+----+"
+            );
+            let upstream_rows =
+                rows(&upstream, "SELECT id FROM text_search(notes, 'snow')").await?;
+            assert!(
+                upstream_rows
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>()
+                    > 0,
+                "the upstream answers the search"
+            );
+            let error = rows(&sidecar, "SELECT id FROM text_search(notes, 'snow')")
+                .await
+                .expect_err("a search past the working set is refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not have a full text search index"),
+                "{error}"
+            );
 
             sidecar.shutdown().await;
             upstream.shutdown().await;

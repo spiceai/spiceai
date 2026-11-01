@@ -536,8 +536,8 @@ impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchTableFu
             // A sidecar's Spice table is searched by the upstream that indexes it.
             if let Some(delegated) = crate::delegated::delegated_search(
                 table_provider.as_ref(),
-                &args.tbl,
-                &crate::delegated::DelegatedSearchCall::Text {
+                &UdtfSource::TextSearch {
+                    table: args.tbl.to_string(),
                     query: args.query.clone(),
                     column: args.column.clone(),
                     limit: args.limit,
@@ -548,7 +548,7 @@ impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchTableFu
             }
             return Err(DataFusionError::Plan(format!(
                 "Table '{}' does not have a full text search index.",
-                args.tbl.clone()
+                args.tbl
             )));
         };
 
