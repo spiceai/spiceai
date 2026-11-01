@@ -276,6 +276,8 @@ pub struct KafkaMetrics {
 
 struct KafkaConsumerContext {
     metrics: Arc<KafkaMetrics>,
+    /// The dataset this consumer reads for, named in the lines it logs.
+    dataset: String,
     /// The offset to resume each `(topic, partition)` from, restored from the sidecar.
     /// Populated at construction so it is in place before `subscribe()` can trigger a
     /// rebalance. The first assignment of a partition takes its entry; a later
@@ -284,9 +286,14 @@ struct KafkaConsumerContext {
 }
 
 impl KafkaConsumerContext {
-    fn new(metrics: Arc<KafkaMetrics>, restore_offsets: HashMap<(String, i32), i64>) -> Self {
+    fn new(
+        metrics: Arc<KafkaMetrics>,
+        dataset: String,
+        restore_offsets: HashMap<(String, i32), i64>,
+    ) -> Self {
         Self {
             metrics,
+            dataset,
             restore_offsets: std::sync::Mutex::new(restore_offsets),
         }
     }
@@ -312,6 +319,7 @@ impl KafkaConsumerContext {
         if restore.is_empty() {
             return None;
         }
+        let dataset = &self.dataset;
         let assigned: Vec<(String, i32)> = assignment
             .elements()
             .iter()
@@ -329,12 +337,12 @@ impl KafkaConsumerContext {
                 }) {
                 Ok(()) => {
                     tracing::debug!(
-                        "Resuming Kafka topic '{topic}' partition {partition} at offset {offset}, restored from the acceleration"
+                        "Resuming dataset '{dataset}' at Kafka topic '{topic}' partition {partition} offset {offset}, restored from its acceleration"
                     );
                 }
                 Err(e) => {
                     tracing::error!(
-                        "Failed to resume Kafka topic '{topic}' partition {partition} at offset {offset}, so it starts at the consumer group's committed offset and may read messages the acceleration already holds a second time. Cause: {e}"
+                        "Failed to resume dataset '{dataset}' at Kafka topic '{topic}' partition {partition} offset {offset}, so it starts at the consumer group's committed offset and may append messages its acceleration already holds a second time. Cause: {e}"
                     );
                 }
             }
@@ -342,7 +350,9 @@ impl KafkaConsumerContext {
         if restored.count() == 0 {
             return None;
         }
-        tracing::info!("Restored Kafka consumer offsets from sidecar");
+        tracing::info!(
+            "Resuming dataset '{dataset}' from the Kafka offsets stored in its acceleration"
+        );
         Some(restored)
     }
 }
@@ -451,6 +461,7 @@ impl rdkafka::consumer::ConsumerContext for KafkaConsumerContext {
         err: RDKafkaRespErr,
         tpl: &mut TopicPartitionList,
     ) {
+        let dataset = &self.dataset;
         let cooperative = matches!(
             base_consumer.rebalance_protocol(),
             RebalanceProtocol::Cooperative
@@ -472,7 +483,7 @@ impl rdkafka::consumer::ConsumerContext for KafkaConsumerContext {
                     && let Err(e) = base_consumer.commit(&restored, CommitMode::Async)
                 {
                     tracing::error!(
-                        "Failed to commit the Kafka consumer offsets restored from the acceleration, so the dataset may not report ready until a new message arrives. Cause: {e}"
+                        "Failed to commit the Kafka offsets dataset '{dataset}' resumed from, so the dataset may not report ready until a new message arrives. Cause: {e}"
                     );
                 }
                 assigned
@@ -486,7 +497,9 @@ impl rdkafka::consumer::ConsumerContext for KafkaConsumerContext {
             }
             _ => {
                 let code: RDKafkaErrorCode = err.into();
-                tracing::error!("Kafka consumer group rebalance failed: {code}");
+                tracing::error!(
+                    "Kafka consumer group rebalance failed for dataset '{dataset}': {code}"
+                );
                 if cooperative {
                     base_consumer.incremental_unassign(tpl)
                 } else {
@@ -496,7 +509,7 @@ impl rdkafka::consumer::ConsumerContext for KafkaConsumerContext {
         };
         if let Err(e) = result {
             tracing::warn!(
-                "Failed to apply a Kafka consumer group rebalance, so this consumer may not read the partitions it was assigned until the next rebalance. Cause: {e}"
+                "Failed to apply a Kafka consumer group rebalance for dataset '{dataset}', so it may not read the partitions it was assigned until the next rebalance. Cause: {e}"
             );
         }
     }
@@ -597,11 +610,13 @@ impl KafkaConsumer {
     /// offsets from the sidecar before any rebalance can fire. Pass an empty
     /// slice for `restore_offsets` when there is nothing to restore.
     pub fn create_with_existing_group_id(
+        dataset: &str,
         group_id: impl Into<String>,
         kafka_config: &KafkaConfig,
         restore_offsets: &[KafkaOffset],
     ) -> Result<Self> {
         Self::create(
+            dataset,
             group_id.into(),
             kafka_config,
             Self::restore_map(restore_offsets),
@@ -614,6 +629,7 @@ impl KafkaConsumer {
         kafka_config: &KafkaConfig,
     ) -> Result<Self> {
         Self::create(
+            dataset,
             group_id.unwrap_or_else(|| Self::generate_group_id(dataset)),
             kafka_config,
             HashMap::new(),
@@ -826,6 +842,7 @@ impl KafkaConsumer {
     }
 
     fn create(
+        dataset: &str,
         group_id: String,
         kafka_config: &KafkaConfig,
         restore_offsets: HashMap<(String, i32), i64>,
@@ -898,6 +915,7 @@ impl KafkaConsumer {
             .set_log_level(RDKafkaLogLevel::Debug)
             .create_with_context(KafkaConsumerContext::new(
                 Arc::clone(&metrics),
+                dataset.to_string(),
                 restore_offsets,
             ))
             .context(UnableToCreateConsumerSnafu)?;
@@ -1049,6 +1067,7 @@ impl KafkaConsumer {
     /// partition (skipping tombstones by seeking backward), and returns the message
     /// with the newest record timestamp across all partitions.
     pub async fn fetch_latest_message<K: DeserializeOwned, V: DeserializeOwned>(
+        dataset: &str,
         topic: &str,
         kafka_config: &KafkaConfig,
         timeout: Duration,
@@ -1061,7 +1080,12 @@ impl KafkaConsumer {
         // that block the calling thread for up to `remaining` (the schema-peek
         // budget, up to ~30s). Run them on the blocking pool so this
         // registration-time path doesn't stall the async runtime thread.
-        let temp_consumer = Arc::new(Self::create(temp_group_id, &peek_config, HashMap::new())?);
+        let temp_consumer = Arc::new(Self::create(
+            dataset,
+            temp_group_id,
+            &peek_config,
+            HashMap::new(),
+        )?);
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         let partition_ids: Vec<i32> = {
