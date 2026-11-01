@@ -612,3 +612,98 @@ impl Model for Protocol {
         properties
     }
 }
+
+/// What one action of a transactions trace does, as the model takes it: the
+/// expectation a replay of the trace through real storage checks against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Step {
+    pub action: String,
+    /// A record that landed on a participant's log: participant, kind (0 a
+    /// write to another key, 1 `Prepare`, 2 a write to the prepared key, 3
+    /// `Resolve`) and outcome (1 commit, 2 abort, for a `Resolve`).
+    pub landed: Option<(usize, u8, u8)>,
+    /// A delivery that did not land: participant, kind, and whether a newer
+    /// lease fenced it (otherwise another record moved the head first).
+    pub refused: Option<(usize, u8, bool)>,
+    /// A participant whose lease the action advanced.
+    pub fenced: Option<usize>,
+    /// The recorded decision after the action: 0 none, 1 commit, 2 abort.
+    pub decision: u8,
+    /// Each participant's log after the action, as (kind, outcome).
+    pub logs: Vec<Vec<(u8, u8)>>,
+}
+
+/// Step `actions` through the model in `mode`, or `None` when one is not
+/// enabled where it occurs.
+#[must_use]
+pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> {
+    let protocol = Protocol::new(mode, bound);
+    let mut state = protocol.init_states().pop()?;
+    let mut out = Vec::with_capacity(actions.len());
+    for text in actions {
+        let (name, arguments) = match text.split_once('(') {
+            Some((name, rest)) => (
+                name,
+                rest.strip_suffix(')')?
+                    .split(',')
+                    .map(|part| part.trim().parse::<usize>().ok())
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            None => (text.as_str(), Vec::new()),
+        };
+        let action = match (name, arguments.as_slice()) {
+            ("Issue", &[i, k]) => Action::Issue(i, k),
+            ("Deliver", &[i, q]) => Action::Deliver(i, q),
+            ("Check", &[i]) => Action::Check(i),
+            ("Fence", &[i]) => Action::Fence(i),
+            ("Deadline", &[]) => Action::Deadline,
+            ("Decide", &[o]) => Action::Decide(o),
+            ("Checkpoint", &[i]) => Action::Checkpoint(i),
+            ("Publish", &[i]) => Action::Publish(i),
+            ("Gc", &[i]) => Action::Gc(i),
+            ("Switch", &[i]) => Action::Switch(i),
+            ("Observe", &[i]) => Action::Observe(i),
+            ("Advance", &[i]) => Action::Advance(i),
+            ("Create", &[i, j]) => Action::Create(i, j),
+            _ => return None,
+        };
+        let mut enabled = vec![];
+        protocol.actions(&state, &mut enabled);
+        if !enabled.contains(&action) {
+            return None;
+        }
+        let next = protocol.next_state(&state, action.clone())?;
+        let grew = |i: usize| next.ds[i].log.len() > state.ds[i].log.len();
+        let (landed, refused) = match action {
+            Action::Deliver(i, _) | Action::Advance(i) if grew(i) => {
+                let &(kind, outcome, ..) = next.ds[i].log.last()?;
+                (Some((i, kind, outcome)), None)
+            }
+            Action::Deliver(i, _) => {
+                let request = state.ds[i].req.as_ref()?;
+                (
+                    None,
+                    Some((i, request.kind, request.base.lease != usize::from(state.ds[i].lease))),
+                )
+            }
+            _ => (None, None),
+        };
+        out.push(Step {
+            action: text.clone(),
+            landed,
+            refused,
+            fenced: match action {
+                Action::Fence(i) => Some(i),
+                _ => None,
+            },
+            decision: next.decision,
+            logs: next
+                .ds
+                .iter()
+                .map(|dataset| dataset.log.iter().map(|&(k, o, ..)| (k, o)).collect())
+                .collect(),
+        });
+        state = next;
+    }
+    Some(out)
+}

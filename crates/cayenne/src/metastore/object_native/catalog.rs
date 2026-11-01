@@ -37,6 +37,9 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(test)]
+mod replay_tests;
+
 /// The registry's key for its entries: partition = dataset name, value = the
 /// dataset's folder under `datasets/`. It has no `/`, so it names no dataset.
 const REGISTRY: &str = "cayenne:datasets";
@@ -114,7 +117,7 @@ fn slug(name: &str) -> String {
     if slug.is_empty() { "dataset".to_string() } else { slug }
 }
 
-/// When the UUIDv7 that ends `name` (a transaction id or a dataset folder) was
+/// When the `UUIDv7` that ends `name` (a transaction id or a dataset folder) was
 /// made, or `None` when `name` does not end in one.
 fn created_at(name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let id = name.get(name.len().checked_sub(36)?..)?;
@@ -131,6 +134,81 @@ async fn delete_under(store: &Arc<dyn ObjectStore>, prefix: &Path) -> CatalogRes
         .await
         .map_err(invalid)?;
     Ok(())
+}
+
+/// Record `commit` as the outcome of `txn` under `transactions` unless one is
+/// recorded, and return the recorded outcome. Exactly one outcome is ever
+/// recorded.
+async fn decide(
+store: &Arc<dyn ObjectStore>,
+transactions: &Path,
+txn: &str,
+commit: bool,
+) -> CatalogResult<bool> {
+    const ATTEMPTS: u32 = 8;
+    let path = transactions.clone().join(txn).join("decision.json");
+    let body = if commit { "commit" } else { "abort" };
+    let mut last = None;
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(50 << attempt.min(6))).await;
+        }
+        match store
+            .put_opts(&path, PutPayload::from(body), PutMode::Create.into())
+            .await
+        {
+            Ok(_) => return Ok(commit),
+            Err(object_store::Error::AlreadyExists { .. }) => {}
+            // Unknown whether it landed: read it back, or try again.
+            Err(error) => {
+                last = Some(error);
+                continue;
+            }
+        }
+        match store.get(&path).await {
+            Ok(recorded) => {
+                let recorded = recorded.bytes().await.map_err(invalid)?;
+                return match recorded.as_ref() {
+                    b"commit" => Ok(true),
+                    b"abort" => Ok(false),
+                    other => Err(invalid(format!(
+                        "transaction {txn} has an unreadable decision: {}",
+                        String::from_utf8_lossy(other)
+                    ))),
+                };
+            }
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(invalid(format!(
+        "could not record the decision of transaction {txn}: {}",
+        last.map_or_else(String::new, |error| error.to_string())
+    )))
+}
+
+/// Remove the records of every transaction under `transactions` made before
+/// `cutoff` that no log holds prepared (`live`), and return how many.
+async fn reclaim_transactions(
+    store: &Arc<dyn ObjectStore>,
+    transactions: &Path,
+    cutoff: chrono::DateTime<chrono::Utc>,
+    live: &HashSet<String>,
+) -> CatalogResult<usize> {
+    let mut removed = 0;
+    let listed = store
+        .list_with_delimiter(Some(transactions))
+        .await
+        .map_err(invalid)?;
+    for prefix in listed.common_prefixes {
+        let Some(txn) = prefix.filename() else {
+            continue;
+        };
+        if !live.contains(txn) && created_at(txn).is_some_and(|created| created < cutoff) {
+            delete_under(store, &prefix).await?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 /// The prefix of the log that holds `dataset` in the catalog at `prefix`, read
@@ -558,7 +636,7 @@ impl ObjectNativeCatalog {
     }
 
     /// Remove what no log needs once recovery has resolved every transaction
-    /// left prepared: transaction records, logs no name refers to (a dataset
+    /// left prepared: the records of transactions no log holds prepared, logs no name refers to (a dataset
     /// dropped, or a create stopped before it was named). Only what is older than
     /// `reclaim_after` goes, since a newer one may belong to a process that took
     /// the logs over after this one opened them.
@@ -566,20 +644,11 @@ impl ObjectNativeCatalog {
         let cutoff = chrono::Utc::now()
             - chrono::Duration::from_std(self.config.reclaim_after).map_err(invalid)?;
         let mut removed = (0, 0);
-        let listed = self
-            .store
-            .list_with_delimiter(Some(&self.transactions))
-            .await
-            .map_err(invalid)?;
-        for prefix in listed.common_prefixes {
-            let Some(txn) = prefix.filename() else {
-                continue;
-            };
-            if created_at(txn).is_some_and(|created| created < cutoff) {
-                delete_under(&self.store, &prefix).await?;
-                removed.0 += 1;
-            }
+        let mut live = HashSet::new();
+        for domain in self.domains() {
+            live.extend(domain.unresolved().await.into_iter().map(|(txn, _)| txn));
         }
+        removed.0 = reclaim_transactions(&self.store, &self.transactions, cutoff, &live).await?;
         let named: HashSet<String> = self
             .registry
             .positions_under(REGISTRY)
@@ -620,48 +689,9 @@ impl ObjectNativeCatalog {
     }
 
     /// Record `commit` as the outcome of `txn` unless one is recorded, and
-    /// return the recorded outcome. Exactly one outcome is ever recorded.
+    /// return the recorded outcome.
     async fn decide(&self, txn: &str, commit: bool) -> CatalogResult<bool> {
-        const ATTEMPTS: u32 = 8;
-        let path = self.transaction_object(txn, "decision.json");
-        let body = if commit { "commit" } else { "abort" };
-        let mut last = None;
-        for attempt in 0..ATTEMPTS {
-            if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(50 << attempt.min(6))).await;
-            }
-            match self
-                .store
-                .put_opts(&path, PutPayload::from(body), PutMode::Create.into())
-                .await
-            {
-                Ok(_) => return Ok(commit),
-                Err(object_store::Error::AlreadyExists { .. }) => {}
-                // Unknown whether it landed: read it back, or try again.
-                Err(error) => {
-                    last = Some(error);
-                    continue;
-                }
-            }
-            match self.store.get(&path).await {
-                Ok(recorded) => {
-                    let recorded = recorded.bytes().await.map_err(invalid)?;
-                    return match recorded.as_ref() {
-                        b"commit" => Ok(true),
-                        b"abort" => Ok(false),
-                        other => Err(invalid(format!(
-                            "transaction {txn} has an unreadable decision: {}",
-                            String::from_utf8_lossy(other)
-                        ))),
-                    };
-                }
-                Err(error) => last = Some(error),
-            }
-        }
-        Err(invalid(format!(
-            "could not record the decision of transaction {txn}: {}",
-            last.map_or_else(String::new, |error| error.to_string())
-        )))
+        decide(&self.store, &self.transactions, txn, commit).await
     }
 
     /// Resolve every transaction a stopped process left prepared, from its

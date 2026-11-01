@@ -368,11 +368,10 @@ async fn an_open_removes_the_logs_no_dataset_uses_and_keeps_the_others() {
     create_fails(&catalog, "unnamed").await;
     faults.clear_rules();
     let kept = objects_under(&store, "datasets").await;
-    let unnamed: Vec<_> = kept
-        .iter()
-        .filter(|path| path.starts_with("datasets/unnamed-"))
-        .collect();
-    assert!(!unnamed.is_empty(), "the stopped create wrote its log: {kept:?}");
+    assert!(
+        kept.iter().any(|path| path.starts_with("datasets/unnamed-")),
+        "the stopped create wrote its log: {kept:?}"
+    );
     drop(catalog);
     // Recent: kept.
     drop(

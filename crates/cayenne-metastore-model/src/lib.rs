@@ -2916,3 +2916,17 @@ pub fn window_head_after(run: &str, actions: &[String]) -> Option<(Vec<usize>, V
     let run = runs().into_iter().find(|r| r.name == run && r.family == "window")?;
     window::head_after(run.mode, run.bound, actions)
 }
+
+pub use transactions::Step as TransactionStep;
+
+/// What each action of a `transactions` trace from `run` does in the model:
+/// the record that lands or the delivery refused, the decision and every
+/// participant's log after it. `None` for an unknown run, a run of another
+/// family, or an action the run does not enable at that point.
+#[must_use]
+pub fn transaction_steps(run: &str, actions: &[String]) -> Option<Vec<TransactionStep>> {
+    let run = runs()
+        .into_iter()
+        .find(|r| r.name == run && r.family == "transactions")?;
+    transactions::steps(run.mode, run.bound, actions)
+}

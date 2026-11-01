@@ -107,7 +107,7 @@ impl Default for NativeCatalogConfig {
             // Small for the prototype, so short CDC runs checkpoint.
             checkpoint_after_batches: 1,
             attempt_horizon: object_store_occ::headlog::DEFAULT_ATTEMPT_HORIZON,
-            reclaim_after: std::time::Duration::from_secs(60 * 60),
+            reclaim_after: std::time::Duration::from_hours(1),
         }
     }
 }

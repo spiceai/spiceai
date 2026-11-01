@@ -3748,6 +3748,7 @@ dependencies = [
  "blake3",
  "bytes",
  "cayenne-metastore-actions",
+ "cayenne-metastore-model",
  "chdb-rust",
  "chrono",
  "cpu-budget",

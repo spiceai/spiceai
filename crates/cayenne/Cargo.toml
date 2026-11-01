@@ -122,6 +122,8 @@ result-correctness-duckdb = ["dep:duckdb"]
 result-correctness-chdb = ["dep:chdb-rust"]
 
 [dev-dependencies]
+# Steps the model's transactions traces for the object-native catalog's replay.
+cayenne-metastore-model = { path = "../cayenne-metastore-model" }
 # getrusage for the `wide_column_point_lookup` bench, and the allocators it can run under: the
 # two `spiced` can be built with (`snmalloc-rs` is its default).
 libc = "0.2"
