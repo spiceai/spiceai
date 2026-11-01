@@ -22,7 +22,7 @@ pub struct ReplacementMatch {
     pub span: std::ops::Range<usize>,
 }
 
-#[derive(Logos, Debug, PartialEq)]
+#[derive(Logos, Debug, Clone, PartialEq)]
 #[logos(skip r"[ \t\n\f]+")] // Ignore whitespace between tokens
 enum SecretReplacementToken {
     #[token("${")]
@@ -66,25 +66,15 @@ impl Iterator for SecretReplacementMatcher<'_> {
 
             let start_span = self.lexer.span().start;
 
-            // A reference that does not parse is skipped, and the search goes
-            // on to the next `${`.
-            let Some(Ok(SecretReplacementToken::Identifier(store_name))) = self.lexer.next() else {
+            // The reference is parsed on a copy, so one that does not parse
+            // consumes nothing past its `${`, and the search goes on from
+            // there.
+            let mut reference = self.lexer.clone();
+            let Some((store_name, key)) = parse_reference(&mut reference) else {
                 continue;
             };
-
-            let Some(Ok(SecretReplacementToken::Colon)) = self.lexer.next() else {
-                continue;
-            };
-
-            let Some(Ok(SecretReplacementToken::Identifier(key))) = self.lexer.next() else {
-                continue;
-            };
-
-            let Some(Ok(SecretReplacementToken::End)) = self.lexer.next() else {
-                continue;
-            };
-
-            let end_span = self.lexer.span().end;
+            let end_span = reference.span().end;
+            self.lexer = reference;
             return Some(ReplacementMatch {
                 store_name,
                 key,
@@ -96,24 +86,50 @@ impl Iterator for SecretReplacementMatcher<'_> {
     }
 }
 
+/// Parses `store:key }`, the rest of a reference after its `${`.
+fn parse_reference(
+    lexer: &mut logos::Lexer<'_, SecretReplacementToken>,
+) -> Option<(String, String)> {
+    let Some(Ok(SecretReplacementToken::Identifier(store_name))) = lexer.next() else {
+        return None;
+    };
+    let Some(Ok(SecretReplacementToken::Colon)) = lexer.next() else {
+        return None;
+    };
+    let Some(Ok(SecretReplacementToken::Identifier(key))) = lexer.next() else {
+        return None;
+    };
+    let Some(Ok(SecretReplacementToken::End)) = lexer.next() else {
+        return None;
+    };
+    Some((store_name, key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn a_reference_that_does_not_parse_leaves_later_references_found() {
-        let input = "postgres://${ secrets:pg.user }:${ secrets:PG_PASS }@db/app";
-        let found: Vec<(String, String, &str)> = SecretReplacementMatcher::new(input)
-            .map(|m| (m.store_name, m.key, &input[m.span]))
-            .collect();
-        assert_eq!(
-            found,
-            vec![(
-                "secrets".to_string(),
-                "PG_PASS".to_string(),
-                "${ secrets:PG_PASS }"
-            )]
-        );
+        for (input, reference) in [
+            (
+                "postgres://${ secrets:pg.user }:${ secrets:PG_PASS }@db/app",
+                "${ secrets:PG_PASS }",
+            ),
+            (
+                "postgres://${ secrets:PG_USER ${ secrets:PG_PASS }@db/app",
+                "${ secrets:PG_PASS }",
+            ),
+        ] {
+            let found: Vec<(String, String, &str)> = SecretReplacementMatcher::new(input)
+                .map(|m| (m.store_name, m.key, &input[m.span]))
+                .collect();
+            assert_eq!(
+                found,
+                vec![("secrets".to_string(), "PG_PASS".to_string(), reference)],
+                "{input}"
+            );
+        }
     }
 
     #[test]
