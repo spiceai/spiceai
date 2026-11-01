@@ -18,8 +18,8 @@ limitations under the License.
 
 use crate::context::RuntimeContext;
 use crate::error::{
-    ConnectionFailedSnafu, InvalidArgumentSnafu, InvalidResponseSnafu, ModelListUnauthorizedSnafu,
-    ModelNotFoundSnafu, NoModelsConfiguredSnafu, Result,
+    ConnectionFailedSnafu, InvalidArgumentSnafu, InvalidResponseSnafu, ModelNotFoundSnafu,
+    NoModelsConfiguredSnafu, Result,
 };
 use crate::output::{OutputFormat, write_json};
 use crate::sse::{SseDecoder, SseEvent};
@@ -471,7 +471,7 @@ fn map_model_error(error: repl::util::UtilError) -> crate::error::Error {
             InvalidResponseSnafu { message }.build()
         }
         repl::util::UtilError::Unauthorized { endpoint } => {
-            ModelListUnauthorizedSnafu { endpoint }.build()
+            crate::error::ModelListUnauthorizedSnafu { endpoint }.build()
         }
     }
 }
