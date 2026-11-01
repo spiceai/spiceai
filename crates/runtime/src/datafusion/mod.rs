@@ -4437,6 +4437,20 @@ impl DataFusion {
                     });
                 }
             }
+        } else if let Some(delete_expr) = retention_delete_expr.as_ref()
+            && let Err(err) = crate::accelerated::ensure_no_fallible_implicit_cast(
+                delete_expr,
+                &source_table_provider.schema(),
+            )
+        {
+            // Without a source fallback nothing reads evicted rows back, so this
+            // is not refused. The retention pass will still fail on every row
+            // the cast cannot convert, so say so once here instead of leaving
+            // only the per-pass retention errors.
+            tracing::warn!(
+                "Dataset {}: `retention_sql` will fail when retention runs on rows it cannot convert: {err}",
+                dataset.name
+            );
         }
 
         accelerated_table_builder.retention(retention);

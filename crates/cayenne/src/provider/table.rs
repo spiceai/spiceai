@@ -23695,6 +23695,38 @@ impl CayenneTableProvider {
         });
     }
 
+    /// Re-arm retention and restart the maintenance loop once `delay` elapses.
+    ///
+    /// Arms a one-shot timer rather than re-queueing the request, so the
+    /// background loop is not woken on every debounce while a failing pass
+    /// backs off. A table quiesced in the meantime is not re-armed.
+    fn schedule_retention_retry(&self, delay: Duration) {
+        let table = self.clone_for_write();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            table.post_write_maintenance.state.lock().retention_requested = true;
+            // Claim the loop before the admission check, so a racing `quiesce`
+            // either sees the claim and drains it or closes first and is seen
+            // here (see `maintenance_still_admitted`).
+            if table
+                .post_write_maintenance
+                .scheduled
+                .swap(true, Ordering::AcqRel)
+            {
+                // A running loop picks the request up on its next pass.
+                return;
+            }
+            if !table.maintenance_still_admitted() {
+                table
+                    .post_write_maintenance
+                    .scheduled
+                    .store(false, Ordering::Release);
+                return;
+            }
+            table.run_post_write_maintenance_loop().await;
+        });
+    }
+
     /// Synchronously drain any pending post-write maintenance, including any
     /// iteration the background loop is currently executing.
     ///
@@ -23717,9 +23749,22 @@ impl CayenneTableProvider {
     /// is draining queued work.
     pub async fn flush_pending_maintenance(&self) -> CatalogResult<()> {
         loop {
+            // A retention pass owed by a backed-off retry is not in the queued
+            // state; fold it in so the drain runs (and reports) it rather than
+            // returning `Ok` with retention still outstanding. Re-read every
+            // iteration: a background pass that fails while this waits records
+            // the debt after the first read. This cannot spin: the folded pass
+            // either completes, which clears the debt, or fails, which returns.
+            let retention_owed = self
+                .post_write_maintenance
+                .retention_backoff
+                .lock()
+                .retry_owed();
             let state = {
                 let mut guard = self.post_write_maintenance.state.lock();
-                std::mem::take(&mut *guard)
+                let mut state = std::mem::take(&mut *guard);
+                state.retention_requested |= retention_owed;
+                state
             };
             if !state.is_empty() {
                 self.run_maintenance_state(state, RetentionFailureAction::ReturnError)
@@ -23731,7 +23776,19 @@ impl CayenneTableProvider {
                 .scheduled
                 .load(Ordering::Acquire)
             {
-                return Ok(());
+                // The background loop may have failed, recorded retry debt,
+                // and released `scheduled` between the reads above and this
+                // one. Only return once the loop is idle *and* nothing is
+                // owed or queued; otherwise drain again.
+                let owed_now = self
+                    .post_write_maintenance
+                    .retention_backoff
+                    .lock()
+                    .retry_owed();
+                if !owed_now && self.post_write_maintenance.state.lock().is_empty() {
+                    return Ok(());
+                }
+                continue;
             }
             // The background loop has the state lock and is mid-iteration.
             // Wait briefly and re-check; we cannot drain its work from here,
@@ -23804,9 +23861,24 @@ impl CayenneTableProvider {
         }
 
         let mut retention_deleted = 0_u64;
-        if state.retention_requested {
+        // After a failed background pass the retry is owned by the timer that
+        // `schedule_retention_retry` armed, so a pass inside the backoff window
+        // leaves retention alone instead of failing again on every debounce.
+        let retention_backing_off = matches!(
+            retention_failure_action,
+            RetentionFailureAction::Requeue
+        ) && self
+            .post_write_maintenance
+            .retention_backoff
+            .lock()
+            .is_waiting(tokio::time::Instant::now());
+        if state.retention_requested && !retention_backing_off {
             match self.apply_retention_filters().await {
                 Ok(RetentionPass::Deleted(deleted)) => {
+                    self.post_write_maintenance
+                        .retention_backoff
+                        .lock()
+                        .record_success();
                     retention_deleted = deleted;
                     if deleted > 0 {
                         tracing::info!(
@@ -23862,19 +23934,25 @@ impl CayenneTableProvider {
                 Err(e) => {
                     match retention_failure_action {
                         RetentionFailureAction::Requeue => {
-                            // Re-queue so the next debounce cycle retries. A
-                            // persistently failing retention scan would
-                            // otherwise leave expired rows undeleted
-                            // indefinitely; re-queueing makes delivery eventual
-                            // and the repeated error log observable. Logged at
-                            // `error` (not `warn`) because the retry semantics
-                            // turn a single failure into a steady signal worth
-                            // alerting on.
+                            // Retry, so a transient failure does not leave
+                            // expired rows undeleted indefinitely, but back off
+                            // exponentially: a failure that does not clear on
+                            // its own (a `retention_sql` whose implicit cast
+                            // cannot convert a stored value) re-armed on every
+                            // 100 ms debounce logged about ten errors a second
+                            // without bound. Logged at `error` because each
+                            // line is a pass that left expired rows queryable.
+                            let (attempt, delay) = self
+                                .post_write_maintenance
+                                .retention_backoff
+                                .lock()
+                                .record_failure(tokio::time::Instant::now());
                             tracing::error!(
                                 table = self.table_metadata.table_name.as_str(),
-                                "Background retention scan failed: {e}. Re-queueing for retry."
+                                "Background retention scan failed (attempt {attempt}): {e}. Retrying in {}s.",
+                                delay.as_secs()
                             );
-                            self.post_write_maintenance.state.lock().retention_requested = true;
+                            self.schedule_retention_retry(delay);
                         }
                         RetentionFailureAction::ReturnError => return Err(e),
                     }
@@ -30395,9 +30473,16 @@ impl CayenneTableProvider {
             self.retention_filters.iter().cloned(),
             &self.table_schema(),
         )
-        .map_err(|err| CatalogError::InvalidOperation {
-            message: self.retention_failed_message(),
-            source: Box::new(err),
+        .map_err(|err| {
+            maintenance_metrics::track_maintenance(
+                table_name,
+                MaintenanceOp::Retention,
+                MaintenanceOutcome::Failed,
+            );
+            CatalogError::InvalidOperation {
+                message: self.retention_failed_message(),
+                source: Box::new(err),
+            }
         })?;
         // Composed through the shared builder rather than hand-rolled, so retention gets
         // the same sink a user `DELETE` does: protected-snapshot and cold-tier listings
@@ -69535,6 +69620,117 @@ mod tests {
             vec![(3, 60)],
             "once the window closes retention must delete exactly the matching rows"
         );
+    }
+
+    /// A `retention_sql` that plans but fails per row at execution (`status > 5`
+    /// on a Utf8 column coerces to `CAST(status AS Int64) > 5`, and `'active'`
+    /// does not convert) used to be re-armed on every 100 ms debounce, logging an
+    /// error about ten times a second without bound. A failed background pass
+    /// now arms a backed-off retry instead of re-queueing, a pass inside the
+    /// window leaves retention alone, and a synchronous drain still runs and
+    /// reports the owed pass.
+    #[tokio::test]
+    async fn failing_background_retention_backs_off_instead_of_requeueing() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let table_name = "retention_backoff_bad_cast".to_string();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
+                .expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("status", DataType::Utf8, false),
+        ]));
+        let seeded = CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+            .create(CreateTableOptions {
+                table_name: table_name.clone(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: data_dir,
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    compaction_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("table created");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["active", "inactive"])),
+            ],
+        )
+        .expect("batch");
+        insert_batch(&seeded, batch).await;
+        drop(seeded);
+
+        let provider = CayenneTableProvider::new_with_retention(
+            &table_name,
+            Arc::clone(&catalog),
+            vec![datafusion_expr::col("status").gt(datafusion_expr::lit(5_i64))],
+            runtime_env,
+        )
+        .await
+        .expect("reopen with retention");
+        provider
+            .apply_retention_filters()
+            .await
+            .expect_err("precondition: the coerced predicate must fail at execution");
+        let backoff = || provider.post_write_maintenance.retention_backoff.lock();
+        assert_eq!(
+            backoff().consecutive_failures(),
+            0,
+            "a direct pass does not touch the background backoff"
+        );
+
+        let requested = || PostWriteMaintenanceState {
+            retention_requested: true,
+            ..PostWriteMaintenanceState::default()
+        };
+        provider
+            .run_maintenance_state(requested(), RetentionFailureAction::Requeue)
+            .await
+            .expect("a failed background pass is logged, not returned");
+        assert_eq!(backoff().consecutive_failures(), 1);
+        assert!(backoff().is_waiting(tokio::time::Instant::now()));
+        assert!(
+            !provider
+                .post_write_maintenance
+                .state
+                .lock()
+                .retention_requested,
+            "the retry belongs to the backoff timer; re-arming the queue is what retried \
+             on every 100 ms debounce"
+        );
+
+        // A write landing inside the window queues retention again; the pass skips it.
+        provider
+            .run_maintenance_state(requested(), RetentionFailureAction::Requeue)
+            .await
+            .expect("a skipped pass is not an error");
+        assert_eq!(
+            backoff().consecutive_failures(),
+            1,
+            "a pass inside the backoff window must not run (and fail) retention again"
+        );
+
+        // A synchronous drain still runs the owed pass, and reports that it failed.
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect_err("the drain must run the owed retention and report its failure");
     }
 
     /// The same deferral for a mem-tier seal shadow: a durable inline row deliberately
