@@ -526,6 +526,18 @@ impl SpiceObjectStoreRegistry {
         self.prepare_https_object_store(target, Some(ssrf::url_table_destination_guard()))
     }
 
+    /// Builds the store an `http`/`https` dataset reads `url` through. The dataset's own host is
+    /// allowed whatever it resolves to; unless `allow_private` is set, a redirect to another host
+    /// is refused when that host is internal.
+    fn prepare_dataset_http_object_store(
+        &self,
+        url: &Url,
+        allow_private: bool,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let guard = (!allow_private).then(|| ssrf::redirect_destination_guard().redirects_only());
+        self.prepare_https_object_store(url, guard)
+    }
+
     fn prepare_https_object_store(
         &self,
         url: &Url,
@@ -818,7 +830,7 @@ impl SpiceObjectStoreRegistry {
             return self.prepare_url_table_http_object_store(&target, ssrf::allow_private_hosts());
         }
         if url.as_str().starts_with("https://") || url.as_str().starts_with("http://") {
-            return self.prepare_https_object_store(url, None);
+            return self.prepare_dataset_http_object_store(url, ssrf::allow_private_hosts());
         }
         if url.as_str().starts_with("s3://") {
             return self.prepare_s3_object_store(url);
@@ -1305,6 +1317,13 @@ mod tests {
     /// returns the origin URL, with `allow_http=true` set the way an `http` dataset or URL table
     /// sets it, and the number of requests the target received.
     async fn redirect_to_loopback_target() -> (Url, Arc<std::sync::atomic::AtomicUsize>) {
+        redirect_to_loopback_target_named("127.0.0.1").await
+    }
+
+    /// As [`redirect_to_loopback_target`], with the redirect naming the target as `target_host`.
+    async fn redirect_to_loopback_target_named(
+        target_host: &'static str,
+    ) -> (Url, Arc<std::sync::atomic::AtomicUsize>) {
         use axum::{Router, http::StatusCode, response::IntoResponse};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1326,7 +1345,7 @@ mod tests {
             async { "id\n1\n" }
         }))
         .await;
-        let location = format!("http://{target}/items.csv");
+        let location = format!("http://{target_host}:{}/items.csv", target.port());
         let origin =
             serve(
                 Router::new().fallback(move || {
@@ -1419,7 +1438,7 @@ mod tests {
     }
 
     /// A dataset's HTTP store for a host must not be served to a URL table for the same host,
-    /// and the dataset's store keeps following redirects.
+    /// and the dataset's store follows a redirect that stays on its own host.
     #[tokio::test]
     async fn url_table_and_dataset_stores_for_one_host_are_separate() {
         use std::sync::atomic::Ordering;
@@ -1433,7 +1452,7 @@ mod tests {
         assert_eq!(
             get_items(&dataset_store)
                 .await
-                .expect("a dataset store follows redirects"),
+                .expect("a dataset store follows a redirect on its own host"),
             "id\n1\n"
         );
 
@@ -1449,6 +1468,116 @@ mod tests {
         assert!(
             error.contains("targets a private, loopback, or link-local address"),
             "{error}"
+        );
+        assert_eq!(target_hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A loopback origin that serves a CSV body at `/moved/items.csv` and redirects every other
+    /// path there; returns the origin as a dataset URL on `host`.
+    async fn same_host_redirecting_origin(host: &str) -> Url {
+        use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the server binds a loopback port");
+        let port = listener
+            .local_addr()
+            .expect("the server has an address")
+            .port();
+        let router = Router::new()
+            .route("/moved/items.csv", get(|| async { "id\n1\n" }))
+            .fallback(|| async {
+                (
+                    StatusCode::FOUND,
+                    [(http::header::LOCATION, "/moved/items.csv")],
+                )
+                    .into_response()
+            });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        Url::parse(&format!("http://{host}:{port}/#allow_http=true")).expect("valid URL")
+    }
+
+    /// A dataset on a loopback host still loads, including through a redirect that stays on
+    /// that host.
+    #[tokio::test]
+    async fn dataset_store_reads_its_own_loopback_host() {
+        for host in ["127.0.0.1", "localhost"] {
+            let origin = same_host_redirecting_origin(host).await;
+            let store = SpiceObjectStoreRegistry::new(Handle::current())
+                .prepare_dataset_http_object_store(&origin, false)
+                .expect("the dataset store builds");
+            assert_eq!(
+                get_items(&store)
+                    .await
+                    .unwrap_or_else(|e| panic!("a dataset on {host} loads: {e}")),
+                "id\n1\n"
+            );
+        }
+    }
+
+    /// A dataset whose origin redirects to another host that is internal is refused before the
+    /// redirect target is reached, whether that host is an address or a name that resolves to
+    /// one.
+    #[tokio::test]
+    async fn dataset_store_refuses_a_redirect_to_another_internal_host() {
+        use std::sync::atomic::Ordering;
+
+        // The origin is reached as `localhost` and redirects to the `127.0.0.1` address.
+        let (origin, target_hits) = redirect_to_loopback_target().await;
+        let mut origin_by_name = origin.clone();
+        origin_by_name
+            .set_host(Some("localhost"))
+            .expect("http URL takes a host");
+        let store = SpiceObjectStoreRegistry::new(Handle::current())
+            .prepare_dataset_http_object_store(&origin_by_name, false)
+            .expect("the dataset store builds");
+        let error = get_items(&store)
+            .await
+            .expect_err("the redirect is refused")
+            .to_string();
+        assert!(
+            error.contains("Refused to connect to http://127.0.0.1:")
+                && error.contains("the HTTPS data connector does not follow a redirect to a private, loopback, or link-local address"),
+            "{error}"
+        );
+        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+
+        // The origin redirects to `localhost.`, a name only the resolver finds internal.
+        let (origin, target_hits) = redirect_to_loopback_target_named("localhost.").await;
+        let store = SpiceObjectStoreRegistry::new(Handle::current())
+            .prepare_dataset_http_object_store(&origin, false)
+            .expect("the dataset store builds");
+        let error = get_items(&store)
+            .await
+            .expect_err("the redirect is refused")
+            .to_string();
+        assert!(
+            error.contains("Refused to connect to localhost")
+                && error.contains("the HTTPS data connector does not follow a redirect to a private, loopback, or link-local address"),
+            "{error}"
+        );
+        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dataset_store_follows_a_redirect_to_another_internal_host_when_private_hosts_are_allowed()
+     {
+        use std::sync::atomic::Ordering;
+
+        let (origin, target_hits) = redirect_to_loopback_target().await;
+        let mut origin_by_name = origin.clone();
+        origin_by_name
+            .set_host(Some("localhost"))
+            .expect("http URL takes a host");
+        let store = SpiceObjectStoreRegistry::new(Handle::current())
+            .prepare_dataset_http_object_store(&origin_by_name, true)
+            .expect("the dataset store builds");
+
+        assert_eq!(
+            get_items(&store).await.expect("the redirect is followed"),
+            "id\n1\n"
         );
         assert_eq!(target_hits.load(Ordering::SeqCst), 1);
     }

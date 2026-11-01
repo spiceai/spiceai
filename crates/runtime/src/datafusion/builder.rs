@@ -4277,6 +4277,190 @@ mod tests {
         );
     }
 
+    /// Runs `NOT IN` queries whose subquery yields a NULL, then counts, over a
+    /// parquet table in a session built with `eager_aggregation`. Returns whether
+    /// the `count(id)` plan pre-aggregates below the join, that plan rendered, and
+    /// each query with its single formatted value (or the error it raised).
+    #[cfg(not(windows))]
+    async fn count_over_a_null_aware_anti_join_on_parquet(
+        eager_aggregation: bool,
+    ) -> (bool, String, Vec<(&'static str, String)>) {
+        use datafusion::parquet::data_type::{Int32Type, Int64Type};
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::parser::parse_message_type;
+        use datafusion::prelude::ParquetReadOptions;
+
+        // 20,000 rows; `qty` has 17 distinct values and every tenth row is NULL.
+        // The rule's cost gate reads the number of distinct values from the
+        // file's column statistics and declines the push without it. A writer
+        // that records it, as DuckDB does, is what puts this file within the
+        // rule's reach, so the column chunk is written with that statistic.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("t.parquet");
+        let schema = Arc::new(
+            parse_message_type("message t { optional int64 id; optional int32 qty; }")
+                .expect("parse the parquet schema"),
+        );
+        let mut writer = SerializedFileWriter::new(
+            std::fs::File::create(&path).expect("create the parquet file"),
+            schema,
+            Arc::new(WriterProperties::builder().build()),
+        )
+        .expect("open the parquet writer");
+        let mut row_group = writer.next_row_group().expect("start the row group");
+
+        let ids: Vec<i64> = (1..=20_000).collect();
+        let mut id = row_group
+            .next_column()
+            .expect("open the id column")
+            .expect("the id column");
+        let present = vec![1_i16; ids.len()];
+        id.typed::<Int64Type>()
+            .write_batch_with_statistics(
+                &ids,
+                Some(present.as_slice()),
+                None,
+                Some(&1),
+                Some(&20_000),
+                None,
+            )
+            .expect("write the id column");
+        id.close().expect("close the id column");
+
+        let qty: Vec<Option<i32>> = (1..=20_000_i32)
+            .map(|i| if i % 10 == 0 { None } else { Some(i % 17 - 8) })
+            .collect();
+        let definition_levels: Vec<i16> = qty.iter().map(|v| i16::from(v.is_some())).collect();
+        let values: Vec<i32> = qty.iter().flatten().copied().collect();
+        let mut qty = row_group
+            .next_column()
+            .expect("open the qty column")
+            .expect("the qty column");
+        qty.typed::<Int32Type>()
+            .write_batch_with_statistics(
+                &values,
+                Some(definition_levels.as_slice()),
+                None,
+                Some(&-8),
+                Some(&8),
+                Some(17),
+            )
+            .expect("write the qty column");
+        qty.close().expect("close the qty column");
+        row_group.close().expect("close the row group");
+        writer.close().expect("close the parquet file");
+        let path = path.to_str().expect("utf-8 path");
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .eager_aggregation(Some(eager_aggregation))
+        .build();
+        df.ctx
+            .register_parquet("t", path, ParquetReadOptions::default())
+            .await
+            .expect("register the parquet table");
+
+        let plan = df
+            .ctx
+            .sql("SELECT count(id) FROM t WHERE qty NOT IN (SELECT NULL::INT)")
+            .await
+            .expect("plan the query")
+            .create_physical_plan()
+            .await
+            .expect("build the physical plan");
+        let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+
+        let mut results = Vec::new();
+        for query in [
+            "SELECT count(*) FROM t WHERE qty NOT IN (SELECT qty FROM t WHERE id <= 50)",
+            "SELECT count(*) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+            "SELECT count(id) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+            "SELECT coalesce(count(*), 42) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+            // Control: the subquery has no NULL, so rows survive the anti join.
+            "SELECT count(*) FROM t WHERE qty NOT IN (SELECT qty FROM t WHERE id <= 9)",
+        ] {
+            let value = match df.ctx.sql(query).await {
+                Ok(frame) => match frame.collect().await {
+                    Ok(batches) => {
+                        let column = batches
+                            .iter()
+                            .find(|b| b.num_rows() > 0)
+                            .map(|b| Arc::clone(b.column(0)));
+                        match column {
+                            Some(column) => arrow::util::display::array_value_to_string(&column, 0)
+                                .expect("format the value"),
+                            None => "<no rows>".to_string(),
+                        }
+                    }
+                    Err(e) => format!("error: {e}"),
+                },
+                Err(e) => format!("error: {e}"),
+            };
+            results.push((query, value));
+        }
+        (aggregates_below_a_join(&plan, false), rendered, results)
+    }
+
+    /// `count` over a `NOT IN` whose subquery holds a NULL is 0: the null-aware
+    /// anti join emits no rows and an ungrouped aggregate still emits one. With eager
+    /// aggregation the pushed partial count is merged by a `SUM`, which is NULL over
+    /// no rows, so `count(id)` returned NULL and `count(*)` failed its non-nullable
+    /// schema check. The disabled session is the control, and the plan check shows
+    /// the rule fires, so the enabled run exercises the rewrite.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn count_over_not_in_with_a_null_is_zero_under_eager_aggregation() {
+        let expected = vec![
+            (
+                "SELECT count(*) FROM t WHERE qty NOT IN (SELECT qty FROM t WHERE id <= 50)",
+                "0".to_string(),
+            ),
+            (
+                "SELECT count(*) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+                "0".to_string(),
+            ),
+            (
+                "SELECT count(id) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+                "0".to_string(),
+            ),
+            (
+                "SELECT coalesce(count(*), 42) FROM t WHERE qty NOT IN (SELECT NULL::INT)",
+                "0".to_string(),
+            ),
+            (
+                "SELECT count(*) FROM t WHERE qty NOT IN (SELECT qty FROM t WHERE id <= 9)",
+                "8467".to_string(),
+            ),
+        ];
+
+        let (pushed, plan, results) = count_over_a_null_aware_anti_join_on_parquet(true).await;
+        assert!(
+            pushed,
+            "with eager aggregation enabled the count has to be pre-aggregated below the \
+             anti join, or this test no longer exercises the rewrite: {plan}"
+        );
+        assert_eq!(
+            results, expected,
+            "eager aggregation changed a count: {plan}"
+        );
+
+        let (pushed, plan, results) = count_over_a_null_aware_anti_join_on_parquet(false).await;
+        assert!(
+            !pushed,
+            "with eager aggregation disabled nothing may be pre-aggregated below the join: {plan}"
+        );
+        assert_eq!(
+            results, expected,
+            "the unrewritten plan returned a wrong count"
+        );
+    }
+
     #[test]
     fn test_cayenne_provider_predicate_detects_poly_accelerator_metadata() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
