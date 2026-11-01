@@ -180,8 +180,8 @@ impl LazyBloom<'_> {
     }
 }
 
-/// The lowest delete sequence among `tombstones` that may still hide a row of
-/// one of `cold_files`, or `None` when none can.
+/// Which of `tombstones` may each hide a row of some file in `cold_files`,
+/// index-aligned with `tombstones`.
 ///
 /// `tombstones` pairs each tombstoned key — row-major, one value per PK column
 /// in primary-key order (`decode_tombstone_keys` output) — with the sequence of
@@ -197,18 +197,16 @@ impl LazyBloom<'_> {
 /// [`encode_int64_bloom_probes`]). `None`, a length mismatch, or a bloom-less
 /// file falls back to the rectangle alone.
 ///
-/// Tombstones are checked oldest first and the first that may hide a row ends
-/// the search, so the common case — the oldest tombstone still masks a
-/// superseded cold row — costs one probe pass.
-pub(crate) fn lowest_cold_relevant_tombstone_sequence(
+/// A promotion keeps exactly the tombstones marked `true`. One that is `false`
+/// can hide no row of any carried file, and none of a file written later,
+/// whose rows are all newer than it.
+pub(crate) fn cold_relevant_tombstones(
     cold_files: &[ColdTierFile],
     tombstones: &[(Vec<ScalarValue>, i64)],
     bloom_probes: Option<&[Box<[u8]>]>,
     schema: &Arc<Schema>,
     pk_indices: &[usize],
-) -> Option<i64> {
-    // A misaligned probe set can't be trusted — degrade to rectangle-only
-    // rather than probing the wrong bytes.
+) -> Vec<bool> {
     let probes = bloom_probes.filter(|p| p.len() == tombstones.len());
     let mut files: Vec<ColdFileKeyTest<'_>> = cold_files
         .iter()
@@ -218,80 +216,16 @@ pub(crate) fn lowest_cold_relevant_tombstone_sequence(
             bloom: LazyBloom::Unparsed(probes.and(file.pk_bloom.as_deref())),
         })
         .collect();
-    let mut ordered: Vec<(&[ScalarValue], i64, Option<&[u8]>)> = tombstones
+    tombstones
         .iter()
         .enumerate()
         .map(|(i, (key, delete_sequence))| {
             let probe = probes.and_then(|p| p.get(i)).map(Box::as_ref);
-            (key.as_slice(), *delete_sequence, probe)
-        })
-        .collect();
-    ordered.sort_unstable_by_key(|(_, delete_sequence, _)| *delete_sequence);
-    ordered
-        .into_iter()
-        .find(|(key, delete_sequence, probe)| {
             files
                 .iter_mut()
-                .any(|file| file.may_hide(key, *delete_sequence, *probe))
+                .any(|file| file.may_hide(key, *delete_sequence, probe))
         })
-        .map(|(_, delete_sequence, _)| delete_sequence)
-}
-
-/// How many of `tombstones` may each hide a row of some file in `cold_files`,
-/// and which files they may hit — the same per-tombstone test as
-/// [`lowest_cold_relevant_tombstone_sequence`], run over every tombstone and
-/// every file instead of stopping at the first hit.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ColdTombstoneRelevance {
-    /// Tombstones that may hide a row of at least one cold file.
-    pub relevant: usize,
-    /// Cold files at least one tombstone may hit.
-    pub files_hit: usize,
-    /// Total bytes of those files.
-    pub bytes_hit: i64,
-}
-
-pub(crate) fn cold_tombstone_relevance(
-    cold_files: &[ColdTierFile],
-    tombstones: &[(Vec<ScalarValue>, i64)],
-    bloom_probes: Option<&[Box<[u8]>]>,
-    schema: &Arc<Schema>,
-    pk_indices: &[usize],
-) -> ColdTombstoneRelevance {
-    let probes = bloom_probes.filter(|p| p.len() == tombstones.len());
-    let mut files: Vec<ColdFileKeyTest<'_>> = cold_files
-        .iter()
-        .map(|file| ColdFileKeyTest {
-            max_sequence: file.max_sequence,
-            bounds: pk_bounds_from_manifest(file, schema, pk_indices),
-            bloom: LazyBloom::Unparsed(probes.and(file.pk_bloom.as_deref())),
-        })
-        .collect();
-    let mut hit = vec![false; files.len()];
-    let mut relevant = 0;
-    for (i, (key, delete_sequence)) in tombstones.iter().enumerate() {
-        let probe = probes.and_then(|p| p.get(i)).map(Box::as_ref);
-        let mut any = false;
-        for (file, hit) in files.iter_mut().zip(hit.iter_mut()) {
-            if file.may_hide(key, *delete_sequence, probe) {
-                *hit = true;
-                any = true;
-            }
-        }
-        relevant += usize::from(any);
-    }
-    let (files_hit, bytes_hit) = cold_files
-        .iter()
-        .zip(&hit)
-        .filter(|(_, hit)| **hit)
-        .fold((0, 0_i64), |(n, bytes), (file, _)| {
-            (n + 1, bytes.saturating_add(file.file_size_bytes.max(0)))
-        });
-    ColdTombstoneRelevance {
-        relevant,
-        files_hit,
-        bytes_hit,
-    }
+        .collect()
 }
 
 /// One cold file's side of the "may this tombstone hide a row here" test.
@@ -584,6 +518,24 @@ mod composite_key_tests {
     /// Every file in these tests holds rows up to sequence 100.
     const NEWER: i64 = 200;
 
+    /// The lowest delete sequence among the tombstones
+    /// [`cold_relevant_tombstones`] keeps, or `None` when it keeps none: the
+    /// retention cutoff a promotion derives from the mask.
+    fn lowest_cold_relevant_tombstone_sequence(
+        cold_files: &[ColdTierFile],
+        tombstones: &[(Vec<ScalarValue>, i64)],
+        bloom_probes: Option<&[Box<[u8]>]>,
+        schema: &Arc<Schema>,
+        pk_indices: &[usize],
+    ) -> Option<i64> {
+        cold_relevant_tombstones(cold_files, tombstones, bloom_probes, schema, pk_indices)
+            .iter()
+            .zip(tombstones)
+            .filter(|(relevant, _)| **relevant)
+            .map(|(_, (_, sequence))| *sequence)
+            .min()
+    }
+
     #[test]
     fn only_a_tombstone_inside_a_files_band_keeps_it() {
         // Three cold generations of orderline data, banded by ol_o_id (the
@@ -609,6 +561,11 @@ mod composite_key_tests {
             ),
             Some(NEWER + 1),
             "the out-of-band tombstone is older but hides nothing; the in-band one decides"
+        );
+        assert_eq!(
+            cold_relevant_tombstones(&files, &tombstones, None, &orderline_schema(), &PK_INDICES),
+            vec![false, true],
+            "only the in-band tombstone is kept, though the out-of-band one is older"
         );
     }
 

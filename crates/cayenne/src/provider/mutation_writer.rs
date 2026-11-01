@@ -1497,11 +1497,7 @@ impl<'a> AppendMutationWriter<'a> {
         let _held = held;
         let new_snapshot_start = Instant::now();
         let (rows, stats_acc, validated_keys, superseded) = self
-            .write_new_snapshot_after_validation(
-                prepared_stream,
-                &post_validation,
-                estimated_bytes,
-            )
+            .write_new_snapshot_after_validation(prepared_stream, &post_validation, estimated_bytes)
             .await?;
         tracing::debug!(
             table = self.table.table_name(),
@@ -1576,7 +1572,10 @@ impl<'a> AppendMutationWriter<'a> {
     /// `append_sequence` is the sequence the write drew for its primary-key OCC
     /// stamp, `None` when it drew none, in which case the stamp falls back to the
     /// high water.
-    #[expect(clippy::too_many_arguments, reason = "experiment: one call per write arm")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "experiment: one call per write arm"
+    )]
     async fn finish_published_write(
         &self,
         total_rows: u64,

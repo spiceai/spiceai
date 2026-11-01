@@ -289,7 +289,10 @@ async fn test_promotion_never_rewrites_existing_datalake_files_impl(
     flush_warm(&table).await;
     assert!(table.promote_warm_to_cold().await?, "promotion 1 fires");
     let generation_1 = manifest(&fixture.catalog, &table).await?;
-    assert!(!generation_1.is_empty(), "promotion 1 registers datalake files");
+    assert!(
+        !generation_1.is_empty(),
+        "promotion 1 registers datalake files"
+    );
     assert_eq!(
         generation_1.iter().map(|f| f.row_count).sum::<i64>(),
         200,
@@ -358,8 +361,13 @@ async fn test_promotion_never_rewrites_existing_datalake_files_impl(
         "DELETE value = 82 removes id 8's live row, which has an upserted tombstone history"
     );
     oracle.remove(&8);
-    assert_matches_oracle(&ctx, &oracle, &lookups, "after deleting id 8 by its live value")
-        .await?;
+    assert_matches_oracle(
+        &ctx,
+        &oracle,
+        &lookups,
+        "after deleting id 8 by its live value",
+    )
+    .await?;
 
     // Reopen from a fresh metastore connection: the retained tombstones and the
     // datalake manifest must reload and answer every query identically.
@@ -389,8 +397,13 @@ async fn test_promotion_never_rewrites_existing_datalake_files_impl(
     // in the third generation), so this upsert supersedes it rather than adding
     // a second row.
     upsert(&reopened, &mut oracle, &[(7, 73)]).await?;
-    assert_matches_oracle(&ctx_2, &oracle, &lookups, "after an upsert on the reopened table")
-        .await?;
+    assert_matches_oracle(
+        &ctx_2,
+        &oracle,
+        &lookups,
+        "after an upsert on the reopened table",
+    )
+    .await?;
 
     Ok(())
 }
@@ -546,7 +559,11 @@ async fn test_cold_compaction_merges_generations_impl(
 /// Open `TABLE` from a fresh metastore connection, registered in a new context.
 async fn reopen(
     fixture: &common::TestFixture,
-) -> TestResult<(Arc<CayenneCatalog>, Arc<CayenneTableProvider>, SessionContext)> {
+) -> TestResult<(
+    Arc<CayenneCatalog>,
+    Arc<CayenneTableProvider>,
+    SessionContext,
+)> {
     let catalog = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
     catalog.init().await?;
     let ctx = SessionContext::new();
@@ -566,7 +583,10 @@ async fn delete_file_count(
     catalog: &CayenneCatalog,
     table: &CayenneTableProvider,
 ) -> TestResult<usize> {
-    Ok(catalog.get_table_delete_files(table.table_id()).await?.len())
+    Ok(catalog
+        .get_table_delete_files(table.table_id())
+        .await?
+        .len())
 }
 
 test_with_backends!(test_partial_cold_compaction_keeps_tombstones_of_unmerged_generations_impl);
@@ -604,7 +624,12 @@ async fn test_partial_cold_compaction_keeps_tombstones_of_unmerged_generations_i
     // Generations 2..=17: each upserts one first-generation key, deletes another,
     // and adds a new key.
     for round in 1..=16_i64 {
-        upsert(&table, &mut oracle, &[(round, 1000 + round), (1000 + round, round)]).await?;
+        upsert(
+            &table,
+            &mut oracle,
+            &[(round, 1000 + round), (1000 + round, round)],
+        )
+        .await?;
         assert_eq!(
             delete_where(&table, col("id").eq(lit(50 + round))).await?,
             1,
@@ -631,11 +656,18 @@ async fn test_partial_cold_compaction_keeps_tombstones_of_unmerged_generations_i
     );
     oracle.remove(&98);
     let before = manifest(&fixture.catalog, &table).await?;
-    assert_eq!(generation_count(&before), 17, "seventeen promotions, seventeen generations");
+    assert_eq!(
+        generation_count(&before),
+        17,
+        "seventeen promotions, seventeen generations"
+    );
     let tombstones_before = delete_file_count(&fixture.catalog, &table).await?;
     assert_matches_oracle(&ctx, &oracle, &lookups, "before the partial merge").await?;
 
-    assert!(table.compact_cold_tier().await?, "the oldest sixteen generations merge");
+    assert!(
+        table.compact_cold_tier().await?,
+        "the oldest sixteen generations merge"
+    );
     let after = manifest(&fixture.catalog, &table).await?;
     assert_eq!(
         generation_count(&after),
@@ -716,18 +748,29 @@ async fn test_do_nothing_table_over_the_datalake_impl(
     assert!(table.promote_warm_to_cold().await?, "promotion 2 fires");
     common::insert_batch(table.as_ref(), id_value_batch(&[(8, 888)])?).await?;
     insert(&mut oracle, &[(8, 888)]);
-    assert_matches_oracle(&ctx, &oracle, &lookups, "after re-inserting across a promotion")
-        .await?;
+    assert_matches_oracle(
+        &ctx,
+        &oracle,
+        &lookups,
+        "after re-inserting across a promotion",
+    )
+    .await?;
 
     // Two more generations, then merge all four.
     for (round, id) in [(3_i64, 301_i64), (4, 302)] {
         common::insert_batch(table.as_ref(), id_value_batch(&[(id, id * 2)])?).await?;
         insert(&mut oracle, &[(id, id * 2)]);
         flush_warm(&table).await;
-        assert!(table.promote_warm_to_cold().await?, "promotion {round} fires");
+        assert!(
+            table.promote_warm_to_cold().await?,
+            "promotion {round} fires"
+        );
     }
     assert!(table.compact_cold_tier().await?, "four generations merge");
-    assert_eq!(generation_count(&manifest(&fixture.catalog, &table).await?), 1);
+    assert_eq!(
+        generation_count(&manifest(&fixture.catalog, &table).await?),
+        1
+    );
     assert_matches_oracle(&ctx, &oracle, &lookups, "after the merge").await?;
     // Delete then re-insert over the merged generation: accepted.
     assert_eq!(delete_where(&table, col("id").eq(lit(9_i64))).await?, 1);
@@ -789,8 +832,12 @@ async fn test_delete_all_counts_live_rows_impl(fixture: common::TestFixture) -> 
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options(&fixture, &cold_dir), ctx.runtime_env())
-            .await?,
+        CayenneTableProvider::create_table(
+            catalog,
+            table_options(&fixture, &cold_dir),
+            ctx.runtime_env(),
+        )
+        .await?,
     );
     ctx.register_table(TABLE, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     let mut oracle: BTreeMap<i64, i64> = BTreeMap::new();
@@ -801,7 +848,11 @@ async fn test_delete_all_counts_live_rows_impl(fixture: common::TestFixture) -> 
     flush_warm(&table).await;
     assert_eq!(delete_where(&table, col("id").eq(lit(1_i64))).await?, 1);
     oracle.remove(&1);
-    assert_eq!(delete_all(&table).await?, 9, "warm: DELETE without WHERE counts the 9 live rows");
+    assert_eq!(
+        delete_all(&table).await?,
+        9,
+        "warm: DELETE without WHERE counts the 9 live rows"
+    );
     oracle.clear();
     assert_eq!(count_star(&ctx).await?, 0);
 
@@ -821,7 +872,11 @@ async fn test_delete_all_counts_live_rows_impl(fixture: common::TestFixture) -> 
     // ten new copies (generation 2), so the delete-all below reads them.
     let files = manifest(&fixture.catalog, &table).await?;
     assert_eq!(generation_count(&files), 2, "two datalake generations");
-    assert_eq!(files.iter().map(|f| f.row_count).sum::<i64>(), 110, "datalake rows");
+    assert_eq!(
+        files.iter().map(|f| f.row_count).sum::<i64>(),
+        110,
+        "datalake rows"
+    );
     let rows: Vec<(i64, i64)> = (120..125).map(|id| (id, id + 2000)).collect();
     upsert(&table, &mut oracle, &rows).await?;
     assert_matches_oracle(&ctx, &oracle, &[100, 120, 150], "before the delete-all").await?;
@@ -856,7 +911,9 @@ async fn upsert_composite(
         composite_schema(),
         vec![
             Arc::new(arrow::array::StringArray::from(
-                rows.iter().map(|(tenant, _, _)| *tenant).collect::<Vec<_>>(),
+                rows.iter()
+                    .map(|(tenant, _, _)| *tenant)
+                    .collect::<Vec<_>>(),
             )),
             Arc::new(Int64Array::from(
                 rows.iter().map(|(_, id, _)| *id).collect::<Vec<_>>(),
@@ -978,7 +1035,10 @@ async fn test_composite_key_datalake_promotion_and_merge_impl(
             col("tenant").eq(lit("b")).and(col("id").eq(lit(round))),
         )
         .await?;
-        assert_eq!(deleted, 1, "DELETE (b, {round}) removes its one first-generation row");
+        assert_eq!(
+            deleted, 1,
+            "DELETE (b, {round}) removes its one first-generation row"
+        );
         oracle.remove(&("b".to_string(), round));
         flush_warm(&table).await;
         assert!(
@@ -1002,15 +1062,23 @@ async fn test_composite_key_datalake_promotion_and_merge_impl(
     // removes exactly that row.
     for stale in [5_i64, 105, 205] {
         assert_eq!(
-            delete_where(&table, col("value").eq(lit(stale)).and(col("tenant").eq(lit("a"))))
-                .await?,
+            delete_where(
+                &table,
+                col("value").eq(lit(stale)).and(col("tenant").eq(lit("a")))
+            )
+            .await?,
             0,
             "DELETE matching the superseded value {stale} affects no row"
         );
     }
     assert_eq!(
-        delete_where(&table, col("value").eq(lit(305_i64)).and(col("tenant").eq(lit("a"))))
-            .await?,
+        delete_where(
+            &table,
+            col("value")
+                .eq(lit(305_i64))
+                .and(col("tenant").eq(lit("a")))
+        )
+        .await?,
         1,
         "DELETE matching the live value removes (a, 5)"
     );
@@ -1045,6 +1113,216 @@ async fn test_composite_key_datalake_promotion_and_merge_impl(
         COMPOSITE_TABLE,
         Arc::clone(&reopened) as Arc<dyn TableProvider>,
     )?;
+    assert_composite_matches(&ctx_2, &oracle, "after reopen").await?;
+    Ok(())
+}
+
+/// Tombstoned keys the durable key-based delete files hold, summed over files.
+async fn durable_key_tombstones(
+    catalog: &CayenneCatalog,
+    table: &CayenneTableProvider,
+) -> TestResult<i64> {
+    Ok(catalog
+        .get_table_delete_files(table.table_id())
+        .await?
+        .iter()
+        .filter(|file| file.source_data_file_path.is_none())
+        .map(|file| file.delete_count)
+        .sum())
+}
+
+test_with_backends!(test_promotion_keeps_only_tombstones_that_hide_datalake_rows_impl);
+
+/// A promotion keeps a tombstone only when it may hide a row of a datalake
+/// file it carries forward, even when an older tombstone must stay. Ids 0..10
+/// are upserted and id 50 deleted, superseding first-generation rows; between
+/// them, warm-only keys are upserted and one deleted, whose tombstones hide
+/// nothing once the promotion has applied them. Only the 11 that hide a
+/// datalake row survive, in memory and durably, every answer matches the
+/// oracle, and a reopen reloads the same 11.
+async fn test_promotion_keeps_only_tombstones_that_hide_datalake_rows_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let cold_dir = fixture.temp_dir.path().join("cold");
+    std::fs::create_dir_all(&cold_dir)?;
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            catalog,
+            table_options(&fixture, &cold_dir),
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    ctx.register_table(TABLE, Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    let mut oracle: BTreeMap<i64, i64> = BTreeMap::new();
+    let lookups = [0, 9, 10, 50, 1000, 1050, 1099];
+
+    let initial: Vec<(i64, i64)> = (0..100).map(|id| (id, id)).collect();
+    upsert(&table, &mut oracle, &initial).await?;
+    flush_warm(&table).await;
+    assert!(table.promote_warm_to_cold().await?, "promotion 1 fires");
+
+    // Oldest first: tombstones that hide first-generation rows.
+    let superseding: Vec<(i64, i64)> = (0..10).map(|id| (id, id + 500)).collect();
+    upsert(&table, &mut oracle, &superseding).await?;
+    // Then warm-only keys, upserted a second time and one deleted: their
+    // tombstones hide only warm rows, which the promotion rewrites.
+    let warm_only: Vec<(i64, i64)> = (1000..1100).map(|id| (id, id)).collect();
+    upsert(&table, &mut oracle, &warm_only).await?;
+    flush_warm(&table).await;
+    let warm_only_again: Vec<(i64, i64)> = (1000..1100).map(|id| (id, id + 1)).collect();
+    upsert(&table, &mut oracle, &warm_only_again).await?;
+    assert_eq!(
+        delete_where(&table, col("id").eq(lit(1050_i64))).await?,
+        1,
+        "DELETE id = 1050 removes its warm-only row"
+    );
+    oracle.remove(&1050);
+    // Newest: a delete that hides a first-generation row.
+    assert_eq!(
+        delete_where(&table, col("id").eq(lit(50_i64))).await?,
+        1,
+        "DELETE id = 50 removes its first-generation row"
+    );
+    oracle.remove(&50);
+    assert_matches_oracle(&ctx, &oracle, &lookups, "before promotion 2").await?;
+    let before = table.deletion_index_len();
+    assert!(
+        before > 11,
+        "the warm-only writes must leave tombstones beyond the 11 that hide datalake rows, got {before}"
+    );
+
+    flush_warm(&table).await;
+    assert!(table.promote_warm_to_cold().await?, "promotion 2 fires");
+    assert_matches_oracle(&ctx, &oracle, &lookups, "after promotion 2").await?;
+    assert_eq!(
+        table.deletion_index_len(),
+        11,
+        "only the tombstones of ids 0..10 and 50 may hide a datalake row (index held {before})"
+    );
+    assert_eq!(
+        durable_key_tombstones(&fixture.catalog, &table).await?,
+        11,
+        "the durable delete files hold the same 11 tombstones"
+    );
+
+    table.drain_in_flight_maintenance().await?;
+    drop(ctx);
+    drop(table);
+    let (catalog_2, reopened, ctx_2) = reopen(&fixture).await?;
+    assert_eq!(
+        reopened.deletion_index_len(),
+        11,
+        "a reopen reloads exactly the kept tombstones"
+    );
+    assert_matches_oracle(&ctx_2, &oracle, &lookups, "after reopen").await?;
+    assert_eq!(durable_key_tombstones(&catalog_2, &reopened).await?, 11);
+
+    // The reloaded tombstones keep hiding the superseded rows through another
+    // promotion, which carries both generations forward.
+    upsert(&reopened, &mut oracle, &[(5, 905), (2000, 2000)]).await?;
+    flush_warm(&reopened).await;
+    assert!(reopened.promote_warm_to_cold().await?, "promotion 3 fires");
+    assert_matches_oracle(&ctx_2, &oracle, &[5, 50, 2000], "after promotion 3").await?;
+    Ok(())
+}
+
+test_with_backends!(
+    test_composite_key_promotion_keeps_only_tombstones_that_hide_datalake_rows_impl
+);
+
+/// [`test_promotion_keeps_only_tombstones_that_hide_datalake_rows_impl`] over a
+/// composite (`Utf8`, `Int64`) primary key, whose tombstones are row-encoded
+/// keys the in-memory index holds only as hashes.
+async fn test_composite_key_promotion_keeps_only_tombstones_that_hide_datalake_rows_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let cold_dir = fixture.temp_dir.path().join("cold");
+    std::fs::create_dir_all(&cold_dir)?;
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let ctx = SessionContext::new();
+    let mut options = table_options(&fixture, &cold_dir);
+    options.table_name = COMPOSITE_TABLE.to_string();
+    options.schema = composite_schema();
+    options.primary_key = vec!["tenant".to_string(), "id".to_string()];
+    options.on_conflict = Some(OnConflict::Upsert(ColumnReference::new(vec![
+        "tenant".to_string(),
+        "id".to_string(),
+    ])));
+    options.vortex_config.cluster_by = vec!["tenant".to_string(), "id".to_string()];
+    let table =
+        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
+    ctx.register_table(
+        COMPOSITE_TABLE,
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    )?;
+    let mut oracle = CompositeOracle::new();
+
+    let initial: Vec<(&str, i64, i64)> = (0..50).map(|id| ("a", id, id)).collect();
+    upsert_composite(&table, &mut oracle, &initial).await?;
+    flush_warm(&table).await;
+    assert!(table.promote_warm_to_cold().await?, "promotion 1 fires");
+
+    let superseding: Vec<(&str, i64, i64)> = (0..5).map(|id| ("a", id, id + 500)).collect();
+    upsert_composite(&table, &mut oracle, &superseding).await?;
+    let warm_only: Vec<(&str, i64, i64)> = (0..60).map(|id| ("w", id, id)).collect();
+    upsert_composite(&table, &mut oracle, &warm_only).await?;
+    flush_warm(&table).await;
+    let warm_only_again: Vec<(&str, i64, i64)> = (0..60).map(|id| ("w", id, id + 1)).collect();
+    upsert_composite(&table, &mut oracle, &warm_only_again).await?;
+    assert_eq!(
+        delete_where(
+            &table,
+            col("tenant").eq(lit("a")).and(col("id").eq(lit(40_i64)))
+        )
+        .await?,
+        1,
+        "DELETE (a, 40) removes its first-generation row"
+    );
+    oracle.remove(&("a".to_string(), 40));
+    let before = table.deletion_index_len();
+    assert!(
+        before > 6,
+        "warm-only upserts leave extra tombstones, got {before}"
+    );
+
+    flush_warm(&table).await;
+    assert!(table.promote_warm_to_cold().await?, "promotion 2 fires");
+    assert_composite_matches(&ctx, &oracle, "after promotion 2").await?;
+    assert_eq!(
+        table.deletion_index_len(),
+        6,
+        "only (a, 0..5) and (a, 40) may hide a datalake row (index held {before})"
+    );
+    assert_eq!(durable_key_tombstones(&fixture.catalog, &table).await?, 6);
+
+    table.drain_in_flight_maintenance().await?;
+    drop(ctx);
+    drop(table);
+    let catalog_2 = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    catalog_2.init().await?;
+    let ctx_2 = SessionContext::new();
+    let reopened = Arc::new(
+        CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog_2) as Arc<dyn MetadataCatalog>,
+            ctx_2.runtime_env(),
+        )
+        .open(COMPOSITE_TABLE)
+        .await?,
+    );
+    ctx_2.register_table(
+        COMPOSITE_TABLE,
+        Arc::clone(&reopened) as Arc<dyn TableProvider>,
+    )?;
+    assert_eq!(
+        reopened.deletion_index_len(),
+        6,
+        "a reopen reloads the kept 6"
+    );
     assert_composite_matches(&ctx_2, &oracle, "after reopen").await?;
     Ok(())
 }
