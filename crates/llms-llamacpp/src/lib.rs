@@ -17,7 +17,8 @@ limitations under the License.
 //! Serves a single-node GGUF model with llama.cpp.
 //!
 //! The prompt is the one the mistral.rs engine would send: the same messages
-//! ([`message_to_mistral`]) rendered by the same chat-template code
+//! ([`message_to_mistral`], fitted to the template by [`ContentSupport`]) rendered by the
+//! same chat-template code
 //! ([`apply_chat_template_to`]), with `reasoning_effort` checked by the same
 //! [`ReasoningSupport`]. llama.cpp only runs the forward passes and samples.
 //!
@@ -81,8 +82,8 @@ use llms::chat::mistral::{
     ReasoningControls, ReasoningSupport, convert_tool, reasoning_controls, request_tool_choice,
 };
 use llms::chat::{
-    Chat, Error as ChatError, LocalModelOptions, PagedAttentionMode, Result, gguf_files,
-    message_to_mistral, nsql::SqlGeneration,
+    Chat, ContentSupport, Error as ChatError, LocalModelOptions, PagedAttentionMode, Result,
+    gguf_files, message_to_mistral, nsql::SqlGeneration,
 };
 use llms::streaming_utils::generate_stream_id;
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
@@ -218,6 +219,8 @@ pub struct LlamaCpp {
     /// The markers of the Harmony replies the template asks for, when it asks for them.
     harmony: Option<harmony::Markers>,
     reasoning_support: ReasoningSupport,
+    /// Which shapes of a message's content each of the model's chat templates reads.
+    content_support: ContentSupport,
     counter: AtomicUsize,
     /// See [`Loaded::context_window`].
     context_window: u32,
@@ -471,6 +474,29 @@ impl LlamaCpp {
             .await
             .unwrap_or_default()
         };
+        // Each template a request may render with is probed with no tools: tools choose
+        // between named templates, and a template reads content alike with or without them.
+        let content_support = {
+            let template = template.clone();
+            let special = loaded.special.clone();
+            tokio::task::spawn_blocking(move || {
+                ContentSupport::from_renders(|messages, with_tools| {
+                    let chosen = chosen_template(&template, with_tools).ok()?;
+                    render(
+                        &Either::Left(chosen.to_string()),
+                        &special,
+                        messages,
+                        None,
+                        None,
+                        Vec::new(),
+                        true,
+                    )
+                    .ok()
+                })
+            })
+            .await
+            .unwrap_or_default()
+        };
         if let Some(effort) = options.reasoning.effort {
             reasoning_controls(Some(effort), &reasoning_support, &model_name).map_err(
                 |message| ChatError::InvalidParamValueError {
@@ -487,6 +513,7 @@ impl LlamaCpp {
             special: loaded.special,
             harmony,
             reasoning_support,
+            content_support,
             counter: AtomicUsize::new(0),
             context_window: loaded.context_window,
             reused_prompt_tokens: loaded.reused_prompt_tokens,
@@ -501,6 +528,22 @@ impl LlamaCpp {
         self.reused_prompt_tokens.load(Ordering::Relaxed)
     }
 
+    /// The prompt `req` renders, as a request decodes it. For tests.
+    #[doc(hidden)]
+    pub fn render_prompt(
+        &self,
+        req: &CreateChatCompletionRequest,
+    ) -> std::result::Result<String, OpenAIError> {
+        let reasoning = reasoning_controls(
+            req.reasoning_effort.as_ref(),
+            &self.reasoning_support,
+            &self.model_name,
+        )
+        .map_err(OpenAIError::InvalidArgument)?;
+        let tools = req.tools.iter().flatten().map(convert_tool).collect();
+        self.prompt(&req.messages, reasoning, tools, true)
+    }
+
     /// The conversation as the chat template renders it, with its generation prompt when
     /// `generation_prompt`.
     fn prompt(
@@ -510,10 +553,17 @@ impl LlamaCpp {
         tools: Vec<Tool>,
         generation_prompt: bool,
     ) -> std::result::Result<String, OpenAIError> {
+        let mut messages = messages
+            .iter()
+            .map(message_to_mistral)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|part| OpenAIError::InvalidArgument(part.refusal(&self.model_name)))?;
+        self.content_support
+            .rewrite(&mut messages, !tools.is_empty());
         render(
             &self.template,
             &self.special,
-            messages.iter().map(message_to_mistral).collect(),
+            messages,
             reasoning.enable_thinking,
             reasoning.reasoning_effort,
             tools,
@@ -3480,6 +3530,7 @@ mod tests {
             special: SpecialTokens::default(),
             harmony: Some(HARMONY_MARKERS),
             reasoning_support: ReasoningSupport::default(),
+            content_support: ContentSupport::default(),
             counter: AtomicUsize::new(0),
             context_window: 0,
             reused_prompt_tokens: Arc::default(),

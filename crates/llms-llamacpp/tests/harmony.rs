@@ -33,7 +33,7 @@ use crate::{fixture, qwen3_gguf, request};
 
 /// Qwen3's control tokens, respelled as the Harmony markers: `<|im_end|>`, Qwen's end of turn,
 /// becomes `<|return|>`, which ends a Harmony reply.
-const MARKERS: [(&str, &str); 7] = [
+pub(crate) const MARKERS: [(&str, &str); 7] = [
     ("<|im_start|>", "<|start|>"),
     ("<|im_end|>", "<|return|>"),
     ("<|box_end|>", "<|channel|>"),
@@ -45,7 +45,7 @@ const MARKERS: [(&str, &str); 7] = [
 
 /// A Harmony template whose generation prompt opens the final message and begins its body
 /// with `begun`.
-fn template(begun: &str) -> String {
+pub(crate) fn template(begun: &str) -> String {
     format!(
         "{{% for m in messages %}}<|start|>{{{{ m.role }}}}<|message|>{{{{ m.content }}}}<|end|>{{% endfor %}}<|start|>assistant<|channel|>final<|message|>{begun}"
     )
