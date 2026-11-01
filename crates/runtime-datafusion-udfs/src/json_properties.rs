@@ -54,7 +54,7 @@ limitations under the License.
 //! - External `$ref` URIs — emitted as `type = "ref"`, never dereferenced (no IO).
 //!
 //! Options (passed as named arguments):
-//! - `max_depth` (`UInt`, default `32`) — walk stops past this depth.
+//! - `max_depth` (`UInt`, default `32`, at most `128`) — walk stops past this depth.
 //! - `max_rows` (`UInt`, default `100_000`) — per-document row cap.
 //! - `max_bytes` (`UInt`, default `8_388_608`) — input size limit.
 //! - `dialect` (`Utf8`, `"json-schema"` | `"openapi"`, default `"json-schema"`) —
@@ -72,15 +72,20 @@ limitations under the License.
 //! - `map_wildcard` (`Utf8`, default `"[*]"`) — the synthetic segment inserted
 //!   between a map and its value when `expand_maps = true`. Must be non-empty.
 //!
+//! One document emits at most 32 times `max_bytes` of output (256 MiB by
+//! default); a walk that reaches this cap stops and returns the rows emitted
+//! so far, like `max_rows`.
+//!
 //! Telemetry: the walker emits OpenTelemetry counters
 //! `flatten_json_properties_invocations_total`,
 //! `flatten_json_properties_rows_emitted_total`, and
 //! `flatten_json_properties_errors_total{kind}`. Malformed input or a hit
-//! depth / row / size limit emits an error-kind metric and yields zero or a
-//! truncated-but-valid batch — never a query-level error.
+//! depth / row / size / output limit emits an error-kind metric and yields
+//! zero or a truncated-but-valid batch. The scalar form errors when one batch
+//! exceeds its row or output-byte ceiling.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
@@ -121,12 +126,26 @@ runtime_udfs_api::register_spice_function!(
 const DEFAULT_MAX_DEPTH: usize = 32;
 const DEFAULT_MAX_ROWS: usize = 100_000;
 const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Largest accepted `max_depth`. The walk recurses once per level, so this
+/// bounds stack use for long `$ref` chains.
+const MAX_DEPTH_LIMIT: usize = 128;
+/// Rows reached through shared `$ref` targets repeat the target's
+/// annotations, so the output can be far larger than the input. One document
+/// emits at most this many bytes per byte of `max_bytes`.
+const OUTPUT_BYTES_PER_INPUT_BYTE: usize = 32;
+/// Schema entries one document may resolve across all `effective_schemas`
+/// calls. Rows that share a large `$ref` target resolve it again for each
+/// row, so the walk stops here like the row cap.
+const MAX_EFFECTIVE_ENTRIES: usize = 4 * 1024 * 1024;
 
 /// Scalar UDF ceiling across a single evaluated batch. Per-document caps
 /// already bound individual rows, but a wide input batch could still
 /// accumulate `number_rows * max_rows` entries in memory. Error out loudly
 /// past this watermark so operators see the condition rather than OOM.
 const SCALAR_BATCH_MAX_ROWS: usize = 10_000_000;
+/// Scalar UDF ceiling on the string bytes of one evaluated batch, kept well
+/// under the 2 GiB offset range of a `Utf8` column.
+const SCALAR_BATCH_MAX_OUTPUT_BYTES: usize = 1024 * 1024 * 1024;
 
 // -------- Metrics --------
 
@@ -151,7 +170,7 @@ static ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .u64_counter("flatten_json_properties_errors_total")
         .with_description(
             "Errors inside flatten_json_properties, labelled by kind \
-             (parse|depth_exceeded|row_cap_hit|cycle|input_too_large).",
+             (parse|depth_exceeded|row_cap_hit|output_cap_hit|cycle|input_too_large|batch_cap_hit).",
         )
         .build()
 });
@@ -205,6 +224,27 @@ pub struct PropertyRow {
     pub format: Option<String>,
     pub enum_values: Option<Vec<String>>,
     pub metadata: Option<String>,
+}
+
+impl PropertyRow {
+    fn output_bytes(&self) -> usize {
+        [&self.description, &self.format, &self.metadata]
+            .into_iter()
+            .flatten()
+            .map(String::len)
+            .sum::<usize>()
+            + self
+                .enum_values
+                .iter()
+                .flatten()
+                .map(String::len)
+                .sum::<usize>()
+            + self.path.len()
+            + self.parent_path.len()
+            + self.name.len()
+            + self.type_name.len()
+            + size_of::<Self>()
+    }
 }
 
 /// Dialect tag carried through options. Currently only affects the metric
@@ -326,6 +366,15 @@ struct Walker<'a> {
     rows: Vec<PropertyRow>,
     /// Active `$ref` pointers on the walk stack, for cycle detection.
     visited_refs: HashSet<String>,
+    /// `$ref` targets (by address) expanded by the current `effective_schemas`
+    /// call, with the shallowest `ref_depth` each was expanded at. A target
+    /// reached again at the same or a deeper level adds nothing new, and
+    /// expanding it again grows exponentially when branches share targets.
+    expanded_targets: HashMap<usize, usize>,
+    /// Entries returned by all `effective_schemas` calls so far.
+    effective_entries: usize,
+    max_effective_entries: usize,
+    output_bytes: usize,
     depth_cap_hit: bool,
     row_cap_hit: bool,
 }
@@ -337,6 +386,10 @@ impl<'a> Walker<'a> {
             opts,
             rows: Vec::new(),
             visited_refs: HashSet::new(),
+            expanded_targets: HashMap::new(),
+            effective_entries: 0,
+            max_effective_entries: MAX_EFFECTIVE_ENTRIES,
+            output_bytes: 0,
             depth_cap_hit: false,
             row_cap_hit: false,
         }
@@ -417,6 +470,9 @@ impl<'a> Walker<'a> {
         required: bool,
         depth: usize,
     ) {
+        if self.check_caps(depth) {
+            return;
+        }
         let path = make_path(parent_path, name, self.opts.path_style);
         let effective_specs = self.effective_schemas(spec);
 
@@ -481,6 +537,17 @@ impl<'a> Walker<'a> {
                         // JSONPath storage conventions (e.g.
                         // `identityMap.[*].id` when the map's values
                         // are arrays of objects).
+                        // Keep the map's own `$ref` on the cycle set while
+                        // walking its values, so a map whose values refer
+                        // back to it ends there.
+                        let map_ref = spec
+                            .get("$ref")
+                            .and_then(Value::as_str)
+                            .filter(|r| is_local_ref(r) && !self.visited_refs.contains(*r))
+                            .map(ToOwned::to_owned);
+                        if let Some(r) = &map_ref {
+                            self.visited_refs.insert(r.clone());
+                        }
                         self.handle_field(
                             self.opts.map_wildcard.as_str(),
                             ap,
@@ -488,6 +555,9 @@ impl<'a> Walker<'a> {
                             false,
                             depth + 1,
                         );
+                        if let Some(r) = map_ref {
+                            self.visited_refs.remove(&r);
+                        }
                     } else {
                         // Legacy: collapse children onto the map's own path.
                         // For Map<String, Object>, ap has `properties` and
@@ -575,7 +645,7 @@ impl<'a> Walker<'a> {
                     .collect::<Vec<_>>()
             });
 
-        self.rows.push(PropertyRow {
+        let row = PropertyRow {
             path: path.to_owned(),
             parent_path: parent_path.to_owned(),
             name: name.to_owned(),
@@ -585,7 +655,20 @@ impl<'a> Walker<'a> {
             format,
             enum_values,
             metadata: Some(raw_spec.to_string()),
-        });
+        };
+        let row_bytes = row.output_bytes();
+        if self.output_bytes + row_bytes
+            > self
+                .opts
+                .max_bytes
+                .saturating_mul(OUTPUT_BYTES_PER_INPUT_BYTE)
+        {
+            self.row_cap_hit = true;
+            record_error("output_cap_hit");
+            return;
+        }
+        self.output_bytes += row_bytes;
+        self.rows.push(row);
 
         if self.rows.len() >= self.opts.max_rows {
             self.row_cap_hit = true;
@@ -598,9 +681,15 @@ impl<'a> Walker<'a> {
     /// can still read shape metadata from them.
     fn effective_schemas(&mut self, schema: &'a Value) -> Vec<&'a Value> {
         let mut out = Vec::new();
+        self.expanded_targets.clear();
         self.collect_effective(schema, &mut out, 0);
         if out.is_empty() {
             out.push(schema);
+        }
+        self.effective_entries += out.len();
+        if self.effective_entries > self.max_effective_entries && !self.row_cap_hit {
+            self.row_cap_hit = true;
+            record_error("work_cap_hit");
         }
         out
     }
@@ -628,6 +717,13 @@ impl<'a> Walker<'a> {
                 // returned `Option<&'a Value>` survives past `self`'s borrow.
                 let root: &'a Value = self.root;
                 if let Some(target) = root.pointer(ref_str.trim_start_matches('#')) {
+                    let key = std::ptr::from_ref(target).addr();
+                    if let Some(&depth) = self.expanded_targets.get(&key)
+                        && depth <= ref_depth
+                    {
+                        return;
+                    }
+                    self.expanded_targets.insert(key, ref_depth);
                     self.visited_refs.insert(ref_str.to_owned());
                     self.collect_effective(target, out, ref_depth + 1);
                     self.visited_refs.remove(ref_str);
@@ -653,6 +749,9 @@ impl<'a> Walker<'a> {
     }
 
     fn check_caps(&mut self, depth: usize) -> bool {
+        if self.row_cap_hit {
+            return true;
+        }
         if depth > self.opts.max_depth {
             if !self.depth_cap_hit {
                 self.depth_cap_hit = true;
@@ -876,7 +975,7 @@ fn apply_named_option(
     opts: &mut FlattenOptions,
 ) -> DataFusionResult<()> {
     match name {
-        "max_depth" => opts.max_depth = parse_usize(name, value)?,
+        "max_depth" => opts.max_depth = check_max_depth(parse_usize(name, value)?)?,
         "max_rows" => opts.max_rows = parse_usize(name, value)?,
         "max_bytes" => opts.max_bytes = parse_usize(name, value)?,
         "dialect" => {
@@ -914,6 +1013,15 @@ fn apply_named_option(
         }
     }
     Ok(())
+}
+
+fn check_max_depth(max_depth: usize) -> DataFusionResult<usize> {
+    if max_depth > MAX_DEPTH_LIMIT {
+        return Err(DataFusionError::Plan(format!(
+            "max_depth must be at most {MAX_DEPTH_LIMIT}, got {max_depth}"
+        )));
+    }
+    Ok(max_depth)
 }
 
 fn parse_usize(name: &str, v: &ScalarValue) -> DataFusionResult<usize> {
@@ -989,7 +1097,7 @@ fn decode_flatten_options(json: &str) -> DataFusionResult<FlattenOptions> {
     let mut opts = FlattenOptions::default();
     for (key, val) in obj {
         match key.as_str() {
-            "max_depth" => opts.max_depth = decode_usize(key, val)?,
+            "max_depth" => opts.max_depth = check_max_depth(decode_usize(key, val)?)?,
             "max_rows" => opts.max_rows = decode_usize(key, val)?,
             "max_bytes" => opts.max_bytes = decode_usize(key, val)?,
             "dialect" => {
@@ -1336,17 +1444,25 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
         // cannot overflow and silently drop rows. Per-document caps inside
         // `flatten_with_options` still bound memory use.
         let mut all_rows: Vec<PropertyRow> = Vec::new();
+        let mut batch_bytes = 0usize;
         let mut offsets: Vec<i64> = Vec::with_capacity(strings.len() + 1);
         offsets.push(0);
 
         for idx in 0..strings.len() {
             if !strings.is_null(idx) {
                 let rows = flatten_with_options(strings.value(idx), &opts);
+                batch_bytes += rows.iter().map(PropertyRow::output_bytes).sum::<usize>();
                 all_rows.extend(rows);
                 if all_rows.len() > SCALAR_BATCH_MAX_ROWS {
                     record_error("batch_cap_hit");
                     return Err(DataFusionError::Execution(format!(
                         "{FLATTEN_JSON_PROPERTIES_UDTF_NAME}(): batch produced more than {SCALAR_BATCH_MAX_ROWS} flattened rows; lower `max_rows` or split the input."
+                    )));
+                }
+                if batch_bytes > SCALAR_BATCH_MAX_OUTPUT_BYTES {
+                    record_error("batch_cap_hit");
+                    return Err(DataFusionError::Execution(format!(
+                        "{FLATTEN_JSON_PROPERTIES_UDTF_NAME}(): batch produced more than {SCALAR_BATCH_MAX_OUTPUT_BYTES} bytes of output; lower `max_rows` or split the input."
                     )));
                 }
             }
@@ -2161,5 +2277,140 @@ mod tests {
             !paths.iter().any(|p| p == "identityMap.id"),
             "collapsed path must not appear when expand_maps=true via SQL"
         );
+    }
+
+    /// `d0`..`d7` each combine four `$ref`s to the next definition; `d8`
+    /// holds one property.
+    fn diamond_schema() -> String {
+        let mut defs: Vec<String> = (0..8)
+            .map(|i| {
+                let r = format!(r##"{{"$ref":"#/$defs/d{}"}}"##, i + 1);
+                format!(r#""d{i}":{{"allOf":[{r},{r},{r},{r}]}}"#)
+            })
+            .collect();
+        defs.push(r#""d8":{"type":"object","properties":{"x":{"type":"string"}}}"#.to_owned());
+        let r = r##"{"$ref":"#/$defs/d0"}"##;
+        format!(
+            r#"{{"allOf":[{r},{r},{r},{r}],"$defs":{{{}}}}}"#,
+            defs.join(",")
+        )
+    }
+
+    #[test]
+    fn shared_ref_targets_are_expanded_once() {
+        let doc = diamond_schema();
+        let root: Value = serde_json::from_str(&doc).expect("valid json");
+        let opts = FlattenOptions::default();
+        let mut walker = Walker::new(&root, &opts);
+        // The root and the nine definitions each contribute once.
+        assert_eq!(walker.effective_schemas(&root).len(), 10);
+
+        let rows = flatten(&doc);
+        assert_eq!(
+            rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            vec!["x"]
+        );
+    }
+
+    #[test]
+    fn max_depth_above_the_limit_is_rejected() {
+        let mut opts = FlattenOptions::default();
+        let err = apply_named_option("max_depth", &ScalarValue::Int64(Some(1_000_000)), &mut opts)
+            .expect_err("max_depth above the limit must be rejected");
+        assert!(err.to_string().contains("at most 128"), "{err}");
+        apply_named_option("max_depth", &ScalarValue::Int64(Some(128)), &mut opts)
+            .expect("max_depth at the limit is accepted");
+        assert_eq!(opts.max_depth, 128);
+        decode_flatten_options(r#"{"max_depth": 1000000}"#)
+            .expect_err("max_depth above the limit is rejected");
+    }
+
+    #[test]
+    fn a_self_referencing_map_with_expand_maps_terminates() {
+        let doc = r##"{"$defs":{"m":{"additionalProperties":{"$ref":"#/$defs/m"}}},"properties":{"a":{"$ref":"#/$defs/m"}}}"##;
+        let opts = FlattenOptions {
+            expand_maps: true,
+            ..FlattenOptions::default()
+        };
+        let rows = flatten_with_options(doc, &opts);
+        assert!(!rows.is_empty() && rows.len() <= 3, "rows: {rows:?}");
+    }
+
+    #[test]
+    fn a_map_chain_with_expand_maps_stops_at_max_depth() {
+        let mut defs: Vec<String> = (0..10)
+            .map(|i| {
+                format!(
+                    r##""m{i}":{{"additionalProperties":{{"$ref":"#/$defs/m{}"}}}}"##,
+                    i + 1
+                )
+            })
+            .collect();
+        defs.push(r#""m10":{"type":"string"}"#.to_owned());
+        let doc = format!(
+            r##"{{"$defs":{{{}}},"properties":{{"a":{{"$ref":"#/$defs/m0"}}}}}}"##,
+            defs.join(",")
+        );
+        let opts = FlattenOptions {
+            expand_maps: true,
+            max_depth: 4,
+            ..FlattenOptions::default()
+        };
+        let rows = flatten_with_options(&doc, &opts);
+        assert!(!rows.is_empty());
+        for row in &rows {
+            assert!(row.path.matches("[*]").count() <= 5, "path {}", row.path);
+        }
+    }
+
+    #[test]
+    fn differently_spelled_refs_to_one_target_expand_it_once() {
+        let refs: Vec<String> = (1..=8)
+            .map(|k| format!(r#"{{"$ref":"{}/$defs/t"}}"#, "#".repeat(k)))
+            .collect();
+        let doc = format!(
+            r#"{{"allOf":[{}],"$defs":{{"t":{{"allOf":[{{}},{{}},{{}}]}}}}}}"#,
+            refs.join(",")
+        );
+        let root: Value = serde_json::from_str(&doc).expect("valid json");
+        let opts = FlattenOptions::default();
+        let mut walker = Walker::new(&root, &opts);
+        // The root, `t` and its three branches.
+        assert_eq!(walker.effective_schemas(&root).len(), 5);
+    }
+
+    #[test]
+    fn resolving_work_is_capped_per_document() {
+        let props: Vec<String> = (0..50)
+            .map(|i| format!(r##""p{i}":{{"$ref":"#/$defs/t"}}"##))
+            .collect();
+        let doc = format!(
+            r#"{{"properties":{{{}}},"$defs":{{"t":{{"allOf":[{}]}}}}}}"#,
+            props.join(","),
+            ["{}"; 10].join(",")
+        );
+        assert_eq!(flatten(&doc).len(), 50);
+
+        let root: Value = serde_json::from_str(&doc).expect("valid json");
+        let opts = FlattenOptions::default();
+        let mut walker = Walker::new(&root, &opts);
+        walker.max_effective_entries = 100;
+        walker.walk_schema(&root, "", 0);
+        assert!(walker.row_cap_hit);
+        assert!(walker.rows.len() < 50, "rows: {}", walker.rows.len());
+    }
+
+    #[test]
+    fn a_ref_reached_again_at_a_shallower_level_is_expanded_again() {
+        let doc = r##"{
+            "allOf": [{"allOf": [{"$ref": "#/$defs/Base"}]}, {"$ref": "#/$defs/Base"}],
+            "$defs": {"Base": {"allOf": [{"properties": {"x": {"type": "string"}}}]}}
+        }"##;
+        let opts = FlattenOptions {
+            max_depth: 2,
+            ..FlattenOptions::default()
+        };
+        let rows = flatten_with_options(doc, &opts);
+        assert!(rows.iter().any(|r| r.path == "x"), "rows: {rows:?}");
     }
 }
