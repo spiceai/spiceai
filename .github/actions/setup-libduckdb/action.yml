@@ -1,0 +1,29 @@
+name: Setup libduckdb
+description: >-
+  Install the DuckDB shared library that the DuckDB test oracles and
+  testoperator load through ADBC, and register it as the 'duckdb' ADBC driver
+  for the rest of the job. scripts/libduckdb.py downloads the release,
+  checks it against the SHA-256 recorded in test/duckdb_versions.json, and
+  writes a driver manifest, which is found through ADBC_DRIVER_PATH, so nothing
+  is installed system-wide and the setting survives macOS, which strips DYLD_*
+  variables from /bin/bash.
+
+inputs:
+  version:
+    description: 'DuckDB release to install; defaults to the newest in test/duckdb_versions.json.'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install libduckdb
+      shell: bash
+      env:
+        LIBDUCKDB_VERSION: ${{ inputs.version }}
+        LIBDUCKDB_CACHE_DIR: ${{ runner.temp }}/libduckdb
+      run: |
+        set -euo pipefail
+        dir="$(python3 scripts/libduckdb.py)"
+        echo "ADBC_DRIVER_PATH=${dir}${ADBC_DRIVER_PATH:+:${ADBC_DRIVER_PATH}}" >> "$GITHUB_ENV"
+        echo "Registered $(grep '^shared' "$dir/duckdb.toml") as the 'duckdb' ADBC driver"

@@ -254,10 +254,22 @@ endif
 # and `verify-cli` so both build the same graph.
 _NEXTEST_TARGETS_CMD = $(PYTHON) scripts/nextest_build_targets.py --filter '$(_NEXTEST_FILTER)' -- $(NEXTEST_SELECTION) $(NEXTEST_FLAG)
 .PHONY: nextest
+# The DuckDB result-correctness lane loads an installed libduckdb through ADBC
+# rather than a DuckDB built into the test binaries. `scripts/libduckdb.py` installs the newest release
+# `test/duckdb_versions.json` lists, checked against its recorded SHA-256 and
+# cached under ~/.cache/spice/libduckdb, so only a machine's first sign-off for a
+# release downloads it. Its manifest goes first on ADBC_DRIVER_PATH, so every
+# sign-off and merge-queue run tests the same release whatever else is installed
+# (LIBDUCKDB_VERSION picks another listed one). A failed install stops the gate:
+# a lane that cannot load its oracle must not pass by not running.
+_WITH_LIBDUCKDB = libduckdb="$$($(PYTHON) scripts/libduckdb.py)" || exit $$?; \
+	export ADBC_DRIVER_PATH="$$libduckdb$${ADBC_DRIVER_PATH:+:$$ADBC_DRIVER_PATH}";
+
 nextest:
 	@echo 'note: the chDB result-correctness lane is not in this run (it needs libchdb; CI runs it in correctness_chdb.yml).' >&2
 	@echo '      to run it here: cargo test -p cayenne --features result-correctness-chdb --test result_correctness_vs_chdb_test' >&2
-	@targets="$$($(_NEXTEST_TARGETS_CMD))" || exit $$?; \
+	@$(_WITH_LIBDUCKDB) \
+	targets="$$($(_NEXTEST_TARGETS_CMD))" || exit $$?; \
 	cargo nextest run $(NEXTEST_SELECTION) $$targets $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
@@ -294,7 +306,8 @@ verify-cli:
 .PHONY: nextest-packages
 nextest-packages:
 	@test -n "$(strip $(PACKAGES))" || { echo 'nextest-packages requires PACKAGES="crate1 crate2"' >&2; exit 1; }
-	@cargo nextest run --no-tests=pass $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
+	@$(_WITH_LIBDUCKDB) \
+	cargo nextest run --no-tests=pass $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
