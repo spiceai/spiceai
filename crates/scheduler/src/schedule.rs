@@ -80,7 +80,10 @@ impl Schedule {
     }
 
     async fn finalise_running_task(task: RunningTask) {
-        match task.consume_for_handle().await {
+        let Some(handle) = task.consume_for_handle() else {
+            return;
+        };
+        match handle.await {
             Ok(Ok(())) => {
                 tracing::debug!("Task executed successfully");
             }
@@ -133,7 +136,7 @@ impl Schedule {
                                                 Self::finalise_running_task(task).await;
                                             }
                                             (false, true) => {
-                                                task.handle.abort();
+                                                task.abort();
                                                 Self::finalise_running_task(task).await;
                                             }
                                             _ => {

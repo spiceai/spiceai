@@ -28,7 +28,7 @@ pub mod tool;
 
 pub use catalog::attach_mcp_schema_snapshot;
 
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, str::FromStr, time::Duration};
 
 use http::{HeaderName, HeaderValue, header::AUTHORIZATION};
 use rmcp::ErrorData as McpError;
@@ -86,6 +86,18 @@ pub(crate) fn task_name_for_exposed_tool(exposed_name: &str) -> String {
     format!("{TOOL_USE_PREFIX}{exposed_name}")
 }
 
+/// Longest wait for an MCP server to finish its handshake. Model loading waits for tools, so a
+/// server that never answers must not hold it forever. A stdio server started through
+/// `npx`/`uvx` may download its package first, so this allows more than a request.
+pub const MCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_mins(2);
+
+/// Longest wait for a `tools/list` or `ping` answer.
+pub const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Longest wait for one `tools/call`. Tools do real work, so this is longer than
+/// [`MCP_REQUEST_TIMEOUT`]; it exists so that a stalled server cannot hold a caller forever.
+pub const MCP_CALL_TOOL_TIMEOUT: Duration = Duration::from_mins(10);
+
 /// Largest MCP response, in bytes, Spice accepts from an MCP server over
 /// Streamable HTTP, and the largest serialized tool result it passes on.
 ///
@@ -100,7 +112,7 @@ pub(crate) fn task_name_for_exposed_tool(exposed_name: &str) -> String {
 /// way to the caller (decoded, re-serialized, captured to task history, and
 /// written to the HTTP response or model context), so its size multiplies
 /// into peak memory.
-const MAX_TOOL_RESULT_SIZE: usize = 16 * 1024 * 1024;
+const MAX_TOOL_RESULT_SIZE: usize = crate::utils::MAX_TOOL_RESULT_BYTES;
 
 const MCP_AUTH_TOKEN_PARAM: &str = "mcp_auth_token";
 /// Custom HTTP headers, formatted `Name: Value` and delimited like the HTTP

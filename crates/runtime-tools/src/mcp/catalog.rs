@@ -54,7 +54,8 @@ use crate::catalog::SpiceToolCatalog;
 use tools::SpiceModelTool;
 
 use super::{
-    Error, MAX_TOOL_RESULT_SIZE, MCPConfig, Result, UnderlyingTransportSnafu,
+    Error, MAX_TOOL_RESULT_SIZE, MCP_CALL_TOOL_TIMEOUT, MCP_HANDSHAKE_TIMEOUT, MCP_REQUEST_TIMEOUT,
+    MCPConfig, Result, UnderlyingTransportSnafu,
     http_client::BoundedHttpClient,
     server::{McpSchemaSnapshot, apply_listed_catalog_cache},
     tool::McpToolWrapper,
@@ -427,7 +428,7 @@ impl McpToolCatalog {
                 // The read lock is held during the heartbeat call. The underlying
                 // McpClient wraps a RunningService which is not Clone, so we cannot
                 // clone the client to release the lock before the network call.
-                // This is acceptable because the call timeout is bounded.
+                // This is acceptable because `MCP_REQUEST_TIMEOUT` bounds each probe.
                 let heartbeat_result = {
                     let client_guard = client_clone.read().await;
                     client_guard.heartbeat().await
@@ -599,10 +600,13 @@ impl McpToolCatalog {
                 }
 
                 Ok(McpClient::Stdio(
-                    ().serve_with_lifecycle(transport, client_lifecycle())
-                        .await
-                        .boxed()
-                        .context(UnderlyingTransportSnafu)?,
+                    handshake(
+                        tool_name,
+                        ().serve_with_lifecycle(transport, client_lifecycle()),
+                    )
+                    .await?
+                    .boxed()
+                    .context(UnderlyingTransportSnafu)?,
                 ))
             }
             MCPConfig::StreamableHttp {
@@ -654,11 +658,13 @@ impl McpToolCatalog {
                 .with_protocol_version(ProtocolVersion::V_2026_07_28);
 
                 Ok(McpClient::Http(
-                    client_info
-                        .serve_with_lifecycle(transport, client_lifecycle())
-                        .await
-                        .boxed()
-                        .context(UnderlyingTransportSnafu)?,
+                    handshake(
+                        tool_name,
+                        client_info.serve_with_lifecycle(transport, client_lifecycle()),
+                    )
+                    .await?
+                    .boxed()
+                    .context(UnderlyingTransportSnafu)?,
                 ))
             }
         }
@@ -938,6 +944,30 @@ fn client_lifecycle() -> ClientLifecycleMode {
     }
 }
 
+/// Waits at most `timeout` for an MCP request. On timeout the request future is dropped.
+async fn bounded<T>(
+    timeout: Duration,
+    request: impl Future<Output = std::result::Result<T, ServiceError>>,
+) -> std::result::Result<T, ServiceError> {
+    tokio::time::timeout(timeout, request)
+        .await
+        .unwrap_or(Err(ServiceError::Timeout { timeout }))
+}
+
+/// Waits at most [`MCP_HANDSHAKE_TIMEOUT`] for an MCP client to start. Dropping the start
+/// future on timeout drops its transport, which stops a stdio server's child process.
+async fn handshake<T>(tool_name: &str, start: impl Future<Output = T>) -> Result<T> {
+    tokio::time::timeout(MCP_HANDSHAKE_TIMEOUT, start)
+        .await
+        .map_err(|_| Error::CouldNotConstructTool {
+            name: tool_name.to_string(),
+            e: format!(
+                "The MCP server did not complete its handshake within {} seconds",
+                MCP_HANDSHAKE_TIMEOUT.as_secs()
+            ),
+        })
+}
+
 pub enum McpClient {
     Stdio(RunningService<RoleClient, ()>),
     Http(RunningService<RoleClient, InitializeRequestParams>),
@@ -961,8 +991,8 @@ impl McpClient {
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListToolsResult, ServiceError> {
         match self {
-            McpClient::Stdio(s) => s.list_tools(params).await,
-            McpClient::Http(s) => s.list_tools(params).await,
+            McpClient::Stdio(s) => bounded(MCP_REQUEST_TIMEOUT, s.list_tools(params)).await,
+            McpClient::Http(s) => bounded(MCP_REQUEST_TIMEOUT, s.list_tools(params)).await,
             #[cfg(test)]
             McpClient::Scripted(scripted) => {
                 scripted.list_calls.fetch_add(1, Ordering::SeqCst);
@@ -979,8 +1009,8 @@ impl McpClient {
         params: CallToolRequestParams,
     ) -> Result<CallToolResult, ServiceError> {
         match self {
-            McpClient::Stdio(s) => s.call_tool(params).await,
-            McpClient::Http(s) => s.call_tool(params).await,
+            McpClient::Stdio(s) => bounded(MCP_CALL_TOOL_TIMEOUT, s.call_tool(params)).await,
+            McpClient::Http(s) => bounded(MCP_CALL_TOOL_TIMEOUT, s.call_tool(params)).await,
             #[cfg(test)]
             McpClient::Scripted(_) => Err(ServiceError::UnexpectedResponse),
         }
@@ -996,8 +1026,8 @@ impl McpClient {
         params: CallToolRequestParams,
     ) -> Result<CallToolResponse, ServiceError> {
         match self {
-            McpClient::Stdio(s) => s.call_tool_once(params).await,
-            McpClient::Http(s) => s.call_tool_once(params).await,
+            McpClient::Stdio(s) => bounded(MCP_CALL_TOOL_TIMEOUT, s.call_tool_once(params)).await,
+            McpClient::Http(s) => bounded(MCP_CALL_TOOL_TIMEOUT, s.call_tool_once(params)).await,
             #[cfg(test)]
             McpClient::Scripted(_) => Err(ServiceError::UnexpectedResponse),
         }
@@ -1006,14 +1036,20 @@ impl McpClient {
     pub async fn ping(&self) -> Result<(), ServiceError> {
         let result = match self {
             McpClient::Stdio(s) => {
-                s.peer()
-                    .send_request(ClientRequest::PingRequest(PingRequest::default()))
-                    .await?
+                bounded(
+                    MCP_REQUEST_TIMEOUT,
+                    s.peer()
+                        .send_request(ClientRequest::PingRequest(PingRequest::default())),
+                )
+                .await?
             }
             McpClient::Http(s) => {
-                s.peer()
-                    .send_request(ClientRequest::PingRequest(PingRequest::default()))
-                    .await?
+                bounded(
+                    MCP_REQUEST_TIMEOUT,
+                    s.peer()
+                        .send_request(ClientRequest::PingRequest(PingRequest::default())),
+                )
+                .await?
             }
             #[cfg(test)]
             McpClient::Scripted(_) => return Err(ServiceError::UnexpectedResponse),
@@ -1049,14 +1085,20 @@ impl McpClient {
     async fn list_tools_uncached(&self) -> Result<ListToolsResult, ServiceError> {
         let result = match self {
             McpClient::Stdio(s) => {
-                s.peer()
-                    .send_request(ClientRequest::ListToolsRequest(ListToolsRequest::default()))
-                    .await?
+                bounded(
+                    MCP_REQUEST_TIMEOUT,
+                    s.peer()
+                        .send_request(ClientRequest::ListToolsRequest(ListToolsRequest::default())),
+                )
+                .await?
             }
             McpClient::Http(s) => {
-                s.peer()
-                    .send_request(ClientRequest::ListToolsRequest(ListToolsRequest::default()))
-                    .await?
+                bounded(
+                    MCP_REQUEST_TIMEOUT,
+                    s.peer()
+                        .send_request(ClientRequest::ListToolsRequest(ListToolsRequest::default())),
+                )
+                .await?
             }
             #[cfg(test)]
             McpClient::Scripted(scripted) => {
