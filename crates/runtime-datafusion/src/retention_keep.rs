@@ -18,7 +18,7 @@ limitations under the License.
 //! rows the accelerator keeps after retention.
 
 use datafusion::common::ToDFSchema;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::expr::Cast;
 use datafusion::logical_expr::{Expr, ExprSchemable};
@@ -100,11 +100,14 @@ pub fn fallible_implicit_string_cast(
     let coerced = simplifier.coerce(delete_pred.clone(), &df_schema)?;
 
     // Explicit casts survive coercion as `Expr::Cast` nodes, so the implicit
-    // ones are those in `coerced` without an equal node in `delete_pred`.
-    let mut explicit: Vec<Expr> = Vec::new();
+    // ones are those in `coerced` without a matching node in `delete_pred`.
+    // Coercion may insert casts *inside* an explicit cast (around a `NULL`
+    // branch of a `CASE`, say), so nodes are matched on target type and on
+    // their operand with every cast stripped, not on whole-subtree equality.
+    let mut explicit: Vec<(DataType, Expr)> = Vec::new();
     delete_pred.apply(|expr| {
-        if matches!(expr, Expr::Cast(_)) {
-            explicit.push(expr.clone());
+        if let Expr::Cast(Cast { expr: inner, field }) = expr {
+            explicit.push((field.data_type().clone(), strip_casts(inner)?));
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
@@ -115,7 +118,11 @@ pub fn fallible_implicit_string_cast(
             return Ok(TreeNodeRecursion::Continue);
         };
         let data_type = field.data_type();
-        if let Some(pos) = explicit.iter().position(|e| e == expr) {
+        let stripped = strip_casts(inner)?;
+        if let Some(pos) = explicit
+            .iter()
+            .position(|(to, operand)| to == data_type && *operand == stripped)
+        {
             explicit.swap_remove(pos);
             return Ok(TreeNodeRecursion::Continue);
         }
@@ -134,6 +141,16 @@ pub fn fallible_implicit_string_cast(
         Ok(TreeNodeRecursion::Continue)
     })?;
     Ok(found)
+}
+
+/// `expr` with every `Expr::Cast` replaced by its operand.
+fn strip_casts(expr: &Expr) -> Result<Expr, DataFusionError> {
+    expr.clone()
+        .transform(|e| match e {
+            Expr::Cast(Cast { expr, .. }) => Ok(Transformed::yes(*expr)),
+            other => Ok(Transformed::no(other)),
+        })
+        .map(|t| t.data)
 }
 
 fn is_string(data_type: &DataType) -> bool {
@@ -249,6 +266,15 @@ mod tests {
             col("id").gt(lit(5_i32)),
             datafusion::prelude::try_cast(col("status"), DataType::Int64).gt(lit(5_i64)),
             datafusion::prelude::cast(col("status"), DataType::Int64).gt(lit(5_i64)),
+            // Coercion casts the `NULL` branch inside the explicit cast; the
+            // explicit cast must still be recognized as the author's.
+            datafusion::prelude::cast(
+                datafusion::logical_expr::when(col("id").eq(lit(1_i64)), col("status"))
+                    .otherwise(lit(datafusion::scalar::ScalarValue::Null))
+                    .expect("case"),
+                DataType::Int64,
+            )
+            .gt(lit(5_i64)),
         ] {
             assert_eq!(
                 fallible_implicit_string_cast(&pred, &string_schema()).expect("coerces"),

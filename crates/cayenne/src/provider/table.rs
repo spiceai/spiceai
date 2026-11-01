@@ -23704,11 +23704,26 @@ impl CayenneTableProvider {
         let table = self.clone_for_write();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            if !table.maintenance_still_admitted() {
+            table.post_write_maintenance.state.lock().retention_requested = true;
+            // Claim the loop before the admission check, so a racing `quiesce`
+            // either sees the claim and drains it or closes first and is seen
+            // here (see `maintenance_still_admitted`).
+            if table
+                .post_write_maintenance
+                .scheduled
+                .swap(true, Ordering::AcqRel)
+            {
+                // A running loop picks the request up on its next pass.
                 return;
             }
-            table.post_write_maintenance.state.lock().retention_requested = true;
-            table.spawn_post_write_maintenance_loop();
+            if !table.maintenance_still_admitted() {
+                table
+                    .post_write_maintenance
+                    .scheduled
+                    .store(false, Ordering::Release);
+                return;
+            }
+            table.run_post_write_maintenance_loop().await;
         });
     }
 
@@ -23733,19 +23748,22 @@ impl CayenneTableProvider {
     /// Returns an error if retention maintenance fails while the explicit flush
     /// is draining queued work.
     pub async fn flush_pending_maintenance(&self) -> CatalogResult<()> {
-        // A retention pass owed by a backed-off retry is not in the queued
-        // state; fold it in once so the drain runs (and reports) it rather than
-        // returning `Ok` with retention still outstanding.
-        let mut retention_owed = self
-            .post_write_maintenance
-            .retention_backoff
-            .lock()
-            .retry_owed();
         loop {
+            // A retention pass owed by a backed-off retry is not in the queued
+            // state; fold it in so the drain runs (and reports) it rather than
+            // returning `Ok` with retention still outstanding. Re-read every
+            // iteration: a background pass that fails while this waits records
+            // the debt after the first read. This cannot spin: the folded pass
+            // either completes, which clears the debt, or fails, which returns.
+            let retention_owed = self
+                .post_write_maintenance
+                .retention_backoff
+                .lock()
+                .retry_owed();
             let state = {
                 let mut guard = self.post_write_maintenance.state.lock();
                 let mut state = std::mem::take(&mut *guard);
-                state.retention_requested |= std::mem::take(&mut retention_owed);
+                state.retention_requested |= retention_owed;
                 state
             };
             if !state.is_empty() {
