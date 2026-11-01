@@ -296,9 +296,9 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `postgres` | Attached [PostgreSQL][postgres] (Spice.ai Enterprise) | Deprecated | N/A |
 | `sqlite`   | Embedded [SQLite][sqlite]         | Deprecated        | `memory`, `file` |
 
-An acceleration with no `engine` uses `cayenne`, or `arrow` on Windows.
+An acceleration with no `engine` uses `cayenne`.
 
-Every accelerator other than `cayenne` is deprecated in v2.4 and will be removed in v2.5. Spice logs a warning naming the datasets and views still using one; set `engine: cayenne` (or remove `engine`) on each to migrate, then delete the old engine's acceleration files and snapshots. Accelerations that hold data their source does not, such as `write_mode: acceleration`, should stay on v2.4 until that data is moved. On Windows, run Spice in Docker or WSL to use Cayenne. See the [migration guide](https://spiceai.org/docs/components/data-accelerators/cayenne/migration).
+Every accelerator other than `cayenne` is deprecated in v2.4 and will be removed in v2.5. Spice logs a warning naming the datasets and views still using one; set `engine: cayenne` (or remove `engine`) on each to migrate, then delete the old engine's acceleration files and snapshots. Accelerations that hold data their source does not, such as `write_mode: acceleration`, should stay on v2.4 until that data is moved. See the [migration guide](https://spiceai.org/docs/components/data-accelerators/cayenne/migration).
 
 [arrow]: https://spiceai.org/docs/components/data-accelerators/arrow
 [cayenne]: https://spiceai.org/docs/components/data-accelerators/cayenne
@@ -458,7 +458,13 @@ On **Windows** using PowerShell:
 iex ((New-Object System.Net.WebClient).DownloadString("https://install.spiceai.org/Install.ps1"))
 ```
 
-> **Note:** Native Windows runtime builds are not provided in v2.0+. Use [WSL](https://learn.microsoft.com/en-us/windows/wsl/) for local development.
+> **Note:** The Spice runtime (`spiced`) does not run natively on Windows. Run it under [WSL](https://learn.microsoft.com/en-us/windows/wsl/) with the Linux CLI, or in Docker from the directory that holds your `spicepod.yaml`:
+>
+> ```powershell
+> docker run -p 8090:8090 -p 50051:50051 -v "${PWD}:/app" spiceai/spiceai --http 0.0.0.0:8090 --flight 0.0.0.0:50051
+> ```
+>
+> The Windows `spice` CLI connects to a runtime in WSL or Docker on its default ports, so `spice sql` and `spice status` work from PowerShell. `spice run` and `spice install` on native Windows point you to WSL.
 
 ### Usage
 

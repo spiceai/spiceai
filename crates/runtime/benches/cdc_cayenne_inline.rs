@@ -23,7 +23,6 @@ limitations under the License.
 //! end to end. Throughput is reported in envelopes/sec via
 //! `criterion::Throughput::Elements`.
 
-#![cfg(not(windows))]
 #![allow(clippy::expect_used)]
 
 use std::hint::black_box;
