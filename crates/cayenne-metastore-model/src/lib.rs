@@ -1083,6 +1083,14 @@ pub fn runs() -> Vec<Run> {
             failure: "a prepared participant keeps its transaction's records",
         },
         Run {
+            name: "transactions-txn-no-intent-check-1-exhaust",
+            family: "transactions",
+            mode: "resolution-txn-no-intent-check",
+            bound: 1,
+            seed: None,
+            failure: "the coordinator reports the transaction's decision",
+        },
+        Run {
             name: "transactions-txn-no-coordinator-wait-0-exhaust",
             family: "transactions",
             mode: "resolution-txn-no-coordinator-wait",
@@ -2737,7 +2745,8 @@ fn required_witness(run: &Run, name: &str, expectation: &Expectation) -> bool {
                 "transactions",
                 "the coordinator removes the records"
                 | "another process removes the records after a takeover"
-                | "a decision object recreated after removal",
+                | "a decision object recreated after removal"
+                | "the coordinator aborts at its deadline and reports it",
             ) => run.mode == "resolution-txn" && run.bound >= 1,
             (
                 "remote-maintenance",

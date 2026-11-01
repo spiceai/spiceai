@@ -66,6 +66,9 @@ pub struct State {
     /// participant's lease moved past the coordinator's, 4 a decision object
     /// recreated after the records went.
     removed: u8,
+    /// The outcome the coordinator reported to its client: 0 none yet, 1
+    /// committed, 2 aborted.
+    reported: u8,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -74,6 +77,8 @@ pub enum Action {
     Check(usize),
     Fence(usize),
     Deadline,
+    /// Create the decision object if absent: 1 the coordinator commits, 2
+    /// another process aborts, 3 the coordinator aborts at its deadline.
     Decide(usize),
     Checkpoint(usize),
     Publish(usize),
@@ -82,6 +87,9 @@ pub enum Action {
     Observe(usize),
     Advance(usize),
     Create(usize, usize),
+    /// The coordinator reports the outcome to its client: the decision object
+    /// it reads while the intent exists.
+    Report,
     /// Remove the transaction's records: 0 by the coordinator once every
     /// participant it prepared has resolved and no `Prepare` of its is in
     /// flight; 1 by any other process once every participant's lease has moved
@@ -154,6 +162,7 @@ impl Protocol {
             Action::Create(i, k) => Action::Create(index(i)?, k),
             Action::Deadline => Action::Deadline,
             Action::Decide(o) => Action::Decide(o),
+            Action::Report => Action::Report,
             Action::Forget(o) => Action::Forget(o),
         })
     }
@@ -290,13 +299,14 @@ impl Model for Protocol {
             records: true,
             recorded: 0,
             coordinator_done: false,
+            reported: 0,
             removed: 0,
         }]
     }
     fn actions(&self, state: &State, action: &mut Vec<Action>) {
         use Action::{
             Advance, Check, Checkpoint, Create, Deadline, Decide, Deliver, Fence, Forget, Gc,
-            Issue, Observe, Publish, Switch,
+            Issue, Observe, Publish, Report, Switch,
         };
         for i in 0..state.ds.len() {
             let dataset = &state.ds[i];
@@ -389,6 +399,21 @@ impl Model for Protocol {
         if (state.deadline || Self::all_fenced(state)) && state.deciders & 2 == 0 {
             action.push(Decide(2));
         }
+        // The coordinator stops waiting for its commit at the deadline and
+        // aborts, so its client gets an answer and its tables are released.
+        if state.deadline && !state.coordinator_done && state.deciders & 4 == 0 {
+            action.push(Decide(3));
+        }
+        // A decision object read once the intent is gone may be one created
+        // after the records were removed, so the coordinator reports only what
+        // it reads while the intent exists.
+        if !state.coordinator_done
+            && state.reported == 0
+            && state.recorded != 0
+            && (state.records || self.has("no-intent-check"))
+        {
+            action.push(Report);
+        }
         if self.coordinator_may_forget(state) {
             action.push(Forget(0));
         }
@@ -400,7 +425,7 @@ impl Model for Protocol {
     fn next_state(&self, state: &State, action: Action) -> Option<State> {
         use Action::{
             Advance, Check, Checkpoint, Create, Deadline, Decide, Deliver, Fence, Forget, Gc,
-            Issue, Observe, Publish, Switch,
+            Issue, Observe, Publish, Report, Switch,
         };
         let mut next = state.clone();
         match action {
@@ -507,7 +532,7 @@ impl Model for Protocol {
             Deadline => next.deadline = true,
             Decide(o) => {
                 next.deciders |= 1 << (o - 1);
-                let o = u8::try_from(o).ok()?;
+                let o = if o == 3 { 2 } else { u8::try_from(o).ok()? };
                 // Create-if-absent: it lands when no decision object exists,
                 // including after the records were removed.
                 if state.recorded == 0 || self.has("no-create-once") {
@@ -520,6 +545,7 @@ impl Model for Protocol {
                     }
                 }
             }
+            Report => next.reported = state.recorded,
             Forget(0) => {
                 next.coordinator_done = true;
                 next.records = false;
@@ -585,6 +611,10 @@ impl Model for Protocol {
                 |_, state: &State| {
                     state.records || state.ds.iter().all(|dataset| !fold(&dataset.log).pending)
                 },
+            ),
+            Property::always(
+                "the coordinator reports the transaction's decision",
+                |_, state: &State| state.reported == 0 || state.reported == state.decision,
             ),
             Property::always("I6 applied outcomes equal decision", |_, state: &State| {
                 state.ds.iter().all(|dataset| {
@@ -698,6 +728,12 @@ impl Model for Protocol {
                 "a decision object recreated after removal",
                 |_, state: &State| state.removed & 4 != 0,
             ),
+            Property::sometimes(
+                "the coordinator aborts at its deadline and reports it",
+                |_, state: &State| {
+                    state.reported == 2 && state.deciders & 4 != 0 && state.deciders & 2 == 0
+                },
+            ),
             Property::sometimes("non-owner Resolve after turnover", |_, state: &State| {
                 state.nonowner
             }),
@@ -746,6 +782,9 @@ pub struct Step {
     pub fenced: Option<usize>,
     /// The decision object after the action: 0 none, 1 commit, 2 abort.
     pub decision: u8,
+    /// The outcome the coordinator has reported after the action: 0 none, 1
+    /// committed, 2 aborted.
+    pub reported: u8,
     /// Whether the transaction's records exist after the action.
     pub records: bool,
     /// Whether the coordinator has a `Prepare` in flight to each participant
@@ -788,6 +827,7 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
             ("Advance", &[i]) => Action::Advance(i),
             ("Create", &[i, j]) => Action::Create(i, j),
             ("Forget", &[o]) => Action::Forget(o),
+            ("Report", &[]) => Action::Report,
             _ => return None,
         };
         let mut enabled = vec![];
@@ -820,6 +860,7 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
                 _ => None,
             },
             decision: next.recorded,
+            reported: next.reported,
             records: next.records,
             prepare_in_flight: state
                 .ds
