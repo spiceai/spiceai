@@ -223,6 +223,57 @@ pub(crate) enum RetentionPass {
     DeferredUntilCheckpoint,
 }
 
+/// Spacing between background retention passes after consecutive failures.
+///
+/// A retention pass that fails for a reason that does not clear on its own (a
+/// `retention_sql` whose implicit cast cannot convert a stored value, say)
+/// would otherwise be retried on every post-write debounce, about ten times a
+/// second, each logging an error. The delay doubles from
+/// [`Self::BASE_DELAY`] per consecutive failure up to [`Self::MAX_DELAY`], and
+/// resets once a pass completes.
+#[derive(Debug, Default)]
+pub(crate) struct RetentionBackoff {
+    consecutive_failures: u32,
+    retry_at: Option<tokio::time::Instant>,
+}
+
+impl RetentionBackoff {
+    pub(crate) const BASE_DELAY: Duration = Duration::from_secs(1);
+    pub(crate) const MAX_DELAY: Duration = Duration::from_secs(300);
+
+    /// Delay before the retry that follows the `failures`-th consecutive failure.
+    pub(crate) fn delay_after(failures: u32) -> Duration {
+        let doublings = failures.saturating_sub(1).min(16);
+        Self::BASE_DELAY
+            .saturating_mul(1_u32 << doublings)
+            .min(Self::MAX_DELAY)
+    }
+
+    /// Record a failed pass at `now`; returns the attempt number and the delay
+    /// before the next one.
+    pub(crate) fn record_failure(&mut self, now: tokio::time::Instant) -> (u32, Duration) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let delay = Self::delay_after(self.consecutive_failures);
+        self.retry_at = Some(now + delay);
+        (self.consecutive_failures, delay)
+    }
+
+    pub(crate) fn record_success(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Whether a background pass at `now` should leave retention to the
+    /// scheduled retry.
+    pub(crate) fn is_waiting(&self, now: tokio::time::Instant) -> bool {
+        self.retry_at.is_some_and(|retry_at| now < retry_at)
+    }
+
+    /// Whether a failed pass still owes a retry.
+    pub(crate) fn retry_owed(&self) -> bool {
+        self.retry_at.is_some()
+    }
+}
+
 pub(crate) enum RetentionFailureAction {
     Requeue,
     ReturnError,
@@ -232,6 +283,8 @@ pub(crate) enum RetentionFailureAction {
 pub(crate) struct PostWriteMaintenance {
     pub(crate) state: ParkingMutex<PostWriteMaintenanceState>,
     pub(crate) scheduled: AtomicBool,
+    /// Backoff after failed background retention passes.
+    pub(crate) retention_backoff: ParkingMutex<RetentionBackoff>,
     /// How many live-row deltas the persisted `num_rows` does not include yet.
     ///
     /// Shared with every outstanding [`OutstandingLiveRowsDelta`], which is what
@@ -397,7 +450,34 @@ impl PublishedLiveRowsDelta {
 
 #[cfg(test)]
 mod post_write_maintenance_tests {
-    use super::PostWriteMaintenance;
+    use super::{PostWriteMaintenance, RetentionBackoff};
+    use std::time::Duration;
+
+    /// The retry spacing doubles per consecutive failure and stops at the cap,
+    /// so a pass that can never succeed logs a bounded number of lines.
+    #[test]
+    fn retention_backoff_doubles_to_the_cap_and_resets() {
+        let delays: Vec<u64> = (1..=12)
+            .map(|n| RetentionBackoff::delay_after(n).as_secs())
+            .collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300]);
+        assert_eq!(
+            RetentionBackoff::delay_after(u32::MAX),
+            RetentionBackoff::MAX_DELAY
+        );
+
+        let now = tokio::time::Instant::now();
+        let mut backoff = RetentionBackoff::default();
+        assert!(!backoff.is_waiting(now));
+        assert_eq!(backoff.record_failure(now), (1, Duration::from_secs(1)));
+        assert_eq!(backoff.record_failure(now), (2, Duration::from_secs(2)));
+        assert!(backoff.is_waiting(now));
+        assert!(!backoff.is_waiting(now + Duration::from_secs(2)));
+        assert!(backoff.retry_owed());
+        backoff.record_success();
+        assert!(!backoff.retry_owed());
+        assert_eq!(backoff.record_failure(now), (1, Duration::from_secs(1)));
+    }
 
     /// A table that has never queued a delta has nothing outstanding, so its
     /// maintained count starts eligible to be served `Exact`.

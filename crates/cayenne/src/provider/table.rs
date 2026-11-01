@@ -23695,6 +23695,23 @@ impl CayenneTableProvider {
         });
     }
 
+    /// Re-arm retention and restart the maintenance loop once `delay` elapses.
+    ///
+    /// Arms a one-shot timer rather than re-queueing the request, so the
+    /// background loop is not woken on every debounce while a failing pass
+    /// backs off. A table quiesced in the meantime is not re-armed.
+    fn schedule_retention_retry(&self, delay: Duration) {
+        let table = self.clone_for_write();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if !table.maintenance_still_admitted() {
+                return;
+            }
+            table.post_write_maintenance.state.lock().retention_requested = true;
+            table.spawn_post_write_maintenance_loop();
+        });
+    }
+
     /// Synchronously drain any pending post-write maintenance, including any
     /// iteration the background loop is currently executing.
     ///
@@ -23716,10 +23733,20 @@ impl CayenneTableProvider {
     /// Returns an error if retention maintenance fails while the explicit flush
     /// is draining queued work.
     pub async fn flush_pending_maintenance(&self) -> CatalogResult<()> {
+        // A retention pass owed by a backed-off retry is not in the queued
+        // state; fold it in once so the drain runs (and reports) it rather than
+        // returning `Ok` with retention still outstanding.
+        let mut retention_owed = self
+            .post_write_maintenance
+            .retention_backoff
+            .lock()
+            .retry_owed();
         loop {
             let state = {
                 let mut guard = self.post_write_maintenance.state.lock();
-                std::mem::take(&mut *guard)
+                let mut state = std::mem::take(&mut *guard);
+                state.retention_requested |= std::mem::take(&mut retention_owed);
+                state
             };
             if !state.is_empty() {
                 self.run_maintenance_state(state, RetentionFailureAction::ReturnError)
@@ -23804,9 +23831,24 @@ impl CayenneTableProvider {
         }
 
         let mut retention_deleted = 0_u64;
-        if state.retention_requested {
+        // After a failed background pass the retry is owned by the timer that
+        // `schedule_retention_retry` armed, so a pass inside the backoff window
+        // leaves retention alone instead of failing again on every debounce.
+        let retention_backing_off = matches!(
+            retention_failure_action,
+            RetentionFailureAction::Requeue
+        ) && self
+            .post_write_maintenance
+            .retention_backoff
+            .lock()
+            .is_waiting(tokio::time::Instant::now());
+        if state.retention_requested && !retention_backing_off {
             match self.apply_retention_filters().await {
                 Ok(RetentionPass::Deleted(deleted)) => {
+                    self.post_write_maintenance
+                        .retention_backoff
+                        .lock()
+                        .record_success();
                     retention_deleted = deleted;
                     if deleted > 0 {
                         tracing::info!(
@@ -23862,19 +23904,25 @@ impl CayenneTableProvider {
                 Err(e) => {
                     match retention_failure_action {
                         RetentionFailureAction::Requeue => {
-                            // Re-queue so the next debounce cycle retries. A
-                            // persistently failing retention scan would
-                            // otherwise leave expired rows undeleted
-                            // indefinitely; re-queueing makes delivery eventual
-                            // and the repeated error log observable. Logged at
-                            // `error` (not `warn`) because the retry semantics
-                            // turn a single failure into a steady signal worth
-                            // alerting on.
+                            // Retry, so a transient failure does not leave
+                            // expired rows undeleted indefinitely, but back off
+                            // exponentially: a failure that does not clear on
+                            // its own (a `retention_sql` whose implicit cast
+                            // cannot convert a stored value) re-armed on every
+                            // 100 ms debounce logged about ten errors a second
+                            // without bound. Logged at `error` because each
+                            // line is a pass that left expired rows queryable.
+                            let (attempt, delay) = self
+                                .post_write_maintenance
+                                .retention_backoff
+                                .lock()
+                                .record_failure(tokio::time::Instant::now());
                             tracing::error!(
                                 table = self.table_metadata.table_name.as_str(),
-                                "Background retention scan failed: {e}. Re-queueing for retry."
+                                "Background retention scan failed (attempt {attempt}): {e}. Retrying in {}s.",
+                                delay.as_secs()
                             );
-                            self.post_write_maintenance.state.lock().retention_requested = true;
+                            self.schedule_retention_retry(delay);
                         }
                         RetentionFailureAction::ReturnError => return Err(e),
                     }
@@ -30395,9 +30443,16 @@ impl CayenneTableProvider {
             self.retention_filters.iter().cloned(),
             &self.table_schema(),
         )
-        .map_err(|err| CatalogError::InvalidOperation {
-            message: self.retention_failed_message(),
-            source: Box::new(err),
+        .map_err(|err| {
+            maintenance_metrics::track_maintenance(
+                table_name,
+                MaintenanceOp::Retention,
+                MaintenanceOutcome::Failed,
+            );
+            CatalogError::InvalidOperation {
+                message: self.retention_failed_message(),
+                source: Box::new(err),
+            }
         })?;
         // Composed through the shared builder rather than hand-rolled, so retention gets
         // the same sink a user `DELETE` does: protected-snapshot and cold-tier listings
