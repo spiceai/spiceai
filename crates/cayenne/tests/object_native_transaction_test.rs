@@ -16,14 +16,16 @@ limitations under the License.
 
 //! A transaction across two datasets of the object-native catalog commits by
 //! two-phase commit over their logs: both or neither, including when the
-//! process stops before or after the decision.
+//! process stops before or after the decision. What no log needs afterwards (a
+//! resolved transaction's records, the log of a dropped dataset or of a create
+//! that stopped before the dataset was named) is removed, and nothing else.
 
 use std::sync::Arc;
 
 use cayenne::{
     MetadataCatalog,
     catalog::CatalogPublication,
-    metastore::object_native::{ObjectNativeCatalog, dataset_log_at},
+    metastore::object_native::{NativeCatalogConfig, ObjectNativeCatalog, dataset_log_at},
 };
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 use object_store_occ::{
@@ -132,6 +134,34 @@ async fn decisions(store: &Arc<dyn ObjectStore>) -> Vec<String> {
     decisions
 }
 
+/// Every object under `prefix`.
+async fn objects_under(store: &Arc<dyn ObjectStore>, prefix: &str) -> Vec<String> {
+    use futures::TryStreamExt;
+    let listed: Vec<_> = store
+        .list(Some(&Path::from(prefix)))
+        .try_collect()
+        .await
+        .expect("list objects");
+    listed
+        .into_iter()
+        .map(|meta| meta.location.to_string())
+        .collect()
+}
+
+/// Open the catalog, removing anything no log needs however recent it is.
+async fn open_reclaiming(store: &Arc<dyn ObjectStore>) -> ObjectNativeCatalog {
+    ObjectNativeCatalog::open_with_config(
+        Arc::clone(store),
+        Path::from("catalog"),
+        NativeCatalogConfig {
+            reclaim_after: std::time::Duration::ZERO,
+            ..NativeCatalogConfig::default()
+        },
+    )
+    .await
+    .expect("open the catalog")
+}
+
 /// The action names committed to `dataset`'s log, oldest first.
 async fn actions(store: &Arc<dyn ObjectStore>, dataset: &str) -> Vec<&'static str> {
     use prost::Message;
@@ -176,7 +206,8 @@ async fn a_transaction_across_two_datasets_commits_on_both_logs() {
             "{dataset}'s log: {names:?}"
         );
     }
-    assert_eq!(decisions(&store).await, ["commit"]);
+    // Both participants resolved it, so the coordinator removed its records.
+    assert_eq!(objects_under(&store, "transactions").await, Vec::<String>::new());
     drop(catalog);
     let reopened = ObjectNativeCatalog::open(Arc::clone(&store), Path::from("catalog"))
         .await
@@ -285,4 +316,122 @@ async fn a_change_to_a_reserved_dataset_waits_for_the_transaction() {
             .expect("read orders"),
         Some(7)
     );
+}
+
+/// A transaction recovery aborted leaves its records until they are older than
+/// `reclaim_after`; then an open removes them, and both datasets keep their
+/// state and accept changes.
+#[tokio::test]
+async fn an_open_removes_the_records_of_a_transaction_recovery_resolved() {
+    let (faults, store, catalog, orders, audit) = setup().await;
+    faults.arm(Op::Create, is_decision, Fault::Hold);
+    let coordinator = tokio::spawn({
+        let catalog = Arc::clone(&catalog);
+        let (orders, audit) = (orders.clone(), audit.clone());
+        async move { catalog.commit_publications(&across(&orders, &audit)).await }
+    });
+    faults.wait_held(None).await;
+    coordinator.abort();
+    assert!(coordinator.await.is_err_and(|error| error.is_cancelled()));
+    drop(catalog);
+    faults.clear_rules();
+    // Recent: kept.
+    let reopened = ObjectNativeCatalog::open(Arc::clone(&store), Path::from("catalog"))
+        .await
+        .expect("reopen");
+    assert_eq!(decisions(&store).await, ["abort"]);
+    drop(reopened);
+    let reopened = open_reclaiming(&store).await;
+    assert_eq!(objects_under(&store, "transactions").await, Vec::<String>::new());
+    assert_eq!(published(&reopened, &orders, &audit).await, [None, None]);
+    reopened
+        .commit_publications(&across(&orders, &audit))
+        .await
+        .expect("a later transaction commits on both");
+    assert_eq!(published(&reopened, &orders, &audit).await, [Some(5), Some(6)]);
+}
+
+/// A dropped dataset's log, and the log of a create that stopped before the
+/// registry named the dataset, are removed once older than `reclaim_after`; the
+/// logs of datasets that exist are kept with their state.
+#[tokio::test]
+async fn an_open_removes_the_logs_no_dataset_uses_and_keeps_the_others() {
+    let (faults, store, catalog, orders, audit) = setup().await;
+    catalog
+        .commit_publications(&across(&orders, &audit))
+        .await
+        .expect("commit across both datasets");
+    let dropped_log = catalog.dataset_log("audit").expect("audit has a log");
+    assert!(catalog.drop_table("audit").await.expect("drop audit"));
+    // A create whose registry commit fails leaves a log nothing names.
+    faults.fail_while(Op::Cas, |path| path.as_ref() == "catalog/head");
+    create_fails(&catalog, "unnamed").await;
+    faults.clear_rules();
+    let kept = objects_under(&store, "datasets").await;
+    let unnamed: Vec<_> = kept
+        .iter()
+        .filter(|path| path.starts_with("datasets/unnamed-"))
+        .collect();
+    assert!(!unnamed.is_empty(), "the stopped create wrote its log: {kept:?}");
+    drop(catalog);
+    // Recent: kept.
+    drop(
+        ObjectNativeCatalog::open(Arc::clone(&store), Path::from("catalog"))
+            .await
+            .expect("reopen"),
+    );
+    assert_eq!(objects_under(&store, "datasets").await, kept);
+    let orders_log = format!(
+        "{}/",
+        dataset_log_at(Arc::clone(&store), &Path::from("catalog"), "orders")
+            .await
+            .expect("read the registry")
+            .expect("orders has a log")
+    );
+    let orders_objects: Vec<_> = kept
+        .iter()
+        .filter(|path| path.starts_with(&orders_log))
+        .cloned()
+        .collect();
+    assert!(!orders_objects.is_empty(), "orders' log has objects: {kept:?}");
+    drop(open_reclaiming(&store).await);
+    // Exactly orders' log is left, every object of it, and the dropped one is gone.
+    assert_eq!(objects_under(&store, "datasets").await, orders_objects);
+    assert!(!orders_objects.iter().any(|path| path.starts_with(&format!("{dropped_log}/"))));
+    // Read back from storage alone.
+    let reopened = ObjectNativeCatalog::open(Arc::clone(&store), Path::from("catalog"))
+        .await
+        .expect("reopen");
+    assert_eq!(
+        reopened
+            .get_snapshot_sequence(&orders, "orders-txn")
+            .await
+            .expect("read orders"),
+        Some(5)
+    );
+    // A dataset created again under the dropped name gets a new log.
+    let audit_again = create(&reopened, "audit").await;
+    reopened
+        .commit_publications(&[publication(&audit_again, "audit-again", 1)])
+        .await
+        .expect("the new audit commits");
+}
+
+async fn create_fails(catalog: &ObjectNativeCatalog, name: &str) {
+    use cayenne::metadata::{CreateTableOptions, VortexConfig};
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+    ]));
+    let created = catalog
+        .create_table(CreateTableOptions {
+            table_name: name.to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: format!("/tmp/unused/{name}"),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        })
+        .await;
+    assert!(created.is_err(), "the create succeeded although the registry could not commit");
 }

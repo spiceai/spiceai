@@ -94,6 +94,10 @@ pub struct NativeCatalogConfig {
     pub checkpoint_after_batches: usize,
     /// How long checkpoints keep the evidence that resolves an uncertain commit.
     pub attempt_horizon: std::time::Duration,
+    /// How long a transaction's records, a dataset log no name refers to, or a
+    /// dropped dataset's log are kept before a catalog that opens may remove
+    /// them: anything newer may belong to a process still writing it.
+    pub reclaim_after: std::time::Duration,
 }
 
 impl Default for NativeCatalogConfig {
@@ -103,6 +107,7 @@ impl Default for NativeCatalogConfig {
             // Small for the prototype, so short CDC runs checkpoint.
             checkpoint_after_batches: 1,
             attempt_horizon: object_store_occ::headlog::DEFAULT_ATTEMPT_HORIZON,
+            reclaim_after: std::time::Duration::from_secs(60 * 60),
         }
     }
 }

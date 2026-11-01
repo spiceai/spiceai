@@ -29,6 +29,7 @@ use crate::{
 };
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use futures::{StreamExt, TryStreamExt};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload, path::Path};
 use parking_lot::RwLock;
 use std::{
@@ -42,6 +43,9 @@ const REGISTRY: &str = "cayenne:datasets";
 
 /// How long a transaction's coordinator has before anyone may abort it.
 const TRANSACTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The object in a dropped dataset's folder whose time is when it was dropped.
+const DROPPED: &str = "dropped";
 
 /// The name registry and every dataset's log.
 pub struct ObjectNativeCatalog {
@@ -108,6 +112,25 @@ fn slug(name: &str) -> String {
         .take(40)
         .collect();
     if slug.is_empty() { "dataset".to_string() } else { slug }
+}
+
+/// When the UUIDv7 that ends `name` (a transaction id or a dataset folder) was
+/// made, or `None` when `name` does not end in one.
+fn created_at(name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let id = name.get(name.len().checked_sub(36)?..)?;
+    let (seconds, nanos) = uuid::Uuid::parse_str(id).ok()?.get_timestamp()?.to_unix();
+    chrono::DateTime::from_timestamp(i64::try_from(seconds).ok()?, nanos)
+}
+
+/// Delete every object under `prefix`.
+async fn delete_under(store: &Arc<dyn ObjectStore>, prefix: &Path) -> CatalogResult<()> {
+    let locations = store.list(Some(prefix)).map_ok(|meta| meta.location).boxed();
+    store
+        .delete_stream(locations)
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(invalid)?;
+    Ok(())
 }
 
 /// The prefix of the log that holds `dataset` in the catalog at `prefix`, read
@@ -270,6 +293,7 @@ impl ObjectNativeCatalog {
             ddl: tokio::sync::Mutex::new(()),
         };
         catalog.recover().await?;
+        catalog.reclaim().await?;
         Ok(catalog)
     }
 
@@ -418,6 +442,15 @@ impl ObjectNativeCatalog {
         };
         let dropped = domain.drop_table(name).await?;
         if own.is_some_and(|own| Arc::ptr_eq(&own, &domain)) {
+            // Written before the registry forgets the name, so a log no name
+            // refers to either has this marker or was never named.
+            self.store
+                .put(
+                    &self.datasets.clone().join(domain.folder.as_str()).join(DROPPED),
+                    PutPayload::new(),
+                )
+                .await
+                .map_err(invalid)?;
             let mut unregister = vec![position(REGISTRY, name, None)];
             unregister.extend(
                 domain
@@ -491,6 +524,11 @@ impl ObjectNativeCatalog {
             }
         };
         drop(reservations);
+        // Once every participant has resolved it, nothing reads the transaction's
+        // records again. Any other outcome leaves them for recovery.
+        if all_prepared && decision.is_ok() && resolved.iter().all(Result::is_ok) {
+            self.forget(&txn).await;
+        }
         for outcome in prepared {
             outcome?;
         }
@@ -509,6 +547,76 @@ impl ObjectNativeCatalog {
 
     fn transaction_object(&self, txn: &str, name: &str) -> Path {
         self.transactions.clone().join(txn).join(name)
+    }
+
+    /// Remove a resolved transaction's records. One that fails is removed when
+    /// a catalog next opens.
+    async fn forget(&self, txn: &str) {
+        if let Err(error) = delete_under(&self.store, &self.transactions.clone().join(txn)).await {
+            tracing::debug!("Cayenne object-native metastore left the records of resolved transaction {txn} for the next open to remove: {error}");
+        }
+    }
+
+    /// Remove what no log needs once recovery has resolved every transaction
+    /// left prepared: transaction records, logs no name refers to (a dataset
+    /// dropped, or a create stopped before it was named). Only what is older than
+    /// `reclaim_after` goes, since a newer one may belong to a process that took
+    /// the logs over after this one opened them.
+    async fn reclaim(&self) -> CatalogResult<()> {
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::from_std(self.config.reclaim_after).map_err(invalid)?;
+        let mut removed = (0, 0);
+        let listed = self
+            .store
+            .list_with_delimiter(Some(&self.transactions))
+            .await
+            .map_err(invalid)?;
+        for prefix in listed.common_prefixes {
+            let Some(txn) = prefix.filename() else {
+                continue;
+            };
+            if created_at(txn).is_some_and(|created| created < cutoff) {
+                delete_under(&self.store, &prefix).await?;
+                removed.0 += 1;
+            }
+        }
+        let named: HashSet<String> = self
+            .registry
+            .positions_under(REGISTRY)
+            .await
+            .into_iter()
+            .filter_map(|(_, folder)| String::from_utf8(folder).ok())
+            .collect();
+        let listed = self
+            .store
+            .list_with_delimiter(Some(&self.datasets))
+            .await
+            .map_err(invalid)?;
+        for prefix in listed.common_prefixes {
+            let Some(folder) = prefix.filename() else {
+                continue;
+            };
+            if named.contains(folder) {
+                continue;
+            }
+            let ended = match self.store.head(&prefix.clone().join(DROPPED)).await {
+                Ok(marker) => Some(marker.last_modified),
+                Err(object_store::Error::NotFound { .. }) => created_at(folder),
+                Err(error) => return Err(invalid(error)),
+            };
+            if ended.is_some_and(|ended| ended < cutoff) {
+                delete_under(&self.store, &prefix).await?;
+                removed.1 += 1;
+            }
+        }
+        if removed != (0, 0) {
+            tracing::debug!(
+                "Cayenne object-native metastore removed the records of {} resolved transactions and {} dataset logs no dataset uses",
+                removed.0,
+                removed.1
+            );
+        }
+        Ok(())
     }
 
     /// Record `commit` as the outcome of `txn` unless one is recorded, and
