@@ -182,3 +182,33 @@ steps:
     eventually: 120s
   - stop-background: { id: no-duplicates, allow: ['^[45][0-9][0-9] ', 'error sending request', 'connection', 'not ready'] }
   - query: *rows
+
+  # A restart resumes Kafka from the offsets the acceleration stored with its
+  # rows, not from the consumer group's: the group commit is asynchronous and
+  # can be lost (as around the broker restart above), and the group is then
+  # behind what the acceleration holds. Rewind the group to the start of the
+  # topic while spiced is down; the restarted runtime reads no message twice.
+  - stop: {}
+    when: { src: kafka }
+  # The stopped consumer stays a member until its session times out, and a
+  # group's offsets can only be reset once it has no members.
+  - source-exec:
+      src: >-
+        set -e;
+        rpk() { command rpk "$@" -X brokers=127.0.0.1:9092; };
+        groups=$(rpk group list | awk 'NR > 1 { print $2 }');
+        [ -n "$groups" ];
+        for g in $groups; do
+          for i in $(seq 1 90); do rpk group describe "$g" | grep -qE '^STATE +Empty' && break; sleep 1; done;
+          rpk group seek "$g" --to start;
+          rpk group describe "$g" | awk 'NR > 1 && $1 ~ /^i[0-9]/ && $3 != "0" { bad = 1 } END { exit bad }';
+        done
+    when: { src: kafka }
+  - start: {}
+    when: { src: kafka }
+  - <<: *write
+    write: { src: "INSERT INTO t SELECT 'k' || g, g, g % 7, 'group rewound' FROM generate_series(601, 650) g" }
+    when: { src: kafka }
+  - query: *rows
+    eventually: 60s
+    when: { src: kafka }
