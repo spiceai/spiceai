@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import io
 import json
@@ -132,9 +133,25 @@ def install(version: str | None, cache_dir: Path) -> Path:
         )
 
     target = cache_dir / version
+    # A complete install is never replaced, so it can be reused without the lock.
     if installed(target, library, expected):
         return target
 
+    # One run installs a release at a time. Without the lock, a run that found
+    # no install could publish over one another run had just returned, and the
+    # caller of that run would find its manifest gone.
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with open(cache_dir / f".{version}.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if installed(target, library, expected):
+            return target
+        publish(target, library, expected, version, release)
+    return target
+
+
+def publish(target: Path, library: str, expected: str, version: str, release: str) -> None:
+    """Download, check and install the release at `target`. The caller holds
+    the release's lock and found no complete install there."""
     url = archive_url(version, release)
     archive = download(url, version)
     actual = hashlib.sha256(archive).hexdigest()
@@ -144,39 +161,32 @@ def install(version: str | None, cache_dir: Path) -> Path:
             f"{VERSIONS_FILE} records {expected}"
         )
 
-    # Build the directory beside its final place and rename it in, so a
-    # concurrent run never sees a manifest without its library.
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f".{version}-", dir=cache_dir))
+    # Build the directory beside its final place and rename it in, so a run
+    # taking the unlocked path never sees a manifest without its library.
+    staging = Path(tempfile.mkdtemp(prefix=f".{version}-", dir=target.parent))
     staging.chmod(0o755)
     old = None
     try:
         (staging / library).write_bytes(extract(archive, url, library))
+        # A JSON string is a valid TOML basic string, so a quote or backslash in
+        # the cache path is escaped rather than ending the value.
+        shared = json.dumps(str(target / library), ensure_ascii=False)
         (staging / MANIFEST).write_text(
             "[Driver]\n"
-            f'shared = "{target / library}"\n'
+            f"shared = {shared}\n"
             'entrypoint = "duckdb_adbc_init"\n'
         )
         (staging / ".sha256").write_text(expected + "\n")
-        # Another run may have installed the release while this one downloaded
-        # it. Its caller may already be loading that copy, so keep it.
-        if installed(target, library, expected):
-            return target
-        # A stale or partial install is renamed aside, not deleted in place, so
-        # the directory is only ever absent between two renames.
+        # An incomplete install is renamed aside, not deleted in place, so the
+        # directory is only ever absent between two renames.
         if target.exists():
-            old = Path(tempfile.mkdtemp(prefix=f".{version}-old-", dir=cache_dir))
+            old = Path(tempfile.mkdtemp(prefix=f".{version}-old-", dir=target.parent))
             target.rename(old / "old")
-        try:
-            staging.rename(target)
-        except OSError:
-            if not installed(target, library, expected):
-                raise
+        staging.rename(target)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
         if old is not None:
             shutil.rmtree(old, ignore_errors=True)
-    return target
 
 
 def installed(target: Path, library: str, expected: str) -> bool:

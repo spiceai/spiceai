@@ -418,7 +418,7 @@ const TPCDS_TABLES: &[&str] = &[
 
 /// Needs network for `INSTALL tpcds`, unlike the TPC-H fixture `support::tpch_data`
 /// generates in-process.
-fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> Option<PathBuf> {
+fn generate_tpcds_parquet(out_dir: &Path, sf: f64, revision: &str) -> Option<PathBuf> {
     // The generation database is temporary and fresh per run. `dsdgen` populates
     // a schema and cannot be run twice against the same database — a reused one
     // fails with `Table with name "call_center" already exists` the moment
@@ -503,15 +503,34 @@ fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> Option<PathBuf> {
     // the directory populated but unstamped, so the next one regenerates instead
     // of reading a fixture that is missing tables — where the queries against
     // those tables fail on both engines, far from the cause.
-    support::mark_fixture_complete(out_dir, TPCDS_FIXTURE_REVISION);
+    support::mark_fixture_complete(out_dir, revision);
     Some(out_dir.to_path_buf())
 }
 
-/// Revision for the TPC-DS fixture. Unlike SSB and TPC-H the generator is
-/// DuckDB's `dsdgen`, not code in this repo, so there is no source to digest;
-/// the stamp is carried for its completeness half, and this bumps only if the
-/// export set or the extension pin changes.
-const TPCDS_FIXTURE_REVISION: &str = "duckdb-dsdgen-1";
+/// Revision for the TPC-DS fixture: the DuckDB release whose `dsdgen` writes
+/// it. Unlike SSB and TPC-H the generator is DuckDB's, not code in this repo, so
+/// there is no source to digest. Naming the release regenerates a fixture another
+/// release wrote, so the rows reported as this DuckDB's came from it. Bump the
+/// prefix if the export set changes.
+fn tpcds_fixture_revision() -> String {
+    use arrow::array::Array as _;
+    let conn = Connection::open_in_memory().expect("open the DuckDB oracle to read its version");
+    let batches = conn
+        .query("SELECT version()")
+        .expect("read the DuckDB oracle's version");
+    let version = batches
+        .first()
+        .filter(|b| b.num_rows() == 1)
+        .and_then(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+        })
+        .filter(|a| !a.is_null(0))
+        .map(|a| a.value(0).to_owned())
+        .expect("DuckDB reports one version");
+    format!("duckdb-dsdgen-1-{version}")
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tpcds_and_clickbench_parity_vs_duckdb() {
@@ -526,8 +545,9 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
     // Reuse only a stamped fixture. Two sentinel files said nothing about the
     // other twenty-two, so a directory left behind by an interrupted dsdgen was
     // read as complete and its missing tables became `Excluded` — a pass.
-    let tpcds_fixture_missing = !support::fixture_is_current(&tpcds_dir, TPCDS_FIXTURE_REVISION)
-        && generate_tpcds_parquet(&tpcds_dir, sf).is_none();
+    let tpcds_revision = tpcds_fixture_revision();
+    let tpcds_fixture_missing = !support::fixture_is_current(&tpcds_dir, &tpcds_revision)
+        && generate_tpcds_parquet(&tpcds_dir, sf, &tpcds_revision).is_none();
 
     // Discover exported tables.
     let exported: Vec<String> = std::fs::read_dir(&tpcds_dir)
