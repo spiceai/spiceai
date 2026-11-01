@@ -37,18 +37,35 @@ use object_store_occ::{
     },
 };
 
-async fn setup() -> (
+type Setup = (
     Arc<FaultStore>,
     Arc<dyn ObjectStore>,
     Arc<ObjectNativeCatalog>,
     String,
     String,
-) {
+);
+
+async fn setup() -> Setup {
+    setup_with(NativeCatalogConfig::default()).await
+}
+
+/// A catalog whose transactions across datasets give up on a commit after
+/// `deadline`.
+async fn setup_with_deadline(deadline: std::time::Duration) -> Setup {
+    setup_with(NativeCatalogConfig {
+        transaction_deadline: deadline,
+        ..NativeCatalogConfig::default()
+    })
+    .await
+}
+
+async fn setup_with(config: NativeCatalogConfig) -> Setup {
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let store: Arc<dyn ObjectStore> = Arc::clone(&faults) as Arc<dyn ObjectStore>;
-    let catalog = ObjectNativeCatalog::create(Arc::clone(&store), Path::from("catalog"))
-        .await
-        .expect("create the catalog");
+    let catalog =
+        ObjectNativeCatalog::create_with_config(Arc::clone(&store), Path::from("catalog"), config)
+            .await
+            .expect("create the catalog");
     let orders = create(&catalog, "orders").await;
     let audit = create(&catalog, "audit").await;
     (faults, store, Arc::new(catalog), orders, audit)
@@ -111,6 +128,32 @@ async fn published(catalog: &ObjectNativeCatalog, orders: &str, audit: &str) -> 
 
 fn is_decision(path: &Path) -> bool {
     path.as_ref().ends_with("/decision")
+}
+
+/// Wait until no transaction's records remain, or fail after `timeout` with
+/// what is left.
+async fn records_removed(store: &Arc<dyn ObjectStore>, timeout: std::time::Duration) {
+    let started = std::time::Instant::now();
+    loop {
+        let left = objects_under(store, "transactions").await;
+        if left.is_empty() {
+            return;
+        }
+        assert!(
+            started.elapsed() < timeout,
+            "the transaction's records are still there: {left:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// The error text of a transaction across `orders` and `audit`.
+async fn failed_across(catalog: &ObjectNativeCatalog, orders: &str, audit: &str) -> String {
+    catalog
+        .commit_publications(&across(orders, audit))
+        .await
+        .expect_err("the transaction does not report a commit")
+        .to_string()
 }
 
 /// Every object under `prefix`.
@@ -381,4 +424,113 @@ async fn create_fails(catalog: &ObjectNativeCatalog, name: &str) {
         })
         .await;
     assert!(created.is_err(), "the create succeeded although the registry could not commit");
+}
+
+/// The decision's create lands but its response is lost: the coordinator's
+/// next create finds the decision and reads it back while the intent exists,
+/// so it reports the commit it recorded.
+#[tokio::test]
+async fn a_commit_whose_response_is_lost_is_reported_committed() {
+    let (faults, store, catalog, orders, audit) = setup().await;
+    faults.arm(Op::Create, is_decision, Fault::DropResponse);
+    catalog
+        .commit_publications(&across(&orders, &audit))
+        .await
+        .expect("the coordinator reads back the commit it recorded");
+    assert_eq!(published(&catalog, &orders, &audit).await, [Some(5), Some(6)]);
+    assert_eq!(objects_under(&store, "transactions").await, Vec::<String>::new());
+}
+
+/// Storage refuses every decision until the deadline and after it, so the
+/// coordinator reports the outcome as unknown and returns. The process keeps
+/// running: a later change to one of the datasets waits rather than being
+/// refused, and once storage answers, the process records the abort, resolves
+/// both datasets, removes the records and lets the change commit.
+#[tokio::test]
+async fn a_decision_storage_refuses_is_reported_unknown_and_finished_once_storage_answers() {
+    let (faults, store, catalog, orders, audit) =
+        setup_with_deadline(std::time::Duration::from_millis(300)).await;
+    faults.fail_while(Op::Create, is_decision);
+    let error = failed_across(&catalog, &orders, &audit).await;
+    assert!(
+        error.contains("is unknown") && error.contains("check whether its changes are visible"),
+        "{error}"
+    );
+    let change = tokio::spawn({
+        let catalog = Arc::clone(&catalog);
+        let orders = orders.clone();
+        async move {
+            catalog
+                .commit_publications(&[publication(&orders, "orders-later", 7)])
+                .await
+        }
+    });
+    // A bounded wait for something that must not happen: the change waits for
+    // as long as storage refuses the decision.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!change.is_finished(), "the change did not wait for the transaction");
+    faults.clear_rules();
+    change
+        .await
+        .expect("change task")
+        .expect("the change commits once the transaction is finished");
+    assert_eq!(published(&catalog, &orders, &audit).await, [None, None]);
+    assert_eq!(
+        catalog
+            .get_snapshot_sequence(&orders, "orders-later")
+            .await
+            .expect("read orders"),
+        Some(7)
+    );
+    records_removed(&store, std::time::Duration::from_secs(10)).await;
+}
+
+/// The commit lands but its response is lost, and the decision cannot be read
+/// back before the deadline: the coordinator cannot tell whether the commit
+/// landed, so it reports the outcome as unknown, not aborted. Once storage
+/// answers, the process finds the commit and applies it on both datasets.
+#[tokio::test]
+async fn a_commit_that_cannot_be_read_back_is_reported_unknown_and_applied() {
+    let (faults, store, catalog, orders, audit) =
+        setup_with_deadline(std::time::Duration::from_millis(300)).await;
+    faults.arm(Op::Create, is_decision, Fault::DropResponse);
+    faults.fail_while(Op::Get, is_decision);
+    let error = failed_across(&catalog, &orders, &audit).await;
+    assert!(error.contains("is unknown"), "{error}");
+    faults.clear_rules();
+    records_removed(&store, std::time::Duration::from_secs(10)).await;
+    assert_eq!(published(&catalog, &orders, &audit).await, [Some(5), Some(6)]);
+}
+
+/// The commit's create is still in flight at the deadline: the coordinator
+/// records an abort instead, applies it, removes the records and reports the
+/// abort. The commit's create lands only afterwards, as a decision with no
+/// intent, which nothing applies: neither dataset shows the transaction, and
+/// the next open removes it.
+#[tokio::test]
+async fn a_commit_still_in_flight_at_the_deadline_is_aborted() {
+    let (faults, store, catalog, orders, audit) =
+        setup_with_deadline(std::time::Duration::from_millis(300)).await;
+    faults.arm(Op::Create, is_decision, Fault::Hold);
+    let error = failed_across(&catalog, &orders, &audit).await;
+    assert!(error.contains("was aborted"), "{error}");
+    assert_eq!(objects_under(&store, "transactions").await, Vec::<String>::new());
+    let held = faults.held_ids();
+    assert_eq!(held.len(), 1, "the commit's create is held");
+    faults
+        .deliver(held[0])
+        .await
+        .expect("the late commit lands after the records were removed");
+    let left = objects_under(&store, "transactions").await;
+    assert!(
+        left.len() == 1 && left[0].ends_with("/decision"),
+        "{left:?}"
+    );
+    assert_eq!(published(&catalog, &orders, &audit).await, [None, None]);
+    drop(catalog);
+    let reopened = ObjectNativeCatalog::open(Arc::clone(&store), Path::from("catalog"))
+        .await
+        .expect("reopen");
+    assert_eq!(published(&reopened, &orders, &audit).await, [None, None]);
+    assert_eq!(objects_under(&store, "transactions").await, Vec::<String>::new());
 }

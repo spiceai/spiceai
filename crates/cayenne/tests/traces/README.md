@@ -9,13 +9,14 @@ action.
 
 | File | Run | Content |
 |---|---|---|
-| transactions.jsonl | transactions-txn-1-exhaust | 8 witnesses + 20 walks (seed 42, 40 steps) |
+| transactions.jsonl | transactions-txn-1-exhaust | 9 witnesses + 20 walks (seed 42, 40 steps) |
 | transactions-no-reservation.jsonl | transactions-txn-no-reservation-0-exhaust | control |
 | transactions-no-matching.jsonl | transactions-txn-no-matching-0-exhaust | control |
 | transactions-no-create-once.jsonl | transactions-txn-no-create-once-0-exhaust | control |
 | transactions-no-fence-check.jsonl | transactions-txn-no-fence-check-0-exhaust | control |
 | transactions-no-prepared-check.jsonl | transactions-txn-no-prepared-check-1-exhaust | control |
 | transactions-no-coordinator-wait.jsonl | transactions-txn-no-coordinator-wait-0-exhaust | control |
+| transactions-no-intent-check.jsonl | transactions-txn-no-intent-check-1-exhaust | control |
 
 Generated serially from the repository root (TRACE_JSON appends):
 
@@ -35,9 +36,16 @@ rather than drives.
 
 Every trace replays to its end on both backends: the model writes a `Prepare`
 only under the coordinator's lease, as the prototype does. On 2026-11-01 the
-positive set replayed 56 trace-backend pairs: 154 records landed, 26 fenced
-deliveries refused, 92 takeovers, 48 decisions, 14 removals by the coordinator
-and 18 by another process (including decisions recreated after a removal).
+positive set replayed 58 trace-backend pairs: 166 records landed, 22 fenced
+deliveries refused, 92 takeovers, 84 decisions (including the coordinator's
+abort at its deadline), 22 reports of the outcome by the coordinator, 22
+removals by the coordinator and 32 by another process (including decisions
+recreated after a removal).
+
+A `Report` is the prototype's `confirmed_outcome`, which `commit_across` reports
+by. The coordinator's retries until the deadline, the switch to an abort and the
+background finish are covered by `object_native_transaction_test`, not by
+replay.
 
 The coordinator's removal is checked against the model's coordinator state,
 not driven through `commit_across`: the replay refuses `Forget(0)` while the
@@ -60,6 +68,8 @@ removed from the prototype, each reports the broken guarantee instead:
 | decision create-if-absent (overwrite instead) | control_create_once | `step 10 Decide(1): create-once: the recorded decision changed` | 2026-11-01 |
 | lease check in `remove_if_finished` | control_fence_check | `step 4 Deliver(1, 0): records: participant 1 holds the transaction prepared and its records are gone` | 2026-11-01 |
 | prepared check in `remove_if_finished` | control_prepared_check | `step 5 Forget(1): records: participant 0 holds the transaction prepared and its records are gone` | 2026-11-01 |
+| intent check in `confirmed_outcome` | control_intent_check | `step 15 Report: report: the coordinator reports true where the decision is false` | 2026-11-01 |
 
-The first three were run against the previous trace set (commit a592a4c3f3);
-the last two against this one.
+The first three were run against an earlier trace set (commit a592a4c3f3),
+the next two against the trace set before the coordinator's deadline, and the
+last against this one.

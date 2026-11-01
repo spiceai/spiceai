@@ -24,7 +24,11 @@ limitations under the License.
 //! read back from the decision object. A delivery the model refuses because a
 //! newer lease fenced it runs through the fenced handle and must be refused.
 //! `Fence` opens the log again, which takes it over. `Decide` records a
-//! decision create-if-absent. `Forget(1)` is another process removing the
+//! decision create-if-absent: the coordinator's commit, another process's
+//! abort, or the coordinator's abort at its deadline. `Report` is the
+//! coordinator reading the outcome it reports to its client by
+//! [`confirmed_outcome`], which must be the model's and the first recorded
+//! decision. `Forget(1)` is another process removing the
 //! records by [`remove_if_finished`], from storage alone; the prototype must
 //! remove exactly when the model does. `Forget(0)` is the coordinator removing
 //! them, which `commit_across` does only after every `Prepare` it sent has
@@ -50,9 +54,12 @@ limitations under the License.
 //! - matching: no `Resolve` lands without its `Prepare`;
 //! - create-once: a recorded decision never changes while the intent exists;
 //! - agreement: every participant resolves to the first recorded decision;
+//! - report: the coordinator reports the first recorded decision or nothing;
 //! - records: a transaction's records survive while a log holds it prepared.
 
-use super::{INTENT, decide, forget_records, read_decision, remove_if_finished};
+use super::{
+    INTENT, confirmed_outcome, decide, forget_records, read_decision, remove_if_finished,
+};
 use crate::{
     catalog::{CatalogPublication, MetadataCatalog},
     metadata::{CreateTableOptions, VortexConfig},
@@ -457,6 +464,30 @@ impl Replay {
                     return outcome;
                 }
                 *outcome.replayed.entry("decide").or_default() += 1;
+            } else if text == "Report" {
+                let reported = confirmed_outcome(&self.store, &self.transactions, TXN)
+                    .await
+                    .expect("read the outcome");
+                if let (Some(reported), Some(decided)) = (reported, self.decided)
+                    && reported != decided
+                {
+                    outcome.violation = Some(at(format!(
+                        "report: the coordinator reports {reported} where the decision is {decided}"
+                    )));
+                    return outcome;
+                }
+                let expected = match step.reported {
+                    0 => None,
+                    reported => Some(reported == 1),
+                };
+                if reported != expected {
+                    outcome.divergence = Some(at(format!(
+                        "reports {reported:?} where the model reports {}",
+                        step.reported
+                    )));
+                    return outcome;
+                }
+                *outcome.replayed.entry("report").or_default() += 1;
             } else if text == "Forget(0)" {
                 if step.prepare_in_flight.iter().any(|&in_flight| in_flight) {
                     outcome.divergence = Some(at(
@@ -683,6 +714,16 @@ async fn control_prepared_check() {
     negative(
         include_str!("../../../../tests/traces/transactions-no-prepared-check.jsonl"),
         "a prepared participant keeps its transaction's records",
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn control_intent_check() {
+    negative(
+        include_str!("../../../../tests/traces/transactions-no-intent-check.jsonl"),
+        "the coordinator reports the transaction's decision",
         true,
     )
     .await;

@@ -19,7 +19,8 @@ limitations under the License.
 //! two-phase commit over their logs.
 
 use super::{
-    Domain, NativeCatalogConfig, OpenSummary, ValueChange, invalid, position, replay_state,
+    Domain, HeldReservation, NativeCatalogConfig, OpenSummary, ValueChange, invalid, position,
+    replay_state,
 };
 use cayenne_metastore_actions::proto;
 use prost::Message;
@@ -47,9 +48,6 @@ mod replay_tests;
 /// The registry's key for its entries: partition = dataset name, value = the
 /// dataset's folder under `datasets/`. It has no `/`, so it names no dataset.
 const REGISTRY: &str = "cayenne:datasets";
-
-/// How long a transaction's coordinator has before anyone may abort it.
-const TRANSACTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The object in a dropped dataset's folder whose time is when it was dropped.
 const DROPPED: &str = "dropped";
@@ -247,6 +245,191 @@ async fn decide(
         "could not record the decision of transaction {txn}: {}",
         last.unwrap_or_default()
     )))
+}
+
+/// Whether `txn`'s intent exists.
+async fn intent_exists(
+    store: &Arc<dyn ObjectStore>,
+    transactions: &Path,
+    txn: &str,
+) -> CatalogResult<bool> {
+    match store.head(&transactions.clone().join(txn).join(INTENT)).await {
+        Ok(_) => Ok(true),
+        Err(object_store::Error::NotFound { .. }) => Ok(false),
+        Err(error) => Err(invalid(error)),
+    }
+}
+
+/// The outcome of `txn` its coordinator may report: the decision object, read
+/// while the intent exists. The intent is written once, before any decision,
+/// and removed before the decision, so a decision read before the intent is
+/// seen is the transaction's only one. Once the intent is gone, a decision may
+/// be one created after the records were removed, so this returns `None`: the
+/// transaction was finished by another process.
+async fn confirmed_outcome(
+    store: &Arc<dyn ObjectStore>,
+    transactions: &Path,
+    txn: &str,
+) -> CatalogResult<Option<bool>> {
+    let Some(decision) = read_decision(store, transactions, txn).await? else {
+        return Ok(None);
+    };
+    Ok(intent_exists(store, transactions, txn)
+        .await?
+        .then_some(decision))
+}
+
+/// One attempt to record `commit` as the outcome of `txn` create-if-absent,
+/// returning the outcome its coordinator may report ([`confirmed_outcome`]).
+/// An error leaves it unknown whether the create landed.
+async fn try_decide(
+    store: &Arc<dyn ObjectStore>,
+    transactions: &Path,
+    txn: &str,
+    commit: bool,
+) -> CatalogResult<Option<bool>> {
+    match store
+        .put_opts(
+            &transactions.clone().join(txn).join(DECISION),
+            PutPayload::from(encode_decision(commit)),
+            PutMode::Create.into(),
+        )
+        .await
+    {
+        Ok(_) => Ok(intent_exists(store, transactions, txn)
+            .await?
+            .then_some(commit)),
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            confirmed_outcome(store, transactions, txn).await
+        }
+        Err(error) => Err(invalid(error)),
+    }
+}
+
+/// What a coordinator learned of its transaction's decision.
+enum Decided {
+    /// The transaction's decision.
+    Recorded(bool),
+    /// The records are gone: another process took the datasets over and
+    /// finished the transaction.
+    Finished,
+    /// Storage did not confirm a decision before the deadline.
+    Unrecorded(String),
+}
+
+/// Record `commit` as the outcome of `txn`, retrying until `deadline`; a commit
+/// not recorded by then is aborted instead, so the outcome is settled in
+/// bounded time whenever storage answers. An attempt still waiting at the
+/// deadline is abandoned: if its create lands later, it is refused by the
+/// decision already recorded, or it is the decision the abort reads back.
+async fn decide_by(
+    store: &Arc<dyn ObjectStore>,
+    transactions: &Path,
+    txn: &str,
+    commit: bool,
+    deadline: tokio::time::Instant,
+) -> Decided {
+    // Attempts to record the abort once the deadline has passed, and how long
+    // each may wait for storage.
+    const ABORT_ATTEMPTS: u32 = 3;
+    const ABORT_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let mut wanted = commit;
+    let mut aborts = 0;
+    let mut attempt: u32 = 0;
+    loop {
+        let now = tokio::time::Instant::now();
+        let limit = if now < deadline {
+            deadline - now
+        } else {
+            ABORT_ATTEMPT_TIMEOUT
+        };
+        let attempted = tokio::time::timeout(limit, try_decide(store, transactions, txn, wanted))
+            .await
+            .unwrap_or_else(|_| Err(invalid("storage did not answer in time")));
+        match attempted {
+            Ok(Some(outcome)) => return Decided::Recorded(outcome),
+            Ok(None) => return Decided::Finished,
+            Err(error) => {
+                if tokio::time::Instant::now() >= deadline {
+                    if wanted {
+                        wanted = false;
+                    } else {
+                        aborts += 1;
+                        if aborts >= ABORT_ATTEMPTS {
+                            return Decided::Unrecorded(error.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        attempt += 1;
+        let backoff = std::time::Duration::from_millis(50 << attempt.min(6));
+        let now = tokio::time::Instant::now();
+        let wait = if now < deadline {
+            backoff.min(deadline - now)
+        } else {
+            backoff
+        };
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// Resolve every prepared participant of `txn` on its `commit` outcome. The
+/// caller holds each participant's reservation.
+async fn resolve_participants(
+    txn: &str,
+    participants: &[(HeldReservation, Option<Vec<String>>)],
+    commit: bool,
+) -> Vec<CatalogResult<()>> {
+    futures::future::join_all(participants.iter().filter_map(|(held, footprint)| {
+        footprint
+            .clone()
+            .map(|footprint| held.0.resolve(txn, footprint, commit))
+    }))
+    .await
+}
+
+/// Finish `txn` once storage answers, for a coordinator that returned before
+/// its outcome was recorded. Its deadline has passed, so it records an abort
+/// unless a decision is recorded, resolves every participant it prepared, and
+/// removes the records; it keeps the participants' reservations until then, so
+/// other changes to them wait rather than being refused.
+async fn finish_in_background(
+    store: Arc<dyn ObjectStore>,
+    transactions: Path,
+    txn: String,
+    participants: Vec<(HeldReservation, Option<Vec<String>>)>,
+) {
+    let mut attempt: u32 = 0;
+    let commit = loop {
+        match try_decide(&store, &transactions, &txn, false).await {
+            Ok(Some(commit)) => break commit,
+            Ok(None) => return,
+            Err(error) => {
+                attempt += 1;
+                tracing::debug!(
+                    "Cayenne object-native metastore could not yet record the outcome of transaction {txn}, retrying: {error}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100 << attempt.min(7))).await;
+            }
+        }
+    };
+    let resolved = resolve_participants(&txn, &participants, commit).await;
+    drop(participants);
+    if let Some(error) = resolved.into_iter().find_map(Result::err) {
+        tracing::error!(
+            "Cayenne object-native metastore recorded the outcome of transaction {txn} across datasets ({}) but could not apply it, so its datasets stop updating until spiced restarts, which applies it: {error}",
+            if commit { "committed" } else { "aborted" }
+        );
+        return;
+    }
+    tracing::info!(
+        "Cayenne object-native metastore recorded the outcome of transaction {txn} across datasets after its coordinator returned: {}",
+        if commit { "committed" } else { "aborted" }
+    );
+    if let Err(error) = forget_records(&store, &transactions, &txn).await {
+        tracing::debug!("Cayenne object-native metastore left the records of resolved transaction {txn} for the next open to remove: {error}");
+    }
 }
 
 /// Remove `txn`'s records: the intent first, so a decision left by a failure
@@ -686,11 +869,10 @@ impl ObjectNativeCatalog {
         groups.sort_by(|(a, _), (b, _)| a.folder.cmp(&b.folder));
         let mut reservations = Vec::with_capacity(groups.len());
         for (domain, _) in &groups {
-            reservations.push(domain.inner.reserve().await);
+            reservations.push(HeldReservation::take(domain).await);
         }
         let txn = uuid::Uuid::now_v7().to_string();
-        let deadline = chrono::Utc::now()
-            + chrono::Duration::from_std(TRANSACTION_DEADLINE).map_err(invalid)?;
+        let deadline = tokio::time::Instant::now() + self.config.transaction_deadline;
         let intent = proto::Intent {
             participants: groups
                 .iter()
@@ -699,7 +881,10 @@ impl ObjectNativeCatalog {
                     lease: domain.opened.lease,
                 })
                 .collect(),
-            deadline_unix_millis: deadline.timestamp_millis(),
+            deadline_unix_millis: (chrono::Utc::now()
+                + chrono::Duration::from_std(self.config.transaction_deadline)
+                    .map_err(invalid)?)
+            .timestamp_millis(),
         };
         self.store
             .put_opts(
@@ -716,42 +901,73 @@ impl ObjectNativeCatalog {
         )
         .await;
         let all_prepared = prepared.iter().all(Result::is_ok);
-        let decision = self.decide(&txn, all_prepared).await;
-        let commit = matches!(decision, Ok(true));
-        let resolved = match &decision {
-            // Undecided: each participant's recovery resolves it.
-            Err(_) => Vec::new(),
-            Ok(_) => {
-                futures::future::join_all(groups.iter().zip(&prepared).filter_map(
-                    |((domain, _), footprint)| {
-                        footprint
-                            .as_ref()
-                            .ok()
-                            .map(|footprint| domain.resolve(&txn, footprint.clone(), commit))
-                    },
-                ))
-                .await
+        let mut prepare_error = None;
+        let participants: Vec<(HeldReservation, Option<Vec<String>>)> = reservations
+            .into_iter()
+            .zip(prepared)
+            .map(|(held, footprint)| match footprint {
+                Ok(footprint) => (held, Some(footprint)),
+                Err(error) => {
+                    prepare_error.get_or_insert(error);
+                    (held, None)
+                }
+            })
+            .collect();
+        let commit = match decide_by(&self.store, &self.transactions, &txn, all_prepared, deadline)
+            .await
+        {
+            Decided::Recorded(commit) => commit,
+            Decided::Finished => {
+                return Err(invalid(format!(
+                    "the outcome of transaction {txn} across datasets is unknown: another process took its datasets over and finished it; check whether its changes are visible before retrying"
+                )));
+            }
+            Decided::Unrecorded(cause) => {
+                tokio::spawn(finish_in_background(
+                    Arc::clone(&self.store),
+                    self.transactions.clone(),
+                    txn.clone(),
+                    participants,
+                ));
+                // Only the coordinator records a commit, so one it never
+                // tried to record cannot be the outcome.
+                if !all_prepared {
+                    return Err(prepare_error.unwrap_or_else(|| {
+                        invalid(format!("transaction {txn} across datasets was aborted"))
+                    }));
+                }
+                tracing::warn!(
+                    "Cayenne object-native metastore could not record the outcome of transaction {txn} across datasets before its deadline, so it reports the outcome as unknown, and changes to its datasets wait until spiced records it: {cause}"
+                );
+                return Err(invalid(format!(
+                    "the outcome of transaction {txn} across datasets is unknown: it could not be recorded before its deadline ({cause}); check whether its changes are visible before retrying"
+                )));
             }
         };
-        drop(reservations);
+        let resolved = resolve_participants(&txn, &participants, commit).await;
+        drop(participants);
+        let resolve_error = resolved.into_iter().find_map(Result::err);
         // Once every participant has resolved it, nothing reads the transaction's
         // records again. Any other outcome leaves them for recovery.
-        if all_prepared && decision.is_ok() && resolved.iter().all(Result::is_ok) {
+        if all_prepared && resolve_error.is_none() {
             self.forget(&txn).await;
         }
-        for outcome in prepared {
-            outcome?;
-        }
-        decision?;
-        for outcome in resolved {
-            outcome?;
+        if let Some(error) = resolve_error {
+            // The decision is durable, so the outcome stands; this process
+            // stops changing the dataset until a reopen applies it.
+            tracing::error!(
+                "Cayenne object-native metastore recorded the outcome of transaction {txn} across datasets ({}) but could not apply it, so its datasets stop updating until spiced restarts, which applies it: {error}",
+                if commit { "committed" } else { "aborted" }
+            );
         }
         if commit {
             Ok(())
         } else {
-            Err(invalid(format!(
-                "transaction {txn} across datasets was aborted before it committed"
-            )))
+            Err(prepare_error.unwrap_or_else(|| {
+                invalid(format!(
+                    "transaction {txn} across datasets was aborted, so none of its changes were applied"
+                ))
+            }))
         }
     }
 

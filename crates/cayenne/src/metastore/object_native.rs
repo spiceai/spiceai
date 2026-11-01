@@ -98,6 +98,10 @@ pub struct NativeCatalogConfig {
     /// dropped dataset's log are kept before a catalog that opens may remove
     /// them: anything newer may belong to a process still writing it.
     pub reclaim_after: std::time::Duration,
+    /// How long the coordinator of a transaction across datasets tries to
+    /// commit it before it aborts it instead, so its client gets an answer and
+    /// its datasets accept other changes again.
+    pub transaction_deadline: std::time::Duration,
 }
 
 impl Default for NativeCatalogConfig {
@@ -108,6 +112,7 @@ impl Default for NativeCatalogConfig {
             checkpoint_after_batches: 1,
             attempt_horizon: object_store_occ::headlog::DEFAULT_ATTEMPT_HORIZON,
             reclaim_after: std::time::Duration::from_hours(1),
+            transaction_deadline: std::time::Duration::from_secs(60),
         }
     }
 }
@@ -185,16 +190,33 @@ impl StateSlot {
         drop(lease);
         Reservation { slot: self }
     }
+
+    fn release(&self) {
+        self.reserved
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.available.notify_waiters();
+    }
 }
 struct Reservation<'a> {
     slot: &'a StateSlot,
 }
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        self.slot
-            .reserved
-            .store(false, std::sync::atomic::Ordering::Release);
-        self.slot.available.notify_waiters();
+        self.slot.release();
+    }
+}
+/// A domain's reservation held through its `Arc`, so a transaction whose
+/// outcome is not yet recorded keeps it after its coordinator returns.
+struct HeldReservation(Arc<Domain>);
+impl HeldReservation {
+    async fn take(domain: &Arc<Domain>) -> Self {
+        std::mem::forget(domain.inner.reserve().await);
+        Self(Arc::clone(domain))
+    }
+}
+impl Drop for HeldReservation {
+    fn drop(&mut self) {
+        self.0.inner.release();
     }
 }
 impl std::ops::Deref for StateLease<'_> {
