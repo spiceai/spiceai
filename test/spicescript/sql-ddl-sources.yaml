@@ -1,0 +1,901 @@
+name: sql-ddl-sources
+description: >
+  A dataset defined with SQL answers from the source its served definition
+  names, never from acceleration data a definition with another source
+  loaded: after an ALTER of a connector parameter; when a Spicepod starts or
+  stops declaring its name, while Spice runs and across a restart; when
+  another instance that shares the definitions points it at another source
+  while this one is stopped; and when a definition starts to keep its data in
+  a store an earlier definition of its name left data in, a file or the one
+  instance DuckDB or SQLite keeps every memory-mode dataset in, also under a
+  name that differs only in case. A change that leaves the data where it is
+  keeps it, two names that map to one engine table or folder keep their data
+  apart, and an instance creates its first acceleration file of each engine.
+
+sources:
+  lake: { kind: files }
+  ref: { kind: postgres }
+  other: { kind: postgres }
+
+# Two instances that share the definitions, where most steps run on `a`, and
+# one of its own that writes no acceleration file before its statements do.
+variants:
+  a: {}
+  b: {}
+  fresh:
+    spicepod:
+      runtime:
+        state:
+          location: file://${instance.dir}/state/
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: sql-ddl-sources
+  runtime:
+    state:
+      location: file://${instance.dir}/../shared-state/
+
+defaults:
+  run-variants: side-by-side
+  compare-variants: false
+  spiced-args: [--pods-watcher-enabled]
+
+steps:
+  - generate:
+      lake:
+        table: orders
+        rows: 50
+        seed: 7
+        primary-key: id
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: amount, int: [0, 1000] }
+    mirror: ref
+  - generate:
+      lake:
+        table: orders_next
+        rows: 30
+        seed: 8
+        primary-key: id
+        format: csv
+        columns:
+          - { name: id, sequence: 1000 }
+          - { name: amount, int: [0, 1000] }
+    mirror: ref
+  - source-exec:
+      other: |
+        CREATE TABLE orders (id integer PRIMARY KEY, amount integer NOT NULL);
+        INSERT INTO orders SELECT 5000 + i, i FROM generate_series(1, 20) AS i;
+  - start: {}
+
+  # A new connector parameter can name another database: the acceleration
+  # then loads from it, not from what the earlier one loaded.
+  - spice-exec: "CREATE TABLE pg WITH (from = 'postgres:public.orders', pg_host = '${sources.ref.params.pg_host}', pg_port = '${sources.ref.params.pg_port}', pg_db = '${sources.ref.params.pg_db}', pg_user = '${sources.ref.params.pg_user}', pg_pass = '${sources.ref.params.pg_pass}', pg_sslmode = 'disable', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM pg
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - spice-exec: "ALTER TABLE pg SET (pg_host = '${sources.other.params.pg_host}', pg_port = '${sources.other.params.pg_port}', pg_db = '${sources.other.params.pg_db}', pg_user = '${sources.other.params.pg_user}', pg_pass = '${sources.other.params.pg_pass}')"
+    only: a
+  - query: SELECT id, amount FROM pg
+    only: a
+    eventually: 60s
+    expect: { oracle: other }
+    oracle-sql: SELECT id, amount FROM orders
+
+  # A Spicepod that starts declaring a name SQL defines is served under it,
+  # from its own source; one that stops gives the name back to the SQL
+  # definition, from its source. While Spice runs:
+  - spice-exec: "CREATE TABLE sw WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM sw
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - edit-spicepod:
+      spicepod:
+        datasets:
+          - from: postgres:public.orders
+            name: sw
+            params: ${sources.other.params}
+            acceleration: { enabled: true, engine: cayenne, mode: file }
+    only: a
+  - query: SELECT id, amount FROM sw
+    only: a
+    eventually: 60s
+    expect: { oracle: other }
+    oracle-sql: SELECT id, amount FROM orders
+  - query: SELECT id, amount FROM sw
+    only: a
+    consistently: 5s
+    expect: { oracle: other }
+    oracle-sql: SELECT id, amount FROM orders
+  - edit-spicepod:
+      spicepod: { datasets: [] }
+    only: a
+  - query: SELECT id, amount FROM sw
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+
+  # The same, across a restart: the Spicepod changes while Spice is stopped.
+  - restart:
+      patch:
+        spicepod:
+          datasets:
+            - from: postgres:public.orders
+              name: sw
+              params: ${sources.other.params}
+              acceleration: { enabled: true, engine: cayenne, mode: file }
+    only: a
+  - query: SELECT id, amount FROM sw
+    only: a
+    eventually: 60s
+    expect: { oracle: other }
+    oracle-sql: SELECT id, amount FROM orders
+  - query: SELECT id, amount FROM sw
+    only: a
+    consistently: 5s
+    expect: { oracle: other }
+    oracle-sql: SELECT id, amount FROM orders
+  - restart:
+      patch: { spicepod: { datasets: [] } }
+    only: a
+  - query: SELECT id, amount FROM sw
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+
+  # Another instance points the dataset at another source while `a` is
+  # stopped: once restarted, `a` answers from the new source.
+  - query: SELECT id, amount FROM sw
+    only: b
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - stop: {}
+    only: a
+  - spice-exec: "ALTER TABLE sw SET (from = 'file://${sources.lake.path}/orders_next/')"
+    only: b
+  - start: {}
+    only: a
+  - query: SELECT id, amount FROM sw
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
+
+  # A definition that starts to keep its acceleration data in a store finds
+  # there only what an earlier definition of its name left, so the store
+  # starts from the source: acceleration turned on again, another engine,
+  # another mode, acceleration set again after a RESET, and a name dropped and
+  # created again. Each dataset loads `orders`, then reads `orders_next`.
+  - spice-exec: "CREATE TABLE l1 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l1
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - spice-exec: "ALTER TABLE l1 SET (acceleration.enabled = false)"
+    only: a
+  - spice-exec: "ALTER TABLE l1 SET (from = 'file://${sources.lake.path}/orders_next/')"
+    only: a
+  - spice-exec: "ALTER TABLE l1 SET (acceleration.enabled = true)"
+    only: a
+  - query: SELECT id, amount FROM l1
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
+  - query: SELECT id, amount FROM l1
+    only: a
+    consistently: 5s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
+  - spice-exec: "CREATE TABLE l2 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l2
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - spice-exec: "ALTER TABLE l2 SET (acceleration.engine = 'duckdb')"
+    only: a
+  - spice-exec: "ALTER TABLE l2 SET (from = 'file://${sources.lake.path}/orders_next/')"
+    only: a
+  - spice-exec: "ALTER TABLE l2 SET (acceleration.engine = 'cayenne')"
+    only: a
+  - query: SELECT id, amount FROM l2
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
+  - spice-exec: "CREATE TABLE l3 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l3
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - spice-exec: "ALTER TABLE l3 SET (acceleration.mode = 'memory')"
+    only: a
+  - spice-exec: "ALTER TABLE l3 SET (from = 'file://${sources.lake.path}/orders_next/')"
+    only: a
+  - spice-exec: "ALTER TABLE l3 SET (acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l3
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
+  - spice-exec: "CREATE TABLE l4 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l4
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - spice-exec: "ALTER TABLE l4 RESET (acceleration)"
+    only: a
+  - spice-exec: "ALTER TABLE l4 SET (from = 'file://${sources.lake.path}/orders_next/')"
+    only: a
+  - spice-exec: "ALTER TABLE l4 SET (acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l4
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
+  - spice-exec: "CREATE TABLE l5 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l5
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - spice-exec: "ALTER TABLE l5 SET (acceleration.enabled = false)"
+    only: a
+  - spice-exec: "DROP TABLE l5"
+    only: a
+  - spice-exec: "CREATE TABLE l5 WITH (from = 'file://${sources.lake.path}/orders_next/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l5
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
+
+  # A name a Spicepod stops declaring, which SQL then defines, while Spice
+  # runs and across a restart.
+  - edit-spicepod:
+      spicepod:
+        datasets:
+          - from: postgres:public.orders
+            name: p1
+            params: ${sources.other.params}
+            acceleration: { enabled: true, engine: cayenne, mode: file }
+    only: a
+  - query: SELECT id, amount FROM p1
+    only: a
+    eventually: 60s
+    expect: { oracle: other }
+    oracle-sql: SELECT id, amount FROM orders
+  - edit-spicepod:
+      spicepod: { datasets: [] }
+    only: a
+  - query: SELECT id, amount FROM p1
+    only: a
+    eventually: 60s
+    expect-error: p1
+  - spice-exec: "CREATE TABLE p1 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM p1
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - restart:
+      patch:
+        spicepod:
+          datasets:
+            - from: postgres:public.orders
+              name: p2
+              params: ${sources.other.params}
+              acceleration: { enabled: true, engine: cayenne, mode: file }
+    only: a
+  - query: SELECT id, amount FROM p2
+    only: a
+    eventually: 60s
+    expect: { oracle: other }
+    oracle-sql: SELECT id, amount FROM orders
+  - restart:
+      patch: { spicepod: { datasets: [] } }
+    only: a
+  - spice-exec: "CREATE TABLE p2 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM p2
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+
+  # Another instance turns acceleration on again with another source, while
+  # this one is stopped, and while it runs.
+  - spice-exec: "CREATE TABLE l6 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, amount FROM l6
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - spice-exec: "ALTER TABLE l6 SET (acceleration.enabled = false)"
+    only: a
+  - stop: {}
+    only: a
+  - spice-exec: "ALTER TABLE l6 SET (from = 'file://${sources.lake.path}/orders_next/', acceleration.enabled = true)"
+    only: b
+  - start: {}
+    only: a
+  - query: SELECT id, amount FROM l6
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
+  - spice-exec: "CREATE TABLE l7 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: b
+  - query: SELECT id, amount FROM l7
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders
+  - spice-exec: "ALTER TABLE l7 SET (acceleration.enabled = false)"
+    only: b
+  - assert-log:
+      contains: ['Applied the change another instance made to the datasets and catalogs defined with SQL in .*dataset ''l7'' \(changed\)']
+    eventually: 30s
+    only: a
+  - spice-exec: "ALTER TABLE l7 SET (from = 'file://${sources.lake.path}/orders_next/', acceleration.enabled = true)"
+    only: b
+  - query: SELECT id, amount FROM l7
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, amount FROM orders_next
+
+  # A memory acceleration of an engine that keeps every memory-mode dataset in
+  # one instance starts from the source too: DuckDB and Turso pointed at
+  # another source, and SQLite dropped and created again. Each appends on
+  # `ts`, and `new`'s rows are older than `old`'s, so an append that resumed
+  # after `old`'s newest row would load none of them.
+  - generate:
+      lake:
+        table: old
+        rows: 20
+        seed: 21
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: ts, sequence: 1000 }
+    mirror: ref
+  - generate:
+      lake:
+        table: new
+        rows: 10
+        seed: 22
+        format: csv
+        columns:
+          - { name: id, sequence: 1000 }
+          - { name: ts, sequence: 1 }
+    mirror: ref
+  - generate:
+      lake:
+        table: ev1
+        rows: 20
+        seed: 23
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: ts, sequence: 1000 }
+    mirror: ref
+  - generate:
+      lake:
+        table: ev2
+        rows: 20
+        seed: 24
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: ts, sequence: 1000 }
+    mirror: ref
+  - spice-exec: "CREATE TABLE m1 WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'duckdb', acceleration.mode = 'memory', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds')"
+    only: a
+  - query: SELECT id, ts FROM m1
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - spice-exec: "ALTER TABLE m1 SET (from = 'file://${sources.lake.path}/new/')"
+    only: a
+  - query: SELECT id, ts FROM m1
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM new
+  - spice-exec: "CREATE TABLE m2 WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'memory', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds')"
+    only: a
+  - query: SELECT id, ts FROM m2
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - spice-exec: "DROP TABLE m2"
+    only: a
+  - spice-exec: "CREATE TABLE m2 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'memory', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds')"
+    only: a
+  - query: SELECT id, ts FROM m2
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM new
+  - spice-exec: "CREATE TABLE m3 WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'turso', acceleration.mode = 'memory', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds')"
+    only: a
+  - query: SELECT id, ts FROM m3
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - spice-exec: "ALTER TABLE m3 SET (from = 'file://${sources.lake.path}/new/')"
+    only: a
+  - query: SELECT id, ts FROM m3
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM new
+
+  # A change that leaves the data where it is keeps it, also rows its source
+  # no longer holds: a parameter that leaves the files where they are, and
+  # naming the engine the acceleration already uses by default. Each source
+  # then keeps 5 newer rows only, which a refresh appends to the 20.
+  - spice-exec: "CREATE TABLE k1 WITH (from = 'file://${sources.lake.path}/ev1/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds', acceleration.refresh_check_interval = '1h')"
+    only: a
+  - spice-exec: "CREATE TABLE k2 WITH (from = 'file://${sources.lake.path}/ev2/', file_format = 'csv', acceleration.enabled = true, acceleration.mode = 'file', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds', acceleration.refresh_check_interval = '1h')"
+    only: a
+  - query: SELECT id, ts FROM k1
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM ev1
+  - query: SELECT id, ts FROM k2
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM ev2
+  - generate:
+      lake:
+        table: ev1
+        rows: 5
+        seed: 25
+        format: csv
+        mode: replace
+        columns:
+          - { name: id, sequence: 5000 }
+          - { name: ts, sequence: 5000 }
+  - generate:
+      lake:
+        table: ev2
+        rows: 5
+        seed: 26
+        format: csv
+        mode: replace
+        columns:
+          - { name: id, sequence: 5000 }
+          - { name: ts, sequence: 5000 }
+  - refresh: k1
+    only: a
+  - refresh: k2
+    only: a
+  - query: SELECT count(*) AS n FROM k1
+    only: a
+    expect: { rows: [['25']] }
+  - query: SELECT id, ts FROM k1
+    only: a
+    id: k1-kept
+    expect: {}
+  - query: SELECT id, ts FROM k2
+    only: a
+    id: k2-kept
+    expect: {}
+  - spice-exec: "ALTER TABLE k1 SET (acceleration.params.cayenne_segment_cache_mb = '64')"
+    only: a
+  - spice-exec: "ALTER TABLE k2 SET (acceleration.engine = 'cayenne')"
+    only: a
+  - query: SELECT id, ts FROM k1
+    only: a
+    consistently: 10s
+    expect: { same-as: k1-kept }
+  - query: SELECT id, ts FROM k2
+    only: a
+    consistently: 10s
+    expect: { same-as: k2-kept }
+
+  # Another spelling of the file or folder the acceleration already keeps its
+  # data in leaves it there, so the data is kept too: DuckDB's file relative to
+  # the directory Spice runs in, and SQLite's file and Cayenne's folder with
+  # `./`.
+  - generate:
+      lake:
+        table: ev3
+        rows: 20
+        seed: 27
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: ts, sequence: 1000 }
+    mirror: ref
+  - generate:
+      lake:
+        table: ev4
+        rows: 20
+        seed: 28
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: ts, sequence: 1000 }
+    mirror: ref
+  - generate:
+      lake:
+        table: ev5
+        rows: 20
+        seed: 29
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: ts, sequence: 1000 }
+    mirror: ref
+  - spice-exec: "CREATE TABLE k3 WITH (from = 'file://${sources.lake.path}/ev3/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'duckdb', acceleration.mode = 'file', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds', acceleration.refresh_check_interval = '1h')"
+    only: a
+  - spice-exec: "CREATE TABLE k4 WITH (from = 'file://${sources.lake.path}/ev4/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'file', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds', acceleration.refresh_check_interval = '1h')"
+    only: a
+  - spice-exec: "CREATE TABLE k5 WITH (from = 'file://${sources.lake.path}/ev5/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds', acceleration.refresh_check_interval = '1h')"
+    only: a
+  - query: SELECT id, ts FROM k3
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM ev3
+  - query: SELECT id, ts FROM k4
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM ev4
+  - query: SELECT id, ts FROM k5
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM ev5
+  - generate:
+      lake:
+        table: ev3
+        rows: 5
+        seed: 30
+        format: csv
+        mode: replace
+        columns:
+          - { name: id, sequence: 5000 }
+          - { name: ts, sequence: 5000 }
+  - generate:
+      lake:
+        table: ev4
+        rows: 5
+        seed: 31
+        format: csv
+        mode: replace
+        columns:
+          - { name: id, sequence: 5000 }
+          - { name: ts, sequence: 5000 }
+  - generate:
+      lake:
+        table: ev5
+        rows: 5
+        seed: 32
+        format: csv
+        mode: replace
+        columns:
+          - { name: id, sequence: 5000 }
+          - { name: ts, sequence: 5000 }
+  - refresh: k3
+    only: a
+  - refresh: k4
+    only: a
+  - refresh: k5
+    only: a
+  - query: SELECT count(*) AS n FROM k3
+    only: a
+    expect: { rows: [['25']] }
+  - query: SELECT id, ts FROM k3
+    only: a
+    id: k3-kept
+    expect: {}
+  - query: SELECT count(*) AS n FROM k4
+    only: a
+    expect: { rows: [['25']] }
+  - query: SELECT id, ts FROM k4
+    only: a
+    id: k4-kept
+    expect: {}
+  - query: SELECT count(*) AS n FROM k5
+    only: a
+    expect: { rows: [['25']] }
+  - query: SELECT id, ts FROM k5
+    only: a
+    id: k5-kept
+    expect: {}
+  - spice-exec: "ALTER TABLE k3 SET (acceleration.params.duckdb_file = '.spice/data/accelerated_duckdb.db')"
+    only: a
+  - spice-exec: "ALTER TABLE k4 SET (acceleration.params.sqlite_file = './.spice/data/accelerated_sqlite.db')"
+    only: a
+  - spice-exec: "ALTER TABLE k5 SET (acceleration.params.cayenne_file_path = './.spice/data')"
+    only: a
+  - query: SELECT id, ts FROM k3
+    only: a
+    consistently: 10s
+    expect: { same-as: k3-kept }
+  - query: SELECT id, ts FROM k4
+    only: a
+    consistently: 10s
+    expect: { same-as: k4-kept }
+  - query: SELECT id, ts FROM k5
+    only: a
+    consistently: 10s
+    expect: { same-as: k5-kept }
+
+  # Two names that map to one Cayenne data directory, `k6_t` and `k6.t`, keep
+  # their data apart, across a restart too: defining the second deletes none
+  # of the first's, also rows its source no longer holds.
+  - generate:
+      lake:
+        table: ev6
+        rows: 20
+        seed: 33
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: ts, sequence: 1000 }
+  - spice-exec: "CREATE TABLE k6_t WITH (from = 'file://${sources.lake.path}/ev6/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds', acceleration.refresh_check_interval = '1h')"
+    only: a
+  - query: SELECT count(*) AS n FROM k6_t
+    only: a
+    eventually: 60s
+    expect: { rows: [['20']] }
+  - generate:
+      lake:
+        table: ev6
+        rows: 5
+        seed: 34
+        format: csv
+        mode: replace
+        columns:
+          - { name: id, sequence: 5000 }
+          - { name: ts, sequence: 5000 }
+  - refresh: k6_t
+    only: a
+  - query: SELECT count(*) AS n FROM k6_t
+    only: a
+    expect: { rows: [['25']] }
+  - query: SELECT id, ts FROM k6_t
+    only: a
+    id: k6-kept
+    expect: {}
+  - spice-exec: "CREATE TABLE k6.t WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, ts FROM k6.t
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM new
+  # A name that prints as another's, `"k7.t"` next to `k7.t`, would use its
+  # engine table, in Cayenne as in any engine, so it is refused, and `k7.t`
+  # keeps its data, across the restart too.
+  - generate:
+      lake:
+        table: ev7
+        rows: 20
+        seed: 35
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: ts, sequence: 1000 }
+  - spice-exec: "CREATE TABLE k7.t WITH (from = 'file://${sources.lake.path}/ev7/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds', acceleration.refresh_check_interval = '1h')"
+    only: a
+  - query: SELECT count(*) AS n FROM k7.t
+    only: a
+    eventually: 60s
+    expect: { rows: [['20']] }
+  - generate:
+      lake:
+        table: ev7
+        rows: 5
+        seed: 36
+        format: csv
+        mode: replace
+        columns:
+          - { name: id, sequence: 5000 }
+          - { name: ts, sequence: 5000 }
+  - refresh: k7.t
+    only: a
+  - query: SELECT count(*) AS n FROM k7.t
+    only: a
+    expect: { rows: [['25']] }
+  - query: SELECT id, ts FROM k7.t
+    only: a
+    id: k7-kept
+    expect: {}
+  - spice-exec: "CREATE TABLE \"k7.t\" WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+    only: a
+    expect-error: "dataset 'k7.t' keeps its acceleration data in the Cayenne table `k7.t`"
+  - restart: {}
+    only: a
+  - query: SELECT id, ts FROM k6_t
+    only: a
+    eventually: 60s
+    expect: { same-as: k6-kept }
+  - query: SELECT id, ts FROM k7.t
+    only: a
+    eventually: 60s
+    expect: { same-as: k7-kept }
+
+  # Two names that differ only in case would share one table in an engine
+  # that does not keep such tables apart, so the statement that defines the
+  # second is refused, and the first keeps its rows: SQLite and Turso in a
+  # file, and DuckDB in memory.
+  - spice-exec: "CREATE TABLE \"C1\" WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, ts FROM "C1"
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - spice-exec: "CREATE TABLE c1 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'file')"
+    only: a
+    expect-error: "dataset 'C1' keeps its acceleration data in the same SQLite file"
+  - query: SELECT id, ts FROM "C1"
+    only: a
+    consistently: 5s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - spice-exec: "CREATE TABLE \"C2\" WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'turso', acceleration.mode = 'file')"
+    only: a
+  - query: SELECT id, ts FROM "C2"
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - spice-exec: "CREATE TABLE c2 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'turso', acceleration.mode = 'file')"
+    only: a
+    expect-error: "dataset 'C2' keeps its acceleration data in the same Turso file"
+  - query: SELECT id, ts FROM "C2"
+    only: a
+    consistently: 5s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - spice-exec: "CREATE TABLE \"C3\" WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'duckdb', acceleration.mode = 'memory')"
+    only: a
+  - query: SELECT id, ts FROM "C3"
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - spice-exec: "CREATE TABLE c3 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'duckdb', acceleration.mode = 'memory')"
+    only: a
+    expect-error: "dataset 'C3' keeps its acceleration data in the same DuckDB memory instance"
+  - query: SELECT id, ts FROM "C3"
+    only: a
+    consistently: 5s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+
+  # A table a dataset the Spicepod no longer declares left under a name that
+  # differs only in case is what the store holds under the name SQL then
+  # defines, so it is deleted first: SQLite and DuckDB in a file, appending
+  # on `ts`, where `new`'s rows are older than the left rows.
+  - restart:
+      patch:
+        spicepod:
+          datasets:
+            - from: file://${sources.lake.path}/old/
+              name: '"C4"'
+              params: { file_format: csv }
+              time_column: ts
+              time_format: unix_seconds
+              acceleration: { enabled: true, engine: sqlite, mode: file, refresh_mode: append, refresh_check_interval: 1h }
+            - from: file://${sources.lake.path}/old/
+              name: '"C5"'
+              params: { file_format: csv }
+              time_column: ts
+              time_format: unix_seconds
+              acceleration: { enabled: true, engine: duckdb, mode: file, refresh_mode: append, refresh_check_interval: 1h }
+    only: a
+  - query: SELECT id, ts FROM "C4"
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - query: SELECT id, ts FROM "C5"
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - restart:
+      patch: { spicepod: { datasets: [] } }
+    only: a
+  - spice-exec: "CREATE TABLE c4 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'file', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds', acceleration.refresh_check_interval = '1h')"
+    only: a
+  - query: SELECT id, ts FROM c4
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM new
+  - spice-exec: "CREATE TABLE c5 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'duckdb', acceleration.mode = 'file', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds', acceleration.refresh_check_interval = '1h')"
+    only: a
+  - query: SELECT id, ts FROM c5
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM new
+
+  # An accelerated view's table counts too: a dataset whose name differs only
+  # in case from a view's, in the same SQLite file, is refused, and the view
+  # keeps its rows.
+  - restart:
+      patch:
+        spicepod:
+          views:
+            - name: '"C6"'
+              sql: SELECT id, ts FROM c4
+              acceleration: { enabled: true, engine: sqlite, mode: file }
+    only: a
+  - query: SELECT id, ts FROM "C6"
+    only: a
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM new
+  - spice-exec: "CREATE TABLE c6 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'file')"
+    only: a
+    expect-error: "view 'C6' keeps its acceleration data in the same SQLite file"
+  - query: SELECT id, ts FROM "C6"
+    only: a
+    consistently: 5s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM new
+
+  # An instance that has written no acceleration file creates the first one
+  # of each engine that keeps one.
+  - spice-exec: "CREATE TABLE e1 WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'duckdb', acceleration.mode = 'file')"
+    only: fresh
+  - query: SELECT id, ts FROM e1
+    only: fresh
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - spice-exec: "CREATE TABLE e2 WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'file')"
+    only: fresh
+  - query: SELECT id, ts FROM e2
+    only: fresh
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old
+  - spice-exec: "CREATE TABLE e3 WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'turso', acceleration.mode = 'file')"
+    only: fresh
+  - query: SELECT id, ts FROM e3
+    only: fresh
+    eventually: 60s
+    expect: { oracle: ref }
+    oracle-sql: SELECT id, ts FROM old

@@ -15,7 +15,14 @@ limitations under the License.
 */
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use std::{borrow::Cow, sync::Arc};
+use datafusion_ddl::component_options::{
+    UNREADABLE_STATEMENT, recorded_text, redact_values, unreadable_parts,
+};
+use std::collections::HashSet;
+use std::{
+    borrow::Cow,
+    sync::{Arc, LazyLock},
+};
 
 use crate::builtin::function_tool::current_principal_allows_write;
 use crate::utils::{parameters, write_to_json_string};
@@ -40,7 +47,7 @@ pub struct SqlToolParams {
 /// (e.g. the request is authenticated with a `:rw`-tagged API key); the
 /// strict read-only validator is still applied for `ReadOnly` / anonymous
 /// callers and for any deployment that hasn't configured `runtime.auth`.
-const DEFAULT_DESCRIPTION: &str = "Execute an SQL query in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions) against the Spice runtime and return the result rows as JSON. Use this for any deterministic lookup, aggregation, or filter where exact column names are known; prefer `search` for semantic or natural-language lookups. Quote identifiers containing capitals or reserved keywords, and quote each part of `catalog.schema.table` separately (e.g. \"spice\".\"public\".\"my_table\"). Avoid `SELECT *` and columns ending in `_offset` or `_embedding`. Write statements (INSERT/UPDATE/DELETE/DDL) require the request to be authenticated with a ReadWrite API key AND the target dataset to be configured `access: read_write`; otherwise they are rejected. Use `list_datasets` and `table_schema` first to discover tables and columns.";
+const DEFAULT_DESCRIPTION: &str = "Execute an SQL query in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions) against the Spice runtime and return the result rows as JSON. Use this for any deterministic lookup, aggregation, or filter where exact column names are known; prefer `search` for semantic or natural-language lookups. Quote identifiers containing capitals or reserved keywords, and quote each part of `catalog.schema.table` separately (e.g. \"spice\".\"public\".\"my_table\"). Avoid `SELECT *` and columns ending in `_offset` or `_embedding`. Write statements (INSERT/UPDATE/DELETE, and DDL in a catalog configured `access: read_write_create`) require the request to be authenticated with a ReadWrite API key AND the target to be writable, such as a dataset configured `access: read_write`; defining, changing, or dropping a dataset or catalog (`CREATE TABLE ... WITH (from = ...)`, `CREATE CATALOG`, and `ALTER` or `DROP` of one) requires an admin API key; otherwise they are rejected. Use `list_datasets` and `table_schema` first to discover tables and columns.";
 
 pub struct SqlTool {
     name: String,
@@ -58,9 +65,13 @@ impl SqlTool {
         description: Option<&str>,
         allowed_tables: Option<ResolvedTableAwareAllowlist>,
     ) -> Self {
+        let name = name.unwrap_or(SQL_TOOL);
+        if !is_sql_tool(name) {
+            SQL_TOOL_NAMES.write().insert(name.to_string());
+        }
         Self {
             df,
-            name: name.unwrap_or("sql").to_string(),
+            name: name.to_string(),
             description: description.unwrap_or(DEFAULT_DESCRIPTION).to_string(),
             allowed_tables,
         }
@@ -81,8 +92,13 @@ impl SpiceModelTool for SqlTool {
         parameters::<SqlToolParams>()
     }
 
+    fn recorded_arguments<'a>(&self, arg: &'a str) -> (Cow<'a, str>, Vec<String>) {
+        recorded_input(arg)
+    }
+
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name().to_string(), input = arg);
+        let (input, removed) = self.recorded_arguments(arg);
+        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name().to_string(), input = %input);
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let SqlToolParams { query } = serde_json::from_str(arg)?;
 
@@ -117,9 +133,145 @@ impl SpiceModelTool for SqlTool {
                 Ok(value)
             }
             Err(e) => {
-                tracing::error!(target: "task_history", parent: &span, "{e}");
+                let message = e.to_string();
+                let message = redact_values(&message, &removed);
+                tracing::error!(target: "task_history", parent: &span, "{message}");
                 Err(e)
             }
         }
+    }
+}
+
+/// The default name of the tool.
+const SQL_TOOL: &str = "sql";
+
+/// The names of the `sql` tools this process has created: `sql`, and any name
+/// a Spicepod gives one. A recorder that sees a call by name, as task history
+/// does for a conversation a client sends back, reads it as one.
+static SQL_TOOL_NAMES: LazyLock<parking_lot::RwLock<HashSet<String>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(HashSet::from([SQL_TOOL.to_string()])));
+
+/// Whether `name` names an `sql` tool, whose arguments are recorded with
+/// [`recorded_input`].
+#[must_use]
+pub fn is_sql_tool(name: &str) -> bool {
+    SQL_TOOL_NAMES.read().contains(name)
+}
+
+/// The names of the `sql` tools this process has created.
+#[must_use]
+pub fn sql_tool_names() -> Vec<String> {
+    SQL_TOOL_NAMES.read().iter().cloned().collect()
+}
+
+/// The tool's arguments as task history records them, and the values that
+/// takes out: the statement they carry recorded as [`recorded_text`] records
+/// it, with every parameter's value redacted, since the tool cannot tell which
+/// are non-secret. Arguments that are not the tool's JSON run nothing, and are
+/// recorded only as [`UNREADABLE_STATEMENT`].
+#[must_use]
+pub fn recorded_input(arg: &str) -> (Cow<'_, str>, Vec<String>) {
+    let Ok(SqlToolParams { query }) = serde_json::from_str::<SqlToolParams>(arg) else {
+        // Owned, as any changed text is: a caller tells a changed text by it.
+        // What a source quotes back of the arguments loses their parts.
+        return (
+            Cow::Owned(UNREADABLE_STATEMENT.to_string()),
+            unreadable_parts(arg),
+        );
+    };
+    let recorded = recorded_text(&query);
+    match recorded.text {
+        // Fields beside the query run nothing, and are not recorded.
+        Cow::Borrowed(_) if has_only_query(arg) => (Cow::Borrowed(arg), Vec::new()),
+        Cow::Borrowed(text) => (
+            Cow::Owned(serde_json::json!({ "query": text }).to_string()),
+            Vec::new(),
+        ),
+        Cow::Owned(text) => (
+            Cow::Owned(serde_json::json!({ "query": text }).to_string()),
+            recorded.removed,
+        ),
+    }
+}
+
+/// Whether `arg`, the tool's JSON, holds the query and nothing else.
+fn has_only_query(arg: &str) -> bool {
+    serde_json::from_str::<serde_json::Map<String, Value>>(arg).is_ok_and(|map| map.len() == 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The query a tool call carries is recorded without its credentials, as
+    /// the statement it runs is, whether or not it parses: one that does not
+    /// may be a mistyped definition.
+    #[test]
+    fn a_tool_call_records_its_statement_without_credentials() {
+        for (arg, recorded, error, recorded_error) in [
+            (
+                r#"{"query": "CREATE TABLE t WITH (from = 'postgres:public.t', pg_host = 'db', pg_pass = 'hunter2')"}"#,
+                r#"{"query":"CREATE TABLE t WITH (from = 'postgres:public.t', pg_host = '<redacted>', pg_pass = '<redacted>')"}"#,
+                "password for 'hunter2' refused",
+                "password for <redacted> refused",
+            ),
+            (
+                r#"{"query": "CRATE TABLE t WITH (pg_host = 'db', pg_pass = 'hunter2')"}"#,
+                r#"{"query":"CRATE TABLE t WITH (pg_host = '<redacted>', pg_pass = '<redacted>')"}"#,
+                "SQL error: ParserError(\"Expected: an SQL statement, found: 'hunter2'\")",
+                "SQL error: ParserError(\"Expected: an SQL statement, found: <redacted>\")",
+            ),
+        ] {
+            let (input, removed) = recorded_input(arg);
+            assert_eq!(input, recorded);
+            assert!(
+                removed.iter().any(|value| value == "hunter2"),
+                "{removed:?}"
+            );
+            assert_eq!(redact_values(error, &removed), recorded_error);
+        }
+
+        // A statement that parses and defines nothing is recorded as sent.
+        for arg in [
+            r#"{"query": "SELECT * FROM t WHERE name = 'a'"}"#,
+            r#"{"query": "DROP TABLE t -- the old copy"}"#,
+        ] {
+            assert!(matches!(recorded_input(arg).0, Cow::Borrowed(text) if text == arg));
+        }
+
+        // Fields beside the query run nothing, and are left out.
+        assert_eq!(
+            recorded_input(r#"{"query": "SELECT 1", "pg_pass": "hunter2"}"#).0,
+            r#"{"query":"SELECT 1"}"#
+        );
+    }
+
+    /// Arguments that are not the tool's JSON run nothing, and are recorded
+    /// only as a placeholder, whatever they carry; what quotes them back loses
+    /// the parts that may be values.
+    #[test]
+    fn arguments_that_are_not_the_tools_json_are_not_recorded() {
+        for arg in [
+            "CREATE TABLE t WITH (pg_pass = 'hunter2')",
+            r#"{"sql": "CRATE TABLE t WITH (pg_pass = 'hunter2')"}"#,
+            r#"{"query": "CRATE TABLE t WITH (pg_pass = 'hunter2')""#,
+        ] {
+            let (recorded, removed) = recorded_input(arg);
+            assert!(
+                matches!(&recorded, Cow::Owned(text) if text == UNREADABLE_STATEMENT),
+                "{arg}: {recorded:?}"
+            );
+            assert!(
+                removed.iter().any(|value| value == "hunter2"),
+                "{arg}: {removed:?}"
+            );
+            assert!(
+                !redact_values(&format!("refused: {arg}"), &removed).contains("hunter2"),
+                "{arg}"
+            );
+        }
+        let (recorded, removed) = recorded_input("not json");
+        assert!(matches!(&recorded, Cow::Owned(text) if text == UNREADABLE_STATEMENT));
+        assert!(removed.is_empty(), "{removed:?}");
     }
 }

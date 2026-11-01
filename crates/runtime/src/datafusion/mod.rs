@@ -152,6 +152,7 @@ use change_generations::{
     ChangeGenerations, GenerationOwner, GenerationPermit, PreparedGeneration,
 };
 pub mod cayenne_ddl;
+pub(crate) mod component_planner;
 pub(crate) mod output_reservation;
 pub(crate) mod query_memory_pool;
 pub use runtime_datafusion::composed_catalog;
@@ -267,6 +268,14 @@ pub enum Error {
         "Failed to rebuild the acceleration of dataset '{dataset_name}' for its changed settings, so the dataset does not load until a retry succeeds: its load checkpoint could not be cleared. Cause: {source}"
     ))]
     AccelerationRebuildCheckpoint {
+        dataset_name: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
+        "The acceleration store of dataset '{dataset_name}' could not be opened or cleared. Cause: {source}"
+    ))]
+    AccelerationDataCheckpoint {
         dataset_name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -1598,6 +1607,33 @@ pub struct DataFusion {
     /// in scheduler mode.
     pub(crate) partition_load_tracker: Option<Arc<runtime_cluster::PartitionLoadTracker>>,
     pub(crate) cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
+    /// Applies the statements that define, change, and remove Spicepod
+    /// datasets and catalogs. Set once the runtime that owns this `DataFusion`
+    /// exists; until then those statements are planned as `DataFusion` plans
+    /// them.
+    component_ddl_handler:
+        std::sync::OnceLock<Arc<dyn datafusion_ddl::component_ddl::ComponentDdlHandler>>,
+    /// The parameters whose values a statement that defines a component
+    /// records as written: each one some component declares non-secret and
+    /// none declares secret. Any other parameter is recorded redacted.
+    recorded_parameter_names: std::sync::OnceLock<HashSet<String>>,
+}
+
+/// Remove `name` from `list`, the session's catalogs: the in-memory list, or
+/// the URL-table list over it.
+fn remove_registered_catalog(
+    list: &dyn datafusion::catalog::CatalogProviderList,
+    name: &str,
+) -> bool {
+    if let Some(memory) = list.downcast_ref::<datafusion::catalog::MemoryCatalogProviderList>() {
+        return memory.catalogs.remove(name).is_some();
+    }
+    if let Some(url_tables) =
+        list.downcast_ref::<runtime_datafusion::url_table::DynamicUrlCatalogList>()
+    {
+        return remove_registered_catalog(url_tables.inner().as_ref(), name);
+    }
+    false
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -2257,6 +2293,46 @@ impl DataFusion {
     /// wrapping `DataFusion` in `Arc`.
     pub fn set_self_ref(self: &Arc<Self>) {
         let _ = self.datafusion_ref.set(Arc::downgrade(self));
+    }
+
+    /// Install the handler of the statements that define Spicepod datasets
+    /// and catalogs. The first one installed is kept.
+    pub(crate) fn set_component_ddl_handler(
+        &self,
+        handler: Arc<dyn datafusion_ddl::component_ddl::ComponentDdlHandler>,
+    ) {
+        let _ = self.component_ddl_handler.set(handler);
+    }
+
+    /// Install the names of the parameters a statement that defines a
+    /// component records the values of. The first set installed is kept.
+    pub(crate) fn set_recorded_parameter_names(&self, names: HashSet<String>) {
+        let _ = self.recorded_parameter_names.set(names);
+    }
+
+    /// `sql` as task history and the list of running queries record it, and
+    /// the values that takes out of it: a statement that may define a
+    /// component keeps the value of a parameter only when the parameter is
+    /// known to be non-secret, none until the names are installed. Read with
+    /// the dialect statements are parsed with.
+    pub(crate) fn recorded_statement<'a>(
+        &self,
+        sql: &'a str,
+    ) -> datafusion_ddl::component_options::RecordedStatement<'a> {
+        let recorded = self.recorded_parameter_names.get();
+        datafusion_ddl::component_options::recorded_statement(
+            sql,
+            &datafusion::sql::sqlparser::dialect::PostgreSqlDialect {},
+            &|name| recorded.is_some_and(|names| names.contains(name)),
+        )
+    }
+
+    /// The handler of the statements that define Spicepod datasets and
+    /// catalogs, once the runtime installed it.
+    pub(crate) fn component_ddl_handler(
+        &self,
+    ) -> Option<Arc<dyn datafusion_ddl::component_ddl::ComponentDdlHandler>> {
+        self.component_ddl_handler.get().cloned()
     }
 
     pub fn mark_dataset_writable(&self, dataset_name: &TableReference) -> Result<()> {
@@ -3523,6 +3599,27 @@ impl DataFusion {
     #[must_use]
     pub fn catalog_exists(&self, catalog: &str) -> bool {
         self.ctx.catalog(catalog).is_some()
+    }
+
+    /// Remove the catalog registered as `name`, with the access its
+    /// declaration granted, and discard the plans and results cached over its
+    /// tables. Returns whether a catalog was registered under the name.
+    pub(crate) async fn deregister_catalog(&self, name: &str) -> Result<bool> {
+        let deferred = self.deferred_catalogs.write().await.remove(name).is_some();
+        let state = self.ctx.state();
+        let registered = remove_registered_catalog(state.catalog_list().as_ref(), name);
+        self.writable_catalogs
+            .write()
+            .map_err(|_| Error::UnableToLockWritableCatalogs {})?
+            .remove(name);
+        self.ddl_enabled_catalogs
+            .write()
+            .map_err(|_| Error::UnableToLockDdlEnabledCatalogs {})?
+            .remove(name);
+        if registered || deferred {
+            self.clear_cached_plans_and_results().await;
+        }
+        Ok(registered || deferred)
     }
 
     pub async fn remove_view(&self, view_name: &TableReference) -> Result<()> {
@@ -5387,6 +5484,100 @@ impl DataFusion {
         Ok(())
     }
 
+    /// Delete the acceleration data of `dataset`, which no longer serves: its
+    /// engine table, checkpoint, and append cursor, so a dataset defined again
+    /// under its name loads from its source. That data outlives the table in a
+    /// file, another database, or the one in-process instance some engines keep
+    /// every memory-mode dataset in ([`Engine::shares_memory_instance`]); any
+    /// other in-memory acceleration ended with its table.
+    ///
+    /// The checkpoint goes first, and must go, as in a settings rebuild: one
+    /// that outlived the table would mark the next definition's empty table
+    /// loaded. A checkpoint store that does not exist was never written, and
+    /// files the engine never created hold nothing; any other failure to open
+    /// the store fails the deletion. Returns whether a checkpoint was cleared: whether
+    /// an earlier load had marked data there loaded.
+    pub(crate) async fn delete_acceleration_data(&self, dataset: &Dataset) -> Result<bool> {
+        let Some(acceleration) = dataset.acceleration.as_ref().filter(|a| a.enabled) else {
+            return Ok(false);
+        };
+        let in_file = dataset.is_file_accelerated();
+        if !in_file && !acceleration.engine.shares_memory_instance() {
+            return Ok(false);
+        }
+        // Files the engine never created hold nothing, and opening them fails.
+        if in_file && self.store_files_absent(dataset, acceleration).await {
+            return Ok(false);
+        }
+        // A memory-mode dataset keeps no checkpoint, only its table.
+        let mut cleared = false;
+        if in_file {
+            let checkpoint = match dataset_checkpointer(
+                dataset,
+                self.accelerator_engine_registry(),
+                OpenOption::OpenExisting,
+                SnapshotBehavior::Disabled,
+            )
+            .await
+            {
+                Ok(checkpoint) => Some(checkpoint),
+                // Nothing was ever written, so there is no checkpoint to clear.
+                Err(runtime_checkpoint_api::CheckpointError::NotFound { .. }) => None,
+                Err(source) => {
+                    return Err(Error::AccelerationDataCheckpoint {
+                        dataset_name: dataset.name.to_string(),
+                        source: Box::new(source),
+                    });
+                }
+            };
+            if let Some(checkpoint) = checkpoint {
+                cleared = checkpoint.exists().await;
+                checkpoint
+                    .delete()
+                    .await
+                    .context(AccelerationDataCheckpointSnafu {
+                        dataset_name: dataset.name.to_string(),
+                    })?;
+            }
+        }
+        self.drop_acceleration_for_recreate(dataset, acceleration, None)
+            .await?;
+        Ok(cleared)
+    }
+
+    /// Whether none of the files and folders `dataset`'s accelerator keeps its
+    /// data in exists: ones never created hold nothing to delete, and opening
+    /// them fails. A store with any of them, such as Cayenne's metadata without
+    /// its data, is there.
+    async fn store_files_absent(&self, dataset: &Dataset, acceleration: &Acceleration) -> bool {
+        let Some(accelerator) = self
+            .accelerator_engine_registry()
+            .get_accelerator_engine(acceleration.engine)
+            .await
+        else {
+            return false;
+        };
+        let paths: Vec<std::path::PathBuf> = match accelerator.acceleration_layout(dataset) {
+            AccelerationLayout::File { path } => vec![path],
+            AccelerationLayout::Directories { dirs } => {
+                dirs.into_iter().map(|(dir, _)| dir).collect()
+            }
+            AccelerationLayout::None => match accelerator.file_path(dataset) {
+                Ok(path) => vec![path.into()],
+                Err(_) => Vec::new(),
+            },
+        };
+        if paths.is_empty() {
+            return false;
+        }
+        for path in paths {
+            if !matches!(tokio::fs::try_exists(&path).await, Ok(false)) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Drops `source`'s accelerated table so the next create builds it again, empty,
     /// from the current settings, then clears the cached plans that reference it.
     ///
@@ -7048,11 +7239,14 @@ impl DataFusion {
         // A plan is not cached when it holds substituted table-function parameters,
         // or when it is DDL: planning `CREATE TABLE` stores its `WITH` and
         // `PARTITION BY` options for the analyzer, which takes them when the plan is
-        // analyzed, so a cached plan would run without them.
+        // analyzed, so a cached plan would run without them. Nor is one that defines
+        // or shows a component: it embeds the definitions of the moment, and its
+        // access was checked for the caller who planned it.
         if placeholders == TableFunctionPlaceholders::Absent
             && let Some(cache) = plans_cache
             && let Some(cache_key) = cache_key_opt
             && !matches!(plan, LogicalPlan::Ddl(_))
+            && !component_planner::embeds_definitions(&plan)
         {
             tracing::trace!("caching plan for {sql}");
             let current = self.plans_generation.read().await;
@@ -7076,6 +7270,18 @@ impl DataFusion {
         sql: &str,
         parameters: Option<&ParamValues>,
     ) -> Result<(LogicalPlan, TableFunctionPlaceholders), DataFusionError> {
+        // An option key may be written dotted and unquoted, in Spice statements
+        // too: quoted, it reads as one identifier.
+        let sql = &*datafusion_ddl::component_options::quote_dotted_option_keys(
+            sql,
+            &datafusion::sql::sqlparser::dialect::PostgreSqlDialect {},
+        );
+        if let Some(handler) = self.component_ddl_handler()
+            && let Some(statement) = component_planner::parse_spice_statement(sql)?
+        {
+            let plan = component_planner::plan_spice_statement(statement, handler).await?;
+            return Ok((plan, TableFunctionPlaceholders::Absent));
+        }
         let mut statement = planner::parse_sql_statement(sql, session)?;
         sql_depth_guard::ensure_statement_within_depth_limits(&statement)?;
         let placeholders = bind_table_function_args(&mut statement, parameters)?;
@@ -7092,6 +7298,7 @@ impl DataFusion {
             ddl_extension_store: Arc::clone(&self.ddl_extension_store),
             executor_registry: self.executor_registry().cloned(),
             ddl_handler: self.cayenne_ddl_handler.clone(),
+            component_ddl: self.component_ddl_handler(),
             io_runtime: self.io_runtime.clone(),
         };
 

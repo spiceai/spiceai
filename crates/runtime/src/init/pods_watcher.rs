@@ -310,11 +310,8 @@ impl Runtime {
         // one-at-a-time. Must be the first statement.
         let _serialize = self.apply_app_lock.lock().await;
 
-        // It is safe to operate by read lock until we actually need to update
-        // the app state: with applies serialized by `_serialize`, no other path
-        // mutates the app during the diff phase, so a write lock is not needed
-        // until the final swap.
-        let current_app = self.read_app().await;
+        // Pinned before the SQL definitions are added, so the Spicepod app that
+        // later statements are applied over keeps the running mode too.
         let mut new_app = new_app;
         if new_app.runtime.mode != self.mode {
             tracing::warn!(
@@ -324,9 +321,30 @@ impl Runtime {
             );
             Arc::make_mut(&mut new_app).runtime.mode = self.mode;
         }
-        Arc::clone(&self)
+
+        // `new_app` is built from the Spicepods; the datasets and catalogs
+        // defined with SQL are served beside theirs.
+        let new_app = self.with_sql_definitions(new_app).await;
+
+        // It is safe to operate by read lock until we actually need to update
+        // the app state: with applies serialized by `_serialize`, no other path
+        // mutates the app during the diff phase, so a write lock is not needed
+        // until the final swap.
+        let (current_app, new_app) = match self.read_app().await {
+            // A name SQL defines that the reload serves from another source,
+            // as when the Spicepod starts or stops declaring it, loses the
+            // acceleration data its earlier definition loaded first.
+            Some(current_app) => {
+                let (current_app, new_app) = self.retire_switched(current_app, new_app).await;
+                (Some(current_app), new_app)
+            }
+            None => (None, new_app),
+        };
+        let applied = Arc::clone(&self)
             .apply_app_diff(current_app.as_ref(), new_app)
-            .await
+            .await;
+        self.record_served().await;
+        applied
     }
 
     /// Diff-and-apply behind [`Runtime::apply_app`].
@@ -334,7 +352,7 @@ impl Runtime {
     /// The caller holds `apply_app_lock`. `current_app` is what to reconcile
     /// *from*, which is not necessarily the installed app; `new_app` is
     /// installed either way.
-    async fn apply_app_diff(
+    pub(crate) async fn apply_app_diff(
         self: Arc<Self>,
         current_app: Option<&Arc<App>>,
         new_app: Arc<App>,

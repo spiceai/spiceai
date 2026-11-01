@@ -17,6 +17,7 @@ limitations under the License.
 use crate::catalog::SpiceToolCatalog;
 use crate::mcp::task_name_for_exposed_tool;
 use crate::tooling::Tooling;
+use datafusion_ddl::component_options::redact_values;
 
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -732,7 +733,8 @@ impl RuntimeServer {
             // through the `/v1/mcp` gateway are audited identically to
             // model-driven tool calls (see `McpToolWrapper::call`). Without
             // this, gateway tool calls bypass the task_history span entirely.
-            let input = serde_json::to_string(&arguments).unwrap_or_default();
+            let arguments = serde_json::to_string(&arguments).unwrap_or_default();
+            let (input, removed) = resolved.tool.recorded_arguments(&arguments);
 
             // Labelled from the canonical identity `get_tool` resolved, never
             // the requested spelling — see `get_tool`.
@@ -753,13 +755,16 @@ impl RuntimeServer {
                     if let CallToolResponse::Complete(result) = &response
                         && let Ok(captured_output) = serde_json::to_string(&result.content)
                     {
+                        let captured_output = redact_values(&captured_output, &removed);
                         tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output);
                     }
                     Ok(response)
                 }
                 Err(e) => {
-                    tracing::error!(target: "task_history", parent: &span, "{e}");
-                    Err(McpError::internal_error(e.to_string(), None))
+                    let message = e.to_string();
+                    let recorded = redact_values(&message, &removed);
+                    tracing::error!(target: "task_history", parent: &span, "{recorded}");
+                    Err(McpError::internal_error(message, None))
                 }
             };
         }

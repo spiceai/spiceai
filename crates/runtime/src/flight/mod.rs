@@ -1041,9 +1041,8 @@ pub(crate) fn handle_datafusion_error(e: &DataFusionError) -> Status {
                             "Acceleration not ready; loading initial data for {dataset_name}"
                         ))
                     }
-                    SpiceExternalError::PartitionsUnavailable { message } => {
-                        Status::unavailable(message)
-                    }
+                    SpiceExternalError::PartitionsUnavailable { message }
+                    | SpiceExternalError::ShuttingDown { message } => Status::unavailable(message),
                 }
             } else if let Some(err) = e.downcast_ref::<FlightClientError>() {
                 match err {

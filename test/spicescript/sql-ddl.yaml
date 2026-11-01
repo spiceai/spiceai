@@ -1,0 +1,263 @@
+name: sql-ddl
+description: >
+  A dataset defined with SQL serves its source's rows, is registered when its
+  CREATE TABLE returns, and is kept across a restart until it is dropped. Only
+  an `:admin` key defines one. What a read-only key reads (SHOW CREATE, and the
+  task history of every statement, mistyped or cut short ones included) holds
+  none of a definition's secrets, nor does the error of a source that repeats
+  a secret a definition names by reference. A definition runs to its end: the
+  query timeout does not stop it, and its client and record get its outcome.
+
+sources:
+  lake: { kind: files }
+  ref: { kind: postgres }
+  api: { kind: mock-http }
+
+variants:
+  # A DuckLake connection string with a password, which a definition names as
+  # a reference, `${env:DL_CONN}`.
+  default:
+    env:
+      DL_CONN: 'postgres:dbname=x host=127.0.0.1 port=1 user=u password=leak-ducklake-reference'
+  # The same in libpq's URI form, and with the password first, where the part
+  # DuckDB repeats has no `postgres:` prefix.
+  uri:
+    env:
+      DL_CONN: 'postgres:postgresql://u:leak-ducklake-uri@127.0.0.1:1/x'
+  password-first:
+    env:
+      DL_CONN: 'postgres:password=leak-ducklake-first dbname=x host=127.0.0.1 port=1 user=u'
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: sql-ddl
+  runtime:
+    auth:
+      api-key:
+        enabled: true
+        keys: [admin-key:admin, writer-key:rw, reader-key:ro]
+
+defaults:
+  api-key: admin-key
+
+steps:
+  - generate:
+      lake:
+        table: orders
+        rows: 200
+        seed: 41
+        primary-key: id
+        format: csv
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: region, choice: [us, eu, apac] }
+          - { name: amount, int: [0, 1000], nulls: 0.05 }
+    mirror: ref
+  - start: {}
+
+  # Only an `:admin` key defines a dataset.
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: writer-key
+      headers: { content-type: text/plain }
+      body: "CREATE TABLE orders WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv')"
+    expect: { status: 400, body-contains: "requires an API key ending in ':admin'" }
+
+  # Accelerated, and registered once the statement returns: a query right
+  # after it may find the acceleration loading, but always finds the table.
+  - spice-exec: "CREATE TABLE orders WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file')"
+  - http:
+      method: POST
+      path: /v1/sql
+      headers: { content-type: text/plain }
+      body: SELECT count(*) AS n FROM orders
+    expect: { body-lacks: ['not found'] }
+  - query: SELECT id, region, amount FROM orders ORDER BY id
+    expect: { oracle: ref }
+    eventually: 60s
+
+  # A name that starts as the datasets Spice keeps for an accelerated
+  # catalog's tables do, in any case, would take such a table's data.
+  - spice-exec: "CREATE TABLE __catalog_accel_pg__public__t WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv')"
+    expect-error: Spice reserves
+  - spice-exec: "CREATE TABLE \"__Catalog_Accel_pg__public__t\" WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv')"
+    expect-error: Spice reserves
+  # So do the names of a DuckDB acceleration's data tables and of the tables
+  # Spice keeps its own state in.
+  - spice-exec: "CREATE TABLE __data_orders_1793398974815 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv')"
+    expect-error: Spice reserves
+  - spice-exec: "CREATE TABLE spice_sys_dataset_checkpoint WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv')"
+    expect-error: Spice reserves
+  # Kept across a restart, and gone for good once dropped.
+  - restart: {}
+  - query: SELECT id, region, amount FROM orders ORDER BY id
+    expect: { oracle: ref }
+    eventually: 60s
+  - spice-exec: DROP TABLE orders
+  - restart: {}
+  - query: SELECT count(*) FROM orders
+    expect-error: not found
+
+  # A secret in a definition is redacted from SHOW CREATE for a read-only key;
+  # a parameter declared non-secret is shown.
+  - spice-exec: "CREATE TABLE secret_accel WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.mode = 'file', acceleration.params.cayenne_s3_auth = 'iam_role', acceleration.params.cayenne_s3_secret = 'leak-accelerator-secret')"
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SHOW CREATE TABLE secret_accel
+    expect:
+      status: 200
+      body-matches: ["cayenne_s3_secret\\\\\" = '<redacted>'", "cayenne_s3_auth\\\\\" = 'iam_role'"]
+      body-lacks: ['leak-']
+
+  # A source URL can carry a user name and password. A read-only key reads the
+  # definition without them, in SHOW CREATE, /v1/datasets, and task history.
+  - source-exec:
+      api: |
+        path: /creds.csv
+        headers: { content-type: text/csv }
+        body: "id,v\n1,a\n"
+  - spice-exec: "CREATE TABLE creds WITH (from = 'http://scenario-user:leak-url-password@${sources.api.host}${sources.api.path}/creds.csv', file_format = 'csv')"
+  - query: SELECT count(*) AS n FROM creds
+    expect: { rows: [['1']] }
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SHOW CREATE TABLE creds
+    expect:
+      status: 200
+      body-matches: ["from = 'http://127\\.0\\.0\\.1:[0-9]+/[^']*/creds\\.csv'"]
+      body-lacks: ['leak-', 'scenario-user']
+  - http:
+      method: GET
+      path: /v1/datasets
+      api-key: reader-key
+    expect: { status: 200, body-contains: creds, body-lacks: ['leak-', 'scenario-user'] }
+
+  # Every way a statement can carry a secret: written correctly, behind
+  # comments the parser reads, mistyped, cut short, or after another statement.
+  # None of these is applied.
+  - spice-exec: "CREATE TABLE p1 WITH (from = 'postgres:public.t', pg_host = '127.0.0.1', pg_port = 1, pg_user = 'probe', pg_db = 'd', pg_pass = 'leak-plain')"
+    expect-error: true
+  - spice-exec: "/*a/*b*/c*/ CREATE TABLE p2 WITH (from = 'postgres:public.t', pg_host = '127.0.0.1', pg_port = 1, pg_db = 'd', pg_pass = 'leak-nested-comment')"
+    expect-error: true
+  - spice-exec: "CREATE TABLE p3 WITH (from = 'postgres:public.t', pg_host = '127.0.0.1', pg_port = 1, pg_db = 'd', pg_pass 'leak-missing-equals')"
+    expect-error: true
+  - spice-exec: "CREATE TABLE p4 WITH pg_pass = 'leak-missing-parentheses'"
+    expect-error: true
+  - spice-exec: "CREATE TABLE p5 WITH (from = 'postgres:public.t', pg_pass = 'leak-unterminated-quote') '"
+    expect-error: true
+  - spice-exec: "CREATE TABLE p6 WITH (from = 'postgres:public.t', pg_pass = $$leak-unterminated-dollar-quote"
+    expect-error: true
+  - spice-exec: "/* CREATE TABLE p7 WITH (from = 'postgres:public.t', pg_pass = 'leak-unterminated-comment')"
+    expect-error: true
+  - spice-exec: "SELECT 1; CREATE TABLE p8 WITH (from = 'postgres:public.t', pg_pass = 'leak-second-statement')"
+    expect-error: true
+  - spice-exec: "CREATE TABLE p9 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.params.cayenne_s3_secret = '${leak-not-a-reference:}', \"params.custom.file_format\" = 'leak-dotted-parameter')"
+    expect-error: true
+  # Fails to parse, whatever its first word.
+  - spice-exec: "CRATE TABLE p10 WITH (from = 'postgres:public.t', pg_pass = 'leak-mistyped-keyword')"
+    expect-error: true
+  - spice-exec: "ATTACH 'host=db.internal user=app password=leak-attach dbname=sales' AS p11 (TYPE postgres)"
+    expect-error: true
+  # Through the `sql` tool, as an agent runs it; MCP calls the same tool.
+  - http:
+      method: POST
+      path: /v1/tools/sql
+      headers: { content-type: application/json }
+      body: '{"query": "CREATE TABLE p12 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-tool-call'')"}'
+    expect: { body-contains: p12 }
+  # A parameters map written as something other than a map.
+  - spice-exec: "CREATE TABLE p13 WITH (from = 'file://${sources.lake.path}/orders/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'cayenne', acceleration.params = JSON '[{\"cayenne_s3_secret\": \"leak-params-not-a-map\"}]')"
+    expect-error: true
+  # `ATTACH`, which parses but which Spice does not run.
+  - spice-exec: "ATTACH 'host=db.internal user=app password=leak-attach-parses dbname=sales' AS p14"
+    expect-error: true
+  # Through the tool: a mistyped keyword, and arguments that are not its JSON.
+  - http:
+      method: POST
+      path: /v1/tools/sql
+      headers: { content-type: application/json }
+      body: '{"query": "CRATE TABLE p15 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-tool-typo'')"}'
+    expect: { body-contains: CRATE }
+  - http:
+      method: POST
+      path: /v1/tools/sql
+      headers: { content-type: application/json }
+      body: '{"query": "CRATE TABLE p16 WITH (pg_pass = ''leak-tool-not-json'')"'
+    expect: { body-contains: EOF }
+  # Through `tool_invoke`, which a model that searches for tools calls.
+  - http:
+      method: POST
+      path: /v1/tools/tool_invoke
+      headers: { content-type: application/json }
+      body: '{"tool_id": "sql", "arguments": {"query": "CREATE TABLE p17 WITH (from = ''postgres:public.t'', pg_host = ''127.0.0.1'', pg_port = 1, pg_db = ''d'', pg_pass = ''leak-tool-invoke'')"}}'
+    expect: { body-contains: p17 }
+  - http:
+      method: POST
+      path: /v1/tools/tool_invoke
+      headers: { content-type: application/json }
+      body: '{"tool_id": "sql", "arguments": {"sql": "CRATE TABLE p18 WITH (pg_pass = ''leak-tool-invoke-bad-arguments'')"}}'
+    expect: { body-contains: 'missing field' }
+  # A DuckLake catalog and dataset whose metadata database cannot be reached:
+  # DuckDB's error repeats the connection string the reference resolves to.
+  - http:
+      method: POST
+      path: /v1/sql
+      headers: { content-type: text/plain }
+      body: "CREATE CATALOG dl WITH (from = 'ducklake', ducklake_connection_string = '${env:DL_CONN}')"
+    expect: { body-contains: Unable to connect to Postgres, body-lacks: ['leak-'] }
+  - http:
+      method: POST
+      path: /v1/sql
+      headers: { content-type: text/plain }
+      body: "CREATE TABLE dl_orders WITH (from = 'ducklake:orders', ducklake_connection_string = '${env:DL_CONN}')"
+    expect: { body-contains: Unable to connect to Postgres, body-lacks: ['leak-'] }
+  - spice-exec: "CREATE TABLE p_last WITH (from = 'postgres:public.t', pg_host = '127.0.0.1', pg_port = 1, pg_db = 'd', pg_pass = 'leak-last')"
+    expect-error: true
+  # Task history, as a read-only key reads it, once the last statement is in it.
+  - http:
+      method: POST
+      path: /v1/sql
+      api-key: reader-key
+      headers: { content-type: text/plain }
+      body: SELECT task, input, error_message FROM runtime.task_history ORDER BY start_time
+    expect:
+      status: 200
+      body-contains: p_last
+      body-lacks: ['leak-']
+    eventually: 30s
+
+  # A definition cannot stop partway, so the query timeout does not apply to
+  # it: its client gets its outcome, and its record holds it. The source
+  # answers its first request 5 s late, past a 2 s timeout, and the rest at once.
+  - source-exec:
+      api: |
+        path: /slow.csv
+        headers: { content-type: text/csv }
+        body: "id,v\n1,a\n2,b\n"
+  - source-exec:
+      api: |
+        path: /slow.csv
+        headers: { content-type: text/csv }
+        body: "id,v\n1,a\n2,b\n"
+        delay-ms: 5000
+        times: 1
+  - restart:
+      patch:
+        spicepod:
+          runtime:
+            query:
+              timeout: 2s
+  - spice-exec: "CREATE TABLE slow WITH (from = '${sources.api.url}/slow.csv', file_format = 'csv')"
+  - query: SELECT count(*) AS n FROM slow
+    expect: { rows: [['2']] }
+  - query: SELECT error_message FROM runtime.task_history WHERE task = 'sql_query' AND input LIKE 'CREATE TABLE slow %'
+    expect: { rows: [[null]] }
+    eventually: 30s

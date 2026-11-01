@@ -462,13 +462,20 @@ impl DatasetSpec {
     /// Returns the dataset source - the first part of the `from` field before the first '://', ':', or '/'
     #[must_use]
     pub fn source(&self) -> &str {
-        if self.from == "sink" || self.from.is_empty() {
+        Self::source_of(&self.from)
+    }
+
+    /// The source a dataset's `from` names: the part before the first '://',
+    /// ':', or '/'.
+    #[must_use]
+    pub fn source_of(from: &str) -> &str {
+        if from == "sink" || from.is_empty() {
             return "sink";
         }
 
-        match find_first_delimiter(&self.from) {
+        match find_first_delimiter(from) {
             Some((0, _)) => "",
-            Some((pos, _)) => &self.from[..pos],
+            Some((pos, _)) => &from[..pos],
             None => "spice.ai",
         }
     }

@@ -588,10 +588,12 @@ impl DataAccelerator for TursoAccelerator {
             .map_err(|source| CheckpointError::Store {
                 source: Box::new(source),
             })?;
-        if open_option == OpenOption::OpenExisting && !std::path::Path::new(&turso_file).exists() {
-            return Err(CheckpointError::Store {
-                source: format!("Turso file does not exist at {turso_file}").into(),
-            });
+        if open_option == OpenOption::OpenExisting {
+            CheckpointError::require_existing(
+                "Turso file",
+                &turso_file,
+                std::path::Path::new(&turso_file).try_exists(),
+            )?;
         }
 
         let pool = self
@@ -951,13 +953,21 @@ impl DataAccelerator for TursoAccelerator {
         let _schema_guard = pool.acquire_schema_write_lock().await;
         let conn = pool.connect().await?;
         let escaped = table_name.replace('"', "\"\"");
+        // `PRAGMA table_info` lists no column for a table that does not exist.
+        let exists = conn
+            .query(&format!("PRAGMA table_info(\"{escaped}\")"), ())
+            .await?
+            .next()
+            .await?
+            .is_some();
+        if !exists {
+            return Ok(());
+        }
         let drop_sql = format!("DROP TABLE IF EXISTS \"{escaped}\"");
         conn.execute(&drop_sql, ())
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-        tracing::info!(
-            "Dropped Turso table '{table_name}' for schema recreation (file_update mode)"
-        );
+        tracing::info!("Deleted the Turso acceleration data of dataset '{table_name}'.");
         Ok(())
     }
 

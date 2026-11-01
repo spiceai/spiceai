@@ -206,6 +206,7 @@ mod source_unavailable;
 #[cfg(feature = "spark")]
 mod spark;
 mod spiceai;
+mod sql_ddl;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod tls;

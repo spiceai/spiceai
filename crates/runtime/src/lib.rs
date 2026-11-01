@@ -103,6 +103,7 @@ pub mod builder;
 pub mod catalogconnector;
 mod changes;
 pub mod component;
+mod component_ddl;
 pub mod config;
 pub mod dataaccelerator;
 pub mod dataconnector;
@@ -777,6 +778,14 @@ pub struct Runtime {
 
     /// The startup check of `runtime.state.location`, when it is set.
     state_location_check: Option<Arc<runtime_state_location::StateLocationCheck>>,
+
+    /// The datasets and catalogs defined with SQL.
+    sql_components: Arc<component_ddl::SqlComponents>,
+
+    /// The load of each catalog, by name, while it may still be in progress:
+    /// a load retries an unreachable source without end, and is stopped when
+    /// its catalog is replaced or removed.
+    catalog_loads: Arc<parking_lot::Mutex<HashMap<String, init::catalog::CatalogLoad>>>,
 }
 
 impl Debug for Runtime {
@@ -2152,6 +2161,13 @@ impl Runtime {
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
     pub async fn load_components(self: Arc<Self>) {
+        self.install_component_ddl_handler().await;
+        // Before the preflight and the loads, so the datasets and catalogs
+        // defined with SQL are checked and loaded with the Spicepod's.
+        if self.distributed.is_none() {
+            self.load_sql_definitions().await;
+        }
+
         self.secrets_preflight().await;
 
         let hold_ready_for_warmup = self.df.results_cache_warmup_holds_ready();

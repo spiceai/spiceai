@@ -637,6 +637,12 @@ impl DynamicUrlCatalogList {
     pub fn factory(&self) -> &Arc<SpiceUrlTableFactory> {
         &self.factory
     }
+
+    /// The catalog list this one adds URL tables to.
+    #[must_use]
+    pub fn inner(&self) -> &Arc<dyn CatalogProviderList> {
+        &self.inner
+    }
 }
 
 impl CatalogProviderList for DynamicUrlCatalogList {

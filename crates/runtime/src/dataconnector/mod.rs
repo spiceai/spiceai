@@ -95,6 +95,15 @@ pub async fn register_connector_factory(
     registry.insert(name.to_string(), connector_factory);
 }
 
+/// The parameter prefix and parameters of every registered connector.
+pub async fn all_parameter_specs() -> Vec<(&'static str, &'static [ParameterSpec])> {
+    let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+    guard
+        .values()
+        .map(|factory| (factory.prefix(), factory.parameters()))
+        .collect()
+}
+
 /// Look up a registered connector factory by name.
 pub async fn get_connector_factory(name: &str) -> Option<Arc<dyn DataConnectorFactory>> {
     let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;

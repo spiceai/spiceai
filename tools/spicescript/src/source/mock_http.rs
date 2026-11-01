@@ -217,6 +217,10 @@ impl Source for MockHttp {
                 Self::prefix(namespace)
             )),
         );
+        // The parts of `url`, to write another URL to the server, such as one
+        // that carries a user name and password.
+        extra.insert("host".into(), json!(format!("127.0.0.1:{}", self.port)));
+        extra.insert("path".into(), json!(Self::prefix(namespace)));
         Ok(super::Namespace {
             params: json!({}),
             extra,

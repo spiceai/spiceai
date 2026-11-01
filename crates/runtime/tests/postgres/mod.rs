@@ -38,6 +38,8 @@ pub mod catalog_changes;
 pub mod comments;
 pub mod common;
 #[cfg(feature = "postgres")]
+pub mod ddl;
+#[cfg(feature = "postgres")]
 pub mod dml;
 #[cfg(feature = "postgres")]
 pub mod numeric_scale;

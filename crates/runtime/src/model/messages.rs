@@ -43,6 +43,7 @@ use crate::model::LoadedChatModel;
 use crate::model::chat::{anthropic_client, typed_params};
 use crate::model::metrics::{handle_metrics, handle_token_metrics, request_labels_messages};
 use crate::model::params::anthropic::AnthropicModelParams;
+use crate::model::recorded_calls;
 use crate::model::tool_use_messages::ToolUsingMessages;
 use messages_chat::ChatMessages;
 use model_capabilities::MessagesBackend;
@@ -442,7 +443,11 @@ impl Messages for MessagesWrapper {
         let start = Instant::now();
         let (request, defaulted) = self.prepare(request);
         let labels = request_labels_messages(&self.public_name, &request.body, false);
-        let input = Value::Object(request.body.clone()).to_string();
+        let input = recorded_calls::recorded(
+            &Value::Object(request.body.clone()),
+            recorded_calls::current_tools().as_ref(),
+        )
+        .unwrap_or_default();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream = false, model = %self.public_name, input = %input);
         let result = self.messages.create(request).instrument(span.clone()).await;
         handle_metrics(start.elapsed(), result.is_err(), &labels);
@@ -477,7 +482,11 @@ impl Messages for MessagesWrapper {
         let start = Instant::now();
         let (request, defaulted) = self.prepare(request);
         let labels = request_labels_messages(&self.public_name, &request.body, true);
-        let input = Value::Object(request.body.clone()).to_string();
+        let input = recorded_calls::recorded(
+            &Value::Object(request.body.clone()),
+            recorded_calls::current_tools().as_ref(),
+        )
+        .unwrap_or_default();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream = true, model = %self.public_name, input = %input);
         match self
             .messages
