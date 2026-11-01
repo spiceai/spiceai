@@ -384,9 +384,20 @@ impl Drop for McpToolCatalog {
 
 impl McpToolCatalog {
     pub async fn try_new(cfg: MCPConfig, name: &str, description: Option<String>) -> Result<Self> {
+        Self::try_new_within(cfg, name, description, MCP_STARTUP_TIMEOUT).await
+    }
+
+    /// Connects to the MCP server and lists its tools, failing if the two together have not
+    /// finished within `startup_timeout`.
+    async fn try_new_within(
+        cfg: MCPConfig,
+        name: &str,
+        description: Option<String>,
+        startup_timeout: Duration,
+    ) -> Result<Self> {
         // The handshake and the first `tools/list` share one startup deadline.
-        let deadline = tokio::time::Instant::now() + MCP_STARTUP_TIMEOUT;
-        let client = Self::create_client(&cfg, name).await?;
+        let deadline = tokio::time::Instant::now() + startup_timeout;
+        let client = Self::create_client_within(&cfg, name, startup_timeout).await?;
         let client = Arc::new(RwLock::new(client));
 
         let client_clone = Arc::clone(&client);
@@ -488,7 +499,7 @@ impl McpToolCatalog {
                 return Err(Error::UnderlyingTransportError {
                     source: format!(
                         "the MCP server did not answer tools/list within {}s of connecting",
-                        MCP_STARTUP_TIMEOUT.as_secs()
+                        startup_timeout.as_secs_f32()
                     )
                     .into(),
                 });
@@ -1322,6 +1333,109 @@ mod tests {
         assert!(
             matches!(closed, Ok(Ok(()))),
             "the timed-out handshake left its connection open"
+        );
+    }
+
+    /// A server that completes the handshake but never answers the first `tools/list` fails
+    /// the load at the shared startup deadline, and the connection carrying that request is
+    /// closed.
+    #[tokio::test]
+    async fn test_unanswered_first_tools_list_fails_within_startup_timeout() {
+        use axum::{
+            Json, Router,
+            http::StatusCode,
+            response::{IntoResponse, Response},
+            routing::post,
+        };
+
+        /// Signals when the handler holding it is dropped, which is when the client closes
+        /// the connection of the request it is answering.
+        struct SignalOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for SignalOnDrop {
+            fn drop(&mut self) {
+                if let Some(closed) = self.0.take() {
+                    let _ = closed.send(());
+                }
+            }
+        }
+
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let closed_tx = Arc::new(StdMutex::new(Some(closed_tx)));
+        let mcp = post(move |Json(message): Json<Value>| {
+            let closed_tx = Arc::clone(&closed_tx);
+            async move {
+                let id = message.get("id").cloned();
+                match message.get("method").and_then(Value::as_str) {
+                    Some("initialize") => (
+                        [("mcp-session-id", "session")],
+                        Json(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "protocolVersion": "2025-03-26",
+                                "capabilities": { "tools": {} },
+                                "serverInfo": { "name": "silent-list", "version": "1.0.0" }
+                            }
+                        })),
+                    )
+                        .into_response(),
+                    Some("tools/list") => {
+                        let _signal = SignalOnDrop(closed_tx.lock().expect("signal lock").take());
+                        std::future::pending::<Response>().await
+                    }
+                    _ if id.is_none() => StatusCode::ACCEPTED.into_response(),
+                    // `server/discover` included: answering it as unknown makes the client
+                    // fall back to `initialize`.
+                    method => Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32601, "message": format!("Method not found: {method:?}") }
+                    }))
+                    .into_response(),
+                }
+            }
+        })
+        .get(|| async { StatusCode::METHOD_NOT_ALLOWED })
+        .delete(|| async { StatusCode::OK });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server =
+            tokio::spawn(
+                async move { axum::serve(listener, Router::new().route("/mcp", mcp)).await },
+            );
+        let cfg = MCPConfig::StreamableHttp {
+            url: url::Url::parse(&format!("http://{addr}/mcp")).expect("valid url"),
+            auth_token: None,
+            headers: HashMap::new(),
+        };
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            McpToolCatalog::try_new_within(cfg, "silent_list", None, Duration::from_millis(500)),
+        )
+        .await
+        .expect("the load must give up at the startup deadline, not wait on tools/list");
+        let Err(err) = result else {
+            panic!("a server that never lists its tools must not load");
+        };
+        assert!(
+            err.to_string().contains("did not answer tools/list within"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the load must give up at the startup deadline, took {:?}",
+            started.elapsed()
+        );
+
+        let closed = tokio::time::timeout(Duration::from_secs(5), closed_rx).await;
+        server.abort();
+        assert!(
+            matches!(closed, Ok(Ok(()))),
+            "the unanswered tools/list left its connection open"
         );
     }
 
