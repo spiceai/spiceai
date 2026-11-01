@@ -104,11 +104,15 @@ pub(super) fn describe(action: &Action) -> String {
             prefix,
             contains,
             min,
+            max,
             ..
-        } => match contains {
-            Some(contains) => format!("assert-objects {source}/{prefix}*{contains}* >= {min}"),
-            None => format!("assert-objects {source}/{prefix} >= {min}"),
-        },
+        } => {
+            let count = max.map_or_else(|| format!(">= {min}"), |max| format!("{min}..={max}"));
+            match contains {
+                Some(contains) => format!("assert-objects {source}/{prefix}*{contains}* {count}"),
+                None => format!("assert-objects {source}/{prefix} {count}"),
+            }
+        }
         Action::Generate {
             source,
             spec,
@@ -484,16 +488,18 @@ pub(super) async fn run_instance_step(
             prefix,
             contains,
             min,
+            max,
             within,
         } => {
             let namespace = namespace(instance, source)?;
+            let fits = |count: usize| count >= *min && max.is_none_or(|max| count <= max);
             let deadline = Instant::now() + within.unwrap_or_default();
             let found = loop {
                 let mut found = sources.get(source)?.list(&namespace, prefix).await?;
                 if let Some(contains) = contains {
                     found.retain(|key| key.contains(contains.as_str()));
                 }
-                if found.len() >= *min || Instant::now() >= deadline {
+                if fits(found.len()) || Instant::now() >= deadline {
                     break found;
                 }
                 tokio::time::sleep(POLL).await;
@@ -501,9 +507,14 @@ pub(super) async fn run_instance_step(
             let matching = contains
                 .as_ref()
                 .map_or_else(String::new, |contains| format!(" containing '{contains}'"));
+            let wanted = match max {
+                Some(max) if max == min => format!("exactly {min}"),
+                Some(max) => format!("{min} to {max}"),
+                None => format!("at least {min}"),
+            };
             ensure!(
-                found.len() >= *min,
-                "expected at least {min} objects under '{prefix}'{matching} in '{source}', found {}: {found:?}",
+                fits(found.len()),
+                "expected {wanted} objects under '{prefix}'{matching} in '{source}', found {}: {found:?}",
                 found.len()
             );
             return Ok(format!(" ({} objects)", found.len()));

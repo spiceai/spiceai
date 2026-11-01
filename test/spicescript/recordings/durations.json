@@ -4,6 +4,7 @@
   "append-time-partition": 4,
   "auth": 3,
   "builtins": 4,
+  "cayenne-transactions": 12,
   "cayenne-upgrade": 4,
   "cayenne-vnext": 8,
   "cayenne-vnext-recreate": 4,
