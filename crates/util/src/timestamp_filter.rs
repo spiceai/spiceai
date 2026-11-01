@@ -398,13 +398,25 @@ impl TimestampFilterConvert {
     /// rows live in. Flooring is a no-op when the mark came from a day-granular
     /// column, since it is already midnight.
     ///
+    /// An ISO 8601 text column compares `>=` against the exact mark, so a row that
+    /// reaches the source after a refresh at the same instant as the newest loaded
+    /// row is still read; the same exact-row dedupe drops the copies already loaded.
+    ///
     /// Sub-day columns (`Time32`, `Time64`, `Timestamp`) keep the strict `>` against
-    /// the exact mark: they carry the precision that makes it correct.
+    /// the exact mark.
     #[must_use]
     pub fn convert_high_water_mark(&self, timestamp_in_nanos: u128) -> Expr {
         self.convert_with_bounds(
-            high_water_mark_bound(timestamp_in_nanos, self.time_is_day_granular),
-            high_water_mark_bound(timestamp_in_nanos, self.time_partition_is_day_granular),
+            high_water_mark_bound(
+                timestamp_in_nanos,
+                self.time_is_day_granular,
+                Some(&self.time_format),
+            ),
+            high_water_mark_bound(
+                timestamp_in_nanos,
+                self.time_partition_is_day_granular,
+                self.time_partition_format.as_ref(),
+            ),
         )
     }
 
@@ -477,13 +489,23 @@ fn floor_to_day(timestamp_in_nanos: u128) -> u128 {
     signed.saturating_sub(signed.rem_euclid(NANOS_PER_DAY)) as u128
 }
 
-/// The comparison a high-water mark implies for one column.
+/// The comparison a high-water mark implies for one column of `format`.
 ///
-/// Day-granular columns compare `>=` against midnight of the mark's day; everything
-/// else compares `>` against the mark itself. See
+/// Day-granular columns compare `>=` against midnight of the mark's day, ISO 8601
+/// text columns `>=` against the mark itself, and everything else `>` against the
+/// mark itself. See
 /// [`convert_high_water_mark`](TimestampFilterConvert::convert_high_water_mark).
-fn high_water_mark_bound(timestamp_in_nanos: u128, is_day_granular: bool) -> Bound {
-    mark_bound(timestamp_in_nanos, is_day_granular, Operator::Gt)
+fn high_water_mark_bound(
+    timestamp_in_nanos: u128,
+    is_day_granular: bool,
+    format: Option<&TimestampFormat>,
+) -> Bound {
+    let exact_op = if matches!(format, Some(TimestampFormat::Iso8601(_))) {
+        Operator::GtEq
+    } else {
+        Operator::Gt
+    };
+    mark_bound(timestamp_in_nanos, is_day_granular, exact_op)
 }
 
 /// The comparison an inclusive mark implies for one column: `>=` the mark, floored to
@@ -766,7 +788,7 @@ mod tests {
         "CAST(ts AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)";
 
     /// Expected high-water-mark comparison for an ISO 8601 string column named `ts`.
-    const ISO_STRICT: &str = "CAST(ts AS Timestamp(µs)) > TimestampMicrosecond(1620000000000000, None) OR CAST(ts AS Timestamp(µs)) = TimestampMicrosecond(1620000000000000, None) AND TRY_CAST(ts AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)";
+    const ISO_INCLUSIVE: &str = "CAST(ts AS Timestamp(µs)) > TimestampMicrosecond(1620000000000000, None) OR CAST(ts AS Timestamp(µs)) = TimestampMicrosecond(1620000000000000, None) AND TRY_CAST(ts AS Timestamp(ns)) >= TimestampNanosecond(1620000000000000000, None)";
 
     /// Build the high-water-mark filter for a single column of `data_type`.
     fn high_water_mark_expr(data_type: &DataType) -> String {
@@ -811,9 +833,34 @@ mod tests {
         assert_eq!(high_water_mark_expr(&time32), TS_STRICT);
         assert_eq!(high_water_mark_expr(&time64), TS_STRICT);
         assert_eq!(high_water_mark_expr(&timestamp), TS_STRICT);
+    }
+
+    #[test]
+    fn test_high_water_mark_is_inclusive_for_iso_text() {
+        // A row at the instant of the newest loaded row is read again, and the append's
+        // exact-row dedupe drops the copies already loaded, so one written later at that
+        // instant still loads.
         assert_eq!(
             high_water_mark_expr(&DataType::Utf8),
-            format!("ts >= Utf8(\"2021-05-02\") AND ({ISO_STRICT})")
+            format!("ts >= Utf8(\"2021-05-02\") AND ({ISO_INCLUSIVE})")
+        );
+        let values = [
+            Some("2021-05-02T23:59:59.999999999Z"),
+            Some("2021-05-03T00:00:00Z"),
+            Some("2021-05-03T09:00:00+09:00"),
+            Some("2021-05-03T00:00:00.000000001Z"),
+        ];
+        let format = data_type_to_timestamp_format(&DataType::Utf8, None).expect("resolves");
+        let mark = TimestampFilterConvert::new("ts".to_string(), format, None, None)
+            .convert_high_water_mark(TS_NANOS);
+        assert_eq!(
+            surviving_iso_rows(&DataType::Utf8, &values, &mark),
+            vec![
+                Some("2021-05-03T00:00:00Z".to_string()),
+                Some("2021-05-03T09:00:00+09:00".to_string()),
+                Some("2021-05-03T00:00:00.000000001Z".to_string()),
+            ],
+            "every spelling of the mark's instant, and what follows it",
         );
     }
 

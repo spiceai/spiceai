@@ -691,8 +691,8 @@ enum StoredRowsFrom {
     /// Nothing: a full load overwrites the stored rows, and an append into an empty
     /// acceleration has none.
     None,
-    /// The stored rows after the high-water mark the source filter used, matching its
-    /// strict `>`.
+    /// The stored rows from the high-water mark the source filter used, compared the
+    /// way that filter compares (`convert_high_water_mark`).
     AfterMark(u128),
     /// The stored rows at or after the lowest time the incoming rows can hold.
     AtOrAfter(u128),
@@ -3574,11 +3574,6 @@ pub async fn read_first_refresh_batch(
     Ok(())
 }
 
-/// Returns true when `candidate` is structurally compatible with `expected`
-/// for swapping a `TableProvider` under a `SwappableTableProvider`. See
-/// [`data_accelerator_api::swappable::schemas_compatible`] for the precise
-/// rules; this is a thin re-export so callers in this module can keep using
-/// the unqualified name.
 /// The `refresh_data_window` load filter: rows newer than `start_in_nanos`.
 ///
 /// A day-granular partition column is bounded by `start`'s day (see
@@ -3627,6 +3622,11 @@ mod window_filter_tests {
     }
 }
 
+/// Returns true when `candidate` is structurally compatible with `expected`
+/// for swapping a `TableProvider` under a `SwappableTableProvider`. See
+/// [`data_accelerator_api::swappable::schemas_compatible`] for the precise
+/// rules; this is a thin re-export so callers in this module can keep using
+/// the unqualified name.
 fn schemas_compatible(candidate: &arrow_schema::Schema, expected: &arrow_schema::Schema) -> bool {
     data_accelerator_api::swappable::schemas_compatible(candidate, expected)
 }
