@@ -633,7 +633,7 @@ impl MistralLlama {
         })
     }
 
-    /// Renders a one-message conversation with a marker in each shape of a message's content,
+    /// Renders a conversation for each role with markers in each shape of a message's content,
     /// to learn which the chat template reads ([`ContentSupport`]), off the async runtime as
     /// [`Self::reasoning_support`] renders. Named templates are probed apart, the `tool_use`
     /// one by rendering with a tool; a single template renders alike with or without tools.
@@ -647,11 +647,7 @@ impl MistralLlama {
             let named = pipeline
                 .get_chat_template()
                 .is_some_and(|t| t.chat_template.as_ref().is_some_and(|t| t.0.is_right()));
-            ContentSupport::from_renders(|content, with_tools| {
-                let message = IndexMap::from([
-                    ("role".to_string(), Either::Left("user".to_string())),
-                    ("content".to_string(), content),
-                ]);
+            ContentSupport::from_renders(|messages, with_tools| {
                 let tools = if with_tools && named {
                     vec![Tool {
                         tp: ToolType::Function,
@@ -666,7 +662,7 @@ impl MistralLlama {
                     Vec::new()
                 };
                 processor
-                    .process(&*pipeline, vec![message], true, false, None, None, tools)
+                    .process(&*pipeline, messages, true, false, None, None, tools)
                     .map(|(_, prompt)| prompt)
                     .ok()
             })

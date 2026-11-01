@@ -470,16 +470,12 @@ impl LlamaCpp {
             let template = template.clone();
             let special = loaded.special.clone();
             tokio::task::spawn_blocking(move || {
-                ContentSupport::from_renders(|content, with_tools| {
+                ContentSupport::from_renders(|messages, with_tools| {
                     let chosen = chosen_template(&template, with_tools).ok()?;
-                    let message = IndexMap::from([
-                        ("role".to_string(), Either::Left("user".to_string())),
-                        ("content".to_string(), content),
-                    ]);
                     render(
                         &Either::Left(chosen.to_string()),
                         &special,
-                        vec![message],
+                        messages,
                         None,
                         None,
                         Vec::new(),
