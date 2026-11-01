@@ -15,10 +15,10 @@ limitations under the License.
 */
 
 //! The llama.cpp engine's integration tests. `load_errors` needs no network and runs in
-//! `make nextest`; `model`, `differential`, `distributed` and `greedy` download Qwen3-0.6B
-//! (639 MB), `mtp` Qwen3.5-0.8B (550 MB), `prefix_reuse` both, `hf_resolution` two of unsloth's
-//! Qwen3-0.6B quantizations, and `unsupported` flan-t5-small (83 MB), from Hugging Face, and run
-//! in `integration_llms.yml`.
+//! `make nextest`; `model`, `differential`, `distributed`, `greedy` and `harmony` download
+//! Qwen3-0.6B (639 MB), `mtp` Qwen3.5-0.8B (550 MB), `prefix_reuse` both, `hf_resolution` two of
+//! unsloth's Qwen3-0.6B quantizations, and `unsupported` flan-t5-small (83 MB), from Hugging Face,
+//! and run in `integration_llms.yml`.
 
 #![expect(
     clippy::expect_used,
@@ -32,6 +32,7 @@ mod differential;
 mod distributed;
 mod fixture;
 mod greedy;
+mod harmony;
 mod hf_resolution;
 mod load_errors;
 mod model;

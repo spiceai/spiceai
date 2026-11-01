@@ -205,6 +205,42 @@ impl<'v> Sampler<'v> {
         }
     }
 
+    /// Whether the sampler at `index` in this chain leaves `token` possible: whether it keeps
+    /// a finite logit for `token` as the only candidate. A grammar sampler rules out a token
+    /// that does not continue its text, and llama.cpp aborts when one is told it picked such a
+    /// token, so a token from elsewhere is checked here before [`Sampler::accept_at`]. False
+    /// when the chain has no sampler there.
+    #[must_use]
+    pub fn allows_at(&mut self, index: i32, token: Token) -> bool {
+        // SAFETY: the chain owns the sampler it returns, which lives as long as the chain.
+        let sampler = unsafe { sys::llama_sampler_chain_get(self.raw.as_ptr(), index) };
+        if sampler.is_null() {
+            return false;
+        }
+        let mut data = sys::llama_token_data {
+            id: token.0,
+            logit: 0.0,
+            p: 0.0,
+        };
+        let mut candidates = sys::llama_token_data_array {
+            data: &raw mut data,
+            size: 1,
+            selected: -1,
+            sorted: false,
+        };
+        // SAFETY: `candidates` points at `data`, which outlives the call. A sampler may
+        // repoint it at a buffer of its own, which lives as long as the sampler.
+        unsafe { sys::llama_sampler_apply(sampler, &raw mut candidates) };
+        if candidates.data.is_null() {
+            return false;
+        }
+        // SAFETY: after the call `candidates` describes `size` live entries, in `data` or in
+        // the sampler's own buffer, and neither changes before they are read here.
+        unsafe { std::slice::from_raw_parts(candidates.data, candidates.size) }
+            .iter()
+            .any(|d| d.id == token.0 && d.logit.is_finite())
+    }
+
     /// Picks the token for output row `index` of the last decoded batch.
     pub fn sample(&mut self, context: &Context<'_>, index: i32) -> Token {
         if self.greedy
