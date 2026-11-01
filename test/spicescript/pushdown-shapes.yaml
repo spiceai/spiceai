@@ -2,19 +2,33 @@ name: pushdown-shapes
 description: >
   Filters, projections, limits (alone, under ORDER BY, with OFFSET),
   aggregates, DISTINCT, same-source joins, IN subqueries, CASE, LIKE, date
-  ranges, NULL tests and window functions reach a federated PostgreSQL or
-  MySQL source inside the one statement Spice sends it, and answer as
-  PostgreSQL does over the same rows.
+  ranges, NULL tests and window functions reach a federated PostgreSQL, MySQL,
+  DuckDB or DuckLake source inside the one statement Spice sends it, and answer as
+  PostgreSQL does over the same rows. DuckDB is also read through ADBC with
+  the DuckDB driver.
 
 sources:
   backend: { kind: '${matrix.backend}' }
   ref: { kind: postgres }
 
 matrix:
-  backend: [postgres, mysql]
+  backend: [postgres, mysql, duckdb, ducklake]
 
 variants:
   federated: {}
+  adbc:
+    when: { backend: duckdb }
+    datasets:
+      t:
+        from: adbc:t
+        params:
+          $merge: '${sources.backend.adbc_params}'
+          duckdb_open: null
+      u:
+        from: adbc:u
+        params:
+          $merge: '${sources.backend.adbc_params}'
+          duckdb_open: null
 
 spicepod:
   version: v1

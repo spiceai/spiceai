@@ -709,6 +709,7 @@ async fn run_combination(
     };
     let result = async {
         let matrix_ctx = json!({ "matrix": combo });
+        let mut resolved = Vec::new();
         for (name, spec) in &script.sources {
             let kind = template::substitute_text(&spec.kind, &matrix_ctx)?;
             let version = spec
@@ -716,6 +717,17 @@ async fn run_combination(
                 .as_deref()
                 .map(|v| template::substitute_text(v, &matrix_ctx))
                 .transpose()?;
+            resolved.push((name, spec, kind, version));
+        }
+        let mut duckdb_releases = Vec::new();
+        for (name, _, kind, version) in &resolved {
+            if matches!(kind.as_str(), "duckdb" | "ducklake") {
+                let release = source::duckdb_cli::version(version.as_deref())?;
+                duckdb_releases.push(((*name).clone(), kind.clone(), release));
+            }
+        }
+        one_duckdb_release(&duckdb_releases)?;
+        for (name, spec, kind, version) in resolved {
             let src = source::start(
                 name,
                 run_id,
@@ -1075,6 +1087,38 @@ async fn create_instances(
             let spicepod_yaml = yaml::to_string(&spicepod)?;
             let spicepod = spicepod.clone();
             let mut env = variant.env.clone();
+            // DuckDB sources install the library matching the CLI. Make it
+            // discoverable by name without changing the harness environment.
+            for entry in context["sources"]
+                .as_object()
+                .into_iter()
+                .flat_map(|sources| sources.values())
+            {
+                if let Some(dir) = entry.get("library_dir").and_then(Value::as_str) {
+                    let key = if cfg!(target_os = "macos") {
+                        "DYLD_FALLBACK_LIBRARY_PATH"
+                    } else {
+                        "LD_LIBRARY_PATH"
+                    };
+                    let previous = env.get(key).cloned().or_else(|| std::env::var(key).ok());
+                    let mut paths = vec![PathBuf::from(dir)];
+                    if let Some(previous) = previous {
+                        paths.extend(std::env::split_paths(&previous));
+                    } else if cfg!(target_os = "macos") {
+                        // Setting DYLD_FALLBACK_LIBRARY_PATH replaces its defaults.
+                        if let Some(home) = std::env::var_os("HOME") {
+                            paths.push(PathBuf::from(home).join("lib"));
+                        }
+                        paths.extend([PathBuf::from("/usr/local/lib"), PathBuf::from("/usr/lib")]);
+                    }
+                    env.insert(
+                        key.into(),
+                        std::env::join_paths(paths)?.into_string().map_err(|_| {
+                            anyhow::anyhow!("DuckDB library search path is not UTF-8")
+                        })?,
+                    );
+                }
+            }
             // Spice derives replication slot names from this, so instances
             // sharing a source do not take each other's slots.
             env.insert("SPICE_INSTANCE_ID".into(), format!("{run_id}-{index}"));
@@ -1520,6 +1564,21 @@ fn record(report: &mut Report, run_label: &str, who: &str, step: &Step, outcome:
 /// How a dataset names table `t` of a source of this kind: `from:
 /// <prefix>t<suffix>`, plus whether it is a directory of files (which then
 /// needs a `file_format`), so one spicepod line serves a matrix over sources.
+/// `spiced` loads one `DuckDB` library, so the `duckdb` and `ducklake` sources of
+/// one run must use the same release. Each entry is a source's name, kind and
+/// resolved release.
+fn one_duckdb_release(sources: &[(String, String, String)]) -> Result<()> {
+    let Some((first, first_kind, release)) = sources.first() else {
+        return Ok(());
+    };
+    if let Some((name, kind, other)) = sources.iter().find(|(_, _, r)| r != release) {
+        anyhow::bail!(
+            "Sources '{first}' ({first_kind}) and '{name}' ({kind}) use DuckDB {release} and {other}, but spiced loads one DuckDB library. Give them the same `version`, or remove both to use --duckdb-version or the newest release in test/duckdb_versions.json."
+        );
+    }
+    Ok(())
+}
+
 fn table_from(kind: &str, entry: &Map<String, Value>) -> (String, String, bool) {
     let field = |key: &str| entry.get(key).and_then(Value::as_str).unwrap_or_default();
     match kind {
@@ -1530,7 +1589,7 @@ fn table_from(kind: &str, entry: &Map<String, Value>) -> (String, String, bool) 
             false,
         ),
         "mongodb" => ("mongodb:".into(), String::new(), false),
-        "mysql" | "clickhouse" => (format!("{kind}:"), String::new(), false),
+        "mysql" | "clickhouse" | "duckdb" => (format!("{kind}:"), String::new(), false),
         "ducklake" => ("ducklake:main.".into(), String::new(), false),
         "iceberg" => (
             format!(
@@ -1912,6 +1971,7 @@ mod table_from_tests {
         assert_eq!(named("dynamodb"), ("dynamodb:i0_x_t".into(), false));
         assert_eq!(named("mysql"), ("mysql:t".into(), false));
         assert_eq!(named("clickhouse"), ("clickhouse:t".into(), false));
+        assert_eq!(named("duckdb"), ("duckdb:t".into(), false));
         assert_eq!(named("ducklake"), ("ducklake:main.t".into(), false));
         assert_eq!(
             named("iceberg"),
@@ -1922,6 +1982,28 @@ mod table_from_tests {
         );
         assert_eq!(named("rustfs"), ("s3://b/t/".into(), true));
         assert_eq!(named("files"), ("file:///d/t/".into(), true));
+    }
+
+    #[test]
+    fn duckdb_sources_of_one_run_use_one_release() {
+        let source = |name: &str, kind: &str, release: &str| {
+            (name.to_string(), kind.to_string(), release.to_string())
+        };
+        one_duckdb_release(&[]).expect("no DuckDB sources");
+        one_duckdb_release(&[
+            source("src", "duckdb", "2.0.0"),
+            source("lake", "ducklake", "2.0.0"),
+        ])
+        .expect("one release");
+        assert_eq!(
+            one_duckdb_release(&[
+                source("src", "duckdb", "2.0.0"),
+                source("lake", "ducklake", "1.5.6")
+            ])
+            .expect_err("two releases")
+            .to_string(),
+            "Sources 'src' (duckdb) and 'lake' (ducklake) use DuckDB 2.0.0 and 1.5.6, but spiced loads one DuckDB library. Give them the same `version`, or remove both to use --duckdb-version or the newest release in test/duckdb_versions.json."
+        );
     }
 }
 

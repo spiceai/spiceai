@@ -364,6 +364,8 @@ elasticsearch = [
     "runtime-search/elasticsearch",
 ]
 duckdb = [
+    "dep:adbc_core",
+    "dep:adbc_driver_manager",
     "dep:duckdb",
     "dep:runtime-checkpoint-duckdb",
     "db_connection_pool/duckdb",

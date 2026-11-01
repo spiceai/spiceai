@@ -111,57 +111,9 @@
     {
       "run": "refresh-api-invalid-sql",
       "who": "append",
-      "key": "http: {\"body\":\"{\\\"refresh_sql\\\": \\\"SELECT * FROM other\\\"}\",\"headers\":{\"content-type\":\"application/json\"},\"method\":\"POST\",\"path\":\"/v1/datasets/t/acceleration/refresh\"}",
-      "kind": "status",
-      "signature": "status 201, expected 400",
-      "group": "api-and-errors"
-    },
-    {
-      "run": "refresh-api-invalid-sql",
-      "who": "append",
-      "key": "http: {\"body\":\"{\\\"refresh_sql\\\": \\\"SELECT * FROM t; DROP TABLE t\\\"}\",\"headers\":{\"content-type\":\"application/json\"},\"method\":\"POST\",\"path\":\"/v1/datasets/t/acceleration/refresh\"}",
-      "kind": "status",
-      "signature": "status 201, expected 400",
-      "group": "api-and-errors"
-    },
-    {
-      "run": "refresh-api-invalid-sql",
-      "who": "append",
-      "key": "http: {\"body\":\"{\\\"refresh_sql\\\": \\\"DELETE FROM t\\\"}\",\"headers\":{\"content-type\":\"application/json\"},\"method\":\"POST\",\"path\":\"/v1/datasets/t/acceleration/refresh\"}",
-      "kind": "status",
-      "signature": "status 201, expected 400",
-      "group": "api-and-errors"
-    },
-    {
-      "run": "refresh-api-invalid-sql",
-      "who": "append",
       "key": "http: {\"body\":\"{\\\"refresh_sql\\\": \\\"DELETE FROM t\\\"}\",\"headers\":{\"content-type\":\"application/json\"},\"method\":\"PATCH\",\"path\":\"/v1/datasets/t/acceleration\"}",
       "kind": "status",
       "signature": "status 500, expected 400",
-      "group": "api-and-errors"
-    },
-    {
-      "run": "refresh-api-invalid-sql",
-      "who": "full",
-      "key": "http: {\"body\":\"{\\\"refresh_sql\\\": \\\"SELECT * FROM other\\\"}\",\"headers\":{\"content-type\":\"application/json\"},\"method\":\"POST\",\"path\":\"/v1/datasets/t/acceleration/refresh\"}",
-      "kind": "status",
-      "signature": "status 201, expected 400",
-      "group": "api-and-errors"
-    },
-    {
-      "run": "refresh-api-invalid-sql",
-      "who": "full",
-      "key": "http: {\"body\":\"{\\\"refresh_sql\\\": \\\"SELECT * FROM t; DROP TABLE t\\\"}\",\"headers\":{\"content-type\":\"application/json\"},\"method\":\"POST\",\"path\":\"/v1/datasets/t/acceleration/refresh\"}",
-      "kind": "status",
-      "signature": "status 201, expected 400",
-      "group": "api-and-errors"
-    },
-    {
-      "run": "refresh-api-invalid-sql",
-      "who": "full",
-      "key": "http: {\"body\":\"{\\\"refresh_sql\\\": \\\"DELETE FROM t\\\"}\",\"headers\":{\"content-type\":\"application/json\"},\"method\":\"POST\",\"path\":\"/v1/datasets/t/acceleration/refresh\"}",
-      "kind": "status",
-      "signature": "status 201, expected 400",
       "group": "api-and-errors"
     },
     {

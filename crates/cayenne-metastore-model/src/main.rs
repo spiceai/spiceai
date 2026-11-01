@@ -1,7 +1,7 @@
 // Copyright 2024-2026 The Spice.ai OSS Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use cayenne_metastore_model::{run, runs};
+use cayenne_metastore_model::{cite_check, run, runs};
 
 // Checking clones and drops a state per transition; allocation dominates the
 // system allocator's profile.
@@ -33,6 +33,9 @@ fn main() -> Result<(), String> {
                 "commits-restart-turnover",
                 "unknown-action-refusal",
                 "naming",
+                "object-names",
+                "reads-linearizable",
+                "reads-bounded",
                 "table-seq",
                 "delete-coverage",
                 "pk-index-checkpoint",
@@ -72,7 +75,27 @@ fn main() -> Result<(), String> {
                 return Err("Unexpected outcomes; see RESULT lines".into());
             }
         }
-        _ => return Err("Usage: cayenne-metastore-model list | run <name> | quick | all".into()),
+        Some("cite-check") => {
+            let mut docs = Vec::new();
+            for path in &args[1..] {
+                let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+                docs.push((path.clone(), text));
+            }
+            let problems = cite_check(&docs);
+            for p in &problems {
+                println!("{p}");
+            }
+            if !problems.is_empty() {
+                return Err(format!("{} citation problems", problems.len()));
+            }
+            println!("CITATIONS ok: {} documents", docs.len());
+        }
+        _ => {
+            return Err(
+                "Usage: cayenne-metastore-model list | run <name> | quick | all | cite-check <doc>…"
+                    .into(),
+            );
+        }
     }
     Ok(())
 }
