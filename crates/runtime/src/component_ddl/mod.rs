@@ -526,8 +526,11 @@ fn shown_names<'a>(
 /// read `vectors.params` and a column's `embeddings[].params`. The parameters
 /// of the other vector engines, and of the full-text engines, are always
 /// redacted.
-fn vector_engine_specs() -> [(&'static str, &'static [ParameterSpec]); 1] {
-    [("s3_vectors", crate::embeddings::index::s3::PARAMETERS)]
+fn vector_engine_specs() -> Vec<(&'static str, &'static [ParameterSpec])> {
+    vec![
+        #[cfg(feature = "s3_vectors")]
+        ("s3_vectors", crate::embeddings::index::s3::PARAMETERS),
+    ]
 }
 
 /// The prefix and parameters of the accelerator `engine`, when it is registered.
