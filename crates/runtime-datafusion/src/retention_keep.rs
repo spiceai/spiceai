@@ -21,9 +21,9 @@ use datafusion::common::ToDFSchema;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::expr::Cast;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{Expr, ExprSchemable};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
-use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
@@ -95,8 +95,11 @@ pub fn fallible_implicit_string_cast(
     schema: &SchemaRef,
 ) -> Result<Option<FallibleImplicitCast>, DataFusionError> {
     let df_schema = Arc::clone(schema).to_dfschema_ref()?;
-    let simplifier =
-        ExprSimplifier::new(SimplifyContext::builder().with_schema(Arc::clone(&df_schema)).build());
+    let simplifier = ExprSimplifier::new(
+        SimplifyContext::builder()
+            .with_schema(Arc::clone(&df_schema))
+            .build(),
+    );
     let coerced = simplifier.coerce(delete_pred.clone(), &df_schema)?;
 
     // Coercion keeps the shape of the predicate and only wraps operands in
