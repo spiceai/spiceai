@@ -1,4 +1,5 @@
 {
+  "adbc-duckdb-catalog": 1,
   "append-embeddings": 13,
   "append-kill": 7,
   "append-time-column": 8,

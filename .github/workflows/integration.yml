@@ -400,6 +400,11 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-nextest
 
+      # duckdb: and ducklake: datasets load the installed DuckDB through ADBC.
+      - name: Install libduckdb
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-libduckdb
+
       - name: Login to DockerHub
         if: needs.check_changes.outputs.relevant_changes == 'true' && github.repository == 'spiceai/spiceai'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -607,6 +612,10 @@ jobs:
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
+
+      # duckdb: and ducklake: datasets load the installed DuckDB through ADBC.
+      - name: Install libduckdb
+        uses: ./.github/actions/setup-libduckdb
 
       - name: Login to DockerHub
         if: github.repository == 'spiceai/spiceai'
