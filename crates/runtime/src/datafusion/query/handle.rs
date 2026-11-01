@@ -942,6 +942,7 @@ impl QueryHandle {
                 Arc::clone(datasets),
                 self.query_start,
                 None,
+                self.df.ctx.task_ctx().memory_pool(),
             )
         } else {
             Box::pin(stream)

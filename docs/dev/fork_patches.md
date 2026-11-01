@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `da71801534bd1ee3fdcb04a5d7adaec8aedefa64` | `spiceai-55` |
+| [datafusion](#datafusion) | `77b231d1654fcc393ed198884c245062ae50262c` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `300acfcfb51abfa9c477f57bff3e0529ec4f5f1a` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `d323656c3bebc04fdce2ebc1cec31081f53b100d` | `spiceai-55` |
@@ -124,7 +124,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1f0744b900e69e1b3fafa721aa4283bd4b048a61` | `spiceai-0.11.0-df-55` |
-| [llama.cpp](#llamacpp) | `a337bb5ce3590beb8763494b4381fe830bac0bc8` | `spiceai-b11803` |
+| [llama.cpp](#llamacpp) | `2bedd1f734588bedf2aef43464172f2a446033cc` | `spiceai-b11999` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [orc-rust](#orc-rust) | `d9632e7ae973456c81c660c04e5f55cc86489bcb` | `spiceai-0.9` |
@@ -228,7 +228,9 @@ negation, and conservative aggregate functional dependencies from
 [fork PR #272](https://github.com/spiceai/datafusion/pull/272). On top of #272, #275 limits
 the nesting depth of a SQL data type, on top of #275, #277 carries the end-of-input part
 of upstream apache/datafusion#25312 and #25984 ahead of any release, and #279 and #280 make
-every join's output cooperative. The pin is the merge commit of #280. These commits descend
+every join's output cooperative. On top of #280, #281 reads a sort key over a
+`SELECT DISTINCT` that the list does not show from a `SELECT` above it. The pin is the
+merge commit of #281. These commits descend
 from #268's merge commit, so the existing patches remain in the commit ancestry. None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
@@ -274,7 +276,8 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Unparser: a `FULL JOIN` input that is itself a join keeps each filtered scan's filter in that scan's own derived table (fork PR #231) | The filter is lifted to the enclosing query's `WHERE`, which SQL evaluates after the `FULL JOIN`, so the null-extended rows the join preserves are discarded — 1 row where the plan returns 2 ([#12593](https://github.com/spiceai/spiceai/issues/12593)); a predicate on such an input that no scan applies is refused rather than emitted where it would discard rows | silent (wrong data) | `…::a_full_join_input_that_is_a_join_keeps_its_scan_filters_scoped` |
 | Unparser: an `EXISTS`-style join refuses a build-side key that only the build projection binds (fork PR #232) | `SELECT 1` replaces the build projection, so a key the projection renamed onto the probe's qualifier binds to the probe instead — `WHERE (p.c = p.c)`, always true: a semi join returns every row and an anti join none ([#13493](https://github.com/spiceai/spiceai/issues/13493)) | silent (wrong data) | `…::an_exists_refuses_a_build_key_only_the_build_projection_binds` |
 | Unparser: the dangling-qualifier sweep keeps a qualifier that an `UNNEST` or `LATERAL FLATTEN` alias, the last part of a schema-qualified table, or the column a struct field path is rooted at binds (spiceai/datafusion#246) | The sweep strips a qualifier that does bind: two `UNNEST` aliases sharing a column name give `SELECT c1, c1 …`, and a join of two schema-qualified tables gives `SELECT v, v FROM s.a INNER JOIN s.b …`, which `DuckDB` rejects as ambiguous; `test."metadata".product` is cut to `product` ([#13442](https://github.com/spiceai/spiceai/issues/13442)) | silent (query failure) | **GAP** — no guard here yet; in the fork, the `plan_to_sql.rs` cases #246 fixes; see [Open gaps](#open-gaps) |
-| Unparser: a sort key that reads a projection output that cannot be repeated, through a larger expression, puts the projection in a derived table so the `ORDER BY` reads the output by name (spiceai/datafusion#247) | `ORDER BY (r + 1.0)` over `random() AS r` is emitted as `ORDER BY (random() + 1.0)`, a second draw: the rows are ordered by a value the `SELECT` list never showed, and under a `LIMIT` a different row is selected than the one whose `r` comes back ([#14109](https://github.com/spiceai/spiceai/issues/14109)) | silent (wrong data) | **GAP** — no guard here yet; in the fork, the cases #247 adds to `plan_to_sql.rs`; see [Open gaps](#open-gaps) |
+| Unparser: a sort key that reads a projection output that cannot be repeated, through a larger expression, puts the projection in a derived table so the `ORDER BY` reads the output by name (spiceai/datafusion#247) | `ORDER BY (r + 1.0)` over `random() AS r` is emitted as `ORDER BY (random() + 1.0)`, a second draw: the rows are ordered by a value the `SELECT` list never showed, and under a `LIMIT` a different row is selected than the one whose `r` comes back ([#14109](https://github.com/spiceai/spiceai/issues/14109)) | silent (wrong data) | `crates/data_components/src/federation.rs::tests::a_sort_key_reading_a_volatile_output_orders_by_the_value_the_select_list_shows`, its `projection` arm; real-engine guard: the `random()` checks in `test/spicescript/unparse-sort-keys.yaml`. In the fork, the cases #247 adds to `plan_to_sql.rs` |
+| Unparser: a sort key over a `SELECT DISTINCT` that its list does not show reads the outputs from a `SELECT` above the `DISTINCT` one, through any filter lowered beneath the sort, with an unaliased aggregate or window output named; a key that matches the expression an output computes stays in the `DISTINCT` one only when every column it reads is an output passed through unchanged; in an unbounded `EXISTS` body, where its order reaches nothing, the sort is left out (spiceai/datafusion#281) | The key is not resolved through the `DISTINCT`: `ORDER BY ("b" + 1)` names an output alias inside an expression and `ORDER BY ("t"."a" + 1)` an expression the list does not show, so PostgreSQL refuses the whole query (`column "b" does not exist`; "for SELECT DISTINCT, ORDER BY expressions must appear in select list"), and an engine that accepts the alias evaluates `random()` again for it; a key that only looks like an output's expression is left where it reads the input, so over `-"a" AS "a"` the key `-"a"` orders by `a` itself and PostgreSQL 17 returns -3 where the plan's first row is -1; a SQLite `EXISTS` body with such a sort is refused outright ([#14109](https://github.com/spiceai/spiceai/issues/14109)) | query failure; silent (wrong data) where the engine accepts the alias | `crates/data_components/src/federation.rs::tests::a_sort_key_reading_a_volatile_output_orders_by_the_value_the_select_list_shows`, its `distinct` arm, `::a_computed_sort_key_over_distinct_is_ordered_above_it`, both arms, and `::a_sort_over_a_scoped_distinct_is_left_out_of_an_unbounded_exists_body`; real-engine guard: `test/spicescript/unparse-sort-keys.yaml`. A key that only looks like an output's expression has no guard here yet. In the fork, `test_sql_sort_keys_over_distinct_unparse_to_sql_postgres_accepts` and the `*_over_distinct_*` cases in `plan_to_sql.rs`, with `test_sort_key_over_distinct_matching_an_output_that_reuses_its_input_name_is_scoped` for the look-alike key |
 | Unparser: a join input that lists no columns of its own, such as a bare or filtered table scan, contributes `q.*` for each relation it reads; a column-less input contributes nothing beside another relation; an aggregate no projection takes lists its group keys before its aggregates (spiceai/datafusion#264) | The join's `SELECT` list no longer matches the plan's schema: `SELECT FROM t WHERE EXISTS (…)`, which `DuckDB` rejects, and `SELECT u.a, (u.a * 2) AS d FROM t INNER JOIN u …`, which returns two columns where the plan has three, so a consumer reading by position gets one input's columns under another's names ([#14738](https://github.com/spiceai/spiceai/issues/14738)) | silent (wrong data / query failure) | **GAP** — no guard here yet; in the fork, the join-input cases #264 adds to `plan_to_sql.rs`; see [Open gaps](#open-gaps) |
 | Unparser: nested IS and NOT predicates parenthesize their operands (#15538) | `(NOT x) IS NULL` selects different rows when emitted as `NOT x IS NULL`; MySQL rejects chained IS predicates; ClickHouse gives `NOT (x IS NULL) IS NULL` a different meaning from `NOT ((x IS NULL) IS NULL)` | silent (wrong data / query failure) | `crates/data_components/src/federation.rs::tests::is_predicate_unparsing_preserves_boolean_partitions`; real-engine guards: `test/spicescript/sql-predicate-precedence.yaml` and `test/spicescript/tlp.yaml`. In the fork, `test_unparser_preserves_is_predicate_operands` |
 | Unparser: renamed and computed projections keep named scopes for EXISTS input correlations (fork PRs #271 and #272) | INTERSECT/EXCEPT join keys cannot bind renamed output columns after projection replacement | query failure | `test/spicescript/unparse-set-operations.yaml`; fork `test_unparse_projected_set_operation_scopes` |
@@ -782,10 +785,14 @@ rather than by taking them. A re-cut cannot lose what the fork does not carry.
 ## llama.cpp
 
 Upstream [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). The fork carries
-upstream releases with the Spice patches below: each `spiceai-<release>` branch is the upstream
-release tag plus the Spice commits, and the pin is its tagged tip, `<release>-spiceai.<n>`,
-or a merge commit on it that no tag names yet: today the merge of spiceai/llama.cpp#8, the
-last of #7, #9, #11, #12 and #8 to land on `spiceai-b11803`.
+upstream releases with the Spice patches below: each `spiceai-<release>` branch is the previous
+Spice branch with the upstream release tag merged in, and the pin is its tagged tip,
+`<release>-spiceai.<n>`, or a merge commit on it that no tag names yet: today
+`b11999-spiceai.1`, upstream `b11984` and then `b11999` merged into `spiceai-b11803`, with
+`spiceai-b11803` merged in again at spiceai/llama.cpp#16. Since `b11984` the DeepSeek-V4.1 model (`deepseek41`) is upstream's, and the fork keeps only
+its fixes on top; of those, the ones without a row below (a LoRA adapter on `output.weight`,
+`deepseek41v` image preprocessing, MXFP8 NaN validation under `--check-tensors` and the
+converter's `--remote` Engram reads) are in code Spice does not call.
 `crates/llama-cpp` builds the sources
 with CMake and binds the part of the C API Spice's GGUF engine uses. To move to a new
 release, follow `spiceai/README.md` in the fork.
@@ -795,9 +802,13 @@ release, follow `spiceai/README.md` in the fork.
 | Cargo packaging: a root `Cargo.toml` and `spiceai/` make the release the `llama-cpp-src` git dependency, whose build script reports the source directory and release | Cargo cannot fetch the sources, and `crates/llama-cpp`'s build script has no `DEP_LLAMA_CPP_SRC_ROOT` | build | compile-guarded by `crates/llama-cpp` |
 | Tensor split across nodes over RPC: the head drives every rank's GPU as a device, a full mesh of direct links all-reduces each split layer for any rank count, and each rank pair moves to the fastest link it shares; the mesh's setup is bounded by a deadline, and a link that fails or shuts down ends the mesh instead of hanging a rank or raising `SIGPIPE` (spiceai/llama.cpp#8) | A model split across nodes fails to load, or all-reduces through the head over copies, several times slower; a rank whose link drops hangs or takes `spiced` down | build (and silent perf, crash) | `distributed::a_model_split_across_two_ranks_answers_as_on_one` (`crates/llms-llamacpp/tests/distributed.rs`): Qwen3-0.6B split across two local ranks answers as on one |
 | `glm5-next` (GLM-5.3) and gated-delta-net state tensors split along the axis that keeps each state whole (spiceai/llama.cpp#8) | GLM-5.3 and Qwen3.8 fail to load split across nodes, or split a recurrent state mid-row | build / crash | **GAP** — no small `glm5-next` or Qwen3.8 GGUF to split here; the fork's `test-llama-archs --rpc` covers them; see [Open gaps](#open-gaps) |
-| Opt-in decode and prompt levers for a split model: graph slots, backend sampling, sampler reuse, RPC read pipelining and async reads, deferred and stream-queued all-reduce, prompt-sized KV padding (`LLAMA_KV_PROMPT_PAD`) and a BF16 NCCL all-reduce wire (`GGML_NCCL_WIRE_BF16`) (spiceai/llama.cpp#7, #8, #12) | Each is off unless its environment variable is set, so losing one only loses its speed | silent (perf) | **GAP** — perf-only rows; see [Open gaps](#open-gaps) |
+| Opt-in decode and prompt levers for a split model: graph slots, backend sampling, sampler reuse, RPC read pipelining and async reads, deferred and stream-queued all-reduce, prompt-sized KV padding (`LLAMA_KV_PROMPT_PAD`), `n_kv` padding past 256 cells (`LLAMA_KV_PAD`) and a BF16 NCCL all-reduce wire (`GGML_NCCL_WIRE_BF16`) (spiceai/llama.cpp#7, #8, #12, #15) | Each is off unless its environment variable is set, so losing one only loses its speed | silent (perf) | **GAP** — perf-only rows; see [Open gaps](#open-gaps) |
 | The meta backend's graph-slot state and its device and buffer-type registries take locks, and a freed compute buffer drops the graph split parked under it (spiceai/llama.cpp#9; the same PR's backend-sampling fix is in `llama-server`, which Spice does not run) | Two models split across nodes that load or compute on threads of their own, as each of Spice's models does, race on the registries; with graph slots on, every recreated scheduler leaves a parked split behind | crash (race) / silent (memory) | **GAP** — races, which the fork's `test-meta-graph-slots` catches under ThreadSanitizer; see [Open gaps](#open-gaps) |
 | CUDA `mul_mat_vec_q` guards its last block of rows by the rows of `dst`, so a one-token `MUL_MAT_ID` whose expert row count is not a multiple of the rows per block is computed once (spiceai/llama.cpp#11; the defect is upstream's) | On CUDA, decoding one token of such a mixture-of-experts model reads past an expert's rows and overwrites the next expert's first rows, racing that expert's own block, so its logits are wrong and differ from run to run. The models served from this fork have expert rows that are multiples of four and never reach it | silent (wrong data, CUDA only) | **GAP** — CUDA only; the fork's `test-backend-ops -o MUL_MAT_ID` case (`n_mats` 8, `n_used` 6, `m` 66, `n` 1, `k` 768) covers it; see [Open gaps](#open-gaps) |
+| RPC graphs are serialized on the head and rebuilt on a rank without an allocation per tensor: open-addressing sets and indexes replace per-tensor hash-map nodes, and the tensor vectors are reused across graphs, with the bytes sent unchanged (spiceai/llama.cpp#14) | Each graph a split model has not sent before costs more CPU to serialize on the head and to rebuild on every rank, which a prompt that needs new graphs pays before it computes | silent (perf) | **GAP** — a perf-only row; see [Open gaps](#open-gaps) |
+| Saving a sequence's state queues each tensor's read on its backend and synchronizes each backend once, and the meta backend's asynchronous read covers split and offset reads as its synchronous read does; a quantized tensor is still read synchronously (spiceai/llama.cpp#16) | A prompt-cache checkpoint of a split model waits one round trip per tensor again: about 72 ms instead of 28 ms on GLM-5.3 split three ways | silent (perf) | **GAP** — a perf-only row; the fork's `test-meta-async-read` checks that the asynchronous read returns what the synchronous one does; see [Open gaps](#open-gaps) |
+| `glm5-next` (GLM-5.3) records its layer inputs for a DFlash drafter, as the models upstream's DFlash supports do | A DFlash draft over GLM-5.3-Flash aborts `spiced` when its graph's outputs are set (layer input tensor is null) | crash | **GAP** — no small `glm5-next` GGUF or drafter to run here; see [Open gaps](#open-gaps) |
+| A DeepSeek-V4 GGUF whose `attention.output_group_count` is 0 fails its load while its hyperparameters are read (`deepseek4`, whose hyperparameters `deepseek41` shares); the attention heads are divided among that many groups | The load goes on to divide by the group count when it sizes the attention output tensors: undefined behaviour in C++, and a `SIGFPE` that takes `spiced` down where the CPU traps it, as x86 does | crash | `a_zero_output_group_count_fails_a_deepseek_load` (`crates/llama-cpp/tests/gguf_corruption.rs`); without the check, the same header fails later, on a missing key |
 | A failed check while loading a model throws instead of aborting: libllama defines `GGML_ABORT_THROWS`, under which `GGML_ABORT` throws a `std::runtime_error` inside the `llama_abort_throws_scope` that `llama_model_load` opens in the try block that catches it, and aborts as upstream everywhere else | Without the patch, a GGUF whose metadata fails a `GGML_ASSERT`, such as an unknown `<arch>.classifier.activation`, aborts `spiced` at load instead of failing that model. Without its scope, a failed check outside a load throws out of a C API function that catches nothing, into Rust | crash | `an_unknown_classifier_activation_fails_the_load_instead_of_aborting` and `a_corrupted_gguf_fails_its_load_without_taking_the_process_down` (`crates/llama-cpp/tests`) for the load, and `sampler::tests::a_failed_check_outside_a_model_load_aborts_instead_of_throwing` (`crates/llama-cpp/src/sampler.rs`) for everywhere else |
 
 ## candle and its kernel crates
@@ -868,7 +879,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**49 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**51 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -890,11 +901,10 @@ They are not equal in consequence; this is the order to close them in.
    logits differ from a correct kernel's. A guard needs a CUDA runner and a
    mixture-of-experts GGUF whose expert rows are not a multiple of four.
 3. `datafusion` fixes the pin to spiceai/datafusion#273 carries ahead of their
-   guards, four rows. #262 (a decimal cast that drops digits) has its guard in
+   guards, three rows. #262 (a decimal cast that drops digits) has its guard in
    [#15207](https://github.com/spiceai/spiceai/pull/15207), which replaces its
-   **GAP** marker when it lands. The unparser fixes #246, #247 and #264
+   **GAP** marker when it lands. The unparser fixes #246 and #264
    ([#13442](https://github.com/spiceai/spiceai/issues/13442),
-   [#14109](https://github.com/spiceai/spiceai/issues/14109),
    [#14738](https://github.com/spiceai/spiceai/issues/14738)) have none: each needs
    a federated query whose pushed SQL a real engine answers differently without
    the patch, as the other unparser guards in `crates/data_components/src/federation.rs` do.
@@ -935,7 +945,9 @@ They are not equal in consequence; this is the order to close them in.
    each architecture small enough for CI; today's evidence is those models served
    on the 3-node DGX Spark cluster. The same holds for `llama.cpp`'s `glm5-next`
    and gated-delta-net state split across nodes (spiceai/llama.cpp#8): a load
-   error if lost, guarded in the fork by `test-llama-archs --rpc`; and for its
+   error if lost, guarded in the fork by `test-llama-archs --rpc`; for its
+   `glm5-next` layer inputs for a DFlash drafter, an abort of the draft if lost,
+   which a guard here would need a GLM-5.3 drafter small enough for CI to reach; and for its
    meta-backend locks (spiceai/llama.cpp#9), races that the fork's
    `test-meta-graph-slots` catches under ThreadSanitizer, which a test here would
    need two split models on one host to reach.
@@ -992,7 +1004,9 @@ without becoming a flaky timing test:
     `mistral.rs` ring collectives over RDMA (spiceai/mistral.rs#53), which no suite
     here trends either — a ring that loses it falls back to TCP;
     `llama.cpp`'s opt-in decode and prompt levers for a model split across nodes
-    (spiceai/llama.cpp#7, #8, #12), measured on the same cluster;
+    (spiceai/llama.cpp#7, #8, #12), its RPC graph serialization without per-tensor
+    allocation (spiceai/llama.cpp#14) and its asynchronous state reads (spiceai/llama.cpp#16),
+    measured on the same cluster;
     `snowflake-rs` streaming batches (memory, not latency — but see the
     `snowflake-rs` note above: it is blocked with the rest of that fork);
     `async-openai` retry-after handling; `datafusion`'s `IoWaitHook` carry through

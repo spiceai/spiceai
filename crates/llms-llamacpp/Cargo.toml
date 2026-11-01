@@ -25,6 +25,7 @@ runtime-request-context = { path = "../runtime-request-context" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["fs", "rt", "time"] }
 tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 tempfile.workspace = true
