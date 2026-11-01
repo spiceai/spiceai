@@ -840,6 +840,52 @@ async fn file_connector_projection_pushdown() -> Result<(), anyhow::Error> {
         .await
 }
 
+/// A filter on `content` of a document dataset (`file_format: md`) must be applied above
+/// the scan. It used to be pushed into the scan and fail with
+/// `Schema error: No field named content`.
+#[tokio::test]
+async fn file_connector_document_content_filter() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("file_connector_content_filter")
+                .with_dataset(get_raw_file_dataset()?)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            let (_, rows) =
+                run_and_count(&rt, "SELECT location FROM docs WHERE length(content) > 0").await?;
+            assert_eq!(rows, 1, "the one non-empty document should match");
+
+            let (_, rows) = run_and_count(
+                &rt,
+                "SELECT location FROM docs WHERE content LIKE '%Testing 2%'",
+            )
+            .await?;
+            assert_eq!(rows, 1, "the document containing 'Testing 2' should match");
+
+            let (_, rows) = run_and_count(
+                &rt,
+                "SELECT location FROM docs WHERE content LIKE '%not in the document%'",
+            )
+            .await?;
+            assert_eq!(rows, 0, "no document should match");
+
+            Ok(())
+        })
+        .await
+}
+
 fn write_orders_csv(path: &std::path::Path) -> Result<(), anyhow::Error> {
     std::fs::write(path, "id,name\n1,alpha\n2,bravo\n")?;
     Ok(())

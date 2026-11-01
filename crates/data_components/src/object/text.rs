@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::{
     catalog::Session,
-    common::{Column, Constraint, Constraints, Statistics, project_schema, stats::Precision},
+    common::{Constraint, Constraints, Statistics, project_schema, stats::Precision},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -231,9 +231,9 @@ impl TableProvider for ObjectStoreTextTable {
         Ok(filters
             .iter()
             .map(|f| {
-                if f.column_refs()
-                    .contains(&Column::from_qualified_name("content"))
-                {
+                // `scan` evaluates pushed filters against object metadata only, which has no
+                // `content`. Match by name: the planner passes qualified columns (`tbl.content`).
+                if f.column_refs().iter().any(|c| c.name == "content") {
                     TableProviderFilterPushDown::Unsupported
                 } else {
                     TableProviderFilterPushDown::Inexact
@@ -395,5 +395,47 @@ pub(crate) fn to_sendable_stream(
                 Err(e) => yield Err(DataFusionError::Execution(format!("{e}"))),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::{
+        common::Column,
+        functions::expr_fn::length,
+        prelude::{col, lit},
+    };
+    use object_store::memory::InMemory;
+
+    fn text_table() -> ObjectStoreTextTable {
+        let url = Url::parse("file:///tmp/docs/").expect("valid url");
+        ObjectStoreTextTable::try_new(Arc::new(InMemory::new()), &url, None, None, None)
+            .expect("text table")
+    }
+
+    #[test]
+    fn content_filters_are_not_pushed_down() {
+        let table = text_table();
+        let qualified = length(Expr::Column(Column::new(Some("docs"), "content"))).gt(lit(0));
+        let unqualified = length(col("content")).gt(lit(0));
+        let location = col("docs.location").eq(lit("a.md"));
+        let mixed = col("docs.location")
+            .eq(lit("a.md"))
+            .or(Expr::Column(Column::new(Some("docs"), "content")).eq(lit("x")));
+
+        let result = table
+            .supports_filters_pushdown(&[&qualified, &unqualified, &location, &mixed])
+            .expect("supports_filters_pushdown");
+
+        assert_eq!(
+            result,
+            vec![
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Unsupported,
+            ]
+        );
     }
 }
