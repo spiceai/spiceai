@@ -132,9 +132,7 @@ def install(version: str | None, cache_dir: Path) -> Path:
         )
 
     target = cache_dir / version
-    manifest = target / MANIFEST
-    stamp = target / ".sha256"
-    if manifest.is_file() and stamp.is_file() and stamp.read_text().strip() == expected:
+    if installed(target, expected):
         return target
 
     url = archive_url(version, release)
@@ -151,6 +149,7 @@ def install(version: str | None, cache_dir: Path) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{version}-", dir=cache_dir))
     staging.chmod(0o755)
+    old = None
     try:
         (staging / library).write_bytes(extract(archive, url, library))
         (staging / MANIFEST).write_text(
@@ -159,17 +158,36 @@ def install(version: str | None, cache_dir: Path) -> Path:
             'entrypoint = "duckdb_adbc_init"\n'
         )
         (staging / ".sha256").write_text(expected + "\n")
+        # Another run may have installed the release while this one downloaded
+        # it. Its caller may already be loading that copy, so keep it.
+        if installed(target, expected):
+            return target
+        # A stale or partial install is renamed aside, not deleted in place, so
+        # the directory is only ever absent between two renames.
         if target.exists():
-            shutil.rmtree(target)
+            old = Path(tempfile.mkdtemp(prefix=f".{version}-old-", dir=cache_dir))
+            target.rename(old / "old")
         try:
             staging.rename(target)
         except OSError:
-            # Another run installed the same release first.
-            if not (stamp.is_file() and stamp.read_text().strip() == expected):
+            if not installed(target, expected):
                 raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+        if old is not None:
+            shutil.rmtree(old, ignore_errors=True)
     return target
+
+
+def installed(target: Path, expected: str) -> bool:
+    """Whether `target` holds a complete install of the archive with SHA-256
+    `expected`. The stamp is written last, so it marks a finished install."""
+    stamp = target / ".sha256"
+    return (
+        (target / MANIFEST).is_file()
+        and stamp.is_file()
+        and stamp.read_text().strip() == expected
+    )
 
 
 def main() -> int:
