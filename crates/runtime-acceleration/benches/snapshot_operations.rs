@@ -186,7 +186,6 @@ fn available_engines() -> Vec<(&'static str, AccelerationEngine)> {
     #[cfg(feature = "sqlite")]
     engines.push(("sqlite", AccelerationEngine::Sqlite));
 
-
     engines
 }
 

@@ -127,10 +127,7 @@ pub fn policy_recreates_on_incompatible(policy: OnSchemaChange) -> bool {
 /// and Postgres rely on the trait default and degrade to block-equivalent.
 #[must_use]
 pub fn engine_supports_in_place_evolution(engine: Engine) -> bool {
-    matches!(
-        engine,
-        Engine::DuckDB | Engine::Sqlite | Engine::Cayenne
-    )
+    matches!(engine, Engine::DuckDB | Engine::Sqlite | Engine::Cayenne)
 }
 
 /// Engines whose [`data_accelerator_api::DataAccelerator::drop_table`] actually drops the

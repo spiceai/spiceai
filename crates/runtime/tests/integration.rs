@@ -180,11 +180,7 @@ mod s3;
 mod s3_folder_marker;
 mod s3_location_pruning;
 mod s3_parquet_overwrite;
-#[cfg(any(
-    feature = "postgres",
-    feature = "duckdb",
-    feature = "sqlite"
-))]
+#[cfg(any(feature = "postgres", feature = "duckdb", feature = "sqlite"))]
 mod schema_evolution;
 #[cfg(feature = "sharepoint")]
 mod sharepoint;
