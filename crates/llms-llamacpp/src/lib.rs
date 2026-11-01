@@ -29,6 +29,7 @@ limitations under the License.
 
 use std::{
     collections::{HashMap, VecDeque},
+    fmt::Write as _,
     num::NonZeroU32,
     ops::Range,
     path::{Path, PathBuf},
@@ -87,6 +88,7 @@ use llms::streaming_utils::generate_stream_id;
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
 
 mod distributed;
+mod harmony;
 
 llms::register_local_chat_engine!(
     LLAMA_CPP,
@@ -213,6 +215,8 @@ pub struct LlamaCpp {
     model_name: String,
     template: Template,
     special: SpecialTokens,
+    /// The markers of the Harmony replies the template asks for, when it asks for them.
+    harmony: Option<harmony::Markers>,
     reasoning_support: ReasoningSupport,
     counter: AtomicUsize,
     /// See [`Loaded::context_window`].
@@ -239,6 +243,8 @@ struct Loaded {
     /// `general.architecture`, as the GGUF names it.
     architecture: Option<String>,
     special: SpecialTokens,
+    /// The Harmony markers, when the vocabulary holds them.
+    harmony: Option<harmony::Markers>,
     /// The context llama.cpp created, in tokens: what one request can hold.
     context_window: u32,
     /// How many prompt tokens each request reads from the KV cache, as the thread sets it.
@@ -273,6 +279,9 @@ struct Job {
     reasoning: Option<TagReasoningContext>,
     /// Reads tool calls out of the content, when the request offers tools.
     tools: Option<ToolCallingMatcher>,
+    /// Reads a Harmony reply, which carries its reasoning, content and tool calls in its own
+    /// messages, in place of `reasoning` and `tools`.
+    harmony: Option<harmony::Reader>,
     /// Whether `tool_choice` requires a tool call, so a reply without one fails.
     require_tool_call: bool,
     /// Set when the decode thread is stopping, which ends the request.
@@ -435,7 +444,7 @@ impl LlamaCpp {
                     "the GGUF file carries no chat template, and the model sets no `chat_template`"
                         .into(),
             })?;
-        check_reply_format(&template, loaded.architecture, file)?;
+        let harmony = check_reply_format(&template, loaded.architecture, loaded.harmony, file)?;
 
         let model_name = options.reasoning.model_name.to_string();
         let reasoning_support = {
@@ -454,6 +463,7 @@ impl LlamaCpp {
                         enable_thinking,
                         effort,
                         Vec::new(),
+                        true,
                     )
                     .ok()
                 })
@@ -475,6 +485,7 @@ impl LlamaCpp {
             model_name,
             template,
             special: loaded.special,
+            harmony,
             reasoning_support,
             counter: AtomicUsize::new(0),
             context_window: loaded.context_window,
@@ -490,11 +501,14 @@ impl LlamaCpp {
         self.reused_prompt_tokens.load(Ordering::Relaxed)
     }
 
+    /// The conversation as the chat template renders it, with its generation prompt when
+    /// `generation_prompt`.
     fn prompt(
         &self,
         messages: &[ChatCompletionRequestMessage],
         reasoning: ReasoningControls,
         tools: Vec<Tool>,
+        generation_prompt: bool,
     ) -> std::result::Result<String, OpenAIError> {
         render(
             &self.template,
@@ -503,6 +517,7 @@ impl LlamaCpp {
             reasoning.enable_thinking,
             reasoning.reasoning_effort,
             tools,
+            generation_prompt,
         )
         .map_err(|e| {
             OpenAIError::InvalidArgument(format!("Failed to render the chat template: {e}"))
@@ -534,13 +549,22 @@ impl LlamaCpp {
         // The template this request renders with, for what its markup decides.
         let template = chosen_template(&self.template, !tools.is_empty())
             .map_err(OpenAIError::InvalidArgument)?;
-        let grammar = content_grammar(
-            &self.model_name,
-            template,
-            req.response_format.as_ref(),
-            &callable,
-            &obliged,
-        )?;
+        let content = || {
+            content_grammar(
+                &self.model_name,
+                template,
+                req.response_format.as_ref(),
+                &callable,
+                &obliged,
+            )
+        };
+        // Harmony is read only when the template this request renders with writes it: named
+        // templates may mix a Harmony one with one that is not.
+        let markers = request_markers(self.harmony, template);
+        // A required Harmony call has a grammar of its own (below); otherwise the content's
+        // grammar holds the reply.
+        let harmony_call_held = markers.is_some() && !obliged.is_empty();
+        let content = if harmony_call_held { None } else { content()? };
         // Each choice reads its own reply, so each has its own reader.
         let matchers = (0..choices)
             .map(|_| {
@@ -560,8 +584,40 @@ impl LlamaCpp {
             .first()
             .and_then(Option::as_ref)
             .is_some_and(ToolCallingMatcher::requires_tool_call);
-        let ban_eog = require_tool_call && grammar.is_none();
-        let prompt = self.prompt(&req.messages, reasoning, tools)?;
+        let ban_eog = require_tool_call && !harmony_call_held && content.is_none();
+        let nameable = nameable_tools(&callable, &obliged);
+        let held = if !obliged.is_empty() {
+            harmony::Held::Call
+        } else if content.is_some() {
+            harmony::Held::Reply
+        } else {
+            harmony::Held::Nothing
+        };
+        let prompt = self.prompt(&req.messages, reasoning, tools.clone(), true)?;
+        // Every choice's reply starts where the prompt leaves it, so the prompt is read once,
+        // from what the generation prompt adds after the conversation the template renders
+        // without it (`harmony::reply_text`).
+        let reader = markers.map(|markers| {
+            let conversation = self
+                .prompt(&req.messages, reasoning, tools.clone(), false)
+                .ok();
+            harmony::Reader::new(markers, nameable, held).after(harmony::reply_text(
+                &markers,
+                &prompt,
+                conversation.as_deref(),
+            ))
+        });
+        // A Harmony grammar holds the reply by the vocabulary's markers, from where the prompt
+        // leaves it.
+        let grammar = match &reader {
+            Some(reader) if harmony_call_held => {
+                Some(harmony_call(reader.markers(), &obliged, reader.opened())?)
+            }
+            Some(reader) => {
+                content.map(|reply| harmony_reply(reader.markers(), &reply, reader.opened()))
+            }
+            None => content,
+        };
         let stop = match &req.stop {
             Some(StopConfiguration::String(s)) => vec![s.clone()],
             Some(StopConfiguration::StringArray(s)) => s.clone(),
@@ -572,6 +628,7 @@ impl LlamaCpp {
         let mut receivers = Vec::with_capacity(choices);
         for tools in matchers {
             let (events, rx) = mpsc::channel(STREAM_BUFFER);
+            let harmony = reader.clone();
             let job = Job {
                 reasoning: reasoning_parser(template, &prompt),
                 prompt: prompt.clone(),
@@ -588,7 +645,8 @@ impl LlamaCpp {
                     ban_eog,
                 },
                 stop: stop.clone(),
-                tools,
+                tools: tools.filter(|_| harmony.is_none()),
+                harmony,
                 require_tool_call,
                 stopping: Arc::clone(&self.decoder.stopping),
                 events,
@@ -829,7 +887,8 @@ fn tool_call(call: &ToolCallResponse) -> ChatCompletionMessageToolCalls {
     })
 }
 
-/// Renders a conversation the way the mistral.rs engine does.
+/// Renders a conversation the way the mistral.rs engine does, with the template's generation
+/// prompt when `generation_prompt`.
 fn render(
     template: &Template,
     special: &SpecialTokens,
@@ -837,10 +896,11 @@ fn render(
     enable_thinking: Option<bool>,
     reasoning_effort: Option<TemplateReasoningEffort>,
     tools: Vec<Tool>,
+    generation_prompt: bool,
 ) -> std::result::Result<String, String> {
     apply_chat_template_to(
         messages,
-        true,
+        generation_prompt,
         enable_thinking,
         reasoning_effort,
         &ChatTemplateValue(template.clone()),
@@ -973,6 +1033,7 @@ fn serve(
         template: model.chat_template(),
         architecture: model.architecture(),
         special,
+        harmony: harmony::Markers::find(vocab),
         context_window,
         reused_prompt_tokens: Arc::clone(&cache.reused),
     };
@@ -1164,21 +1225,31 @@ fn load_error(path: &Path, error: llama_cpp::Error) -> ChatError {
     }
 }
 
-/// A Harmony reply (gpt-oss) is read token by token rather than as text, which this engine
-/// does not do, so a model whose chat template writes one is refused rather than served with
-/// its channel markup in the content.
+/// A Harmony reply (gpt-oss) is read token by token, by its markers, so a model whose chat
+/// template writes one is served only when its vocabulary holds every marker as one token, and
+/// refused otherwise rather than served with its channel markup in the content. Returns the
+/// markers a Harmony template's replies are read by.
 fn check_reply_format(
     template: &Template,
     architecture: Option<String>,
+    markers: Option<harmony::Markers>,
     file: String,
-) -> Result<()> {
-    if templates(template).any(is_harmony_template) {
-        return Err(ChatError::UnsupportedArchitecture {
+) -> Result<Option<harmony::Markers>> {
+    if !templates(template).any(is_harmony_template) {
+        return Ok(None);
+    }
+    markers
+        .map(Some)
+        .ok_or_else(|| ChatError::UnsupportedArchitecture {
             architecture: architecture.unwrap_or_else(|| "gpt-oss".to_string()),
             file,
-        });
-    }
-    Ok(())
+        })
+}
+
+/// The markers a request's reply is read by: the model's, when the template the request renders
+/// with writes Harmony, and none for a template that does not.
+fn request_markers(markers: Option<harmony::Markers>, template: &str) -> Option<harmony::Markers> {
+    markers.filter(|_| is_harmony_template(template))
 }
 
 /// The file an error names: its name, or the whole path when it has none.
@@ -1578,6 +1649,7 @@ struct Output {
     produced: u32,
     reasoning: Option<TagReasoningContext>,
     tools: Option<ToolSplit>,
+    harmony: Option<harmony::Reader>,
     require_tool_call: bool,
     /// Whether tool calls were sent; nothing is sent after them.
     called: bool,
@@ -1596,6 +1668,7 @@ impl Output {
             produced: 0,
             reasoning: job.reasoning,
             tools: job.tools.map(ToolSplit::new),
+            harmony: job.harmony,
             require_tool_call: job.require_tool_call,
             called: false,
             failure: None,
@@ -1604,26 +1677,111 @@ impl Output {
         (job.prompt, job.sampling, output)
     }
 
-    /// Whether generation has left any reasoning block, so `response_format` applies.
+    /// The reply's text the prompt wrote, for the grammar to be advanced over before the reply
+    /// goes on from where the prompt left it.
+    fn pending(&self) -> &str {
+        self.harmony.as_ref().map_or("", harmony::Reader::pending)
+    }
+
+    /// Starts the reply where the prompt left it when it `goes_on` from there, sending the
+    /// text the prompt began the opened message with first; otherwise from a header.
+    fn begin(&mut self, goes_on: bool) {
+        if let Some(reader) = self.harmony.as_mut() {
+            let begun = reader.begin(goes_on);
+            // A client that is gone is found at the next send, as it is for any other.
+            self.route(&begun);
+        }
+    }
+
+    /// Whether generation has left any reasoning block, so `response_format` applies: in a
+    /// Harmony reply, whether it is in its final message.
     fn in_content(&self) -> bool {
-        !self
-            .reasoning
-            .as_ref()
-            .is_some_and(TagReasoningContext::is_in_think_block)
+        match &self.harmony {
+            Some(reader) => reader.in_grammar(),
+            None => !self
+                .reasoning
+                .as_ref()
+                .is_some_and(TagReasoningContext::is_in_think_block),
+        }
+    }
+
+    /// The end-of-generation tokens a required tool call rules out: all of `eog` but the one
+    /// that ends a Harmony reply with a call.
+    fn ruled_out(&self, eog: &[Token]) -> Vec<Token> {
+        let call = self.harmony.as_ref().map(|reader| reader.markers().call());
+        eog.iter().copied().filter(|&t| Some(t) != call).collect()
     }
 
     /// Sends one sampled token, or returns why generation ends.
     fn token(&mut self, model: &Model, token: Token) -> Option<FinishReason> {
+        let vocab = model.vocab();
+        self.read(token, vocab.is_eog(token), || {
+            vocab.token_to_piece(token, true)
+        })
+    }
+
+    /// Sends one sampled token, which ends generation when `eog` and otherwise reads as
+    /// `piece`, or returns why generation ends.
+    fn read(
+        &mut self,
+        token: Token,
+        eog: bool,
+        piece: impl FnOnce() -> Vec<u8>,
+    ) -> Option<FinishReason> {
         if self.stopping.load(Ordering::Relaxed) {
             self.failure = Some(DECODE_STOPPED.to_string());
             return Some(FinishReason::Stop);
         }
-        let vocab = model.vocab();
-        if vocab.is_eog(token) {
+        // A Harmony marker is read before anything else, because two of them end generation
+        // and one of those completes a tool call.
+        if self
+            .harmony
+            .as_ref()
+            .is_some_and(|r| r.marks(token, self.stops.held()))
+        {
+            return self.mark(token, eog);
+        }
+        if eog {
             return Some(FinishReason::Stop);
         }
         self.produced += 1;
-        self.bytes(&vocab.token_to_piece(token, true))
+        let piece = piece();
+        if let Some(reader) = self.harmony.as_mut()
+            && reader.in_header()
+        {
+            // A header names a channel and a recipient, which no stop sequence applies to.
+            reader.text(&String::from_utf8_lossy(&piece));
+            return self.spent();
+        }
+        self.bytes(&piece)
+    }
+
+    /// Reads a Harmony marker, which ends generation when `eog`.
+    fn mark(&mut self, token: Token, eog: bool) -> Option<FinishReason> {
+        // What the stop matcher and the character assembly still hold belongs to the message
+        // the marker closes.
+        let mut held = self.stops.finish();
+        held.push_str(&String::from_utf8_lossy(&std::mem::take(&mut self.pending)));
+        if let Some(finish) = self.route(&held) {
+            return Some(finish);
+        }
+        let reader = self.harmony.as_mut()?;
+        // A marker that does not end generation is a completion token, whatever it does.
+        if !eog {
+            self.produced += 1;
+        }
+        match reader.mark(token) {
+            harmony::Mark::Next => self.spent(),
+            harmony::Mark::Call(call) => Some(self.calls(None, vec![call])),
+            harmony::Mark::Done => Some(FinishReason::Stop),
+        }
+    }
+
+    /// Whether the token budget is spent.
+    fn spent(&self) -> Option<FinishReason> {
+        self.limit
+            .is_some_and(|limit| self.produced as usize >= limit)
+            .then_some(FinishReason::Length)
     }
 
     /// Sends the text a token's bytes complete, or returns why generation ends.
@@ -1642,9 +1800,7 @@ impl Output {
         if stopped {
             return Some(FinishReason::Stop);
         }
-        self.limit
-            .is_some_and(|limit| self.produced as usize >= limit)
-            .then_some(FinishReason::Length)
+        self.spent()
     }
 
     /// Whether the client is still there to take `event`.
@@ -1657,6 +1813,15 @@ impl Output {
     fn route(&mut self, text: &str) -> Option<FinishReason> {
         if self.called || text.is_empty() {
             return None;
+        }
+        if let Some(reader) = self.harmony.as_mut() {
+            return match reader.text(text) {
+                harmony::Text::Reasoning => {
+                    (!self.send(Event::Reasoning(text.to_string()))).then_some(FinishReason::Stop)
+                }
+                harmony::Text::Content => self.content(text.to_string()),
+                harmony::Text::Held => None,
+            };
         }
         let (reasoning, content) = match self.reasoning.as_mut() {
             Some(parser) => {
@@ -1724,6 +1889,12 @@ impl Output {
             if self.route(&tail) == Some(FinishReason::ToolCalls) {
                 finish = FinishReason::ToolCalls;
             }
+        }
+        if !self.called
+            && self.failure.is_none()
+            && let Some(call) = self.harmony.as_mut().and_then(harmony::Reader::finish)
+        {
+            finish = self.calls(None, vec![call]);
         }
         if !self.called
             && let Some(parser) = self.reasoning.as_mut()
@@ -1870,16 +2041,24 @@ struct Picker<'v> {
     /// Whether each chain starts with the penalties, which then also hear of the tokens the
     /// other chain picks.
     penalized: bool,
+    /// Whether the grammar was advanced over all of the reply's text the prompt wrote, so the
+    /// reply goes on from where the prompt left it.
+    goes_on: bool,
 }
 
 impl<'v> Picker<'v> {
     /// `window` is how many generated tokens the penalties remember: the context's length
-    /// covers a whole reply.
+    /// covers a whole reply. The grammar is advanced over `pending`, the reply's text the
+    /// prompt wrote, when it allows each of its tokens in turn; on the first it does not, it
+    /// is built again at its root, and [`Picker::goes_on`] is false. Each token is checked
+    /// before the grammar is told of it, because llama.cpp aborts on a token a grammar
+    /// rejects.
     fn new(
         vocab: Vocab<'v>,
         sampling: &Sampling,
         eog: &[Token],
         window: u32,
+        pending: &str,
     ) -> std::result::Result<Self, String> {
         let frequency = sampling.frequency_penalty.unwrap_or(0.0);
         let presence = sampling.presence_penalty.unwrap_or(0.0);
@@ -1905,15 +2084,43 @@ impl<'v> Picker<'v> {
             samplers.extend(draw(sampling));
             Ok(Sampler::chain(samplers))
         };
+        let mut constrained = sampling
+            .grammar
+            .as_deref()
+            .map(|g| chain(Some(g)))
+            .transpose()?;
+        let mut goes_on = true;
+        if let (Some(grammar), Some(fed)) = (sampling.grammar.as_deref(), constrained.as_mut())
+            && !pending.is_empty()
+        {
+            // The grammar follows the penalties and the end-of-generation ban in its chain.
+            let at = i32::from(penalized) + i32::from(sampling.ban_eog);
+            let tokens = vocab
+                .tokenize(pending, false, true)
+                .map_err(|e| e.to_string())?;
+            goes_on = tokens.into_iter().all(|token| {
+                let allowed = fed.allows_at(at, token);
+                if allowed {
+                    fed.accept_at(at, token);
+                }
+                allowed
+            });
+            if !goes_on {
+                constrained = Some(chain(Some(grammar))?);
+            }
+        }
         Ok(Self {
             free: chain(None)?,
-            constrained: sampling
-                .grammar
-                .as_deref()
-                .map(|g| chain(Some(g)))
-                .transpose()?,
+            constrained,
             penalized,
+            goes_on,
         })
+    }
+
+    /// Whether the reply goes on from where the prompt left it: false only when the grammar
+    /// would not be advanced over the reply's text the prompt wrote.
+    fn goes_on(&self) -> bool {
+        self.goes_on
     }
 
     fn sample(&mut self, context: &Context<'_>, index: i32, in_content: bool) -> Token {
@@ -1958,7 +2165,14 @@ fn generate(
     let namespace = job.namespace.clone();
     let (prompt, sampling, mut out) = Output::new(job);
     let vocab = model.vocab();
-    let mut picker = Picker::new(vocab, &sampling, eog, context.n_ctx())?;
+    let mut picker = Picker::new(
+        vocab,
+        &sampling,
+        &out.ruled_out(eog),
+        context.n_ctx(),
+        out.pending(),
+    )?;
+    out.begin(picker.goes_on());
     // `tokens` grows by every reply token decoded, so it is always what the cache holds.
     let (mut tokens, mut batch) =
         read_prompt(model, context, cache, (&prompt, &namespace), &out.stopping)?;
@@ -2000,7 +2214,14 @@ fn generate_mtp(
     let namespace = job.namespace.clone();
     let (prompt, sampling, mut out) = Output::new(job);
     let vocab = model.vocab();
-    let mut picker = Picker::new(vocab, &sampling, eog, spec.target().n_ctx())?;
+    let mut picker = Picker::new(
+        vocab,
+        &sampling,
+        &out.ruled_out(eog),
+        spec.target().n_ctx(),
+        out.pending(),
+    )?;
+    out.begin(picker.goes_on());
     // `read_prompt` hands every decoded prompt batch to the head, which needs the target's
     // hidden state at each prompt position before `begin`; its cache keeps the positions the
     // target's reuses.
@@ -2206,6 +2427,11 @@ impl StopMatcher {
         (emit, false)
     }
 
+    /// The text held back as the possible start of a stop sequence.
+    fn held(&self) -> &str {
+        &self.held
+    }
+
     fn finish(&mut self) -> String {
         std::mem::take(&mut self.held)
     }
@@ -2276,6 +2502,17 @@ fn callable_tools<'t>(choice: Option<&ToolChoice>, tools: &'t [Tool]) -> Vec<&'t
     }
 }
 
+/// The names a Harmony reply's call may take: the tools `tool_choice` obliges a call to, when
+/// it obliges one, as a named choice does; otherwise the callable ones.
+fn nameable_tools(callable: &[&Tool], obliged: &[&Tool]) -> Vec<String> {
+    let tools = if obliged.is_empty() {
+        callable
+    } else {
+        obliged
+    };
+    tools.iter().map(|t| t.function.name.clone()).collect()
+}
+
 /// The tools among `tools` that `allowed` names.
 fn allowed_tools<'t>(allowed: &AllowedToolsToolChoice, tools: &'t [Tool]) -> Vec<&'t Tool> {
     tools
@@ -2340,15 +2577,103 @@ fn content_grammar(
     Ok(Some(either_grammar(&call, &reply)))
 }
 
+/// The grammar of a whole Harmony reply that must call one of `tools`: any reasoning, then a
+/// `commentary` message addressed to the tool, its arguments held to the tool's schema, as
+/// llama.cpp's server forces one. Each marker is its token, never text spelling it. The
+/// grammar goes on from where the prompt leaves the reply, `opened`.
+fn harmony_call(
+    markers: &harmony::Markers,
+    tools: &[&Tool],
+    opened: &harmony::Opened,
+) -> std::result::Result<String, OpenAIError> {
+    let [start, channel, message, end, _] = markers.terminals();
+    let mut grammar = harmony_rules(markers);
+    let mut calls = Vec::with_capacity(tools.len());
+    for (i, tool) in tools.iter().enumerate() {
+        let prefix = format!("tool{i}-");
+        let arguments = json_grammar(&arguments_schema(tool), "tools")?;
+        grammar.push_str(&prefix_rules(&arguments, &prefix));
+        let name = serde_json::Value::String(tool.function.name.clone());
+        calls.push(format!("{name} constrain? {message} {prefix}root"));
+    }
+    grammar.push_str("call ::= ");
+    grammar.push_str(&calls.join(" | "));
+    grammar.push('\n');
+    let call = format!("{channel} \"commentary to=functions.\" call");
+    let after_analysis = format!("reasoning {end} {start} \"assistant\" {call}");
+    let root = match opened {
+        harmony::Opened::Channel => {
+            format!("\"analysis\" {message} {after_analysis} | \"commentary to=functions.\" call")
+        }
+        harmony::Opened::AnalysisHeader => format!("{message} {after_analysis}"),
+        harmony::Opened::Analysis => after_analysis,
+        harmony::Opened::Call(name) => match tools.iter().position(|t| t.function.name == *name) {
+            Some(i) => format!("tool{i}-root"),
+            None => format!("analysis? {call}"),
+        },
+        // The reader goes on from no other message under a required call.
+        harmony::Opened::Header | harmony::Opened::FinalHeader | harmony::Opened::Final => {
+            format!("analysis? {call}")
+        }
+    };
+    let _ = writeln!(grammar, "root ::= {root}");
+    Ok(grammar)
+}
+
+/// The grammar of a whole Harmony reply held to a `response_format`: analysis messages, then
+/// a final message whose body is `reply`'s JSON, as llama.cpp's server holds one. A preamble
+/// is ruled out, since its text would be content outside the schema. The grammar goes on
+/// from where the prompt leaves the reply, `opened`.
+fn harmony_reply(markers: &harmony::Markers, reply: &str, opened: &harmony::Opened) -> String {
+    let [start, channel, message, end, _] = markers.terminals();
+    let mut grammar = harmony_rules(markers);
+    grammar.push_str(&prefix_rules(reply, "reply-"));
+    let whole = format!("analysis* {channel} \"final\" constrain? {message} reply-root");
+    let after_analysis = format!("reasoning {end} {start} \"assistant\" {whole}");
+    let root = match opened {
+        harmony::Opened::Channel => format!(
+            "\"analysis\" {message} {after_analysis} | \"final\" constrain? {message} reply-root"
+        ),
+        harmony::Opened::AnalysisHeader => format!("{message} {after_analysis}"),
+        harmony::Opened::FinalHeader => format!("constrain? {message} reply-root"),
+        harmony::Opened::Analysis => after_analysis,
+        harmony::Opened::Final => "reply-root".to_string(),
+        // The reader goes on from no call under a `response_format`.
+        harmony::Opened::Header | harmony::Opened::Call(_) => whole,
+    };
+    let _ = writeln!(grammar, "root ::= {root}");
+    grammar
+}
+
+/// The rules both Harmony grammars share: an analysis message and the role header of the
+/// message after it, and a header's optional content type.
+fn harmony_rules(markers: &harmony::Markers) -> String {
+    let [start, channel, message, end, constrain] = markers.terminals();
+    let mut rules = String::new();
+    let _ = writeln!(
+        rules,
+        "analysis ::= {channel} \"analysis\" {message} reasoning {end} {start} \"assistant\""
+    );
+    // The text between markers holds no `<|`, so it cannot spell one either.
+    rules.push_str("reasoning ::= ([^<] | \"<\" [^|])*\n");
+    let _ = writeln!(rules, "constrain ::= \" \" {constrain}? [A-Za-z0-9_-]+");
+    rules
+}
+
+/// A tool's arguments schema: its parameters, or any object.
+fn arguments_schema(tool: &Tool) -> serde_json::Value {
+    tool.function.parameters.as_ref().map_or_else(
+        || serde_json::json!({ "type": "object" }),
+        |p| serde_json::Value::Object(p.clone().into_iter().collect()),
+    )
+}
+
 /// The JSON schema of a call to one of `tools`, with the arguments held to the tool's schema.
 fn call_schema(tools: &[&Tool]) -> serde_json::Value {
     let calls: Vec<serde_json::Value> = tools
         .iter()
         .map(|tool| {
-            let arguments = tool.function.parameters.as_ref().map_or_else(
-                || serde_json::json!({ "type": "object" }),
-                |p| serde_json::Value::Object(p.clone().into_iter().collect()),
-            );
+            let arguments = arguments_schema(tool);
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2643,6 +2968,7 @@ mod tests {
             reasoning,
             require_tool_call: matcher.requires_tool_call(),
             tools: Some(matcher),
+            harmony: None,
             stopping: Arc::default(),
             events,
         };
@@ -2973,6 +3299,7 @@ mod tests {
             stop: Vec::new(),
             reasoning: reasoning_parser(template, prompt),
             tools: None,
+            harmony: None,
             require_tool_call: false,
             stopping: Arc::default(),
             events,
@@ -3030,28 +3357,742 @@ mod tests {
     }
 
     const HARMONY: &str = "{{ '<|start|>assistant<|channel|>final<|message|>' }}{{ '<|end|>' }}";
+    const HARMONY_MARKERS: harmony::Markers = harmony::TEST_MARKERS;
+
+    /// Named templates may mix a Harmony template with one that is not: a request rendered
+    /// with the other reads its reply as text, which a Harmony reader would hold as a header.
+    #[test]
+    fn only_a_request_whose_template_writes_harmony_reads_harmony() {
+        assert_eq!(
+            request_markers(Some(HARMONY_MARKERS), HARMONY),
+            Some(HARMONY_MARKERS)
+        );
+        let chatml = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>{% endfor %}";
+        assert_eq!(request_markers(Some(HARMONY_MARKERS), chatml), None);
+        assert_eq!(request_markers(None, HARMONY), None);
+    }
+
+    /// An `Output` reading a Harmony reply that may call `tools`, with `stop` sequences and a
+    /// token `limit`, and what it sends.
+    fn harmony_output(
+        tools: &[&str],
+        stop: &[&str],
+        limit: Option<usize>,
+    ) -> (Output, mpsc::Receiver<Event>) {
+        let (events, rx) = mpsc::channel(STREAM_BUFFER);
+        let tools = tools.iter().map(ToString::to_string).collect();
+        let job = Job {
+            prompt: String::new(),
+            namespace: CacheNamespace::Public,
+            limit,
+            sampling: Sampling::default(),
+            stop: stop.iter().map(ToString::to_string).collect(),
+            reasoning: None,
+            tools: None,
+            harmony: Some(harmony::Reader::new(
+                HARMONY_MARKERS,
+                tools,
+                harmony::Held::Nothing,
+            )),
+            require_tool_call: false,
+            stopping: Arc::default(),
+            events,
+        };
+        let (_, _, out) = Output::new(job);
+        (out, rx)
+    }
+
+    /// Generates `reply`: each marker as its token, which ends generation if it is
+    /// `<|return|>` or `<|call|>`, and other text a character per token. Returns why generation
+    /// ended, and after how many tokens.
+    fn generate_harmony(out: &mut Output, reply: &str) -> (Option<FinishReason>, usize) {
+        let ending = [Token(5), Token(6)];
+        let mut tokens = Vec::new();
+        for (marker, text) in harmony::spell(reply) {
+            match marker {
+                Some(token) => tokens.push((token, text)),
+                None => tokens.extend(text.chars().map(|c| (Token(100), c.to_string()))),
+            }
+        }
+        for (n, (token, text)) in tokens.into_iter().enumerate() {
+            if let Some(finish) = out.read(token, ending.contains(&token), || text.into_bytes()) {
+                return (Some(finish), n + 1);
+            }
+        }
+        (None, 0)
+    }
+
+    /// `sent`, with each run of one kind of event as one.
+    fn joined(sent: Vec<String>) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for event in sent {
+            match out.last_mut() {
+                Some(last)
+                    if last.starts_with("r:") && event.starts_with("r:")
+                        || last.starts_with("c:") && event.starts_with("c:") =>
+                {
+                    last.push_str(&event[2..]);
+                }
+                _ => out.push(event),
+            }
+        }
+        out
+    }
 
     #[test]
-    fn a_harmony_model_is_refused_as_an_unsupported_architecture() {
+    fn a_harmony_reply_sends_its_reasoning_then_its_answer() {
+        let (mut out, rx) = harmony_output(&[], &[], None);
+        let reply = "<|channel|>analysis<|message|>Add them.<|end|><|start|>assistant<|channel|>final<|message|>2 + 2 = 4<|return|>";
+        let (finish, n) = generate_harmony(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::Stop));
+        let outcome = out
+            .finish(FinishReason::Stop, 9)
+            .expect("the request succeeds");
+        // every token but the `<|return|>` that ends the reply
+        assert_eq!(outcome.completion_tokens as usize, n - 1);
+        assert_eq!(
+            joined(sent(rx)),
+            ["r:Add them.".to_string(), "c:2 + 2 = 4".to_string()]
+        );
+    }
+
+    /// A gpt-oss-style template whose generation prompt goes on from `<|start|>assistant` with
+    /// `OPENS`, as a custom template may. An earlier turn's reply is a final message, closed
+    /// with `<|end|>`, as gpt-oss's own template renders one.
+    const HARMONY_OPENS: &str = "{% for m in messages %}<|start|>{{ m.role }}{% if m.role == 'assistant' %}<|channel|>final{% endif %}<|message|>{{ m.content }}<|end|>{% endfor %}{% if add_generation_prompt %}<|start|>assistantOPENS{% endif %}";
+
+    /// The engine serving `template`, and the job it queues for a request with the fields
+    /// `request` sets (a question about France's capital, by default), and what that job sends.
+    fn harmony_job(
+        template: String,
+        request: serde_json::Value,
+    ) -> (LlamaCpp, String, Sampling, Output, mpsc::Receiver<Event>) {
+        let (jobs, queued) = std_mpsc::channel();
+        let llama = LlamaCpp {
+            decoder: DecodeThread {
+                model: "gpt-oss".to_string(),
+                jobs: Some(jobs),
+                stopping: Arc::default(),
+                freed: None,
+            },
+            model_name: "gpt-oss".to_string(),
+            template: Either::Left(template),
+            special: SpecialTokens::default(),
+            harmony: Some(HARMONY_MARKERS),
+            reasoning_support: ReasoningSupport::default(),
+            counter: AtomicUsize::new(0),
+            context_window: 0,
+            reused_prompt_tokens: Arc::default(),
+        };
+        let mut req = serde_json::json!({
+            "model": "gpt-oss",
+            "messages": [{ "role": "user", "content": "What is the capital of France?" }],
+        });
+        if let (Some(req), serde_json::Value::Object(fields)) = (req.as_object_mut(), request) {
+            req.extend(fields);
+        }
+        let req: CreateChatCompletionRequest = serde_json::from_value(req).expect("a request");
+        let receivers = llama
+            .submit(&req, &CacheNamespace::Public)
+            .expect("the request is queued");
+        let rx = receivers.into_iter().next().expect("one choice");
+        let (prompt, sampling, out) = Output::new(queued.try_recv().expect("its job"));
+        (llama, prompt, sampling, out, rx)
+    }
+
+    /// What a Harmony model's `reply` sends when the template's generation prompt goes on from
+    /// `<|start|>assistant` with `opens`, for a request with the fields `request` sets, or why
+    /// the request fails, and the `root` rule of the request's grammar, if it has one. The
+    /// request is queued as the engine queues it, so the reply is read from where the engine
+    /// starts reading it.
+    fn harmony_reply_after(
+        opens: &str,
+        request: serde_json::Value,
+        reply: &str,
+    ) -> (std::result::Result<Vec<String>, String>, Option<String>) {
+        let (_llama, prompt, sampling, mut out, rx) =
+            harmony_job(HARMONY_OPENS.replace("OPENS", opens), request);
+        // These cases leave the grammar nothing to be advanced over, which the decode thread
+        // would do before the reply starts.
+        assert_eq!(out.pending(), "", "{opens:?}");
+        out.begin(true);
+        assert!(
+            prompt.ends_with(&format!("<|end|><|start|>assistant{opens}")),
+            "the generation prompt goes on with {opens:?}: {prompt:?}"
+        );
+        let root = sampling.grammar.as_deref().and_then(|grammar| {
+            grammar
+                .lines()
+                .find_map(|line| line.strip_prefix("root ::= "))
+                .map(ToString::to_string)
+        });
+        let finish = generate_harmony(&mut out, reply)
+            .0
+            .expect("the reply ends at `<|return|>` or `<|call|>`");
+        let sent = out.finish(finish, 1).map(|_| joined(sent(rx)));
+        (sent, root)
+    }
+
+    /// A stock gpt-oss template ends its generation prompt at `<|start|>assistant`, so the
+    /// reply writes its first message's header. A custom one may go on to name that message's
+    /// channel or to open its body, as `<|start|>assistant<|channel|>final<|message|>` does,
+    /// and the reply goes on from there.
+    #[test]
+    fn a_harmony_reply_goes_on_from_where_the_generation_prompt_leaves_it() {
+        let rest = "Recall it.<|end|><|start|>assistant<|channel|>final<|message|>Paris<|return|>";
+        let read = [
+            ("", format!("<|channel|>analysis<|message|>{rest}")),
+            ("<|channel|>final<|message|>", "Paris<|return|>".to_string()),
+            ("<|channel|>analysis<|message|>", rest.to_string()),
+            ("<|channel|>analysis", format!("<|message|>{rest}")),
+        ]
+        .map(|(opens, reply)| {
+            harmony_reply_after(opens, serde_json::json!({}), &reply)
+                .0
+                .expect("the request succeeds")
+        });
+        let answer = || vec!["r:Recall it.".to_string(), "c:Paris".to_string()];
+        assert_eq!(
+            read,
+            [answer(), vec!["c:Paris".to_string()], answer(), answer()]
+        );
+    }
+
+    /// A grammar that holds a reply, to a `response_format` or to a required call, goes on from
+    /// where the generation prompt leaves the reply rather than making it write a header
+    /// inside a message the prompt opened. A message the grammar cannot go on from, such as a
+    /// final message before a required call, keeps the grammar of a whole reply, and the reply
+    /// is read from its first header.
+    #[test]
+    fn a_harmony_grammar_goes_on_from_where_the_generation_prompt_leaves_it() {
+        let structured = serde_json::json!({ "response_format": { "type": "json_object" } });
+        let required = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                        "required": ["city"],
+                    },
+                },
+            }],
+            "tool_choice": "required",
+        });
+        // a second turn, after an earlier structured reply
+        let mut second_turn = structured.clone();
+        second_turn["messages"] = serde_json::json!([
+            { "role": "user", "content": "What is the capital of France?" },
+            { "role": "assistant", "content": "{\"capital\":\"Paris\"}" },
+            { "role": "user", "content": "And of Italy?" },
+        ]);
+        let json = "{\"capital\":\"Paris\"}";
+        let final_json = format!("<|channel|>final<|message|>{json}<|return|>");
+        let call =
+            "<|channel|>commentary to=functions.get_weather<|message|>{\"city\":\"Paris\"}<|call|>";
+        let cases = [
+            ("", &structured, final_json.clone()),
+            (
+                "<|channel|>final<|message|>",
+                &structured,
+                format!("{json}<|return|>"),
+            ),
+            (
+                "<|channel|>analysis<|message|>",
+                &structured,
+                format!("Recall it.<|end|><|start|>assistant{final_json}"),
+            ),
+            (
+                "<|channel|>",
+                &structured,
+                format!("final<|message|>{json}<|return|>"),
+            ),
+            (
+                "<|channel|>final",
+                &structured,
+                format!("<|message|>{json}<|return|>"),
+            ),
+            (
+                "<|channel|>analysis",
+                &structured,
+                format!("<|message|>Recall it.<|end|><|start|>assistant{final_json}"),
+            ),
+            ("<|channel|>commentary<|message|>", &structured, final_json),
+            ("", &required, call.to_string()),
+            (
+                "<|channel|>analysis<|message|>",
+                &required,
+                format!("Look it up.<|end|><|start|>assistant{call}"),
+            ),
+            (
+                "<|channel|>commentary to=functions.get_weather<|message|>",
+                &required,
+                "{\"city\":\"Paris\"}<|call|>".to_string(),
+            ),
+            (
+                "<|channel|>",
+                &required,
+                call["<|channel|>".len()..].to_string(),
+            ),
+            (
+                "<|channel|>analysis",
+                &required,
+                format!("<|message|>Look it up.<|end|><|start|>assistant{call}"),
+            ),
+            ("<|channel|>final<|message|>", &required, call.to_string()),
+            (
+                "<|channel|>final<|message|>",
+                &second_turn,
+                format!("{json}<|return|>"),
+            ),
+        ];
+        let read: Vec<_> = cases
+            .iter()
+            .map(|(opens, request, reply)| harmony_reply_after(opens, (*request).clone(), reply))
+            .collect();
+        let structured_root = "analysis* <[2]> \"final\" constrain? <[3]> reply-root";
+        let after_analysis = format!("<[4]> <[1]> \"assistant\" {structured_root}");
+        let call_root = "<[2]> \"commentary to=functions.\" call";
+        let answer = || vec![format!("c:{json}")];
+        let called = || vec!["t:get_weather({\"city\":\"Paris\"})".to_string()];
+        let expected = [
+            (answer(), structured_root.to_string()),
+            (answer(), "reply-root".to_string()),
+            (
+                vec!["r:Recall it.".to_string(), format!("c:{json}")],
+                format!("reasoning {after_analysis}"),
+            ),
+            (
+                answer(),
+                format!(
+                    "\"analysis\" <[3]> reasoning {after_analysis} | \"final\" constrain? <[3]> reply-root"
+                ),
+            ),
+            (answer(), "constrain? <[3]> reply-root".to_string()),
+            (
+                vec!["r:Recall it.".to_string(), format!("c:{json}")],
+                format!("<[3]> reasoning {after_analysis}"),
+            ),
+            (answer(), structured_root.to_string()),
+            (called(), format!("analysis? {call_root}")),
+            (
+                [vec!["r:Look it up.".to_string()], called()].concat(),
+                format!("reasoning <[4]> <[1]> \"assistant\" {call_root}"),
+            ),
+            (called(), "tool0-root".to_string()),
+            (
+                called(),
+                format!(
+                    "\"analysis\" <[3]> reasoning <[4]> <[1]> \"assistant\" {call_root} | \"commentary to=functions.\" call"
+                ),
+            ),
+            (
+                [vec!["r:Look it up.".to_string()], called()].concat(),
+                format!("<[3]> reasoning <[4]> <[1]> \"assistant\" {call_root}"),
+            ),
+            (called(), format!("analysis? {call_root}")),
+            (answer(), "reply-root".to_string()),
+        ];
+        assert_eq!(
+            read,
+            expected
+                .into_iter()
+                .map(|(sent, root)| (Ok(sent), Some(root)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The reply goes on from what the template's generation prompt adds after the
+    /// conversation, whose messages the template closes: an earlier turn's final message ends
+    /// there, and the markers a prefill's JSON spells, `<|end|><|start|>` included, are the
+    /// prefill's, for a structured reply and a required call alike. A template that adds its
+    /// opened message whether or not a generation prompt is asked for is read whole.
+    #[test]
+    fn a_harmony_prefill_after_earlier_turns_keeps_the_markers_its_json_spells() {
+        let second_turn = |mut request: serde_json::Value| {
+            request["messages"] = serde_json::json!([
+                { "role": "user", "content": "What is the capital of France?" },
+                { "role": "assistant", "content": "{\"capital\":\"Paris\"}" },
+                { "role": "user", "content": "And of Italy?" },
+            ]);
+            request
+        };
+        let structured = serde_json::json!({ "response_format": { "type": "json_object" } });
+        let required = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                    },
+                },
+            }],
+            "tool_choice": "required",
+        });
+        let prefill = "<|channel|>final<|message|>{\"note\":\"<|end|><|start|>\",\"capital\":\"Ro";
+        let call = "<|channel|>commentary to=functions.get_weather<|message|>{\"city\":\"<|end|><|start|>Ro";
+        let pending = |template: String, request: serde_json::Value| {
+            let (_llama, _, _, out, _) = harmony_job(template, request);
+            out.pending().to_string()
+        };
+        let opens = |opened: &str| HARMONY_OPENS.replace("OPENS", opened);
+        // always adds `<|start|>assistant` and the prefill
+        let ignores_generation_prompt = |opened: &str| {
+            format!(
+                "{{% for m in messages %}}<|start|>{{{{ m.role }}}}<|message|>{{{{ m.content }}}}<|end|>{{% endfor %}}<|start|>assistant{opened}"
+            )
+        };
+        assert_eq!(
+            [
+                pending(opens(prefill), second_turn(structured.clone())),
+                pending(opens(call), second_turn(required)),
+                pending(ignores_generation_prompt(prefill), structured),
+            ],
+            [prefill, call, prefill]
+        );
+    }
+
+    /// A template may write the reply's role header whatever is asked for and add the rest of
+    /// the generation prompt only when asked, so what the generation prompt adds starts no
+    /// message: the reply then goes on from the message the conversation leaves open, after
+    /// an earlier turn's closed final message, with and without a grammar. A `<|start|>` the
+    /// body of that message spells is the body's, whether the generation prompt adds it or the
+    /// template writes it whatever is asked for, and so are the markers an earlier message
+    /// spells.
+    #[test]
+    fn a_harmony_header_split_across_the_generation_prompt_is_read_whole() {
+        let split = |always: &str, added: &str| {
+            format!(
+                "{{% for m in messages %}}<|start|>{{{{ m.role }}}}{{% if m.role == 'assistant' %}}<|channel|>final{{% endif %}}<|message|>{{{{ m.content }}}}<|end|>{{% endfor %}}<|start|>assistant{always}{{% if add_generation_prompt %}}{added}{{% endif %}}"
+            )
+        };
+        let second_turn = |mut request: serde_json::Value| {
+            request["messages"] = serde_json::json!([
+                { "role": "user", "content": "What is the capital of France?" },
+                { "role": "assistant", "content": "{\"capital\":\"Paris\"}" },
+                { "role": "user", "content": "And of Italy?" },
+            ]);
+            request
+        };
+        let read = |template: String, request: serde_json::Value, reply: &str| {
+            let (_llama, _, sampling, mut out, rx) = harmony_job(template, request);
+            let root = sampling.grammar.as_deref().and_then(|grammar| {
+                grammar
+                    .lines()
+                    .find_map(|line| line.strip_prefix("root ::= "))
+                    .map(ToString::to_string)
+            });
+            let pending = out.pending().to_string();
+            out.begin(true);
+            let finish = generate_harmony(&mut out, reply)
+                .0
+                .expect("the reply ends at `<|return|>`");
+            let sent = out.finish(finish, 1).map(|_| joined(sent(rx)));
+            (sent, root, pending)
+        };
+        let structured = serde_json::json!({ "response_format": { "type": "json_object" } });
+        let spelled_pair = serde_json::json!({
+            "messages": [{ "role": "user", "content": "Say <|end|><|start|> verbatim." }],
+        });
+        let opened = "<|channel|>final<|message|>";
+        let rome = |content: &str| -> (
+            std::result::Result<Vec<String>, String>,
+            Option<String>,
+            String,
+        ) { (Ok(vec![content.to_string()]), None, String::new()) };
+        assert_eq!(
+            [
+                read(split("", opened), serde_json::json!({}), "Rome<|return|>"),
+                read(
+                    split("", opened),
+                    second_turn(structured),
+                    "{\"capital\":\"Rome\"}<|return|>"
+                ),
+                // a `<|start|>` in the body the generation prompt adds
+                read(
+                    split("", "<|channel|>final<|message|>Note: <|start|>!"),
+                    serde_json::json!({}),
+                    "Rome<|return|>"
+                ),
+                // a `<|start|>` in the body the template writes whatever is asked for
+                read(
+                    split("<|channel|>final<|message|>Note: <|start|>", "!"),
+                    serde_json::json!({}),
+                    "Rome<|return|>"
+                ),
+                // the pair an earlier message spells
+                read(split("", opened), spelled_pair, "Rome<|return|>"),
+            ],
+            [
+                rome("c:Rome"),
+                (
+                    Ok(vec!["c:{\"capital\":\"Rome\"}".to_string()]),
+                    Some("reply-root".to_string()),
+                    String::new()
+                ),
+                rome("c:Note: <|start|>!Rome"),
+                rome("c:Note: <|start|>!Rome"),
+                rome("c:Rome"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_harmony_call_ends_the_reply_with_its_arguments() {
+        let (mut out, rx) = harmony_output(&["get_weather"], &[], None);
+        let reply = "<|channel|>analysis<|message|>Look it up.<|end|><|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"city\":\"Paris\"}<|call|>";
+        let (finish, _) = generate_harmony(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+        let outcome = out
+            .finish(FinishReason::ToolCalls, 9)
+            .expect("the request succeeds");
+        assert_eq!(outcome.finish, FinishReason::ToolCalls);
+        assert_eq!(
+            joined(sent(rx)),
+            [
+                "r:Look it up.".to_string(),
+                "t:get_weather({\"city\":\"Paris\"})".to_string()
+            ]
+        );
+    }
+
+    /// `<|end|>` can close a call whose arguments are complete JSON, and it does not end
+    /// generation in the vocabulary, so it is a completion token like any other marker; only
+    /// the `<|return|>` or `<|call|>` that ends a reply is not counted.
+    #[test]
+    fn an_end_that_closes_a_harmony_call_counts_as_a_completion_token() {
+        let (mut out, rx) = harmony_output(&["f"], &[], None);
+        let reply = "<|channel|>commentary to=functions.f<|message|>{}<|end|>";
+        let (finish, n) = generate_harmony(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+        let outcome = out
+            .finish(FinishReason::ToolCalls, 1)
+            .expect("the request succeeds");
+        assert_eq!(
+            outcome.completion_tokens as usize, n,
+            "every token, `<|end|>` included"
+        );
+        assert_eq!(joined(sent(rx)), ["t:f({})".to_string()]);
+    }
+
+    #[test]
+    fn a_stop_sequence_applies_to_a_harmony_body_but_not_its_header() {
+        let (mut out, rx) = harmony_output(&[], &["final"], None);
+        let reply = "<|channel|>analysis<|message|>r<|end|><|start|>assistant<|channel|>final<|message|>the final word<|return|>";
+        let (finish, _) = generate_harmony(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::Stop));
+        out.finish(FinishReason::Stop, 1)
+            .expect("the request succeeds");
+        assert_eq!(joined(sent(rx)), ["r:r".to_string(), "c:the ".to_string()]);
+    }
+
+    #[test]
+    fn text_a_stop_sequence_holds_back_goes_out_before_the_next_harmony_message() {
+        // `x` may start the stop sequence, so it is held until the marker closes its message
+        let (mut out, rx) = harmony_output(&[], &["xyz"], None);
+        let reply = "<|channel|>analysis<|message|>abx<|end|><|start|>assistant<|channel|>final<|message|>c<|return|>";
+        generate_harmony(&mut out, reply);
+        out.finish(FinishReason::Stop, 1)
+            .expect("the request succeeds");
+        assert_eq!(joined(sent(rx)), ["r:abx".to_string(), "c:c".to_string()]);
+    }
+
+    #[test]
+    fn a_harmony_reply_counts_its_markers_against_the_budget() {
+        // `<|channel|>`, the five tokens of `final` and `<|message|>` leave two of nine
+        let (mut out, rx) = harmony_output(&[], &[], Some(9));
+        let reply = "<|channel|>final<|message|>abcdef<|return|>";
+        assert_eq!(
+            generate_harmony(&mut out, reply),
+            (Some(FinishReason::Length), 9)
+        );
+        out.finish(FinishReason::Length, 1)
+            .expect("the request succeeds");
+        assert_eq!(joined(sent(rx)), ["c:ab".to_string()]);
+    }
+
+    #[test]
+    fn a_harmony_call_cut_off_after_complete_arguments_is_still_made() {
+        // `<|channel|>`, `commentary to=functions.f` (25 characters), `<|message|>` and `{}`
+        let (mut out, rx) = harmony_output(&["f"], &[], Some(29));
+        let reply = "<|channel|>commentary to=functions.f<|message|>{}<|call|>";
+        assert_eq!(
+            generate_harmony(&mut out, reply),
+            (Some(FinishReason::Length), 29)
+        );
+        let outcome = out
+            .finish(FinishReason::Length, 1)
+            .expect("the request succeeds");
+        assert_eq!(outcome.finish, FinishReason::ToolCalls);
+        assert_eq!(joined(sent(rx)), ["t:f({})".to_string()]);
+    }
+
+    #[test]
+    fn a_named_tool_choice_is_the_only_name_a_harmony_call_may_take() {
+        let tool = |name: &str| {
+            let mut tool = weather_tool();
+            tool.function.name = name.to_string();
+            tool
+        };
+        let (f, g) = (tool("f"), tool("g"));
+        assert_eq!(nameable_tools(&[&f, &g], &[&f]), ["f".to_string()]);
+        assert_eq!(
+            nameable_tools(&[&f, &g], &[]),
+            ["f".to_string(), "g".to_string()]
+        );
+        // a call to the other tool is dropped, so a required call is not made
+        let (events, _rx) = mpsc::channel(STREAM_BUFFER);
+        let (_, _, mut output) = Output::new(Job {
+            prompt: String::new(),
+            namespace: CacheNamespace::Public,
+            limit: None,
+            sampling: Sampling::default(),
+            stop: Vec::new(),
+            reasoning: None,
+            tools: None,
+            harmony: Some(harmony::Reader::new(
+                HARMONY_MARKERS,
+                nameable_tools(&[&f, &g], &[&f]),
+                harmony::Held::Nothing,
+            )),
+            require_tool_call: true,
+            stopping: Arc::default(),
+            events,
+        });
+        let reply = "<|channel|>commentary to=functions.g<|message|>{}<|call|>";
+        assert_eq!(
+            generate_harmony(&mut output, reply).0,
+            Some(FinishReason::Stop)
+        );
+        assert_eq!(
+            output.finish(FinishReason::Stop, 1).map(|o| o.finish),
+            Err("Tool choice was required but no tools were called.".to_string())
+        );
+    }
+
+    #[test]
+    fn a_required_harmony_call_is_forced_by_a_grammar_over_the_whole_reply() {
+        let tool = weather_tool();
+        let grammar = harmony_call(&HARMONY_MARKERS, &[&tool], &harmony::Opened::Header)
+            .expect("the tool's schema converts");
+        // the test vocabulary's markers are tokens 1 to 7, matched as tokens
+        assert!(
+            grammar.ends_with("root ::= analysis? <[2]> \"commentary to=functions.\" call\n"),
+            "{grammar}"
+        );
+        assert!(
+            grammar.starts_with(
+                "analysis ::= <[2]> \"analysis\" <[3]> reasoning <[4]> <[1]> \"assistant\"\n"
+            ),
+            "{grammar}"
+        );
+        assert!(
+            grammar.contains("call ::= \"get_weather\" constrain? <[3]> tool0-root\n"),
+            "{grammar}"
+        );
+        assert!(
+            grammar.contains("constrain ::= \" \" <[7]>? [A-Za-z0-9_-]+\n"),
+            "{grammar}"
+        );
+        assert!(
+            !grammar.contains("<|"),
+            "no marker is written as text: {grammar}"
+        );
+        assert_eq!(
+            grammar.matches("\nroot ::=").count() + usize::from(grammar.starts_with("root ::=")),
+            1,
+            "one start rule: {grammar}"
+        );
+        // nor does a Harmony template make one without its markers
+        assert_eq!(
+            content_grammar("m", HARMONY, None, &[&tool], &[&tool]).expect("no grammar"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_structured_harmony_reply_is_held_from_its_first_header() {
+        let reply = content_grammar("m", HARMONY, Some(&answer_schema()), &[], &[])
+            .expect("the schema converts")
+            .expect("a json_schema format has a grammar");
+        let grammar = harmony_reply(&HARMONY_MARKERS, &reply, &harmony::Opened::Header);
+        // analysis messages, then the final one: no preamble, whose text would be content
+        assert!(
+            grammar.ends_with("root ::= analysis* <[2]> \"final\" constrain? <[3]> reply-root\n"),
+            "{grammar}"
+        );
+        assert!(!grammar.contains("commentary"), "{grammar}");
+        assert_eq!(
+            grammar.matches("\nroot ::=").count() + usize::from(grammar.starts_with("root ::=")),
+            1,
+            "one start rule: {grammar}"
+        );
+    }
+
+    #[test]
+    fn a_harmony_call_ends_where_its_arguments_do_though_a_stop_sequence_holds_their_end() {
+        // `}x` may begin at the closing `}`, which is held back when `<|end|>` comes
+        let (mut out, rx) = harmony_output(&["f"], &["}x"], None);
+        let reply = "<|channel|>commentary to=functions.f<|message|>{}<|end|><|start|>assistant<|channel|>final<|message|>no<|return|>";
+        let (finish, _) = generate_harmony(&mut out, reply);
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+        out.finish(FinishReason::ToolCalls, 1)
+            .expect("the request succeeds");
+        assert_eq!(joined(sent(rx)), ["t:f({})".to_string()]);
+    }
+
+    #[test]
+    fn a_required_harmony_call_leaves_only_its_call_marker_possible() {
+        let (out, _rx) = harmony_output(&["f"], &[], None);
+        assert_eq!(
+            out.ruled_out(&[Token(5), Token(6), Token(99)]),
+            [Token(5), Token(99)]
+        );
+        let (out, _rx) = output(ToolChoice::Auto, None);
+        assert_eq!(out.ruled_out(&[Token(6)]), [Token(6)]);
+    }
+
+    #[test]
+    fn a_harmony_model_is_refused_only_when_its_vocabulary_lacks_the_markers() {
         let refused = check_reply_format(
             &Either::Left(HARMONY.to_string()),
             Some("gpt-oss".to_string()),
+            None,
             "gpt-oss-20b-mxfp4.gguf".to_string(),
         )
-        .expect_err("a Harmony template is refused");
+        .expect_err("a Harmony template without its markers is refused");
         assert_eq!(
             refused.to_string(),
             "Architecture 'gpt-oss' in gpt-oss-20b-mxfp4.gguf is not supported by this Spice release. Upgrade Spice, or use a GGUF of a supported architecture: https://spiceai.org/docs/components/models#gguf-architectures"
         );
         assert!(reasoning_parser(HARMONY, "").is_none());
-        check_reply_format(
-            &Either::Left(THINKS.to_string()),
+        assert_eq!(
+            check_reply_format(
+                &Either::Left(HARMONY.to_string()),
+                Some("gpt-oss".to_string()),
+                Some(HARMONY_MARKERS),
+                "gpt-oss-20b-mxfp4.gguf".to_string(),
+            )
+            .expect("a Harmony template with its markers"),
+            Some(HARMONY_MARKERS)
+        );
+        assert_eq!(
+            check_reply_format(
+                &Either::Left(THINKS.to_string()),
+                None,
+                Some(HARMONY_MARKERS),
+                "qwen.gguf".to_string(),
+            )
+            .expect("a think-tag template"),
             None,
-            "qwen.gguf".to_string(),
-        )
-        .expect("a think-tag template");
+            "only a Harmony template's replies are read by the markers"
+        );
         check_reply_format(
             &Either::Left(GEMMA4.to_string()),
+            None,
             None,
             "gemma.gguf".to_string(),
         )
@@ -3059,7 +4100,7 @@ mod tests {
     }
 
     /// Named templates are chosen as the mistral.rs engine chooses them, and a Harmony template
-    /// among them is refused as a lone one is.
+    /// among them is read as a lone one is.
     #[test]
     fn named_templates_are_chosen_as_mistral_rs_chooses() {
         let entry = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
@@ -3092,7 +4133,7 @@ mod tests {
             entry(&[("name", "tool_use"), ("template", HARMONY)]),
         ]);
         assert!(matches!(
-            check_reply_format(&harmony, None, "gpt-oss.gguf".to_string()),
+            check_reply_format(&harmony, None, None, "gpt-oss.gguf".to_string()),
             Err(ChatError::UnsupportedArchitecture { .. })
         ));
     }
@@ -3178,6 +4219,7 @@ mod tests {
             stop: vec!["STOP".to_string()],
             reasoning: None,
             tools: None,
+            harmony: None,
             require_tool_call: false,
             stopping: Arc::default(),
             events,
