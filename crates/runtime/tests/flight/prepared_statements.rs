@@ -79,6 +79,16 @@ mod flight_prepared_statements {
                         )?,
                     ),
                     ("SELECT 1 + $1 AS x", int_param()?),
+                    (
+                        "SELECT $1 AS x",
+                        create_param_batch(
+                            vec![("$1", arrow::datatypes::DataType::Date64, true)],
+                            vec![
+                                Arc::new(arrow::array::Date64Array::from(vec![1_768_498_200_000]))
+                                    as ArrayRef,
+                            ],
+                        )?,
+                    ),
                 ];
 
                 for (sql, params) in cases {
