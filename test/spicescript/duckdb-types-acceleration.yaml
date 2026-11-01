@@ -5,9 +5,9 @@ description: >
   and microsecond precision, time, string, binary, decimals up to 38 digits,
   and lists of integers and strings), holding each type's limits, its zero or
   empty value, and NULL, answers through Spice as the DuckDB CLI answers it:
-  federated, and accelerated into every engine. Every answer comes back the
-  same over Flight, Flight SQL and HTTP JSON. (Intervals, Turso's timestamps
-  before 1970 and SQLite's decimals are in
+  federated, and accelerated into every engine, with each column typed as
+  DuckDB exports it to Arrow. Every answer comes back the same over Flight,
+  Flight SQL and HTTP JSON. (Intervals and SQLite's 20-digit decimals are in
   known-failing/duckdb/duckdb-types-known.yaml.)
 
 sources:
@@ -112,7 +112,7 @@ steps:
   - source-query:
       src: SELECT id, t_decimal_10_2, t_decimal_20_4, t_decimal_38_10 FROM t ORDER BY id
     expect:
-      rows: &decimals
+      rows:
         - [1, '99999999.99', '9999999999999999.9999', '9999999999999999999999999999.9999999999']
         - [2, '-99999999.99', '-9999999999999999.9999', '-9999999999999999999999999999.9999999999']
         - [3, '0.00', '0.0000', '0.0000000000']
@@ -127,6 +127,32 @@ steps:
         - [4, null, null]
 
   - start: {}
+
+  # Each column's Arrow type, as DuckDB exports its SQL type to Arrow.
+  - query: >-
+      SELECT column_name, data_type FROM information_schema.columns
+      WHERE table_name = 't' ORDER BY ordinal_position
+    expect:
+      rows:
+        - [id, Int32]
+        - [t_boolean, Boolean]
+        - [t_int8, Int8]
+        - [t_int16, Int16]
+        - [t_int32, Int32]
+        - [t_int64, Int64]
+        - [t_float32, Float32]
+        - [t_float64, Float64]
+        - [t_date, Date32]
+        - [t_timestamp_ms, Timestamp(ms)]
+        - [t_timestamp, Timestamp(µs)]
+        - [t_time, Time64(µs)]
+        - [t_string, Utf8]
+        - [t_binary, Binary]
+        - ['t_decimal_10_2', 'Decimal128(10, 2)']
+        - ['t_decimal_20_4', 'Decimal128(20, 4)']
+        - ['t_decimal_38_10', 'Decimal128(38, 10)']
+        - [t_list_int, "List(Int32, field: 'l')"]
+        - [t_list_string, "List(Utf8, field: 'l')"]
 
   - query: SELECT id, t_boolean FROM t ORDER BY id
     protocols: [flight, flightsql, http]
@@ -149,12 +175,25 @@ steps:
         - [2, 日本語 naïve 😀, '\x00ff']
         - [3, '', '\x']
         - [4, null, null]
-  # SQLite keeps a decimal as a double, which cannot hold these (#14662;
-  # known-failing/duckdb/duckdb-types-known.yaml).
-  - query: SELECT id, t_decimal_10_2, t_decimal_20_4, t_decimal_38_10 FROM t ORDER BY id
+  - query: SELECT id, t_decimal_10_2 FROM t ORDER BY id
     protocols: [flight, flightsql, http]
-    expect: { rows: *decimals }
+    expect:
+      rows: [[1, '99999999.99'], [2, '-99999999.99'], [3, '0.00'], [4, null]]
+  # SQLite keeps this decimal as a double, which cannot hold it (#14662;
+  # known-failing/duckdb/duckdb-types-known.yaml).
+  - query: SELECT id, t_decimal_20_4 FROM t ORDER BY id
+    protocols: [flight, flightsql, http]
+    expect:
+      rows: [[1, '9999999999999999.9999'], [2, '-9999999999999999.9999'], [3, '0.0000'], [4, null]]
     except: sqlite
+  - query: SELECT id, t_decimal_38_10 FROM t ORDER BY id
+    protocols: [flight, flightsql, http]
+    expect:
+      rows:
+        - [1, '9999999999999999999999999999.9999999999']
+        - [2, '-9999999999999999999999999999.9999999999']
+        - [3, '0.0000000000']
+        - [4, null]
   # The same lists; an empty string is an empty element.
   - query: SELECT id, t_list_int, t_list_string FROM t ORDER BY id
     protocols: [flight, flightsql, http]

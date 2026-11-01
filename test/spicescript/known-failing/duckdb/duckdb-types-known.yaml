@@ -4,10 +4,9 @@ description: >
   protocol cannot carry them yet. An INTERVAL column answers as the DuckDB CLI
   answers over Flight and Flight SQL, but Cayenne and SQLite refuse to
   accelerate it, and HTTP JSON writes it as text (`1.000000000 secs`) that
-  does not read back as an interval. A millisecond timestamp before 1970 fails
-  Turso's refresh (`Invalid timestamp value: -2208988799999 Millisecond`).
-  SQLite keeps a decimal as a double, so a 20-digit DECIMAL(20, 4) no longer
-  fits its column when read back (#14662).
+  does not read back as an interval. SQLite keeps a DECIMAL(20, 4) as a
+  double, which rounds 9999999999999999.9999 up past what the column holds
+  when read back (#14662).
 
 sources:
   src: { kind: duckdb }
@@ -18,7 +17,6 @@ variants:
   duckdb: duckdb-file
   cayenne: cayenne-file
   sqlite: sqlite-file
-  turso: turso-file
 
 spicepod:
   version: v1
@@ -27,11 +25,6 @@ spicepod:
   datasets:
     - from: duckdb:main.iv
       name: iv
-      params: ${sources.src.params}
-      acceleration:
-        enabled: false
-    - from: duckdb:main.ts
-      name: ts
       params: ${sources.src.params}
       acceleration:
         enabled: false
@@ -51,15 +44,9 @@ steps:
         CREATE TABLE iv (id INTEGER, t_interval INTERVAL);
         INSERT INTO iv VALUES
           (1, INTERVAL '1 second'), (2, INTERVAL '2 seconds'), (3, INTERVAL '0 seconds'), (4, NULL);
-        CREATE TABLE ts (id INTEGER, t_timestamp_ms TIMESTAMP_MS);
-        INSERT INTO ts VALUES
-          (1, TIMESTAMP_MS '2024-01-15 21:00:33.999'), (2, TIMESTAMP_MS '1900-01-01 00:00:00.001'),
-          (3, TIMESTAMP_MS '1970-01-01 00:00:00'), (4, NULL);
-        CREATE TABLE dec (id INTEGER, t_decimal_20_4 DECIMAL(20, 4), t_decimal_38_10 DECIMAL(38, 10));
+        CREATE TABLE dec (id INTEGER, t_decimal_20_4 DECIMAL(20, 4));
         INSERT INTO dec VALUES
-          (1, 9999999999999999.9999, 9999999999999999999999999999.9999999999),
-          (2, -9999999999999999.9999, -9999999999999999999999999999.9999999999),
-          (3, 0.0000, 0.0000000000), (4, NULL, NULL);
+          (1, 9999999999999999.9999), (2, -9999999999999999.9999), (3, 0.0000), (4, NULL);
   - source-query:
       src: SELECT id, t_interval FROM iv ORDER BY id
     expect:
@@ -69,25 +56,29 @@ steps:
         - [3, '00:00:00']
         - [4, null]
   - source-query:
-      src: SELECT id, t_decimal_20_4, t_decimal_38_10 FROM dec ORDER BY id
+      src: SELECT id, t_decimal_20_4 FROM dec ORDER BY id
     expect:
-      rows: &decimals
-        - [1, '9999999999999999.9999', '9999999999999999999999999999.9999999999']
-        - [2, '-9999999999999999.9999', '-9999999999999999999999999999.9999999999']
-        - [3, '0.0000', '0.0000000000']
-        - [4, null, null]
-  - source-query:
-      src: SELECT id, t_timestamp_ms FROM ts ORDER BY id
-    expect:
-      rows: &timestamps
-        - [1, '2024-01-15 21:00:33.999']
-        - [2, '1900-01-01 00:00:00.001']
-        - [3, '1970-01-01 00:00:00']
+      rows: &decimal_20_4
+        - [1, '9999999999999999.9999']
+        - [2, '-9999999999999999.9999']
+        - [3, '0.0000']
         - [4, null]
 
   # Some accelerations fail to load one dataset; wait only for HTTP, so each
   # dataset's failure is its own query's.
   - start: { ready: false }
+
+  # Each column's Arrow type, as DuckDB exports its SQL type to Arrow.
+  - query: >-
+      SELECT table_name, column_name, data_type FROM information_schema.columns
+      WHERE table_name IN ('iv', 'dec') ORDER BY table_name, ordinal_position
+    eventually: 30s
+    expect:
+      rows:
+        - [dec, id, Int32]
+        - [dec, 't_decimal_20_4', 'Decimal128(20, 4)']
+        - [iv, id, Int32]
+        - [iv, t_interval, Interval(MonthDayNano)]
 
   # The same intervals, written as Arrow parses them.
   - query: SELECT id, t_interval FROM iv ORDER BY id
@@ -102,11 +93,7 @@ steps:
   - query: SELECT id, t_interval FROM iv ORDER BY id
     protocols: [flight, http]
     eventually: 30s
-  - query: SELECT id, t_timestamp_ms FROM ts ORDER BY id
+  - query: SELECT id, t_decimal_20_4 FROM dec ORDER BY id
     protocols: [flight, flightsql, http]
     eventually: 30s
-    expect: { rows: *timestamps }
-  - query: SELECT id, t_decimal_20_4, t_decimal_38_10 FROM dec ORDER BY id
-    protocols: [flight, flightsql, http]
-    eventually: 30s
-    expect: { rows: *decimals }
+    expect: { rows: *decimal_20_4 }
