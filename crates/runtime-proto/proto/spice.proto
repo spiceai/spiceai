@@ -79,6 +79,9 @@ message GetDdlCatchupResponse {
 message ExpandSecretRequest {
     string executor_id = 1;
     string key = 2;
+    // Store named by the reference (`${ store:key }`). `secrets`, or empty,
+    // searches the stores the app references the key through.
+    string store = 3;
 }
 
 // Response message for ExpandSecret RPC.
