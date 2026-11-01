@@ -29,9 +29,10 @@ steps:
   - query: SELECT count(*) AS n, sum(id) AS s FROM ev
     oracle-sql: SELECT count(*) AS n, sum(id) AS s FROM model
   # A read compares -0.0 and 0.0 as SQL does.
-  - query: SELECT count(*) AS n, sum(id) AS s FROM ev WHERE a <> b
-    oracle-sql: SELECT count(*) AS n, sum(id) AS s FROM model WHERE a <> b
+  - query: SELECT id FROM ev WHERE a <> b
+    oracle-sql: SELECT id FROM model WHERE a <> b
   - spice-exec: DELETE FROM ev WHERE a <> b
   - source-exec: { src: DELETE FROM model WHERE a <> b }
-  - query: SELECT count(*) AS n, sum(id) AS s FROM ev
-    oracle-sql: SELECT count(*) AS n, sum(id) AS s FROM model
+  # Exactly the rows PostgreSQL keeps survive, not only as many of them.
+  - query: SELECT id FROM ev
+    oracle-sql: SELECT id FROM model
