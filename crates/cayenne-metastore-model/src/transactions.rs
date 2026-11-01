@@ -212,7 +212,10 @@ impl Protocol {
             && state
                 .ds
                 .iter()
-                .all(|dataset| Self::decode(dataset).is_some_and(|log| !fold(&log).pending))
+                .all(|dataset| {
+                    self.has("no-prepared-check")
+                        || Self::decode(dataset).is_some_and(|log| !fold(&log).pending)
+                })
     }
     fn head(dataset: &Local) -> Head {
         Head {
@@ -745,6 +748,9 @@ pub struct Step {
     pub decision: u8,
     /// Whether the transaction's records exist after the action.
     pub records: bool,
+    /// Whether the coordinator has a `Prepare` in flight to each participant
+    /// before the action: its own knowledge, which it removes the records by.
+    pub prepare_in_flight: Vec<bool>,
     /// Each participant's log after the action, as (kind, outcome).
     pub logs: Vec<Vec<(u8, u8)>>,
 }
@@ -815,6 +821,15 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
             },
             decision: next.recorded,
             records: next.records,
+            prepare_in_flight: state
+                .ds
+                .iter()
+                .map(|dataset| {
+                    [&dataset.req, &dataset.parked]
+                        .into_iter()
+                        .any(|r| r.as_ref().is_some_and(|r| r.kind == 1))
+                })
+                .collect(),
             logs: next
                 .ds
                 .iter()

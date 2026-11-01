@@ -1075,6 +1075,14 @@ pub fn runs() -> Vec<Run> {
             failure: "a prepared participant keeps its transaction's records",
         },
         Run {
+            name: "transactions-txn-no-prepared-check-1-exhaust",
+            family: "transactions",
+            mode: "resolution-txn-no-prepared-check",
+            bound: 1,
+            seed: None,
+            failure: "a prepared participant keeps its transaction's records",
+        },
+        Run {
             name: "transactions-txn-no-coordinator-wait-0-exhaust",
             family: "transactions",
             mode: "resolution-txn-no-coordinator-wait",
