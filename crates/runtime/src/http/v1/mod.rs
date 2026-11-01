@@ -21,6 +21,7 @@ pub mod datasets;
 pub mod decisions;
 pub mod embeddings;
 pub mod functions;
+pub mod gemini;
 pub mod iceberg;
 pub mod messages;
 pub mod responses;
@@ -39,7 +40,7 @@ pub mod status;
 pub mod tools;
 pub mod workers;
 
-use std::sync::Arc;
+use std::{borrow::Borrow, sync::Arc};
 
 use crate::{
     component::dataset::Dataset,
@@ -51,11 +52,19 @@ use crate::{
             schema_has_union_columns, single_line, transaction_statements, write_to_json_string,
         },
     },
-    egress::EgressAccount,
+    egress::{EgressAccount, collect_reserved},
     http::server_timing::ServerTiming,
     status::ComponentStatus,
 };
-use arrow::{array::RecordBatch, datatypes::SchemaRef, util::pretty::pretty_format_batches};
+use arrow::{
+    array::RecordBatch,
+    datatypes::SchemaRef,
+    error::ArrowError,
+    util::{
+        display::{ArrayFormatter, FormatOptions},
+        pretty::pretty_format_batches,
+    },
+};
 use arrow_json::writer::JsonArray;
 use async_stream::try_stream;
 use axum::{
@@ -72,7 +81,11 @@ use cache::result::{
 };
 use csv::Writer;
 use datafusion::common::ParamValues;
-use datafusion::execution::{SendableRecordBatchStream, memory_pool::MemoryPool};
+use datafusion::error::DataFusionError;
+use datafusion::execution::{
+    SendableRecordBatchStream,
+    memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation},
+};
 use headers_accept::Accept;
 use http::{
     HeaderValue,
@@ -82,7 +95,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::ResultExt;
 
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt};
 
 use runtime_auth::AuthPrincipalRef;
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
@@ -252,6 +265,273 @@ fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn s
     Ok(String::from_utf8(w.into_inner()?)?)
 }
 
+/// Schemes whose URLs WHATWG parsers accept with any number of `/` or `\`
+/// (including none) before the authority, e.g. `https:user:pass@host`.
+const SPECIAL_URL_SCHEMES: &[&str] = &["http", "https", "ws", "wss", "ftp"];
+
+/// Schemes where the part before `@` is not a credential: a storage
+/// container (`abfss://container@account.dfs.core.windows.net/path`), or a
+/// file name (`file://alice@report.csv`).
+const NON_CREDENTIAL_USERINFO_SCHEMES: &[&str] = &["abfs", "abfss", "wasb", "wasbs", "file"];
+
+/// Query keys whose values are credentials, compared with case and
+/// punctuation removed (`api_key` and `apiKey` are both `apikey`).
+const SECRET_QUERY_KEYS: &[&str] = &["key", "sig", "auth", "pwd", "pass"];
+
+/// Endings of query keys whose values are credentials (`password`,
+/// `client_secret`, `access_token`, `X-Amz-Signature`, `x-goog-credential`),
+/// compared the same way. `sort_key` and `monkey` do not match.
+const SECRET_QUERY_KEY_ENDINGS: &[&str] = &[
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "apikey",
+    "accesskey",
+    "secretkey",
+    "privatekey",
+    "accountkey",
+    "sharedkey",
+    "signature",
+    "credential",
+    "credentials",
+    "authorization",
+];
+
+const REDACTED: &str = "***";
+
+fn is_scheme_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')
+}
+
+/// Characters that end a URL embedded in free text.
+fn ends_embedded_url(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>')
+}
+
+fn is_secret_query_key(key: &str) -> bool {
+    let key: String = percent_encoding::percent_decode_str(key)
+        .decode_utf8_lossy()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    SECRET_QUERY_KEYS.contains(&key.as_str())
+        || SECRET_QUERY_KEY_ENDINGS.iter().any(|e| key.ends_with(e))
+}
+
+/// Whether `authority` (no userinfo) is a plausible `host[:port]`, i.e. its
+/// port, if any, is numeric.
+fn is_host_and_port(authority: &str) -> bool {
+    let after_host = match authority.rfind(']') {
+        Some(bracket) => &authority[bracket + 1..],
+        None => authority,
+    };
+    match after_host.rfind(':') {
+        Some(colon) => after_host[colon + 1..].chars().all(|c| c.is_ascii_digit()),
+        None => true,
+    }
+}
+
+/// If `s` starts with a URL that has an authority, `s`'s URL prefix with the
+/// userinfo removed and secret query values replaced, plus how many bytes of
+/// `s` that prefix covers. `None` when `s` does not start with such a URL.
+///
+/// `embedded` is set when `s` is free text (an error message), where
+/// whitespace and quotes end the URL; otherwise `s` is a whole source.
+///
+/// This is a string scan, not a URL parse, so it also fails closed for URLs a
+/// parser would reject (a bad port, an unknown scheme, a raw `?`, `#` or quote
+/// inside the password).
+fn redact_url_at(s: &str, embedded: bool) -> Option<(String, usize)> {
+    let colon = s.find(':')?;
+    let scheme = &s[..colon];
+    if !scheme.starts_with(|c: char| c.is_ascii_alphabetic()) || !scheme.chars().all(is_scheme_char)
+    {
+        return None;
+    }
+    let scheme = scheme.to_ascii_lowercase();
+    let after_colon = &s[colon + 1..];
+    let authority_start = if SPECIAL_URL_SCHEMES.contains(&scheme.as_str()) {
+        colon + 1 + (after_colon.len() - after_colon.trim_start_matches(['/', '\\']).len())
+    } else if after_colon.starts_with("//") {
+        colon + 1 + "//".len()
+    } else {
+        return None;
+    };
+    let ends_url = |c: char| embedded && ends_embedded_url(c);
+
+    // A connector prefix written with `://` (`iceberg://https://u:p@h/...`):
+    // redact the inner URL.
+    if let Some((inner, len)) = redact_url_at(&s[authority_start..], embedded) {
+        return Some((
+            format!("{}{inner}", &s[..authority_start]),
+            authority_start + len,
+        ));
+    }
+
+    // The authority as a URL parser would read it ends at the path, query or
+    // fragment. A password can hold a raw `?`, `#`, quote or tab, though
+    // (`user:pa?ss@host`), and some drivers read it that way. So when the
+    // region up to the path holds an `@` past that point, and the parsed
+    // authority is userinfo-like, fail closed: remove everything up to the
+    // last `@` before the path. The parsed authority is userinfo-like when it
+    // has an `@`, is not a valid `host[:port]`, or has a `:` and the text up
+    // to that `@` is not a `key=value` query (`u:123?SECRET@h` is, but
+    // `h:8443?email=a@b.example` is a host, port and query). Only a space
+    // ends that region in free text, since URL parsers strip tabs and
+    // newlines.
+    let after_start = &s[authority_start..];
+    let strict_len = after_start
+        .find(|c: char| matches!(c, '/' | '\\' | '?' | '#') || ends_url(c))
+        .unwrap_or(after_start.len());
+    let strict = &after_start[..strict_len];
+    let extended_len = after_start
+        .find(|c: char| matches!(c, '/' | '\\') || (embedded && c == ' '))
+        .unwrap_or(after_start.len());
+    let last_at = after_start[..extended_len].rfind('@');
+    let authority_len = match last_at {
+        Some(at)
+            if at >= strict_len
+                && (strict.contains('@')
+                    || !is_host_and_port(strict)
+                    || (strict.contains(':') && !after_start[strict_len..at].contains('='))) =>
+        {
+            let host_len = after_start[at + 1..extended_len]
+                .find(|c: char| matches!(c, '?' | '#') || ends_url(c))
+                .unwrap_or(extended_len - at - 1);
+            at + 1 + host_len
+        }
+        _ => strict_len,
+    };
+    let authority_end = authority_start + authority_len;
+    let authority = &s[authority_start..authority_end];
+
+    let mut out = String::with_capacity(s.len());
+    out.push_str(&s[..authority_start]);
+    match authority.rfind('@') {
+        Some(at) if !NON_CREDENTIAL_USERINFO_SCHEMES.contains(&scheme.as_str()) => {
+            out.push_str(&authority[at + 1..]);
+        }
+        _ => out.push_str(authority),
+    }
+
+    let rest = &s[authority_end..];
+    let mut url_len = rest.find(ends_url).unwrap_or(rest.len());
+    if embedded {
+        url_len = extend_over_quoted_secret(rest, url_len);
+    }
+    let rest = &rest[..url_len];
+    let (before_fragment, fragment) = rest.split_at(rest.find('#').unwrap_or(rest.len()));
+    match before_fragment.split_once('?') {
+        Some((path, query)) => {
+            out.push_str(path);
+            out.push('?');
+            for (i, pair) in query.split('&').enumerate() {
+                if i > 0 {
+                    out.push('&');
+                }
+                match pair.split_once('=') {
+                    Some((key, _)) if is_secret_query_key(key) => {
+                        out.push_str(key);
+                        out.push('=');
+                        out.push_str(REDACTED);
+                    }
+                    _ => out.push_str(pair),
+                }
+            }
+        }
+        None => out.push_str(before_fragment),
+    }
+    out.push_str(fragment);
+    Some((out, authority_end + url_len))
+}
+
+/// In free text a quote ends a URL, but a secret query value can contain one
+/// (`?token=abc'def`). If the query pair that the quote cuts off is a secret,
+/// the URL is taken to run past that pair (to the next quote or whitespace),
+/// and the scan goes on so later secret pairs are replaced too. A quote that
+/// is the last character of a pair is taken as the closing quote.
+fn extend_over_quoted_secret(rest: &str, mut url_len: usize) -> usize {
+    let Some(query_start) = rest[..url_len].find('?') else {
+        return url_len;
+    };
+    let region = &rest[..rest.find(char::is_whitespace).unwrap_or(rest.len())];
+    let mut pos = query_start + 1;
+    while pos < url_len {
+        let pair_end = region[pos..]
+            .find(['&', '#'])
+            .map_or(region.len(), |i| pos + i);
+        if pair_end > url_len {
+            match region[pos..pair_end].split_once('=') {
+                Some((key, _)) if is_secret_query_key(key) && url_len + 1 < pair_end => {
+                    url_len = region[pair_end..]
+                        .find(ends_embedded_url)
+                        .map_or(region.len(), |i| pair_end + i);
+                }
+                _ => return url_len,
+            }
+        }
+        if region[pair_end..].starts_with('#') {
+            break;
+        }
+        pos = pair_end + 1;
+    }
+    url_len
+}
+
+/// `from` as the HTTP API reports it, without credentials.
+///
+/// A component source can carry credentials in its URL, either directly
+/// (`https://user:password@host/file.csv`) or after a connector prefix with
+/// any delimiter the runtime accepts (`iceberg:https://...`,
+/// `iceberg/https://...`, `iceberg://https://...`). Any API key that can list
+/// components can read `from`, so the `user[:password]@` part and the values of
+/// secret-looking query keys (`token`, `api_key`, `sig`, ...) are removed
+/// before it is returned. Only the URL at the start of `from`, or right after
+/// its connector prefix, is redacted; a `://` later in a path is left alone. A
+/// source without credentials is returned unchanged.
+#[must_use]
+pub(crate) fn redact_source_credentials(from: &str) -> String {
+    if let Some((redacted, len)) = redact_url_at(from, false) {
+        let redacted = format!("{redacted}{}", &from[len..]);
+        if redacted != from {
+            return redacted;
+        }
+    }
+    if let Some((pos, delimiter_len)) = runtime_component::find_first_delimiter(from) {
+        let start = pos + delimiter_len;
+        if let Some((redacted, len)) = redact_url_at(&from[start..], false) {
+            return format!("{}{redacted}{}", &from[..start], &from[start + len..]);
+        }
+    }
+    from.to_string()
+}
+
+/// `message` with every URL in it redacted as [`redact_source_credentials`]
+/// would. Used for status error messages, which connectors often build from
+/// the source URL.
+#[must_use]
+pub(crate) fn redact_message_credentials(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    let mut prev: Option<char> = None;
+    while let Some(c) = rest.chars().next() {
+        if prev.is_none_or(|p| !is_scheme_char(p))
+            && let Some((redacted, len)) = redact_url_at(rest, true)
+        {
+            out.push_str(&redacted);
+            prev = redacted.chars().last();
+            rest = &rest[len..];
+            continue;
+        }
+        out.push(c);
+        prev = Some(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
 fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
     // First check the runtime status which tracks the actual component state
     // (Initializing, Refreshing, Ready, Error, etc.)
@@ -272,7 +552,8 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
 //
 // JSON, CSV and the vnd.* JSON envelopes stream batch-by-batch via a chunked
 // body, so the full result set is never materialized in memory. `text/plain`
-// and results containing union columns buffer via `to_http_response`.
+// and results containing union columns buffer via `to_http_response`, reserving
+// the buffered bytes from the query memory pool.
 pub async fn sql_to_http_response(
     df: Arc<DataFusion>,
     sql: Arc<str>,
@@ -339,7 +620,7 @@ async fn query_stream_to_http_response(
 ) -> Response {
     // Streamability is a schema property, so decide it before pulling any batch.
     let Some(encoder) = streamed_encoder(format, &data_stream.schema()) else {
-        return buffered_sql_response(data_stream, cache_status, format).await;
+        return buffered_sql_response(data_stream, cache_status, format, &memory_pool).await;
     };
 
     // Pull the first batch eagerly so the common immediate-execution error still
@@ -367,14 +648,16 @@ async fn transaction_to_http_response(
     read_only: bool,
     format: ResponseMimeType,
 ) -> Response {
-    match run_transaction(&df, &statements, parameters, read_only).await {
+    match run_transaction(&df, &statements, parameters, read_only, |data| {
+        rendered_bytes(format, data)
+    })
+    .await
+    {
         Ok(outcome) => match outcome.result {
             // Return the final statement's result (for the canonical gate+write
             // shape, the write's row-count summary).
             Some((batches, cache_status)) => {
-                to_http_response(batches, cache_status, format, ResponseMetadata::empty())
-                    .await
-                    .into_response()
+                render_reserved(batches, outcome.reservation, cache_status, format).await
             }
             None => (StatusCode::OK, "COMMIT").into_response(),
         },
@@ -386,9 +669,10 @@ async fn transaction_to_http_response(
 fn transaction_error_to_response(error: TransactionError) -> Response {
     match error {
         TransactionError::Rejected(message) => sql_error_response(message, SqlErrorKind::General),
-        TransactionError::Plan(e) | TransactionError::Stream(e) => {
+        TransactionError::Plan(e) => {
             sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e))
         }
+        TransactionError::Stream(e) => buffered_error_response(&e),
         TransactionError::Query(e) => {
             sql_error_response(e.to_string(), SqlErrorKind::of_query_error(&e))
         }
@@ -496,18 +780,134 @@ fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
 }
 
 /// Buffered (non-streaming) response path for formats that cannot stream.
-async fn buffered_sql_response(
-    data_stream: SendableRecordBatchStream,
+///
+/// The collected batches, and for `text/plain` the rendered table, are reserved
+/// from the query memory pool until the body is built; a refused reservation
+/// fails the query with 503.
+async fn buffered_sql_response<S, B>(
+    data_stream: S,
+    cache_status: CacheStatus,
+    format: ResponseMimeType,
+    memory_pool: &Arc<dyn MemoryPool>,
+) -> Response
+where
+    S: Stream<Item = Result<B, DataFusionError>> + Send,
+    B: Borrow<RecordBatch> + Send,
+{
+    let reservation = MemoryConsumer::new("http_buffered_response").register(memory_pool);
+    let data = match collect_reserved(data_stream, &reservation).await {
+        Ok(data) => data,
+        Err(e) => return buffered_error_response(&e),
+    };
+    if let Err(e) = reservation.try_grow(rendered_bytes(format, &data)) {
+        return buffered_error_response(&e);
+    }
+    render_reserved(data, reservation, cache_status, format).await
+}
+
+/// The bytes rendering `data` as `format` adds beyond its batches: the padded
+/// `text/plain` table. A table that cannot be measured reports 0, and rendering
+/// it fails with the same error.
+fn rendered_bytes(format: ResponseMimeType, data: &[RecordBatch]) -> usize {
+    match format {
+        ResponseMimeType::Plain => plain_text_size(data).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Renders a collected result while `reservation` holds its batches and
+/// [`rendered_bytes`].
+async fn render_reserved(
+    data: Vec<RecordBatch>,
+    reservation: MemoryReservation,
     cache_status: CacheStatus,
     format: ResponseMimeType,
 ) -> Response {
-    let data = match data_stream.try_collect::<Vec<RecordBatch>>().await {
-        Ok(data) => data,
-        Err(e) => return sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e)),
-    };
-    to_http_response(data, cache_status, format, ResponseMetadata::empty())
+    let response = to_http_response(data, cache_status, format, ResponseMetadata::empty())
         .await
-        .into_response()
+        .into_response();
+    drop(reservation);
+    response
+}
+
+fn buffered_error_response(e: &DataFusionError) -> Response {
+    let kind = SqlErrorKind::of_datafusion_error(e);
+    let message = if matches!(kind, SqlErrorKind::ResourcesExhausted) {
+        format!("The query result is too large to buffer in memory for this response. {e}")
+    } else {
+        e.to_string()
+    };
+    sql_error_response(message, kind)
+}
+
+/// The approximate size of the table [`arrow_to_plain`] renders: every line is
+/// padded to the full table width, and a value with line breaks adds lines to
+/// its row.
+fn plain_text_size(data: &[RecordBatch]) -> Result<usize, ArrowError> {
+    use std::fmt::Write as _;
+
+    let Some(schema) = data.first().map(RecordBatch::schema) else {
+        return Ok(0);
+    };
+    let options = FormatOptions::default().with_display_error(true);
+    let mut widths: Vec<usize> = schema.fields().iter().map(|f| f.name().len()).collect();
+    // The top, header-separator and bottom borders, and the header row.
+    let mut lines: usize = 4;
+    for batch in data {
+        let formatters = batch
+            .columns()
+            .iter()
+            .map(|column| ArrayFormatter::try_new(column.as_ref(), &options))
+            .collect::<Result<Vec<_>, _>>()?;
+        for row in 0..batch.num_rows() {
+            let mut row_lines = 1;
+            for (width, formatter) in widths.iter_mut().zip(&formatters) {
+                let mut cell = CellExtent::default();
+                write!(cell, "{}", formatter.value(row))
+                    .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+                *width = (*width).max(cell.widest);
+                row_lines = row_lines.max(cell.lines);
+            }
+            lines = lines.saturating_add(row_lines);
+        }
+    }
+    // `| a | b |` plus the line break.
+    let line_len = widths.iter().fold(2_usize, |len, width| {
+        len.saturating_add(width.saturating_add(3))
+    });
+    Ok(lines.saturating_mul(line_len))
+}
+
+/// The line count and widest line of one formatted value, measured without
+/// storing it.
+struct CellExtent {
+    lines: usize,
+    line: usize,
+    widest: usize,
+}
+
+impl Default for CellExtent {
+    fn default() -> Self {
+        Self {
+            lines: 1,
+            line: 0,
+            widest: 0,
+        }
+    }
+}
+
+impl std::fmt::Write for CellExtent {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        for (i, part) in s.split('\n').enumerate() {
+            if i > 0 {
+                self.lines += 1;
+                self.line = 0;
+            }
+            self.line += part.len();
+            self.widest = self.widest.max(self.line);
+        }
+        Ok(())
+    }
 }
 
 async fn query_raw_stream_to_http_response(
@@ -518,18 +918,7 @@ async fn query_raw_stream_to_http_response(
     memory_pool: Arc<dyn MemoryPool>,
 ) -> Response {
     let Some(encoder) = streamed_encoder(format, &schema) else {
-        let data = match data_stream.try_collect::<Vec<_>>().await {
-            Ok(batches) => batches
-                .iter()
-                .map(|batch| RecordBatch::clone(batch.as_ref()))
-                .collect(),
-            Err(e) => {
-                return sql_error_response(e.to_string(), SqlErrorKind::of_datafusion_error(&e));
-            }
-        };
-        return to_http_response(data, cache_status, format, ResponseMetadata::empty())
-            .await
-            .into_response();
+        return buffered_sql_response(data_stream, cache_status, format, &memory_pool).await;
     };
 
     let first = match data_stream.next().await {
@@ -982,6 +1371,205 @@ mod tests {
         status::RuntimeStatus,
     };
 
+    #[test]
+    fn redact_source_credentials_removes_userinfo() {
+        for (from, expected) in [
+            (
+                "https://user:secret@files.example.com/data.csv",
+                "https://files.example.com/data.csv",
+            ),
+            (
+                "http://token@files.example.com:8080/data.csv",
+                "http://files.example.com:8080/data.csv",
+            ),
+            (
+                "https://:secret@files.example.com",
+                "https://files.example.com",
+            ),
+            (
+                "postgres://user:secret@db.example.com:5432/app?sslmode=require",
+                "postgres://db.example.com:5432/app?sslmode=require",
+            ),
+            // `@` inside the password: everything up to the last `@` goes.
+            (
+                "https://user:p@ss@files.example.com/data.csv",
+                "https://files.example.com/data.csv",
+            ),
+            // Forms WHATWG parsers accept for special schemes.
+            (
+                "https:///user:secret@files.example.com/data.csv",
+                "https:///files.example.com/data.csv",
+            ),
+            (
+                "https:user:secret@files.example.com/data.csv",
+                "https:files.example.com/data.csv",
+            ),
+            (
+                "HTTPS:\\\\user:secret@files.example.com/data.csv",
+                "HTTPS:\\\\files.example.com/data.csv",
+            ),
+            // Every delimiter `DatasetSpec::path` / `CatalogSpec::catalog_id` accept.
+            (
+                "iceberg:https://user:secret@catalog.example.com/v1/ns",
+                "iceberg:https://catalog.example.com/v1/ns",
+            ),
+            (
+                "iceberg/https://user:secret@catalog.example.com/v1/ns",
+                "iceberg/https://catalog.example.com/v1/ns",
+            ),
+            (
+                "iceberg://https://user:secret@catalog.example.com/v1/ns",
+                "iceberg://https://catalog.example.com/v1/ns",
+            ),
+            // Malformed authorities fail closed.
+            (
+                "https://user:secret@files.example.com:invalid/data.csv",
+                "https://files.example.com:invalid/data.csv",
+            ),
+            (
+                "iceberg:https://user:secret@catalog.example.com:bad/v1",
+                "iceberg:https://catalog.example.com:bad/v1",
+            ),
+            ("https://user:secret@", "https://"),
+            // Secret query values.
+            (
+                "https://files.example.com/data.csv?api_key=secret&format=csv",
+                "https://files.example.com/data.csv?api_key=***&format=csv",
+            ),
+            (
+                "https://acct.blob.example.com/c/data.csv?sv=2024&sig=abc%2Fdef#frag",
+                "https://acct.blob.example.com/c/data.csv?sv=2024&sig=***#frag",
+            ),
+            (
+                "iceberg:https://user:pw@catalog.example.com/v1?Token=abc",
+                "iceberg:https://catalog.example.com/v1?Token=***",
+            ),
+        ] {
+            assert_eq!(redact_source_credentials(from), expected, "from: {from}");
+        }
+    }
+
+    #[test]
+    fn redact_source_credentials_keeps_sources_without_credentials() {
+        for from in [
+            "postgres:public.orders",
+            "s3://bucket/path/trips.parquet",
+            "s3://bucket/reports/https://alice@example.csv",
+            "abfs://container/path/",
+            "abfss://container@account.dfs.core.windows.net/data.csv",
+            "https://files.example.com/data.csv",
+            "https://files.example.com/users/@me/data.csv",
+            "https://files.example.com/data.csv?owner=a@example.com",
+            "https://files.example.com/data.csv#a@b",
+            "HTTPS://Files.Example.com:8443/Data.csv",
+            "file:../data/orders.csv",
+            "file:///home/me/a@b/orders.csv",
+            "memory:store",
+            "spice.ai:spiceai/quickstart/datasets/taxi_trips",
+            "",
+        ] {
+            assert_eq!(redact_source_credentials(from), from);
+        }
+    }
+
+    #[test]
+    fn redact_message_credentials_redacts_embedded_urls() {
+        assert_eq!(
+            redact_message_credentials(
+                "Cannot setup the dataset d (https). https://alice:SECRET@example.com:bad/data.csv is not a valid URL."
+            ),
+            "Cannot setup the dataset d (https). https://example.com:bad/data.csv is not a valid URL."
+        );
+        assert_eq!(
+            redact_message_credentials(
+                "Error performing HEAD https://u:SECRET@h/x.csv?token=T0K in 4s; retry 'postgresql://a:B@db/app'"
+            ),
+            "Error performing HEAD https://h/x.csv?token=*** in 4s; retry 'postgresql://db/app'"
+        );
+        let plain = "Unable to authenticate with datasource credentials: user@example.com";
+        assert_eq!(redact_message_credentials(plain), plain);
+    }
+
+    /// Passwords with characters a URL parser would treat as delimiters,
+    /// percent-encoded secret keys, and keys that only look like secrets.
+    #[test]
+    fn redact_source_credentials_handles_delimiters_in_secrets() {
+        for (from, want) in [
+            ("https://u:pa?ss@h/f.csv", "https://h/f.csv"),
+            ("https://u:pa#ss@h/f.csv", "https://h/f.csv"),
+            ("https://u:pa\"ss@h/f.csv", "https://h/f.csv"),
+            ("https://u:pa\tss@h/f.csv", "https://h/f.csv"),
+            ("https://h/f.csv?%74oken=T0K", "https://h/f.csv?%74oken=***"),
+            (
+                "https://[::1]:8443/f.csv?a=1",
+                "https://[::1]:8443/f.csv?a=1",
+            ),
+            (
+                "https://h/f.csv?author=alice",
+                "https://h/f.csv?author=alice",
+            ),
+            (
+                "https://h/f.csv?monkey=banana&sort_key=date",
+                "https://h/f.csv?monkey=banana&sort_key=date",
+            ),
+            (
+                "https://h/f.csv?api_key=K&X-Amz-Signature=S",
+                "https://h/f.csv?api_key=***&X-Amz-Signature=***",
+            ),
+            (
+                "iceberg://https://u:S@h/x?token=T",
+                "iceberg://https://h/x?token=***",
+            ),
+            ("https://u:123?SECRET@h/x", "https://h/x"),
+            ("https://u:p@ss?SECRET@h/x", "https://h/x"),
+            ("file://alice@report.csv", "file://alice@report.csv"),
+            (
+                "https://alice:p'ass@h/x?token=abc'def",
+                "https://h/x?token=***",
+            ),
+            (
+                "https://h/f.csv?email=a@b.example",
+                "https://h/f.csv?email=a@b.example",
+            ),
+            (
+                "https://h:8443?email=a@b.example",
+                "https://h:8443?email=a@b.example",
+            ),
+            ("https://u:123#SECRET@h/x", "https://h/x"),
+        ] {
+            assert_eq!(redact_source_credentials(from), want, "{from}");
+        }
+        assert_eq!(
+            redact_message_credentials("bad url 'https://u:pa?ss@h/f.csv': invalid port"),
+            "bad url 'https://h/f.csv': invalid port"
+        );
+        assert_eq!(
+            redact_message_credentials(
+                "bad url https://u:pa\tss@h/x and iceberg://https://u:S@h/y"
+            ),
+            "bad url https://h/x and iceberg://https://h/y"
+        );
+        // Apostrophes inside a password or a secret query value.
+        assert_eq!(
+            redact_message_credentials("GET 'https://alice:p'ass@h/x?token=abc'def&a=1' failed"),
+            "GET 'https://h/x?token=***&a=1' failed"
+        );
+        // Secret pairs after a quoted secret value.
+        assert_eq!(
+            redact_message_credentials("GET 'https://h/x?token=abc'def&api_key=SECOND' failed"),
+            "GET 'https://h/x?token=***&api_key=***' failed"
+        );
+        assert_eq!(
+            redact_message_credentials("GET https://h/x?token=abc'def&a=1&api_key=SECOND failed"),
+            "GET https://h/x?token=***&a=1&api_key=*** failed"
+        );
+        // A host, port and query holding an `@` keeps its origin.
+        assert_eq!(
+            redact_message_credentials("GET https://h:8443?email=a@b.example failed"),
+            "GET https://h:8443?email=a@b.example failed"
+        );
+    }
+
     /// A query the results cache refuses (e.g. one calling `random()` or
     /// `now()`) reports `CacheDisabled`, which must emit no `X-Cache` or
     /// `Results-Cache-Status` header rather than a misleading HIT/MISS.
@@ -1267,6 +1855,90 @@ mod tests {
             .await
             .expect("transaction response body should be readable");
         assert_eq!(body.as_ref(), br#"[{"value":42}]"#);
+    }
+
+    /// A transaction's final result is reserved from the query memory pool: a
+    /// 600 KB value fits a 1 MiB pool as JSON, but not with its rendered
+    /// `text/plain` table, and not as JSON in a 256 KiB pool.
+    #[tokio::test]
+    async fn transaction_result_is_reserved_from_the_query_memory_pool() {
+        let value = "x".repeat(600 * 1024);
+        let cases = [
+            (1 << 20, ResponseMimeType::Json, StatusCode::OK),
+            (
+                1 << 20,
+                ResponseMimeType::Plain,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                256 << 10,
+                ResponseMimeType::Json,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (8 << 20, ResponseMimeType::Plain, StatusCode::OK),
+        ];
+        // The rendered bytes are refused inside the transaction, before commit.
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                tokio::runtime::Handle::current(),
+            )
+            .memory_limit(Some(1 << 20))
+            .build(),
+        );
+        let refused = run_transaction(&df, &["SELECT 1 AS v".to_string()], None, false, |_| {
+            2 << 20
+        })
+        .await;
+        assert!(matches!(
+            refused,
+            Err(TransactionError::Stream(
+                DataFusionError::ResourcesExhausted(_)
+            ))
+        ));
+
+        for (limit, format, expected) in cases {
+            let df = Arc::new(
+                DataFusionBuilder::new(
+                    RuntimeStatus::new(),
+                    Arc::new(AcceleratorEngineRegistry::new()),
+                    tokio::runtime::Handle::current(),
+                )
+                .memory_limit(Some(limit))
+                .build(),
+            );
+            let response = sql_to_http_response(
+                df,
+                Arc::from("BEGIN; SELECT $1 AS v; COMMIT"),
+                Some(ParamValues::from(vec![ScalarValue::Utf8(Some(
+                    value.clone(),
+                ))])),
+                format,
+                false,
+            )
+            .await;
+
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 16 << 20)
+                .await
+                .expect("body");
+            let body = String::from_utf8_lossy(&body);
+            assert_eq!(status, expected, "{format:?} in {limit} bytes");
+            if expected == StatusCode::OK {
+                // `text/plain` wraps a cell this wide over several lines.
+                assert_eq!(
+                    body.matches('x').count(),
+                    value.len(),
+                    "{format:?}: the value is returned"
+                );
+            } else {
+                assert!(
+                    body.contains("too large to buffer"),
+                    "{format:?}: the error names the cause"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1596,6 +2268,164 @@ mod tests {
                     "{format:?}: body bytes must match the owned-stream path"
                 );
             }
+        }
+    }
+
+    /// `plain_text_size` measures the padded table `arrow_to_plain` renders,
+    /// including a value that spans lines, so its reservation covers the body.
+    #[test]
+    fn plain_text_size_matches_the_rendered_table() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = |ids: Vec<Option<i64>>, names: Vec<Option<&str>>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)) as ArrayRef,
+                    Arc::new(StringArray::from(names)) as ArrayRef,
+                ],
+            )
+            .expect("record batch")
+        };
+        let data = vec![
+            batch(vec![Some(1), None], vec![Some("a"), Some("two\nlines")]),
+            batch(vec![Some(123_456)], vec![None]),
+        ];
+
+        let rendered = arrow_to_plain(&data).expect("plain body");
+        // Every rendered line, plus the line break the last line lacks.
+        assert_eq!(plain_text_size(&data).expect("size"), rendered.len() + 1);
+        assert_eq!(plain_text_size(&[]).expect("size"), 0);
+    }
+
+    /// Formats that buffer the whole result reserve it from the query memory
+    /// pool: a pool just large enough serves the usual response, one byte less
+    /// fails with 503, and the reservation is released either way.
+    #[tokio::test]
+    async fn buffered_formats_reserve_from_the_query_memory_pool() {
+        use arrow::array::{Array, Int32Array, ListArray, UnionArray};
+        use arrow::datatypes::{Int64Type, UnionFields};
+        use cache::result::query::wrap_raw_batches;
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, UnboundedMemoryPool};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let single = |name: &str, array: ArrayRef| {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                name,
+                array.data_type().clone(),
+                true,
+            )]));
+            RecordBatch::try_new(schema, vec![array]).expect("record batch")
+        };
+        let union = UnionArray::try_new(
+            UnionFields::try_new(vec![0], vec![Field::new("i", DataType::Int32, false)])
+                .expect("union fields"),
+            vec![0_i8, 0].into(),
+            None,
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .expect("union array");
+        let list = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![Some(1)])]);
+        let cases = [
+            (
+                ResponseMimeType::Plain,
+                vec![
+                    single("n", Arc::new(Int64Array::from(vec![1, 2]))),
+                    single("n", Arc::new(Int64Array::from(vec![3]))),
+                ],
+            ),
+            (
+                ResponseMimeType::Json,
+                vec![single("u", Arc::new(union) as ArrayRef)],
+            ),
+            (
+                ResponseMimeType::Csv,
+                vec![single("l", Arc::new(list) as ArrayRef)],
+            ),
+        ];
+
+        for (format, batches) in cases {
+            let schema = batches[0].schema();
+            let mut need: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+            if matches!(format, ResponseMimeType::Plain) {
+                need += plain_text_size(&batches).expect("size");
+            }
+            let (expected_status, _, expected_body) = to_http_response(
+                batches.clone(),
+                CacheStatus::CacheHit,
+                format,
+                ResponseMetadata::empty(),
+            )
+            .await;
+            assert!(
+                streamed_encoder(format, &schema).is_none(),
+                "{format:?} over {schema:?} buffers"
+            );
+
+            for raw in [false, true] {
+                for limit in [need, need - 1] {
+                    let greedy = Arc::new(GreedyMemoryPool::new(limit));
+                    let pool: Arc<dyn MemoryPool> = Arc::<GreedyMemoryPool>::clone(&greedy);
+                    let result = if raw {
+                        QueryResult::from_cached_raw(
+                            wrap_raw_batches(batches.clone()),
+                            Arc::clone(&schema),
+                            CacheStatus::CacheHit,
+                        )
+                    } else {
+                        QueryResult::new(
+                            Box::pin(RecordBatchStreamAdapter::new(
+                                Arc::clone(&schema),
+                                futures::stream::iter(
+                                    batches.clone().into_iter().map(Ok::<_, DataFusionError>),
+                                ),
+                            )),
+                            CacheStatus::CacheHit,
+                        )
+                    };
+                    let response = query_result_to_http_response(result, format, pool).await;
+                    assert_eq!(greedy.reserved(), 0, "{format:?}: reservation released");
+
+                    let status = response.status();
+                    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                        .await
+                        .expect("body");
+                    let body = String::from_utf8_lossy(&body);
+                    if limit == need {
+                        assert_eq!(status, expected_status, "{format:?} raw={raw}: {body}");
+                        assert_eq!(body, expected_body, "{format:?} raw={raw}");
+                    } else {
+                        assert_eq!(
+                            status,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "{format:?} raw={raw}"
+                        );
+                        assert!(
+                            body.contains("too large to buffer"),
+                            "{format:?} raw={raw}: the error names the cause: `{body}`"
+                        );
+                    }
+                }
+            }
+
+            let unbounded: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let reservation = MemoryConsumer::new("test").register(&unbounded);
+            let data = collect_reserved(
+                futures::stream::iter(batches.clone().into_iter().map(Ok::<_, DataFusionError>)),
+                &reservation,
+            )
+            .await
+            .expect("collected");
+            assert_eq!(data, batches);
+            assert_eq!(
+                reservation.size(),
+                batches
+                    .iter()
+                    .map(RecordBatch::get_array_memory_size)
+                    .sum::<usize>()
+            );
         }
     }
 }

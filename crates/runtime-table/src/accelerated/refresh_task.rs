@@ -880,6 +880,17 @@ impl RefreshTask {
         &self,
         refresh: &Refresh,
     ) -> Result<RefreshOutcome, RetryError<super::Error>> {
+        // `changes` streams are applied by their own worker and `disabled` never
+        // refreshes. Overrides are checked before a refresh is queued, so reaching here
+        // in either mode is a bug in a caller: fail the refresh, without retries, rather
+        // than panic the worker.
+        if matches!(refresh.mode, RefreshMode::Disabled | RefreshMode::Changes) {
+            return Err(RetryError::permanent(super::Error::RefreshModeCannotRun {
+                dataset_name: self.dataset_name.to_string(),
+                mode: super::refresh::refresh_mode_name(refresh.mode),
+            }));
+        }
+
         // Snapshot polling owns its status and metrics and reads no source, including
         // the timestamp queries used to measure a source-consuming refresh's lag.
         if refresh.mode == RefreshMode::Snapshot {
@@ -980,10 +991,10 @@ impl RefreshTask {
             #[expect(clippy::match_same_arms)] // Caching will have different behavior in future
             match refresh.mode {
                 RefreshMode::Disabled => {
-                    unreachable!("Refresh cannot be called when acceleration is disabled")
+                    unreachable!("run_once rejects disabled mode")
                 }
                 RefreshMode::Full | RefreshMode::Append => &metrics::REFRESH_DURATION_MS,
-                RefreshMode::Changes => unreachable!("changes are handled upstream"),
+                RefreshMode::Changes => unreachable!("run_once rejects changes mode"),
                 RefreshMode::Caching => &metrics::REFRESH_DURATION_MS,
                 RefreshMode::Snapshot => &metrics::REFRESH_DURATION_MS,
             },
@@ -1001,7 +1012,7 @@ impl RefreshTask {
         let mut append_cursor_to_save: Option<String> = None;
         let get_data_update_result = match refresh.mode {
             RefreshMode::Disabled => {
-                unreachable!("Refresh cannot be called when acceleration is disabled")
+                unreachable!("run_once rejects disabled mode")
             }
             // A full refresh of a dataset whose append refresh follows its source's
             // commits reads the source pinned to its current commit and saves it, so the
@@ -1037,7 +1048,7 @@ impl RefreshTask {
                 }
                 Err(e) => Err(e),
             },
-            RefreshMode::Changes => unreachable!("changes are handled upstream"),
+            RefreshMode::Changes => unreachable!("run_once rejects changes mode"),
             RefreshMode::Caching => {
                 // For caching mode, identify and refresh stale rows based on _fetched_at and TTL
                 return self
@@ -2535,11 +2546,11 @@ impl RefreshTask {
     fn update_type_for(mode: RefreshMode) -> UpdateType {
         match mode {
             RefreshMode::Disabled => {
-                unreachable!("Refresh cannot be called when acceleration is disabled")
+                unreachable!("run_once rejects disabled mode")
             }
             RefreshMode::Full => UpdateType::Overwrite,
             RefreshMode::Append => UpdateType::Append,
-            RefreshMode::Changes => unreachable!("changes are handled upstream"),
+            RefreshMode::Changes => unreachable!("run_once rejects changes mode"),
             RefreshMode::Caching => UpdateType::Overwrite,
             RefreshMode::Snapshot => {
                 unreachable!("snapshot mode is handled by refresh_from_snapshot")
@@ -2563,7 +2574,20 @@ impl RefreshTask {
         let effective_sql = match refresh.override_sql_raw.as_ref().map(|s| {
             refresh_sql::parse_refresh_sql(dataset_name.clone(), s, federated_provider.schema())
         }) {
-            Some(Ok((mut parsed, _schema))) => {
+            Some(Ok((mut parsed, schema))) => {
+                // As at dataset setup: rows read without the time column would be
+                // written with a NULL time, which an append reads again next time.
+                if let Err(e) =
+                    refresh.validate_time_format_inner(&dataset_name.to_string(), &schema, false)
+                {
+                    return Err(RetryError::permanent(
+                        super::Error::FailedToRefreshDataset {
+                            source: DataFusionError::Plan(format!(
+                                "Invalid override refresh_sql: {e}"
+                            )),
+                        },
+                    ));
+                }
                 if let Some(base) = &refresh.sql {
                     parsed.set_partition_filters(base.partition_filters().map(<[_]>::to_vec));
                 }

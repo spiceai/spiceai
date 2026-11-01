@@ -149,7 +149,6 @@ where
 // scheduler fails to serialize the catalog table's `IcebergTableScan` for the
 // executor and the query errors with "unsupported plan type: IcebergTableScan".
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_iceberg_catalog_scan() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -215,7 +214,6 @@ async fn test_distributed_iceberg_catalog_scan() -> Result<(), anyhow::Error> {
 // Guards that the data-connector path (the original PR #11378 fix) keeps
 // working through the cluster, alongside the new catalog path.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_iceberg_dataset_scan() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -293,7 +291,6 @@ fn ids(batches: &[RecordBatch]) -> Vec<i64> {
 // scheduler and executor share, so this runs without credentials. Pinning a
 // version older than the latest keeps the row check non-vacuous.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_pinned_iceberg_dataset_scan() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -354,7 +351,6 @@ async fn test_distributed_pinned_iceberg_dataset_scan() -> Result<(), anyhow::Er
 // The same distributed scan over a table AWS Glue manages on S3, pinned to the
 // metadata file Glue records for it.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_pinned_glue_iceberg_dataset_scan() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 

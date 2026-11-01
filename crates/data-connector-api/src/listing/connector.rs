@@ -19,6 +19,7 @@ use crate::parameters::ConnectorContext;
 use data_components::cdc::{AccelerationContents, ChangesStream};
 use data_components::csv_header_projection::HeaderProjectedCsvFormat;
 use data_components::file_schema_drift::{FileSchemaDriftGuard, FileSchemaDriftLayer};
+use data_components::fresh_file_listing::FreshFileListingLayer;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -60,7 +61,6 @@ use object_store::client::{HttpError, HttpErrorKind};
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
 use snafu::prelude::*;
 use url::Url;
-#[cfg(not(windows))]
 use {
     datafusion_datasource::file_format::FileFormatFactory, vortex_datafusion::VortexFormatFactory,
 };
@@ -266,13 +266,16 @@ impl ListingTableTemplate {
             Arc::new(LocationPruningListingTable::new(
                 table,
                 Arc::clone(&self.object_store),
-                table_path,
+                table_path.clone(),
                 Arc::clone(&self.schema),
                 self.extension.as_str(),
             ))
         } else {
             table
         };
+        // A file dataset is read as its files are at query time, not as they were
+        // listed at its first scan.
+        let table = FreshFileListingLayer::over(table, vec![table_path]);
         match self.schema_drift_guard() {
             Some(guard) => FileSchemaDriftLayer::over(table, guard),
             None => table,
@@ -1047,7 +1050,7 @@ pub trait ListingTableConnector: DataConnector {
     /// unstructured formats. It supports the following tabular formats:
     ///  - parquet
     ///  - orc
-    ///  - vortex (not available on Windows)
+    ///  - vortex
     ///  - csv
     ///
     /// For tabular formats, file options can also be specified in the [`Dataset`]'s `param`s.
@@ -1177,7 +1180,6 @@ pub trait ListingTableConnector: DataConnector {
                     file_compression_type,
                 ),
             )),
-            #[cfg(not(windows))]
             (Some("vortex"), _) | (None, Some("vortex")) => Ok((
                 Some(
                     VortexFormatFactory::new()
@@ -1286,7 +1288,6 @@ pub trait ListingTableConnector: DataConnector {
                             FileCompressionType::UNCOMPRESSED,
                         ),
                     )),
-                    #[cfg(not(windows))]
                     Some("vortex") => Ok((
                         Some(
                             VortexFormatFactory::new()
@@ -2449,7 +2450,6 @@ fn structured_file_formats() -> Vec<&'static str> {
         "auto", "csv", "json", "jsonl", "ldjson", "ndjson", "orc", "parquet", "soda", "socrata",
         "tsv",
     ];
-    #[cfg(not(windows))]
     formats.push("vortex");
     formats
 }
@@ -4253,7 +4253,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_get_file_format_and_extension_detect_vortex_extension() {
         let (connector, dataset) = setup_connector("test:test.vortex".to_string(), HashMap::new());
@@ -4267,7 +4266,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_get_file_format_and_extension_auto_detects_vortex() {
         let mut params = HashMap::new();

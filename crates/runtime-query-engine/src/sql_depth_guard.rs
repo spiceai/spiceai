@@ -1141,6 +1141,31 @@ mod tests {
         );
     }
 
+    /// The Arrow type-string parser bounds its own nesting, so a type string
+    /// that is not a SQL literal is bounded too.
+    #[test]
+    fn arrow_type_string_past_the_parser_depth_limit_is_a_parse_error() {
+        let nested_list = |depth: usize| {
+            format!(
+                "{}Int64{}",
+                "List(".repeat(depth - 1),
+                ")".repeat(depth - 1)
+            )
+        };
+
+        nested_list(64)
+            .parse::<arrow_schema::DataType>()
+            .expect("a type nested 64 levels deep parses");
+        let err = nested_list(65)
+            .parse::<arrow_schema::DataType>()
+            .expect_err("a type nested 65 levels deep is refused");
+        assert!(
+            matches!(err, arrow_schema::ArrowError::ParseError(_))
+                && err.to_string().contains("nested more than 64 levels deep"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// A deep `arrow_cast` type string wrapped in `count(*)` is still rejected
     /// (the type string is reached wherever the call appears).
     #[test]

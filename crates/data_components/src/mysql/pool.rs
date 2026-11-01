@@ -282,11 +282,12 @@ pub async fn connect(
         component,
         logged_at: parking_lot::Mutex::new(HashMap::new()),
     };
-    Ok(
-        MySQLConnectionPool::new_with_pool_opts(params, move |pool_opts| settings.apply(pool_opts))
-            .await?
-            .with_new_connection_observer(move |identity| log.log(identity)),
+    MySQLConnectionPool::new_with_pool_opts_and_observer(
+        params,
+        move |pool_opts| settings.apply(pool_opts),
+        move |identity| log.log(identity),
     )
+    .await
 }
 
 /// Logs the server each new pooled connection reached: at INFO the first time in

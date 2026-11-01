@@ -733,6 +733,81 @@ async fn shared_group_gtid_restore_resumes_via_executed_set() -> Result<(), anyh
     Ok(())
 }
 
+/// A transaction committed under a tagged GTID (`uuid:tag:gno`, `MySQL` 8.3+) stops a
+/// GTID-positioned group with an error naming the GTID, before its rows are delivered. Its
+/// sequence number counts apart from the source's untagged transactions and the executed set
+/// records no tags, so folding it in as `uuid:gno` would claim an untagged transaction the
+/// group never applied, which a reconnect from that set would then skip.
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_group_gtid_stops_on_a_tagged_transaction() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
+
+    let container = common::start_mysql_gtid_docker_container().await?;
+    let port = container.host_port(3306)?;
+    let pool = common::get_mysql_conn(port)?;
+    setup_table(&pool, "tagged", &[(1, "t1")]).await?;
+    let server_uuid: String = pool
+        .get_conn()
+        .await?
+        .query_first("SELECT @@server_uuid")
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("@@server_uuid returned no row"))?;
+
+    let store: Arc<dyn PositionStore> = Arc::new(MemoryPositionStore::default());
+    let mut stream =
+        start_replication_stream(stream_input(port, 210_601, "tagged", Arc::clone(&store)));
+    drain_bootstrap(&mut stream, "tagged member", &[1]).await?;
+    wait_for_ready(&mut stream, "tagged member readiness").await?;
+    // An untagged transaction streams as usual.
+    exec(&pool, "INSERT INTO tagged VALUES (2, 't2')").await?;
+    expect_single_change(&mut stream, "untagged insert", "c", 2).await?;
+
+    {
+        // `gtid_next` is per session, so the three statements share one connection.
+        let mut conn = pool.get_conn().await?;
+        conn.query_drop("SET gtid_next = 'AUTOMATIC:spice_tag'")
+            .await?;
+        conn.query_drop("INSERT INTO tagged VALUES (3, 't3')")
+            .await?;
+        conn.query_drop("SET gtid_next = 'AUTOMATIC'").await?;
+    }
+
+    let expected = format!("the tagged GTID '{server_uuid}:spice_tag:1'");
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
+    loop {
+        let item = tokio::time::timeout(Duration::from_secs(30), stream.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for the tagged-GTID error"))?
+            .ok_or_else(|| anyhow::anyhow!("stream ended without the tagged-GTID error"))?;
+        match item {
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains(&expected),
+                    "the stream failed without naming {expected}: {message}"
+                );
+                break;
+            }
+            Ok(envelope) => {
+                anyhow::ensure!(
+                    num_rows(&envelope) == 0,
+                    "the tagged transaction's rows were delivered: {:?}",
+                    ids_of(&envelope)
+                );
+                envelope.commit().await?;
+            }
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "only idle heartbeats arrived while waiting for the tagged-GTID error"
+        );
+    }
+
+    drop(stream);
+    pool.disconnect().await?;
+    Ok(())
+}
+
 /// A single dataset on its own shared dump — the common production case where
 /// sharing coalesces exactly one member. Verifies the always-on shared path
 /// serves a lone member end-to-end: cold snapshot, then create/update/delete
