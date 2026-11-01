@@ -16,9 +16,10 @@ limitations under the License.
 
 //! A transaction across two datasets of the object-native catalog commits by
 //! two-phase commit over their logs: both or neither, including when the
-//! process stops before or after the decision. What no log needs afterwards (a
-//! resolved transaction's records, the log of a dropped dataset or of a create
-//! that stopped before the dataset was named) is removed, and nothing else.
+//! process stops before or after the decision. What no log needs afterwards is
+//! removed, and nothing else: a finished transaction's records by whoever
+//! finishes it, and the log of a dropped dataset or of a create that stopped
+//! before the dataset was named once older than `reclaim_after`.
 
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ use cayenne::{
     catalog::CatalogPublication,
     metastore::object_native::{NativeCatalogConfig, ObjectNativeCatalog, dataset_log_at},
 };
-use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
+use object_store::{ObjectStore, memory::InMemory, path::Path};
 use object_store_occ::{
     headlog::Reader,
     sim::{
@@ -109,29 +110,7 @@ async fn published(catalog: &ObjectNativeCatalog, orders: &str, audit: &str) -> 
 }
 
 fn is_decision(path: &Path) -> bool {
-    path.as_ref().ends_with("/decision.json")
-}
-
-/// The one decision object written, and what it says.
-async fn decisions(store: &Arc<dyn ObjectStore>) -> Vec<String> {
-    use futures::TryStreamExt;
-    let listed: Vec<_> = store
-        .list(Some(&Path::from("transactions")))
-        .try_collect()
-        .await
-        .expect("list transactions");
-    let mut decisions = Vec::new();
-    for meta in listed.into_iter().filter(|meta| is_decision(&meta.location)) {
-        let bytes = store
-            .get(&meta.location)
-            .await
-            .expect("get decision")
-            .bytes()
-            .await
-            .expect("decision bytes");
-        decisions.push(String::from_utf8_lossy(&bytes).into_owned());
-    }
-    decisions
+    path.as_ref().ends_with("/decision")
 }
 
 /// Every object under `prefix`.
@@ -216,8 +195,9 @@ async fn a_transaction_across_two_datasets_commits_on_both_logs() {
 }
 
 /// The coordinator stops before recording its decision: the process that opens
-/// the logs next aborts the transaction, so neither dataset shows it, and both
-/// accept changes again.
+/// the logs next has fenced it on both, so it aborts the transaction without
+/// waiting for the deadline and removes its records. Neither dataset shows it,
+/// and both accept changes again.
 #[tokio::test]
 async fn a_transaction_stopped_before_its_decision_aborts_when_the_catalog_reopens() {
     let (faults, store, catalog, orders, audit) = setup().await;
@@ -236,7 +216,7 @@ async fn a_transaction_stopped_before_its_decision_aborts_when_the_catalog_reope
         .await
         .expect("reopen resolves the prepared transaction");
     assert_eq!(published(&reopened, &orders, &audit).await, [None, None]);
-    assert_eq!(decisions(&store).await, ["abort"]);
+    assert_eq!(objects_under(&store, "transactions").await, Vec::<String>::new());
     reopened
         .commit_publications(&[publication(&orders, "orders-later", 7)])
         .await
@@ -248,7 +228,8 @@ async fn a_transaction_stopped_before_its_decision_aborts_when_the_catalog_reope
 }
 
 /// The decision to commit lands, then the coordinator stops before resolving:
-/// the next open finishes the commit on both datasets.
+/// the next open finishes the commit on both datasets and removes the
+/// transaction's records.
 #[tokio::test]
 async fn a_transaction_stopped_after_its_commit_decision_commits_when_the_catalog_reopens() {
     let (faults, store, catalog, orders, audit) = setup().await;
@@ -268,7 +249,7 @@ async fn a_transaction_stopped_after_its_commit_decision_commits_when_the_catalo
         .await
         .expect("reopen resolves the prepared transaction");
     assert_eq!(published(&reopened, &orders, &audit).await, [Some(5), Some(6)]);
-    assert_eq!(decisions(&store).await, ["commit"]);
+    assert_eq!(objects_under(&store, "transactions").await, Vec::<String>::new());
 }
 
 /// Between a transaction's `Prepare` and `Resolve`, another change to one of its
@@ -316,39 +297,6 @@ async fn a_change_to_a_reserved_dataset_waits_for_the_transaction() {
             .expect("read orders"),
         Some(7)
     );
-}
-
-/// A transaction recovery aborted leaves its records until they are older than
-/// `reclaim_after`; then an open removes them, and both datasets keep their
-/// state and accept changes.
-#[tokio::test]
-async fn an_open_removes_the_records_of_a_transaction_recovery_resolved() {
-    let (faults, store, catalog, orders, audit) = setup().await;
-    faults.arm(Op::Create, is_decision, Fault::Hold);
-    let coordinator = tokio::spawn({
-        let catalog = Arc::clone(&catalog);
-        let (orders, audit) = (orders.clone(), audit.clone());
-        async move { catalog.commit_publications(&across(&orders, &audit)).await }
-    });
-    faults.wait_held(None).await;
-    coordinator.abort();
-    assert!(coordinator.await.is_err_and(|error| error.is_cancelled()));
-    drop(catalog);
-    faults.clear_rules();
-    // Recent: kept.
-    let reopened = ObjectNativeCatalog::open(Arc::clone(&store), Path::from("catalog"))
-        .await
-        .expect("reopen");
-    assert_eq!(decisions(&store).await, ["abort"]);
-    drop(reopened);
-    let reopened = open_reclaiming(&store).await;
-    assert_eq!(objects_under(&store, "transactions").await, Vec::<String>::new());
-    assert_eq!(published(&reopened, &orders, &audit).await, [None, None]);
-    reopened
-        .commit_publications(&across(&orders, &audit))
-        .await
-        .expect("a later transaction commits on both");
-    assert_eq!(published(&reopened, &orders, &audit).await, [Some(5), Some(6)]);
 }
 
 /// A dropped dataset's log, and the log of a create that stopped before the

@@ -18,7 +18,11 @@ limitations under the License.
 //! so datasets commit independently. A transaction across datasets commits by
 //! two-phase commit over their logs.
 
-use super::{Domain, NativeCatalogConfig, OpenSummary, ValueChange, invalid, position};
+use super::{
+    Domain, NativeCatalogConfig, OpenSummary, ValueChange, invalid, position, replay_state,
+};
+use cayenne_metastore_actions::proto;
+use prost::Message;
 use crate::{
     catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit},
     metadata::{
@@ -50,6 +54,12 @@ const TRANSACTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs
 /// The object in a dropped dataset's folder whose time is when it was dropped.
 const DROPPED: &str = "dropped";
 
+/// A transaction's records under `transactions/<id>/`: the intent, created
+/// before the first `Prepare`, and the decision, created if absent. Both are
+/// [`proto::Intent`] and [`proto::Decision`] messages.
+const INTENT: &str = "intent";
+const DECISION: &str = "decision";
+
 /// The name registry and every dataset's log.
 pub struct ObjectNativeCatalog {
     store: Arc<dyn ObjectStore>,
@@ -58,7 +68,8 @@ pub struct ObjectNativeCatalog {
     /// created before datasets had logs of their own, and positions whose key
     /// names no dataset.
     registry: Arc<Domain>,
-    /// `datasets/` and `transactions/`, beside the registry.
+    /// The registry's prefix, and `datasets/` and `transactions/` beside it.
+    prefix: Path,
     datasets: Path,
     transactions: Path,
     routes: RwLock<Routes>,
@@ -136,79 +147,193 @@ async fn delete_under(store: &Arc<dyn ObjectStore>, prefix: &Path) -> CatalogRes
     Ok(())
 }
 
+fn encode_decision(commit: bool) -> Vec<u8> {
+    proto::Decision {
+        outcome: if commit {
+            proto::Outcome::Commit
+        } else {
+            proto::Outcome::Abort
+        } as i32,
+    }
+    .encode_to_vec()
+}
+
+fn decode_decision(txn: &str, bytes: &[u8]) -> CatalogResult<bool> {
+    let decision = proto::Decision::decode(bytes).map_err(invalid)?;
+    match proto::Outcome::try_from(decision.outcome) {
+        Ok(proto::Outcome::Commit) => Ok(true),
+        Ok(proto::Outcome::Abort) => Ok(false),
+        _ => Err(invalid(format!(
+            "transaction {txn} has an unreadable decision (outcome {})",
+            decision.outcome
+        ))),
+    }
+}
+
+/// The bytes of `transactions/<txn>/<name>`, or `None` when it does not exist.
+async fn read_record(
+    store: &Arc<dyn ObjectStore>,
+    transactions: &Path,
+    txn: &str,
+    name: &str,
+) -> CatalogResult<Option<bytes::Bytes>> {
+    match store.get(&transactions.clone().join(txn).join(name)).await {
+        Ok(object) => Ok(Some(object.bytes().await.map_err(invalid)?)),
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(error) => Err(invalid(error)),
+    }
+}
+
+async fn read_intent(
+    store: &Arc<dyn ObjectStore>,
+    transactions: &Path,
+    txn: &str,
+) -> CatalogResult<Option<proto::Intent>> {
+    read_record(store, transactions, txn, INTENT)
+        .await?
+        .map(|bytes| proto::Intent::decode(bytes).map_err(invalid))
+        .transpose()
+}
+
+/// The recorded outcome of `txn`: `Some(true)` to commit.
+async fn read_decision(
+    store: &Arc<dyn ObjectStore>,
+    transactions: &Path,
+    txn: &str,
+) -> CatalogResult<Option<bool>> {
+    read_record(store, transactions, txn, DECISION)
+        .await?
+        .map(|bytes| decode_decision(txn, &bytes))
+        .transpose()
+}
+
 /// Record `commit` as the outcome of `txn` under `transactions` unless one is
-/// recorded, and return the recorded outcome. Exactly one outcome is ever
-/// recorded.
+/// recorded, and return the recorded outcome. Exactly one outcome is recorded
+/// while the transaction's records exist.
 async fn decide(
-store: &Arc<dyn ObjectStore>,
-transactions: &Path,
-txn: &str,
-commit: bool,
+    store: &Arc<dyn ObjectStore>,
+    transactions: &Path,
+    txn: &str,
+    commit: bool,
 ) -> CatalogResult<bool> {
     const ATTEMPTS: u32 = 8;
-    let path = transactions.clone().join(txn).join("decision.json");
-    let body = if commit { "commit" } else { "abort" };
+    let path = transactions.clone().join(txn).join(DECISION);
+    let body = encode_decision(commit);
     let mut last = None;
     for attempt in 0..ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(50 << attempt.min(6))).await;
         }
         match store
-            .put_opts(&path, PutPayload::from(body), PutMode::Create.into())
+            .put_opts(&path, PutPayload::from(body.clone()), PutMode::Create.into())
             .await
         {
             Ok(_) => return Ok(commit),
             Err(object_store::Error::AlreadyExists { .. }) => {}
             // Unknown whether it landed: read it back, or try again.
             Err(error) => {
-                last = Some(error);
+                last = Some(error.to_string());
                 continue;
             }
         }
-        match store.get(&path).await {
-            Ok(recorded) => {
-                let recorded = recorded.bytes().await.map_err(invalid)?;
-                return match recorded.as_ref() {
-                    b"commit" => Ok(true),
-                    b"abort" => Ok(false),
-                    other => Err(invalid(format!(
-                        "transaction {txn} has an unreadable decision: {}",
-                        String::from_utf8_lossy(other)
-                    ))),
-                };
-            }
-            Err(error) => last = Some(error),
+        match read_decision(store, transactions, txn).await {
+            Ok(Some(recorded)) => return Ok(recorded),
+            // Removed between the create and the read: try again.
+            Ok(None) => last = Some("the decision was removed while it was read".to_string()),
+            Err(error) => last = Some(error.to_string()),
         }
     }
     Err(invalid(format!(
         "could not record the decision of transaction {txn}: {}",
-        last.map_or_else(String::new, |error| error.to_string())
+        last.unwrap_or_default()
     )))
 }
 
-/// Remove the records of every transaction under `transactions` made before
-/// `cutoff` that no log holds prepared (`live`), and return how many.
-async fn reclaim_transactions(
+/// Remove `txn`'s records: the intent first, so a decision left by a failure
+/// between the two is one with no intent, which [`remove_if_finished`] removes.
+async fn forget_records(
     store: &Arc<dyn ObjectStore>,
     transactions: &Path,
-    cutoff: chrono::DateTime<chrono::Utc>,
-    live: &HashSet<String>,
-) -> CatalogResult<usize> {
-    let mut removed = 0;
-    let listed = store
-        .list_with_delimiter(Some(transactions))
-        .await
-        .map_err(invalid)?;
-    for prefix in listed.common_prefixes {
-        let Some(txn) = prefix.filename() else {
-            continue;
-        };
-        if !live.contains(txn) && created_at(txn).is_some_and(|created| created < cutoff) {
-            delete_under(store, &prefix).await?;
-            removed += 1;
+    txn: &str,
+) -> CatalogResult<()> {
+    for name in [INTENT, DECISION] {
+        match store.delete(&transactions.clone().join(txn).join(name)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => return Err(invalid(error)),
         }
     }
-    Ok(removed)
+    Ok(())
+}
+
+/// A participant's log as storage holds it: its head lease, and whether it
+/// holds `txn` prepared. A log that does not exist can take no `Prepare`.
+async fn participant_state(
+    store: &Arc<dyn ObjectStore>,
+    log: Path,
+    txn: &str,
+) -> CatalogResult<(u64, bool)> {
+    match store.head(&log.clone().join("head")).await {
+        Ok(_) => {}
+        Err(object_store::Error::NotFound { .. }) => return Ok((u64::MAX, false)),
+        Err(error) => return Err(invalid(error)),
+    }
+    let (reader, opened) = object_store_occ::headlog::Reader::open(Arc::clone(store), log)
+        .await
+        .map_err(invalid)?;
+    let lease = reader.state().head.lease;
+    Ok((lease, replay_state(opened)?.state.prepared.contains_key(txn)))
+}
+
+/// Whether every participant of `intent` is past the coordinator's lease, from
+/// storage alone, and the participants still holding `txn` prepared.
+async fn participants(
+    store: &Arc<dyn ObjectStore>,
+    intent: &proto::Intent,
+    log: &impl Fn(&str) -> Path,
+    txn: &str,
+) -> CatalogResult<(bool, Vec<String>)> {
+    let mut fenced = true;
+    let mut prepared = Vec::new();
+    for participant in &intent.participants {
+        let (lease, holds) = participant_state(store, log(&participant.folder), txn).await?;
+        fenced &= lease > participant.lease;
+        if holds {
+            prepared.push(participant.folder.clone());
+        }
+    }
+    Ok((fenced, prepared))
+}
+
+/// Remove `txn`'s records when nothing can still need them, read from storage
+/// alone: a decision is recorded, every participant's head lease is past the
+/// lease the coordinator prepares under (so no `Prepare` of the coordinator's
+/// can land), and no participant holds the transaction prepared. A decision with
+/// no intent, created after the records were removed, goes too: no participant
+/// holds the transaction prepared, so nothing applies it. `log` maps a
+/// participant's folder to its log's prefix. Returns whether anything was
+/// removed.
+async fn remove_if_finished(
+    store: &Arc<dyn ObjectStore>,
+    transactions: &Path,
+    log: &impl Fn(&str) -> Path,
+    txn: &str,
+) -> CatalogResult<bool> {
+    let Some(intent) = read_intent(store, transactions, txn).await? else {
+        let stray = read_record(store, transactions, txn, DECISION).await?.is_some();
+        if stray {
+            forget_records(store, transactions, txn).await?;
+        }
+        return Ok(stray);
+    };
+    if read_decision(store, transactions, txn).await?.is_none() {
+        return Ok(false);
+    }
+    let (fenced, prepared) = participants(store, &intent, log, txn).await?;
+    if !fenced || !prepared.is_empty() {
+        return Ok(false);
+    }
+    forget_records(store, transactions, txn).await?;
+    Ok(true)
 }
 
 /// The prefix of the log that holds `dataset` in the catalog at `prefix`, read
@@ -365,6 +490,7 @@ impl ObjectNativeCatalog {
             store,
             config,
             registry,
+            prefix,
             datasets,
             transactions,
             routes: RwLock::new(routes),
@@ -565,14 +691,20 @@ impl ObjectNativeCatalog {
         let txn = uuid::Uuid::now_v7().to_string();
         let deadline = chrono::Utc::now()
             + chrono::Duration::from_std(TRANSACTION_DEADLINE).map_err(invalid)?;
-        let intent = serde_json::json!({
-            "participants": groups.iter().map(|(domain, _)| domain.folder.clone()).collect::<Vec<_>>(),
-            "deadline": deadline.to_rfc3339(),
-        });
+        let intent = proto::Intent {
+            participants: groups
+                .iter()
+                .map(|(domain, _)| proto::Participant {
+                    folder: domain.folder.clone(),
+                    lease: domain.opened.lease,
+                })
+                .collect(),
+            deadline_unix_millis: deadline.timestamp_millis(),
+        };
         self.store
             .put_opts(
-                &self.transaction_object(&txn, "intent.json"),
-                PutPayload::from(intent.to_string()),
+                &self.transactions.clone().join(txn.as_str()).join(INTENT),
+                PutPayload::from(intent.encode_to_vec()),
                 PutMode::Create.into(),
             )
             .await
@@ -623,32 +755,32 @@ impl ObjectNativeCatalog {
         }
     }
 
-    fn transaction_object(&self, txn: &str, name: &str) -> Path {
-        self.transactions.clone().join(txn).join(name)
+    /// The prefix of the log in folder `folder`: the registry's for the empty
+    /// folder, a dataset's otherwise.
+    fn log_of(&self, folder: &str) -> Path {
+        if folder.is_empty() {
+            self.prefix.clone()
+        } else {
+            self.datasets.clone().join(folder)
+        }
     }
 
-    /// Remove a resolved transaction's records. One that fails is removed when
-    /// a catalog next opens.
+    /// Remove a transaction's records once the coordinator has resolved every
+    /// participant. One that fails is removed when a catalog next opens.
     async fn forget(&self, txn: &str) {
-        if let Err(error) = delete_under(&self.store, &self.transactions.clone().join(txn)).await {
+        if let Err(error) = forget_records(&self.store, &self.transactions, txn).await {
             tracing::debug!("Cayenne object-native metastore left the records of resolved transaction {txn} for the next open to remove: {error}");
         }
     }
 
-    /// Remove what no log needs once recovery has resolved every transaction
-    /// left prepared: the records of transactions no log holds prepared, logs no name refers to (a dataset
-    /// dropped, or a create stopped before it was named). Only what is older than
-    /// `reclaim_after` goes, since a newer one may belong to a process that took
-    /// the logs over after this one opened them.
+    /// Remove the logs no name refers to: a dataset dropped, or a create stopped
+    /// before it was named. Only what is older than `reclaim_after` goes, since
+    /// a newer one may belong to a process that took the registry over after this
+    /// one opened it.
     async fn reclaim(&self) -> CatalogResult<()> {
         let cutoff = chrono::Utc::now()
             - chrono::Duration::from_std(self.config.reclaim_after).map_err(invalid)?;
-        let mut removed = (0, 0);
-        let mut live = HashSet::new();
-        for domain in self.domains() {
-            live.extend(domain.unresolved().await.into_iter().map(|(txn, _)| txn));
-        }
-        removed.0 = reclaim_transactions(&self.store, &self.transactions, cutoff, &live).await?;
+        let mut removed = 0;
         let named: HashSet<String> = self
             .registry
             .positions_under(REGISTRY)
@@ -675,14 +807,12 @@ impl ObjectNativeCatalog {
             };
             if ended.is_some_and(|ended| ended < cutoff) {
                 delete_under(&self.store, &prefix).await?;
-                removed.1 += 1;
+                removed += 1;
             }
         }
-        if removed != (0, 0) {
+        if removed > 0 {
             tracing::debug!(
-                "Cayenne object-native metastore removed the records of {} resolved transactions and {} dataset logs no dataset uses",
-                removed.0,
-                removed.1
+                "Cayenne object-native metastore removed {removed} dataset logs no dataset uses"
             );
         }
         Ok(())
@@ -694,21 +824,80 @@ impl ObjectNativeCatalog {
         decide(&self.store, &self.transactions, txn, commit).await
     }
 
-    /// Resolve every transaction a stopped process left prepared, from its
-    /// decision. One with no decision yet is aborted: this process fenced the
-    /// coordinator when it opened the logs, so it can no longer commit.
+    /// Finish every transaction a stopped process left behind. Opening the
+    /// catalog took every log over, so the coordinator of each transaction under
+    /// `transactions/` can prepare and decide nothing more: one with no decision
+    /// is aborted, every participant holding it prepared is resolved from its
+    /// decision, and its records are removed once storage shows no participant
+    /// needs them ([`remove_if_finished`]).
     async fn recover(&self) -> CatalogResult<()> {
+        let listed = self
+            .store
+            .list_with_delimiter(Some(&self.transactions))
+            .await
+            .map_err(invalid)?;
+        let mut finished = HashSet::new();
+        for prefix in listed.common_prefixes {
+            let Some(txn) = prefix.filename() else {
+                continue;
+            };
+            self.finish(txn).await?;
+            finished.insert(txn.to_string());
+        }
+        // Records survive while a log holds their transaction prepared, so a
+        // prepared transaction without them means its outcome is lost.
         for domain in self.domains() {
-            for (txn, footprint) in domain.unresolved().await {
-                let reservation = domain.inner.reserve().await;
-                let commit = self.decide(&txn, false).await?;
-                domain.resolve(&txn, footprint, commit).await?;
-                drop(reservation);
-                tracing::info!(
-                    "Cayenne object-native metastore resolved transaction {txn}, left prepared when spiced stopped: {}",
-                    if commit { "committed" } else { "aborted" }
-                );
+            if let Some((txn, _)) = domain
+                .unresolved()
+                .await
+                .into_iter()
+                .find(|(txn, _)| !finished.contains(txn))
+            {
+                return Err(invalid(format!(
+                    "transaction {txn} is prepared on the dataset log '{}' but its records under `transactions/` are gone, so its outcome is unknown",
+                    domain.folder
+                )));
             }
+        }
+        Ok(())
+    }
+
+    /// Decide, resolve and remove `txn` as [`Self::recover`] describes.
+    async fn finish(&self, txn: &str) -> CatalogResult<()> {
+        let log = |folder: &str| self.log_of(folder);
+        if let Some(intent) = read_intent(&self.store, &self.transactions, txn).await? {
+            let (fenced, prepared) = participants(&self.store, &intent, &log, txn).await?;
+            let decision = match read_decision(&self.store, &self.transactions, txn).await? {
+                Some(commit) => Some(commit),
+                None if fenced => Some(self.decide(txn, false).await?),
+                None => None,
+            };
+            if let Some(commit) = decision {
+                for domain in self.domains() {
+                    if !prepared.contains(&domain.folder) {
+                        continue;
+                    }
+                    for (_, footprint) in domain
+                        .unresolved()
+                        .await
+                        .into_iter()
+                        .filter(|(prepared, _)| prepared == txn)
+                    {
+                        let reservation = domain.inner.reserve().await;
+                        domain.resolve(txn, footprint, commit).await?;
+                        drop(reservation);
+                        tracing::info!(
+                            "Cayenne object-native metastore resolved transaction {txn}, left prepared when spiced stopped: {}",
+                            if commit { "committed" } else { "aborted" }
+                        );
+                    }
+                }
+            }
+        }
+        if remove_if_finished(&self.store, &self.transactions, &log, txn).await? {
+            tracing::debug!(
+                "Cayenne object-native metastore removed the records of finished transaction {txn}"
+            );
         }
         Ok(())
     }

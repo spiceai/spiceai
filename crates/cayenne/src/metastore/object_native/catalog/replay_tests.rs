@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 //! Replay of the `cayenne-metastore-model` `transactions` traces through two
-//! real dataset logs, the decision object and the transaction-record removal.
+//! real dataset logs, the transaction's records (intent and decision) and their
+//! removal.
 //!
 //! Each record the model lands on a participant's log is the same operation on
 //! that participant's log here: a write to another key (a source position), a
@@ -23,8 +24,13 @@ limitations under the License.
 //! read back from the decision object. A delivery the model refuses because a
 //! newer lease fenced it runs through the fenced handle and must be refused.
 //! `Fence` opens the log again, which takes it over. `Decide` records a
-//! decision create-if-absent. `Gc` removes the records of transactions no log
-//! holds prepared.
+//! decision create-if-absent. `Forget(1)` is another process removing the
+//! records by [`remove_if_finished`], from storage alone; the prototype must
+//! remove exactly when the model does. `Forget(0)` is the coordinator removing
+//! them, which `commit_across` does only after every `Prepare` it sent has
+//! returned: the replay refuses it while the model's coordinator has one in
+//! flight, and otherwise removes the records. `Gc` collects a participant's
+//! staged objects, which the head log's own GC does, so it is counted.
 //!
 //! Each `Check`, identical retry and lost response of one write is the head
 //! log's own protocol, which the `commits` and `source-positions` replays in
@@ -42,17 +48,18 @@ limitations under the License.
 //!
 //! - reservation: no write to a prepared table lands;
 //! - matching: no `Resolve` lands without its `Prepare`;
-//! - create-once: a recorded decision never changes;
-//! - agreement: every participant resolves to the recorded decision;
+//! - create-once: a recorded decision never changes while the intent exists;
+//! - agreement: every participant resolves to the first recorded decision;
 //! - records: a transaction's records survive while a log holds it prepared.
 
-use super::{decide, reclaim_transactions};
+use super::{INTENT, decide, forget_records, read_decision, remove_if_finished};
 use crate::{
     catalog::{CatalogPublication, MetadataCatalog},
     metadata::{CreateTableOptions, VortexConfig},
     metastore::object_native::{Domain, NativeCatalogConfig, position, replay_state},
 };
-use cayenne_metastore_actions::DatasetState;
+use cayenne_metastore_actions::{DatasetState, proto};
+use prost::Message;
 use cayenne_metastore_model::TransactionStep;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload, path::Path};
 use object_store_occ::headlog::{HeadLogConfig, Reader};
@@ -61,7 +68,6 @@ use std::{
     sync::Arc,
 };
 
-/// A `UUIDv7`, so record removal can tell its age.
 const TXN: &str = "01a19500-0000-7000-8000-000000000000";
 
 struct Trace {
@@ -184,8 +190,6 @@ struct Outcome {
     divergence: Option<String>,
     /// A guarantee broke, from storage alone.
     violation: Option<String>,
-    /// The step where the trace leaves what the prototype can do.
-    truncated: Option<String>,
     /// Actions replayed and actions counted without a call.
     replayed: BTreeMap<&'static str, usize>,
     counted: BTreeMap<String, usize>,
@@ -235,10 +239,19 @@ impl Replay {
             });
         }
         let transactions = Path::from("transactions");
+        let intent = proto::Intent {
+            participants: (0..count)
+                .map(|i| proto::Participant {
+                    folder: format!("p{i}"),
+                    lease: participants[i].handles[&1].opened.lease,
+                })
+                .collect(),
+            deadline_unix_millis: 0,
+        };
         store
             .put_opts(
-                &transactions.clone().join(TXN).join("intent.json"),
-                PutPayload::from("{}"),
+                &transactions.clone().join(TXN).join(INTENT),
+                PutPayload::from(intent.encode_to_vec()),
                 PutMode::Create.into(),
             )
             .await
@@ -263,24 +276,24 @@ impl Replay {
         View::of_state(&self.read(i).await, &self.participants[i].table)
     }
 
-    async fn object(&self, name: &str) -> Option<String> {
+    /// Whether the intent exists.
+    async fn intent(&self) -> bool {
         match self
             .store
-            .get(&self.transactions.clone().join(TXN).join(name))
+            .head(&self.transactions.clone().join(TXN).join(INTENT))
             .await
         {
-            Ok(object) => Some(
-                String::from_utf8(object.bytes().await.expect("object bytes").to_vec())
-                    .expect("UTF-8"),
-            ),
-            Err(object_store::Error::NotFound { .. }) => None,
-            Err(error) => panic!("read {name}: {error}"),
+            Ok(_) => true,
+            Err(object_store::Error::NotFound { .. }) => false,
+            Err(error) => panic!("read the intent: {error}"),
         }
     }
 
     /// The recorded decision: `Some(true)` to commit.
     async fn decision(&self) -> Option<bool> {
-        self.object("decision.json").await.map(|body| body == "commit")
+        read_decision(&self.store, &self.transactions, TXN)
+            .await
+            .expect("read the decision")
     }
 
     /// Run a record of `kind` on participant `i` through the handle of `lease`.
@@ -333,7 +346,7 @@ impl Replay {
     async fn guarantees(&mut self) -> Option<String> {
         let decision = self.decision().await;
         if let Some(decided) = self.decided {
-            if decision.is_some_and(|now| now != decided) {
+            if self.intent().await && decision.is_some_and(|now| now != decided) {
                 return Some("create-once: the recorded decision changed".to_string());
             }
         } else {
@@ -352,7 +365,7 @@ impl Replay {
             ));
         }
         for i in 0..self.participants.len() {
-            if self.view(i).await.prepared && self.object("intent.json").await.is_none() {
+            if self.view(i).await.prepared && !self.intent().await {
                 return Some(format!(
                     "records: participant {i} holds the transaction prepared and its records are gone"
                 ));
@@ -378,9 +391,8 @@ impl Replay {
                 let lease = self.participants[i].lease;
                 if kind == 1 && lease != 1 {
                     // Only the coordinator writes a `Prepare`, under the lease it
-                    // held when the transaction began; a process that took the log
-                    // over has fenced it. The model lets the new owner prepare.
-                    outcome.truncated = Some(at("a Prepare under a lease that took the log over".into()));
+                    // held when the transaction began.
+                    outcome.divergence = Some(at("the model prepares under a later lease".into()));
                     return outcome;
                 }
                 let before = self.view(i).await;
@@ -445,20 +457,27 @@ impl Replay {
                     return outcome;
                 }
                 *outcome.replayed.entry("decide").or_default() += 1;
-            } else if name == "Gc" {
-                let mut live = HashSet::new();
-                for i in 0..self.participants.len() {
-                    live.extend(self.read(i).await.prepared.into_keys());
+            } else if text == "Forget(0)" {
+                if step.prepare_in_flight.iter().any(|&in_flight| in_flight) {
+                    outcome.divergence = Some(at(
+                        "the coordinator removes the records only after every Prepare it sent has returned".into(),
+                    ));
+                    return outcome;
                 }
-                reclaim_transactions(
-                    &self.store,
-                    &self.transactions,
-                    chrono::Utc::now() + chrono::Duration::days(1),
-                    &live,
-                )
-                .await
-                .expect("remove transaction records");
-                *outcome.replayed.entry("gc").or_default() += 1;
+                forget_records(&self.store, &self.transactions, TXN)
+                    .await
+                    .expect("remove the records");
+                *outcome.replayed.entry("forget-coordinator").or_default() += 1;
+            } else if text == "Forget(1)" {
+                let log = |folder: &str| Path::from(format!("datasets/{folder}"));
+                let removed = remove_if_finished(&self.store, &self.transactions, &log, TXN)
+                    .await
+                    .expect("remove finished records");
+                if !removed {
+                    outcome.divergence = Some(at("kept records the model removes".into()));
+                    return outcome;
+                }
+                *outcome.replayed.entry("forget-other").or_default() += 1;
             } else {
                 if let Some(i) = text
                     .strip_prefix("Issue(")
@@ -487,8 +506,15 @@ impl Replay {
                 0 => None,
                 decision => Some(decision == 1),
             };
-            let records = self.object("intent.json").await.is_some();
-            if records && self.decision().await != expected {
+            let intent = self.intent().await;
+            if intent != step.records {
+                outcome.divergence = Some(at(format!(
+                    "the intent exists: {intent}; the model's records exist: {}",
+                    step.records
+                )));
+                return outcome;
+            }
+            if self.decision().await != expected {
                 outcome.divergence = Some(at(format!(
                     "decision {:?}; the model records {}",
                     self.decision().await,
@@ -542,7 +568,6 @@ async fn positive(text: &str) {
     let mut replayed: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut counted: BTreeMap<String, usize> = BTreeMap::new();
     let mut count = 0;
-    let mut truncations = 0;
     for trace in traces(text) {
         for (backend, outcome) in replay(&trace).await {
             assert!(
@@ -550,10 +575,6 @@ async fn positive(text: &str) {
                 "{backend} {}: {outcome:?}",
                 describe(&trace)
             );
-            if let Some(truncated) = &outcome.truncated {
-                truncations += 1;
-                eprintln!("TRUNCATED {backend} {}: {truncated}", describe(&trace));
-            }
             for (name, n) in outcome.replayed {
                 *replayed.entry(name).or_default() += n;
             }
@@ -564,7 +585,7 @@ async fn positive(text: &str) {
         }
     }
     eprintln!(
-        "REPLAYED traces×backends={count} truncated={truncations} replayed={replayed:?} counted={counted:?}"
+        "REPLAYED traces×backends={count} replayed={replayed:?} counted={counted:?}"
     );
 }
 
@@ -638,11 +659,31 @@ async fn control_create_once() {
 }
 
 #[tokio::test]
-async fn control_roots() {
+async fn control_fence_check() {
     negative(
-        include_str!("../../../../tests/traces/transactions-no-roots.jsonl"),
-        "I4 Prepare and visible objects survive",
-        false,
+        include_str!("../../../../tests/traces/transactions-no-fence-check.jsonl"),
+        "a prepared participant keeps its transaction's records",
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn control_coordinator_wait() {
+    negative(
+        include_str!("../../../../tests/traces/transactions-no-coordinator-wait.jsonl"),
+        "a prepared participant keeps its transaction's records",
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn control_prepared_check() {
+    negative(
+        include_str!("../../../../tests/traces/transactions-no-prepared-check.jsonl"),
+        "a prepared participant keeps its transaction's records",
+        true,
     )
     .await;
 }

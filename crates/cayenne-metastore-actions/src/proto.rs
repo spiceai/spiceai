@@ -494,6 +494,48 @@ pub struct Resolve {
     pub commit: bool,
 }
 
+/// A transaction across datasets' logs, created before its first `Prepare`
+/// at `transactions/<id>/intent`.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct Intent {
+    #[prost(message, repeated, tag = "1")]
+    pub participants: Vec<Participant>,
+    /// Milliseconds since the Unix epoch after which any process may abort.
+    #[prost(int64, tag = "2")]
+    pub deadline_unix_millis: i64,
+}
+
+/// One log in a transaction across datasets.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct Participant {
+    /// The dataset folder under `datasets/`; empty for the name registry's log.
+    #[prost(string, tag = "1")]
+    pub folder: String,
+    /// The lease generation the coordinator writes this log's `Prepare` under.
+    /// Once the log's head lease is past it, no `Prepare` of the transaction can
+    /// land there.
+    #[prost(uint64, tag = "2")]
+    pub lease: u64,
+}
+
+/// The outcome of a transaction across datasets, created if absent at
+/// `transactions/<id>/decision`.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct Decision {
+    #[prost(enumeration = "Outcome", tag = "1")]
+    pub outcome: i32,
+}
+
+/// A transaction's outcome. Zero is no outcome, so a decision that decodes to
+/// it is unreadable rather than an abort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[repr(i32)]
+pub enum Outcome {
+    Unspecified = 0,
+    Commit = 1,
+    Abort = 2,
+}
+
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Action {
     #[prost(
