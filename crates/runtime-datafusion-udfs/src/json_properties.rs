@@ -133,9 +133,10 @@ const MAX_DEPTH_LIMIT: usize = 128;
 /// annotations, so the output can be far larger than the input. One document
 /// emits at most this many bytes per byte of `max_bytes`.
 const OUTPUT_BYTES_PER_INPUT_BYTE: usize = 32;
-/// Schema entries one document may resolve across all `effective_schemas`
-/// calls. Rows that share a large `$ref` target resolve it again for each
-/// row, so the walk stops here like the row cap.
+/// Schema nodes one document may visit while resolving `$ref` and
+/// combinators, across all `effective_schemas` calls. Rows that share a large
+/// `$ref` target resolve it again for each row, so the walk stops here like
+/// the row cap.
 const MAX_EFFECTIVE_ENTRIES: usize = 4 * 1024 * 1024;
 
 /// Scalar UDF ceiling across a single evaluated batch. Per-document caps
@@ -371,7 +372,7 @@ struct Walker<'a> {
     /// reached again at the same or a deeper level adds nothing new, and
     /// expanding it again grows exponentially when branches share targets.
     expanded_targets: HashMap<usize, usize>,
-    /// Entries returned by all `effective_schemas` calls so far.
+    /// Schema nodes visited by all `collect_effective` calls so far.
     effective_entries: usize,
     max_effective_entries: usize,
     output_bytes: usize,
@@ -686,11 +687,6 @@ impl<'a> Walker<'a> {
         if out.is_empty() {
             out.push(schema);
         }
-        self.effective_entries += out.len();
-        if self.effective_entries > self.max_effective_entries && !self.row_cap_hit {
-            self.row_cap_hit = true;
-            record_error("work_cap_hit");
-        }
         out
     }
 
@@ -699,6 +695,15 @@ impl<'a> Walker<'a> {
     /// `opts.max_depth` so pathological combinator / ref chains can't blow the
     /// stack or iterate unboundedly (`DoS`).
     fn collect_effective(&mut self, schema: &'a Value, out: &mut Vec<&'a Value>, ref_depth: usize) {
+        if self.row_cap_hit {
+            return;
+        }
+        self.effective_entries += 1;
+        if self.effective_entries > self.max_effective_entries {
+            self.row_cap_hit = true;
+            record_error("work_cap_hit");
+            return;
+        }
         if ref_depth > self.opts.max_depth {
             if !self.depth_cap_hit {
                 self.depth_cap_hit = true;
@@ -742,6 +747,9 @@ impl<'a> Walker<'a> {
         for comb in ["allOf", "oneOf", "anyOf"] {
             if let Some(arr) = schema.get(comb).and_then(Value::as_array) {
                 for entry in arr {
+                    if self.row_cap_hit {
+                        return;
+                    }
                     self.collect_effective(entry, out, ref_depth + 1);
                 }
             }
@@ -2419,6 +2427,27 @@ mod tests {
         let opts = FlattenOptions::default();
         let mut walker = Walker::new(&root, &opts);
         walker.max_effective_entries = 100;
+        walker.walk_schema(&root, "", 0);
+        assert!(walker.row_cap_hit);
+        assert!(walker.rows.len() < 50, "rows: {}", walker.rows.len());
+    }
+
+    #[test]
+    fn references_skipped_as_already_expanded_count_toward_the_work_cap() {
+        let props: Vec<String> = (0..50)
+            .map(|i| format!(r##""p{i}":{{"$ref":"#/$defs/t"}}"##))
+            .collect();
+        let doc = format!(
+            r#"{{"properties":{{{}}},"$defs":{{"u":{{}},"t":{{"type":"string","allOf":[{}]}}}}}}"#,
+            props.join(","),
+            [r##"{"$ref":"#/$defs/u"}"##; 200].join(",")
+        );
+        assert_eq!(flatten(&doc).len(), 50);
+
+        let root: Value = serde_json::from_str(&doc).expect("valid json");
+        let opts = FlattenOptions::default();
+        let mut walker = Walker::new(&root, &opts);
+        walker.max_effective_entries = 1000;
         walker.walk_schema(&root, "", 0);
         assert!(walker.row_cap_hit);
         assert!(walker.rows.len() < 50, "rows: {}", walker.rows.len());
