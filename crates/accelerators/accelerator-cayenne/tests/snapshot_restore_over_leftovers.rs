@@ -271,7 +271,7 @@ async fn publish(manager: &SnapshotManager, rows: i64) {
         .create_snapshot(
             &schema(),
             lock,
-            None,
+            runtime_acceleration::snapshot::LocalData::synced(None),
             Some(u64::try_from(rows).expect("positive")),
             ForceCreate(true),
         )

@@ -214,6 +214,16 @@ impl SnapshotEngine for SqliteSnapshotEngine {
         .map_err(|e| super::SnapshotEngineError::Sqlite { source: e })
     }
 
+    /// Checks the database header only: a connection, even a read-only one, can create
+    /// a journal or WAL beside the downloaded file.
+    async fn verify_downloaded_file(
+        &self,
+        downloaded: &Path,
+        dataset_name: &str,
+    ) -> Result<(), super::SnapshotEngineError> {
+        super::verify_sqlite_header(downloaded, dataset_name, "sqlite").await
+    }
+
     async fn prepare_for_upload(
         &self,
         source_path: &Path,
@@ -960,10 +970,14 @@ mod tests {
 
         let engine = SqliteSnapshotEngine::new();
         let missing = tmp.path().join("missing-download.sqlite");
-        let error =
-            crate::snapshot::replace_downloaded_file(&engine, &missing, &live_path, "orders")
-                .await
-                .expect_err("a missing download cannot replace the live database");
+        let error = crate::snapshot::replace_downloaded_file(
+            &engine,
+            &crate::snapshot::VerifiedDownload::assume_verified(&missing),
+            &live_path,
+            "orders",
+        )
+        .await
+        .expect_err("a missing download cannot replace the live database");
         assert!(
             matches!(
                 error,
@@ -1180,9 +1194,14 @@ mod tests {
         let tmp = TempDir::new().expect("tmp");
         let (live_path, download, live) = live_wal_database_and_download(&tmp);
         let engine = SqliteSnapshotEngine::new();
-        crate::snapshot::replace_downloaded_file(&engine, &download, &live_path, "orders")
-            .await
-            .expect("replace");
+        crate::snapshot::replace_downloaded_file(
+            &engine,
+            &crate::snapshot::VerifiedDownload::assume_verified(&download),
+            &live_path,
+            "orders",
+        )
+        .await
+        .expect("replace");
         assert_eq!(count_rows_in_wal_mode(&live_path), 3);
         drop(live);
         assert_eq!(count_rows_in_wal_mode(&live_path), 3);
@@ -1238,5 +1257,43 @@ mod tests {
             count_rows(&final_path),
             i64::try_from(rows.len()).expect("row count fits in i64")
         );
+    }
+
+    /// A downloaded file without the `SQLite` header is refused before it can replace
+    /// the accelerator's file; a real database passes, and neither check leaves a file
+    /// beside the download.
+    #[tokio::test]
+    async fn verify_downloaded_file_refuses_a_file_that_is_not_a_database() {
+        let tmp = TempDir::new().expect("tmp");
+        let junk = tmp.path().join("junk.sqlite");
+        std::fs::write(&junk, [0x5a_u8; 4096]).expect("write random-looking bytes");
+        let short = tmp.path().join("short.sqlite");
+        std::fs::write(&short, b"SQLite").expect("write a truncated header");
+        let engine = SqliteSnapshotEngine::new();
+
+        for path in [&junk, &short] {
+            let err = engine
+                .verify_downloaded_file(path, "orders")
+                .await
+                .expect_err("a file that is not a database must be refused");
+            assert!(
+                matches!(err, super::super::SnapshotEngineError::Unopenable { .. }),
+                "{err}"
+            );
+        }
+
+        let database = create_wal_mode_db_with_rows(&tmp, &[(1, "a")]);
+        let checkpoint = Connection::open(&database).expect("open");
+        checkpoint
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .expect("checkpoint");
+        drop(checkpoint);
+        let before = std::fs::read_dir(tmp.path()).expect("list").count();
+        engine
+            .verify_downloaded_file(&database, "orders")
+            .await
+            .expect("a database passes the check");
+        let after = std::fs::read_dir(tmp.path()).expect("list").count();
+        assert_eq!(before, after, "the check must not create files");
     }
 }
