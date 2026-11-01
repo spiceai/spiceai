@@ -945,7 +945,9 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::RuntimeUnavailable { .. } => "runtime_unavailable",
         spice::error::Error::TlsVerificationFailed { .. } => "tls_verification_failed",
         spice::error::Error::TlsRootCertificate { .. } => "tls_root_certificate",
-        spice::error::Error::Unauthorized => "unauthorized",
+        spice::error::Error::Unauthorized | spice::error::Error::ModelListUnauthorized { .. } => {
+            "unauthorized"
+        }
         spice::error::Error::PermissionDenied => "permission_denied",
         spice::error::Error::RuntimeHttp { .. } => "runtime_http_error",
         spice::error::Error::ConnectionFailed { .. } => "connection_failed",
