@@ -124,7 +124,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1f0744b900e69e1b3fafa721aa4283bd4b048a61` | `spiceai-0.11.0-df-55` |
-| [llama.cpp](#llamacpp) | `2bedd1f734588bedf2aef43464172f2a446033cc` | `spiceai-b11999` |
+| [llama.cpp](#llamacpp) | `3a536dbfe202c9b7765b82ecc2978e45e03b729a` | `spiceai-b11999` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [orc-rust](#orc-rust) | `d9632e7ae973456c81c660c04e5f55cc86489bcb` | `spiceai-0.9` |
@@ -785,9 +785,10 @@ rather than by taking them. A re-cut cannot lose what the fork does not carry.
 Upstream [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). The fork carries
 upstream releases with the Spice patches below: each `spiceai-<release>` branch is the previous
 Spice branch with the upstream release tag merged in, and the pin is its tagged tip,
-`<release>-spiceai.<n>`, or a merge commit on it that no tag names yet: today
-`b11999-spiceai.1`, upstream `b11984` and then `b11999` merged into `spiceai-b11803`, with
-`spiceai-b11803` merged in again at spiceai/llama.cpp#16. Since `b11984` the DeepSeek-V4.1 model (`deepseek41`) is upstream's, and the fork keeps only
+`<release>-spiceai.<n>`, or a commit on it that no tag names yet: today the squash of
+spiceai/llama.cpp#23, three commits (#21, #20, #23) past `b11999-spiceai.1`, which is upstream
+`b11984` and then `b11999` merged into `spiceai-b11803`, with `spiceai-b11803` merged in again at
+spiceai/llama.cpp#16. Since `b11984` the DeepSeek-V4.1 model (`deepseek41`) is upstream's, and the fork keeps only
 its fixes on top; of those, the ones without a row below (a LoRA adapter on `output.weight`,
 `deepseek41v` image preprocessing, MXFP8 NaN validation under `--check-tensors` and the
 converter's `--remote` Engram reads) are in code Spice does not call.
@@ -806,6 +807,9 @@ release, follow `spiceai/README.md` in the fork.
 | RPC graphs are serialized on the head and rebuilt on a rank without an allocation per tensor: open-addressing sets and indexes replace per-tensor hash-map nodes, and the tensor vectors are reused across graphs, with the bytes sent unchanged (spiceai/llama.cpp#14) | Each graph a split model has not sent before costs more CPU to serialize on the head and to rebuild on every rank, which a prompt that needs new graphs pays before it computes | silent (perf) | **GAP** — a perf-only row; see [Open gaps](#open-gaps) |
 | Saving a sequence's state queues each tensor's read on its backend and synchronizes each backend once, and the meta backend's asynchronous read covers split and offset reads as its synchronous read does; a quantized tensor is still read synchronously (spiceai/llama.cpp#16) | A prompt-cache checkpoint of a split model waits one round trip per tensor again: about 72 ms instead of 28 ms on GLM-5.3 split three ways | silent (perf) | **GAP** — a perf-only row; the fork's `test-meta-async-read` checks that the asynchronous read returns what the synchronous one does; see [Open gaps](#open-gaps) |
 | `glm5-next` (GLM-5.3) records its layer inputs for a DFlash drafter, as the models upstream's DFlash supports do | A DFlash draft over GLM-5.3-Flash aborts `spiced` when its graph's outputs are set (layer input tensor is null) | crash | **GAP** — no small `glm5-next` GGUF or drafter to run here; see [Open gaps](#open-gaps) |
+| Mistral Large 4 (`mistral-large4`) and its DSpark drafter split across devices (`LLAMA_SPLIT_MODE_TENSOR`): its MLA attention splits by whole query heads with the latent and indexer caches mirrored, its SSMax scale is built in the operand order the meta backend broadcasts, and the drafter's MLA stages split with the target's, whose split output head's logits are gathered before the drafter's Markov head (spiceai/llama.cpp#20) | Mistral Large 4 does not tensor-split, as upstream lists it as unable to, so it splits across nodes by layer, several times slower; with its DSpark drafter, a split target aborts on its first request (`GGML_ASSERT(split_states_equal(src_ss[0], src_ss[2]))`) | crash (and silent perf) | **GAP** — no small `mistral-large4` GGUF or drafter to split here; the fork's `test-llama-archs -a mistral-large4` (its Meta and `--rpc` rows) covers the split; see [Open gaps](#open-gaps) |
+| The meta backend handles `GGML_OP_POOL_1D` as upstream `b11999` does, without the unused split-state handler the `b11984` merge left behind (spiceai/llama.cpp#21) | Nothing Spice builds or runs: the dead lambda only fails GCC's `-Werror=unused-but-set-variable` in the fork's own CI | none | none needed — the patch deletes dead code, and Spice builds the sources without `-Werror` |
+| A DSpark draft token is read from its logits row as the row's largest logit, the first on a tie, when the drafter's CPU sampler chain is top-k and its final pick alone and no backend sampler sampled the row, instead of filling a candidate per vocabulary token and partially sorting it (spiceai/llama.cpp#23) | Each DSpark draft token costs the candidate fill and sort again. With the runtime's own greedy fast path (spiceai/spiceai#15911), the two measured +0.7% decode throughput on DeepSeek-V4.1 split across three DGX Sparks; the drafter half was not measured on its own | silent (perf) | **GAP** — a perf-only row; the fork's `test-logits-argmax` and `test-backend-sampler` (`test_row_argmax`, `test_top1_is_argmax`) check that the pick is the greedy sampler's and that other chains and backend-sampled rows keep the old path; see [Open gaps](#open-gaps) |
 | A DeepSeek-V4 GGUF whose `attention.output_group_count` is 0 fails its load while its hyperparameters are read (`deepseek4`, whose hyperparameters `deepseek41` shares); the attention heads are divided among that many groups | The load goes on to divide by the group count when it sizes the attention output tensors: undefined behaviour in C++, and a `SIGFPE` that takes `spiced` down where the CPU traps it, as x86 does | crash | `a_zero_output_group_count_fails_a_deepseek_load` (`crates/llama-cpp/tests/gguf_corruption.rs`); without the check, the same header fails later, on a missing key |
 | A failed check while loading a model throws instead of aborting: libllama defines `GGML_ABORT_THROWS`, under which `GGML_ABORT` throws a `std::runtime_error` inside the `llama_abort_throws_scope` that `llama_model_load` opens in the try block that catches it, and aborts as upstream everywhere else | Without the patch, a GGUF whose metadata fails a `GGML_ASSERT`, such as an unknown `<arch>.classifier.activation`, aborts `spiced` at load instead of failing that model. Without its scope, a failed check outside a load throws out of a C API function that catches nothing, into Rust | crash | `an_unknown_classifier_activation_fails_the_load_instead_of_aborting` and `a_corrupted_gguf_fails_its_load_without_taking_the_process_down` (`crates/llama-cpp/tests`) for the load, and `sampler::tests::a_failed_check_outside_a_model_load_aborts_instead_of_throwing` (`crates/llama-cpp/src/sampler.rs`) for everywhere else |
 
@@ -877,7 +881,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**51 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**53 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -945,7 +949,10 @@ They are not equal in consequence; this is the order to close them in.
    and gated-delta-net state split across nodes (spiceai/llama.cpp#8): a load
    error if lost, guarded in the fork by `test-llama-archs --rpc`; for its
    `glm5-next` layer inputs for a DFlash drafter, an abort of the draft if lost,
-   which a guard here would need a GLM-5.3 drafter small enough for CI to reach; and for its
+   which a guard here would need a GLM-5.3 drafter small enough for CI to reach; for its
+   Mistral Large 4 and DSpark-drafter tensor split (spiceai/llama.cpp#20), a layer-only split and
+   an abort on the drafter's first request if lost, guarded in the fork by `test-llama-archs -a mistral-large4`,
+   which a guard here would need a Mistral Large 4 GGUF and drafter small enough for CI to reach; and for its
    meta-backend locks (spiceai/llama.cpp#9), races that the fork's
    `test-meta-graph-slots` catches under ThreadSanitizer, which a test here would
    need two split models on one host to reach.
@@ -1003,7 +1010,8 @@ without becoming a flaky timing test:
     here trends either — a ring that loses it falls back to TCP;
     `llama.cpp`'s opt-in decode and prompt levers for a model split across nodes
     (spiceai/llama.cpp#7, #8, #12), its RPC graph serialization without per-tensor
-    allocation (spiceai/llama.cpp#14) and its asynchronous state reads (spiceai/llama.cpp#16),
+    allocation (spiceai/llama.cpp#14), its asynchronous state reads (spiceai/llama.cpp#16) and
+    its DSpark draft tokens read as the row's largest logit (spiceai/llama.cpp#23),
     measured on the same cluster;
     `snowflake-rs` streaming batches (memory, not latency — but see the
     `snowflake-rs` note above: it is blocked with the rest of that fork);
