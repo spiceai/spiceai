@@ -144,6 +144,8 @@ pub fn try_map_boxed_error_to_box(
 pub struct UnsupportedContentPart {
     /// The part's `type`, as the request names it.
     pub part: &'static str,
+    /// The input the part carries, as a model that accepts it would name it.
+    pub input: &'static str,
 }
 
 #[cfg(feature = "local_llm")]
@@ -152,8 +154,8 @@ impl UnsupportedContentPart {
     #[must_use]
     pub fn refusal(&self, model: &str) -> String {
         format!(
-            "Model '{model}' reads only text, so it cannot take the `{}` part of a user message. Send the message's content as text.",
-            self.part
+            "Model '{model}' reads only text, so it cannot take the `{}` part of a user message. Send the message's content as text, or use a model that accepts {} input.",
+            self.part, self.input
         )
     }
 }
@@ -197,15 +199,22 @@ pub fn message_to_mistral(
                                 Ok(t.text.as_str())
                             }
                             ChatCompletionRequestUserMessageContentPart::ImageUrl(_) => {
-                                Err(UnsupportedContentPart { part: "image_url" })
+                                Err(UnsupportedContentPart {
+                                    part: "image_url",
+                                    input: "image",
+                                })
                             }
                             ChatCompletionRequestUserMessageContentPart::InputAudio(_) => {
                                 Err(UnsupportedContentPart {
                                     part: "input_audio",
+                                    input: "audio",
                                 })
                             }
                             ChatCompletionRequestUserMessageContentPart::File(_) => {
-                                Err(UnsupportedContentPart { part: "file" })
+                                Err(UnsupportedContentPart {
+                                    part: "file",
+                                    input: "file",
+                                })
                             }
                         })
                         .collect::<std::result::Result<Vec<_>, _>>()?;

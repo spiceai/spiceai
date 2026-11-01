@@ -361,6 +361,6 @@ async fn a_part_other_than_text_is_refused() {
     };
     assert_eq!(
         message,
-        "Model 'qwen3.5' reads only text, so it cannot take the `image_url` part of a user message. Send the message's content as text."
+        "Model 'qwen3.5' reads only text, so it cannot take the `image_url` part of a user message. Send the message's content as text, or use a model that accepts image input."
     );
 }
