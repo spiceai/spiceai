@@ -421,7 +421,7 @@
             }
           },
           "400": {
-            "description": "Dataset is not accelerated; nothing to refresh",
+            "description": "Dataset is not accelerated, or the overrides are invalid: a `refresh_mode` other than `full` or `append`, or a `refresh_sql` that does not parse or omits the dataset's `time_column`",
             "content": {
               "application/json": {
                 "schema": {
@@ -12043,6 +12043,14 @@
           }
         }
       },
+      "OnDemandRefreshMode": {
+        "type": "string",
+        "description": "The `refresh_mode` values an on-demand refresh accepts, as documented in the API\nschema. Requests are read as a [`RefreshMode`] and checked by\n[`RefreshOverrides::validate_mode`].",
+        "enum": [
+          "full",
+          "append"
+        ]
+      },
       "OutputItem": {
         "oneOf": [
           {
@@ -13011,17 +13019,6 @@
           }
         }
       },
-      "RefreshMode": {
-        "type": "string",
-        "enum": [
-          "disabled",
-          "full",
-          "append",
-          "changes",
-          "caching",
-          "snapshot"
-        ]
-      },
       "RefreshOverrides": {
         "type": "object",
         "description": "[`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.",
@@ -13040,8 +13037,8 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/RefreshMode",
-                "description": "The refresh mode to use for this refresh. Defaults to the `refresh_mode` specified in the spicepod, or `full`."
+                "$ref": "#/components/schemas/OnDemandRefreshMode",
+                "description": "The refresh mode to use for this refresh: `full` or `append`. Defaults to the `refresh_mode` specified in the spicepod, or `full`."
               }
             ]
           },
