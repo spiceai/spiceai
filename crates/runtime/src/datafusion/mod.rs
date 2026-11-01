@@ -4269,10 +4269,13 @@ impl DataFusion {
         }
 
         // we must not fetch data older than the explicitly set refresh data window or retention period
-        let refresh_data_window = dataset.refresh_data_window().or(dataset.retention_period());
+        let explicit_refresh_data_window = dataset.refresh_data_window();
+        let refresh_data_window = explicit_refresh_data_window.or(dataset.retention_period());
 
         if let Some(refresh_data_window) = refresh_data_window {
-            refresh = refresh.period(refresh_data_window);
+            refresh = refresh
+                .period(refresh_data_window)
+                .period_keeps_null_time(explicit_refresh_data_window.is_none());
         }
         refresh
             .validate_time_format(&dataset.name.to_string(), &refresh_schema)

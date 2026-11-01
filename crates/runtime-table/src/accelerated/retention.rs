@@ -17,7 +17,8 @@ limitations under the License.
 use std::{sync::Arc, time::SystemTime};
 
 use crate::accelerated::{
-    DataRetentionFilter, Retention, refresh, refresh_task::collect_all_indexes,
+    DataRetentionFilter, Retention, exact_string_time::pin_string_time_comparisons, refresh,
+    refresh_task::collect_all_indexes,
 };
 use crate::federated::FederatedTable;
 use crate::filter_converter::{TimestampFilterConvert, create_timestamp_filter_convert};
@@ -49,6 +50,24 @@ use tokio::sync::Mutex;
 /// stops the peel rather than being silently skipped here.
 fn strip_index_wrapper_layers(tbl: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
     Arc::clone(peel_to(tbl, LayerWalk::RetentionDelete))
+}
+
+/// Whether `provider` (already peeled to its retention-delete target) evaluates a
+/// delete's filter itself: a Cayenne table, or a partitioned table whose partitions
+/// are Cayenne tables.
+///
+/// The Cayenne accelerator sits beneath a `PolyTableProvider` read/write split, which
+/// stops every walk but the write walk, so the write walk finds the table the delete
+/// reaches.
+fn deletes_evaluate_with_datafusion(provider: &Arc<dyn TableProvider>) -> bool {
+    let provider: &dyn std::any::Any = peel_to(provider, LayerWalk::Write).as_ref();
+    provider.is::<cayenne::CayenneTableProvider>()
+        || provider
+            .downcast_ref::<runtime_table_partition::provider::PartitionTableProvider>()
+            .is_some_and(|partitioned| {
+                let creator: &dyn std::any::Any = partitioned.creator().as_ref();
+                creator.is::<cayenne::CayennePartitionCreator>()
+            })
 }
 
 /// Resolves the index a retention delete should actually hit: for a compound (fallback-composed)
@@ -121,28 +140,52 @@ pub(crate) async fn apply_retention_filters_once(
     }
 
     let raw_accelerator = strip_index_wrapper_layers(accelerator);
-    let plan = match raw_accelerator.delete_from(&ctx.state(), vec![expr]).await {
-        Ok(plan) => plan,
-        Err(e) => {
-            tracing::error!("[retention] Error running retention check: {e}");
-            return Err(e);
+    // An accelerator that renders the delete's filter into its own SQL parses a
+    // string time column differently than `DataFusion`; pin each such comparison to
+    // the strings `DataFusion` selects first (see `exact_string_time`). Cayenne
+    // evaluates the filter itself, in each data file's Vortex scan or with `DataFusion`
+    // where Vortex cannot express it, and its scans hide the rows its time retention
+    // expires, so pinning there would find nothing to delete.
+    let predicates = if deletes_evaluate_with_datafusion(&raw_accelerator) {
+        vec![expr]
+    } else {
+        match pin_string_time_comparisons(accelerator, &ctx.state(), expr).await {
+            Ok(predicates) => predicates,
+            Err(e) => {
+                tracing::error!("[retention] Error running retention check: {e}");
+                return Err(e);
+            }
         }
     };
 
-    let deleted = match collect(plan, ctx.task_ctx()).await {
-        Ok(deleted) => deleted,
-        Err(e) => {
-            tracing::error!("[retention] Error running retention check: {e}");
-            return Err(e);
-        }
-    };
+    let mut num_records = 0;
+    for predicate in predicates {
+        let plan = match raw_accelerator
+            .delete_from(&ctx.state(), vec![predicate])
+            .await
+        {
+            Ok(plan) => plan,
+            Err(e) => {
+                tracing::error!("[retention] Error running retention check: {e}");
+                return Err(e);
+            }
+        };
 
-    let num_records = deleted.first().map_or(0, |f| {
-        f.column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .map_or(0, |v| v.values().first().copied().unwrap_or(0))
-    });
+        let deleted = match collect(plan, ctx.task_ctx()).await {
+            Ok(deleted) => deleted,
+            Err(e) => {
+                tracing::error!("[retention] Error running retention check: {e}");
+                return Err(e);
+            }
+        };
+
+        num_records += deleted.first().map_or(0, |f| {
+            f.column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .map_or(0, |v| v.values().first().copied().unwrap_or(0))
+        });
+    }
 
     for (target, keys) in warm_deletes {
         if let Err(e) = target.delete_by_keys(keys).await {
@@ -601,6 +644,532 @@ mod tests {
             deleted, 2,
             "two fixture rows have deleted = true; the logged eviction count must be that number"
         );
+    }
+
+    /// Cayenne's scans hide the rows its time retention expires. Retention must still
+    /// physically delete an expired ISO8601 string row there, which pinning the
+    /// comparison through such a scan would turn into a delete of nothing; the table is
+    /// wrapped as the Cayenne accelerator wraps it, so the check that skips pinning
+    /// sees what it sees in `spiced`. The table has no primary key, so it deletes by
+    /// row position: from a data file, where Vortex cannot evaluate the comparison's
+    /// cast and `DataFusion` does, and from the rows still held inline.
+    #[tokio::test]
+    async fn deletes_an_expired_string_time_row_from_a_cayenne_table_with_time_retention() {
+        use cayenne::metadata::{CreateTableOptions, VortexConfig};
+        use cayenne::{
+            CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog,
+            TimeRetentionFilterBuilder,
+        };
+        use datafusion::{datasource::memory::MemorySourceConfig, logical_expr::dml::InsertOp};
+        use util::timestamp_filter::{TimestampFilterConvert, data_type_to_timestamp_format};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = temp_dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{}/cayenne.db", metadata_dir.display()))
+                .expect("catalog"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Utf8, false),
+        ]));
+        let retention =
+            TimeRetentionFilterBuilder::try_new("ts", 86_400, &schema).expect("retention builder");
+        let ctx = SessionContext::new();
+        let cayenne = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .with_time_retention_filter_builder(retention)
+            .create(CreateTableOptions {
+                table_name: "string_time_retention".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: temp_dir.path().join("data").display().to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            })
+            .await
+            .expect("Cayenne table");
+        let insert = async |ids: Vec<i64>, times: Vec<&str>| {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(times)),
+                ],
+            )
+            .expect("batch");
+            let input = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
+                .expect("input");
+            let insert = cayenne
+                .insert_into(&ctx.state(), input, InsertOp::Append)
+                .await
+                .expect("insert plan");
+            collect(insert, ctx.task_ctx()).await.expect("insert");
+        };
+        // One expired and one live row in a Vortex data file, and another pair inline.
+        insert(
+            vec![1, 2],
+            vec!["2021-05-01T00:00:00Z", "9999-01-01T00:00:00Z"],
+        )
+        .await;
+        cayenne
+            .checkpoint_inlined_data()
+            .await
+            .expect("the first rows are flushed to a data file");
+        insert(
+            vec![3, 4],
+            vec!["2021-05-01T09:00:00+09:00", "9999-01-01T00:00:00-07:00"],
+        )
+        .await;
+
+        let accelerator = cayenne_accelerator(cayenne);
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
+        let format = data_type_to_timestamp_format(&DataType::Utf8, None).expect("ISO8601");
+        let converter = TimestampFilterConvert::new("ts".to_string(), format, None, None);
+        let cutoff = refresh::get_timestamp(SystemTime::now() - Duration::from_hours(24));
+        let retention_pass = async || {
+            apply_retention_filters_once(
+                &TableReference::bare("string_time_retention"),
+                &accelerator,
+                &federated,
+                converter.convert(cutoff, Operator::Lt),
+                &Handle::current(),
+            )
+            .await
+            .expect("retention delete")
+        };
+
+        assert_eq!(
+            retention_pass().await,
+            2,
+            "both 2021 rows are past the one-day retention and must be deleted, not only hidden: the one in the data file and the inline one"
+        );
+        assert_eq!(
+            retention_pass().await,
+            0,
+            "a row retention already deleted is not deleted again"
+        );
+    }
+
+    /// Deletes from a Cayenne table without a primary key delete exactly the rows an
+    /// in-test oracle selects: over several data files of several chunks each, after an
+    /// earlier delete left a deletion vector on them, with NULLs in the filter columns,
+    /// and with `-0.0` and `0.0`, which SQL holds equal and Vortex does not. Only the
+    /// conjuncts the read path would push down go into each file's scan, and every
+    /// position comes from `row_idx()`, so a pruned chunk or an excluded row cannot
+    /// shift the positions the deletion vector records.
+    #[tokio::test]
+    async fn cayenne_deletes_by_a_split_filter_match_an_oracle() {
+        use cayenne::metadata::{CreateTableOptions, VortexConfig};
+        use cayenne::{CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog};
+        use datafusion::arrow::array::{Array, Float64Array};
+        use datafusion::logical_expr::{col, dml::InsertOp, lit};
+        use datafusion::{datasource::memory::MemorySourceConfig, prelude::Expr};
+
+        #[derive(Clone, Copy)]
+        struct Row {
+            id: i64,
+            v: Option<i64>,
+            a: f64,
+        }
+        let rows: Vec<Row> = (0..120_000_i64)
+            .map(|id| Row {
+                id,
+                v: (id % 7 != 0).then_some(id % 11),
+                // `-0.0` on one row in five, a real difference from `b = 0.0` on another.
+                a: match id % 5 {
+                    0 => -0.0,
+                    1 => 1.0,
+                    _ => 0.0,
+                },
+            })
+            .collect();
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = temp_dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{}/cayenne.db", metadata_dir.display()))
+                .expect("catalog"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("a", DataType::Float64, false),
+            Field::new("b", DataType::Float64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let cayenne = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .create(CreateTableOptions {
+                table_name: "split_delete".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: temp_dir.path().join("data").display().to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            })
+            .await
+            .expect("Cayenne table");
+        // Three data files of 40,000 rows.
+        for file in rows.chunks(40_000) {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(file.iter().map(|r| r.id))),
+                    Arc::new(Int64Array::from(
+                        file.iter().map(|r| r.v).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Float64Array::from_iter_values(file.iter().map(|r| r.a))),
+                    Arc::new(Float64Array::from_iter_values(file.iter().map(|_| 0.0))),
+                ],
+            )
+            .expect("batch");
+            let input = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
+                .expect("input");
+            let insert = cayenne
+                .insert_into(&ctx.state(), input, InsertOp::Append)
+                .await
+                .expect("insert plan");
+            collect(insert, ctx.task_ctx()).await.expect("insert");
+            cayenne
+                .checkpoint_inlined_data()
+                .await
+                .expect("flush to a data file");
+        }
+
+        let mut live: Vec<Row> = rows.clone();
+        let mut delete = async |filter: Expr, matches: &dyn Fn(&Row) -> bool| {
+            let expected = live.iter().filter(|r| matches(r)).count();
+            let plan = cayenne
+                .delete_from(&ctx.state(), vec![filter.clone()])
+                .await
+                .expect("delete plan");
+            let deleted = collect(plan, ctx.task_ctx()).await.expect("delete");
+            let deleted = deleted[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("count")
+                .value(0);
+            assert_eq!(
+                usize::try_from(deleted).expect("fits"),
+                expected,
+                "{filter} deletes the rows the oracle selects"
+            );
+            live.retain(|r| !matches(r));
+        };
+
+        // Vortex evaluates this one whole and leaves a deletion vector on the first file.
+        delete(
+            col("id")
+                .gt_eq(lit(1_000_i64))
+                .and(col("id").lt(lit(30_000_i64))),
+            &|r| (1_000..30_000).contains(&r.id),
+        )
+        .await;
+        // `id >= 20000` goes into the scan and `DataFusion` evaluates the arithmetic,
+        // which is NULL, and deletes nothing, where `v` is NULL. Rows the first delete
+        // took are not deleted twice.
+        delete(
+            col("id")
+                .gt_eq(lit(20_000_i64))
+                .and((col("v") % lit(3_i64)).eq(lit(0_i64))),
+            &|r| r.id >= 20_000 && r.v.is_some_and(|v| v % 3 == 0),
+        )
+        .await;
+        // SQL holds `-0.0` and `0.0` equal, so `a <> b` is false on those rows, which
+        // Vortex, comparing floats by their bits, would delete: the comparison stays
+        // in `DataFusion`, beside a conjunct Vortex cannot express and on its own.
+        delete(
+            col("a")
+                .not_eq(col("b"))
+                .and((col("id") % lit(2_i64)).eq(lit(0_i64))),
+            &|r| r.a.abs() > 0.0 && r.id % 2 == 0,
+        )
+        .await;
+        delete(col("a").not_eq(col("b")), &|r| r.a.abs() > 0.0).await;
+
+        let plan = cayenne
+            .scan(&ctx.state(), Some(&vec![0]), &[], None)
+            .await
+            .expect("scan plan");
+        let mut survivors: Vec<i64> = collect(plan, ctx.task_ctx())
+            .await
+            .expect("scan")
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("ids");
+                (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        survivors.sort_unstable();
+        let expected: Vec<i64> = live.iter().map(|r| r.id).collect();
+        let first_difference = survivors
+            .iter()
+            .zip(&expected)
+            .position(|(survivor, expected)| survivor != expected);
+        assert_eq!(
+            (survivors.len(), first_difference),
+            (expected.len(), None),
+            "the surviving rows are exactly the oracle's (count, first differing position)"
+        );
+    }
+
+    /// Wall time of a retention check on a Cayenne table without a primary key whose
+    /// time column is ISO 8601 text, over `RETENTION_BENCH_FILES` (20) data files of
+    /// `RETENTION_BENCH_ROWS` (50000) rows, for two layouts:
+    ///
+    /// - spread: one-day retention, 1% of each file's rows expired, so no file can be
+    ///   skipped — the worst case for pruning;
+    /// - ordered: thirty-day retention over rows appended in time order across 31 days,
+    ///   so only the oldest files hold expired rows.
+    ///
+    /// Each layout's first pass must delete exactly the expired rows. Then each of
+    /// `RETENTION_BENCH_REPS` (1000) repetitions times three delete filters, in an
+    /// order that rotates: the plain `ts < '<cutoff text>'` that takes Cayenne's
+    /// file-based path (statistics only), the instant comparison alone, and the text
+    /// bound joined to it by `AND`, as retention builds it. Prints P50/P99/max per filter. Run
+    /// with `cargo test --release -p runtime-table --lib -- --ignored --nocapture
+    /// retention_check_cost_on_iso_text`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "benchmark: run explicitly with --ignored"]
+    async fn retention_check_cost_on_iso_text() {
+        let env = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+        let reps = env("RETENTION_BENCH_REPS", 1000);
+        let files = env("RETENTION_BENCH_FILES", 20);
+        let rows_per_file = env("RETENTION_BENCH_ROWS", 50_000);
+        for layout in [RetentionBenchLayout::Spread, RetentionBenchLayout::Ordered] {
+            time_retention_checks(layout, reps, files, rows_per_file).await;
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RetentionBenchLayout {
+        Spread,
+        Ordered,
+    }
+
+    async fn time_retention_checks(
+        layout: RetentionBenchLayout,
+        reps: usize,
+        files: usize,
+        rows_per_file: usize,
+    ) {
+        use cayenne::metadata::{CreateTableOptions, VortexConfig};
+        use cayenne::{
+            CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog,
+            TimeRetentionFilterBuilder,
+        };
+        use datafusion::{datasource::memory::MemorySourceConfig, logical_expr::dml::InsertOp};
+        use util::timestamp_filter::{TimestampFilterConvert, data_type_to_timestamp_format};
+
+        const DAY: i64 = 86_400;
+        let retention_days: i64 = match layout {
+            RetentionBenchLayout::Spread => 1,
+            RetentionBenchLayout::Ordered => 30,
+        };
+        let total_rows = i64::try_from(files * rows_per_file).expect("fits");
+        let now = chrono::Utc::now().timestamp();
+        let cutoff_secs = now - retention_days * DAY;
+        // Seconds before `now` of row `id`.
+        let seconds_ago = |id: i64| match layout {
+            // One row in a hundred is two days old; the rest fall within 23 hours.
+            RetentionBenchLayout::Spread if id % 100 == 0 => 2 * DAY,
+            RetentionBenchLayout::Spread => id % 82_800,
+            // Evenly spaced from 31 days ago to now, oldest first.
+            RetentionBenchLayout::Ordered => 31 * DAY - id * 31 * DAY / total_rows,
+        };
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = temp_dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{}/cayenne.db", metadata_dir.display()))
+                .expect("catalog"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Utf8, false),
+        ]));
+        let retention = TimeRetentionFilterBuilder::try_new(
+            "ts",
+            u64::try_from(retention_days * DAY).expect("positive"),
+            &schema,
+        )
+        .expect("retention builder");
+        let ctx = SessionContext::new();
+        let cayenne = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .with_time_retention_filter_builder(retention)
+            .create(CreateTableOptions {
+                table_name: "retention_bench".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: temp_dir.path().join("data").display().to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            })
+            .await
+            .expect("Cayenne table");
+
+        let mut expired = 0_u64;
+        let mut id = 0_i64;
+        for _ in 0..files {
+            let mut ids = Vec::with_capacity(rows_per_file);
+            let mut times = Vec::with_capacity(rows_per_file);
+            for _ in 0..rows_per_file {
+                let time = now - seconds_ago(id);
+                if time < cutoff_secs {
+                    expired += 1;
+                }
+                ids.push(id);
+                times.push(
+                    chrono::DateTime::from_timestamp(time, 0)
+                        .expect("in range")
+                        .format("%Y-%m-%dT%H:%M:%SZ")
+                        .to_string(),
+                );
+                id += 1;
+            }
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(times)),
+                ],
+            )
+            .expect("batch");
+            let input = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
+                .expect("input");
+            let insert = cayenne
+                .insert_into(&ctx.state(), input, InsertOp::Append)
+                .await
+                .expect("insert plan");
+            collect(insert, ctx.task_ctx()).await.expect("insert");
+            cayenne
+                .checkpoint_inlined_data()
+                .await
+                .expect("flush to a data file");
+        }
+        let data_files = walk_count_files(&temp_dir.path().join("data"), "vortex");
+
+        let accelerator = cayenne_accelerator(cayenne);
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
+        let format = data_type_to_timestamp_format(&DataType::Utf8, None).expect("ISO8601");
+        let converter = TimestampFilterConvert::new("ts".to_string(), format, None, None);
+        let cutoff = u128::try_from(cutoff_secs).expect("after 1970") * 1_000_000_000;
+        let conjoined = converter.convert(cutoff, Operator::Lt);
+        let Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
+            op: Operator::And,
+            right: instant,
+            ..
+        }) = &conjoined
+        else {
+            panic!("retention ANDs a text bound with the instant comparison: {conjoined}");
+        };
+        let instant = instant.as_ref().clone();
+        let text = datafusion::prelude::col("ts").lt(datafusion::prelude::lit(
+            util::timestamp_filter::nanos_to_iso8601_string(cutoff),
+        ));
+        let check = async |filter: &Expr| {
+            let started = std::time::Instant::now();
+            let deleted = apply_retention_filters_once(
+                &TableReference::bare("retention_bench"),
+                &accelerator,
+                &federated,
+                filter.clone(),
+                &Handle::current(),
+            )
+            .await
+            .expect("retention check");
+            (started.elapsed(), deleted)
+        };
+
+        // The first pass deletes the expired rows, all of them: the text bound selects
+        // a superset of what the instant comparison does. Every timed pass after it
+        // finds nothing new, the steady state of a periodic check.
+        let (first, deleted) = check(&conjoined).await;
+        assert_eq!(
+            deleted, expired,
+            "{layout:?}: the first pass deletes every expired row"
+        );
+        eprintln!(
+            "{layout:?}: {data_files} data files, {total_rows} rows, {retention_days}-day retention; first pass deleted {deleted} in {first:?}"
+        );
+        let arms: [(&str, &Expr); 3] = [
+            ("text comparison alone (file-based path)", &text),
+            ("instant comparison alone", &instant),
+            ("text bound AND instant comparison", &conjoined),
+        ];
+        let mut samples: [Vec<std::time::Duration>; 3] =
+            std::array::from_fn(|_| Vec::with_capacity(reps));
+        for rep in 0..reps {
+            for offset in 0..arms.len() {
+                let arm = (rep + offset) % arms.len();
+                let (elapsed, deleted) = check(arms[arm].1).await;
+                assert_eq!(
+                    deleted, 0,
+                    "{layout:?}: a steady-state pass deletes nothing"
+                );
+                samples[arm].push(elapsed);
+            }
+        }
+        for ((name, _), samples) in arms.iter().zip(samples.iter_mut()) {
+            samples.sort_unstable();
+            let at = |percent: usize| samples[(samples.len() * percent).div_ceil(100) - 1];
+            eprintln!(
+                "{layout:?} {name}: n={} p50={:?} p99={:?} max={:?}",
+                samples.len(),
+                at(50),
+                at(99),
+                samples[samples.len() - 1]
+            );
+        }
+    }
+
+    /// `cayenne` as the Cayenne accelerator hands it to the runtime: beneath a
+    /// `PolyTableProvider` read/write split whose write side is the table.
+    fn cayenne_accelerator(cayenne: cayenne::CayenneTableProvider) -> Arc<dyn TableProvider> {
+        let cayenne = Arc::new(cayenne) as Arc<dyn TableProvider>;
+        Arc::new(
+            data_components::poly::PolyTableProvider::new_with_schema_metadata(
+                Arc::clone(&cayenne),
+                cayenne,
+                std::collections::HashMap::new(),
+            ),
+        )
+        .into_table() as Arc<dyn TableProvider>
+    }
+
+    /// Files under `dir`, recursively, whose extension is `extension`.
+    fn walk_count_files(dir: &std::path::Path, extension: &str) -> usize {
+        std::fs::read_dir(dir).map_or(0, |entries| {
+            entries
+                .flatten()
+                .map(|entry| {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk_count_files(&path, extension)
+                    } else {
+                        usize::from(path.extension().is_some_and(|ext| ext == extension))
+                    }
+                })
+                .sum()
+        })
     }
 
     #[test]

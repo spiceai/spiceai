@@ -135,6 +135,11 @@ pub struct Refresh {
     pub(crate) reload_generation: u64,
     pub(crate) mode: RefreshMode,
     pub(crate) period: Option<Duration>,
+    /// `period` stands in for `retention_period` (no `refresh_data_window` is set), so
+    /// the load window also keeps rows whose `time_column` is NULL: retention never
+    /// deletes them (`NULL < cutoff` is not true), and dropping them at load would make
+    /// the loaded set disagree with what retention keeps.
+    pub(crate) period_keeps_null_time: bool,
     pub(crate) append_overlap: Option<Duration>,
     /// Keep each key's newest version by `time_column`: only rows newer than the
     /// version of their key already kept (see `refresh_task::latest_by_time`), resolved as the
@@ -337,6 +342,14 @@ impl Refresh {
     #[must_use]
     pub fn period(mut self, period: Duration) -> Self {
         self.period = Some(period);
+        self
+    }
+
+    /// Mark `period` as derived from `retention_period`, so the load window also keeps
+    /// rows whose `time_column` is NULL (retention never deletes them).
+    #[must_use]
+    pub fn period_keeps_null_time(mut self, keeps_null_time: bool) -> Self {
+        self.period_keeps_null_time = keeps_null_time;
         self
     }
 
@@ -837,6 +850,7 @@ impl Default for Refresh {
             reload_generation: 0,
             mode: RefreshMode::Full,
             period: None,
+            period_keeps_null_time: false,
             append_overlap: None,
             versions_by_time: None,
             retry_enabled: false,
