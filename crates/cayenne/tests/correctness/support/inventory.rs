@@ -176,7 +176,7 @@ fn empty_result_review(suite: &str, name: &str) -> Option<EmptyResultReview> {
         // qualification values. DuckDB 1.4's `dsdgen` happened to answer them;
         // from 1.5 it follows the v4 tools and no generator a lane loads does.
         // With the qualification values (q17 '2001Q1', q25 2001, q85 2000) the
-        // v4 rows answer all three.
+        // v4 rows answer all three; moving the suite to them is #15909.
         ("tpcds", "tpcds_q17") => (
             &[TPCDS_DSDGEN_SF1, TPCDS_TPCDSGEN_SF1],
             "no rows on either generator's SF1 data with the suite's 1999 quarters",
