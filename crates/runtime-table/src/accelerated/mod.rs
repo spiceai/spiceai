@@ -74,7 +74,9 @@ pub mod caching_eviction;
 mod caching_scan_tests;
 pub mod checkpoint_primary_key;
 pub mod fallback_retention;
-pub use fallback_retention::{Error as FallbackRetentionKeepError, FallbackRetentionKeep};
+pub use fallback_retention::{
+    Error as FallbackRetentionKeepError, FallbackRetentionKeep, ensure_no_fallible_implicit_cast,
+};
 pub mod federation;
 pub(crate) mod index_rebuild;
 pub mod partition_scope;

@@ -28,7 +28,10 @@ use crate::accelerated::refresh;
 use crate::accelerated::{DataRetentionFilter, Retention};
 use crate::filter_converter::create_timestamp_filter_convert;
 use runtime_component::dataset::TimeFormat;
-use runtime_datafusion::retention_keep::{keep_expr_for_retention_delete, validate_keep_expr};
+use runtime_datafusion::retention_keep::{
+    FallibleImplicitCast, fallible_implicit_string_cast, keep_expr_for_retention_delete,
+    validate_keep_expr,
+};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -45,6 +48,11 @@ pub enum Error {
         runtime_datafusion::error::format_datafusion_error(source)
     ))]
     UntranslatableExpr { source: DataFusionError },
+
+    #[snafu(display(
+        "the retention predicate does not type-check against the source schema: {cast}. Compare against a value of the column's type (for example a quoted string), or write the conversion explicitly with TRY_CAST"
+    ))]
+    FallibleImplicitCast { cast: FallibleImplicitCast },
 
     #[snafu(display(
         "retention is computed from accelerator size rather than a row predicate, so it has no inverse that the source can evaluate"
@@ -251,14 +259,39 @@ impl FallbackRetentionKeep {
     ///
     /// # Errors
     ///
-    /// Returns an error when a time converter cannot be built or a keep
-    /// expression cannot be compiled as a physical filter.
+    /// Returns an error when a time converter cannot be built, a keep
+    /// expression cannot be compiled as a physical filter, or a `retention_sql`
+    /// predicate only type-checks through an implicit string cast that fails
+    /// per row at execution (see [`ensure_no_fallible_implicit_cast`]).
     pub fn validate(&self, schema: &SchemaRef) -> Result<()> {
+        for filter in &self.filters {
+            if let DataRetentionFilter::Expression { delete_expr } = filter {
+                ensure_no_fallible_implicit_cast(delete_expr, schema)?;
+            }
+        }
         let keeps = self.keep_filters(schema)?;
         for keep in &keeps {
             validate_keep_expr(keep, schema).context(UntranslatableExprSnafu)?;
         }
         Ok(())
+    }
+}
+
+/// Fail when `delete_expr` only type-checks against `schema` through an
+/// implicit cast that errors per row at execution.
+///
+/// Such a predicate plans, so [`FallbackRetentionKeep::validate`] would
+/// otherwise accept it and every fallback scan would fail at execution while
+/// the dataset reports Ready.
+///
+/// # Errors
+///
+/// Returns [`Error::FallibleImplicitCast`] for such a cast, or
+/// [`Error::UntranslatableExpr`] when `delete_expr` cannot be coerced.
+pub fn ensure_no_fallible_implicit_cast(delete_expr: &Expr, schema: &SchemaRef) -> Result<()> {
+    match fallible_implicit_string_cast(delete_expr, schema).context(UntranslatableExprSnafu)? {
+        Some(cast) => FallibleImplicitCastSnafu { cast }.fail(),
+        None => Ok(()),
     }
 }
 
@@ -324,6 +357,29 @@ mod tests {
         keep_from_sql()
             .validate(&events_schema())
             .expect("deleted = true is a source filter");
+    }
+
+    /// `status > 5` on a `Utf8` column plans (coercion adds `CAST(status AS
+    /// Int64)`), so only the implicit-cast check refuses it.
+    #[test]
+    fn validate_rejects_predicate_that_only_fails_at_coercion() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("status", DataType::Utf8, true),
+        ]));
+        let keep = FallbackRetentionKeep::from_delete_expr(col("status").gt(lit(5_i64)));
+        for keep_expr in keep.keep_filters(&schema).expect("coerces") {
+            validate_keep_expr(&keep_expr, &schema).expect("the inverse plans");
+        }
+        let err = keep.validate(&schema).expect_err("implicit Utf8 -> Int64 cast");
+        assert!(matches!(err, Error::FallibleImplicitCast { .. }), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("`status` is Utf8"), "{message}");
+        assert!(message.contains("TRY_CAST"), "{message}");
+
+        FallbackRetentionKeep::from_delete_expr(col("status").gt(lit("5")))
+            .validate(&schema)
+            .expect("a string comparison needs no cast");
     }
 
     #[tokio::test]

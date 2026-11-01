@@ -18,14 +18,17 @@ limitations under the License.
 //! rows the accelerator keeps after retention.
 
 use datafusion::common::ToDFSchema;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::expr::Cast;
+use datafusion::logical_expr::{Expr, ExprSchemable};
+use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 
 /// Rows retention keeps: it deletes only when `delete_pred` is TRUE.
 ///
@@ -50,6 +53,98 @@ pub fn validate_keep_expr(keep: &Expr, schema: &SchemaRef) -> Result<(), DataFus
         &PhysicalPlanningContext::default(),
     )?;
     Ok(())
+}
+
+/// A cast that type coercion added to a retention predicate and that can fail
+/// on individual rows at execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallibleImplicitCast {
+    /// The expression being cast, as written in the predicate (usually a column).
+    pub expr: String,
+    pub from: DataType,
+    pub to: DataType,
+}
+
+impl std::fmt::Display for FallibleImplicitCast {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`{}` is {} but is compared with a {} value, so it is implicitly cast to {}, and that cast fails at execution on any row whose value does not convert",
+            self.expr, self.from, self.to, self.to
+        )
+    }
+}
+
+/// The first cast that coercing `delete_pred` against `schema` adds from a
+/// string-typed, row-dependent expression to a non-string type.
+///
+/// Planning a predicate such as `status > 5` with a `Utf8` `status` succeeds:
+/// coercion rewrites it to `CAST(status AS Int64) > 5`, which compiles to a
+/// physical filter and then errors on the first row whose `status` is not a
+/// number. [`validate_keep_expr`] cannot see that, because the cast is valid
+/// for the type; it is only invalid for the data. Casts the predicate spells
+/// out (`CAST`, `TRY_CAST`) are the author's choice and are not reported, and
+/// casts of constants are folded or rejected at planning, so neither is
+/// counted.
+///
+/// # Errors
+///
+/// Returns an error if `delete_pred` cannot be coerced against `schema`.
+pub fn fallible_implicit_string_cast(
+    delete_pred: &Expr,
+    schema: &SchemaRef,
+) -> Result<Option<FallibleImplicitCast>, DataFusionError> {
+    let df_schema = Arc::clone(schema).to_dfschema_ref()?;
+    let simplifier =
+        ExprSimplifier::new(SimplifyContext::builder().with_schema(Arc::clone(&df_schema)).build());
+    let coerced = simplifier.coerce(delete_pred.clone(), &df_schema)?;
+
+    // Explicit casts survive coercion as `Expr::Cast` nodes, so the implicit
+    // ones are those in `coerced` without an equal node in `delete_pred`.
+    let mut explicit: Vec<Expr> = Vec::new();
+    delete_pred.apply(|expr| {
+        if matches!(expr, Expr::Cast(_)) {
+            explicit.push(expr.clone());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+
+    let mut found = None;
+    coerced.apply(|expr| {
+        let Expr::Cast(Cast {
+            expr: inner,
+            data_type,
+        }) = expr
+        else {
+            return Ok(TreeNodeRecursion::Continue);
+        };
+        if let Some(pos) = explicit.iter().position(|e| e == expr) {
+            explicit.swap_remove(pos);
+            return Ok(TreeNodeRecursion::Continue);
+        }
+        if inner.column_refs().is_empty() || is_string(data_type) {
+            return Ok(TreeNodeRecursion::Continue);
+        }
+        let from = inner.get_type(df_schema.as_ref())?;
+        if is_string(&from) {
+            found = Some(FallibleImplicitCast {
+                expr: inner.to_string(),
+                from,
+                to: data_type.clone(),
+            });
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(found)
+}
+
+fn is_string(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => true,
+        DataType::Dictionary(_, value) => is_string(value),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -124,5 +219,45 @@ mod tests {
     fn validate_keep_expr_rejects_unknown_column() {
         let keep = keep_expr_for_retention_delete(col("missing").eq(lit(true)));
         validate_keep_expr(&keep, &schema()).expect_err("missing is not on the schema");
+    }
+
+    fn string_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("status", DataType::Utf8, true),
+        ]))
+    }
+
+    #[test]
+    fn implicit_string_to_number_cast_is_reported() {
+        let cast = fallible_implicit_string_cast(&col("status").gt(lit(5_i64)), &string_schema())
+            .expect("coerces")
+            .expect("status > 5 casts status to a number");
+        assert_eq!(cast.expr, "status");
+        assert_eq!(cast.from, DataType::Utf8);
+        assert_eq!(cast.to, DataType::Int64);
+        // Coercion-only failure: the inverse still plans as a physical filter.
+        validate_keep_expr(
+            &keep_expr_for_retention_delete(col("status").gt(lit(5_i64))),
+            &string_schema(),
+        )
+        .expect("the cast plans; it only fails per row at execution");
+    }
+
+    #[test]
+    fn same_type_and_explicit_casts_are_not_reported() {
+        for pred in [
+            col("status").eq(lit("archived")),
+            col("status").gt(lit("5")),
+            col("id").gt(lit(5_i32)),
+            datafusion::prelude::try_cast(col("status"), DataType::Int64).gt(lit(5_i64)),
+            datafusion::prelude::cast(col("status"), DataType::Int64).gt(lit(5_i64)),
+        ] {
+            assert_eq!(
+                fallible_implicit_string_cast(&pred, &string_schema()).expect("coerces"),
+                None,
+                "{pred}"
+            );
+        }
     }
 }
