@@ -18,8 +18,6 @@ variants:
       primary_key: ID, indexes: { col_Timestamp: enabled, '(col_Timestamp, col_String)': unique } } } } }
   cayenne: { datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file,
       primary_key: ID, indexes: { col_Timestamp: enabled, '(col_Timestamp, col_String)': unique } } } } }
-  turso: { datasets: { '*': { acceleration: { enabled: true, engine: turso, mode: file,
-      primary_key: ID, indexes: { col_Timestamp: enabled, '(col_Timestamp, col_String)': unique } } } } }
 
 spicepod:
   version: v1
