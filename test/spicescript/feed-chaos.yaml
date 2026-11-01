@@ -201,7 +201,8 @@ steps:
         for g in $groups; do
           for i in $(seq 1 90); do rpk group describe "$g" | grep -qE '^STATE +Empty' && break; sleep 1; done;
           rpk group seek "$g" --to start;
-          rpk group describe "$g" | awk 'NR > 1 && $1 ~ /^i[0-9]/ && $3 != "0" { bad = 1 } END { exit bad }';
+          desc=$(rpk group describe "$g");
+          printf '%s\n' "$desc" | awk 'NR > 1 && $1 ~ /^i[0-9]/ { n++; if ($3 != "0") bad = 1 } END { exit (bad || n == 0) }';
         done
     when: { src: kafka }
   - start: {}
