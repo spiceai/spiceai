@@ -237,6 +237,63 @@ pub(crate) fn lowest_cold_relevant_tombstone_sequence(
         .map(|(_, delete_sequence, _)| delete_sequence)
 }
 
+/// How many of `tombstones` may each hide a row of some file in `cold_files`,
+/// and which files they may hit — the same per-tombstone test as
+/// [`lowest_cold_relevant_tombstone_sequence`], run over every tombstone and
+/// every file instead of stopping at the first hit.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ColdTombstoneRelevance {
+    /// Tombstones that may hide a row of at least one cold file.
+    pub relevant: usize,
+    /// Cold files at least one tombstone may hit.
+    pub files_hit: usize,
+    /// Total bytes of those files.
+    pub bytes_hit: i64,
+}
+
+pub(crate) fn cold_tombstone_relevance(
+    cold_files: &[ColdTierFile],
+    tombstones: &[(Vec<ScalarValue>, i64)],
+    bloom_probes: Option<&[Box<[u8]>]>,
+    schema: &Arc<Schema>,
+    pk_indices: &[usize],
+) -> ColdTombstoneRelevance {
+    let probes = bloom_probes.filter(|p| p.len() == tombstones.len());
+    let mut files: Vec<ColdFileKeyTest<'_>> = cold_files
+        .iter()
+        .map(|file| ColdFileKeyTest {
+            max_sequence: file.max_sequence,
+            bounds: pk_bounds_from_manifest(file, schema, pk_indices),
+            bloom: LazyBloom::Unparsed(probes.and(file.pk_bloom.as_deref())),
+        })
+        .collect();
+    let mut hit = vec![false; files.len()];
+    let mut relevant = 0;
+    for (i, (key, delete_sequence)) in tombstones.iter().enumerate() {
+        let probe = probes.and_then(|p| p.get(i)).map(Box::as_ref);
+        let mut any = false;
+        for (file, hit) in files.iter_mut().zip(hit.iter_mut()) {
+            if file.may_hide(key, *delete_sequence, probe) {
+                *hit = true;
+                any = true;
+            }
+        }
+        relevant += usize::from(any);
+    }
+    let (files_hit, bytes_hit) = cold_files
+        .iter()
+        .zip(&hit)
+        .filter(|(_, hit)| **hit)
+        .fold((0, 0_i64), |(n, bytes), (file, _)| {
+            (n + 1, bytes.saturating_add(file.file_size_bytes.max(0)))
+        });
+    ColdTombstoneRelevance {
+        relevant,
+        files_hit,
+        bytes_hit,
+    }
+}
+
 /// One cold file's side of the "may this tombstone hide a row here" test.
 struct ColdFileKeyTest<'a> {
     max_sequence: i64,

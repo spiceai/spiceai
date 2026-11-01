@@ -1807,6 +1807,13 @@ struct ColdTombstoneRetention {
     retain_above: Option<i64>,
     /// Tombstoned keys the decision ran against (observability only).
     tombstones: usize,
+    /// Tombstones above `retain_above`, i.e. what the promotion keeps
+    /// (observability only).
+    kept: usize,
+    /// Per-tombstone relevance against the carried files (observability only).
+    relevance: super::cold_partition::ColdTombstoneRelevance,
+    /// Time spent computing `relevance`, in milliseconds (observability only).
+    relevance_ms: u128,
 }
 
 /// The in-memory deletion index a datalake promotion keeps, built before the
@@ -27532,6 +27539,9 @@ impl CayenneTableProvider {
         let keep_none = ColdTombstoneRetention {
             retain_above: None,
             tombstones: 0,
+            kept: 0,
+            relevance: super::cold_partition::ColdTombstoneRelevance::default(),
+            relevance_ms: 0,
         };
 
         let Some(oldest_cold_sequence) = cold_files.iter().map(|f| f.max_sequence).min() else {
@@ -27563,7 +27573,7 @@ impl CayenneTableProvider {
         if deleted_row_keys.is_empty() {
             return Ok(ColdTombstoneRetention {
                 retain_above: unreadable_floor.map(|sequence| sequence.saturating_sub(1)),
-                tombstones: 0,
+                ..keep_none
             });
         }
 
@@ -27614,9 +27624,28 @@ impl CayenneTableProvider {
             &self.pk_column_indices,
         );
         let lowest_kept = [lowest_relevant, unreadable_floor].into_iter().flatten().min();
+        let relevance_start = Instant::now();
+        let relevance = super::cold_partition::cold_tombstone_relevance(
+            cold_files,
+            &tombstones,
+            bloom_probes.as_deref(),
+            &self.table_metadata.schema,
+            &self.pk_column_indices,
+        );
+        let relevance_ms = relevance_start.elapsed().as_millis();
+        let retain_above = lowest_kept.map(|sequence| sequence.saturating_sub(1));
+        let kept = retain_above.map_or(0, |cutoff| {
+            tombstones
+                .iter()
+                .filter(|(_, sequence)| *sequence > cutoff)
+                .count()
+        });
         Ok(ColdTombstoneRetention {
-            retain_above: lowest_kept.map(|sequence| sequence.saturating_sub(1)),
+            retain_above,
             tombstones: tombstones.len(),
+            kept,
+            relevance,
+            relevance_ms,
         })
     }
 
@@ -27773,7 +27802,13 @@ impl CayenneTableProvider {
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
             tombstones = retention.tombstones,
+            kept_tombstones = retention.kept,
+            relevant_tombstones = retention.relevance.relevant,
+            relevant_files = retention.relevance.files_hit,
+            relevant_bytes = retention.relevance.bytes_hit,
+            relevance_ms = retention.relevance_ms,
             carried_files = prior_cold_len,
+            carried_bytes = prior_cold.iter().map(|f| f.file_size_bytes.max(0)).sum::<i64>(),
             retain_tombstones_above = ?retention.retain_above,
             "Decided which tombstones the datalake move keeps"
         );
