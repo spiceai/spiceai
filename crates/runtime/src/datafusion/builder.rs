@@ -4285,39 +4285,72 @@ mod tests {
     async fn count_over_a_null_aware_anti_join_on_parquet(
         eager_aggregation: bool,
     ) -> (bool, String, Vec<(&'static str, String)>) {
-        use arrow::array::{Int32Array, Int64Array, RecordBatch};
-        use datafusion::dataframe::DataFrameWriteOptions;
+        use datafusion::parquet::data_type::{Int32Type, Int64Type};
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::parser::parse_message_type;
         use datafusion::prelude::ParquetReadOptions;
 
-        // 20,000 rows; `qty` has 17 distinct values and every tenth row is NULL,
-        // so the rule's cost gate sees a large reduction and pushes the count.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, true),
-            Field::new("qty", DataType::Int32, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from_iter_values(1..=20_000)),
-                Arc::new(Int32Array::from_iter(
-                    (1..=20_000_i32).map(|i| if i % 10 == 0 { None } else { Some(i % 17 - 8) }),
-                )),
-            ],
-        )
-        .expect("build the batch");
+        // 20,000 rows; `qty` has 17 distinct values and every tenth row is NULL.
+        // The rule's cost gate reads the number of distinct values from the
+        // file's column statistics and declines the push without it. A writer
+        // that records it, as DuckDB does, is what puts this file within the
+        // rule's reach, so the column chunk is written with that statistic.
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("t.parquet");
-        let path = path.to_str().expect("utf-8 path");
-        SessionContext::new()
-            .read_batch(batch)
-            .expect("read the batch")
-            .write_parquet(
-                path,
-                DataFrameWriteOptions::new().with_single_file_output(true),
+        let schema = Arc::new(
+            parse_message_type("message t { optional int64 id; optional int32 qty; }")
+                .expect("parse the parquet schema"),
+        );
+        let mut writer = SerializedFileWriter::new(
+            std::fs::File::create(&path).expect("create the parquet file"),
+            schema,
+            Arc::new(WriterProperties::builder().build()),
+        )
+        .expect("open the parquet writer");
+        let mut row_group = writer.next_row_group().expect("start the row group");
+
+        let ids: Vec<i64> = (1..=20_000).collect();
+        let mut id = row_group
+            .next_column()
+            .expect("open the id column")
+            .expect("the id column");
+        let present = vec![1_i16; ids.len()];
+        id.typed::<Int64Type>()
+            .write_batch_with_statistics(
+                &ids,
+                Some(present.as_slice()),
+                None,
+                Some(&1),
+                Some(&20_000),
                 None,
             )
-            .await
-            .expect("write the parquet file");
+            .expect("write the id column");
+        id.close().expect("close the id column");
+
+        let qty: Vec<Option<i32>> = (1..=20_000_i32)
+            .map(|i| if i % 10 == 0 { None } else { Some(i % 17 - 8) })
+            .collect();
+        let definition_levels: Vec<i16> = qty.iter().map(|v| i16::from(v.is_some())).collect();
+        let values: Vec<i32> = qty.iter().flatten().copied().collect();
+        let mut qty = row_group
+            .next_column()
+            .expect("open the qty column")
+            .expect("the qty column");
+        qty.typed::<Int32Type>()
+            .write_batch_with_statistics(
+                &values,
+                Some(definition_levels.as_slice()),
+                None,
+                Some(&-8),
+                Some(&8),
+                Some(17),
+            )
+            .expect("write the qty column");
+        qty.close().expect("close the qty column");
+        row_group.close().expect("close the row group");
+        writer.close().expect("close the parquet file");
+        let path = path.to_str().expect("utf-8 path");
 
         let df = DataFusionBuilder::new(
             status::RuntimeStatus::new(),
