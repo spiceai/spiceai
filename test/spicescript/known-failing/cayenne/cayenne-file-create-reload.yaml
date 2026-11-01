@@ -1,0 +1,60 @@
+# Known failing: when a watched Spicepod changes a `mode: file_create` Cayenne
+# dataset, the reload deletes the acceleration's data directory and registers
+# the dataset again, but no refresh runs, so the dataset answers with no rows
+# until something else refreshes it. The warning it logs says the acceleration
+# "recreates the acceleration from the source on every load".
+name: cayenne-file-create-reload
+description: >
+  A `mode: file_create` Cayenne acceleration is rebuilt from its source
+  whenever it loads: after a watched Spicepod changes the dataset, and after a
+  restart, it answers with the source's current rows, not with what the
+  deleted acceleration held and not with nothing.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-file-create-reload
+  datasets:
+    # No refresh schedule: only a load reads the source's new rows.
+    - from: postgres:public.fc
+      name: file_create_reload
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file_create, refresh_mode: full }
+
+defaults:
+  expect: { oracle: src }
+  spiced-args: [--pods-watcher-enabled]
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE fc (id int PRIMARY KEY, v text);
+        INSERT INTO fc SELECT i, 'v' || i FROM generate_series(1, 8) i;
+  - start: {}
+  - query: SELECT id, v FROM file_create_reload
+    oracle-sql: SELECT id, v FROM fc
+
+  # The source grows; with no schedule the acceleration keeps its 8 rows.
+  - source-exec: { src: "INSERT INTO fc SELECT i, 'v' || i FROM generate_series(9, 16) i" }
+  - query: SELECT count(*) AS n FROM file_create_reload
+    expect: { rows: [['8']] }
+
+  # Changing the dataset reloads it, which recreates the acceleration.
+  - edit-spicepod:
+      datasets:
+        file_create_reload: { params: { pg_sslmode: prefer } }
+  - query: SELECT id, v FROM file_create_reload
+    oracle-sql: SELECT id, v FROM fc
+    eventually: 60s
+  - explain: SELECT id, v FROM file_create_reload
+    contains: CayenneAccelerationExec
+
+  # So does a restart.
+  - source-exec: { src: "INSERT INTO fc SELECT i, 'v' || i FROM generate_series(17, 24) i" }
+  - restart: {}
+  - query: SELECT id, v FROM file_create_reload
+    oracle-sql: SELECT id, v FROM fc
+    eventually: 60s
