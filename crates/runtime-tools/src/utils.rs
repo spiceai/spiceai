@@ -52,11 +52,12 @@ pub fn write_to_json_string(
 pub const MAX_TOOL_RESULT_BYTES: usize = 16 * 1024 * 1024;
 
 fn result_too_large(max_bytes: usize, fix: &str) -> Box<dyn std::error::Error + Send + Sync> {
-    format!(
-        "The result is larger than {} MiB, the limit for a tool result. {fix}",
-        max_bytes / (1024 * 1024)
-    )
-    .into()
+    let limit = if max_bytes >= 1024 * 1024 {
+        format!("{} MiB", max_bytes / (1024 * 1024))
+    } else {
+        format!("{} KiB", max_bytes / 1024)
+    };
+    format!("The result is larger than {limit}, the size limit for this request. {fix}").into()
 }
 
 /// Writes the rows of `stream` as a JSON array, like [`write_to_json_string`]. Stops reading
@@ -202,6 +203,20 @@ mod tests {
             .await
             .expect_err("batches over the limit fail");
         assert!(e.to_string().contains("Request fewer rows"), "{e}");
+    }
+
+    #[test]
+    fn the_limit_in_the_error_is_never_rounded_to_zero() {
+        assert!(
+            result_too_large(MAX_TOOL_RESULT_BYTES, "")
+                .to_string()
+                .contains("larger than 16 MiB")
+        );
+        assert!(
+            result_too_large(MAX_TOOL_RESULT_BYTES / 100, "")
+                .to_string()
+                .contains("larger than 163 KiB")
+        );
     }
 
     #[tokio::test]
