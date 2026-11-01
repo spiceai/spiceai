@@ -69592,6 +69592,117 @@ mod tests {
         );
     }
 
+    /// A `retention_sql` that plans but fails per row at execution (`status > 5`
+    /// on a Utf8 column coerces to `CAST(status AS Int64) > 5`, and `'active'`
+    /// does not convert) used to be re-armed on every 100 ms debounce, logging an
+    /// error about ten times a second without bound. A failed background pass
+    /// now arms a backed-off retry instead of re-queueing, a pass inside the
+    /// window leaves retention alone, and a synchronous drain still runs and
+    /// reports the owed pass.
+    #[tokio::test]
+    async fn failing_background_retention_backs_off_instead_of_requeueing() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let table_name = "retention_backoff_bad_cast".to_string();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
+                .expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("status", DataType::Utf8, false),
+        ]));
+        let seeded = CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+            .create(CreateTableOptions {
+                table_name: table_name.clone(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: data_dir,
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    compaction_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("table created");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["active", "inactive"])),
+            ],
+        )
+        .expect("batch");
+        insert_batch(&seeded, batch).await;
+        drop(seeded);
+
+        let provider = CayenneTableProvider::new_with_retention(
+            &table_name,
+            Arc::clone(&catalog),
+            vec![datafusion_expr::col("status").gt(datafusion_expr::lit(5_i64))],
+            runtime_env,
+        )
+        .await
+        .expect("reopen with retention");
+        provider
+            .apply_retention_filters()
+            .await
+            .expect_err("precondition: the coerced predicate must fail at execution");
+        let backoff = || provider.post_write_maintenance.retention_backoff.lock();
+        assert_eq!(
+            backoff().consecutive_failures(),
+            0,
+            "a direct pass does not touch the background backoff"
+        );
+
+        let requested = || PostWriteMaintenanceState {
+            retention_requested: true,
+            ..PostWriteMaintenanceState::default()
+        };
+        provider
+            .run_maintenance_state(requested(), RetentionFailureAction::Requeue)
+            .await
+            .expect("a failed background pass is logged, not returned");
+        assert_eq!(backoff().consecutive_failures(), 1);
+        assert!(backoff().is_waiting(tokio::time::Instant::now()));
+        assert!(
+            !provider
+                .post_write_maintenance
+                .state
+                .lock()
+                .retention_requested,
+            "the retry belongs to the backoff timer; re-arming the queue is what retried \
+             on every 100 ms debounce"
+        );
+
+        // A write landing inside the window queues retention again; the pass skips it.
+        provider
+            .run_maintenance_state(requested(), RetentionFailureAction::Requeue)
+            .await
+            .expect("a skipped pass is not an error");
+        assert_eq!(
+            backoff().consecutive_failures(),
+            1,
+            "a pass inside the backoff window must not run (and fail) retention again"
+        );
+
+        // A synchronous drain still runs the owed pass, and reports that it failed.
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect_err("the drain must run the owed retention and report its failure");
+    }
+
     /// The same deferral for a mem-tier seal shadow: a durable inline row deliberately
     /// held above the watermark while its rows are still live in RAM. Materializing one
     /// would raise the watermark past it and serve those rows twice, which is why
