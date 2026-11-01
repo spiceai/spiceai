@@ -73,7 +73,7 @@ steps:
   - query: SELECT count(*) AS n, sum(t_id) AS st, count(DISTINCT label) AS nl FROM u
     eventually: 60s
     expect: { oracle: src }
-  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 11, queries: 200, depth: 2, oracle: src, avoid: [not, decimal-int, unread-groups, nested-union, join-key-dependency, set-operation-nulls, case-widening, unsigned-rank] }
+  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 11, queries: 200, depth: 2, oracle: src, avoid: [decimal-int] }
 
   # Round 1: single statements.
   - source-exec:
@@ -91,7 +91,7 @@ steps:
   - query: SELECT count(*) AS n, sum(t_id) AS st, count(DISTINCT label) AS nl FROM u
     eventually: 60s
     expect: { oracle: src }
-  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 12, queries: 200, depth: 2, oracle: src, avoid: [not, decimal-int, unread-groups, nested-union, join-key-dependency, set-operation-nulls, case-widening, unsigned-rank] }
+  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 12, queries: 200, depth: 2, oracle: src, avoid: [decimal-int] }
 
   # Round 2: key changes and a transaction mixing every kind of change.
   - source-exec:
@@ -112,4 +112,4 @@ steps:
   - query: SELECT count(*) AS n, sum(t_id) AS st, count(DISTINCT label) AS nl FROM u
     eventually: 60s
     expect: { oracle: src }
-  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 13, queries: 200, depth: 2, oracle: src, avoid: [not, decimal-int, unread-groups, nested-union, join-key-dependency, set-operation-nulls, case-widening, unsigned-rank] }
+  - random-queries: { tables: [t, u], joins: ['t.id = u.t_id'], seed: 13, queries: 200, depth: 2, oracle: src, avoid: [decimal-int] }

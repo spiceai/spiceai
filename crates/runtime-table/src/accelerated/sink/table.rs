@@ -478,7 +478,6 @@ mod tests {
 
     /// A partitioned Cayenne table as the accelerator builds it: the partitioned
     /// table under a poly layer and an index layer, so no sink holds it directly.
-    #[cfg(not(windows))]
     struct LayeredPartitionedCayenne {
         _dir: tempfile::TempDir,
         schema: SchemaRef,
@@ -486,7 +485,6 @@ mod tests {
         layered: Arc<dyn TableProvider>,
     }
 
-    #[cfg(not(windows))]
     impl LayeredPartitionedCayenne {
         async fn new() -> Self {
             use std::collections::HashMap;
@@ -615,7 +613,6 @@ mod tests {
     /// The same for every partition of a partitioned Cayenne table under the
     /// layers the accelerator stacks over it, the partitions a write creates
     /// included.
-    #[cfg(not(windows))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn refresh_write_prepares_every_partition_of_a_layered_cayenne_table() {
         let table = LayeredPartitionedCayenne::new().await;
@@ -651,7 +648,6 @@ mod tests {
 
     /// The same when the partitioned table is the parent of synchronized
     /// datasets, written through `MultiSink`.
-    #[cfg(not(windows))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn synchronized_refresh_write_prepares_every_partition_of_a_layered_cayenne_table() {
         let table = LayeredPartitionedCayenne::new().await;

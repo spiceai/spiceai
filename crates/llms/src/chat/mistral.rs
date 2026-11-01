@@ -17,7 +17,9 @@ limitations under the License.
 use crate::chat::{LocalModelOptions, PagedAttentionMode, ReasoningDefault, message_to_mistral};
 use crate::streaming_utils::create_stream_response_with_timestamp;
 
-use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
+use super::{
+    Chat, Error as ChatError, FailedToRunModelSnafu, Result, TokenLimits, nsql::SqlGeneration,
+};
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::chat::{
@@ -108,6 +110,8 @@ impl MistralLlama {
             context_length,
             paged_attention,
             reasoning,
+            // mistral.rs reads its ring from `RING_CONFIG`, which the caller wrote.
+            distributed: _,
         } = options;
         for weight in model_weights {
             if !weight.exists() {
@@ -813,6 +817,22 @@ impl Chat for MistralLlama {
     async fn health(&self) -> Result<()> {
         // If [`MistralLlama`] is instantiated successfully, it is healthy.
         Ok(())
+    }
+
+    /// The longest sequence mistral.rs runs the model with: it refuses a longer prompt.
+    async fn token_limits(&self) -> TokenLimits {
+        // Only one model runs in this pipeline.
+        let context_window = self
+            .pipeline
+            .max_sequence_length(None)
+            .ok()
+            .flatten()
+            .and_then(|length| u64::try_from(length).ok())
+            .filter(|window| *window > 0);
+        TokenLimits {
+            context_window,
+            max_output_tokens: None,
+        }
     }
 
     async fn stream<'a>(

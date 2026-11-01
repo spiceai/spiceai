@@ -718,9 +718,8 @@ const fn default_true() -> bool {
     true
 }
 
-/// The engine an acceleration uses when it does not set `engine`. Cayenne is not built
-/// on Windows, so Windows uses Arrow.
-pub const DEFAULT_ENGINE: &str = if cfg!(windows) { "arrow" } else { "cayenne" };
+/// The engine an acceleration uses when it does not set `engine`.
+pub const DEFAULT_ENGINE: &str = "cayenne";
 
 /// Fields an `enabled: false` block does not discard *because it is disabled*,
 /// and so must not be named by a warning whose remedy is "remove

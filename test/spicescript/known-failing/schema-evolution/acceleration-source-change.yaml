@@ -1,0 +1,70 @@
+name: acceleration-source-change
+description: >
+  A file acceleration answers from the source its dataset names once the
+  Spicepod points the dataset at another source: across a restart, while Spice
+  runs, and when the dataset is removed and declared again. Known failing: the
+  acceleration's checkpoint marks it loaded, and with no refresh interval no
+  refresh runs when the dataset loads again, so the rows the earlier source
+  loaded are served, and the dataset reads Ready.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  cayenne: cayenne-file
+  duckdb: duckdb-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: acceleration-source-change
+  datasets:
+    - from: postgres:public.items_a
+      name: items
+      params: ${sources.src.params}
+
+defaults:
+  spiced-args: [--pods-watcher-enabled]
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE items_a (id integer PRIMARY KEY, name text NOT NULL);
+        INSERT INTO items_a VALUES (1, 'a'), (2, 'b');
+        CREATE TABLE items_b (id integer PRIMARY KEY, name text NOT NULL);
+        INSERT INTO items_b VALUES (20, 'y');
+        CREATE TABLE items_c (id integer PRIMARY KEY, name text NOT NULL);
+        INSERT INTO items_c VALUES (30, 'z');
+  - start: {}
+  - query: SELECT id, name FROM items ORDER BY id
+    eventually: 60s
+    expect: { rows: [['1', 'a'], ['2', 'b']] }
+
+  # The Spicepod points the dataset at another table while Spice is stopped.
+  - restart:
+      patch: { datasets: { items: { from: 'postgres:public.items_b' } } }
+  - query: SELECT id, name FROM items ORDER BY id
+    eventually: 30s
+    expect: { rows: [['20', 'y']] }
+
+  # The same while Spice runs.
+  - edit-spicepod: { datasets: { items: { from: 'postgres:public.items_c' } } }
+  - query: SELECT id, name FROM items ORDER BY id
+    eventually: 30s
+    expect: { rows: [['30', 'z']] }
+
+  # The dataset is removed, then declared again from another table.
+  - edit-spicepod: { spicepod: { datasets: [] } }
+  - query: SELECT id, name FROM items
+    expect-error: items
+    eventually: 30s
+  - edit-spicepod:
+      spicepod:
+        datasets:
+          - from: postgres:public.items_b
+            name: items
+            params: ${sources.src.params}
+            acceleration: { enabled: true, engine: '${variant.name}', mode: file }
+  - query: SELECT id, name FROM items ORDER BY id
+    eventually: 30s
+    expect: { rows: [['20', 'y']] }

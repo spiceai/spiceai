@@ -19,9 +19,8 @@
 //! denominator, so the result is directly comparable across engines and
 //! lanes.
 //!
-//! Lanes (compile-time gated):
-//! - `cayenne`       — Cayenne with the SQLite metastore (default)
-//! - `cayenne_turso` — Cayenne with the Turso metastore (--features turso)
+//! Lanes:
+//! - `cayenne`       — Cayenne with the SQLite metastore
 //! - `duckdb`        — DuckDB file-mode with `INSERT INTO ... VALUES (...)`
 
 #![allow(clippy::expect_used)]

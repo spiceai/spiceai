@@ -21,7 +21,10 @@ limitations under the License.
 //! it: typing an oracle's text answer, literal rows, and the rule that two empty
 //! answers have compared nothing.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use arrow::{
@@ -32,7 +35,11 @@ use arrow::{
     buffer::{NullBuffer, OffsetBuffer},
     compute::{CastOptions, cast_with_options},
     datatypes::{DataType, Field, Schema, SchemaRef},
-    util::{display::FormatOptions, pretty::pretty_format_batches},
+    error::ArrowError,
+    util::{
+        display::{ArrayFormatter, FormatOptions},
+        pretty::pretty_format_batches,
+    },
 };
 use result_compare::{QueryValidationResult, validate_against_reference};
 use serde_json::Value;
@@ -450,6 +457,116 @@ pub fn compare(
     }
 }
 
+/// The widest a value is drawn in a failure report's table, in characters,
+/// unless `--cell-width` says otherwise. Mismatches show in the first
+/// characters or the last; the values that run longer are the large ones a
+/// script writes on purpose, and drawn whole they make each line of the
+/// table as wide as they are.
+pub const DEFAULT_CELL_WIDTH: usize = 40;
+
+static CELL_WIDTH: AtomicUsize = AtomicUsize::new(DEFAULT_CELL_WIDTH);
+
+/// Sets the widest a value is drawn in a failure report's table; 0 draws
+/// every value whole.
+pub fn set_cell_width(width: usize) {
+    CELL_WIDTH.store(width, Ordering::Relaxed);
+}
+
+/// `value`, or its start and end around `…` when it is longer than `width`
+/// characters.
+fn shortened(value: String, width: usize) -> String {
+    let length = value.chars().count();
+    if width == 0 || length <= width {
+        return value;
+    }
+    let tail = (width - 1) / 2;
+    let head = width - 1 - tail;
+    let mut short: String = value.chars().take(head).collect();
+    short.push('…');
+    short.extend(value.chars().skip(length - tail));
+    short
+}
+
+/// `batch` with each value as the text a table draws, shortened to `width`.
+fn shortened_batch(batch: &RecordBatch, width: usize) -> Result<RecordBatch, ArrowError> {
+    let options = FormatOptions::default().with_display_error(true);
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| {
+            let formatter = ArrayFormatter::try_new(column.as_ref(), &options)?;
+            let values: StringArray = (0..column.len())
+                .map(|i| {
+                    column
+                        .is_valid(i)
+                        .then(|| shortened(formatter.value(i).to_string(), width))
+                })
+                .collect();
+            Ok(Arc::new(values) as ArrayRef)
+        })
+        .collect::<Result<Vec<_>, ArrowError>>()?;
+    let fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| Field::new(f.name(), DataType::Utf8, true))
+        .collect();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+}
+
+/// Protocols serialize the same result types, so equality is exact after
+/// normalizing row order and SQL's equivalent representations of zero.
+/// The ordinary comparator additionally checks explicit SQL sort contracts.
+pub fn compare_protocol(
+    name: &str,
+    sql: &str,
+    actual: &[RecordBatch],
+    expected: &[RecordBatch],
+    expect_empty: bool,
+) -> Result<Option<String>> {
+    if let Some(report) = compare(name, sql, actual, expected, expect_empty)? {
+        return Ok(Some(report));
+    }
+    let preserve_order = actual
+        .first()
+        .or_else(|| expected.first())
+        .is_some_and(|batch| {
+            result_compare::sort_order::resolve_sort_key(sql, &batch.schema()).hides_a_sort_term()
+        });
+    let rows = |batches: &[RecordBatch]| -> Result<Vec<Vec<Option<String>>>> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            for row in 0..batch.num_rows() {
+                rows.push(
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|column| result_compare::array_value_to_string(column.as_ref(), row))
+                        .collect::<Result<Vec<_>>>()?,
+                );
+            }
+        }
+        if !preserve_order {
+            rows.sort_unstable();
+        }
+        Ok(rows)
+    };
+    let actual_rows = rows(actual)?;
+    let expected_rows = rows(expected)?;
+    if actual_rows != expected_rows {
+        return Ok(Some(format!(
+            "protocol values differ (exact comparison); first different rows: {:?}\n--- actual\n{}\n--- expected\n{}",
+            actual_rows
+                .iter()
+                .zip(&expected_rows)
+                .find(|(actual, expected)| actual != expected),
+            preview(actual),
+            preview(expected)
+        )));
+    }
+    Ok(None)
+}
+
 /// The first rows of an answer, for a failure report.
 pub fn preview(batches: &[RecordBatch]) -> String {
     const ROWS: usize = 10;
@@ -463,7 +580,13 @@ pub fn preview(batches: &[RecordBatch]) -> String {
         })
         .collect();
     let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    let table = pretty_format_batches(&head).map_or_else(|e| e.to_string(), |t| t.to_string());
+    let width = CELL_WIDTH.load(Ordering::Relaxed);
+    let table = head
+        .iter()
+        .map(|b| shortened_batch(b, width))
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|head| pretty_format_batches(&head))
+        .map_or_else(|e| e.to_string(), |t| t.to_string());
     if total > ROWS {
         format!("{table}\n… {} more rows", total - ROWS)
     } else {
@@ -481,6 +604,39 @@ mod tests {
     use result_compare::array_value_to_string;
 
     use super::*;
+
+    #[test]
+    fn protocol_values_use_exact_numeric_comparison() {
+        use arrow::array::Float64Array;
+        let batch = |values: Vec<f64>| {
+            RecordBatch::try_from_iter([("f", Arc::new(Float64Array::from(values)) as ArrayRef)])
+                .expect("float batch")
+        };
+        let left = vec![batch(vec![1.0, 1.000_001])];
+        let changed = vec![batch(vec![1.0, 1.000_002])];
+        assert!(
+            compare_protocol("protocols", "SELECT f FROM t", &left, &changed, false)
+                .expect("comparison")
+                .is_some()
+        );
+        let swapped = vec![batch(vec![1.000_001, 1.0])];
+        assert!(
+            compare_protocol("protocols", "SELECT f FROM t", &left, &swapped, false)
+                .expect("unordered comparison")
+                .is_none()
+        );
+        assert!(
+            compare_protocol(
+                "protocols",
+                "SELECT f FROM t ORDER BY hidden_key",
+                &left,
+                &swapped,
+                false
+            )
+            .expect("hidden order comparison")
+            .is_some()
+        );
+    }
 
     fn text(rows: &[&[Option<&str>]]) -> TextResult {
         TextResult {
@@ -670,5 +826,46 @@ mod tests {
         assert!(first.is_null(3), "an unquoted NULL is a NULL element");
         assert!(!first.is_null(4), "a quoted \"NULL\" is text");
         assert!(batch.column(0).is_null(1), "a NULL cell is a NULL list");
+    }
+
+    #[test]
+    fn a_long_value_is_drawn_by_its_start_and_end() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("s", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![
+                    Some("short".to_string()),
+                    Some(format!("start{}é-end", "x".repeat(1000))),
+                    None,
+                ])),
+            ],
+        )
+        .expect("batch");
+        let draw = |width| {
+            pretty_format_batches(&[shortened_batch(&batch, width).expect("shortened")])
+                .expect("table")
+                .to_string()
+        };
+        assert_eq!(
+            draw(12),
+            "+----+--------------+\n\
+             | id | s            |\n\
+             +----+--------------+\n\
+             | 1  | short        |\n\
+             | 2  | startx…é-end |\n\
+             | 3  |              |\n\
+             +----+--------------+"
+        );
+        // 0 draws each value whole, as the table did before.
+        assert_eq!(
+            draw(0),
+            pretty_format_batches(std::slice::from_ref(&batch))
+                .expect("table")
+                .to_string()
+        );
     }
 }

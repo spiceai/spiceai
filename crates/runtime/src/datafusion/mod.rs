@@ -121,12 +121,6 @@ use parking_lot::Mutex as ParkingMutex;
 use query::QueryBuilder;
 use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_acceleration::snapshot::AccelerationLayout;
-#[cfg(any(
-    feature = "duckdb",
-    feature = "sqlite",
-    feature = "postgres",
-    not(windows)
-))]
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::{EnsureSchemaError, ensure_schema_exists};
@@ -157,7 +151,6 @@ mod change_generations;
 use change_generations::{
     ChangeGenerations, GenerationOwner, GenerationPermit, PreparedGeneration,
 };
-#[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub(crate) mod output_reservation;
 pub(crate) mod query_memory_pool;
@@ -174,7 +167,6 @@ pub mod job_executor_context_extension;
 pub use runtime_datafusion::managed_runtime;
 pub use runtime_datafusion::param_utils;
 pub use runtime_datafusion::pg_catalog;
-#[cfg(not(windows))]
 pub mod planner;
 pub(crate) mod point_lookup;
 pub(crate) use runtime_datafusion::refresh_sql;
@@ -856,7 +848,6 @@ pub(crate) fn engine_to_acceleration_engine(engine: Engine) -> Option<Accelerati
         Engine::Sqlite => Some(AccelerationEngine::Sqlite),
         #[cfg(feature = "turso")]
         Engine::Turso => Some(AccelerationEngine::Turso),
-        #[cfg(not(windows))]
         Engine::Cayenne => Some(AccelerationEngine::Cayenne),
         _ => None,
     }
@@ -1437,6 +1428,10 @@ pub enum DeferredRefreshOutcome {
     TableChanged,
 }
 
+/// The plan-cache clear count when a session was copied from `DataFusion::ctx`.
+#[derive(Debug)]
+struct PlansGeneration(u64);
+
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     pub(crate) runtime_status: Arc<status::RuntimeStatus>,
@@ -1459,6 +1454,12 @@ pub struct DataFusion {
     /// default catalog, keyed by dataset name (see [`DatasetPlacement`]).
     dataset_placements: dashmap::DashMap<String, Arc<dyn DatasetPlacement>>,
     caching: Arc<Caching>,
+    /// Counts plan-cache clears; `ctx` carries the count as a [`PlansGeneration`]
+    /// extension. A plan is cached only if its session was copied after the last clear,
+    /// because a copied session keeps the functions it was copied with and a plan that
+    /// resolved a definition the clear retired would outlive it. A write holds the read
+    /// guard across its check and insert, so a clear cannot count in between.
+    plans_generation: TokioRwLock<u64>,
     /// First 10 distinct SQL results-cache plan shapes, replayed after the
     /// first full/append refresh until the cache is full. No-op unless
     /// `runtime.caching.sql_results.warmup` is `on_first_refresh`.
@@ -1525,6 +1526,8 @@ pub struct DataFusion {
     // EXECUTE (not lightweight PREPARE/DEALLOCATE/SET) — i.e. query admission
     // control; `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
     query_admission_semaphore: Option<Arc<Semaphore>>,
+    // Permits in `query_admission_semaphore`; `None` when admission is unbounded.
+    query_admission_limit: Option<usize>,
     pub(crate) task_history_enabled: bool,
     /// Which failed queries are logged; `runtime.query.log_errors`.
     pub(crate) query_error_logging: QueryErrorLogging,
@@ -1594,7 +1597,6 @@ pub struct DataFusion {
     /// scheduler reflects actual data availability on executors. Only set
     /// in scheduler mode.
     pub(crate) partition_load_tracker: Option<Arc<runtime_cluster::PartitionLoadTracker>>,
-    #[cfg(not(windows))]
     pub(crate) cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
 }
 
@@ -1771,6 +1773,12 @@ impl DataFusion {
     /// `acceleration_refresh_semaphore` for the read/query side.
     pub(crate) fn query_admission_semaphore(&self) -> Option<Arc<Semaphore>> {
         self.query_admission_semaphore.clone()
+    }
+
+    /// The number of permits in the query-admission semaphore; `None` when
+    /// admission is unbounded.
+    pub(crate) fn query_admission_limit(&self) -> Option<usize> {
+        self.query_admission_limit
     }
 
     #[must_use]
@@ -2271,7 +2279,6 @@ impl DataFusion {
     }
 
     /// Returns `true` if any DDL-enabled catalog is Cayenne-backed.
-    #[cfg(not(windows))]
     fn has_cayenne_catalog(&self) -> bool {
         match self.ddl_enabled_catalogs.read() {
             Ok(cats) => cats.iter().any(|name| {
@@ -2295,18 +2302,9 @@ impl DataFusion {
     pub fn is_cayenne_catalog(&self, table_reference: &TableReference) -> bool {
         let catalog_name = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
 
-        #[cfg(not(windows))]
-        {
-            self.ctx
-                .catalog(catalog_name)
-                .is_some_and(|catalog| cayenne_ddl::is_cayenne_catalog(catalog.as_ref()))
-        }
-
-        #[cfg(windows)]
-        {
-            let _ = catalog_name;
-            false
-        }
+        self.ctx
+            .catalog(catalog_name)
+            .is_some_and(|catalog| cayenne_ddl::is_cayenne_catalog(catalog.as_ref()))
     }
 
     /// Returns the partition expression string for a table by querying the catalog provider.
@@ -4749,7 +4747,6 @@ impl DataFusion {
 
         // Check if this is an S3 Express One Zone acceleration (Cayenne with S3 Express config)
         // This is used for better error messages when S3 Express upload fails
-        #[cfg(not(windows))]
         let is_s3_express_acceleration = acceleration_settings.engine == Engine::Cayenne
             && (acceleration_settings
                 .params
@@ -4758,8 +4755,6 @@ impl DataFusion {
                 || acceleration_settings
                     .params
                     .contains_key("cayenne_s3_zone_ids"));
-        #[cfg(windows)]
-        let is_s3_express_acceleration = false;
         accelerated_table_builder.s3_express_acceleration(is_s3_express_acceleration);
 
         // The engine rewrites some incoming types at table creation because its storage
@@ -6112,6 +6107,33 @@ impl DataFusion {
         dataset_name: &TableReference,
         overrides: Option<RefreshOverrides>,
     ) -> Result<Option<RefreshCompletionWaiter>> {
+        // Overrides are checked before anything is queued or forwarded, so the caller
+        // learns of a mode or `refresh_sql` that cannot run. A scheduler checks against
+        // its own copy of the dataset when it has one, and always checks the mode.
+        if let Some(overrides) = &overrides {
+            overrides
+                .validate_mode()
+                .map_err(|source| Error::UnableToTriggerRefresh {
+                    dataset_name: dataset_name.to_string(),
+                    source: crate::accelerated::Error::InvalidRefreshOverrides { source },
+                })?;
+            if let Ok(table) = self
+                .get_accelerated_table_provider(dataset_name.to_string().as_str())
+                .await
+                && let Some(accelerated_table) = spice_table::find_layer::<AcceleratedTable>(
+                    table.as_ref(),
+                    spice_table::LayerWalk::Read,
+                )
+            {
+                accelerated_table
+                    .validate_refresh_overrides(overrides)
+                    .await
+                    .context(UnableToTriggerRefreshSnafu {
+                        dataset_name: dataset_name.to_string(),
+                    })?;
+            }
+        }
+
         // If we're a scheduler with a partition service, forward refresh to executors
         // instead of trying to refresh locally (the scheduler doesn't run refresh workers).
         if matches!(
@@ -7017,6 +7039,10 @@ impl DataFusion {
             None
         };
 
+        let generation = session
+            .config()
+            .get_extension::<PlansGeneration>()
+            .map(|generation| generation.0);
         let (plan, placeholders) = self.create_logical_plan(session, sql, parameters).await?;
 
         // A plan is not cached when it holds substituted table-function parameters,
@@ -7029,7 +7055,10 @@ impl DataFusion {
             && !matches!(plan, LogicalPlan::Ddl(_))
         {
             tracing::trace!("caching plan for {sql}");
-            cache.put_raw_key(&cache_key.as_u64(), plan.clone()).await;
+            let current = self.plans_generation.read().await;
+            if generation == Some(*current) {
+                cache.put_raw_key(&cache_key.as_u64(), plan.clone()).await;
+            }
         }
 
         Ok(plan)
@@ -7041,7 +7070,6 @@ impl DataFusion {
     ///
     /// `parameters` are substituted into table-function arguments first; see
     /// [`runtime_datafusion::table_function_params`].
-    #[cfg(not(windows))]
     pub(crate) async fn create_logical_plan(
         &self,
         session: &SessionState,
@@ -7072,29 +7100,6 @@ impl DataFusion {
         Ok((plan, placeholders))
     }
 
-    /// On Windows the `planner` module is not available, so delegate
-    /// directly to DataFusion's standard logical planner.
-    #[cfg(windows)]
-    pub(crate) async fn create_logical_plan(
-        &self,
-        session: &SessionState,
-        sql: &str,
-        parameters: Option<&ParamValues>,
-    ) -> Result<(LogicalPlan, TableFunctionPlaceholders), DataFusionError> {
-        let dialect = session.config().options().sql_parser.dialect;
-        let mut statement = session.sql_to_statement(sql, &dialect)?;
-        sql_depth_guard::ensure_statement_within_depth_limits(&statement)?;
-        let placeholders = bind_table_function_args(&mut statement, parameters)?;
-        self.resolve_pending_initializations_for_statement(session, &statement)
-            .await?;
-        let spellings =
-            runtime_datafusion::analyzer_rule::exact_float_decimal_cast::FloatLiteralSpellings::collect(
-                &statement,
-            );
-        let plan = spellings.retain(session.statement_to_plan(statement).await?)?;
-        Ok((plan, placeholders))
-    }
-
     /// Whether `sql` has a placeholder in a table-function argument, which
     /// means it cannot be planned until its parameters are known.
     ///
@@ -7106,16 +7111,33 @@ impl DataFusion {
         // The plain parser suffices: only `CREATE TABLE ... CLUSTER BY` needs
         // `planner::parse_sql_statement`, and it has no table functions.
         let dialect = state.config().options().sql_parser.dialect;
-        state
-            .sql_to_statement(sql, &dialect)
+        sql_depth_guard::sql_to_statement(&state, sql, &dialect)
             .and_then(|mut statement| bind_table_function_args(&mut statement, None))
             .is_ok_and(|placeholders| placeholders == TableFunctionPlaceholders::Present)
     }
 
     pub(crate) async fn clear_cached_plans(&self) {
         tracing::trace!("clearing cached logical plans");
+        {
+            let mut generation = self.plans_generation.write().await;
+            *generation += 1;
+            self.ctx
+                .state_ref()
+                .write()
+                .config_mut()
+                .set_extension(Arc::new(PlansGeneration(*generation)));
+        }
         if let Some(cache_provider) = self.plans_cache_provider() {
             cache_provider.invalidate_all().await;
+        }
+    }
+
+    /// Discards every cached plan and result, for a reload that replaces a definition a
+    /// query reads through (a view, a catalog or a user function) rather than a table.
+    pub(crate) async fn clear_cached_plans_and_results(&self) {
+        self.clear_cached_plans().await;
+        if let Some(results) = self.results_cache_provider() {
+            results.invalidate_all().await;
         }
     }
 
@@ -7711,12 +7733,6 @@ async fn build_snapshot_creation_config(
         }
     };
 
-    #[cfg(any(
-        feature = "duckdb",
-        feature = "sqlite",
-        feature = "postgres",
-        not(windows)
-    ))]
     let acceleration_engine = match acceleration_settings.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => AccelerationEngine::DuckDB,
@@ -7724,7 +7740,6 @@ async fn build_snapshot_creation_config(
         Engine::Sqlite => AccelerationEngine::Sqlite,
         #[cfg(feature = "turso")]
         Engine::Turso => AccelerationEngine::Turso,
-        #[cfg(not(windows))]
         Engine::Cayenne => AccelerationEngine::Cayenne,
         _ => {
             // This code is unreachable since build_snapshot_creation_config is
@@ -7733,24 +7748,6 @@ async fn build_snapshot_creation_config(
         }
     };
 
-    #[cfg(not(any(
-        feature = "duckdb",
-        feature = "sqlite",
-        feature = "postgres",
-        not(windows)
-    )))]
-    {
-        let _ = acceleration_layout;
-        let _ = snapshot_creation_trigger;
-        return Err(Error::UnsupportedAccelerationEngineForSnapshots);
-    }
-
-    #[cfg(any(
-        feature = "duckdb",
-        feature = "sqlite",
-        feature = "postgres",
-        not(windows)
-    ))]
     Ok(SnapshotManager::try_new(
         dataset.name.to_string(),
         acceleration_settings.snapshot_behavior.clone(),
@@ -7933,6 +7930,8 @@ async fn build_snapshot_refresh_state(
 
 #[cfg(test)]
 mod installation_tests;
+#[cfg(test)]
+mod integer_overflow;
 
 #[cfg(test)]
 mod tests {
@@ -8506,10 +8505,64 @@ mod tests {
         );
     }
 
+    /// A session copied before a reload clears the plan cache keeps the functions the
+    /// reload retired, so a plan built from it must not be cached.
+    #[tokio::test]
+    async fn a_plan_from_a_session_copied_before_a_plan_cache_clear_is_not_cached() {
+        static SQL: &str = "SELECT value FROM echo('fox')";
+        let raw_cache_key =
+            CacheKey::Query(SQL, None).as_raw_key(Box::new(std::hash::DefaultHasher::new()));
+
+        let runtime = RuntimeBuilder::new().build().await;
+        let plan_cache_provider = Arc::new(SimpleCache::new(
+            512,
+            Duration::from_hours(1),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
+        ));
+        let df = Arc::new(
+            DataFusion::builder(
+                status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+                Handle::current(),
+            )
+            .with_caching(Arc::new(
+                Caching::new().with_plans_cache(plan_cache_provider),
+            ))
+            .build(),
+        );
+        df.ctx.register_udtf("echo", Arc::new(EchoTableFunc));
+
+        let session = df.ctx.state();
+        df.clear_cached_plans().await;
+        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL, None)
+            .await
+            .expect("plan from the copied session");
+
+        let Some(cache_provider) = df.plans_cache_provider() else {
+            unreachable!("Cache provider should be available");
+        };
+        cache_provider.checkpoint().await;
+        assert_eq!(
+            cache_provider.item_count().await,
+            0,
+            "a plan from a session copied before a clear must not be cached"
+        );
+
+        let session = df.ctx.state();
+        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL, None)
+            .await
+            .expect("plan from a session copied after the clear");
+        cache_provider.checkpoint().await;
+        assert_eq!(
+            cache_provider.item_count().await,
+            1,
+            "a plan from a session copied after a clear is cached"
+        );
+    }
+
     /// Each plan of a `CREATE TABLE` stores its options for the analyzer, which takes
     /// them: a Flight SQL client plans the statement to advertise its schema, then
     /// again to run it.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn each_plan_of_a_create_table_stores_its_options() {
         static SQL: &str = "CREATE TABLE t (id BIGINT, region VARCHAR) \

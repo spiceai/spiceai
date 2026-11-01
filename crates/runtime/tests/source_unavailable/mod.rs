@@ -2161,6 +2161,48 @@ mod served_from_acceleration {
         Ok(())
     }
 
+    /// A cron-scheduled dataset whose first load fails is still refreshed on its schedule,
+    /// so it loads once the source answers again.
+    #[tokio::test]
+    async fn a_cron_scheduled_dataset_whose_first_load_failed_loads_on_schedule()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("cron-after-failed-load").await?;
+        let source = &fixture.source;
+        source.bring_up();
+        source.read_lazily();
+        source.set_scans_failing(true);
+        let mut dataset = with_refresh_cron(fixture.dataset(ReadyState::OnLoad), "*/2 * * * * *");
+        if let Some(acceleration) = dataset.acceleration.as_mut() {
+            acceleration.refresh_jitter_enabled = false;
+            acceleration.refresh_retry_enabled = false;
+        }
+        let (rt, loader) = start(dataset).await;
+        let failed = wait_until_true(Duration::from_secs(15), || async {
+            source.failed_scans() > 0
+                && matches!(
+                    dataset_status(&rt, "orders"),
+                    Some(ComponentStatus::Error(_))
+                )
+        })
+        .await;
+
+        source.set_scans_failing(false);
+        let recovered = wait_until_true(Duration::from_secs(15), || async {
+            sum_and_count(&rt).await == Some((3, 3))
+                && dataset_status(&rt, "orders") == Some(ComponentStatus::Ready)
+        })
+        .await;
+        let observed = (sum_and_count(&rt).await, dataset_status(&rt, "orders"));
+        stop(rt, loader).await;
+        assert!(failed, "the first load fails while scans fail");
+        assert!(
+            recovered,
+            "a scheduled refresh loads the dataset once scans succeed, got {observed:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn synchronized_child_uses_parent_refresh_deadline() -> Result<(), anyhow::Error> {
         assert_synchronized_deadline("sync-child-deadline", false, Some("10m")).await
@@ -2953,8 +2995,7 @@ mod served_from_acceleration {
 }
 
 /// `append` datasets with a `time_column` and acceleration snapshots enabled.
-// Cayenne does not build on Windows.
-#[cfg(all(feature = "snapshots", not(windows)))]
+#[cfg(feature = "snapshots")]
 mod served_with_snapshots_enabled {
     use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
