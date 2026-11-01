@@ -49,9 +49,13 @@ pub mod hf_files;
 pub mod mistral;
 pub mod nsql;
 #[cfg(feature = "local_llm")]
+mod template_content;
+#[cfg(feature = "local_llm")]
 pub use crate::chat::distributed::{DistributedBackend, DistributedConfig};
 #[cfg(feature = "local_llm")]
 use crate::chat::distributed::{configure_ring_distributed, ensure_distributed_build};
+#[cfg(feature = "local_llm")]
+pub use crate::chat::template_content::ContentSupport;
 #[cfg(feature = "local_llm")]
 use indexmap::IndexMap;
 #[cfg(feature = "local_llm")]
@@ -133,149 +137,136 @@ pub fn try_map_boxed_error_to_box(
     try_map_boxed_error(&*e).map_or_else(|| e, std::convert::Into::into)
 }
 
-/// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequestMessage`] type.
+/// A part of a user message's content that a local model cannot read: the engines give its
+/// chat template only text.
 #[cfg(feature = "local_llm")]
-#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedContentPart {
+    /// The part's `type`, as the request names it.
+    pub part: &'static str,
+}
+
+#[cfg(feature = "local_llm")]
+impl UnsupportedContentPart {
+    /// Why a request to `model` that carries this part is refused.
+    #[must_use]
+    pub fn refusal(&self, model: &str) -> String {
+        format!(
+            "Model '{model}' reads only text, so it cannot take the `{}` part of a user message. Send the message's content as text.",
+            self.part
+        )
+    }
+}
+
+/// Converts a [`ChatCompletionRequestMessage`] to the message a chat template renders, as the
+/// local engines render it. Content sent as an array becomes text parts,
+/// `[{"type": "text", "text": …}]`, which [`ContentSupport::rewrite`] then fits to the
+/// template; an empty array is empty text, as llama-server takes it.
+///
+/// # Errors
+///
+/// A user message's part other than text: an image, audio or a file, which no local engine
+/// passes to its model.
+#[cfg(feature = "local_llm")]
 pub fn message_to_mistral(
     message: &ChatCompletionRequestMessage,
-) -> IndexMap<String, MessageContent> {
+) -> std::result::Result<IndexMap<String, MessageContent>, UnsupportedContentPart> {
     use async_openai::types::chat::{
-        ChatCompletionMessageToolCalls, ChatCompletionRequestSystemMessageContent,
-        ChatCompletionRequestToolMessageContent,
+        ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageContentPart,
+        ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
+        ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
+        ChatCompletionRequestUserMessageContentPart,
     };
     use either::Either;
-    use serde_json::{Value, json};
+    use serde_json::Value;
 
-    match message {
+    let role = |role: &str| (String::from("role"), Either::Left(role.to_string()));
+    let text = |text: &str| Either::Left(text.to_string());
+
+    Ok(match message {
         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
             content, ..
         }) => {
-            let body: MessageContent = match content {
-                ChatCompletionRequestUserMessageContent::Text(text) => {
-                    either::Either::Left(text.clone())
-                }
-                ChatCompletionRequestUserMessageContent::Array(array) => {
-                    let index_map = array.iter().map(|p| {
-                        match p {
-                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::Text(t) => {
-                                ("content".to_string(), Value::String(t.text.clone()))
+            let content = match content {
+                ChatCompletionRequestUserMessageContent::Text(t) => text(t),
+                ChatCompletionRequestUserMessageContent::Array(parts) => {
+                    let texts = parts
+                        .iter()
+                        .map(|part| match part {
+                            ChatCompletionRequestUserMessageContentPart::Text(t) => {
+                                Ok(t.text.as_str())
                             }
-                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::ImageUrl(i) => {
-                                ("image_url".to_string(), Value::String(i.image_url.url.clone()))
+                            ChatCompletionRequestUserMessageContentPart::ImageUrl(_) => {
+                                Err(UnsupportedContentPart { part: "image_url" })
                             }
-                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::InputAudio(a) => {
-                                ("input_audio".to_string(), Value::String(a.input_audio.data.clone()))
+                            ChatCompletionRequestUserMessageContentPart::InputAudio(_) => {
+                                Err(UnsupportedContentPart {
+                                    part: "input_audio",
+                                })
                             }
-                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::File(f) => {
-                                ("file".to_string(), serde_json::to_value(&f.file).unwrap_or_default())
+                            ChatCompletionRequestUserMessageContentPart::File(_) => {
+                                Err(UnsupportedContentPart { part: "file" })
                             }
-                        }
-
-                    }).collect();
-                    either::Either::Right(vec![index_map])
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    parts_content(&texts)
                 }
             };
-            IndexMap::from([
-                (String::from("role"), Either::Left(String::from("user"))),
-                (String::from("content"), body),
-            ])
+            IndexMap::from([role("user"), (String::from("content"), content)])
         }
         ChatCompletionRequestMessage::Developer(ChatCompletionRequestDeveloperMessage {
-            content: ChatCompletionRequestDeveloperMessageContent::Text(text),
-            ..
-        }) => IndexMap::from([
-            (
-                String::from("role"),
-                Either::Left(String::from("developer")),
-            ),
-            (String::from("content"), Either::Left(text.clone())),
-        ]),
-        ChatCompletionRequestMessage::Developer(ChatCompletionRequestDeveloperMessage {
-            content: ChatCompletionRequestDeveloperMessageContent::Array(parts),
+            content,
             ..
         }) => {
-            // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
-            let content_json = parts
-                .iter()
-                .map(|p| {
-                    let ChatCompletionRequestDeveloperMessageContentPart::Text(t) = p;
-                    t.text.clone()
-                })
-                .collect::<Vec<_>>();
-            IndexMap::from([
-                (
-                    String::from("role"),
-                    Either::Left(String::from("developer")),
+            let content = match content {
+                ChatCompletionRequestDeveloperMessageContent::Text(t) => text(t),
+                ChatCompletionRequestDeveloperMessageContent::Array(parts) => parts_content(
+                    &parts
+                        .iter()
+                        .map(
+                            |ChatCompletionRequestDeveloperMessageContentPart::Text(t)| {
+                                t.text.as_str()
+                            },
+                        )
+                        .collect::<Vec<_>>(),
                 ),
-                (
-                    String::from("content"),
-                    Either::Left(json!(content_json).to_string()),
-                ),
-            ])
+            };
+            IndexMap::from([role("developer"), (String::from("content"), content)])
         }
         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-            content: ChatCompletionRequestSystemMessageContent::Text(text),
-            ..
-        }) => IndexMap::from([
-            (String::from("role"), Either::Left(String::from("system"))),
-            (String::from("content"), Either::Left(text.clone())),
-        ]),
-        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-            content: ChatCompletionRequestSystemMessageContent::Array(parts),
+            content,
             ..
         }) => {
-            // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
-            let content_json = parts
-                .iter()
-                .map(|p| match p {
-                    async_openai::types::chat::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
-                        ("text".to_string(), t.text.clone())
-                    }
-                })
-                .collect::<Vec<_>>();
-            IndexMap::from([
-                (String::from("role"), Either::Left(String::from("system"))),
-                (
-                    String::from("content"),
-                    Either::Left(json!(content_json).to_string()),
+            let content = match content {
+                ChatCompletionRequestSystemMessageContent::Text(t) => text(t),
+                ChatCompletionRequestSystemMessageContent::Array(parts) => parts_content(
+                    &parts
+                        .iter()
+                        .map(|ChatCompletionRequestSystemMessageContentPart::Text(t)| {
+                            t.text.as_str()
+                        })
+                        .collect::<Vec<_>>(),
                 ),
-            ])
+            };
+            IndexMap::from([role("system"), (String::from("content"), content)])
         }
         ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
-            content: ChatCompletionRequestToolMessageContent::Text(text),
-            tool_call_id,
-        }) => IndexMap::from([
-            (String::from("role"), Either::Left(String::from("tool"))),
-            (String::from("content"), Either::Left(text.clone())),
-            (
-                String::from("tool_call_id"),
-                Either::Left(tool_call_id.clone()),
-            ),
-        ]),
-        ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
-            content: ChatCompletionRequestToolMessageContent::Array(parts),
+            content,
             tool_call_id,
         }) => {
-            // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
-            let content_json = parts
-                .iter()
-                .map(|p| match p {
-                    async_openai::types::chat::ChatCompletionRequestToolMessageContentPart::Text(t) => {
-                        ("text".to_string(), t.text.clone())
-                    }
-                })
-                .collect::<Vec<_>>();
-
+            let content = match content {
+                ChatCompletionRequestToolMessageContent::Text(t) => text(t),
+                ChatCompletionRequestToolMessageContent::Array(parts) => parts_content(
+                    &parts
+                        .iter()
+                        .map(|ChatCompletionRequestToolMessageContentPart::Text(t)| t.text.as_str())
+                        .collect::<Vec<_>>(),
+                ),
+            };
             IndexMap::from([
-                (String::from("role"), Either::Left(String::from("tool"))),
-                (
-                    String::from("content"),
-                    Either::Left(json!(content_json).to_string()),
-                ),
-                (
-                    String::from("tool_call_id"),
-                    Either::Left(tool_call_id.clone()),
-                ),
+                role("tool"),
+                (String::from("content"), content),
+                (String::from("tool_call_id"), text(tool_call_id)),
             ])
         }
         ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
@@ -284,36 +275,28 @@ pub fn message_to_mistral(
             tool_calls,
             ..
         }) => {
-            let mut map: IndexMap<String, MessageContent> = IndexMap::from([(
-                String::from("role"),
-                Either::Left(String::from("assistant")),
-            )]);
-            match content {
-                Some(ChatCompletionRequestAssistantMessageContent::Text(s)) => {
-                    map.insert("content".to_string(), Either::Left(s.clone()));
-                }
-                Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => {
-                    // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
-                    let content_json= parts.iter().map(|p| match p {
-                        async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
-                            ("text".to_string(), t.text.clone())
-                        }
-                        async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
-                            ("refusal".to_string(), i.refusal.clone())
-                        }
-                    }).collect::<Vec<_>>();
-                    map.insert(
-                        String::from("content"),
-                        Either::Left(json!(content_json).to_string()),
-                    );
-                }
-                None => {
-                    // Use Some(""), not None as it is more compatible with many open source `chat_template`s.
-                    map.insert("content".to_string(), Either::Left(String::new()));
-                }
-            }
+            let content = match content {
+                Some(ChatCompletionRequestAssistantMessageContent::Text(t)) => text(t),
+                // A refusal is what the assistant said, so the template reads it as its text.
+                Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => parts_content(
+                    &parts
+                        .iter()
+                        .map(|part| match part {
+                            ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
+                                t.text.as_str()
+                            }
+                            ChatCompletionRequestAssistantMessageContentPart::Refusal(r) => {
+                                r.refusal.as_str()
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                // Empty text, not none, which more open-source chat templates accept.
+                None => text(""),
+            };
+            let mut map = IndexMap::from([role("assistant"), (String::from("content"), content)]);
             if let Some(name) = name {
-                map.insert("name".to_string(), Either::Left(name.clone()));
+                map.insert("name".to_string(), text(name));
             }
             if let Some(tool_calls) = tool_calls {
                 let tool_call_results: Vec<IndexMap<String, Value>> = tool_calls
@@ -344,13 +327,24 @@ pub fn message_to_mistral(
             content,
             name,
         }) => IndexMap::from([
-            (String::from("role"), Either::Left(String::from("function"))),
+            role("function"),
             (
                 "content".to_string(),
-                Either::Left(content.clone().unwrap_or_default()),
+                text(content.as_deref().unwrap_or_default()),
             ),
-            ("name".to_string(), Either::Left(name.clone())),
+            ("name".to_string(), text(name)),
         ]),
+    })
+}
+
+/// A message's content sent as an array of text parts: the parts, or empty text when there are
+/// none, as llama-server takes an empty array.
+#[cfg(feature = "local_llm")]
+fn parts_content(texts: &[&str]) -> MessageContent {
+    if texts.is_empty() {
+        either::Either::Left(String::new())
+    } else {
+        template_content::text_parts(texts.iter().copied())
     }
 }
 
