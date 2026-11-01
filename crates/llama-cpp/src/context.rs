@@ -156,6 +156,35 @@ impl Context<'_> {
         }
     }
 
+    /// The logits of output row `index` of the last decoded batch, one per token of the
+    /// model's vocabulary, by token id. `None` when the last decode did not output that row,
+    /// or when a backend sampler, which leaves only its own candidates, sampled it.
+    pub(crate) fn logits(&self, index: i32) -> Option<&[f32]> {
+        let ctx = self.raw.as_ptr();
+        // SAFETY: `raw` is live while `self` is (see `Context`). Each call waits for the last
+        // decode to finish, then reads where it left row `index`.
+        let backend_sampled = unsafe {
+            sys::llama_get_sampled_token_ith(ctx, index) != sys::LLAMA_TOKEN_NULL
+                || !sys::llama_get_sampled_logits_ith(ctx, index).is_null()
+                || !sys::llama_get_sampled_probs_ith(ctx, index).is_null()
+        };
+        if backend_sampled {
+            return None;
+        }
+        // SAFETY: as above; null when the decode did not output row `index`.
+        let row = NonNull::new(unsafe { sys::llama_get_logits_ith(ctx, index) })?;
+        // SAFETY: as above; the model outlives the context, and its vocabulary the model.
+        let n_vocab = unsafe {
+            sys::llama_vocab_n_tokens(sys::llama_model_get_vocab(sys::llama_get_model(ctx)))
+        };
+        let n_vocab = usize::try_from(n_vocab).ok()?;
+        // SAFETY: llama.cpp keeps a row of logits per output, one per vocabulary token. It
+        // writes them while it decodes, and when the first read after a decode puts the rows in
+        // batch order, which the calls above have done. Only another decode queues writes again,
+        // and it takes `&mut self`, so it cannot start while the returned row borrows `self`.
+        Some(unsafe { std::slice::from_raw_parts(row.as_ptr(), n_vocab) })
+    }
+
     /// Waits for the computation queued by earlier decodes to finish: a decode returns once
     /// its computation is queued, and a time taken without waiting would leave it out.
     pub fn synchronize(&mut self) {
