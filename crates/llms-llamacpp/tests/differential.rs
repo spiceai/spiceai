@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use llms::chat::mistral::MistralLlama;
 use llms::chat::{Chat, LocalModelOptions, ReasoningDefault};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::{FILE, MODEL, REVISION, request};
 
@@ -88,8 +88,8 @@ fn last_word(reply: &str) -> &str {
         .unwrap_or_default()
 }
 
-#[tokio::test]
-async fn both_engines_answer_the_corpus_alike_and_right() {
+/// The GGUF on each engine: llama.cpp, then mistral.rs.
+async fn both_engines() -> (Arc<dyn Chat>, MistralLlama) {
     let path = local_gguf().await;
     let weights = [path];
     let options = LocalModelOptions {
@@ -106,6 +106,60 @@ async fn both_engines_answer_the_corpus_alike_and_right() {
     let mistral = MistralLlama::from(&weights, None, None, None, None, options, None)
         .await
         .expect("mistral.rs loads it");
+    (llama, mistral)
+}
+
+/// How many tokens the prompt of `messages` is on `model`, as its reply's usage reports.
+async fn prompt_tokens(model: &dyn Chat, messages: Value) -> u32 {
+    model
+        .chat_request(request(json!({
+            "model": "qwen3",
+            "messages": messages,
+            "temperature": 0,
+            "reasoning_effort": "none",
+            "max_tokens": 1,
+        })))
+        .await
+        .unwrap_or_else(|e| panic!("a reply to {messages}: {e}"))
+        .usage
+        .expect("usage")
+        .prompt_tokens
+}
+
+/// A message's text parts reach either engine's chat template as llama-server gives them:
+/// Qwen3-0.6B's reads only strings, so as the parts' text joined with newlines. Each engine's
+/// prompt for the parts is as long as its prompt for the joined text, and as the other's.
+#[tokio::test]
+async fn both_engines_read_text_parts_as_their_joined_text() {
+    let (llama, mistral) = both_engines().await;
+    let parts = json!([
+        { "type": "text", "text": "The secret word is PLUM." },
+        { "type": "text", "text": "Be brief." },
+    ]);
+    let joined = json!("The secret word is PLUM.\nBe brief.");
+    let hi = json!({ "role": "user", "content": "hi" });
+    for role in ["system", "user"] {
+        let conversation = |content: &Value| match role {
+            "system" => json!([{ "role": "system", "content": content }, hi]),
+            _ => json!([{ "role": "user", "content": content }]),
+        };
+        let from_llama = prompt_tokens(&*llama, conversation(&joined)).await;
+        let from_mistral = prompt_tokens(&mistral, conversation(&joined)).await;
+        assert_eq!(
+            (
+                prompt_tokens(&*llama, conversation(&parts)).await,
+                prompt_tokens(&mistral, conversation(&parts)).await,
+            ),
+            (from_llama, from_mistral),
+            "each engine's {role} message of text parts is as long as its joined text"
+        );
+        assert_eq!(from_llama, from_mistral, "the engines' {role} prompts");
+    }
+}
+
+#[tokio::test]
+async fn both_engines_answer_the_corpus_alike_and_right() {
+    let (llama, mistral) = both_engines().await;
 
     for &(prompt, expected) in CORPUS {
         let (from_llama, from_mistral) = (

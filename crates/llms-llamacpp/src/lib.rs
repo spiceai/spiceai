@@ -490,6 +490,22 @@ impl LlamaCpp {
         self.reused_prompt_tokens.load(Ordering::Relaxed)
     }
 
+    /// The prompt `req` renders, as a request decodes it. For tests.
+    #[doc(hidden)]
+    pub fn render_prompt(
+        &self,
+        req: &CreateChatCompletionRequest,
+    ) -> std::result::Result<String, OpenAIError> {
+        let reasoning = reasoning_controls(
+            req.reasoning_effort.as_ref(),
+            &self.reasoning_support,
+            &self.model_name,
+        )
+        .map_err(OpenAIError::InvalidArgument)?;
+        let tools = req.tools.iter().flatten().map(convert_tool).collect();
+        self.prompt(&req.messages, reasoning, tools)
+    }
+
     fn prompt(
         &self,
         messages: &[ChatCompletionRequestMessage],
