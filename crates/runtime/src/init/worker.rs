@@ -90,6 +90,8 @@ impl Runtime {
         let completion_llms = self.completion_llms();
         let mut llm_registry = completion_llms.write().await;
         llm_registry.remove(&cfg.name);
+        drop(llm_registry);
+        self.workers.write().await.remove(&cfg.name);
 
         if let Err(e) = Arc::clone(&self)
             .remove_worker_schedule(cfg.name.clone().into())
