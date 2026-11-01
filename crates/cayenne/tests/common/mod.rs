@@ -120,16 +120,12 @@ pub async fn fixture_catalog(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendType {
     Sqlite,
-    #[cfg(feature = "turso")]
-    Turso,
 }
 
 impl BackendType {
     pub fn name(self) -> &'static str {
         match self {
             BackendType::Sqlite => "SQLite",
-            #[cfg(feature = "turso")]
-            BackendType::Turso => "Turso",
         }
     }
 }
@@ -158,11 +154,6 @@ impl TestFixture {
                 let db_path = temp_dir.path().join("test.db");
                 format!("sqlite://{}", db_path.to_string_lossy())
             }
-            #[cfg(feature = "turso")]
-            BackendType::Turso => {
-                let db_path = temp_dir.path().join("test.db");
-                format!("libsql://{}", db_path.to_string_lossy())
-            }
         };
 
         let catalog = fixture_catalog(connection_string).await?;
@@ -183,15 +174,11 @@ impl TestFixture {
 
     /// Connection string for this fixture's backend, matching the scheme used
     /// in [`TestFixture::new`]. Tests that simulate a restart (reopen the
-    /// catalog from disk) must use this rather than hardcoding `sqlite://`,
-    /// otherwise the Turso variant reopens a Turso-format file with the `SQLite`
-    /// backend and fails with "file is not a database".
+    /// catalog from disk) use this rather than building their own.
     pub fn connection_string(&self) -> String {
         let db_path = self.db_path();
         match self.backend_type {
             BackendType::Sqlite => format!("sqlite://{}", db_path.to_string_lossy()),
-            #[cfg(feature = "turso")]
-            BackendType::Turso => format!("libsql://{}", db_path.to_string_lossy()),
         }
     }
 }
@@ -208,9 +195,7 @@ pub fn single_batch_stream(batch: RecordBatch) -> SendableRecordBatchStream {
 /// Stack size for the thread a backend-parameterized test body runs on.
 ///
 /// The mutation and cold-tier workloads plan and unparse deeply enough to need
-/// more than the 2 MiB std gives a thread, and how much more depends on the
-/// metastore backend: the Turso variants of four of them need above 2 MiB where
-/// their `SQLite` siblings fit (#12436). 16 MiB matches the headroom
+/// more than the 2 MiB std gives a thread (#12436). 16 MiB matches the headroom
 /// `runtime`'s own deep-plan tests reserve
 /// (`crates/runtime/tests/cayenne/transaction.rs`), and is address space
 /// reserved rather than memory committed.
@@ -243,12 +228,6 @@ macro_rules! test_with_backends {
                 common::run_with_backend_blocking(common::BackendType::Sqlite, $test_fn)
             }
 
-            #[cfg(feature = "turso")]
-            #[test]
-            fn [<$test_fn _turso>]() -> Result<(), String> {
-                tracing::debug!("\n🔧 Running {} with Turso backend", stringify!($test_fn));
-                common::run_with_backend_blocking(common::BackendType::Turso, $test_fn)
-            }
         }
     };
 }

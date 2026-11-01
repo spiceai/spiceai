@@ -25,21 +25,24 @@ limitations under the License.
 )]
 
 mod context;
+mod devices;
 mod log;
 mod model;
 mod mtp;
+pub mod rpc;
 mod sampler;
 
 use std::sync::OnceLock;
 
 use snafu::Snafu;
 
-pub use context::{Batch, Context, ContextParams};
+pub use context::{Batch, Context, ContextParams, Truncation};
+pub use devices::gpu_free_memory;
 pub use model::{Model, ModelParams, Vocab};
-pub use mtp::{Mtp, MtpParams};
+pub use mtp::{DraftKind, Mtp, MtpParams};
 pub use sampler::Sampler;
 
-/// The llama.cpp release this crate is built from, such as `b11803`.
+/// The llama.cpp release this crate is built from, such as `b11999`.
 pub const RELEASE: &str = env!("LLAMA_CPP_RELEASE");
 
 mod sys {
@@ -88,6 +91,18 @@ pub enum Error {
 
     #[snafu(display("llama.cpp MTP drafting failed: {message}"))]
     Mtp { message: String },
+
+    #[snafu(display("No GPU server answered at '{endpoint}'"))]
+    RpcConnect { endpoint: String },
+
+    #[snafu(display("The address '{endpoint}' cannot be passed to llama.cpp: {source}"))]
+    RpcEndpoint {
+        endpoint: String,
+        source: std::ffi::NulError,
+    },
+
+    #[snafu(display("llama.cpp could not serve this node's GPUs at '{endpoint}': {reason}"))]
+    RpcServe { endpoint: String, reason: String },
 
     #[snafu(display("llama.cpp could not use the grammar: {reason}"))]
     Grammar { reason: String },

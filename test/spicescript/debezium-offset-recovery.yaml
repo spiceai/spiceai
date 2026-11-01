@@ -76,7 +76,7 @@ steps:
         DEBEZIUM_FORMAT_KEY_SCHEMAS_ENABLE=false
         QUARKUS_HTTP_PORT=${instance.port}
         QUARKUS_LOG_FILE_ENABLE=false
-        nohup /debezium/run.sh >> /tmp/${sources.src.namespace}/debezium.log 2>&1 < /dev/null &
+        nohup /debezium/run.sh > /proc/1/fd/1 2>&1 < /dev/null &
         echo $! > /tmp/${sources.src.namespace}/pid
   - query: SELECT * FROM acct
     eventually: 120s

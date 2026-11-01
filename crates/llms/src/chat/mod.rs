@@ -40,14 +40,18 @@ use async_openai::types::chat::{
 #[cfg(feature = "local_llm")]
 pub mod engine;
 #[cfg(feature = "local_llm")]
+pub mod gguf_files;
+#[cfg(feature = "local_llm")]
+mod gguf_header;
+#[cfg(feature = "local_llm")]
 pub mod hf_files;
 #[cfg(feature = "local_llm")]
 pub mod mistral;
 pub mod nsql;
 #[cfg(feature = "local_llm")]
-use crate::chat::distributed::configure_ring_distributed;
-#[cfg(feature = "local_llm")]
 pub use crate::chat::distributed::{DistributedBackend, DistributedConfig};
+#[cfg(feature = "local_llm")]
+use crate::chat::distributed::{configure_ring_distributed, ensure_distributed_build};
 #[cfg(feature = "local_llm")]
 use indexmap::IndexMap;
 #[cfg(feature = "local_llm")]
@@ -360,9 +364,11 @@ use crate::hf::HubParams;
 /// the cache's snapshot directory: it never downloads anything itself.
 /// `model_type` is the type of model, if needed to be explicit. Often this can
 ///    be inferred from the `.model_type` key in a HF's `config.json`, or from the GGUF metadata.
-/// `gguf_files` are the GGUF files within the huggingface model repo to load the model from,
-///    in the order the model lists them: every shard, and any MTP draft head. A registered
-///    engine that serves them gets them all; mistral.rs loads the first.
+/// `files` are the model's `files`, as the Spicepod lists them: GGUF files within the repo,
+///    or a quantization by name (`UD-Q4_K_XL`), resolved against the repo
+///    ([`gguf_files::resolve`]); with none, a GGUF repo's largest quantization that fits the
+///    memory the engine reports. A registered engine that serves the GGUF files gets them all,
+///    every shard and any draft head; mistral.rs loads the first.
 /// `hub` is the model's `hf_token` and `hf_endpoint`.
 /// `distributed` optionally runs the model tensor-parallel across multiple nodes.
 /// `reasoning` names the model and its `reasoning_effort` default for the load-time check.
@@ -370,35 +376,66 @@ use crate::hf::HubParams;
 pub async fn create_hf_model(
     model_id: &str,
     model_type: Option<&str>,
-    gguf_files: &[PathBuf],
+    files: &[&str],
     hub: HubParams<'_>,
     chat_template_literal: Option<&str>,
     distributed: Option<DistributedConfig>,
     reasoning: ReasoningDefault<'_>,
 ) -> Result<Arc<dyn Chat>> {
-    let gguf = gguf_files
-        .iter()
-        .map(|file| {
-            file.to_str().ok_or_else(|| Error::FailedToLoadModel {
-                source: format!("the GGUF path '{}' is not valid UTF-8", file.display()).into(),
-            })
-        })
-        .collect::<Result<Vec<&str>>>()?;
-    let dir = hf_files::download_model(model_id, &gguf, hub, reasoning.model_name)
-        .await
-        .map_err(|error| Error::FailedToDownloadModel {
-            configuration: error.is_configuration_error(),
-            source: Box::new(error),
-        })?;
-    if distributed.is_none()
-        && let Some(engine) = engine::engine_for(gguf_files)
+    let download_error = |error: huggingface_hub::DownloadError| Error::FailedToDownloadModel {
+        configuration: error.is_configuration_error(),
+        source: Box::new(error),
+    };
+    // Every node of a split model resolves the files itself, and each would choose by its own
+    // memory, so a split model takes only a repository's one quantization: every node must name
+    // the same files.
+    let budget = if distributed.is_some() {
+        hf_files::Budget::Split
+    } else {
+        engine::free_memory().map_or(hf_files::Budget::Unmeasured, hf_files::Budget::Free)
+    };
+    // A rank other than 0 of a model an engine splits across nodes never reads the weights (the
+    // head sends each rank its share), so it doesn't download them. It resolves the files from
+    // the Hub's listing and reads the first shard's header instead, to decide as the head does.
+    if let Some(cfg) = distributed.as_ref()
+        && cfg.node_rank > 0
     {
-        let weights: Vec<PathBuf> = gguf_files.iter().map(|file| dir.join(file)).collect();
+        let resolved =
+            hf_files::model_architecture(model_id, files, budget, hub, reasoning.model_name)
+                .await
+                .map_err(download_error)?;
+        let gguf_files: Vec<PathBuf> = resolved.gguf.iter().map(PathBuf::from).collect();
+        if let Some(engine) = engine::engine_for(&gguf_files)
+            && engine.distributed.is_some()
+            && engine.splits(resolved.architecture.as_deref())
+        {
+            ensure_distributed_build()?;
+            let options = LocalModelOptions {
+                reasoning,
+                distributed: Some(cfg),
+                ..LocalModelOptions::default()
+            };
+            return (engine.load)(&gguf_files, options).await;
+        }
+    }
+    let hf_files::Downloaded { dir, gguf } =
+        hf_files::download_model(model_id, files, budget, hub, reasoning.model_name)
+            .await
+            .map_err(download_error)?;
+    let gguf_files: Vec<PathBuf> = gguf.iter().map(PathBuf::from).collect();
+    let weights: Vec<PathBuf> = gguf_files.iter().map(|file| dir.join(file)).collect();
+    if let Some(engine) = engine::engine_for(&gguf_files)
+        && (distributed.is_none() || engine.splits_weights(&weights).await)
+    {
+        if distributed.is_some() {
+            ensure_distributed_build()?;
+        }
         let template_file = hf_files::chat_template_file(&dir).await;
         let options = LocalModelOptions {
             chat_template_literal,
             chat_template_file: template_file.as_deref(),
             reasoning,
+            distributed: distributed.as_ref(),
             ..LocalModelOptions::default()
         };
         return (engine.load)(&weights, options).await;
@@ -419,7 +456,7 @@ pub async fn create_hf_model(
     mistral::MistralLlama::from_snapshot(
         &dir,
         model_type,
-        gguf.first().copied(),
+        gguf.first().map(String::as_str),
         chat_template_literal,
         ring_config,
         reasoning,
@@ -447,6 +484,9 @@ pub struct LocalModelOptions<'a> {
     pub paged_attention: PagedAttentionMode,
     /// The model's name and `reasoning_effort` default, checked against its chat template.
     pub reasoning: ReasoningDefault<'a>,
+    /// The nodes the model is split across, for an engine that serves distributed models
+    /// ([`engine::LocalChatEngine::distributed`]); mistral.rs reads its ring from the environment.
+    pub distributed: Option<&'a DistributedConfig>,
 }
 
 /// A local model's Spicepod name and its `reasoning_effort` default. The loader checks the
@@ -469,17 +509,28 @@ pub async fn create_local_model(
     distributed: Option<DistributedConfig>,
     options: LocalModelOptions<'_>,
 ) -> Result<Arc<dyn Chat>> {
-    // A single-node model goes to a registered engine that serves its weights; a ring model
-    // stays on mistral.rs, whose tensor-parallel backend no other engine has a counterpart for.
-    if distributed.is_none() {
-        let weights = model_weights.iter().map(PathBuf::from).collect::<Vec<_>>();
-        if let Some(engine) = engine::engine_for(&weights) {
-            let options = LocalModelOptions {
-                chat_template_file: tokenizer_config.map(Path::new),
-                ..options
-            };
-            return (engine.load)(&weights, options).await;
+    // A model goes to a registered engine that serves its weights; a distributed one only when
+    // that engine splits models of its architecture, and to mistral.rs's ring otherwise.
+    let weights = model_weights.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let engine = match engine::engine_for(&weights) {
+        Some(engine) => Some(engine),
+        None if distributed.as_ref().is_some_and(|cfg| cfg.node_rank > 0) => {
+            engine::engine_without_weights(&weights).await
         }
+        None => None,
+    };
+    if let Some(engine) = engine
+        && (distributed.is_none() || engine.splits_weights(&weights).await)
+    {
+        if distributed.is_some() {
+            ensure_distributed_build()?;
+        }
+        let options = LocalModelOptions {
+            chat_template_file: tokenizer_config.map(Path::new),
+            distributed: distributed.as_ref(),
+            ..options
+        };
+        return (engine.load)(&weights, options).await;
     }
     // Configure multi-node distributed (ring) inference before loading: the
     // loader reads `RING_CONFIG` from the environment while building the

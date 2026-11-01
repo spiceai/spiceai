@@ -533,8 +533,6 @@ async fn test_cayenne_catalog_persistence_impl(
 
     let connection_string = match fixture.backend_type {
         common::BackendType::Sqlite => format!("sqlite://{}", db_path.to_string_lossy()),
-        #[cfg(feature = "turso")]
-        common::BackendType::Turso => format!("libsql://{}", db_path.to_string_lossy()),
     };
 
     // Create catalog and initialize

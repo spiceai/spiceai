@@ -2,7 +2,7 @@ name: postgres-cdc-parity
 description: >
   Postgres CDC converges to the source after inserts, updates, deletes, key
   changes and large transactions, across a clean restart and a kill: Cayenne
-  under every metastore and deletion mode, with file CDC durability, and
+  under each deletion mode, with file CDC durability, and
   partitioned on its key, and DuckDB.
 
 sources:
@@ -45,10 +45,6 @@ variants:
   # The same flush cadence on SQLite, so the comparison isolates the metastore.
   sqlite-key-flush:
     datasets: { '*': { acceleration: { params: { cayenne_metastore: sqlite, cayenne_deletion_mode: key, cayenne_cdc_mem_tier_min_flush_bytes: '0' } } } }
-  turso-key:
-    datasets: { '*': { acceleration: { params: { cayenne_metastore: turso, cayenne_deletion_mode: key } } } }
-  turso-position:
-    datasets: { '*': { acceleration: { params: { cayenne_metastore: turso, cayenne_deletion_mode: position } } } }
   # CDC batches written to files before the source is acknowledged, instead
   # of the default in-memory tier.
   file-durability:

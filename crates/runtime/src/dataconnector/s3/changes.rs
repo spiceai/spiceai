@@ -633,8 +633,8 @@ impl S3ChangesConfig {
 /// `file_format`, then `file_extension` (`parse_file_extension_param`), then
 /// the `from` path (`detect_file_extension_from_url_or_path`). A prefix
 /// dataset with `file_extension: .parquet` and no `file_format` is therefore
-/// accepted here, matching `get_file_format_and_extension`. ORC (and Vortex
-/// on non-Windows) are listing formats, so they are accepted here too.
+/// accepted here, matching `get_file_format_and_extension`. ORC and Vortex
+/// are listing formats, so they are accepted here too.
 fn ensure_structured_file_format(params: &Parameters, dataset: &DatasetSpec) -> Result<()> {
     let file_format = params
         .get("file_format")
@@ -674,21 +674,11 @@ fn ensure_structured_file_format(params: &Parameters, dataset: &DatasetSpec) -> 
 }
 
 /// Formats `get_file_format_and_extension` turns into a listing `FileFormat`.
-/// Vortex is not linked on Windows; keep the allowlist in lockstep.
 fn is_structured_listing_format(name: &str) -> bool {
     matches!(
         name,
-        "parquet" | "csv" | "json" | "tsv" | "jsonl" | "ndjson" | "ldjson" | "orc"
-    ) || {
-        #[cfg(not(windows))]
-        {
-            name == "vortex"
-        }
-        #[cfg(windows)]
-        {
-            false
-        }
-    }
+        "parquet" | "csv" | "json" | "tsv" | "jsonl" | "ndjson" | "ldjson" | "orc" | "vortex"
+    )
 }
 
 fn parse_backfill_interval(params: &Parameters, dataset_name: &str) -> Result<Duration> {
@@ -2369,7 +2359,6 @@ mod tests {
             .expect("changes enabled");
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn validate_accepts_vortex_file_format() {
         let params = test_params(vec![
@@ -2379,11 +2368,10 @@ mod tests {
         ])
         .await;
         S3ChangesConfig::try_from_params(&params, &events_dataset())
-            .expect("vortex is a listing FileFormat on non-Windows")
+            .expect("vortex is a listing FileFormat")
             .expect("changes enabled");
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn validate_accepts_vortex_file_extension_without_file_format() {
         let params = test_params(vec![
@@ -2407,10 +2395,9 @@ mod tests {
                 "{name} is a listing FileFormat and must pass changes validation"
             );
         }
-        #[cfg(not(windows))]
         assert!(
             is_structured_listing_format("vortex"),
-            "vortex is a listing FileFormat on non-Windows"
+            "vortex is a listing FileFormat"
         );
         assert!(
             !is_structured_listing_format("txt"),

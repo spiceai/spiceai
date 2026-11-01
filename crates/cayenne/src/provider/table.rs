@@ -38660,8 +38660,8 @@ impl CayenneTableProvider {
         // is provably below every memtable-pressure threshold. The pre-fix
         // implementation issued a `get_inlined_data_stats` SQL query on
         // every inline-write commit just to read three integer counters
-        // that we already maintain in-process. On network catalogs (Turso,
-        // PostgreSQL metastore) each round trip costs 10-50 ms — orders of
+        // that we already maintain in-process. On a metastore reached over
+        // the network each round trip costs 10-50 ms — orders of
         // magnitude more than the rest of the per-row write — and
         // dominated throughput on small-batch CDC ingestion. This is the
         // same shape of fast path the parallel agents added for
@@ -49918,7 +49918,6 @@ mod tests {
             std::fs::create_dir_all(&metadata_dir).map_err(DataFusionError::IoError)?;
 
             let connection_string = match metastore_type {
-                "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
                 "sqlite" => format!("sqlite://{metadata_dir}/cayenne.db"),
                 _ => {
                     return Err(DataFusionError::Execution(format!(

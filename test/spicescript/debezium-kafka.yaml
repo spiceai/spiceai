@@ -81,7 +81,7 @@ steps:
         DEBEZIUM_FORMAT_KEY=json
         QUARKUS_HTTP_PORT=${instance.port}
         QUARKUS_LOG_FILE_ENABLE=false
-        nohup /debezium/run.sh > /tmp/${sources.src.namespace}/debezium.log 2>&1 < /dev/null &
+        nohup /debezium/run.sh > /proc/1/fd/1 2>&1 < /dev/null &
   - source-query: { kafka: "for i in $(seq 1 60); do rpk topic list | grep -q '${sources.src.namespace}.public.t' && break; sleep 1; done; rpk topic list | grep -c '${sources.src.namespace}.public.t'" }
     expect: { rows: [['1']] }
   - start: {}

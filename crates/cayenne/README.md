@@ -1,12 +1,12 @@
 # Cayenne
 
-A lakehouse format for the Vortex columnar file format. Combines pluggable metastore backends (SQLite, Turso) for transactional metadata with Vortex files for columnar data, plus an LSM-style level-0 inline-data tier that absorbs small writes without writing data files.
+A lakehouse format for the Vortex columnar file format. Combines an embedded SQLite metastore for transactional metadata with Vortex files for columnar data, plus an LSM-style level-0 inline-data tier that absorbs small writes without writing data files.
 
 ## Overview
 
 Cayenne provides a lakehouse format that enables efficient CRUD operations on columnar data:
 
-- **Pluggable metastore backends** (`metastore::sqlite::SqliteMetastore`, optional `metastore::turso::TursoMetastore`) for transactional metadata with `BEGIN ... COMMIT` semantics, each managing a per-instance connection pool to lift the cross-table write/read concurrency ceiling.
+- **An embedded metastore** (`metastore::sqlite::SqliteMetastore`, behind the `MetastoreBackend` trait) for transactional metadata with `BEGIN ... COMMIT` semantics, each managing a per-instance connection pool to lift the cross-table write/read concurrency ceiling.
 - **Vortex data files** as the persistent columnar tier, with configurable target file size, compression, and concurrent upload fan-out.
 - **Inline-data memtable** (`cayenne_inlined_data` / `cayenne_inlined_delete` tables) absorbs small bursts directly in the metastore as Arrow IPC blobs, flushed to Vortex once accumulated rows / segments / bytes exceed configurable thresholds.
 - **Deletion vectors** stored as Arrow IPC files for position-based deletion, plus a bloom-prefiltered in-memory PK index (`DeletionIndex` for Int64 PKs / `KeyDeletionIndex` for composite or non-integer PKs) for key-based deletion. Each index entry *fuses* the highest delete sequence and the highest upsert re-insertion sequence into one `TombstoneEntry`, so the scan hot path answers "deleted, and re-inserted after that?" in a single probe. Sequence-numbered for Iceberg-style upsert semantics.
@@ -25,7 +25,7 @@ Cayenne provides a lakehouse format that enables efficient CRUD operations on co
 
 Cayenne runs in one of two storage modes, selected by the acceleration `mode:` field:
 
-- **`mode: file`** (durable): metadata in a local `SQLite`/Turso metastore, immutable data in Vortex data files (local FS or S3 Express One Zone), an LSM level-0 inline tier, and background compaction. Survives restarts. This is Cayenne's original behavior.
+- **`mode: file`** (durable): metadata in a local `SQLite` metastore, immutable data in Vortex data files (local FS or S3 Express One Zone), an LSM level-0 inline tier, and background compaction. Survives restarts. This is Cayenne's original behavior.
 - **`mode: memory`** (fully in-RAM, ephemeral): all data lives in the RAM mem-tier, backed by an in-memory `memdb` `SQLite` metastore — **nothing is written to disk**. Checkpointing, sealing, compaction, and the cold tier are disabled. The dataset is ephemeral and reloads from its source on restart (like the in-memory Arrow accelerator); because there is no durable checkpoint, a CDC (`changes`) source's replication slot is committed immediately after each in-RAM write (not deferred), so source-side retention is not pinned. It works for all refresh modes (`full`/`append`/`changes`) and for both keyed and no-PK datasets, and a full refresh atomically replaces the in-RAM tier. **Partitioning is not supported** — if `partition_by` is set the accelerator returns a configuration error (use `mode: file` for a partitioned table). Since nothing spills to disk, a per-table hard RAM bound (`cayenne_cdc_mem_tier_max_bytes`; default unbounded) returns a structured error on breach rather than growing without limit.
 
 ## Architecture
@@ -35,7 +35,7 @@ Cayenne runs in one of two storage modes, selected by the acceleration `mode:` f
 │  CayenneTableProvider                                        │
 │                                                              │
 │  ┌───────────────────────────────────────────────────────┐   │
-│  │  Metastore (SqliteMetastore or TursoMetastore)        │   │
+│  │  Metastore (SqliteMetastore)                          │   │
 │  │                                                       │   │
 │  │   cayenne_table            cayenne_partition          │   │
 │  │   cayenne_delete_file      cayenne_insert_record      │   │
@@ -45,7 +45,7 @@ Cayenne runs in one of two storage modes, selected by the acceleration `mode:` f
 │  │   cayenne_inlined_delete   ← LSM level-0 tombstones   │   │
 │  │                                                       │   │
 │  │   Pool of K independent connections                   │   │
-│  │     (SQLite K = min(parallelism, 32), Turso K = 16)   │   │
+│  │     (K = min(parallelism, 32))                        │   │
 │  └───────────────────────────────────────────────────────┘   │
 │                                                              │
 │  ┌───────────────────────────────────────────────────────┐   │
@@ -91,7 +91,7 @@ Cayenne runs in one of two storage modes, selected by the acceleration `mode:` f
 
 This section walks through Cayenne end-to-end — the lifecycle of a write, the lifecycle of a read, and the background maintenance that keeps both fast — to show how the components in *Key Components* fit together. Everything rests on three cooperating tiers:
 
-- a **transactional metastore** (SQLite or Turso) that holds all metadata — the table row, the current-snapshot pointer, per-snapshot file manifests, deletion-file and insert-record references, sequence numbers, statistics, and the inline memtable — and gives Cayenne atomic multi-row commits;
+- a **transactional metastore** (SQLite) that holds all metadata — the table row, the current-snapshot pointer, per-snapshot file manifests, deletion-file and insert-record references, sequence numbers, statistics, and the inline memtable — and gives Cayenne atomic multi-row commits;
 - **Vortex data files**, immutable once written, grouped under per-snapshot directories on local disk or S3 Express One Zone;
 - an **LSM-style level-0 tier** — the metastore-resident *inline memtable* and, for the CDC profile, the *in-RAM mem-tier* — that absorbs small writes without producing a data file per batch.
 
@@ -172,9 +172,9 @@ pub trait MetastoreTransaction: Send + Sync {
 }
 ```
 
-Backends translate the `MetastoreValue` enum (`Integer | Text | Bool | Blob | Null`) to and from native column types. The starting BEGIN statement is sent by the backend itself: `BEGIN IMMEDIATE` for SQLite (takes the reserved write lock up front so a subsequent `UPDATE`/`INSERT` cannot upgrade-deadlock against a concurrent writer), and `BEGIN CONCURRENT` for Turso (MVCC writers proceed optimistically and conflict on the statement that writes a row another transaction has changed, or on `COMMIT`).
+Backends translate the `MetastoreValue` enum (`Integer | Text | Bool | Blob | Null`) to and from native column types. The starting BEGIN statement is sent by the backend itself: `BEGIN IMMEDIATE`, which takes the reserved write lock up front so a subsequent `UPDATE`/`INSERT` cannot upgrade-deadlock against a concurrent writer.
 
-**Schema validation.** `metastore::EXPECTED_TABLES` is the canonical list of expected metadata tables and their ordered column names; `validate_existing_schema` is invoked after `init_schema` and returns `CatalogError::SchemaMismatch` (with an actionable "clear your acceleration data" message) when the on-disk schema does not match. Types and constraints are not compared — SQLite/libSQL type affinity makes exact type matching unreliable — but column names and ordering are.
+**Schema validation.** `metastore::EXPECTED_TABLES` is the canonical list of expected metadata tables and their ordered column names; `validate_existing_schema` is invoked after `init_schema` and returns `CatalogError::SchemaMismatch` (with an actionable "clear your acceleration data" message) when the on-disk schema does not match. Types and constraints are not compared — SQLite type affinity makes exact type matching unreliable — but column names and ordering are.
 
 **Implementations:**
 
@@ -182,11 +182,10 @@ Backends translate the `MetastoreValue` enum (`Integer | Text | Bool | Blob | Nu
 
   A round-robin connection **pool** of K independent connections is created lazily on first use (`K = min(cpu_budget().cores(), 32)`, with a floor of 2). Pool acquisition tries each slot starting at the round-robin index and returns the first one with a free `tokio::sync::Mutex`, falling back to an awaited lock on the starting slot. SQLite WAL mode allows concurrent readers and serializes writers at the engine level; the pool primarily lifts read-side concurrency for metadata-heavy workloads where every scan pays multiple metastore reads. `begin_transaction` holds an `OwnedMutexGuard` on one pool slot for the full transaction lifetime.
 
-- **`TursoMetastore`** (`metastore/turso.rs`): optional, gated on the `turso` feature. libSQL/Turso backend with a fixed `K = 16` pool. Uses `BEGIN CONCURRENT` for MVCC-backed concurrent writers; the journal mode is set to the libSQL MVCC literal at connection open. Same 30-second `busy_timeout`.
 
 ### 2. Metadata catalog (`catalog.rs`, `cayenne_catalog.rs`)
 
-`MetadataCatalog` is the higher-level interface that the table provider uses; `CayenneCatalog` is the concrete implementation backed by any `MetastoreBackend`. `is_retryable_write_conflict` is re-exported at the crate root so callers can implement bounded retries against transient `SQLITE_BUSY` / Turso `BEGIN CONCURRENT` conflicts. Selected methods (full signature in `catalog.rs`):
+`MetadataCatalog` is the higher-level interface that the table provider uses; `CayenneCatalog` is the concrete implementation backed by any `MetastoreBackend`. `is_retryable_write_conflict` is re-exported at the crate root so callers can implement bounded retries against transient `SQLITE_BUSY` / `SQLITE_LOCKED` conflicts. Selected methods (full signature in `catalog.rs`):
 
 ```rust
 #[async_trait]
@@ -568,7 +567,7 @@ The Cayenne accelerator (`crates/accelerators/accelerator-cayenne/src/lib.rs`) r
 | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
 | `cayenne_file_path`                              | Data file path. Local path or S3 Express One Zone (`s3://{bucket}--{zone-id}--x-s3/...`). Standard S3 buckets are rejected. | `{spice_data}/{dataset}/`                                                 |
 | `cayenne_metadata_dir`                           | SQLite metadata directory.                                                                                                  | `{spice_data}/metadata` or `{cayenne_file_path}/metadata` for local paths |
-| `cayenne_metastore`                              | `sqlite` (default) or `turso` (requires `turso` build feature).                                                             | `sqlite`                                                                  |
+| `cayenne_metastore`                              | `sqlite`, the only supported value. `turso` is no longer supported and has no effect: the dataset loads on `sqlite` and logs a warning. | `sqlite`                                                                  |
 | `cayenne_unsupported_type_action`                | `error` (default), `string`, `warn`, `ignore`.                                                                              | `error`                                                                   |
 | `cayenne_segment_cache_mb`                       | Vortex segment cache in MB.                                                                                                 | `256`                                                                     |
 | `cayenne_pk_keyset_cache_mb`                     | Resident PK-keyset cache cap per table (drives the exact-keyset vs. bloom-fallback deletion path). Accounted against `runtime.query.memory_limit`. | memory-derived (~1/32 of total, clamped `[256, 8192]`)      |
@@ -657,7 +656,7 @@ Cayenne shares some shape with the [DuckLake v1.0 specification](https://ducklak
 
 ### Shared concepts
 
-- Transactional catalog database (Cayenne supports SQLite or Turso; DuckLake also allows DuckDB, Postgres, MySQL).
+- Transactional catalog database (Cayenne uses SQLite; DuckLake also allows DuckDB, Postgres, MySQL).
 - Sequence-numbered snapshots for visibility ordering.
 - Per-table partition metadata and per-snapshot data layout.
 - Delete-file references decoupled from data files (so deletes don't rewrite data).
@@ -699,11 +698,11 @@ Cayenne shares some shape with the [DuckLake v1.0 specification](https://ducklak
 - Snapshot expiration and time-travel queries
 - Full MVCC
 
-If interoperability with a DuckLake catalog reader is a requirement, Cayenne is not the right tool. If a Vortex-native, CDC-friendly accelerator backed by SQLite or Turso fits the workload, Cayenne is purpose-built for that.
+If interoperability with a DuckLake catalog reader is a requirement, Cayenne is not the right tool. If a Vortex-native, CDC-friendly accelerator backed by SQLite fits the workload, Cayenne is purpose-built for that.
 
 ## Database schema
 
-The metastore (SQLite or Turso) materializes these tables. DDL lives in `crates/cayenne/src/metastore/sqlite.rs` (and is mirrored verbatim by Turso). Expected column lists are exported as `metastore::EXPECTED_TABLES` and checked by `validate_existing_schema` at startup.
+The SQLite metastore materializes these tables. DDL lives in `crates/cayenne/src/metastore/sqlite.rs`. Expected column lists are exported as `metastore::EXPECTED_TABLES` and checked by `validate_existing_schema` at startup.
 
 ```sql
 CREATE TABLE IF NOT EXISTS cayenne_table (
@@ -844,7 +843,7 @@ df.show().await?;
 
 ### Current status
 
-- Pluggable metastore (SQLite default; Turso optional) with per-instance connection pool
+- Embedded SQLite metastore with per-instance connection pool
 - Position- and key-based deletion vectors (`PositionBased`, `Int64Pk`, `RowConverterBased` strategies)
 - Primary keys, upsert on-conflict, retention policies (time- and SQL-based)
 - Sequence-based ordering with protected snapshots
@@ -930,12 +929,12 @@ Cayenne provides Iceberg-style **sequence-number snapshot isolation**: each writ
 ## Benefits
 
 1. **Efficient deletes**: deletion vectors stored as Arrow IPC files; no data-file rewrites.
-2. **ACID metadata**: SQLite (or Turso) provides transaction guarantees for catalog operations.
+2. **ACID metadata**: SQLite provides transaction guarantees for catalog operations.
 3. **Performance**: Vortex columnar format with configurable compression and caches; inline memtable absorbs small writes without writing data files.
 4. **Crash safety**: staging WAL with tmp+fsync+rename ensures atomic visibility; partitioned WAL anchors cross-partition commits; self-healing recovery on the next open.
 5. **Object store support**: native S3 Express One Zone integration, with optional multi-zone atomic replication.
 6. **CDC-friendly**: Stage A / Stage B pipelining, debounced maintenance, and optional blind-append mode for append-only ingestion.
-7. **Flexibility**: trait-based metastore lets the same catalog logic run against SQLite or Turso.
+7. **Flexibility**: the catalog logic runs against the `MetastoreBackend` trait rather than SQLite directly.
 8. **HTAP-aware**: optimizer rules surface predicate transitive closure, dynamic-filter sharing, and spillable sort-merge joins automatically for Cayenne-backed scans.
 9. **Portable snapshots**: per-dataset metastore slices are anchor-relocatable JSON, so snapshots travel cleanly across nodes with different layouts.
 
@@ -1025,9 +1024,6 @@ Cayenne synthesizes several established database/storage techniques. The list be
 - **SQLite WAL mode** for the metastore. Allows concurrent readers and a single writer at the engine level; combined with Cayenne's connection pool this lifts the read-side concurrency ceiling.
   - SQLite WAL documentation: <https://www.sqlite.org/wal.html>
 
-- **libSQL `BEGIN CONCURRENT`** (MVCC writers) on Turso. Lets multiple writers run in parallel and conflict on the statement that writes a row another transaction has changed, or on `COMMIT`, rather than at `BEGIN` time.
-  - Turso `BEGIN CONCURRENT`: <https://github.com/tursodatabase/libsql/blob/main/docs/BEGIN_CONCURRENT.md>
-
 - **UUIDv7** for `table_id`, `delete_file_id`, snapshot ids, and other catalog IDs. Time-ordered UUIDs keep newly-created rows clustered in B-tree-ordered SQLite primary indexes, reducing page splits on insert-heavy workloads.
   - [RFC 9562 — UUIDv7](https://www.rfc-editor.org/rfc/rfc9562)
 
@@ -1055,7 +1051,6 @@ Cayenne synthesizes several established database/storage techniques. The list be
 - [Apache Arrow](https://arrow.apache.org/)
 - [Apache DataFusion](https://datafusion.apache.org/)
 - [SQLite WAL](https://www.sqlite.org/wal.html)
-- [libSQL / Turso](https://github.com/tursodatabase/libsql)
 - [RoaringBitmap format specification](https://github.com/RoaringBitmap/RoaringFormatSpec)
 - [RFC 9562 — UUIDv7](https://www.rfc-editor.org/rfc/rfc9562)
 - [AWS S3 Express One Zone](https://aws.amazon.com/s3/storage-classes/express-one-zone/)

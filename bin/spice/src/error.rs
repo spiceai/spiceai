@@ -129,6 +129,19 @@ pub enum Error {
     #[snafu(display("The Spice runtime is unavailable at {endpoint}. Is it running?"))]
     RuntimeUnavailable { endpoint: String },
 
+    /// The runtime answered, but its TLS certificate was not trusted. `remedy` is the step
+    /// that fixes this particular failure: the CA flag only for an unknown issuer.
+    #[snafu(display("TLS certificate verification failed for {endpoint}: {reason}. {remedy}"))]
+    TlsVerificationFailed {
+        endpoint: String,
+        reason: String,
+        remedy: &'static str,
+    },
+
+    /// The `--tls-root-certificate-file` could not be read or holds no certificate
+    #[snafu(display("Could not load the TLS root certificate file '{path}': {message}"))]
+    TlsRootCertificate { path: String, message: String },
+
     /// Unauthorized access to the runtime API (401 — credentials missing/invalid)
     #[snafu(display(
         "unauthorized: invalid or missing Spice API key. Run `spice login` or set SPICE_API_KEY."
@@ -302,6 +315,136 @@ pub enum Error {
     /// Atomic Cloud Connect project creation/attachment failed.
     #[snafu(display("{message}"))]
     CloudConnectProject { message: String },
+
+    #[snafu(display(
+        "Failed to start {agent}: it is not installed (no `{binary}` on PATH). {instructions} Then rerun `spice {command}`. See: {docs}"
+    ))]
+    CodingAgentNotInstalled {
+        agent: &'static str,
+        binary: String,
+        instructions: &'static str,
+        command: &'static str,
+        docs: &'static str,
+    },
+
+    #[snafu(display("Failed to start {agent} with the Spice runtime: {explanation}"))]
+    CodingAgentUnsupportedBuild {
+        agent: &'static str,
+        explanation: &'static str,
+    },
+
+    #[snafu(display(
+        "`spice {command}` runs a coding agent against a Spice runtime on this machine, and --cloud is not supported. Remove --cloud to use the runtime at --http-endpoint, or the one started for the Spicepod in this directory."
+    ))]
+    CodingAgentCloudUnsupported { command: &'static str },
+
+    #[snafu(display("Failed to start {agent} ('{}'): {source}", program.display()))]
+    CodingAgentLaunch {
+        agent: String,
+        program: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to prepare {agent}: `{command}` exited with {status}: {detail}."))]
+    CodingAgentPrepare {
+        agent: String,
+        command: String,
+        status: String,
+        detail: String,
+    },
+
+    #[snafu(display(
+        "Failed to start {agent}: '{}' sets `{key}` to '{value}', which {agent} applies over the endpoint spice gives it, so its requests and the runtime key would go there instead of to Spice. Remove `{key}` from that file to run {agent} on Spice. See: https://spiceai.org/docs/cli",
+        file.display()
+    ))]
+    CodingAgentConfigConflict {
+        agent: &'static str,
+        file: PathBuf,
+        key: String,
+        value: String,
+    },
+
+    #[snafu(display("Failed to write '{}' for the coding agent: {source}", path.display()))]
+    CodingAgentFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display(
+        "Failed to start the Spice runtime at {endpoint}, so the coding agent was not started: {detail}. The full log is at '{}'. See: https://spiceai.org/docs/cli",
+        log.display()
+    ))]
+    CodingAgentRuntimeStart {
+        endpoint: String,
+        log: PathBuf,
+        detail: String,
+    },
+
+    #[snafu(display(
+        "Failed to start the Spice runtime for {agent}: there is no spicepod.yaml in '{}', and no Spice runtime answers at {endpoint}. Run `spice {command}` in your Spicepod's directory, start a runtime there with `spice run`, or create a Spicepod here with `spice init` and add a model with `spice model add my-model --from openai:gpt-4o-mini`. See: https://spiceai.org/docs/cli",
+        dir.display()
+    ))]
+    CodingAgentNoSpicepod {
+        agent: &'static str,
+        command: &'static str,
+        dir: PathBuf,
+        endpoint: String,
+    },
+
+    #[snafu(display(
+        "Failed to start {agent}: the Spice runtime at {endpoint} serves the Spicepod '{served}', not '{local}' in this directory. Stop that runtime, or start one for this Spicepod on another port with `spice --http-endpoint {} {command}`. To use the running one anyway, pass `--http-endpoint {endpoint}`. See: https://spiceai.org/docs/cli",
+        next_port(endpoint)
+    ))]
+    CodingAgentOtherSpicepod {
+        agent: &'static str,
+        command: &'static str,
+        endpoint: String,
+        served: String,
+        local: String,
+    },
+
+    #[snafu(display(
+        "Failed to use the Spice runtime at {endpoint}, so the coding agent was not started: another `spice` session is using the runtime it started at {started_at}, which does not answer at {endpoint}. Rerun with `--http-endpoint {started_at}`, or use another port. See: https://spiceai.org/docs/cli"
+    ))]
+    CodingAgentRuntimeElsewhere {
+        endpoint: String,
+        started_at: String,
+    },
+
+    #[snafu(display(
+        "Failed to coordinate the Spice runtime with other `spice` sessions through '{}': {source}",
+        path.display()
+    ))]
+    CodingAgentRuntimeLock {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to record the Spice runtime in '{}': {source}", path.display()))]
+    CodingAgentRuntimeState {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display(
+        "Failed to start the coding agent: the Spice runtime has no model '{model}'. Available models: {available}. Pass one of them with --model, or add the model to the Spicepod the runtime serves. See: https://spiceai.org/docs/components/models"
+    ))]
+    CodingAgentModelNotFound { model: String, available: String },
+
+    #[snafu(display(
+        "Failed to load model '{model}', so the coding agent has no model to use. Cause: {message}. Check the model's configuration in spicepod.yaml and the runtime log. See: https://spiceai.org/docs/components/models"
+    ))]
+    CodingAgentModelFailed { model: String, message: String },
+
+    #[snafu(display(
+        "The Spice runtime serves no models, so the coding agent has nothing to use. Add one to spicepod.yaml, for example `spice model add llm --from openai:gpt-4o-mini`, and rerun. See: https://spiceai.org/docs/components/models"
+    ))]
+    CodingAgentNoModels,
+
+    #[snafu(display(
+        "Failed to start the coding agent: the Spice runtime did not finish loading {models} within {minutes} minutes. Check the runtime log, then rerun."
+    ))]
+    CodingAgentModelTimeout { models: String, minutes: u64 },
 }
 
 impl Error {
@@ -390,10 +533,99 @@ impl Error {
             // behavior on the generic failure code because that variant is
             // also used for operational validation failures throughout the
             // existing command surface.
-            Self::InvalidUsage { .. } | Self::ServiceNotInstalled { .. } => Self::USAGE_EXIT_CODE,
+            Self::InvalidUsage { .. }
+            | Self::ServiceNotInstalled { .. }
+            | Self::CodingAgentCloudUnsupported { .. } => Self::USAGE_EXIT_CODE,
             Self::Interrupted => Self::INTERRUPTED_EXIT_CODE,
             _ => Self::FAILURE_EXIT_CODE,
         }
+    }
+}
+
+/// The error for a runtime request that got no HTTP response.
+///
+/// A request that fails because the runtime's certificate is not trusted is reported as a
+/// certificate failure, with the flag that fixes it: the runtime is up and answering, so
+/// "Is it running?" would send the user looking in the wrong place. Anything else is
+/// reported as the runtime being unavailable at `endpoint`.
+#[must_use]
+pub fn runtime_unreachable(endpoint: &str, err: &Error) -> Error {
+    if let Error::ConnectionFailed { source, .. } = err
+        && let Some(cert_error) = invalid_certificate(source)
+    {
+        return TlsVerificationFailedSnafu {
+            endpoint: endpoint.to_string(),
+            reason: describe_certificate_error(cert_error),
+            remedy: certificate_error_remedy(cert_error),
+        }
+        .build();
+    }
+
+    RuntimeUnavailableSnafu {
+        endpoint: endpoint.to_string(),
+    }
+    .build()
+}
+
+/// The certificate error a failed request carries, if the TLS handshake rejected the
+/// server's certificate.
+///
+/// The rustls error sits inside an `io::Error` whose `source()` skips the wrapped error
+/// itself, so each `io::Error` in the chain is opened with `get_ref` as well.
+fn invalid_certificate(err: &reqwest::Error) -> Option<&rustls::CertificateError> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(link) = current {
+        if let Some(rustls::Error::InvalidCertificate(cert_error)) =
+            link.downcast_ref::<rustls::Error>()
+        {
+            return Some(cert_error);
+        }
+        current = link
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .map(|inner| inner as &(dyn std::error::Error + 'static))
+            .or_else(|| link.source());
+    }
+    None
+}
+
+fn describe_certificate_error(err: &rustls::CertificateError) -> String {
+    match err {
+        rustls::CertificateError::UnknownIssuer => "unknown issuer".to_string(),
+        rustls::CertificateError::Expired | rustls::CertificateError::ExpiredContext { .. } => {
+            "certificate expired".to_string()
+        }
+        rustls::CertificateError::NotValidYet
+        | rustls::CertificateError::NotValidYetContext { .. } => {
+            "certificate is not valid yet".to_string()
+        }
+        rustls::CertificateError::NotValidForName
+        | rustls::CertificateError::NotValidForNameContext { .. } => {
+            "certificate is not valid for this host".to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+/// What to do about a rejected certificate. `--tls-root-certificate-file` only helps when the
+/// issuer is unknown; for a certificate that is expired or issued for another name, passing a
+/// CA changes nothing, so the user is pointed at the endpoint and the certificate instead.
+fn certificate_error_remedy(err: &rustls::CertificateError) -> &'static str {
+    match err {
+        rustls::CertificateError::UnknownIssuer => {
+            "Pass --tls-root-certificate-file with the CA certificate that issued the runtime's certificate."
+        }
+        rustls::CertificateError::Expired
+        | rustls::CertificateError::ExpiredContext { .. }
+        | rustls::CertificateError::NotValidYet
+        | rustls::CertificateError::NotValidYetContext { .. } => {
+            "Check the validity dates of the runtime's certificate and the local clock."
+        }
+        rustls::CertificateError::NotValidForName
+        | rustls::CertificateError::NotValidForNameContext { .. } => {
+            "Connect with a host name the runtime's certificate covers (--http-endpoint), or reissue the certificate for this host."
+        }
+        _ => "Check the endpoint and the runtime's certificate.",
     }
 }
 
@@ -461,6 +693,19 @@ pub async fn read_response(
             source,
         }),
     }
+}
+
+/// `endpoint` on the next port, for a second runtime beside the one there.
+#[must_use]
+pub fn next_port(endpoint: &str) -> String {
+    reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|mut url| {
+            let port = url.port_or_known_default()?.checked_add(1)?;
+            url.set_port(Some(port)).ok()?;
+            Some(url.as_str().trim_end_matches('/').to_string())
+        })
+        .unwrap_or_else(|| "http://127.0.0.1:8091".to_string())
 }
 
 #[cfg(test)]

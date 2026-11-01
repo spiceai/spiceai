@@ -1,14 +1,14 @@
 # Cayenne object-native metastore
 
-Status: **draft design for discussion.** This document states the direction: the
-goals, the milestones, the key decisions and the alternatives behind them. The
-[technical design](object-native-metastore-technical.md) holds the invariants,
-how Cayenne works today where this changes it, and the details, with the
-measurements and model checks behind them.
-
-These documents and the protocol model capture the current direction: complete
-enough to build toward, and expected to change. Implementation will update the
-design and the model together.
+Status: **draft design for discussion.** This document states the direction:
+the product problem, the milestones, the key decisions with their
+alternatives, and the order of the work. It is not a specification. The
+[technical design](object-native-metastore-technical.md) holds the components,
+code changes, protocol details and the roadmap's exit proofs. The
+[protocol model](../../crates/cayenne-metastore-model/README.md) holds the
+model checks, cited here by run name.
+[Enhancement #15760](https://github.com/spiceai/spiceai/issues/15760) holds the  
+user-facing surface. All of them evolve together as implementation proceeds and unknowns are worked out.
 
 ---
 
@@ -18,908 +18,527 @@ design and the model together.
 
 Every Cayenne acceleration depends on a metastore. Today that is an embedded
 SQLite database holding every table's snapshot pointers, file manifests,
-deletion state, statistics and its small-write tier. That choice shapes what
+deletion state, statistics and the small-write tier. That choice shapes what
 Spice can offer:
 
-- **State is tied to one machine.** The catalog lives on an instance's disk, so
-a replacement instance cannot pick up where the old one left off. Nodes cannot
-share an acceleration without exporting and importing metastore slices.
+- **State is tied to one machine.** The catalog lives on an instance's disk.
+  A replacement instance cannot pick up where the old one left off, and nodes
+  cannot share an acceleration without exporting and importing metastore
+  slices.
 - **One writer.** SQLite serializes every write in a process, and nothing lets
-a second instance write the same table. Log, event and metric ingest from many
-instances, per-partition CDC, and distributed maintenance are all out of reach.
-- **More to choose and operate.** Users and operators meet modes, metastore
-backends, and SQLite-specific failure modes (busy timeouts, WAL growth,
-freelist vacuum), none of which they asked for.
+  a second instance write the same table. Ingest from many instances,
+  per-partition CDC and distributed maintenance are out of reach.
+- **More to choose and operate.** Users meet modes, metastore backends and
+  SQLite failure modes (busy timeouts, WAL growth, freelist vacuum), none of
+  which describe what they want.
 
 ## What we are building
 
 **One metastore for Spice and Cayenne that is native to object storage** and
-runs unchanged on a local directory:
+runs unchanged on a local directory.
 
-- The user chooses **where durable data lives**: a bucket, a local directory,
-or `mem://` for tests. That is the only storage decision. There is no
-metastore choice, no tuning knob, and no external coordination service or
-database.
-- Durability is the destination's. With an object store, acknowledged state
-survives losing any instance and its disk. With a local directory, it is as
-durable as the disk the user chose.
-- **The data moves too, not only the metastore.** Today a file-mode dataset
-keeps its Vortex and deletion files on the instance's disk, or in S3 Express
-where configured, and only the instance's metastore says which are live.
-Here, every file a commit references is written to the destination before
-the commit, and local disk becomes a cache. This makes the change larger than
-swapping the metastore, and it is deliberate:
-  - A commit that referenced files on one instance's disk could not be
-    recovered after losing that disk, or read by any other instance.
-  - A file is invisible until a record references it, so writing the files
-    first and then the record makes the record's one conditional write commit
-    both. No commit has to span the instance's disk and the destination.
-- **Every existing guarantee holds.** Guarded commits are atomic. A write
-across a dataset's partitions commits atomically, and so does a transaction
-across tables, as both do in the SQL metastore today.
-- **New guarantees.** With an object-store destination, acknowledged state
-survives losing any instance and its disk, and any instance can recover or
-read it. A CDC source position becomes durable in the same commit as the state
-it covers; today the two are written separately.
-- **Then, maintenance and standbys on any node.** In a second milestone,
-compaction and the bake run on any node, and standby replicas take over
-ingestion when the writer fails.
-- **Later, many writers per table.** In a third milestone, **many writers can
-write one table** wherever their data is independent, without the user
-declaring a layout to make that safe.
+- **One storage decision.** The user chooses where durable state lives (`runtime.state.location`): a bucket, a local directory, or
+  `mem://` for tests. There is no metastore choice, no tuning knob, and no
+  external coordination service or database.
+- **Durability is the destination's.** With an object store, acknowledged
+  state survives losing any instance and its disk, and any instance can
+  recover or read it. With a local directory, state is as durable as that
+  disk.
+- **The data moves too.** Today a file-mode dataset keeps its Vortex and
+  deletion files on the instance's disk, or in S3 Express where configured.
+  Here every file a commit references is in the destination before the
+  commit, and local disk becomes a cache. A commit that referenced one
+  instance's disk could not be recovered without that disk. And because a file
+  is invisible until a record references it, one conditional write of the
+  record commits both; no commit spans local disk and the destination.
+- **Every existing guarantee holds.** Guarded commits are atomic, and so are a
+  write across a dataset's partitions and a transaction across tables.
+- **One new guarantee.** A CDC source position commits in the same record as
+  the state it covers. Today the two are written separately.
 
-**Scope: metadata, with data only where the metadata needs it.** How Cayenne
-stores its data (Vortex files and deletions) is a separate design. Its
-direction is to stop treating local disk as durable storage with an optional
-cold tier behind it, and instead treat local disk as a cache in front of one or
-more tiers of durable, object-store-backed storage. This document covers data
-only where the metastore depends on it: a file must be durable before a commit
-references it, and the metastore records where each file lives.
+**Scope.** How Cayenne stores data (Vortex files and deletions) is a separate
+design, whose direction is local disk as a cache in front of durable,
+object-backed tiers. This document covers data only where the metastore
+depends on it: a file is durable before a commit references it, and the
+metastore records where each file lives.
 
 ### Consistency
 
-What holds, in common terms:
-
-- **Commits to one dataset are serializable.** One compare-and-swap of the
-  dataset's head orders every commit, and each commit's guards are checked
+- **Commits to one dataset are serializable.** One compare-and-swap (CAS) of
+  the dataset's head orders every commit, and each commit's guards are checked
   against the exact state it follows.
 - **Every read sees a consistent snapshot** of committed state, and a node's
-  view only moves forward (monotonic reads).
-- **Across nodes, reads are eventually consistent, with bounded staleness.**
-  Another node sees a commit once it refreshes its cached copy of the head,
-  which a query does when the copy is older than the staleness bound. So the
-  delay is the commit cadence plus that bound, while the destination is
-  reachable; when it is not, a node keeps answering from the last state it
-  read, which can be older. With several writers (Milestones 2 and 3), different
-  nodes can briefly observe different recent states.
-- **Read-your-writes holds on the node that wrote,** not across nodes.
-- **On the writing node, buffered writes are queryable before they commit,** as
-  they are today. A read there can therefore see a value that is never
-  committed: a crash, a fence, or an unknown commit outcome drops the buffer,
-  which was never acknowledged. Other nodes only ever see committed state.
-  Publishing at commit (decision 1.2) would remove this.
+  view only moves forward.
+- **Across nodes, staleness is bounded.** A node sees another's commit once it
+  refreshes its cached head, which a query does when the copy is older than
+  the staleness bound S. While the destination is unreachable, a node keeps
+  answering from the last state it read, which can be older than S. Such a
+  query has no retention protection: GC may already have deleted objects it
+  needs, and then it fails with an error, never other rows (model:
+  `dataset-query-expiry*`). With several writers (Milestones 2 and 3),
+  nodes can briefly see different recent states.
+- **Read-your-writes holds on the node that wrote.** There, buffered writes are
+  queryable before they commit, as today, so a read can see a value a crash,
+  a fence or an unresolved commit then drops. That value was never
+  acknowledged, and other nodes see only committed state. Publishing at commit
+  (decision 1.2) would remove this.
 
-What does not hold: linearizable reads, read-your-writes across nodes, and
-atomic reads across datasets (non-goals below).
+**Not goals of this work:**
 
-## Non-goals for this work
-
-- **Linearizable reads, and read-your-writes across nodes.** A node answers
-  from the state it last read, so a client that writes through one node and
-  reads through another may not see its own write until the second node polls
-  (see [Consistency](#consistency) for what does hold). Routing a client's
-  reads to the writer, or a read that waits for the client's commit number,
-  would add it later (see
-  [possible future improvements](#milestone-n-possible-future-improvements)).
-- **Highly contended writes.** The design assumes writes are mostly
-  non-conflicting: writers of partitioned CDC, appenders, and owners of disjoint
-  keys rarely touch the same keys. Heavy contention on shared keys would need a
-  coordinated commit layer on top of this one (see
-  [possible future improvements](#milestone-n-possible-future-improvements)).
-- **Atomic reads across datasets.** A query that reads several datasets sees
-  each one at its own snapshot, as it does today. Snapshot tokens and
-  transaction outcomes are designed so a consistent cross-dataset read can be
-  added later (decision 1.3).
+- **Linearizable reads, or read-your-writes across nodes.** See
+  [Future work](#future-work-not-planned).
+- **Atomic reads across datasets.** Writes across datasets are atomic
+  (decision 1.3), but a query sees each dataset at its own snapshot, as today,
+  so it can see one dataset's side of a transaction before the other's. Decision
+  1.3 keeps a consistent read possible later.
+- **Highly contended writes.** Writes are assumed mostly non-conflicting;
+  heavy contention on shared keys needs a coordinated commit layer (Future
+  work).
 - **One atomic commit across regions**, and **source-version ordering** for
-  overlapping keys: deferred, as described in Milestone 3.
-- **An interchange table format.** This is Cayenne's internal format, as its
-  on-disk layout is today.
+  overlapping keys (decision 3.2).
+- **An interchange table format.** This is Cayenne's internal format.
 
-## How it works, in one paragraph
+## How it works
 
-Each accelerated dataset has one small mutable object in the destination,
-the **head**, which carries the dataset's most recent commit records. A commit
-is **one conditional write**: a compare-and-swap of the head, which succeeds
-only if no one else replaced it first. Success is acceptance, and only an
-accepted commit is acknowledged. One instance at a time is a dataset's
-writer: it holds the dataset's **writer lease**, a small object in the
-destination that it renews. Taking the lease over raises the dataset's **lease
-generation**, which the head records, so a former writer's next commit fails.
-The lease decides who writes; the generation in the head is what makes a
-stale writer harmless. Older records leave the head in immutable
-batches, and the head lists them. Records carry typed, file-level actions
-("add these files", "add these deletion vectors", "replace these files with
-their compaction"). Data files and bulk content such as file manifests and the
-primary-key index are immutable objects that the actions reference. Writers
-buffer changes and commit only when something must be acknowledged — a CDC
-source position every ~2 s, a SQL `COMMIT`, or a freshness bound — so remote
-writes scale with acknowledgements, not with ingest volume. A reader learns of
-new commits, and reads them, with one conditional read of the head. Periodic,
-incremental checkpoints keep open and recovery cost bounded. From Milestone 2, a
-writer that loses the race for the head checks whether the winning commits
-touched anything its commit depends on. If not (a compaction of other files,
-and in Milestone 3 appends, disjoint keys or disjoint source partitions), it
-simply retries on the new head.
-
-## Relationship to the datalake tier
-
-Cayenne already puts data in object storage through its optional **datalake
-tier**, enabled by `cayenne_datalake_location`. The datalake tier is about
-data; this work is about metadata, and touches data only as the metadata
-references it. The two answer different questions:
-
-- **The datalake tier decides where cold rows live.** A background promoter
-  moves rows from local disk to S3, once local disk passes a threshold, as
-  large clustered Vortex files. The list of live cold files, with their
-  statistics and key bloom filters, stays in the local SQLite metastore.
-- **This work decides where the commits and their metadata live.** It moves
-  the metastore itself into the destination, alongside the data.
-
-**How they combine.** With this design, the datalake tier is not needed as a
-separate feature. It is an early form of
-[tiered storage beneath the destination](#milestone-n-possible-future-improvements):
-it moves data, but not metadata, from local disk to S3.
-
-- **With an object-store destination,** every data file is already in the
-destination, so there is nothing to promote, and local disk serves as a
-cache. What the tier does well becomes compaction and layout policy:
-carry-forward rewrites of only the changed files, Hilbert clustering for
-tight zone maps, large read-optimized files, and per-file statistics and key
-bloom filters for reads.
-- **With a local-directory destination,** moving cold data to S3 is the
-tiered-storage item itself. That item would put commits and checkpoints in
-the lower tier too, so the S3 tier is recoverable on its own.
-- Either way, its separate location, thresholds and GC are no longer needed.
-- **Milestone 1 maps the tier as it is.** A promotion becomes one record: the new
-cold manifest plus the removal of the promoted warm files
-([mapping, and a comparison with the tier today](object-native-metastore-technical.md#cayenne_cold_tier_file)).
-Its GC then roots in the destination instead of the local metastore.
-- **No existing data is stranded.** Datasets whose cold files are already in a
-datalake location keep working. Folding the tier into compaction, and
-retiring its settings, waits for re-bootstrap, compatibility and recovery to
-be shown. Retiring the settings is a user-facing change, so it goes through the
-same Enhancement review as the rest of the
-[user-facing surface](#user-facing-surface-proposal-for-the-enhancement).
-
-**One gap this narrows.** The tier's GC deletes an object a short grace period
-(5 minutes by default) after it becomes unreferenced, so a query still reading
-cold files then fails. A Cayenne integration test that forces that
-interleaving reproduces it. Under decision 1.10 the same failure needs a query
-to outlive the retention, about an hour, and it is always an error, never rows
-from part of a snapshot.
+- **The head and its CAS.** Each dataset has one small mutable object, the
+  head, carrying its newest commit records. A commit is a CAS of the head,
+  which succeeds only if no one replaced it first. Success is acceptance, and
+  only an accepted commit is acknowledged. Older records leave the head in
+  immutable batches that the head lists.
+- **The lease and the generation.** In Milestone 1, one instance at a time is
+  a dataset's writer and holds its writer lease. Taking the lease raises the
+  lease generation, which the head records, so a former writer's next commit
+  fails. The lease decides who writes; the generation in the head makes a stale
+  writer harmless. Milestone 2 leases maintenance units and Milestone 3 source
+  partitions the same way, each fenced by a generation in the head.
+- **Actions and immutable objects.** Records carry typed, file-level actions
+  ("add these files", "replace these files with their compaction"). Data files
+  and bulk content, such as file manifests and the primary-key (PK) index, are
+  immutable objects that actions reference.
+- **Acknowledgement points.** Writers buffer changes and commit only when
+  something must be acknowledged: a CDC source position every ~2 s, a SQL
+  `COMMIT`, or a freshness bound. Remote writes scale with acknowledgements,
+  not ingest volume.
+- **Readers and checkpoints.** A reader learns of new commits, and reads them,
+  with one conditional read of the head. Incremental checkpoints bound the
+  cost of opening a dataset and of recovery.
 
 ## Milestones
 
-Three milestones are planned, and each removes the main limit left by the one
-before it. All three are planned in full. Milestone 1 is firm. Milestones 2
-and 3 are settled in their decisions, with the open points listed where they
-arise: each waits on a measurement or a model check, and none on a new
-design.
-[Possible future improvements](#milestone-n-possible-future-improvements) lists
-work that is not planned, kept here only so that the planned milestones do not
-rule it out.
+The [technical roadmap](object-native-metastore-technical.md#implementation-roadmap)
+breaks Milestone 1 into steps. Each milestone removes the main limit the one before it leaves. Milestone 1 is  
+firm. Milestones 2 and 3 are settled in  direction; what is open waits on  
+a measurement or a model check, not a new design  
+([Open decisions](#open-decisions)).
 
 ### Milestone 1: one object-native metastore
 
+Enhancement [#15760](https://github.com/spiceai/spiceai/issues/15760) rolls Milestone 1 out to users in two stages (a flag, then
+the replacement); those stages are not milestones.
+
 **What:** every accelerated dataset's metastore and data files live in the
-user's chosen destination, written by one writer per dataset and readable by
-any instance, with no SQLite or Turso.
+destination, for every deployment: a laptop, an on-prem server with a local
+directory, a node on S3, GCS or Azure. One writer per dataset holds a lease;
+any number of instances read.
 
-**Why:** the metastore is the reason acceleration state is tied to one machine.
-Making it native to object storage, with one implementation for every
-destination, is the prerequisite for everything else.
+**Why:** the metastore is what ties acceleration state to one machine. One
+object-native implementation for every destination is the prerequisite for
+everything else.
 
-**Delivers:**
-
-- SQLite and Turso replaced everywhere, by one implementation for object-store
-and local-directory destinations.
-- A replacement instance that recovers from the bucket without a reload.
-- State any instance can read directly, which Milestone 2's replicas build on.
-- No metastore choice and no metastore knobs.
-
-**Limits it leaves:**
-
-- **One writer per dataset.** Ingest throughput for a dataset is capped by what
-one node can decode, encode and commit. Log, event and metric ingest from many
-instances still has to funnel through that node.
-- **Maintenance shares the writer's node.** Compaction and the bake compete with
-ingest for that node's CPU and I/O. A heavy dataset cannot spread maintenance
-across the cluster.
-- **Automatic failover waits for the lease.** Safety never depends on the
-lease: a new writer fences the old one by recording its generation in the
-head, and every older writer's next commit then fails. So a replacement that
-is told it is the writer (a restarted pod, an orchestrator) takes over at
-once. The lease only decides which of several candidate instances becomes the
-writer; a candidate waits for the holder's lease to lapse, so writes pause for
-up to the lease duration while reads continue.
-
-### Milestone 2: maintenance and standbys on any node
-
-**What:** one ingest writer per dataset, as in Milestone 1, while compaction, the
-bake and cold promotion run on any node, and standby replicas take over
-ingestion when the writer fails.
-
-**Why:** Milestone 1's sharpest operational limit is maintenance competing with
-ingest on one node. And while Milestone 1 fences and replaces a failed writer, a
-replacement has no source handoff: nothing yet stops a standby from consuming
-the source before it holds the lease. Both lift with much less than many
-writers need. Maintenance
-records only rewrite files: they draw no new `seq`s and raise no table's
-high-water mark, so with one ingest writer they need no key footprints and
-no answer to Milestone 3's `seq` decision (decision 3.4). The protocol model
-checks this: one ingest writer racing maintenance on other nodes keeps every
-row correct with neither.
-
-**Delivers:**
-
-- Maintenance on any node, coordinated by leases over file sets, racing the
-  writer on the head with guards (decisions 2.1 and 2.2).
-- **Replicated ingestion behind a lease.** Several replicas run the same
-  Spicepod against one destination. A lease picks the replica that consumes
-  the source and writes; the others answer queries from the shared state and
-  take over when the lease lapses. Milestone 1 supplies what makes this safe:
-  - *Fencing.* A takeover records the new writer's generation in the head, so
-    a former holder that still believes it holds the lease fails its next
-    commit instead of writing. Safety never depends on lease timing; only
-    failover delay does, as in Milestone 1's failover limit.
-  - *Durable resume.* Source positions commit with the state they cover
-    (decision 1.9), so the new holder resumes from the head, not from the old
-    holder's disk.
-  - *Shared reads.* Any instance can already read committed state from the
-    destination, so standbys answer queries from it.
-
-  What each source needs on top:
-  - *Consume only while holding the lease.* A PostgreSQL replication slot
-    accepts one active consumer, so a standby must not attach until it holds
-    the lease. An SQS queue delivers to any replica that polls, so a standby
-    must not poll.
-  - *Acknowledge the source only after the commit.* The holder confirms the
-    slot's flush position, or deletes the SQS messages, only once the record
-    covering them has committed: the acknowledgement points of decision 1.2.
-  - *Replay after takeover.* PostgreSQL resumes from the committed position.
-    SQS has no position: messages not yet deleted reappear after their
-    visibility timeout, so the new holder must skip files the log already
-    records.
-
-**Limits it leaves:**
-
-- **One ingest writer per dataset.** Ingest throughput for a dataset is still
-capped by what one node can decode, encode and commit, and log, event and
-metric ingest from many instances still funnels through that node.
-- **Read-dependent writes on a dataset stay on the writer,** as in Milestone 1.
-
-### Milestone 3: concurrent writers
-
-**What:** many writers commit to one dataset at once, wherever their data is
-independent.
-
-**Why:** to remove the one-writer limit without asking users to declare a
-layout.
-
-**Delivers:**
-
-- Many appenders to one table. Replicated ingestion from a source of
-  independent appends, such as SQS, can then share the work instead of
-  standing by.
-- Writers over disjoint key sets.
-- One ordered CDC writer per source partition.
-- Distributed query writes that commit once per job.
-- Writers in several regions over disjoint keys, against one bucket.
-- `UPDATE`/`DELETE … WHERE`, `INSERT … SELECT` and transactions from any
-  writer, serializable in commit order. They conflict only with commits that
-  change rows they read, so ingestion of other rows doesn't block them. This
-  lands last; until it does, a read-dependent write on a dataset with several
-  writers re-plans whenever another commit wrote a table it reads, which is
-  safe but can report a conflict under heavy ingestion.
-
-**Limits it leaves:**
-
-- **One log per dataset caps its commit rate.** Each commit is one
-conditional write of the head, so a log accepts at most about `1 / (conditional-write
-latency)` commits per second. That is on the order of 20 per second on S3
-Standard, and hundreds on S3 Express or a local disk. Several logs per dataset
-would lift this cap; that is a possible future improvement, not part of this
-plan.
-  - At a 2 s commit cadence per writer, races grow with writer count, and tens
-  of writers per dataset approach the cap.
-  - Independent writers that lose a race retry rather than abort, but each
-  retry adds a read and a write.
-- **Cross-region writers pay cross-region latency on every commit,** and depend
-on the bucket's home region being available.
-- **Writers with overlapping keys still need a resolution:** abort and retry, or
-key ownership. (Source-version ordering is deferred.)
-
-### Milestone N: Possible Future Improvements
-
-None of the items below is part of this plan or scheduled. They are listed so the
-planned milestones keep them possible.
-
-**Several logs per dataset.** If one log's commit rate saturates, or each region
-should commit to a log of its own, a dataset's state could become the merge of
-several logs, each written by one group of writers:
-
-- A snapshot would be a position in each log. Milestone 1 keeps snapshot positions
-opaque, so this would need no format break.
-- Milestone 3's footprints would prove writers on different logs independent.
-- An atomic commit across logs would use the same decision-object protocol as
-cross-dataset transactions.
-- Placement (which writers use which log) and atomicity across logs would need
-their own design first. Nothing here promises that sharding would be automatic.
-
-Its own limits:
-
-- An atomic commit across logs costs an extra round trip.
-- Overlapping keys across logs still need abort-and-retry or ownership.
-- One atomic commit across regions stays out of scope.
-
-**Coordinated commits for contended workloads.** If many writers contend for
-the same keys, optimistic retries waste work. A lease-elected committer could
-take writers' changes and batch them into single records, which removes the
-race without an external service. Delta Lake's coordinated-commits feature takes
-a similar approach, though with a separate coordinator.
-
-**Atomic reads across datasets.** A catalog transaction frontier: a record of
-which `(dataset, commit)` vectors are mutually consistent, so a multi-dataset query
-reads one consistent cut. Milestone 1 keeps snapshot tokens as vectors and makes
-cross-dataset outcomes visible only through log records, so this needs no format
-change.
-
-**Cross-node consistency.** Read-your-writes or linearizable reads across nodes,
-for example a reader that waits until the log reaches a given commit before
-answering. The planned milestones keep the pieces this needs, and nothing more has to
-be decided now:
-
-- *One linearization point per dataset.* Every commit is one replace of the
-  head, and object stores give strong read-after-write consistency, so a
-  reader that reads the head and applies up to its commit before answering
-  gives a linearizable read of that dataset.
-- *Commit numbers as tokens.* Snapshot tokens are `(dataset, commit)` vectors.
-  Returning the commit number with an acknowledgement is an API addition, not
-  a format change, and gives clients a read-your-writes token.
-- *Committed state is distinguishable from buffered writes.* Other nodes only
-  ever see committed state. On the writing node, a strict read would exclude
-  the buffer, or the dataset would publish at commit (decision 1.2).
-- Serializable reads across datasets build on the atomic cross-dataset read
-  item above.
-
-**Tiered storage beneath the destination.** Writes could pass through a stack of
-tiers: an ephemeral disk buffer, then a store on persistent disk, then S3.
-The acknowledgement point happens once the data is committed to the first
-object store tier. The user can then choose the first object store with the
-commit latency, cost and durability they desire.
-
----
-
-# Milestone 1: one object-native metastore
-
-**Scope.** Replace SQLite and Turso as Cayenne's metastore with a head object,
-its batches and immutable objects in the destination, for every deployment: a laptop, an
-on-prem server with a local directory, and a node backed by S3, GCS or Azure.
-One writer per dataset holds a lease; any number of readers.
-
-**What the user sees.** Nothing new to configure. A restarted or replacement
+**What the user sees:** nothing new to configure. A restarted or replacement
 instance pointed at the same bucket recovers the acceleration without a full
-reload. Running several instances on one destination (replicas and
-standbys) comes with Milestone 2, also with nothing new to configure.
+reload.
 
 **What it removes:**
 
-- SQLite and Turso as metastores (the `turso` build feature goes earlier, with
-the accelerator deprecation). Replacing them is the goal of this work, but the old storage is removed only after the new path has
-proven its durability, re-bootstrap and operating behavior.
-- **Running a database inside every instance:** its locking, tuning and
-  upkeep, such as busy timeouts, write queueing, checkpointing and vacuum.
-- **Copying acceleration state between instances.** A replacement instance
-  reads the destination directly instead of importing a metastore slice, and
-  so do Milestone 2's replicas.
-- **A metastore round trip on every write.** Writes commit once per
+- SQLite as a metastore, with the metastore choice and its knobs, once the new
+  path has proven its durability, re-bootstrap and operating behavior. The Turso
+  metastore goes earlier, with the accelerator deprecation ([#15492](https://github.com/spiceai/spiceai/issues/15492)).
+- A database inside every instance, with its locking, tuning and upkeep (busy
+  timeouts, write queueing, checkpointing, vacuum).
+- Copying acceleration state between instances: a replacement reads the
+  destination directly.
+- A metastore round trip on every write: writes commit once per
   acknowledgement point.
-- **A separate small-write tier inside the database,** once its replacement is
-  measured (decision 1.5).
+- The small-write tier inside the database, once its replacement is measured
+  (decision 1.5).
 
-## Key decisions
+**Delivers, beyond the metastore itself:**
 
-**1.1 One conditional write commits: a compare-and-swap of the dataset's head.**
-The head carries the newest commit records, so a CAS on its version both
-orders a commit and accepts it, and a stale writer's CAS fails. Guards are
-checked locally against the exact version the CAS replaces, and acceptance is
-all-or-nothing for the whole record. A lost response resolves to *accepted*,
-*rejected* or *unresolved* by reading the head, or by retrying the identical
-CAS. Older records move into immutable batches that the head lists. This is
-the commit point the existing `object_store_occ` WAL already uses, extended so
-that a reader needs one request per poll and a new reader opens in two
-parallel steps. Apache Iceberg commits the same way, by swapping a metadata
-pointer, and S3's conditional writes (`If-None-Match` in August 2024,
-`If-Match` in November 2024) are what let the object store itself be the
-coordinator.
-*Details in:* [Summary](object-native-metastore-technical.md#summary),
-[The write path](object-native-metastore-technical.md#the-write-path).
+- **Standbys behind a lease.** Instances run the same Spicepod on one
+  destination. The holder consumes the source and writes; the others
+  serve queries from shared state and take over when the lease lapses.
+  Fencing, durable resume (decision 1.9) and shared reads make this possible.
+  [#15760](https://github.com/spiceai/spiceai/issues/15760) requires it before the object-native metastore replaces SQLite, so two
+  instances started on one destination by accident never both consume the
+  source. Each source consumes only while holding the lease, acknowledges
+  after the commit, and replays after takeover
+  ([step 7](object-native-metastore-technical.md#step-7-standbys)).
 
-- *Alternative: a numbered log,* creating `log/<pos>` per commit, as Delta
-  Lake and SlateDB do. Prototyped, model-checked and timed against the head.
-  Creating a record orders a commit without accepting it, so the log needs a
-  GC boundary checked after every create, a no-op fill and fence records, and
-  its readers need about twice the requests per poll and slower cold opens.
-  Rejected.
-- *Alternative: append to a log object.* S3 Express, Azure append blobs and GCS
-  zonal buckets support a conditional append; S3 Standard and most
-  S3-compatible stores do not. Every provider bills an append as a write, so
-  appending would not reduce billed writes. Rejected as inconsistently
-  supported and no cheaper.
+**Limits it leaves:**
 
-**1.2 Commit when something must be acknowledged, not on every write.** Writes
-accumulate in a buffer and are committed as one record when one of these
-happens. Each is an *acknowledgement point*: something is waiting for an
-acknowledgement. It triggers the commit, and the acknowledgement itself is sent
-only after the commit succeeds.
+- **One writer per dataset** caps a dataset's ingest at what one node can
+  decode, encode and commit.
+- **Maintenance shares the writer's node.** Compaction and the bake (merging
+  file groups) compete with ingest for its CPU and I/O.
+- **Failover waits for the lease.** Safety never depends on lease timing,
+  because the generation in the head fences the old writer. A standby waits for
+  the holder's lease to lapse, so ingestion pauses for up to the lease duration
+  while reads continue.
 
-- a CDC source position must be acknowledged (~2 s);
-- a SQL `COMMIT` returns;
-- a freshness bound for other readers is reached;
-- the buffer hits a size or age bound.
+### Milestone 2: maintenance on any node
 
-The buffer is in memory — the existing RAM mem-tier already plays this role —
-and losing it loses only unacknowledged work, which the source replays.
+**What:** one ingest writer per dataset, while compaction, the bake and cold
+promotion run on any node.
 
-**Milestone 1 keeps today's local visibility.** A buffered write is queryable on
-the writing node as soon as it is applied, as the mem-tier does today, and on
-other nodes once its commit succeeds and they poll. So a read on the writing
-node can see a value that is never committed (see [Consistency](#consistency)).
+**Why:** maintenance competing with ingest is Milestone 1's sharpest
+operational limit, and it needs much less than many writers do. Maintenance records only rewrite files and draw no
+new sequence numbers (decision 1.8), so with one ingest writer they need no
+key footprints and no answer to decision 3.4 (model: `remote-maintenance*`).
 
-- *Option: publish at commit.* Buffered writes would become queryable, on the
-  writing node too, only once their commit succeeds, so no read would ever see
-  a value that is never committed. The cost is freshness on the ingesting node:
-  up to one commit interval plus the conditional write, about 2 s plus
-  30–100 ms on S3 Standard. It is independent of how `seq`s are stamped
-  (decision 3.4), and would be chosen if reads of uncommitted values
-  must be ruled out.
+**Delivers:**
 
-On a
-local-directory destination, each commit is written durably (fsync) as it
-happens. At S3 Standard request prices, a dataset costs roughly \$17/day if every
-CDC burst commits (20/s), about \$0.50/day at a 2 s cadence, and about \$0.02/day
-at 60 s.
-*Details in:* [The write path](object-native-metastore-technical.md#the-write-path).
+- **Maintenance on any node,** under leases over file sets, racing the writer
+  on the head with guards (decisions 2.1, 2.2). A writer that loses to a
+  compaction of other files retries on the new head.
+**Limits it leaves:** one ingest writer per dataset, and read-dependent writes
+stay on the writer.
 
-- *Alternative: a persistent disk-backed buffer.* It would shorten replay after
-a crash, but it is not needed for correctness and adds a second log format.
-It is not in Milestone 1. The general form, tiers of storage beneath the
-destination, is listed under
-[possible future improvements](#milestone-n-possible-future-improvements).
+### Milestone 3: concurrent writers
 
-**1.3 A transaction domain per dataset.** There is one log per accelerated
-dataset, so a commit across a dataset's partitions is one record. A small
-catalog log holds the name registry. The rare multi-table transaction spanning
-datasets uses a create-if-absent decision object. One log per dataset gives the
-most concurrency Milestones 2 and 3 can use.
+**What:** many writers commit to one dataset wherever their data is
+independent, without the user declaring a layout.
 
-No Cayenne query reads several tables at one atomic snapshot today, and
-per-dataset logs keep that behavior. The design keeps a consistent
-cross-dataset read possible later: snapshot tokens are vectors of
-`(dataset, commit)`, and a cross-dataset outcome becomes visible only through a
-`Resolve` record in each dataset's log.
-*Details in:* [Multi-table transactions across datasets](object-native-metastore-technical.md#multi-table-transactions-across-datasets).
+**Delivers:** many appenders to one table (so SQS replicas share the work
+instead of standing by); writers over disjoint key sets; one ordered CDC
+writer per source partition; distributed query writes that commit once per
+job; writers in several regions over disjoint keys, against one bucket; and,
+last, `UPDATE`/`DELETE … WHERE`, `INSERT … SELECT` and transactions from any
+writer, serializable in commit order (decision 3.5). Until that last item, a
+read-dependent write re-plans whenever another commit wrote a table it reads:
+safe, but it can report a conflict under heavy ingestion.
 
-- *Alternative: one head per catalog.* Every dataset's commits go through one
-  head.
-  - *Gains:* a transaction across datasets is one record, with no `Prepare`,
-    decision or `Resolve`, and every query reads all datasets at one position,
-    so cross-dataset reads are atomic.
-  - *Costs:* one head is replaced at most about once per conditional-write
-    round trip (about 20 per second on S3 Standard), for the whole catalog.
-    One process writing every dataset can fold all of them into each
-    replacement with group commit, but 100 datasets each committing every 2 s
-    already need 50 commits per second from several processes, which only a
-    single committer per catalog can sustain. Any second writer (a node owning
-    other datasets, a maintenance node) races on every commit, so Milestone 2's
-    retry machinery would be needed from the start, and contention would be the
-    norm rather than the exception. Every changed poll downloads every
-    dataset's recent records, a busy dataset's commits fill the window and
-    checkpoints of quiet ones, and one lease would own the whole catalog.
-  - Rejected. Transactions across datasets are rare, and their two-phase path
-    costs about five round trips only when used; atomic cross-dataset reads can
-    come later through a frontier. Adopting it later would be a migration.
-- *Alternative: one log per transaction group.* Datasets that transact together
-  share a log, so atomic reads and writes within a group become ordinary log
-  application, at the cost of shared ordering within the group. Rejected: it
-  needs configuration, or inference, to decide the groups.
-- *Alternative: one log per partition.* Rejected. Writes that fan out to several
-  partitions, and partitioned overwrites, commit atomically across partitions
-  today, so each would need a distributed transaction. Table-wide state (schema,
-  statistics, the PK index, the cold-tier manifest) would have no single home.
-  Readers would have to merge logs from day one. And it ties concurrency to
-  declared layout, which Milestone 3 sets out to remove.
+**Limits it leaves:**
 
-**1.4 Data out of the log; checkpoints chunked and incremental.** Records carry
-small typed actions. Manifests, deletion-vector lists, statistics and
-cold-tier manifests are immutable objects named by content hash. A
-checkpoint is a small root plus sorted, size-bounded parts, and it rewrites only
-the parts that changed. The PK index is one of its collections, so it is
-always as of its checkpoint and never needs history GC has removed. Opening a
-dataset reads the latest checkpoint plus the records after it.
-*Details in:* [Dataset state](object-native-metastore-technical.md#dataset-state-where-it-lives-and-how-it-changes),
-[Mapping the metastore tables](object-native-metastore-technical.md#mapping-the-metastore-tables).
+- **One log per dataset caps its commit rate** at about `1 / (conditional-write
+  latency)`: on the order of 20 per second on S3 Standard, hundreds on S3
+  Express or a local disk. At a 2 s cadence, tens of writers per dataset
+  approach it, and each lost race adds a read and a write.
+- **Cross-region writers pay cross-region latency per commit** and depend on
+  the bucket's home region.
+- **Overlapping keys still need a resolution:** abort and retry, or key
+  ownership.
 
-**1.5 Small writes are buffered locally; the inline tier is retired once its
-replacement is measured.** Today small writes are stored as Arrow IPC rows
-*inside* SQLite, to avoid one file per tiny batch. Here they accumulate in the
-writer's RAM tier and are written out at the next commit, so the file count is
-bounded by commit cadence, not write rate. A small commit, such as a one-row
-`INSERT; COMMIT` or a CDC batch of a few KiB, carries its rows inline in its
-record, which stays in the head until it leaves in a batch: the commit is one
-round trip. The SQL inline tier is
-removed only once this replacement meets the bar measured against it, including
-a caching workload that depends on it today.
-*Details in:* [Small writes and the inline tier](object-native-metastore-technical.md#small-writes-and-the-inline-tier).
+### Future work (not planned)
 
-**1.6 File-level actions from day one.** Even with one writer, records use
-file-level actions (`AddFiles`, `RemoveFiles`, `ReplaceFiles`,
-`AddDeleteFiles`), and "current snapshot" is derived state. That costs little
-now and is what lets Milestone 2 run compaction alongside other writers.
+None of these is scheduled. They are listed so the planned milestones keep
+them possible.
 
-**1.7 Not SlateDB.** SlateDB is a well-built LSM on object storage, but its model
-is one writer per database: "SlateDB ensures a single writer through a formally
-verified manifest fencing protocol, but supports multiple readers"
-([slatedb.io](https://slatedb.io/), read 2026-10-26). We found no published
-plan for multiple writers. It also has no atomic commit across databases. Milestone 3's concurrent writers would each need their own database
-(breaking cross-partition commits, and Milestone 2's maintenance on other nodes) or a single
-funnel process (an added service). The single-writer model is the deciding
-mismatch; smaller ones are that it does not fsync on a local directory, and that
-its compaction of a large mutable keyspace solves a problem decision 1.4 avoids
-having. Its fencing and GC primitives (`slatedb-txn-obj`) are worth borrowing
-from, and the GC design does.
-
-**1.8 Two numbers: commit numbers name states, `seq`s order mutations.** Every
-accepted record gets the next commit number, data commits and maintenance
-alike, and a commit number names the dataset state after it: snapshot tokens,
-checkpoints and the floor use it. Cayenne's sequence numbers stay as they
-are, drawn per write operation per table and stamped while buffering. Within
-each table, every `seq` in a record is above every `seq` in earlier records,
-so `seq` order is commit order, every existing `seq` comparison keeps its
-meaning, and Milestone 1 changes no allocation or stamping code. Iceberg splits
-its numbers the same way, between snapshot and data sequence numbers. How a
-Milestone 3 writer that loses a race keeps `seq` order is decision 3.4.
-*Details in:* [Commit numbers and sequence numbers](object-native-metastore-technical.md#commit-numbers-and-sequence-numbers).
-
-- *Alternative: name states by `seq`, with no commit number.* A compaction or a
-  schema change alters state without drawing a `seq`, so two states would share
-  a name, and so would their checkpoints; the model finds both. Rejected.
-- *Alternative: one `seq` rule per dataset.* Each partition table has its own
-  allocator, so a dataset-wide rule refuses correctly allocated records that
-  span partitions; the model finds that too. One allocator per dataset would
-  fix it, but changes allocation code that per-table transactions depend on.
-  Rejected.
-- *Alternative: independent `seq` blocks reserved per writer.* `seq` order would
-  differ from commit order across writers, needing re-reserve rules and every
-  cross-key comparison rewritten against a separate position. Rejected.
-
-**1.9 Source positions commit with the state they cover.** Consumer-side CDC
-positions live today in `spice_sys_*` sidecar tables inside the Cayenne
-metastore, written separately from data commits. Here an
-`AdvanceSourcePosition` action rides in the same record as the state it covers,
-so a replacement instance resumes without the old instance's disk. A backfill
-running alongside live CDC needs one more rule: a live change after the
-backfill's snapshot position wins over backfilled data.
-*Details in:* [Source positions and backfill](object-native-metastore-technical.md#source-positions-and-backfill).
-
-**1.10 GC keeps removed files for a fixed retention, collects uploads by age,
-and readers never write.** Every read returns the object it references or fails
-the query, so GC's timing decides only which long queries can fail, never which
-rows a query returns.
-
-- *Files that were once live* are deleted from what the records say left: a
-  file leaves the state at the record that removes it, and GC deletes it a
-  fixed retention T (about an hour) after it observes that record. No LIST is
-  needed, as Delta Lake deletes from its `remove` actions and Iceberg from
-  expired snapshots.
-- *The removal stays recorded* in durable state until GC deletes the file, so
-  a new GC after a takeover still knows it, and the sweep of uploads that never
-  committed skips it.
-- *Readers write nothing.* A query starts from a state confirmed current within
-  the staleness bound S, counted from when the confirming request was sent, so
-  every file it needs survives at least T − S. A
-  query that outlives that may fail, with an error saying to rerun it; it never
-  gets other rows. A read-only node needs only read access to the location.
-- *Uploads that never committed* are collected by age on the store's clock.
-  Every object has a fresh name. A writer references only objects live in its
-  commit's base and its own uploads it has never published, and refuses an
-  upload once its base's store time is an age limit (about a day) past the
-  upload's. GC deletes an unreferenced upload once the head it read is that
-  age limit past the upload's `LastModified`. A commit that lands after GC's
-  read is based on that head or a newer one, so the writer would have refused
-  the upload. On an idle dataset, GC makes an empty commit so the head's time
-  advances.
-- *No clock is compared across machines.* Upload ages are differences of two
-  store timestamps; GC times removals on its own clock; a takeover restarts
-  the removal timers.
-- *Long uploads* that cannot commit within the age limit are split across
-  several commits. If that ever binds, a `PREPARE_UPLOAD` record can protect a
-  long upload's objects by reference until it commits or a `RELEASE_UPLOAD`
-  drops them.
-
-The protocol model checks this in two graphs, one for references and one for
-queries: with any rule removed, a committed state references a deleted file, or
-a query within the retention fails.
-
-*Details in:* [Checkpoints and garbage collection](object-native-metastore-technical.md#checkpoints-and-garbage-collection).
-
-- *Alternative: leased reader pins,* a low-water commit each reading node
-  writes and renews, as SlateDB's readers keep their checkpoints alive.
-  Rejected: a pin only moves the time bound, since a reader paused past its
-  lease fails anyway, and it buys only queries longer than the retention. In
-  exchange every reader needs write access to the location, a lease with
-  renewal writes, and a write-then-recheck before its first read, and GC must
-  list pins. Delta Lake (`VACUUM`, 7 days by default), Iceberg (snapshot expiry
-  and orphan cleanup by age) and Hudi (the cleaner keeps the last N commits)
-  all protect readers with a retention bound, and none has readers register.
-- *Alternative: object generations,* where each upload goes into its writer's
-  generation and GC lists only generations no live writer uses. Rejected: it
-  avoids listing the whole prefix, but needs explicit generation closes once
-  writers run on several nodes, an interlock and an admission guard for reused
-  content addresses, and repeated sweeps to catch late uploads. The age rule
-  and fresh names need none of them.
-- *Alternative: the writer ages uploads on its own clock, and GC waits for the
-  head to move and rechecks.* Rejected: it compares the writer's clock with the
-  store's, so a store clock that runs ahead lets GC delete an upload the writer
-  still thinks young. Measuring both ages against the head removes the clock
-  comparison, and the head move and the recheck with it.
-- *Alternative: GC times candidates on its own clock from the first LIST that
-  saw them.* Rejected: GC would have to remember its listings, and a restart
-  would start every wait again.
-
-## User-facing surface (proposal for the Enhancement)
-
-The surface change needs its own Enhancement with PM and UX/DX sign-off before
-it is built. This is the proposal that Enhancement would review.
-
-**Rollout shape.** The new path is developed behind a feature flag, off by
-default, so nothing changes for users until they opt in. Once the new path is
-proven, it becomes the default, and the flag is removed together with the
-surface it makes obsolete: the metastore backend choice, the separate metadata
-directory, the small-write inlining settings and, for Cayenne, snapshots (a
-reader opens the destination directly). The flag's name and shape, and
-each deprecation and its timing, are defined and reviewed in the Enhancement,
-not here.
-
-**Location: reuse `runtime.state.location` rather than add
-`runtime.object_store`.** Spicepods already have one root for shared runtime
-state:
-
-- `runtime.state.location` accepts `file://`, `s3://`, `abfs://`, `abfss://`
-and `gs://`.
-- Credentials go in `runtime.state.params`.
-- Each feature writes under its own folder: `results-cache/`, `rate-control/`,
-`cluster/` and `snapshots/`.
-
-The metastore, with the data files it references, would be one more folder
-in it, `cayenne/v1/`. A second root field would give users two places to
-configure the same thing.
-
-```yaml
-runtime:
-  state:
-    location: s3://my-bucket/spice   # existing field; Cayenne uses <location>/cayenne/v1/
-datasets:
-  - from: postgres:public.orders
-    name: orders
-    acceleration:
-      enabled: true
-```
-
-**Questions for the review:**
-
-- **The default when `runtime.state` is unset.** The proposal is the local data
-directory (`.spice/data`), the same default file mode uses today, so the
-zero-config case still works.
-- **What replaces `mode: memory`.** It is today's default. Ideally nothing
-replaces it: every dataset uses the same metastore, and the runtime finds that
-a table is small enough to hold in memory and serves it from there, so there
-is no separate mode to choose. Whether that works depends on measurements and
-details not yet available. `mem://` stays a whole-runtime test destination,
-not a per-dataset choice. Deprecating `mode` can be decided and scheduled
-separately from the metastore work.
-- **The layout of data files.** Data files live in the destination (see
-[What we are building](#what-we-are-building)), under each dataset's
-`data/` folder with their current file names
-([layout](object-native-metastore-technical.md#layout)). A file never moves or
-is renamed, and GC deletes a removed file only after the retention (decision
-1.10).
-- **Data locations separate from the catalog.** By default the catalog and the
-data share one location. The format lets the catalog reference data in other
-locations, each with its own permissions, storage class or region (see
-[multiple data locations](object-native-metastore-technical.md#future-multiple-data-locations));
-today's per-dataset overrides, such as S3 Express, would become one. The
-surface for configuring them, and when it ships, belong to a separate
-Enhancement on object-native data; this one covers the metadata. Every data
-location must be an object store that every instance needing its files can
-read.
+- **Several logs per dataset,** if one log's commit rate saturates or each
+  region should commit to its own. A snapshot becomes a position in each log.
+  Kept possible by opaque snapshot positions and the decision-object protocol
+  (decision 1.3) and by footprints (3.1). Placement and atomicity across logs
+  need their own design; a cross-log commit costs an extra round trip.
+- **Coordinated commits for contended keys:** a lease-elected committer
+  batches writers' changes into single records, with no external service
+  (Delta Lake's coordinated commits use a separate coordinator). Kept possible
+  by decision 2.2.
+- **Atomic reads across datasets** through a catalog frontier of mutually
+  consistent `(dataset, commit)` vectors. Kept possible by decision 1.3.
+- **Cross-node consistency.** Commit numbers returned with acknowledgements are
+  read-your-writes tokens (decision 1.8): a read that waits for the head to
+  reach a token sees that write, but may miss later commits that completed
+  before it started. A linearizable read sends a head GET after it starts and
+  serves at least the commit that GET returns (decision 1.1). Either kind of
+  strict read excludes the buffer, or the dataset publishes at commit (1.2).
+- **Tiered storage beneath the destination:** ephemeral disk, then persistent
+  disk, then S3, acknowledged once data reaches the first object store tier.
+  Kept possible by acknowledgement points (decision 1.2).
 
 ---
 
-# Milestones 2 and 3: concurrent metastore
+# Key decisions
 
-*Note: The decisions below are settled. What is still open waits on evidence,
-not on design: decision 3.4 (a measurement on Milestone 1's code), and wider
-model checks that join maintenance and transactions with failures and GC.
-Measurements on Milestone 1 may still adjust details.*
+## Milestone 1
 
-Several writers commit to one dataset whenever their data is independent.
-Milestone 2 adds the maintenance writers; Milestone 3 adds the rest:
+**1.1 One conditional write commits: a CAS of the dataset's head.** The head
+carries the newest commit records, so a CAS on its version both orders and
+accepts a commit, and a stale writer's CAS fails. Guards are checked locally
+against the exact version the CAS replaces, and acceptance is all-or-nothing.
+A lost response resolves to *accepted*, *rejected* or *unresolved* by reading
+the head, or by resending the identical CAS while the head is still at the
+version it replaces; a failed resend is resolved again from the head. While
+the head is unreadable, the writer retries the read, never the write. Older records move into immutable
+batches the head lists. This extends the commit point of the existing
+`object_store_occ` WAL so that a poll is one request and a cold open is two
+dependent steps: the head, then the checkpoint root and batches in parallel.
+Apache Iceberg commits the same way, and S3's conditional writes (2024) let
+the object store itself coordinate.
+*Details:* [The write path](object-native-metastore-technical.md#the-write-path).
 
-| Milestone | Write pattern | Example | Why writers are independent |
-|---|---|---|---|
-| 2 | Distributed maintenance | Compaction, bake, cold promotion on any node | Leases over file sets avoid duplicate work; guards keep it correct |
-| 3 | Append | Log, event or metric ingest from several instances; no PK | Appends always commute |
-| 3 | Disjoint keys | OLTP-style writers owning key sets; metric appenders each owning services, keyed `(service, metric, ts)` | Their key sets do not intersect |
-| 3 | Partitioned ordered CDC | A writer per Kafka/Debezium partition, DynamoDB shard, or PostgreSQL slot | The source routes each key to one partition |
-| 3 | Distributed query write | A full refresh or `INSERT … SELECT` run as many tasks | One job commit for all tasks |
-| 3 | Read-dependent write | `UPDATE … WHERE` or a transaction alongside ingestion | Validation finds the commits that changed rows it read |
+- *Considered: a numbered log* (`log/<pos>` per commit, as in Delta Lake and
+  SlateDB). Prototyped and timed. A create orders a commit
+  without accepting it, so it needs a GC boundary checked after every create,
+  no-op fill and fence records, about twice the reader requests per poll and
+  slower cold opens. Rejected.
+- *Considered: append to a log object.* Supported on S3 Express, Azure and GCS
+  zonal buckets but not S3 Standard or most S3-compatible stores, and billed
+  as a write everywhere. Rejected.
 
-**The aim: no declared table layout for write safety.** A user should not have
-to `partition_by` a table to let writers run concurrently. Writers prove their
-independence at commit time, and partitioning and sort order become read-layout
-choices that compaction can change.
+**1.2 Commit when something must be acknowledged, not on every write.** Writes
+accumulate in the mem-tier, Cayenne's existing in-memory write buffer, and
+commit as one record at an *acknowledgement point*: a CDC position to
+acknowledge (~2 s), a SQL `COMMIT`, a freshness bound, or a buffer size or age
+bound. The acknowledgement is sent only after the commit succeeds; losing the
+buffer loses only unacknowledged work, which the source replays. On a local
+directory each write is flushed before it returns. Committing every CDC burst
+would cost a dataset about 20 head writes per second; a 2 s cadence costs 0.5,
+and 60 s one a minute. Milestone 1 keeps today's local visibility:
+buffered writes are queryable on the writing node once applied.
 
-**Assumption: writes are mostly non-conflicting.** Partitioned CDC writers,
-appenders and owners of disjoint keys rarely or never touch the same keys. The
-commit protocol is optimistic and built for that case. A workload with heavy
-contention on shared keys would need a coordinated commit layer on top (see
-[possible future improvements](#milestone-n-possible-future-improvements)).
+- *Option: publish at commit.* No read sees an uncommitted value, at the cost
+  of up to one commit interval plus the CAS of freshness on the ingesting node
+  (about 2 s plus 30–100 ms on S3 Standard). Independent of decision 3.4.
+- *Alternative: a persistent disk-backed buffer.* Shorter replay after a
+  crash, but not needed for correctness, and a second log format. Not in
+  Milestone 1; its general form is tiered storage (Future work).
 
-**Contention.** Writers lose races only when they commit at the same moment.
-Take one log, each writer flushing every 2 s, and about 50 ms per conditional
-write: with 4 writers, about 10% of commits race; with 20 writers, about 40%. A
-race between independent writers costs a retry, not an abort. A single log
-saturates near `1 / (conditional-write latency)` commits per second, which is
-the ceiling a future several-logs improvement would lift.
+**1.3 A transaction domain per dataset.** One log per accelerated dataset, so a
+commit across its partitions is one record. A small catalog log holds the
+name registry. The rare transaction across datasets uses a create-if-absent
+decision object, and its outcome becomes visible only through a `Resolve`
+record in each dataset's log. Snapshot tokens are `(dataset, commit)` vectors,
+so a consistent cross-dataset read stays possible. This gives the most
+concurrency Milestones 2 and 3 can use.
+*Details:* [Multi-table transactions across datasets](object-native-metastore-technical.md#multi-table-transactions-across-datasets).
 
-## Key decisions
+- *Alternative: one head per catalog.* Cross-dataset transactions and reads
+  become atomic, but one head takes about 20 commits per second on S3 Standard
+  for the whole catalog (100 datasets at 2 s need 50), any second writer races
+  on every commit, every poll downloads every dataset's records, and one lease
+  owns the catalog. Rejected; adopting it later would be a migration.
+- *Alternative: one log per transaction group.* Rejected: the groups need
+  configuration or inference.
+- *Alternative: one log per partition.* Rejected: fan-out writes and
+  partitioned overwrites would need distributed transactions, table-wide state
+  would have no home, readers would merge logs from day one, and concurrency
+  would depend on declared layout.
 
-Details for all of them are in
-[Milestones 2 and 3: concurrent writers](object-native-metastore-technical.md#milestones-2-and-3-concurrent-writers).
-Decisions 2.1 and 2.2 are what Milestone 2 needs; decisions 3.1 to 3.5 come with Milestone 3.
+**1.4 Data out of the log; checkpoints chunked and incremental.** Records carry
+small typed actions. Manifests, deletion-vector lists, statistics and cold-tier
+manifests are immutable objects with fresh names; each reference carries the
+object's BLAKE3 digest, which checks its bytes. A checkpoint is a small root
+plus sorted, size-bounded pages and rewrites only the pages that changed. The
+PK index is one of its collections, so it never needs history GC has removed.
+Opening a dataset reads the latest checkpoint plus the records after it.
+*Details:* [What the state holds](object-native-metastore-technical.md#what-the-state-holds).
+
+**1.5 Small writes are buffered; the inline tier is retired once its
+replacement is measured.** Today small writes are Arrow IPC rows inside
+SQLite. Here they accumulate in the mem-tier and are written at the next
+commit, so file count follows commit cadence, not write rate. A small commit
+(a one-row `INSERT; COMMIT`, a CDC batch of a few KiB) carries its rows inline
+in its record until the next checkpoint writes them as a level-0 file, so it
+is one round trip. The SQL inline tier goes only once this meets the bar
+measured against it, including a caching workload that depends on it today.
+*Details:* [Small writes](object-native-metastore-technical.md#small-writes).
+
+**1.6 File-level actions from day one.** Even with one writer, records use
+`AddFiles`, `RemoveFiles`, `ReplaceFiles` and `AddDeleteFiles`, and the
+current snapshot is derived state. It costs little now and lets Milestone 2
+run compaction beside other writers.
+
+**1.7 Not SlateDB.** SlateDB is a well-built LSM on object storage with one
+writer per database ("SlateDB ensures a single writer through a formally
+verified manifest fencing protocol, but supports multiple readers",
+[slatedb.io](https://slatedb.io/), read 2026-10-26), no published plan for
+multiple writers, and no atomic commit across databases. Milestone 3's writers
+would each need a database, breaking cross-partition commits and remote
+maintenance, or a funnel process, an added service. It also does not fsync on
+a local directory, and its compaction of a large mutable keyspace solves a problem
+decision 1.4 avoids. Its fencing and GC primitives (`slatedb-txn-obj`) informed
+the GC design.
+
+**1.8 Two numbers: commit numbers name states, `seq`s order mutations.** Every
+accepted record, data or maintenance, gets the next commit number, which names
+the state after it: snapshot tokens and checkpoints use it.
+Cayenne's sequence numbers (`seq`s) stay as they are, drawn per write per
+table while buffering. Within each table, every `seq` in a record is above
+every `seq` in earlier records, so `seq` order is commit order and Milestone 1
+changes no allocation or stamping code. Iceberg splits snapshot and data
+sequence numbers the same way.
+*Details:* [Commit numbers and sequence numbers](object-native-metastore-technical.md#commit-numbers-and-sequence-numbers).
+
+- *Alternative: name states by `seq`.* Compaction and schema changes draw no
+  `seq`, so two states and their checkpoints would share a name (the model
+  finds both). Rejected.
+- *Alternative: one `seq` rule per dataset.* It refuses correctly allocated
+  records that span partitions, which have their own allocators (the model
+  finds it); one allocator per dataset changes code per-table transactions
+  depend on. Rejected.
+- *Alternative: `seq` blocks reserved per writer.* `seq` order would diverge
+  from commit order, and every cross-key comparison would be rewritten.
+  Rejected.
+
+**1.9 Source positions commit with the state they cover.** CDC positions live
+today in `spice_sys_*` sidecar tables, written separately from data. Here an
+`AdvanceSourcePosition` action rides in the same record as its state, so a
+replacement resumes without the old instance's disk. A backfill beside live
+CDC adds one rule: a live change after the backfill's snapshot position wins.
+*Details:* [Source positions and backfill](object-native-metastore-technical.md#source-positions-and-backfill).
+
+**1.10 GC deletes removed objects after a fixed retention, collects uploads
+that never committed by age on the store's clock, and readers never write.**
+A read returns the object it references or fails the query, so GC's timing
+decides only which long queries can fail, never which rows a query returns.
+
+- *Removed objects* are deleted a fixed retention T (about an hour) after GC
+  observes the removal. The log says what left, so no LIST is needed, as in
+  Delta Lake and Iceberg.
+- *Pending removals are durable:* checkpoint roots carry them until the
+  delete, and a takeover restarts their timers.
+- *Readers write nothing.* A query starts from a head confirmed within S of
+  when its GET was sent, so every object it needs survives at least T − S.
+  One that outlives that may fail, with an error saying to rerun it; it never
+  gets other rows. A read-only node needs only read access.
+- *Uploads that never committed* are collected by age on the store's clock.
+  Every object has a fresh name (its identity plus its owner: the leased unit
+  that created it and that unit's generation). GC deletes an unreferenced upload once the head's
+  `LastModified` is T_O (about a day) past the upload's. A writer references
+  only objects live in its CAS base or its own never-published uploads, and
+  refuses an upload once its base's store time is T_O minus a margin past the
+  upload's, uploading again instead. So a commit landing after GC read the
+  head would have refused the upload. No head move or recheck is needed for
+  safety; GC's empty commit on an idle head only lets ages advance.
+- *No clock is compared across machines.* Ages are differences of store
+  timestamps; GC times removals on its own clock.
+- *Versioned buckets and one-way replication* are supported ([#15760](https://github.com/spiceai/spiceai/issues/15760) Stage 2).
+  Data replicates in any direction. The state has one writable copy, because a
+  conditional write is atomic only within one bucket; it may replicate one way,
+  to a copy nothing writes, with no failover to it. On a versioned bucket, GC
+  deletes without a version id so the delete marker replicates, then removes
+  noncurrent versions.
+- T and T_O are internal constants. An upload that cannot commit within T_O is
+  split across commits; if that binds, a `PREPARE_UPLOAD` record can protect it
+  by reference until it commits or a `RELEASE_UPLOAD` drops it.
+
+Model: `retention*`; with any rule removed, a committed state references a
+deleted object or a query within the retention fails.
+*Details:* [Garbage collection](object-native-metastore-technical.md#garbage-collection).
+
+- *Alternative: leased reader pins,* as SlateDB's readers keep checkpoints
+  alive. Rejected: a paused reader fails past its lease anyway, and pins cost
+  every reader write access, renewals and a recheck. Delta Lake, Iceberg and
+  Hudi protect readers with a retention bound, and none has readers register.
+- *Alternative: object generations* that GC lists only once no live writer uses
+  them. Rejected: it avoids listing the whole prefix, but needs generation closes across nodes, an interlock, an
+  admission guard for reused addresses and repeated sweeps.
+- *Alternative: the writer ages uploads on its own clock, and GC waits for the
+  head to move and rechecks.* Rejected: a store clock running ahead lets GC
+  delete an upload the writer thinks young.
+- *Alternative: GC times candidates from the first LIST that saw them.*
+  Rejected: GC would remember listings, and a restart restarts every wait.
+
+## Milestones 2 and 3
+
+Decisions 2.1 and 2.2 are what Milestone 2 needs; 3.1 to 3.5 come with
+Milestone 3.
+*Details:* [Milestones 2 and 3](object-native-metastore-technical.md#milestones-2-and-3-concurrent-writers).
 
 **2.1 A writer that loses a race retries if the winners did not touch what it
-depends on.** The losing writer checks its guards and footprint against the
-commits that won, and the outcome has four classes: compatible (retry
-unchanged), rebasable (transform the actions, for example remapping a position
-delete onto a compaction's outputs), retryable (re-plan from the new state), or
-incompatible (return the conflict). This is safe because actions never carry
-values computed from what was read.
+depends on.** It checks its guards and footprint against the winners, with
+four classes: compatible (retry unchanged), rebasable (transform the actions,
+such as remapping a position delete onto a compaction's outputs), retryable
+(re-plan) or incompatible (return the conflict). This is safe because actions
+never carry values computed from what was read.
 
 **2.2 Leases coordinate work; guards guarantee correctness.** CDC writers hold
 one lease per source partition, and maintenance nodes lease a deterministic
 unit. A lost lease or a racing node fails its guard and wastes work; it cannot
-corrupt state.
+corrupt state. A lease turnover is a head commit, because the unit's
+generation is in the dataset's state, so a plan from an older generation loses
+its CAS. A retry checks the unit's generation in the head it lost to before
+rebasing, and an expired unit re-plans. Model: `remote-maintenance*`.
 
 **3.1 Commits publish key footprints,** checked cheapest first: PK hash buckets
-and per-file min/max in the record, then the commit's keys as sorted 64-bit
-digests, compared by one linear merge. A digest collision can only report a
-false conflict, never miss a real one. Bloom filters are not used: their false
-positives compound over a commit's keys (at 1% per key, a 1,000-key commit
-almost always matches), so they decide only small commits and the digests are
-needed anyway.
+and per-file min/max, then the keys as sorted 64-bit digests compared by one
+linear merge. A digest collision can only report a false conflict. Bloom
+filters are not used: at 1% per key, a 1,000-key commit almost always matches,
+so they decide only small commits and the digests are needed anyway.
 
-**3.2 Overlapping keys are resolved by the writers.** Writers whose keys do not
-overlap need no resolution and no coordination, which is the common case. When
-keys can overlap, Milestone 3 supports abort-and-re-plan and key-range ownership.
-Source-version ordering, where the highest source version of a key wins, is
-deferred until a concrete use case justifies its new semantics and surface.
+**3.2 Overlapping keys are resolved by the writers:** abort-and-re-plan or
+key-range ownership. Disjoint writers need neither. Source-version ordering is
+deferred until a concrete use case justifies its semantics and surface.
 
-**3.3 Distributed execution writes by source partition, not table partition.** A
-distributed query commits once with every successful task's output; distributed
-ingest assigns source partitions to executors, each an independent writer.
+**3.3 Distributed execution writes by source partition, not table partition.**
+A distributed query commits once with every successful task's output;
+distributed ingest gives each executor source partitions, as an independent
+writer.
 
-**3.4 Open: how a writer that loses a race keeps `seq` order,** decided by
-measurement. A losing writer's buffered `seq`s are below the winner's, and the
-rule that, within a table, every record is above every earlier one must still
-hold. Two options:
-
-- *(a) Shift the buffer.* Move every buffered `seq` up by the same amount,
-  above the winner's, in each table they share. No change to how Cayenne stamps today, but the shift
-  re-stamps the window's keys in the in-memory indexes, bounded by one commit
-  interval of the writer's own work.
-- *(b) Coalesce eagerly and stamp at commit.* The buffer keeps a set of keys
-  the window affected and a set of rows it inserted; a key affected but not
-  inserted is deleted. Local reads treat the buffer as newer than committed
-  data, so they need no `seq`, and the final `seq`s are stamped once, when the
-  commit succeeds, so a lost race renumbers nothing. It changes the mem-tier's
-  apply path.
-
-The choice rests on measuring the shift for a realistic window against a
-retry's round trips; (a) unless that is expensive. It is independent of
-publishing at commit (decision 1.2).
+**3.4 Open: how a writer that loses a race keeps `seq` order.** Its buffered
+`seq`s are below the winner's, and decision 1.8's per-table rule must hold.
+*(a) Shift the buffer* above the winner's in each shared table: no stamping
+change, but it re-stamps the window's keys in the in-memory indexes, bounded by one commit
+interval of the writer's own work. *(b)
+Coalesce eagerly and stamp at commit:* the buffer tracks affected keys and
+inserted rows, local reads treat it as newest, and `seq`s are stamped when the
+commit succeeds; it changes the mem-tier's apply path. (a) unless measuring
+the shift against a retry's round trips shows it is expensive. Independent of
+publishing at commit.
 
 **3.5 Read-dependent writes validate what they read.** An `UPDATE … WHERE`,
 `DELETE … WHERE`, `INSERT … SELECT` or transaction records the keys it looked
 up and the predicates it scanned. On a lost race it conflicts only with
 winners that wrote one of those keys or changed a row matching one of those
-predicates, before or after the change; a conflict re-runs the statement on
-the new head. The state at every commit then equals running the accepted
-writes one at a time in commit order. This lands last in Milestone 3; until then
-the check is coarser, and any commit to a table the write read is a conflict.
+predicates, before or after the change, and re-runs on the new head. Every
+commit's state then equals running the accepted writes one at a time in
+commit order. Checking written keys alone is not enough: with rows
+`r(a=0, b=1)` and `s(a=1, b=0)`, `UPDATE t SET b = b + 1 WHERE a = 1` writes
+only `s` and `UPDATE t SET a = a + 1 WHERE b = 1` writes only `r`. Their written
+keys are disjoint, yet both commit to `r(1, 1), s(1, 1)`, where either serial
+order gives `s(2, 1)` or `r(1, 2)`. Until this lands, any commit to a table the write read is a
+conflict.
 
 - *Alternative: one read-dependent write at a time,* with blind writes checked
-  only by key footprints. Rejected: a blind upsert can change a row into one
-  the write's predicate matches, and the write then commits a stale plan. It
-  needs validation against blind writers anyway.
-
-## Multi-region
-
-- **Replication: data in any direction, state one way.** Data objects are
-  immutable with fresh names, so they can be replicated freely. The state
-  location has exactly one writable copy: a conditional write is atomic only
-  within one bucket, so two writable copies would let two writers both hold
-  the lease and the merge drop acknowledged commits. It may replicate one way to
-  a copy nothing writes; failing over to that copy is not supported.
-- **Write in one region, read in others:** supported, with writers, the lease
-  and GC on the source, in two patterns:
-  - *one state location and replicated data:* readers poll the source head and
-    read files from the nearest replica, falling back to the source for a file
-    not yet replicated. Query bytes cross regions once, by replication;
-  - *one-way replicated state:* regional readers also poll their replica. A
-    replica exposes only a readable frontier, a head whose newly referenced
-    objects it has confirmed present, and a reader never adopts a lower head.
-    Freshness adds the replication lag.
-- **Versioned buckets** (which replication requires): GC deletes without a
-  version id so the delete marker replicates, and noncurrent versions are then
-  removed.
-- **Writers in several regions over disjoint keys:** supported, against one
-  bucket (paying cross-region latency per commit), or with a log per region (a
-  possible future improvement).
-- **Overlapping keys across regions:** only with key ownership.
-- **One atomic commit across regions:** out of scope.
+  only by footprints. Rejected: a blind upsert can turn a row into one the
+  predicate matches, so validation against blind writers is needed anyway.
 
 ---
 
-# Implementation roadmap
+# Related storage
 
-The [technical design's roadmap](object-native-metastore-technical.md#implementation-roadmap) orders the work
-as discrete changes, each shipping on its own, and each with an exit proof:
+## The datalake tier
 
-1. The head log in `object_store_occ`, proven under the WAL's existing test
-   suite and on S3 Standard, S3 Express, RustFS and a local directory.
-2. Cayenne's catalog changes expressed as actions, with the SQL metastore
-   still authoritative and a differential check that both agree.
-3. A shadow log written alongside the SQL metastore, on real workloads.
-4. Data files in the destination, and readers that open from the shadow in
-   tests and the benchmark harness.
-5. The object-native metastore as the authority for new datasets, behind the
-   flag. Its records can reference data files still on local disk until step
-   4's placement lands, so the metadata work does not wait on the data work;
-   until then, recovery is limited to that disk.
-6. Existing datasets keep the metastore they are on; moving one means deleting
-   its acceleration so it re-bootstraps from its source. Metastore contents are
-   not migrated, and nothing switches automatically.
-7. On by default, once a second instance on the same destination can no
-   longer race the writer: either read-only support or detection that
-   refuses it.
-8. Removal of the SQL metastore.
+Today's datalake tier is about where data lives; that belongs to the
+object-native data Enhancement ([#15818](https://github.com/spiceai/spiceai/issues/15818)). This design is about object-native
+metadata. Milestone 1 maps the tier as it is: a promotion is one record, the
+new cold manifest plus the removal of the promoted warm files, and its GC roots
+in the destination. Existing datalake locations keep working.
 
-The format is in real use from step 3, first as a follower; the default
-changes only after re-bootstrap and recovery are shown, and the old code goes
-last. Milestones 2 and 3 build on the object-native path only; removing the SQL
-metastore (step 8) can proceed alongside them.
+## Multi-region
 
-# Open decisions
+Not in any milestone. Replicating data, and the state one way, is Milestone 1
+(decision 1.10). These rules keep the rest possible:
 
-Both open decisions wait on measurements, not on design.
+- **Write in one region, read in others.** Regional read-only replicas are a
+  separate Enhancement. Writers, the lease and GC use the source. Regional
+  readers wait for replication by default: a reader adopts a head only once
+  every object it newly references is in its replica, so no query reads across
+  regions.
+- **Writers in several regions** over disjoint keys use one bucket; overlapping
+  keys need key ownership; no commit is atomic across regions.
 
-- **What replaces per-dataset `mode: memory`.** The preferred answer is
-  nothing: the same metastore for every dataset, with the runtime finding that
-  a table is small enough to hold in memory. Whether that works depends on
-  measurements and details not yet available. It is user-facing surface, so the
-  answer goes through the Enhancement.
-- **How a writer that loses a race keeps `seq` order** (decision 3.4): shift
-  the buffer, or coalesce eagerly and stamp at commit, decided by measuring the
-  shift on Milestone 1's code.
+---
+
+## Open decisions
+
+The open decisions, with what decides each and the step that needs it, are one
+list in the
+[technical design](object-native-metastore-technical.md#open-decisions).
+
+## User-facing surface
+
+The surface (the flag, the `cayenne/v1/` folder, defaults, deprecations,
+errors, logs and metrics) is in
+[Enhancement #15760](https://github.com/spiceai/spiceai/issues/15760). Nothing
+in this design adds a user decision beyond `runtime.state.location`.

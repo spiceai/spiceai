@@ -21,7 +21,6 @@ use crate::cluster::PartitionStore;
 use crate::cluster::ResolvedClusterConfig;
 use crate::cluster::SchedulerHeartbeatStore;
 use crate::cluster::partition::service::PartitionService;
-#[cfg(not(windows))]
 use crate::config::ClusterRole;
 use crate::config::Config;
 use crate::datafusion::builder::{CayenneOptimizerRules, OutputPreview};
@@ -38,12 +37,12 @@ use crate::{
     status,
 };
 use app::App;
-#[cfg(not(windows))]
 use runtime_acceleration::CayenneAccelerationDemand;
 use runtime_acceleration::acceleration::{RefreshMode, unset_refresh_mode_for_connector};
 use runtime_metrics as metrics;
 use spicepod::component::caching::CacheKeyType;
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
+use spicepod::component::runtime::RuntimeMode;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;
 use spicepod::component::runtime::TelemetryConfig;
@@ -380,6 +379,11 @@ impl RuntimeBuilder {
         document_parse::register_all().await;
 
         let query = spicepod_rt.query.clone().unwrap_or_default();
+        if spicepod_rt.mode == RuntimeMode::Sidecar {
+            tracing::info!(
+                "Runtime mode: sidecar. Remote Spice reads use Substrait plans created locally."
+            );
+        }
 
         let memory_limit = parse_memory_limit(query.memory_limit.clone());
         let target_partitions = query.target_partitions;
@@ -804,6 +808,7 @@ impl RuntimeBuilder {
         )
         .memory_limit(memory_limit)
         .target_partitions(target_partitions)
+        .runtime_mode(spicepod_rt.mode)
         .max_concurrent_queries(max_concurrent_queries)
         .prefer_hash_join(query.prefer_hash_join)
         .eager_aggregation(query.eager_aggregation)
@@ -878,6 +883,7 @@ impl RuntimeBuilder {
         };
 
         let mut rt = Runtime {
+            mode: spicepod_rt.mode,
             app: shared_app,
             apply_app_lock: Arc::new(tokio::sync::Mutex::new(())),
             initial_load: Arc::new(crate::InitialLoad::default()),
@@ -1353,7 +1359,6 @@ pub fn streams_cdc_changes(app: Option<&Arc<app::App>>) -> bool {
 /// This enumerates component kinds by hand because it runs *before* initialization,
 /// against the Spicepod — the pre-init counterpart of the `AccelerationSource`
 /// trait that datasets and views both implement once components exist.
-#[cfg(not(windows))]
 fn cayenne_workload(app: Option<&Arc<app::App>>) -> CayenneWorkload {
     let Some(app) = app else {
         return CayenneWorkload::default();
@@ -1364,13 +1369,6 @@ fn cayenne_workload(app: Option<&Arc<app::App>>) -> CayenneWorkload {
             needs_compaction: compacts_into_carved_pool(&accel, profile),
         })
     })
-}
-
-/// Cayenne is not compiled on Windows (`accelerator-cayenne` is a `cfg(not(windows))`
-/// dependency), so no acceleration there can demand anything of the host.
-#[cfg(windows)]
-fn cayenne_workload(_app: Option<&Arc<app::App>>) -> CayenneWorkload {
-    CayenneWorkload::default()
 }
 
 /// Whether an enabled Cayenne acceleration can compact into the carved compaction
@@ -1384,7 +1382,6 @@ fn cayenne_workload(_app: Option<&Arc<app::App>>) -> CayenneWorkload {
 /// - **A profile that accumulates files.** A whole-table replace discards what the
 ///   previous refresh wrote, leaving nothing to consolidate; every other profile
 ///   builds files up across writes.
-#[cfg(not(windows))]
 fn compacts_into_carved_pool(
     accel: &spicepod::acceleration::Acceleration,
     profile: data_accelerator_api::SpicepodWriteProfile,
@@ -1402,18 +1399,12 @@ fn compacts_into_carved_pool(
 /// An accelerated catalog counts once, not once per table: how many tables it
 /// discovers is unknowable before the connector connects. The count is a log line
 /// about which configuration earned the carve, not a table census.
-#[cfg(not(windows))]
 fn count_compaction_eligible_accelerations(app: Option<&Arc<app::App>>) -> usize {
     app.map_or(0, |app| {
         cayenne_accelerations(app)
             .filter(|(accel, profile)| compacts_into_carved_pool(accel, *profile))
             .count()
     })
-}
-
-#[cfg(windows)]
-fn count_compaction_eligible_accelerations(_app: Option<&Arc<app::App>>) -> usize {
-    0
 }
 
 /// The Cayenne memory decisions the Runtime builder makes at startup.
@@ -1490,7 +1481,6 @@ fn plan_cayenne_memory_budgets(
 /// at all — [`cayenne_accelerations`] converts a catalog's `CatalogAcceleration`
 /// and drops the catalogs that have none, which is every catalog of this shape.
 /// It is the one way a pod hosts Cayenne tables that no acceleration block names.
-#[cfg(not(windows))]
 fn reads_from_cayenne_catalog(app: &Arc<app::App>) -> bool {
     app.catalogs.iter().any(|catalog| {
         catalog
@@ -1507,16 +1497,8 @@ fn reads_from_cayenne_catalog(app: &Arc<app::App>) -> bool {
 /// acceleration of its own (see [`reads_from_cayenne_catalog`]), so gating the
 /// startup log on [`CayenneWorkload::is_configured`] alone would suppress it for
 /// a catalog-only pod even though that pod installs and uses the cache.
-#[cfg(not(windows))]
 fn cayenne_configured_for_startup_log(app: Option<&Arc<app::App>>) -> bool {
     cayenne_workload(app).is_configured() || app.is_some_and(reads_from_cayenne_catalog)
-}
-
-/// Cayenne is not compiled on Windows (`accelerator-cayenne` is a
-/// `cfg(not(windows))` dependency), so no catalog can read from it either.
-#[cfg(windows)]
-fn cayenne_configured_for_startup_log(app: Option<&Arc<app::App>>) -> bool {
-    cayenne_workload(app).is_configured()
 }
 
 /// Every enabled Cayenne acceleration in `app`, paired with its RESOLVED write
@@ -1542,7 +1524,6 @@ fn cayenne_configured_for_startup_log(app: Option<&Arc<app::App>>) -> bool {
 ///
 /// The yielded acceleration is therefore owned for a catalog and borrowed for the
 /// two component kinds that declare one directly.
-#[cfg(not(windows))]
 fn cayenne_accelerations(
     app: &Arc<app::App>,
 ) -> impl Iterator<
@@ -1593,7 +1574,6 @@ fn cayenne_accelerations(
 ///
 /// Reached through the registration slice rather than by naming the engine crate, which
 /// the runtime must not depend on.
-#[cfg(not(windows))]
 pub(crate) fn cayenne_write_profile(
     acceleration: &spicepod::acceleration::Acceleration,
     unset_refresh_mode: RefreshMode,
@@ -1647,7 +1627,6 @@ pub(crate) fn cayenne_write_profile(
 /// before the connector connects. Under-counting a catalog leaves the query pool
 /// larger than the tables warrant, but counting it as zero — which is what excluding
 /// catalogs did — reserves nothing at all for a pod built entirely on one.
-#[cfg(not(windows))]
 fn estimate_cayenne_reservation_bytes(
     app: Option<&Arc<app::App>>,
     runtime_params: &HashMap<String, String>,
@@ -1759,16 +1738,6 @@ fn estimate_cayenne_reservation_bytes(
             .saturating_add(vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or(0));
     }
     total
-}
-
-/// Cayenne is not compiled on Windows (`accelerator-cayenne` is a `cfg(not(windows))`
-/// dependency), so nothing there holds an off-pool Cayenne cache.
-#[cfg(windows)]
-fn estimate_cayenne_reservation_bytes(
-    _app: Option<&Arc<app::App>>,
-    _runtime_params: &HashMap<String, String>,
-) -> u64 {
-    0
 }
 
 /// Deduped-by-instance summary of the `DuckDB` accelerators in `app`, for the
@@ -2183,7 +2152,6 @@ mod test {
         );
     }
 
-    #[cfg(not(windows))]
     fn dataset_with_cayenne(
         name: &str,
         segment_cache_mb: Option<&str>,
@@ -2208,7 +2176,6 @@ mod test {
     /// A pod with no Cayenne acceleration must reserve nothing. The reservation is
     /// subtracted from the query memory limit, so counting a cache that is never
     /// installed would shrink every query's budget for memory nothing allocates.
-    #[cfg(not(windows))]
     #[test]
     fn no_cayenne_acceleration_reserves_nothing() {
         let app = Arc::new(
@@ -2229,7 +2196,6 @@ mod test {
     /// The counterpart to the no-Cayenne case: a pod that does have a Cayenne
     /// table reserves its write-path state, so the gate above is what decides,
     /// not an empty estimator.
-    #[cfg(not(windows))]
     #[test]
     fn a_cayenne_acceleration_reserves_its_write_path_state() {
         const MIB: u64 = 1024 * 1024;
@@ -2269,7 +2235,6 @@ mod test {
     /// Asserts the reservation for `app` is `write_path` plus the process-wide
     /// segment cache. That cache is installed at most once per process, so the
     /// estimate, which reads it between the two reads here, matches one of them.
-    #[cfg(not(windows))]
     fn assert_cayenne_reservation(app: &Arc<app::App>, write_path: u64) {
         let cache_before = vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or(0);
         let estimate = estimate_cayenne_reservation_bytes(Some(app), &HashMap::new());
@@ -2284,7 +2249,6 @@ mod test {
     /// A catalog-only pod hosts Cayenne tables with no dataset acceleration block,
     /// so the reservation has to see it or the shared cache grows beside a query
     /// pool that never accounted for it.
-    #[cfg(not(windows))]
     #[test]
     fn a_cayenne_catalog_reserves_even_without_a_dataset_acceleration() {
         let catalog =
@@ -2562,7 +2526,6 @@ mod test {
         ds
     }
 
-    #[cfg(not(windows))]
     fn cayenne_test_view(
         name: &str,
         accel: spicepod::acceleration::Acceleration,
@@ -2593,7 +2556,6 @@ mod test {
     /// `DataAccelerator::init` path as a dataset, so Cayenne on a view must count
     /// toward the compaction-pool gate — otherwise a view-only Cayenne pod carves no
     /// compaction pool and sizes its query pool as if no Cayenne tier existed.
-    #[cfg(not(windows))]
     #[test]
     fn cayenne_workload_counts_views_and_datasets() {
         use spicepod::component::dataset::Dataset;
@@ -2655,7 +2617,6 @@ mod test {
     /// mode, not merely on Cayenne being present: a full-refresh-only pod has no
     /// reachable in-memory CDC tier to reserve host RAM for, and nothing for
     /// compaction to consolidate.
-    #[cfg(not(windows))]
     #[test]
     fn cayenne_workload_separates_cdc_tier_from_compaction() {
         use spicepod::acceleration::RefreshMode;
@@ -2740,7 +2701,6 @@ mod test {
     /// default, so the pre-init classifier must apply the same connector defaults.
     /// Assuming `full` for an unannotated `debezium:`/`cdc:` dataset would classify
     /// a genuine CDC pod as a whole-table replace and under-provision its memory.
-    #[cfg(not(windows))]
     #[test]
     fn cayenne_workload_honors_connector_unset_refresh_defaults() {
         let workload_for = |from: &str| {
@@ -2870,7 +2830,6 @@ mod test {
 
     /// One accelerated dataset for [`cayenne_budget_app`], as
     /// `(engine, enabled, mode, refresh_mode, refresh_check_interval)`.
-    #[cfg(not(windows))]
     type DatasetSpec<'a> = (
         &'a str,
         bool,
@@ -2881,7 +2840,6 @@ mod test {
 
     /// Build a Spicepod app from `datasets`, plus `cayenne_views` Cayenne-accelerated
     /// file-mode views.
-    #[cfg(not(windows))]
     fn cayenne_budget_app(datasets: Vec<DatasetSpec<'_>>, cayenne_views: usize) -> Arc<app::App> {
         use spicepod::acceleration::{Acceleration, Mode};
         use spicepod::component::{dataset::Dataset, view::View};
@@ -2920,7 +2878,6 @@ mod test {
     /// file-mode and on a write profile that accumulates files, so only those are
     /// counted. Views never qualify today: `ViewBuilder::try_from` rejects every view
     /// refresh mode except `full`, a whole-table replace.
-    #[cfg(not(windows))]
     #[test]
     fn count_compaction_eligible_accelerations_counts_only_eligible_accelerations() {
         use spicepod::acceleration::{Mode, RefreshMode};
@@ -3183,7 +3140,6 @@ mod test {
     ///
     /// Asserted against an equivalent dataset rather than against literals, so the
     /// two component kinds cannot drift apart as the classification evolves.
-    #[cfg(not(windows))]
     #[test]
     fn cayenne_workload_counts_accelerated_catalogs() {
         use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
@@ -3288,7 +3244,6 @@ mod test {
     /// REACHABLE (`uses_cdc_tier`) rather than on the carve: the query-pool default
     /// is itself reduced to leave room for that tier, so a pod that cannot reach it
     /// would otherwise pay that haircut for nothing.
-    #[cfg(not(windows))]
     #[test]
     fn cayenne_memory_budgets_are_reserved_only_for_an_eligible_dataset() {
         use spicepod::acceleration::{Mode, RefreshMode};
@@ -3425,7 +3380,6 @@ mod test {
     /// with no ceiling installed every mem-tier reserve succeeds unconditionally —
     /// the coordinated host partition would hold on paper while the tier grew
     /// unbounded, which is the shape of the SF1000 process OOM it exists to prevent.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn memory_mode_cdc_pod_installs_the_mem_tier_budget_without_a_compaction_runtime() {
         use spicepod::acceleration::{Mode, RefreshMode};

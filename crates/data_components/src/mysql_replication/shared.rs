@@ -2138,10 +2138,37 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                     // idle-credit of members with no change) folds it into their
                     // executed sets for failover-safe resume.
                     txn_open = true;
-                    current_txn_gtid =
-                        Some((uuid::Uuid::from_bytes(gtid_event.sid()), gtid_event.gno()));
                     current_txn_commit_ts_ms =
                         immediate_commit_ts_ms(gtid_event.immediate_commit_timestamp());
+                    let source_uuid = uuid::Uuid::from_bytes(gtid_event.sid());
+                    if let Some(tag) = gtid_event.tag() {
+                        // A tagged GTID (`uuid:tag:gno`, MySQL 8.3+) numbers its
+                        // transactions apart from the source's untagged ones, and
+                        // the executed set records no tags. Folding it in as
+                        // `uuid:gno` would claim an untagged transaction this group
+                        // never applied, which a reconnect from that set then skips.
+                        // Under GTID positioning that set is the resume point, so
+                        // fail the whole group loudly, as for an anonymous one.
+                        if use_gtid {
+                            fatal_broadcast(
+                                &source,
+                                Error::TaggedTransactionUnderGtid {
+                                    dataset: connection.clone(),
+                                    gtid: format!(
+                                        "{source_uuid}:{}:{}",
+                                        tag.as_str(),
+                                        gtid_event.gno()
+                                    ),
+                                }
+                                .to_string(),
+                            )
+                            .await;
+                            break 'reconnect;
+                        }
+                        current_txn_gtid = None;
+                    } else {
+                        current_txn_gtid = Some((source_uuid, gtid_event.gno()));
+                    }
                 }
                 Some(EventData::AnonymousGtidEvent(anonymous)) => {
                     // An anonymous transaction carries no GTID. Under GTID

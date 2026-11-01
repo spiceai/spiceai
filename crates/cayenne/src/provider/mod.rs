@@ -481,16 +481,6 @@ mod tests {
         test_concurrent_reads_impl(&connection_string).await;
     }
 
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn test_concurrent_reads_turso() {
-        let temp_dir = TempDir::new()
-            .expect("Failed to create temporary directory for concurrent reads test (Turso)");
-        let db_path = temp_dir.path().join("cayenne_concurrent_test.db");
-        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
-        test_concurrent_reads_impl(&connection_string).await;
-    }
-
     /// Core concurrent read test implementation
     async fn test_concurrent_reads_impl(connection_string: &str) {
         let ctx = SessionContext::new();
@@ -577,16 +567,6 @@ mod tests {
         test_concurrent_reads_with_filters_impl(&connection_string).await;
     }
 
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn test_concurrent_reads_with_filters_turso() {
-        let temp_dir =
-            TempDir::new().expect("Failed to create temporary directory for filter test (Turso)");
-        let db_path = temp_dir.path().join("cayenne_filter_test.db");
-        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
-        test_concurrent_reads_with_filters_impl(&connection_string).await;
-    }
-
     /// Test concurrent reads with various filter conditions
     async fn test_concurrent_reads_with_filters_impl(connection_string: &str) {
         let ctx = SessionContext::new();
@@ -669,16 +649,6 @@ mod tests {
         test_concurrent_reads_with_projections_impl(&connection_string).await;
     }
 
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn test_concurrent_reads_with_projections_turso() {
-        let temp_dir = TempDir::new()
-            .expect("Failed to create temporary directory for projection test (Turso)");
-        let db_path = temp_dir.path().join("cayenne_projection_test.db");
-        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
-        test_concurrent_reads_with_projections_impl(&connection_string).await;
-    }
-
     /// Test concurrent reads with different column projections
     async fn test_concurrent_reads_with_projections_impl(connection_string: &str) {
         let ctx = SessionContext::new();
@@ -752,17 +722,6 @@ mod tests {
             .expect("Failed to create temporary directory for high concurrency stress test");
         let db_path = temp_dir.path().join("cayenne_stress_test.db");
         let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
-        test_high_concurrency_stress_impl(&connection_string).await;
-    }
-
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn test_high_concurrency_stress_turso() {
-        let temp_dir = TempDir::new().expect(
-            "Failed to create temporary directory for high concurrency stress test (Turso)",
-        );
-        let db_path = temp_dir.path().join("cayenne_stress_test.db");
-        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
         test_high_concurrency_stress_impl(&connection_string).await;
     }
 

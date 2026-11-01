@@ -24,8 +24,6 @@ use super::metadata::{
     TableStatistics, TableStorageStats, VortexConfig,
 };
 use super::metastore::sqlite::{SqliteMetastore, is_memory_db_path};
-#[cfg(feature = "turso")]
-use super::metastore::turso::TursoMetastore;
 use super::metastore::{
     ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreTransaction,
     MetastoreValue, QueryParams, QueryRowParams,
@@ -106,35 +104,19 @@ fn ensure_reinsert_keys_have_key_based_delete_file(
     Ok(())
 }
 
-/// Metastore backend enum to support different implementations.
-#[derive(Debug)]
-enum MetastoreBackendImpl {
-    Sqlite(SqliteMetastore),
-    #[cfg(feature = "turso")]
-    Turso(TursoMetastore),
-}
-
-/// Pluggable metastore plus a process-local op counter. Query / execute / begin
+/// The metastore plus a process-local op counter. Query / execute / begin
 /// increment the counter; shutdown / WAL checkpoint / vacuum do not (those are
 /// maintenance, not scan-path catalog I/O).
 #[derive(Debug)]
 struct MetastoreImpl {
-    backend: MetastoreBackendImpl,
+    backend: SqliteMetastore,
     query_count: AtomicU64,
 }
 
 impl MetastoreImpl {
     fn sqlite(metastore: SqliteMetastore) -> Self {
         Self {
-            backend: MetastoreBackendImpl::Sqlite(metastore),
-            query_count: AtomicU64::new(0),
-        }
-    }
-
-    #[cfg(feature = "turso")]
-    fn turso(metastore: TursoMetastore) -> Self {
-        Self {
-            backend: MetastoreBackendImpl::Turso(metastore),
+            backend: metastore,
             query_count: AtomicU64::new(0),
         }
     }
@@ -147,7 +129,7 @@ impl MetastoreImpl {
         self.query_count.load(Ordering::Relaxed)
     }
 
-    /// Helper to query a single row from metastore, working with both `SQLite` and Turso
+    /// Helper to query a single row from metastore
     pub(crate) async fn query_row_helper<F, T>(
         &self,
         params: QueryRowParams<'_>,
@@ -158,34 +140,22 @@ impl MetastoreImpl {
         T: Send + 'static,
     {
         self.note_query();
-        match &self.backend {
-            MetastoreBackendImpl::Sqlite(m) => m.query_row(params, f).await,
-            #[cfg(feature = "turso")]
-            MetastoreBackendImpl::Turso(m) => m.query_row(params, f).await,
-        }
+        self.backend.query_row(params, f).await
     }
 
-    /// Helper to execute a statement on metastore, working with both `SQLite` and Turso
+    /// Helper to execute a statement on metastore
     pub(crate) async fn execute_helper(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
         self.note_query();
-        match &self.backend {
-            MetastoreBackendImpl::Sqlite(m) => m.execute(params).await,
-            #[cfg(feature = "turso")]
-            MetastoreBackendImpl::Turso(m) => m.execute(params).await,
-        }
+        self.backend.execute(params).await
     }
 
-    /// Helper to execute a transactional batch on metastore, working with both `SQLite` and Turso
+    /// Helper to execute a transactional batch on metastore
     pub(crate) async fn execute_transaction_batch_helper(&self, sql: &str) -> CatalogResult<()> {
         self.note_query();
-        match &self.backend {
-            MetastoreBackendImpl::Sqlite(m) => m.execute_transaction_batch(sql).await,
-            #[cfg(feature = "turso")]
-            MetastoreBackendImpl::Turso(m) => m.execute_transaction_batch(sql).await,
-        }
+        self.backend.execute_transaction_batch(sql).await
     }
 
-    /// Helper to query multiple rows from metastore, working with both `SQLite` and Turso
+    /// Helper to query multiple rows from metastore
     pub(crate) async fn query_helper<F, T>(
         &self,
         params: QueryParams<'_>,
@@ -196,53 +166,33 @@ impl MetastoreImpl {
         T: Send + 'static,
     {
         self.note_query();
-        match &self.backend {
-            MetastoreBackendImpl::Sqlite(m) => m.query(params, f).await,
-            #[cfg(feature = "turso")]
-            MetastoreBackendImpl::Turso(m) => m.query(params, f).await,
-        }
+        self.backend.query(params, f).await
     }
 
     /// Shutdown the metastore, performing any necessary cleanup.
     pub(crate) async fn shutdown(&self) -> CatalogResult<()> {
-        match &self.backend {
-            MetastoreBackendImpl::Sqlite(m) => m.shutdown().await,
-            #[cfg(feature = "turso")]
-            MetastoreBackendImpl::Turso(m) => m.shutdown().await,
-        }
+        self.backend.shutdown().await
     }
 
     /// Run a non-blocking WAL checkpoint off the hot path (cycle-5 TASK 2b).
     pub(crate) async fn checkpoint_wal(&self) -> CatalogResult<()> {
-        match &self.backend {
-            MetastoreBackendImpl::Sqlite(m) => m.checkpoint_wal().await,
-            #[cfg(feature = "turso")]
-            MetastoreBackendImpl::Turso(m) => m.checkpoint_wal().await,
-        }
+        self.backend.checkpoint_wal().await
     }
 
     pub(crate) async fn incremental_vacuum(&self) -> CatalogResult<u64> {
-        match &self.backend {
-            MetastoreBackendImpl::Sqlite(m) => m.incremental_vacuum().await,
-            #[cfg(feature = "turso")]
-            MetastoreBackendImpl::Turso(m) => m.incremental_vacuum().await,
-        }
+        self.backend.incremental_vacuum().await
     }
 
     /// Begin a transaction on the underlying metastore.
     ///
-    /// Each backend sends the appropriate BEGIN statement (e.g. `BEGIN TRANSACTION`
-    /// for `SQLite`, `BEGIN CONCURRENT` for Turso). The returned transaction object
+    /// The backend sends its own BEGIN statement (`BEGIN IMMEDIATE`). The returned
+    /// transaction object
     /// holds exclusive access to the connection.
     pub(crate) async fn begin_transaction(
         &self,
     ) -> CatalogResult<Box<dyn super::metastore::MetastoreTransaction>> {
         self.note_query();
-        match &self.backend {
-            MetastoreBackendImpl::Sqlite(m) => m.begin_transaction().await,
-            #[cfg(feature = "turso")]
-            MetastoreBackendImpl::Turso(m) => m.begin_transaction().await,
-        }
+        self.backend.begin_transaction().await
     }
 }
 
@@ -260,7 +210,7 @@ impl MetastoreImpl {
 ///
 /// ## Concurrency Model
 ///
-/// The catalog uses a metastore backend (`SQLite` or Turso) with WAL mode which allows:
+/// The catalog uses a `SQLite` metastore in WAL mode, which allows:
 /// - Multiple concurrent readers
 /// - One writer at a time (serialized by the backend)
 ///
@@ -272,30 +222,23 @@ pub struct CayenneCatalog {
 }
 
 impl CayenneCatalog {
-    /// Create a new Cayenne catalog with the appropriate metastore backend.
-    ///
-    /// The connection string determines which backend to use:
-    /// - `sqlite://path` - `SQLite` backend
-    /// - `libsql://path` - Turso backend (requires `turso` feature)
+    /// Create a new Cayenne catalog over the `SQLite` metastore at
+    /// `connection_string`: a `sqlite://path` URL or a bare path.
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogError::InvalidOperation`] if the `libsql://` scheme is used
-    /// but the `turso` feature is not enabled.
+    /// Returns [`CatalogError::UnsupportedMetastoreScheme`] for a URL with any
+    /// scheme other than `sqlite://`.
     pub fn new(connection_string: impl Into<String>) -> CatalogResult<Self> {
         let connection_string = connection_string.into();
-        let metastore = if connection_string.starts_with("libsql://") {
-            #[cfg(feature = "turso")]
-            {
-                MetastoreImpl::turso(TursoMetastore::new(&connection_string))
-            }
-            #[cfg(not(feature = "turso"))]
-            {
-                return Err(CatalogError::TursoNotEnabled);
-            }
-        } else {
-            MetastoreImpl::sqlite(SqliteMetastore::new(&connection_string))
-        };
+        if let Some((scheme, _)) = connection_string.split_once("://")
+            && scheme != "sqlite"
+        {
+            return Err(CatalogError::UnsupportedMetastoreScheme {
+                scheme: scheme.to_string(),
+            });
+        }
+        let metastore = MetastoreImpl::sqlite(SqliteMetastore::new(&connection_string));
 
         // Prototype verification, compiled in only with
         // `--cfg cayenne_metastore_tap_verify`: every catalog checks its
@@ -352,7 +295,6 @@ impl CayenneCatalog {
     fn db_path(&self) -> &str {
         self.connection_string
             .strip_prefix("sqlite://")
-            .or_else(|| self.connection_string.strip_prefix("libsql://"))
             .unwrap_or(&self.connection_string)
     }
 
@@ -372,8 +314,8 @@ impl CayenneCatalog {
 
     /// Open a transaction on the underlying metastore.
     ///
-    /// Each backend sends the appropriate BEGIN statement (e.g. `BEGIN IMMEDIATE`
-    /// for `SQLite`, `BEGIN CONCURRENT` for Turso). The returned handle owns
+    /// The backend sends its own BEGIN statement (`BEGIN IMMEDIATE`). The returned
+    /// handle owns
     /// exclusive access to the connection until `commit` or `rollback` is
     /// called, or the handle is dropped (which auto-rolls-back).
     ///
@@ -1424,8 +1366,7 @@ created_at: row.get_string(5)?,
     ) -> CatalogResult<()> {
         // The failing `ON CONFLICT DO UPDATE` path uses SQLite's default ABORT
         // conflict mode: the statement is rolled back, but the transaction stays
-        // open for this validation read. Turso is expected to preserve the same
-        // SQLite-compatible transaction behavior.
+        // open for this validation read.
         let count_values = tx
             .query_row_values(QueryRowParams {
                 sql: r"
@@ -3047,27 +2988,13 @@ created_at: row.get_string(5)?,
         table_id: &str,
     ) -> CatalogResult<Vec<String>> {
         self.metastore.note_query();
-        match &self.metastore.backend {
-            MetastoreBackendImpl::Sqlite(m) => {
-                crate::metastore::partition_child_table_ids(
-                    m,
-                    table_name,
-                    table_id,
-                    crate::metastore::PartitionChildren::All,
-                )
-                .await
-            }
-            #[cfg(feature = "turso")]
-            MetastoreBackendImpl::Turso(m) => {
-                crate::metastore::partition_child_table_ids(
-                    m,
-                    table_name,
-                    table_id,
-                    crate::metastore::PartitionChildren::All,
-                )
-                .await
-            }
-        }
+        crate::metastore::partition_child_table_ids(
+            &self.metastore.backend,
+            table_name,
+            table_id,
+            crate::metastore::PartitionChildren::All,
+        )
+        .await
         .map_err(|e| CatalogError::FailedToGetPartitions {
             source: Box::new(e),
         })
@@ -3432,11 +3359,7 @@ impl MetadataCatalog for CayenneCatalog {
         }
 
         // Initialize schema using the appropriate metastore backend
-        match &self.metastore.backend {
-            MetastoreBackendImpl::Sqlite(metastore) => metastore.init_schema().await?,
-            #[cfg(feature = "turso")]
-            MetastoreBackendImpl::Turso(metastore) => metastore.init_schema().await?,
-        }
+        self.metastore.backend.init_schema().await?;
 
         Ok(())
     }
@@ -4300,7 +4223,7 @@ impl MetadataCatalog for CayenneCatalog {
         // reserved-lock acquire/hold cycle per staged batch. The same retry-on-
         // `SQLITE_BUSY` loop is preserved (a single autocommit statement can still
         // return `SQLITE_BUSY` if it cannot acquire the writer within
-        // `busy_timeout`). Turso routes `query_row` the same single-statement way.
+        // `busy_timeout`).
         for attempt in 1..=max_attempts {
             let tap_guard = self.tap_guard().await;
             let new_high = match self
@@ -4674,10 +4597,9 @@ impl MetadataCatalog for CayenneCatalog {
         // transaction is even attempted, so a crash before the pointer move leaves
         // an orphaned (but harmless) new snapshot directory.
         //
-        // A concurrent write can fail the transaction with SQLITE_BUSY/SQLITE_LOCKED
-        // or, under Turso's BEGIN CONCURRENT, a write-write conflict raised by a
-        // statement or by the COMMIT. Either way the attempt is rolled back, so
-        // retry it a few times with backoff.
+        // A concurrent write can fail the transaction with SQLITE_BUSY/SQLITE_LOCKED,
+        // raised by a statement or by the COMMIT. Either way the attempt is rolled
+        // back, so retry it a few times with backoff.
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
         if max_attempts == 0 {
             return Err(CatalogError::InvalidOperationNoSource {
@@ -6840,15 +6762,12 @@ impl MetadataCatalog for CayenneCatalog {
         data_dir_anchor: &std::path::Path,
     ) -> CatalogResult<crate::metastore::snapshot::DatasetMetastoreSlice> {
         let _guard = self.tap_guard().await;
-        let result = match &self.metastore.backend {
-            MetastoreBackendImpl::Sqlite(m) => {
-                crate::metastore::snapshot::export_dataset(m, dataset_name, data_dir_anchor).await
-            }
-            #[cfg(feature = "turso")]
-            MetastoreBackendImpl::Turso(m) => {
-                crate::metastore::snapshot::export_dataset(m, dataset_name, data_dir_anchor).await
-            }
-        }?;
+        let result = crate::metastore::snapshot::export_dataset(
+            &self.metastore.backend,
+            dataset_name,
+            data_dir_anchor,
+        )
+        .await?;
         self.tap_record("export_dataset_slice", || {
             self.tap_slice_unconverted(&result, "export_dataset_slice")
         });
@@ -6865,25 +6784,16 @@ impl MetadataCatalog for CayenneCatalog {
             .tap
             .as_ref()
             .map(|_| self.tap_slice_unconverted(slice, "import_dataset_slice"));
-        let result = match &self.metastore.backend {
-            MetastoreBackendImpl::Sqlite(m) => {
-                crate::metastore::snapshot::import_dataset(m, slice, data_dir_anchor).await
-            }
-            #[cfg(feature = "turso")]
-            MetastoreBackendImpl::Turso(m) => {
-                crate::metastore::snapshot::import_dataset(m, slice, data_dir_anchor).await
-            }
-        };
-        result?;
+        crate::metastore::snapshot::import_dataset(&self.metastore.backend, slice, data_dir_anchor)
+            .await?;
         self.tap_record("import_dataset_slice", || actions.unwrap_or_default());
         Ok(())
     }
 }
 
 /// Returns `true` if the given catalog error looks like a transient write
-/// conflict: `SQLITE_BUSY`, `SQLITE_LOCKED`, or a Turso `BEGIN CONCURRENT`
-/// write-write conflict. Turso raises the last from the statement that writes a
-/// row another transaction has changed, as well as from `COMMIT`.
+/// conflict: `SQLITE_BUSY` or `SQLITE_LOCKED`, raised by a statement as well as
+/// by `COMMIT`.
 ///
 /// Looks through the errors a commit step wraps its statement failures in
 /// (`InvalidOperation`, `FailedToSetCurrentSnapshot`), so a conflict raised
@@ -6979,9 +6889,8 @@ async fn sleep_before_metastore_write_retry(
 ///
 /// The attempt is rolled back explicitly, the last one included, rather than
 /// dropped: a dropped transaction rolls back from a detached task, so its
-/// connection, and under `SQLite` the write lock, could still be held when the
-/// next attempt begins. Under Turso the conflict has already ended the
-/// transaction, and the rollback only returns the connection to the pool.
+/// connection and its write lock could still be held when the next attempt
+/// begins.
 async fn end_conflicted_attempt(
     tx: Box<dyn MetastoreTransaction>,
     attempt: u32,
@@ -10893,295 +10802,6 @@ mod tests {
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
         let _ = std::fs::remove_file(format!("{db_path}-wal"));
-    }
-
-    /// The write a conflicting transaction holds open on a table's control row,
-    /// which every snapshot-pointer swap also writes.
-    #[cfg(feature = "turso")]
-    const CONTROL_ROW_WRITE: &str = "UPDATE cayenne_table \
-        SET current_sequence_number = current_sequence_number + 1 WHERE table_id = ?1";
-
-    /// Open a metastore transaction that writes the rows `sql` selects for
-    /// `table_id`, and leave it open: until it ends, any other transaction that
-    /// writes those rows conflicts with it.
-    #[cfg(feature = "turso")]
-    async fn hold_conflicting_write(
-        catalog: &CayenneCatalog,
-        sql: &str,
-        table_id: &str,
-    ) -> Box<dyn MetastoreTransaction> {
-        let tx = catalog
-            .begin_transaction()
-            .await
-            .expect("begin the conflicting transaction");
-        tx.execute(ExecuteParams {
-            sql,
-            params: vec![MetastoreValue::Text(table_id.to_string())],
-        })
-        .await
-        .expect("write the rows the operation under test also writes");
-        tx
-    }
-
-    /// `None` when a commit envelope that ran while [`hold_conflicting_write`]
-    /// held its rows spent every attempt and failed with an error a caller still
-    /// recognises as a retryable write conflict. Otherwise, what it did instead.
-    #[cfg(feature = "turso")]
-    fn statement_conflict_violation<T: std::fmt::Debug>(
-        operation: &str,
-        attempts: u64,
-        result: &CatalogResult<T>,
-    ) -> Option<String> {
-        let expected = u64::from(DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS);
-        match result {
-            Err(error) if attempts == expected && is_retryable_write_conflict(error) => None,
-            Err(error) => Some(format!(
-                "{operation}: made {attempts} of {expected} attempts, then returned {error:?} \
-                 (retryable: {})",
-                is_retryable_write_conflict(error)
-            )),
-            Ok(value) => Some(format!(
-                "{operation}: returned {value:?} while a conflicting transaction was open"
-            )),
-        }
-    }
-
-    /// Under Turso's `BEGIN CONCURRENT`, writing a row that another open
-    /// transaction has changed fails the statement itself with a write-write
-    /// conflict, not only the `COMMIT`. Every commit envelope has to treat that
-    /// the way it treats a conflicted `COMMIT` — roll the attempt back and retry
-    /// it — and, once it gives up, return the conflict in a form a coordinator
-    /// above it still recognises as retryable. With the conflicting transaction
-    /// held open, each envelope therefore spends all its attempts, one `BEGIN`
-    /// each; once that transaction ends, the same write succeeds.
-    ///
-    /// The rows here are still in the MVCC store, where Turso already failed the
-    /// conflicting statement before 0.8.
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn turso_statement_write_conflicts_are_retried_by_every_commit_envelope() {
-        assert_every_commit_envelope_retries_a_statement_write_conflict(false).await;
-    }
-
-    /// [`turso_statement_write_conflicts_are_retried_by_every_commit_envelope`] on
-    /// rows checkpointed into the B-tree, whose write-write conflict Turso 0.8 moved
-    /// from `COMMIT` to the conflicting statement (tursodatabase/turso#8961).
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn turso_statement_write_conflicts_on_checkpointed_rows_are_retried_by_every_commit_envelope()
-     {
-        assert_every_commit_envelope_retries_a_statement_write_conflict(true).await;
-    }
-
-    /// The body of the statement-write-conflict tests above. With
-    /// `checkpoint_every_commit`, the metastore checkpoints after every commit, so
-    /// every row the conflicting transactions write lives in the B-tree rather than
-    /// the MVCC store.
-    #[cfg(feature = "turso")]
-    async fn assert_every_commit_envelope_retries_a_statement_write_conflict(
-        checkpoint_every_commit: bool,
-    ) {
-        let (_table_root, base_path) = test_table_root();
-        let metastore_dir = tempfile::tempdir().expect("create a temporary metastore directory");
-        let catalog = CayenneCatalog::new(format!(
-            "libsql://{}",
-            metastore_dir.path().join("cayenne.db").display()
-        ))
-        .expect("Failed to create catalog");
-        catalog.init().await.expect("Failed to initialize catalog");
-        if checkpoint_every_commit {
-            catalog
-                .metastore
-                .execute_helper(ExecuteParams {
-                    sql: "PRAGMA mvcc_checkpoint_threshold = 0",
-                    params: vec![],
-                })
-                .await
-                .expect("checkpoint the metastore after every commit");
-        }
-        let table_id = catalog
-            .create_table(CreateTableOptions {
-                table_name: "statement_conflicts".to_string(),
-                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-                    "id",
-                    arrow_schema::DataType::Int64,
-                    false,
-                )])),
-                primary_key: vec![],
-                on_conflict: None,
-                base_path,
-                partition_column: None,
-                vortex_config: crate::metadata::VortexConfig::default(),
-            })
-            .await
-            .expect("Failed to create table");
-        let mut violations = Vec::new();
-
-        // Every envelope that swaps the snapshot pointer writes the control row.
-        let blocker = hold_conflicting_write(&catalog, CONTROL_ROW_WRITE, &table_id).await;
-        let current = current_snapshot_id(&catalog, &table_id).await;
-
-        let before = catalog.metastore_query_count();
-        let result = catalog
-            .set_current_snapshot(&table_id, &current, &uuid::Uuid::now_v7().to_string())
-            .await;
-        violations.extend(statement_conflict_violation(
-            "set_current_snapshot",
-            catalog.metastore_query_count() - before,
-            &result,
-        ));
-
-        let before = catalog.metastore_query_count();
-        let result = catalog
-            .commit_compaction(&table_id, &current, &uuid::Uuid::now_v7().to_string())
-            .await;
-        violations.extend(statement_conflict_violation(
-            "commit_compaction",
-            catalog.metastore_query_count() - before,
-            &result,
-        ));
-
-        let before = catalog.metastore_query_count();
-        let result = catalog
-            .commit_compaction_fenced(
-                &table_id,
-                &current,
-                &uuid::Uuid::now_v7().to_string(),
-                i64::MAX,
-                &[],
-            )
-            .await;
-        violations.extend(statement_conflict_violation(
-            "commit_compaction_fenced",
-            catalog.metastore_query_count() - before,
-            &result,
-        ));
-
-        let before = catalog.metastore_query_count();
-        let result = catalog
-            .commit_overwrite(&table_id, &uuid::Uuid::now_v7().to_string(), None, &[])
-            .await;
-        violations.extend(statement_conflict_violation(
-            "commit_overwrite",
-            catalog.metastore_query_count() - before,
-            &result,
-        ));
-
-        let before = catalog.metastore_query_count();
-        let result = catalog
-            .commit_overwrite_to_cold(&table_id, &uuid::Uuid::now_v7().to_string(), &[])
-            .await;
-        violations.extend(statement_conflict_violation(
-            "commit_overwrite_to_cold",
-            catalog.metastore_query_count() - before,
-            &result,
-        ));
-
-        blocker
-            .rollback()
-            .await
-            .expect("end the transaction holding the control row");
-        let compacted_to = uuid::Uuid::now_v7().to_string();
-        catalog
-            .commit_compaction(&table_id, &current, &compacted_to)
-            .await
-            .expect("commit_compaction succeeds once the conflicting transaction ends");
-        assert_eq!(
-            current_snapshot_id(&catalog, &table_id).await,
-            compacted_to,
-            "the compaction moved the snapshot pointer"
-        );
-
-        // A protected-snapshot swap writes the protected snapshots' roster rows.
-        let merged_away_first = uuid::Uuid::now_v7().to_string();
-        let merged_away_second = uuid::Uuid::now_v7().to_string();
-        for (snapshot_id, sequence_number) in [(&merged_away_first, 1), (&merged_away_second, 2)] {
-            catalog
-                .set_snapshot_sequence(&table_id, snapshot_id, sequence_number)
-                .await
-                .expect("protect a snapshot");
-        }
-        let merged_away = [merged_away_first, merged_away_second];
-        let merged_into = uuid::Uuid::now_v7().to_string();
-        let blocker = hold_conflicting_write(
-            &catalog,
-            "UPDATE cayenne_snapshot_sequence SET sequence_number = sequence_number + 1 \
-             WHERE table_id = ?1",
-            &table_id,
-        )
-        .await;
-
-        let before = catalog.metastore_query_count();
-        let result = catalog
-            .swap_protected_snapshots(&table_id, &merged_away, &merged_into, 3)
-            .await;
-        violations.extend(statement_conflict_violation(
-            "swap_protected_snapshots",
-            catalog.metastore_query_count() - before,
-            &result,
-        ));
-
-        blocker
-            .rollback()
-            .await
-            .expect("end the transaction holding the roster rows");
-        assert!(
-            catalog
-                .swap_protected_snapshots(&table_id, &merged_away, &merged_into, 3)
-                .await
-                .expect("swap_protected_snapshots succeeds once the conflicting transaction ends"),
-            "both merged-away snapshots are still protected, so the swap commits"
-        );
-
-        // An inline mutation writes the inline rows it rewrites.
-        let inlined = InlinedData {
-            inlined_id: uuid::Uuid::now_v7().to_string(),
-            table_id: table_id.clone(),
-            partition_key: None,
-            data_ipc: vec![1, 2, 3],
-            record_count: 1,
-            sequence_number: 1,
-            created_at: "2026-10-01T00:00:00Z".to_string(),
-        };
-        catalog
-            .commit_inlined_mutation(&table_id, vec![], vec![], vec![inlined.clone()], 1)
-            .await
-            .expect("inline a row");
-        let rewritten = InlinedData {
-            data_ipc: vec![4, 5, 6],
-            ..inlined
-        };
-        let blocker = hold_conflicting_write(
-            &catalog,
-            "UPDATE cayenne_inlined_data SET record_count = record_count + 1 WHERE table_id = ?1",
-            &table_id,
-        )
-        .await;
-
-        let before = catalog.metastore_query_count();
-        let result = catalog
-            .commit_inlined_mutation(&table_id, vec![rewritten.clone()], vec![], vec![], 2)
-            .await;
-        violations.extend(statement_conflict_violation(
-            "commit_inlined_mutation",
-            catalog.metastore_query_count() - before,
-            &result,
-        ));
-
-        blocker
-            .rollback()
-            .await
-            .expect("end the transaction holding the inline rows");
-        catalog
-            .commit_inlined_mutation(&table_id, vec![rewritten], vec![], vec![], 2)
-            .await
-            .expect("commit_inlined_mutation succeeds once the conflicting transaction ends");
-
-        assert!(
-            violations.is_empty(),
-            "a write conflict raised by a statement was not retried like a conflicted COMMIT: \
-             {violations:#?}"
-        );
     }
 
     /// Test that `commit_compaction` rejects non-UUID identifiers.

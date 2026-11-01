@@ -156,7 +156,6 @@ async fn alter_to_double(
 
 /// Cayenne evolves the table live under `sync_all_columns`, so the change
 /// after the `ALTER` lands with its fractional value.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn cayenne_sync_all_columns_widens_live() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -195,7 +194,6 @@ async fn cayenne_sync_all_columns_widens_live() -> Result<(), anyhow::Error> {
 
 /// Under `block` the registered `Int32` type stays: a value that type holds
 /// exactly is applied as it.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn cayenne_block_keeps_the_registered_type() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -330,7 +328,6 @@ async fn duckdb_sync_all_columns_applies_a_delete_whose_old_row_no_longer_fits()
 /// Under `block`, a delete's old row is decoded with the registered types. With
 /// `REPLICA IDENTITY FULL` it carries every column, and after a type change its
 /// non-key values may not fit them; the delete applies by key regardless.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn cayenne_block_applies_a_delete_whose_old_row_no_longer_fits() -> Result<(), anyhow::Error>
 {

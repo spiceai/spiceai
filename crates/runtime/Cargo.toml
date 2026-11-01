@@ -46,6 +46,7 @@ byte-unit.workspace = true
 bytes.workspace = true
 ctor.workspace = true
 cache = { path = "../cache" }
+cayenne = { path = "../cayenne", features = ["partition-table-provider"] }
 chrono.workspace = true
 chunking = { path = "../chunking" }
 clap.workspace = true
@@ -104,8 +105,11 @@ linkme.workspace = true
 llms = { path = "../llms", default-features = false }
 evaluate-api = { path = "../evaluate-api" }
 evaluate-chat = { path = "../evaluate-chat" }
+gemini-api = { path = "../gemini-api" }
+gemini-chat = { path = "../gemini-chat" }
 messages-api = { path = "../messages-api" }
 messages-chat = { path = "../messages-chat" }
+responses-chat = { path = "../responses-chat" }
 model-capabilities = { path = "../model-capabilities" }
 runtime-decide = { path = "../runtime-decide" }
 mediatype = "0.21.0"
@@ -244,6 +248,8 @@ gethostname.workspace = true
 uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
+vortex.workspace = true
+vortex-datafusion.workspace = true
 
 [build-dependencies]
 yaml = { path = "../yaml" }
@@ -302,6 +308,7 @@ runtime-checkpoint-postgres = { path = "../runtime-checkpoint-postgres" }
 accelerator-sqlite = { path = "../accelerators/accelerator-sqlite" }
 accelerator-turso = { path = "../accelerators/accelerator-turso" }
 accelerator-duckdb = { path = "../accelerators/accelerator-duckdb" }
+accelerator-cayenne = { path = "../accelerators/accelerator-cayenne" }
 turso.workspace = true
 connector-postgres = { path = "../data-connectors/connector-postgres" }
 connector-scylladb = { path = "../data-connectors/connector-scylladb" }
@@ -357,6 +364,8 @@ elasticsearch = [
     "runtime-search/elasticsearch",
 ]
 duckdb = [
+    "dep:adbc_core",
+    "dep:adbc_driver_manager",
     "dep:duckdb",
     "dep:runtime-checkpoint-duckdb",
     "db_connection_pool/duckdb",
@@ -461,15 +470,6 @@ turso = [
     "runtime-acceleration/turso",
 ]
 vortex = []
-[target.'cfg(not(windows))'.dev-dependencies]
-# The engine itself is not built on Windows, so neither is the test code that
-# exercises it or force-links its registration.
-accelerator-cayenne = { path = "../accelerators/accelerator-cayenne" }
-
-[target.'cfg(not(windows))'.dependencies]
-cayenne = { path = "../cayenne", features = ["turso", "partition-table-provider"] }
-vortex.workspace = true
-vortex-datafusion.workspace = true
 
 [[bench]]
 harness = false
