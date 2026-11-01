@@ -111,13 +111,10 @@ pub fn fallible_implicit_string_cast(
 
     let mut found = None;
     coerced.apply(|expr| {
-        let Expr::Cast(Cast {
-            expr: inner,
-            data_type,
-        }) = expr
-        else {
+        let Expr::Cast(Cast { expr: inner, field }) = expr else {
             return Ok(TreeNodeRecursion::Continue);
         };
+        let data_type = field.data_type();
         if let Some(pos) = explicit.iter().position(|e| e == expr) {
             explicit.swap_remove(pos);
             return Ok(TreeNodeRecursion::Continue);
