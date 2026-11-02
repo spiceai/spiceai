@@ -1320,7 +1320,7 @@ dependencies = [
 [[package]]
 name = "async-openai"
 version = "0.32.0"
-source = "git+https://github.com/spiceai/async-openai?rev=307eaf407cbf71afa967f3008250ba96c79626b7#307eaf407cbf71afa967f3008250ba96c79626b7"
+source = "git+https://github.com/spiceai/async-openai?rev=c1bf4a090c50e18f27663b008dac4c108e49b994#c1bf4a090c50e18f27663b008dac4c108e49b994"
 dependencies = [
  "async-openai-macros",
  "base64 0.22.1",
@@ -1342,13 +1342,13 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "url",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
 name = "async-openai-macros"
 version = "0.3.0"
-source = "git+https://github.com/spiceai/async-openai?rev=307eaf407cbf71afa967f3008250ba96c79626b7#307eaf407cbf71afa967f3008250ba96c79626b7"
+source = "git+https://github.com/spiceai/async-openai?rev=c1bf4a090c50e18f27663b008dac4c108e49b994#c1bf4a090c50e18f27663b008dac4c108e49b994"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2866,7 +2866,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2886,7 +2886,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2906,7 +2906,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "regex",
@@ -4336,7 +4336,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8389,7 +8389,7 @@ dependencies = [
  "serde_json",
  "snafu",
  "tokio",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -9368,8 +9368,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.1.3",
- "windows-result 0.3.4",
+ "windows-link 0.2.1",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -10482,7 +10482,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "system-configuration 0.7.0",
  "tokio",
  "tower-service",
@@ -10517,7 +10517,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -15367,7 +15367,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6705a26ad89d241a989a5395641931ba37076f5ab5fbd19ee92402414a43af32"
 dependencies = [
  "arrayvec",
- "hashbrown 0.5.0",
+ "hashbrown 0.17.1",
  "parking_lot",
  "rand 0.8.6",
 ]
@@ -15865,8 +15865,8 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.4.1",
- "itertools 0.10.5",
+ "heck 0.5.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph",
@@ -15887,7 +15887,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -15900,7 +15900,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -16236,7 +16236,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -16275,7 +16275,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -17679,7 +17679,7 @@ dependencies = [
  "typetag",
  "url",
  "util",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
  "utoipa-swagger-ui",
  "uuid 1.23.2",
  "vortex",
@@ -17742,7 +17742,7 @@ dependencies = [
  "twox-hash",
  "url",
  "util",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
  "uuid 1.23.2",
 ]
 
@@ -17752,7 +17752,7 @@ version = "2.4.2"
 dependencies = [
  "serde",
  "serde_json",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -18374,7 +18374,7 @@ dependencies = [
  "tonic",
  "tracing",
  "util",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -18516,7 +18516,7 @@ dependencies = [
  "tracing",
  "twox-hash",
  "util",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -18607,7 +18607,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "util",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
  "uuid 1.23.2",
 ]
 
@@ -18637,40 +18637,6 @@ dependencies = [
  "libsqlite3-sys",
  "smallvec 1.15.1",
  "sqlite-wasm-rs",
-]
-
-[[package]]
-name = "rust-embed"
-version = "8.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04113cb9355a377d83f06ef1f0a45b8ab8cd7d8b1288160717d66df5c7988d27"
-dependencies = [
- "rust-embed-impl",
- "rust-embed-utils",
- "walkdir",
-]
-
-[[package]]
-name = "rust-embed-impl"
-version = "8.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da0902e4c7c8e997159ab384e6d0fc91c221375f6894346ae107f47dd0f3ccaa"
-dependencies = [
- "proc-macro2",
- "quote",
- "rust-embed-utils",
- "syn 2.0.117",
- "walkdir",
-]
-
-[[package]]
-name = "rust-embed-utils"
-version = "8.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bcdef0be6fe7f6fa333b1073c949729274b05f123a0ad7efcb8efd878e5c3b1"
-dependencies = [
- "sha2 0.10.9",
- "walkdir",
 ]
 
 [[package]]
@@ -19460,7 +19426,7 @@ checksum = "4db5a4a562bcc0017c34cd0efbabf447be783f00576a2a516947f884e6a7ed57"
 dependencies = [
  "ahash 0.8.12",
  "annotate-snippets",
- "base64 0.21.7",
+ "base64 0.22.1",
  "encoding_rs_io",
  "nohash-hasher",
  "num-traits",
@@ -20018,7 +19984,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -23571,7 +23537,6 @@ checksum = "6ba0b99ee52df3028635d93840c797102da61f8a7bb3cf751032455895b52ef8"
 dependencies = [
  "proc-macro2",
  "quote",
- "regex",
  "syn 2.0.117",
 ]
 
@@ -23583,33 +23548,33 @@ checksum = "d935f1c83fdf8b88f09bbe050d0cea78ea4afee6d7b0317403228c1200b2c8ab"
 dependencies = [
  "proc-macro2",
  "quote",
+ "regex",
  "syn 3.0.6",
 ]
 
 [[package]]
 name = "utoipa-swagger-ui"
-version = "9.0.2"
+version = "10.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d047458f1b5b65237c2f6dc6db136945667f40a7668627b3490b9513a3d43a55"
+checksum = "4f1fd2f9615838885c6ff4115fde8a2b58825dc7b4617f78d29c167377a15c92"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "mime_guess",
  "regex",
- "rust-embed",
  "serde",
  "serde_json",
  "url",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
  "utoipa-swagger-ui-vendored",
- "zip 3.0.0",
+ "zip 9.1.2",
 ]
 
 [[package]]
 name = "utoipa-swagger-ui-vendored"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2eebbbfe4093922c2b6734d7c679ebfebd704a0d7e56dfcb0d05818ce28977d"
+checksum = "552a64d6a0d251ae28bc021838800943cce60c9ec2e60ff331f54e79f696268f"
 
 [[package]]
 name = "uuid"
@@ -25092,7 +25057,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -26099,20 +26064,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "70b40401a28d86ce16a330b863b86fd7dbee4d7c940587ab09ab8c019f9e3fdf"
 dependencies = [
  "num-traits",
-]
-
-[[package]]
-name = "zip"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12598812502ed0105f607f941c386f43d441e00148fce9dec3ca5ffb0bde9308"
-dependencies = [
- "arbitrary",
- "crc32fast",
- "flate2",
- "indexmap 2.14.0",
- "memchr",
- "zopfli",
 ]
 
 [[package]]
