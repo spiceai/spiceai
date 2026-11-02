@@ -307,6 +307,11 @@ enum WriteKind {
 pub(super) struct HeldWriteGuards {
     _write: OwnedMutexGuard<()>,
     _checkpoint: OwnedMutexGuard<()>,
+    /// When the caller already held `write_lock` (autocommit `UPDATE`), `_write`
+    /// is a dummy, because the mutex is not reentrant, and this is the real hold
+    /// ([`super::write_lock_held`]). A publish that outlives a cancelled caller
+    /// keeps it, so cancellation cannot release the lock mid-publish.
+    outer_write: Option<Arc<OwnedMutexGuard<()>>>,
 }
 
 impl HeldWriteGuards {
@@ -314,7 +319,13 @@ impl HeldWriteGuards {
         Self {
             _write: write,
             _checkpoint: checkpoint,
+            outer_write: super::write_lock_held::held_guard(),
         }
+    }
+
+    /// The caller's outer `write_lock` hold, if it had one; see `outer_write`.
+    fn outer_write(&self) -> Option<Arc<OwnedMutexGuard<()>>> {
+        self.outer_write.as_ref().map(Arc::clone)
     }
 }
 
@@ -1489,6 +1500,10 @@ impl<'a> AppendMutationWriter<'a> {
             let task_context = Arc::clone(self.task_context);
             let into_empty_table = self.into_empty_table;
             let table_name = self.table.table_name().to_string();
+            // The outer hold is task-local and does not cross `tokio::spawn`, so
+            // the publish re-enters it: a nested write then shares the lock instead
+            // of waiting on it.
+            let outer_write = held.outer_write();
             return tokio::spawn(async move {
                 let _held = held;
                 let writer = AppendMutationWriter {
@@ -1497,14 +1512,16 @@ impl<'a> AppendMutationWriter<'a> {
                     task_context: &task_context,
                     into_empty_table,
                 };
-                writer
-                    .publish_plain_append(
-                        staged,
-                        write_start,
-                        &post_validation,
-                        reserved_live_rows_delta,
-                    )
-                    .await
+                let publish = writer.publish_plain_append(
+                    staged,
+                    write_start,
+                    &post_validation,
+                    reserved_live_rows_delta,
+                );
+                match outer_write {
+                    Some(guard) => super::write_lock_held::scope(guard, publish).await,
+                    None => publish.await,
+                }
             })
             .await
             .map_err(|source| super::Error::TaskPanicked {
