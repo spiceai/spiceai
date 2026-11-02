@@ -17,13 +17,15 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 snafu.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 tracing.workspace = true
 util = { path = "../util" }
 
 [dev-dependencies]
+axum.workspace = true
 base64.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["fs", "net"] }
 
 [lints]
 workspace = true
