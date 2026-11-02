@@ -1416,12 +1416,11 @@ async fn test_cancelled_plain_append_does_not_wedge_after_compaction_impl(
     };
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while staging_wal_paths(&table).is_empty() {
-        if writer.is_finished() {
-            panic!(
-                "append finished before writing its staging WAL: {:?}",
-                writer.await
-            );
-        }
+        assert!(
+            !writer.is_finished(),
+            "append finished before writing its staging WAL: {:?}",
+            writer.await
+        );
         assert!(
             std::time::Instant::now() < deadline,
             "append never wrote its staging WAL"
