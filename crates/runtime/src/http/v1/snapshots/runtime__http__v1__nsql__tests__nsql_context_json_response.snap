@@ -104,7 +104,7 @@ expression: response
             "function": "vector_search",
             "syntax": "vector_search(sales.orders, 'query text', customer_id)",
             "model": "embed_model",
-            "engine": "duckdb_vector_index",
+            "engine": "s3_vectors",
             "row_id_columns": [
               "order_id"
             ],
@@ -112,12 +112,12 @@ expression: response
             "chunked": false,
             "input_mode": "scalar",
             "index": {
-              "name": "duckdb_vector_index",
+              "name": "s3_vector_index",
               "columns": [
                 "customer_id",
                 "order_id"
               ],
-              "kind": "duckdb_vector_index",
+              "kind": "s3_vector_index",
               "source": "runtime_index"
             },
             "required_columns": [

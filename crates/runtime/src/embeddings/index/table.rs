@@ -28,9 +28,6 @@ use tokio::sync::RwLock;
 
 use spicepod::semantic::Column;
 
-#[cfg(feature = "duckdb")]
-use spicepod::component::embeddings::ColumnEmbeddingConfig;
-
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use {
     crate::embeddings::construct_chunker,
@@ -76,11 +73,11 @@ pub async fn wrap_table_as_index(
     }
     #[cfg(not(feature = "s3_vectors"))]
     let _ = ctx;
-    #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb")))]
+    #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch")))]
     let _ = file_format;
     #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch")))]
     let _ = (secrets, on_zero_results);
-    #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb")))]
+    #[cfg(not(any(feature = "s3_vectors", feature = "elasticsearch")))]
     let _ = (
         embedding_models,
         secrets,
@@ -120,17 +117,9 @@ pub async fn wrap_table_as_index(
             )
             .await
         }
-        #[cfg(feature = "duckdb")]
-        Some("duckdb") => {
-            wrap_table_as_index_duckdb(
-                embedding_models,
-                tbl,
-                columns,
-                file_format,
-                inner_table_provider,
-            )
-            .await
-        }
+        Some("duckdb") => Err(Box::from(
+            runtime_component::vector_engine::removed_vector_engine_message(),
+        )),
         None => Err(Box::from(
             "No vector engine specified. Provide a vector engine under `.vectors.engine`."
                 .to_string(),
@@ -139,51 +128,6 @@ pub async fn wrap_table_as_index(
             "Unknown vector engine '.vectors.engine: {unknown_engine}'"
         ))),
     }
-}
-
-#[cfg(feature = "duckdb")]
-async fn wrap_table_as_index_duckdb(
-    embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
-    tbl: &TableReference,
-    columns: &[Column],
-    file_format: Option<&str>,
-    inner_table_provider: Arc<dyn TableProvider + 'static>,
-) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-    tracing::info!("DuckDB vector engine for table {tbl} initializing...");
-    let start = std::time::Instant::now();
-
-    let embeddings = columns
-        .iter()
-        .flat_map(|column| {
-            column
-                .embeddings
-                .iter()
-                .map(|embedding| ColumnEmbeddingConfig {
-                    column: column.name.clone(),
-                    model: embedding.model.clone(),
-                    chunking: embedding.chunking.clone(),
-                    primary_keys: embedding.row_ids.clone(),
-                    vector_size: embedding.vector_size,
-                    aggregation: embedding.aggregation,
-                    max_elements_per_row: embedding.max_elements_per_row,
-                })
-        })
-        .collect::<Vec<_>>();
-
-    let provider = runtime_search::embeddings::table::EmbeddingTable::from_spicepod_columns(
-        inner_table_provider,
-        embeddings,
-        embedding_models,
-        file_format,
-    )
-    .await
-    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-
-    tracing::info!(
-        "DuckDB vector engine for table {tbl} initialized in {:?}",
-        start.elapsed()
-    );
-    Ok(provider)
 }
 
 #[cfg(feature = "s3_vectors")]

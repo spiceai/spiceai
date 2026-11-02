@@ -7,7 +7,9 @@ description: >
   another table, a missing file, a missing table — while a healthy dataset
   beside them serves. A Cayenne dataset that still names the retired Turso
   metastore loads on the SQLite metastore it shares with a healthy one, and
-  is warned once to drop the param.
+  is warned once to drop the param. A dataset that still selects the removed
+  duckdb vector engine fails to load with one error naming the Cayenne fix,
+  while a Cayenne dataset beside it answers vector_search.
 
 sources:
   src: { kind: postgres }
@@ -15,6 +17,8 @@ spicepod:
   version: v1
   kind: Spicepod
   name: probe-config
+  embeddings:
+    - { from: 'model2vec:minishlab/potion-base-2M', name: potion }
   datasets:
     - { from: 'postgres:public.t', name: healthy, params: '${sources.src.params}' }
     - { from: 'nosuchconnector:whatever', name: bad_connector }
@@ -28,6 +32,8 @@ spicepod:
     - { from: 'postgres:public.no_such_table', name: bad_table, params: '${sources.src.params}' }
     - { from: 'postgres:public.t', name: healthy_cayenne, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file, params: { cayenne_metastore: sqlite, cayenne_file_path: '${instance.dir}/healthy_cayenne', cayenne_metadata_dir: '${instance.dir}/meta' } } }
     - { from: 'postgres:public.t', name: turso_param, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file, params: { cayenne_metastore: turso, cayenne_file_path: '${instance.dir}/turso_param', cayenne_metadata_dir: '${instance.dir}/meta' } } }
+    - { from: 'postgres:public.t', name: duckdb_vectors, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne }, vectors: { enabled: true, engine: duckdb }, columns: [{ name: v, embeddings: [{ from: potion, row_id: [id] }] }] }
+    - { from: 'postgres:public.t', name: cayenne_vectors, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne }, columns: [{ name: v, embeddings: [{ from: potion, row_id: [id] }] }] }
     - { from: 'postgres:public.t', name: turso_param_memory, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: memory, params: { cayenne_metastore: turso } } }
 steps:
   - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'a')" }
@@ -70,3 +76,12 @@ steps:
         "Dataset 'turso_param' sets `cayenne_metastore: turso`, which is no longer supported and has no effect: the dataset uses the built-in metastore. Remove `cayenne_metastore` from this dataset. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration": 1
         "Dataset 'turso_param_memory' sets `cayenne_metastore: turso`, which is no longer supported and has no effect": 1
   - assert-files: { contains: ['^meta/cayenne\.db$'], lacks: ['^meta/cayenne\.db-log$'] }
+  # The duckdb vector engine is removed: the dataset that selects it fails with
+  # exactly one error, and the Cayenne dataset indexes its embeddings itself.
+  - query: SELECT id FROM vector_search(cayenne_vectors, 'a') ORDER BY _score DESC, id
+    expect: { rows: [['1']] }
+    eventually: 60s
+  - assert-log:
+      count:
+        "ERROR .*Failed to load dataset 'duckdb_vectors': the vector engine `duckdb` is no longer supported as of v2\\.5 and cannot be used\\. Remove the `vectors` block and use `acceleration\\.engine: cayenne`, which indexes embedding columns for `vector_search` itself\\. See: https://spiceai\\.org/docs/components/data-accelerators/cayenne/migration#migrating-the-duckdb-vector-engine": 1
+        "ERROR .*duckdb_vectors": 1

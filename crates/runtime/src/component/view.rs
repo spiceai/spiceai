@@ -41,6 +41,9 @@ impl From<Error> for crate::Error {
             }
             Error::NeedToSpecifySQLView { name } => crate::Error::NeedToSpecifySQLView { name },
             Error::InvalidAccelerationConfiguration { source } => source.into(),
+            Error::VectorEngineRemoved { view_name } => {
+                crate::Error::ViewVectorEngineRemoved { view_name }
+            }
             Error::AcceleratedViewInvalidConfiguration { view_name, reason } => {
                 crate::Error::AcceleratedViewInvalidConfiguration { view_name, reason }
             }
@@ -268,6 +271,26 @@ mod tests {
     use super::ViewBuilder;
     use crate::component::{AcceleratedComponent, deprecated_ready_state_warning};
     use spicepod::component::view as spicepod_view;
+
+    /// A view that still selects the removed `duckdb` vector engine fails to load with the
+    /// line the runtime logs for it, naming the view and the Cayenne fix.
+    #[test]
+    fn a_view_selecting_the_duckdb_vector_engine_fails_to_load() {
+        let view: spicepod_view::View = yaml::from_str(
+            "name: daily_docs\nsql: SELECT 1\nvectors:\n  enabled: true\n  engine: duckdb\n",
+        )
+        .expect("yaml parses");
+
+        let Err(err) = ViewBuilder::try_from(view) else {
+            panic!("a view selecting the duckdb vector engine must fail to load");
+        };
+        let err = crate::Error::from(err);
+        assert!(
+            matches!(err, crate::Error::ViewVectorEngineRemoved { .. }),
+            "unexpected error: {err}"
+        );
+        insta::assert_snapshot!("view_duckdb_vector_engine_removed", err.to_string());
+    }
 
     /// The wording itself is asserted beside the shared builder in `component::tests`. What is
     /// specific to the view — and what makes that escaping load-bearing rather than decorative — is

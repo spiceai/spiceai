@@ -394,7 +394,7 @@ datasets:
         vector_size: 1536
     vectors:
       enabled: true
-      engine: duckdb
+      engine: s3_vectors
       partition_by:
         - name: category
           expression: category
@@ -1166,9 +1166,9 @@ views:
     sql: SELECT id, content FROM postgres_full
     vectors:
       enabled: true
-      engine: duckdb
+      engine: s3_vectors
       params:
-        duckdb_file: ./vectors/view.duckdb
+        s3_vectors_bucket: my-vectors
 
 # =============================================================================
 # MODELS

@@ -108,6 +108,15 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
                 .transpose()?
         };
 
+        if runtime_component::vector_engine::uses_removed_vector_engine(
+            dataset.vectors.as_ref(),
+            &dataset.columns,
+        ) {
+            return Err(crate::Error::DatasetVectorEngineRemoved {
+                dataset: dataset.name,
+            });
+        }
+
         validate_identifier(&dataset.name).context(crate::ComponentSnafu)?;
 
         let table_reference = Dataset::parse_table_reference(&dataset.name)?;

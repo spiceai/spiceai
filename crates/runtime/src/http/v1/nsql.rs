@@ -338,11 +338,11 @@ fn nsql_context_error_response(error: &NsqlContextError) -> (StatusCode, String)
                             "function": "vector_search",
                             "syntax": "vector_search(sales.orders, 'query text', customer_id)",
                             "model": "embed_model",
-                            "engine": "duckdb_vector_index",
+                            "engine": "s3_vectors",
                             "row_id_columns": ["order_id"],
                             "vector_size": 384,
                             "chunked": false,
-                            "index": {"name": "duckdb_vector_index", "columns": ["customer_id", "order_id"], "kind": "duckdb_vector_index", "source": "runtime_index"},
+                            "index": {"name": "s3_vector_index", "columns": ["customer_id", "order_id"], "kind": "s3_vector_index", "source": "runtime_index"},
                             "required_columns": ["customer_id", "order_id"],
                             "notes": []
                         }],
@@ -1461,7 +1461,7 @@ mod tests {
 - Indexes:
     - `customer_id`: `customer_id` (enabled, spicepod.acceleration.indexes)
 - Search indexes:
-    - vector search on `customer_id` using `embed_model`. Syntax: `vector_search(sales.orders, 'query text', customer_id)`. Engine/index: `duckdb_vector_index`. Row id: `order_id`.
+    - vector search on `customer_id` using `embed_model`. Syntax: `vector_search(sales.orders, 'query text', customer_id)`. Engine/index: `s3_vectors`. Row id: `order_id`.
     - full-text search on `customer_id` using `tantivy`. Syntax: `text_search(sales.orders, 'query text', customer_id)`. Row id: `order_id`.
         ";
         let sample_context_blocks = vec![
@@ -1584,16 +1584,16 @@ mod tests {
                     function: "vector_search".to_string(),
                     syntax: "vector_search(sales.orders, 'query text', customer_id)".to_string(),
                     model: "embed_model".to_string(),
-                    engine: Some("duckdb_vector_index".to_string()),
+                    engine: Some("s3_vectors".to_string()),
                     row_id_columns: vec!["order_id".to_string()],
                     vector_size: Some(384),
                     chunked: false,
                     input_mode: Some("scalar".to_string()),
                     required_columns: vec!["customer_id".to_string(), "order_id".to_string()],
                     index: Some(NsqlIndexContext {
-                        name: Some("duckdb_vector_index".to_string()),
+                        name: Some("s3_vector_index".to_string()),
                         columns: vec!["customer_id".to_string(), "order_id".to_string()],
-                        kind: "duckdb_vector_index".to_string(),
+                        kind: "s3_vector_index".to_string(),
                         source: "runtime_index".to_string(),
                     }),
                     notes: vec![],

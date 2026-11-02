@@ -30,6 +30,7 @@ tracing.workspace = true
 util = { path = "../util" }
 
 [dev-dependencies]
+insta.workspace = true
 tempfile.workspace = true
 yaml = { path = "../yaml" }
 

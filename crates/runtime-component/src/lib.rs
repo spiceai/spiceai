@@ -44,6 +44,7 @@ pub mod access;
 pub mod catalog;
 pub mod column;
 pub mod dataset;
+pub mod vector_engine;
 pub mod view;
 
 #[derive(Debug, Snafu)]

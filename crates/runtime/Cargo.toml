@@ -372,8 +372,6 @@ duckdb = [
     "data_components/duckdb",
     "datafusion-optimizer-rules/duckdb",
     "runtime-acceleration/duckdb",
-    "search/duckdb",
-    "runtime-search/duckdb",
 ]
 # Test-only marker: the DynamoDB connector now lives in `connector-dynamodb` (a
 # dev-dependency, registered unconditionally by `do_register_test_connectors`).
