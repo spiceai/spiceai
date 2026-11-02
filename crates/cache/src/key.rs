@@ -65,6 +65,9 @@ impl SearchKey {
 #[derive(Clone, Copy)]
 pub enum CacheKey<'a> {
     LogicalPlan(&'a LogicalPlan),
+    /// Digest of a serialized plan, with its decoded plan retained for normal
+    /// cache eligibility, table invalidation, and background revalidation.
+    SerializedPlan(&'a str, &'a LogicalPlan),
     Query(&'a str, Option<&'a ParamValues>),
     Search(&'a SearchKey),
     /// A caller-supplied key (`Spice-Cache-Key` / `client_supplied`). This is an
@@ -93,13 +96,26 @@ impl<'a> From<(&'a str, &'a EmbeddingInput)> for CacheKey<'a> {
     }
 }
 
-impl CacheKey<'_> {
+impl<'a> CacheKey<'a> {
+    /// The key for a query plan: the digest of its serialized form when it
+    /// arrived serialized, otherwise the plan itself.
+    #[must_use]
+    pub fn for_plan(plan: &'a LogicalPlan, serialized_digest: Option<&'a str>) -> Self {
+        serialized_digest.map_or(Self::LogicalPlan(plan), |digest| {
+            Self::SerializedPlan(digest, plan)
+        })
+    }
+
     /// Hash this key's payload into `hasher`. Used by both [`Self::as_raw_key`]
     /// and [`Self::as_raw_key_in_namespace`] so the payload byte stream stays
     /// identical regardless of whether a namespace prefix was mixed in.
     fn hash_payload<T: Hasher>(&self, hasher: &mut T) {
         match self {
             Self::LogicalPlan(logical_plan) => logical_plan.hash(hasher),
+            Self::SerializedPlan(digest, _) => {
+                b"spice:serialized-plan:v1".hash(hasher);
+                digest.hash(hasher);
+            }
             Self::Search(search_key) => search_key.hash(hasher),
             Self::EmbeddingRequest(embedding_request) => embedding_request.hash(hasher),
             Self::EmbeddingInput(model_name, embedding_input) => {

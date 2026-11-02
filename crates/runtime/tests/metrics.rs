@@ -37,7 +37,6 @@ limitations under the License.
 // Accelerator engines are their own crates and self-register through a linkme slice. Each
 // integration test is a separate binary that links independently, and the linker drops an
 // unreferenced slice static, so a binary exercising Cayenne must name the crate itself.
-#[cfg(not(windows))]
 use accelerator_cayenne as _;
 
 // Accelerator engines are their own crates and self-register through a linkme slice. A
@@ -356,11 +355,6 @@ fn csv_backed_dataset(dir: &std::path::Path, name: &str) -> Dataset {
 /// The footprint sample runs on that tick, so the interval has to be short; its
 /// own 30-second floor does not suppress the FIRST sample, which is the one this
 /// test reads.
-///
-/// Not built on Windows: the engine crate is a `cfg(not(windows))`
-/// dev-dependency, so the `cayenne` accelerator is unregistered there and a
-/// dataset naming it could never load.
-#[cfg(not(windows))]
 fn cayenne_backed_dataset(dir: &std::path::Path, name: &str) -> Dataset {
     let csv = fixture_csv(dir, name);
     write_fixture_csv(&csv, FIXTURE_EPOCH_SECONDS);
@@ -401,7 +395,6 @@ fn cayenne_backed_dataset(dir: &std::path::Path, name: &str) -> Dataset {
 /// families; the ones that need a specific event are in
 /// [`EVENT_GATED_CAYENNE_MAINTENANCE_METRICS`], and the test asserts they are
 /// *absent* so neither list can silently go stale.
-#[cfg(not(windows))]
 const EXPECTED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
     "cayenne_compaction_outcome_total",
     "cayenne_maintenance_outcome_total",
@@ -452,7 +445,6 @@ const EXPECTED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
 /// Kept as a list rather than a comment because the test asserts they are absent:
 /// if one starts arriving without a workload it has become always-sampled, and
 /// leaving it here would mean nothing ever checks that its call site survives.
-#[cfg(not(windows))]
 const EVENT_GATED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
     // Recorded when a threshold actually fires. This fixture holds one inline
     // file, so every pass declines before any trigger is evaluated.
@@ -725,7 +717,6 @@ async fn an_accelerated_dataset_reports_the_query_and_refresh_families() {
 /// The dataset sets a 250 ms compaction interval because the footprint sample
 /// rides that tick. Its own 30-second floor does not suppress the first sample,
 /// which is the one read here.
-#[cfg(not(windows))]
 #[tokio::test]
 async fn a_cayenne_dataset_reports_its_maintenance_and_footprint_families() {
     let registry = &*PROMETHEUS;
@@ -823,7 +814,6 @@ async fn a_cayenne_dataset_reports_its_maintenance_and_footprint_families() {
 /// The table label is part of the key because the registry is shared across the
 /// tests in this file, so a sibling fixture's series must not satisfy an
 /// assertion about this one.
-#[cfg(not(windows))]
 fn compaction_outcomes(registry: &prometheus::Registry) -> HashMap<(String, String, String), f64> {
     registry
         .gather()
@@ -1639,7 +1629,6 @@ async fn a_cache_hit_is_recorded_when_the_stream_is_consumed() {
 /// `rows_written` counts every row received. A dataset with a primary key
 /// publishes `arrival` at zero at load, before its first repeated key; one
 /// without a primary key publishes no series.
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cayenne_refresh_reports_the_rows_it_supersedes_by_reason() {
     let registry = &*PROMETHEUS;
@@ -1718,7 +1707,6 @@ async fn a_cayenne_refresh_reports_the_rows_it_supersedes_by_reason() {
 
 /// A user's statement reports the rows it received but did not keep: an `INSERT`
 /// repeating a key counts the copy that arrived first as `arrival`.
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cayenne_statement_reports_the_rows_it_supersedes() {
     use runtime_request_context::{Protocol, RequestContext};
@@ -2203,7 +2191,7 @@ async fn model_request_durations_are_recorded_in_milliseconds() {
 /// Built only with `snapshots`: without it every snapshot behavior resolves to
 /// `Disabled` and nothing is created. Cayenne is the engine because its crate needs
 /// no feature, so the gate's build runs these.
-#[cfg(all(feature = "snapshots", not(windows)))]
+#[cfg(feature = "snapshots")]
 mod snapshot_metrics {
     use std::{
         path::{Path, PathBuf},

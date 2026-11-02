@@ -1067,8 +1067,8 @@ fn position_based_sink_rebuilds_only_changed_deletion_vectors() {
 // memtable to Vortex. The pre-fix implementation unconditionally issued a
 // `get_inlined_data_stats` SQL query (per-write catalog round trip) just to
 // read three integer counters that the in-process atomic
-// `inlined_row_count` already tracks accurately. On network catalogs
-// (Turso, PostgreSQL metastore) each round trip costs 10-50 ms, dominating
+// `inlined_row_count` already tracks accurately. On a metastore reached
+// over the network each round trip costs 10-50 ms, dominating
 // the small-batch CDC ingestion path.
 //
 // The fix consults the cached `inlined_row_count` first: when far below the

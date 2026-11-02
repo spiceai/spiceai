@@ -79,7 +79,6 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 
 use data_components::flightsql::{FlightSqlClient, FlightSqlExec, query_to_stream};
-use data_components::sql_expr::to_sql_preserving_precedence;
 use flight_client::cookie::CookieStore;
 
 /// Pass-through nodes that may sit between a `HashJoinExec` and the federated
@@ -300,6 +299,16 @@ fn try_rewrite(
     let Some(right) = resolve_federated_side(join.right()) else {
         return Ok(Transformed::no(plan));
     };
+
+    // executor_table() and exact numeric encoding belong to Spice peers.
+    if left
+        .flight_execs
+        .iter()
+        .chain(&right.flight_execs)
+        .any(|scan| !scan.uses_spice_sql())
+    {
+        return Ok(Transformed::no(plan));
+    }
 
     // Pick the smaller side (by stats) as the broadcast dimension; it must be
     // below the threshold. The other side is the partitioned fact.
@@ -584,7 +593,7 @@ fn build_join_sql(
         .map(|f| quote_ident(f.name()))
         .collect::<Vec<_>>()
         .join(", ");
-    let dim_where = render_filters(dim_fe.filters())?;
+    let dim_where = render_filters(dim_fe)?;
     let dim_union = addresses
         .iter()
         .map(|addr| {
@@ -666,13 +675,14 @@ fn build_join_sql(
     ))
 }
 
-fn render_filters(filters: &[datafusion::logical_expr::Expr]) -> Option<String> {
+fn render_filters(scan: &FlightSqlExec) -> Option<String> {
+    let filters = scan.filters();
     if filters.is_empty() {
         return Some(String::new());
     }
     let parts = filters
         .iter()
-        .map(|f| to_sql_preserving_precedence(f).map(|s| format!("({s})")))
+        .map(|f| scan.filter_sql(f).map(|s| format!("({s})")))
         .collect::<std::result::Result<Vec<_>, _>>()
         .ok()?;
     Some(format!(" WHERE {}", parts.join(" AND ")))
@@ -758,6 +768,7 @@ mod tests {
                 Arc::new(CookieStore::new()),
             )
             .expect("build FlightSqlExec")
+            .with_spice_sql(true)
             .with_statistics(Statistics::new_unknown(schema).with_num_rows(Precision::Exact(rows))),
         )
     }

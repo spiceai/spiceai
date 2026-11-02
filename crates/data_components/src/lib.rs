@@ -56,7 +56,7 @@ pub mod debezium_kafka;
 pub mod delta_lake;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
-#[cfg(feature = "duckdb")]
+#[cfg(feature = "adbc")]
 pub mod ducklake;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
@@ -65,6 +65,7 @@ pub mod file_schema_drift;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
+pub mod fresh_file_listing;
 pub mod function_support;
 pub mod iceberg;
 pub mod incremental_append;

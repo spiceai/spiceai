@@ -16,6 +16,13 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 #![recursion_limit = "256"]
 
+// Windows users run `spiced` under WSL or in Docker, and the Windows `spice` CLI
+// connects to it.
+#[cfg(windows)]
+compile_error!(
+    "spiced does not build for native Windows. Run it under WSL or in Docker. See: https://spiceai.org/docs/installation"
+);
+
 use ::tools::SpiceModelTool;
 use ::tools::naming::{decode_tool_name, encode_tool_name};
 use ::tools::rename::with_name;
@@ -681,6 +688,8 @@ impl Default for InitialLoad {
 #[derive(Clone)]
 #[expect(clippy::struct_field_names)]
 pub struct Runtime {
+    /// Fixed at startup, including across app reloads and connector recreation.
+    mode: spicepod::component::runtime::RuntimeMode,
     app: Arc<RwLock<Option<Arc<App>>>>,
     /// Serializes [`Runtime::apply_app`] so that concurrent callers cannot
     /// interleave their diff-and-swap. `apply_app` computes diffs under a read
@@ -849,24 +858,59 @@ impl Runtime {
         self.llm_runtime_stores.capabilities()
     }
 
-    pub async fn responses_supported_model_names(&self) -> HashSet<String> {
+    /// What answers `/v1/responses` for model `name`: its own Responses API, or, for a chat
+    /// model whose provider has none, its chat completions, by translation.
+    ///
+    /// # Errors
+    ///
+    /// Returns why `name` cannot answer when it serves neither.
+    pub async fn responses_model(
+        &self,
+        name: &str,
+    ) -> Result<Arc<dyn llms::responses::Responses>, model_capabilities::Refusal> {
+        use model_capabilities::{Capability, Refusal, require};
+
         let capabilities = self.llm_runtime_stores.capabilities();
         let capabilities = capabilities.read().await;
         let responses = self.llm_runtime_stores.responses_llms();
-        let responses = responses.read().await;
-        capabilities
-            .keys()
-            .filter(|name| {
-                model_capabilities::require(
-                    &capabilities,
-                    &responses,
-                    name,
-                    model_capabilities::Capability::Responses,
-                )
-                .is_ok()
-            })
-            .cloned()
-            .collect()
+        let own = require(
+            &capabilities,
+            &*responses.read().await,
+            name,
+            Capability::Responses,
+        );
+        let through_chat = match &own {
+            Err(Refusal::Unsupported(found)) => found.has(Capability::Chat),
+            // A worker router serves chat completions without a capability entry of its own.
+            Err(Refusal::NotFound) => true,
+            Ok(_) | Err(Refusal::Unavailable) => false,
+        };
+        if !through_chat {
+            return own;
+        }
+        let chat = self.llm_runtime_stores.completion_llms();
+        require(&capabilities, &*chat.read().await, name, Capability::Chat).map(|chat| {
+            Arc::new(model::ResponsesViaChat::new(chat)) as Arc<dyn llms::responses::Responses>
+        })
+    }
+
+    /// The models `/v1/responses` serves: those [`Self::responses_model`] answers for, of the
+    /// models and the worker routers that serve chat completions.
+    pub async fn responses_supported_model_names(&self) -> HashSet<String> {
+        let names: HashSet<String> = {
+            let capabilities = self.llm_runtime_stores.capabilities();
+            let capabilities = capabilities.read().await;
+            let chat = self.llm_runtime_stores.completion_llms();
+            let chat = chat.read().await;
+            capabilities.keys().chain(chat.keys()).cloned().collect()
+        };
+        let mut served = HashSet::with_capacity(names.len());
+        for name in names {
+            if self.responses_model(&name).await.is_ok() {
+                served.insert(name);
+            }
+        }
+        served
     }
 
     #[must_use]
@@ -1423,11 +1467,8 @@ impl Runtime {
             // are cayenne *catalog* tables (not spice.public datasets), so the
             // dataset partition-assignment map doesn't cover them; enumerate the
             // cayenne catalog directly. Also include any dataset assignments.
-            let mut tables: Vec<TableReference> = Vec::new();
-            #[cfg(not(windows))]
-            {
-                tables.extend(crate::cluster::discover_cayenne_tables(&df).await);
-            }
+            let mut tables: Vec<TableReference> =
+                crate::cluster::discover_cayenne_tables(&df).await;
             if let Some(assignments_lock) = self.partition_assignments() {
                 for resolved in assignments_lock.read().await.keys() {
                     tables.push(TableReference::full(

@@ -447,6 +447,11 @@ jobs:
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
         uses: ./.github/actions/setup-adbc-bigquery
 
+      # duckdb: and ducklake: datasets load the installed DuckDB through ADBC.
+      - name: Install libduckdb
+        if: ${{ contains(github.event.inputs.spicepod_path, 'duckdb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
+        uses: ./.github/actions/setup-libduckdb
+
       - name: Set up Python
         if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -505,10 +510,11 @@ jobs:
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
         run: |
           # DuckLake stamps its catalog with the version of the extension that wrote it, and spiced reads it
-          # with the DuckDB version the `duckdb` crate pins in Cargo.toml. A newer duckdb writes a catalog the
-          # runtime's extension rejects: "Only DuckLake versions 0.1, 0.2, 0.3-dev1 and 0.3 are supported".
-          duckdb_version=$(awk -F'"' '/^duckdb = "/ { print $2; exit }' Cargo.toml)
-          [ -n "$duckdb_version" ] || { echo 'could not read the duckdb version from Cargo.toml'; exit 1; }
+          # with the installed DuckDB, which setup-libduckdb takes from the newest release in
+          # test/duckdb_versions.json. A newer duckdb writes a catalog an older one rejects, so write it with
+          # that same release.
+          duckdb_version=$(jq -r '.versions[-1].version' test/duckdb_versions.json)
+          [ -n "$duckdb_version" ] || { echo 'could not read the duckdb version from test/duckdb_versions.json'; exit 1; }
           python -m pip install --upgrade "duckdb==$duckdb_version" minio
 
           python <<'PY'

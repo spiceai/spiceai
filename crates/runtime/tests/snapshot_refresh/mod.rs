@@ -64,7 +64,6 @@ use uuid::Uuid;
 use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
 use crate::{init_tracing, run_query};
 
-#[cfg(not(windows))]
 mod cayenne;
 #[cfg(feature = "duckdb")]
 mod duckdb;

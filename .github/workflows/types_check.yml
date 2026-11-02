@@ -59,13 +59,6 @@ jobs:
             rsync -av "${{ steps.build-spiced.outputs.target_dir_relative }}/" /home/spiceai/build/target/
           fi
 
-      - name: Update build cache (Windows)
-        if: matrix.target_os == 'windows'
-        run: |
-          if (Test-Path C:/spiceai/build/target) {
-            Copy-Item -Recurse -Force "${{ steps.build-spiced.outputs.target_dir_relative }}/*" C:/spiceai/build/target
-          }
-
   test_acceleration:
     name: '${{ matrix.acceleration.engine }} acceleration on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}

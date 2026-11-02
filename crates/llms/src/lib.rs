@@ -27,6 +27,7 @@ pub mod google;
 pub mod hf;
 #[cfg(feature = "local_embed")]
 pub mod model2vec;
+mod model_info;
 pub mod openai;
 pub mod progress;
 pub mod provider;

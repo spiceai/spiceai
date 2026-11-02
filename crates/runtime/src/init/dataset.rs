@@ -6321,7 +6321,6 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         async fn sidecar(
             &self,
             _source: &dyn AccelerationSource,
-            _registry: Arc<data_accelerator_api::AcceleratorEngineRegistry>,
             _open_option: runtime_acceleration::sidecar::OpenOption,
         ) -> std::result::Result<
             Arc<dyn runtime_acceleration::sidecar::AcceleratorSidecar>,

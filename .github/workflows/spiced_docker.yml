@@ -298,7 +298,7 @@ jobs:
         # Authenticate to Docker Hub before building so base image pulls (debian, etc.)
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: ${{ needs.setup.outputs.run_amd64 == 'true' && github.repository == 'spiceai/spiceai' }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -323,6 +323,7 @@ jobs:
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             BINARY_VARIANT=${{ env.BINARY_VARIANT }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            APT_CACHE_BUST=${{ github.run_id }}-${{ github.run_attempt }}
             GITHUB_REPOSITORY=${{ github.repository }}
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
@@ -379,7 +380,7 @@ jobs:
         # Authenticate to Docker Hub before building so base image pulls (debian, etc.)
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: ${{ needs.setup.outputs.run_arm64 == 'true' && github.repository == 'spiceai/spiceai' }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -404,6 +405,7 @@ jobs:
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             BINARY_VARIANT=${{ env.BINARY_VARIANT }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            APT_CACHE_BUST=${{ github.run_id }}-${{ github.run_attempt }}
             GITHUB_REPOSITORY=${{ github.repository }}
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
@@ -441,7 +443,7 @@ jobs:
         # Authenticate to Docker Hub before building so base image pulls (nvidia/cuda, etc.)
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: ${{ needs.setup.outputs.run_cuda == 'true' && github.repository == 'spiceai/spiceai' }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -467,6 +469,7 @@ jobs:
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             CUDA_COMPUTE_CAP=${{ env.CUDA_COMPUTE_CAP }}
             GITHUB_REPOSITORY=${{ github.repository }}
+            APT_CACHE_BUST=${{ github.run_id }}-${{ github.run_attempt }}
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Validate CUDA image
@@ -519,7 +522,7 @@ jobs:
         # rate limits instead of anonymous (per-IP) limits when pulling
         # registry:2 below.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -530,7 +533,7 @@ jobs:
 
       - name: Login to GitHub Package Registry
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -538,7 +541,7 @@ jobs:
 
       - name: Login to DockerHub
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -635,7 +638,7 @@ jobs:
         # rate limits instead of anonymous (per-IP) limits when pulling
         # registry:2 below.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -646,7 +649,7 @@ jobs:
 
       - name: Login to GitHub Package Registry
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -654,7 +657,7 @@ jobs:
 
       - name: Login to DockerHub
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}

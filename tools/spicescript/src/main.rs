@@ -32,6 +32,7 @@ mod generate;
 mod ledger;
 mod pki;
 mod reap;
+mod release;
 mod results;
 mod rqg;
 mod runner;
@@ -60,11 +61,18 @@ struct Cli {
     #[arg(long = "spiced", value_name = "[NAME=]PATH")]
     spiced: Vec<String>,
 
-    /// Start every instance on this `spiced` binary instead; an `upgrade`
-    /// step then moves it to the binary under test, over the same data. Without
-    /// it, `upgrade` is a restart.
+    /// Start every instance on this `spiced` binary instead of the release
+    /// its script names with `from:`; an `upgrade` step then moves it to the
+    /// binary under test, over the same data. Without either, `upgrade` is a
+    /// restart.
     #[arg(long, value_name = "PATH")]
     from: Option<PathBuf>,
+
+    /// Start the runs whose `from:` is `FROM` (such as `2.3.x`) on release
+    /// `VERSION` (such as `2.3.2`) instead of the one it resolves to. Repeat
+    /// it for several.
+    #[arg(long = "from-release", value_name = "FROM=VERSION", value_parser = parse_from_release)]
+    from_release: Vec<(String, String)>,
 
     /// Run every instance as a cluster: a scheduler with one executor,
     /// over node mTLS with a CA and certificates generated for the run.
@@ -147,6 +155,18 @@ struct Cli {
     #[arg(long = "log-capture", value_name = "DIR")]
     log_capture: Option<PathBuf>,
 
+    /// The `DuckDB` release `duckdb` and `ducklake` sources use when their
+    /// spec names no `version`: their `duckdb` CLI writes and checks the
+    /// data, and `spiced` loads its library. Defaults to the newest release
+    /// `test/duckdb_versions.json` lists. The expected-failures ledger is
+    /// recorded at that default, so `--record-failures` refuses another.
+    #[arg(
+        long = "duckdb-version",
+        value_name = "VERSION",
+        env = "SPICESCRIPT_DUCKDB_VERSION"
+    )]
+    duckdb_version: Option<String>,
+
     /// The widest a value is drawn in a failure report's table, in
     /// characters; a longer one keeps its start and end. 0 draws every value
     /// whole.
@@ -226,6 +246,57 @@ async fn run(cli: Cli) -> Result<bool> {
         return check(&paths, &scripts);
     }
 
+    // Each base release the selected runs start on, resolved and downloaded
+    // once; `--from` replaces them all.
+    let mut releases = std::collections::BTreeMap::new();
+    if cli.from.is_none() {
+        let mut specs = std::collections::BTreeSet::new();
+        for script in &scripts {
+            for combo in script::matrix_combinations(&script.matrix) {
+                specs.extend(script.render_from(&combo)?);
+            }
+        }
+        let pins: std::collections::BTreeMap<_, _> = cli.from_release.into_iter().collect();
+        if let Some(unused) = pins.keys().find(|spec| !specs.contains(*spec)) {
+            anyhow::bail!("--from-release {unused}=…: no selected run starts from `{unused}`");
+        }
+        let mut list = None;
+        let mut fetched = std::collections::BTreeMap::<String, std::path::PathBuf>::new();
+        for spec in specs {
+            let (version, how) = if let Some(version) = pins.get(&spec) {
+                (version.clone(), "--from-release")
+            } else if release::is_exact(&spec)? {
+                (spec.clone(), "exact")
+            } else {
+                if list.is_none() {
+                    list = Some(release::Releases::load().await?);
+                }
+                let list = list.as_ref().context("release list was just loaded")?;
+                (list.resolve(&spec)?, "newest published")
+            };
+            let binary = if let Some(binary) = fetched.get(&version) {
+                binary.clone()
+            } else {
+                let binary = release::fetch(&version).await?;
+                fetched.insert(version.clone(), binary.clone());
+                binary
+            };
+            println!("from {spec}: v{version} ({how}), {}", binary.display());
+            releases.insert(
+                spec.clone(),
+                release::BaseRelease {
+                    spec,
+                    version,
+                    binary,
+                },
+            );
+        }
+    } else if !cli.from_release.is_empty() {
+        anyhow::bail!(
+            "--from starts every instance on one binary, so --from-release has nothing to choose"
+        );
+    }
+
     let work_dir = std::path::absolute(&cli.work_dir)?;
     reap::reap(&work_dir);
     if cli.keep {
@@ -234,6 +305,14 @@ async fn run(cli: Cli) -> Result<bool> {
     cleanup::install_signal_handler();
     if let Some(limit) = cli.max_wait {
         runner::set_max_wait(limit);
+    }
+    if let Some(version) = cli.duckdb_version.clone() {
+        let default = source::duckdb_cli::version(None)?;
+        anyhow::ensure!(
+            !cli.record_failures || version.trim_start_matches('v') == default,
+            "--record-failures records the ledger at DuckDB {default}, the newest release test/duckdb_versions.json lists; drop --duckdb-version {version} to record"
+        );
+        source::duckdb_cli::set_default_version(version);
     }
     if let Some(from) = &cli.from {
         anyhow::ensure!(
@@ -246,7 +325,8 @@ async fn run(cli: Cli) -> Result<bool> {
     let pki = pki::generate(&work_dir.join(format!("pki-{}", std::process::id())))?;
     let options = runner::Options {
         targets,
-        from: cli.from,
+        from_override: cli.from,
+        releases,
         cluster: cli.cluster,
         work_dir,
         keep: cli.keep,
@@ -503,6 +583,20 @@ fn parse_matrix_value(text: &str) -> Result<(String, String), String> {
         _ => Err(format!(
             "`{text}` is not KEY=VALUE, a key under the script's `matrix:`; to run one of its `variants:`, use --variant {text}"
         )),
+    }
+}
+
+fn parse_from_release(text: &str) -> Result<(String, String), String> {
+    let (spec, version) = text
+        .split_once('=')
+        .ok_or_else(|| format!("`{text}` is not FROM=VERSION, such as 2.3.x=2.3.2"))?;
+    release::validate(spec).map_err(|e| e.to_string())?;
+    match release::is_exact(version) {
+        Ok(true) => Ok((spec.to_string(), version.to_string())),
+        Ok(false) => Err(format!(
+            "`{version}` names a minor line; give one release, such as 2.3.2"
+        )),
+        Err(e) => Err(e.to_string()),
     }
 }
 

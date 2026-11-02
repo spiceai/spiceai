@@ -49,6 +49,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cache::{QueryResultsCacheProvider, key::RawCacheKey, to_cached_record_batch_stream};
 use datafusion::common::TableReference;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::StreamExt;
 use spicepod::component::caching::SQLResultsCacheConfig;
@@ -123,6 +124,7 @@ async fn store_entries(
 
     let mut stored_schemas = Vec::with_capacity(ENTRIES);
     let mut stored_tables = Vec::with_capacity(ENTRIES);
+    let memory_pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
     for i in 0..ENTRIES {
         let schema = fresh_schema(field_count, name_len);
         let input_tables = fresh_input_tables(table_name);
@@ -136,6 +138,7 @@ async fn store_entries(
             input_tables,
             std::time::Instant::now(),
             None,
+            &memory_pool,
         );
         // The store happens once the stream is drained, so drain it.
         while let Some(batch) = stream.next().await {

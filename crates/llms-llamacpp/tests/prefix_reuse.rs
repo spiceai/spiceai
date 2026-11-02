@@ -62,11 +62,13 @@ async fn gemma_gguf() -> std::path::PathBuf {
     llms::chat::hf_files::download_model(
         "unsloth/gemma-3-270m-it-GGUF:c90975dbd40c0c7b275fefaae758c3415c906238",
         &[GEMMA_FILE],
+        llms::chat::hf_files::Budget::Unmeasured,
         llms::hf::HubParams::default(),
         "gemma-3-270m",
     )
     .await
     .expect("Gemma 3 270M downloads")
+    .dir
     .join(GEMMA_FILE)
 }
 

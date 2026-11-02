@@ -45,6 +45,9 @@ jobs:
     name: Sign-off coverage integration tests
     runs-on: spiceai-macos
     timeout-minutes: 10
+    # Self-hosted pool: skip PRs from forks so an approved fork run does not
+    # execute here. Non-PR events and same-repo PRs still run.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     permissions:
       contents: read
     steps:
@@ -104,6 +107,9 @@ jobs:
     # pushes stay in the job's temp directory and no status is posted.
     runs-on: spiceai-dev-runners
     timeout-minutes: 5
+    # Self-hosted pool: skip PRs from forks so an approved fork run does not
+    # execute here. Non-PR events and same-repo PRs still run.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     permissions:
       contents: read
     steps:

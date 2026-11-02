@@ -40,6 +40,8 @@ For version `vX.Y.Z`:
 2. Cherry-pick required fixes from `trunk`. No new features are allowed in patch releases, only bug/security fixes.
 3. Update patch version number.
 
+The open-source release supports only the latest release for security updates (see [`SECURITY.md`](../SECURITY.md)), so open-source security patches are cut only from the latest minor release branch.
+
 ## Endgame issue
 
 Create a [Milestone Endgame](https://github.com/spiceai/spiceai/issues/new?assignees=&labels=endgame&projects=&template=end_game.md&title=v0.x.x-alpha+Endgame) issue to track the checklist needed for a specific milestone release.

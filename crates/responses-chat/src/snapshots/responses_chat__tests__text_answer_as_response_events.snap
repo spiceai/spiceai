@@ -1,0 +1,165 @@
+---
+source: crates/responses-chat/src/tests.rs
+expression: "pretty(&normalized(&Value::Array(events)))"
+---
+[
+  {
+    "response": {
+      "created_at": "<timestamp>",
+      "id": "<resp_1>",
+      "instructions": "Be brief.",
+      "model": "gpt",
+      "object": "response",
+      "output": [],
+      "parallel_tool_calls": true,
+      "status": "in_progress",
+      "tool_choice": "auto",
+      "tools": []
+    },
+    "sequence_number": 0,
+    "type": "response.created"
+  },
+  {
+    "response": {
+      "created_at": "<timestamp>",
+      "id": "<resp_1>",
+      "instructions": "Be brief.",
+      "model": "gpt",
+      "object": "response",
+      "output": [],
+      "parallel_tool_calls": true,
+      "status": "in_progress",
+      "tool_choice": "auto",
+      "tools": []
+    },
+    "sequence_number": 1,
+    "type": "response.in_progress"
+  },
+  {
+    "item": {
+      "content": [],
+      "id": "<msg_1>",
+      "role": "assistant",
+      "status": "in_progress",
+      "type": "message"
+    },
+    "output_index": 0,
+    "sequence_number": 2,
+    "type": "response.output_item.added"
+  },
+  {
+    "content_index": 0,
+    "item_id": "<msg_1>",
+    "output_index": 0,
+    "part": {
+      "annotations": [],
+      "logprobs": [],
+      "text": "",
+      "type": "output_text"
+    },
+    "sequence_number": 3,
+    "type": "response.content_part.added"
+  },
+  {
+    "content_index": 0,
+    "delta": "Hello",
+    "item_id": "<msg_1>",
+    "logprobs": [],
+    "output_index": 0,
+    "sequence_number": 4,
+    "type": "response.output_text.delta"
+  },
+  {
+    "content_index": 0,
+    "delta": ", world.",
+    "item_id": "<msg_1>",
+    "logprobs": [],
+    "output_index": 0,
+    "sequence_number": 5,
+    "type": "response.output_text.delta"
+  },
+  {
+    "content_index": 0,
+    "item_id": "<msg_1>",
+    "logprobs": [],
+    "output_index": 0,
+    "sequence_number": 6,
+    "text": "Hello, world.",
+    "type": "response.output_text.done"
+  },
+  {
+    "content_index": 0,
+    "item_id": "<msg_1>",
+    "output_index": 0,
+    "part": {
+      "annotations": [],
+      "logprobs": [],
+      "text": "Hello, world.",
+      "type": "output_text"
+    },
+    "sequence_number": 7,
+    "type": "response.content_part.done"
+  },
+  {
+    "item": {
+      "content": [
+        {
+          "annotations": [],
+          "logprobs": [],
+          "text": "Hello, world.",
+          "type": "output_text"
+        }
+      ],
+      "id": "<msg_1>",
+      "role": "assistant",
+      "status": "completed",
+      "type": "message"
+    },
+    "output_index": 0,
+    "sequence_number": 8,
+    "type": "response.output_item.done"
+  },
+  {
+    "response": {
+      "completed_at": "<timestamp>",
+      "created_at": "<timestamp>",
+      "id": "<resp_1>",
+      "instructions": "Be brief.",
+      "model": "gpt",
+      "object": "response",
+      "output": [
+        {
+          "content": [
+            {
+              "annotations": [],
+              "logprobs": [],
+              "text": "Hello, world.",
+              "type": "output_text"
+            }
+          ],
+          "id": "<msg_1>",
+          "role": "assistant",
+          "status": "completed",
+          "type": "message"
+        }
+      ],
+      "parallel_tool_calls": true,
+      "status": "completed",
+      "tool_choice": "auto",
+      "tools": [],
+      "usage": {
+        "input_tokens": 120,
+        "input_tokens_details": {
+          "cached_tokens": 100
+        },
+        "output_tokens": 30,
+        "output_tokens_details": {
+          "reasoning_tokens": 12
+        },
+        "total_tokens": 150
+      }
+    },
+    "sequence_number": 9,
+    "type": "response.completed"
+  }
+]

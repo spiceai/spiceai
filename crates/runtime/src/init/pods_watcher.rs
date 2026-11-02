@@ -79,6 +79,7 @@ fn start_time_only_changes(
         source_rate_control,
         drasi,
         functions: _,
+        mode: _,
     } = new;
 
     [
@@ -285,7 +286,7 @@ impl Runtime {
     }
 
     /// Hot-apply a new [`App`] to the running runtime, reconciling catalogs,
-    /// datasets, views, models, functions, and (without the `models` feature)
+    /// datasets, views, models, functions, and (with the `models` feature)
     /// workers against the currently-loaded app.
     ///
     /// This is the diff-based reconcile the pods watcher performs when a
@@ -314,6 +315,15 @@ impl Runtime {
         // mutates the app during the diff phase, so a write lock is not needed
         // until the final swap.
         let current_app = self.read_app().await;
+        let mut new_app = new_app;
+        if new_app.runtime.mode != self.mode {
+            tracing::warn!(
+                "runtime.mode changed from '{}' to '{}'. Restart spiced to apply the new mode.",
+                self.mode,
+                new_app.runtime.mode
+            );
+            Arc::make_mut(&mut new_app).runtime.mode = self.mode;
+        }
         Arc::clone(&self)
             .apply_app_diff(current_app.as_ref(), new_app)
             .await
@@ -362,7 +372,7 @@ impl Runtime {
             self.apply_model_diff(current_app, &new_app).await;
             crate::datafusion::udf::apply_function_diff(&self, current_app, &new_app).await;
 
-            if !cfg!(feature = "models") {
+            if cfg!(feature = "models") {
                 Arc::clone(&self)
                     .apply_worker_diff(current_app, &new_app)
                     .await;
