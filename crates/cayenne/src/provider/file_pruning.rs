@@ -125,11 +125,17 @@ fn i64_bound(precision: &datafusion_common::stats::Precision<ScalarValue>) -> Op
 /// Build `pk NOT IN (hidden keys)` for sparse Int64 tombstone sets so Vortex and
 /// listing-time pruning can skip rows/files before the deletion filter exec runs.
 /// Returns `None` when the set is empty, too large, or not single-column Int64.
+///
+/// `deleted_after`, when set, keeps only the keys whose newest delete is newer
+/// than it — judged on the key's fused entry, not through
+/// `min_delete_seq_to_apply`, whose run skipping can miss a re-insert recorded
+/// in a skipped run.
 pub(crate) fn tombstone_exclusion_filter(
     pk_column_name: &str,
     tombstones: &DeletionIndex,
     insert_record_handling: InsertRecordHandling,
     min_delete_seq_to_apply: Option<i64>,
+    deleted_after: Option<i64>,
     max_keys: usize,
 ) -> Option<Expr> {
     if !tombstones.has_deletions() {
@@ -137,7 +143,14 @@ pub(crate) fn tombstone_exclusion_filter(
     }
 
     let mut hidden_keys = Vec::new();
-    for (pk, _) in tombstones.iter_entries() {
+    for (pk, entry) in tombstones.iter_entries() {
+        if deleted_after.is_some_and(|after| {
+            entry
+                .delete_sequence()
+                .is_none_or(|delete_sequence| delete_sequence <= after)
+        }) {
+            continue;
+        }
         if !is_pk_visible_i64(
             pk,
             tombstones,
@@ -545,7 +558,7 @@ mod tests {
     fn tombstone_exclusion_builds_negated_in_list() {
         let index = DeletionIndex::from_map(HashMap::from([(10, 1), (20, 2)]));
         let filter =
-            tombstone_exclusion_filter("id", &index, InsertRecordHandling::Ignore, None, 256)
+            tombstone_exclusion_filter("id", &index, InsertRecordHandling::Ignore, None, None, 256)
                 .expect("filter");
         let Expr::InList(in_list) = filter else {
             panic!("expected negated IN list");
@@ -554,11 +567,45 @@ mod tests {
         assert_eq!(in_list.list.len(), 2);
     }
 
+    /// Only keys whose newest delete is newer than every datalake file may be
+    /// excluded from every branch: an older delete can name a key whose live
+    /// copy is in a newer datalake file.
+    #[test]
+    fn tombstone_exclusion_keeps_only_keys_deleted_after_the_bound() {
+        let index = DeletionIndex::from_map(HashMap::from([(10, 1), (20, 5)]));
+        let filter = tombstone_exclusion_filter(
+            "id",
+            &index,
+            InsertRecordHandling::Apply,
+            None,
+            Some(3),
+            256,
+        )
+        .expect("filter");
+        let Expr::InList(in_list) = filter else {
+            panic!("expected negated IN list");
+        };
+        assert!(in_list.negated);
+        assert_eq!(in_list.list, vec![lit(ScalarValue::Int64(Some(20)))]);
+        assert!(
+            tombstone_exclusion_filter(
+                "id",
+                &index,
+                InsertRecordHandling::Apply,
+                None,
+                Some(5),
+                256
+            )
+            .is_none(),
+            "no key is deleted after the newest datalake file"
+        );
+    }
+
     #[test]
     fn tombstone_exclusion_skips_reinserted_upsert_keys() {
         let index = DeletionIndex::from_maps(HashMap::from([(10, 5)]), HashMap::from([(10, 6)]));
         assert!(
-            tombstone_exclusion_filter("id", &index, InsertRecordHandling::Apply, None, 256)
+            tombstone_exclusion_filter("id", &index, InsertRecordHandling::Apply, None, None, 256)
                 .is_none(),
             "re-inserted keys must not be pushed into NOT IN"
         );

@@ -36,8 +36,8 @@ use super::constants::{
     LOOKUP_INDEX_DIR_NAME, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
 };
 use super::delete::{
-    CaptureLocks, CayenneDeletionSink, DeleteScanSource, DeletionIdentifier,
-    DeletionVectorWriteResult, DeletionVectorWriteSpec, DeletionVectorWriter,
+    CaptureLocks, CayenneDeletionSink, ColdDeletionFilterExec, ColdTombstones, DeleteScanSource,
+    DeletionIdentifier, DeletionVectorWriteResult, DeletionVectorWriteSpec, DeletionVectorWriter,
     FileBasedDeletionSink, InsertRecordHandling, Int64PkDeletionFilterExec,
     KeyBasedDeletionFilterExec,
 };
@@ -1632,6 +1632,69 @@ struct ColdTierScan<'a> {
     /// A selective query scan (see `scan()`): read each surviving cold file
     /// whole, as the warm branch does.
     selective: bool,
+    /// Carry each file's [`ColdTierFile::max_sequence`] as a trailing constant
+    /// column ([`COLD_MAX_SEQUENCE_COLUMN`]), so the caller's
+    /// [`ColdDeletionFilterExec`] can apply each row only the tombstones newer
+    /// than its file. Callers set it exactly when some tombstone in their
+    /// captured deletion state is newer than some cold file
+    /// ([`cold_files_need_deletion_filter`]); otherwise no row can be hidden
+    /// and the scan is the plain one.
+    ///
+    /// [`ColdTierFile::max_sequence`]: crate::metadata::ColdTierFile::max_sequence
+    per_file_thresholds: bool,
+}
+
+/// Name of the constant per-file column a cold-tier scan built with
+/// [`ColdTierScan::per_file_thresholds`] carries: the file's
+/// `ColdTierFile::max_sequence`, as an `Int64` partition value. Never written to
+/// a file and stripped before the branch leaves the cold scan.
+const COLD_MAX_SEQUENCE_COLUMN: &str = "__cayenne_cold_max_sequence";
+
+/// The cold-tier scan: every surviving file of the captured manifest in one
+/// `DataSourceExec`.
+///
+/// A promotion writes a cold file holding the table's live rows as of its
+/// `max_sequence` and never rewrites it, so a tombstone hides a row of it only
+/// when the tombstone is newer (`delete_sequence > max_sequence`): an older one
+/// was already applied when the file was written, and the key it names may have
+/// a live copy in exactly this file.
+struct ColdTierBranch {
+    plan: Arc<dyn ExecutionPlan>,
+    /// Index in `plan`'s output of [`COLD_MAX_SEQUENCE_COLUMN`] — always the last
+    /// column — when the scan was built with per-file thresholds.
+    max_sequence_column: Option<usize>,
+}
+
+/// Whether any tombstone in `deletion_snapshot` is newer than some of
+/// `cold_files` — the only case in which the cold branch needs a deletion
+/// filter (see [`ColdTierBranch`]).
+fn cold_files_need_deletion_filter(
+    deletion_snapshot: &PkDeletionSnapshot,
+    cold_files: &[crate::metadata::ColdTierFile],
+) -> bool {
+    deletion_snapshot
+        .max_sequence_number()
+        .is_some_and(|newest_delete| cold_files.iter().any(|f| f.max_sequence < newest_delete))
+}
+
+/// Which durable tombstones a warm-to-datalake promotion keeps; see
+/// `CayenneTableProvider::cold_tombstone_retention`.
+struct ColdTombstoneRetention {
+    /// Every tombstone and re-insert record above this sequence is kept, the
+    /// rest cleared; `None` clears them all. The kept ones may still hide a
+    /// superseded row of a cold file the promotion carries forward.
+    retain_above: Option<i64>,
+    /// Tombstoned keys the decision ran against (observability only).
+    tombstones: usize,
+}
+
+/// The in-memory deletion index a datalake promotion keeps, built before the
+/// promotion's publish clears the index and stored back under the same fence.
+enum RetainedTombstones {
+    Int64Pk(DeletionIndex),
+    RowConverterBased(KeyDeletionIndex),
+    /// A position-based table holds no key tombstones.
+    PositionBased,
 }
 
 /// Identity of a [`RawScanInput`] capture — the cache key for its built [`ScanView`].
@@ -3966,6 +4029,24 @@ const PROTECTED_TIER_GROWTH: u64 = 8;
 /// bounding the per-pass read/write amplification regardless of how many
 /// same-tier runs have accumulated.
 const PROTECTED_MERGE_MAX_WIDTH: usize = 32;
+
+/// Fewest same-size datalake generations a cold compaction merges at once (see
+/// [`CayenneTableProvider::compact_cold_tier`]). With [`COLD_TIER_GROWTH`] it
+/// bounds the generations a table holds to about `(COLD_MERGE_MIN_RUNS - 1)`
+/// per size tier.
+const COLD_MERGE_MIN_RUNS: usize = 4;
+
+/// Most datalake generations one cold compaction merges.
+const COLD_MERGE_MAX_WIDTH: usize = 16;
+
+/// Geometric growth factor between datalake generation size tiers.
+const COLD_TIER_GROWTH: u64 = 4;
+
+/// Largest datalake generation in size tier 0. A promotion writes a few MiB at
+/// a time, so tier 0 must sit near that size: sized at the cold target file
+/// (hundreds of MiB), a whole table's datalake stays in tier 0 and every merge
+/// folds the growing base back in, rewriting it on each pass.
+const COLD_TIER_BASE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Bytes of merge input one protected-snapshot pass may select, per byte of the
 /// memory pool it accounts against.
@@ -6763,15 +6844,24 @@ impl CayenneTableProvider {
     /// once the commit succeeds: no row names them afterwards, and nothing else
     /// would. Such a rewrite excludes writers, so the rows read before the commit
     /// are the rows it clears.
+    ///
+    /// `cold_cap` is [`Self::cold_tombstone_prune_cap`], read once by the caller
+    /// so its in-memory clear ([`Self::clear_deletion_caches_for_rewrite`]) uses
+    /// the same bound. A warm rewrite never touches datalake files, so every
+    /// scope clears only tombstones at or below it: the ones above may still
+    /// hide superseded datalake rows.
     pub(crate) async fn commit_snapshot_rewrite(
         &self,
         replaced_snapshot_id: &str,
         new_snapshot_id: &str,
         scope: &RewriteScope,
+        cold_cap: Option<i64>,
     ) -> CatalogResult<()> {
+        let clear_through = Self::rewrite_tombstone_clear_bound(scope, cold_cap);
         let cleared_delete_files = match scope {
             RewriteScope::All | RewriteScope::AllTombstonesFoldedSnapshots { .. } => {
-                self.catalog
+                let mut files = self
+                    .catalog
                     .get_table_delete_files(&self.table_metadata.table_id)
                     .await
                     .unwrap_or_else(|error| {
@@ -6784,12 +6874,21 @@ impl CayenneTableProvider {
                             "Could not list the deletion vectors a snapshot rewrite clears; their files stay on disk"
                         );
                         Vec::new()
-                    })
+                    });
+                // The rows a capped commit keeps still name their files.
+                files
+                    .retain(|file| clear_through.is_none_or(|bound| file.sequence_number <= bound));
+                files
             }
             RewriteScope::Fenced { .. } => Vec::new(),
         };
         let committed = self
-            .commit_snapshot_rewrite_catalog(replaced_snapshot_id, new_snapshot_id, scope)
+            .commit_snapshot_rewrite_catalog(
+                replaced_snapshot_id,
+                new_snapshot_id,
+                scope,
+                clear_through,
+            )
             .await;
         if committed.is_ok() {
             super::delete::remove_dropped_deletion_vector_files(
@@ -6800,22 +6899,51 @@ impl CayenneTableProvider {
         committed
     }
 
+    /// The highest sequence of a tombstone a rewrite commit of `scope` clears,
+    /// or `None` for every one: the scope's own bound, capped at `cold_cap`.
+    fn rewrite_tombstone_clear_bound(scope: &RewriteScope, cold_cap: Option<i64>) -> Option<i64> {
+        match scope {
+            RewriteScope::All | RewriteScope::AllTombstonesFoldedSnapshots { .. } => cold_cap,
+            RewriteScope::Fenced { cutoff, .. } => {
+                Some(cold_cap.map_or(*cutoff, |cap| (*cutoff).min(cap)))
+            }
+        }
+    }
+
     async fn commit_snapshot_rewrite_catalog(
         &self,
         replaced_snapshot_id: &str,
         new_snapshot_id: &str,
         scope: &RewriteScope,
+        clear_through: Option<i64>,
     ) -> CatalogResult<()> {
         match scope {
-            RewriteScope::All => {
-                self.catalog
-                    .commit_compaction(
-                        &self.table_metadata.table_id,
-                        replaced_snapshot_id,
-                        new_snapshot_id,
-                    )
-                    .await
-            }
+            RewriteScope::All => match clear_through {
+                None => {
+                    self.catalog
+                        .commit_compaction(
+                            &self.table_metadata.table_id,
+                            replaced_snapshot_id,
+                            new_snapshot_id,
+                        )
+                        .await
+                }
+                // Datalake files exist: keep the tombstones that may hide their
+                // rows. A wholesale rewrite folds every protected snapshot.
+                Some(bound) => {
+                    let folded_ids: Vec<String> =
+                        self.protected_snapshot_ids().into_iter().collect();
+                    self.catalog
+                        .commit_compaction_fenced(
+                            &self.table_metadata.table_id,
+                            replaced_snapshot_id,
+                            new_snapshot_id,
+                            bound,
+                            &folded_ids,
+                        )
+                        .await
+                }
+            },
             RewriteScope::AllTombstonesFoldedSnapshots { folded } => {
                 let folded_ids: Vec<String> = folded.iter().cloned().collect();
                 self.catalog
@@ -6828,20 +6956,25 @@ impl CayenneTableProvider {
                         // rewrite that rewrote their file away — an unbounded
                         // cutoff clears every one, exactly as
                         // `commit_compaction` does. Only the protected-snapshot
-                        // clear is narrowed to `folded`.
-                        i64::MAX,
+                        // clear is narrowed to `folded`, and the tombstone clear
+                        // to the datalake cap when the table has datalake files.
+                        clear_through.unwrap_or(i64::MAX),
                         &folded_ids,
                     )
                     .await
             }
             RewriteScope::Fenced { cutoff, folded } => {
                 let folded_ids: Vec<String> = folded.iter().cloned().collect();
+                // The durable clear takes the same cold cap as the in-memory prune
+                // that follows the commit: a tombstone that may still mask a
+                // superseded cold row must survive a restart too, and the reload
+                // sees only what this commit leaves.
                 self.catalog
                     .commit_compaction_fenced(
                         &self.table_metadata.table_id,
                         replaced_snapshot_id,
                         new_snapshot_id,
-                        *cutoff,
+                        clear_through.unwrap_or(*cutoff),
                         &folded_ids,
                     )
                     .await
@@ -7179,7 +7312,8 @@ impl CayenneTableProvider {
     }
 
     /// One physical-GC mark-and-sweep pass over the datalake (cold) tier:
-    /// deletes `.vortex` objects orphaned by overwrites and dirty rewrites.
+    /// deletes `.vortex` objects orphaned by overwrites and by promotions whose
+    /// commit never landed.
     ///
     /// The manifest is the GC root; the orphan set is re-derived every pass as
     /// `(objects under the cold prefix) − (manifest URLs)`, so GC is
@@ -15495,6 +15629,8 @@ impl CayenneTableProvider {
             cold_files,
             cold_statistics_schema,
             _scan_guard,
+            deleted_pk_i64,
+            deleted_row_keys,
         ) = {
             let _fence = self.listing_fence.read().await;
             let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
@@ -15541,6 +15677,23 @@ impl CayenneTableProvider {
             } else {
                 None
             };
+            // The deletion index joins the same instant: a datalake merge swaps the
+            // manifest under the WRITE fence and only afterwards clears the
+            // tombstones its inputs needed, so an index loaded after this block
+            // could pair the pre-merge manifest with a pruned index and let a
+            // deleted key back into the keyset.
+            let deleted_pk_i64: Option<Arc<DeletionIndex>> = match &self.pk_deletion_strategy {
+                PkDeletionStrategyWithCache::Int64Pk {
+                    deletion_snapshot, ..
+                } => Some(Arc::clone(&deletion_snapshot.load_full().tombstones)),
+                _ => None,
+            };
+            let deleted_row_keys: Option<Arc<KeyDeletionIndex>> = match &self.pk_deletion_strategy {
+                PkDeletionStrategyWithCache::RowConverterBased {
+                    deletion_snapshot, ..
+                } => Some(Arc::clone(&deletion_snapshot.load_full().tombstones)),
+                _ => None,
+            };
             // Pin every snapshot dir this rebuild reads (the current snapshot plus
             // every protected snapshot) against the retired-dir sweep for the whole
             // read. Unlike a query scan, this write-path read opens Vortex files with
@@ -15567,6 +15720,8 @@ impl CayenneTableProvider {
                 cold_files,
                 self.table_schema(),
                 scan_guard,
+                deleted_pk_i64,
+                deleted_row_keys,
             )
         };
         #[cfg(test)]
@@ -15587,24 +15742,9 @@ impl CayenneTableProvider {
             )
             .await?;
 
-        // Load the deletion caches based on pk_deletion_strategy.
+        // The deletion caches were captured with the snapshot list above.
         // Note: PositionBased strategy is never used here since it implies no primary key,
         // and this function is only called for tables with primary keys.
-        // ArcSwap loads are wait-free; the resulting `Arc<...Index>` is an immutable
-        // snapshot of the deletion state at this instant.
-        let deleted_pk_i64: Option<Arc<DeletionIndex>> = match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                deletion_snapshot, ..
-            } => Some(Arc::clone(&deletion_snapshot.load_full().tombstones)),
-            _ => None,
-        };
-
-        let deleted_row_keys: Option<Arc<KeyDeletionIndex>> = match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::RowConverterBased {
-                deletion_snapshot, ..
-            } => Some(Arc::clone(&deletion_snapshot.load_full().tombstones)),
-            _ => None,
-        };
 
         // Byte budget only for upsert tables — a bloom is a sound existence
         // answer there; `do-nothing` needs an exact answer (a false positive
@@ -15676,16 +15816,28 @@ impl CayenneTableProvider {
         // it. Without this pass a post-promotion rebuild (warm just cleared by
         // the graduation) produces an EMPTY keyset, upserts false-negative, and
         // every re-ingested key double-counts against its cold copy (caught by
-        // the datalake e2e's restart + re-append phase). The FULL deletion
-        // filter (None threshold) mirrors the main-tier handling: a tombstoned
-        // cold key is dead here, and its re-inserted copy is picked up by the
-        // warm/mem-tier passes above.
+        // the datalake e2e's restart + re-append phase). Each promotion
+        // generation takes the tombstones newer than its files, exactly as the
+        // scan applies them (`apply_cold_deletion_filter`): a key tombstoned
+        // after a generation was written is dead in it, while the generation
+        // that holds the key's newest copy keeps it.
         //
         // Skipped when `fold_cold` is false: the cold contribution is then
         // served by the `ColdPkExistence` bloom, avoiding this O(cold-rows)
         // object-store scan entirely.
-        if let Some(cold_files) = cold_files.as_ref()
-            && let Some(cold_plan) = self
+        // The same captured indices the warm passes above probe, in the shape the
+        // cold deletion filter takes.
+        let cold_deletions = match (&deleted_pk_i64, &deleted_row_keys) {
+            (Some(tombstones), _) => PkDeletionSnapshot::Int64Pk {
+                tombstones: Arc::clone(tombstones),
+            },
+            (None, Some(tombstones)) => PkDeletionSnapshot::RowConverterBased {
+                tombstones: Arc::clone(tombstones),
+            },
+            (None, None) => PkDeletionSnapshot::PositionBased,
+        };
+        let cold_plan = match cold_files.as_ref() {
+            Some(cold_files) => self
                 .build_cold_tier_scan_plan(ColdTierScan {
                     state: &ctx.state(),
                     projection: Some(&pk_projection),
@@ -15696,21 +15848,33 @@ impl CayenneTableProvider {
                     file_statistics_schema: cold_statistics_schema,
                     cold_files: cold_files.as_slice(),
                     selective: false,
+                    per_file_thresholds: cold_files_need_deletion_filter(
+                        &cold_deletions,
+                        cold_files.as_slice(),
+                    ),
                 })
                 .await?
-        {
+                .map(|branch| {
+                    self.apply_cold_deletion_filter(branch, &projected_pk_indices, &cold_deletions)
+                })
+                .transpose()?,
+            None => None,
+        };
+        if let Some(cold_plan) = cold_plan {
             let scan_start = Instant::now();
             let keys_before = keyset.len();
             let cold_stream = datafusion_physical_plan::execute_stream(cold_plan, ctx.task_ctx())?;
+            // The cold deletion filter already hid every superseded row, each
+            // against its own file's cutoff, so nothing is filtered again here.
             Self::process_stream_into_keyset(
                 cold_stream,
                 &self.pk_deletion_strategy,
                 pk_indices,
                 converter,
                 &projected_pk_indices,
-                deleted_pk_i64.as_deref(),
-                deleted_row_keys.as_deref(),
-                None, // all deletions apply to cold-resident keys
+                None,
+                None,
+                None,
                 &self.table_metadata.table_name,
                 &mut keyset,
                 &mut row_id_base,
@@ -21276,9 +21440,15 @@ impl CayenneTableProvider {
         // and the flip would then put the sorted old rows back over it.
         #[cfg(test)]
         self.run_test_pre_publish_hook().await;
+        let cold_cap = self.cold_tombstone_prune_cap().await;
         let listing_guard = self.listing_fence.write().await;
         if let Err(e) = self
-            .commit_snapshot_rewrite(&replaced_snapshot_id, &new_snapshot_id, &RewriteScope::All)
+            .commit_snapshot_rewrite(
+                &replaced_snapshot_id,
+                &new_snapshot_id,
+                &RewriteScope::All,
+                cold_cap,
+            )
             .await
         {
             drop(listing_guard);
@@ -21307,7 +21477,7 @@ impl CayenneTableProvider {
         // silently vanish/resurrect rows. Mirrors `publish_overwrite_snapshot` and the
         // compaction publish in `rewrite_current_snapshot_for_compaction`.
         self.update_current_snapshot_id(&new_snapshot_id);
-        self.clear_all_deletion_caches();
+        self.clear_deletion_caches_for_rewrite(None, cold_cap);
         self.listing_table.store(new_listing_table);
         drop(listing_guard);
 
@@ -22983,13 +23153,12 @@ impl CayenneTableProvider {
     /// BOUND on the commit sequences it holds, not an exact range, so its minimum
     /// bounds the floor the same way a warm snapshot's manifest does.
     ///
-    /// Promotion records that bound as `0` — it re-materializes the whole table, so
-    /// a per-file lower bound is not meaningful — which pins the floor to `0` for
-    /// any table holding cold files, and no key DV is reclaimed there. That is the
+    /// Promotion records that bound as `0`, which pins the floor to `0` for any
+    /// table holding cold files, and no key DV is reclaimed there. That is the
     /// correct outcome as well as the safe one: a promotion clears every
-    /// delete-file row it applied, so each DV recorded afterwards carries a
-    /// sequence above every cold row and genuinely hides one, until the next
-    /// promotion applies and clears it in turn.
+    /// delete-file row that can no longer hide a cold row and keeps the rest,
+    /// so each DV left behind may still hide a superseded row of a cold file it
+    /// is newer than.
     async fn cold_snapshot_floor(
         catalog: &dyn MetadataCatalog,
         table_id: &str,
@@ -26160,8 +26329,9 @@ impl CayenneTableProvider {
                 );
                 return Ok(false);
             }
+            let cold_cap = self.cold_tombstone_prune_cap().await;
             if let Err(e) = self
-                .commit_snapshot_rewrite(&snapshot_id_before, &new_snapshot_id, &scope)
+                .commit_snapshot_rewrite(&snapshot_id_before, &new_snapshot_id, &scope, cold_cap)
                 .await
             {
                 drop(listing_guard);
@@ -26227,28 +26397,23 @@ impl CayenneTableProvider {
             // difference, which overstates the yield.
             let held_before_clear = self.pk_deletion_snapshot().delete_len();
             match &scope {
-                // This rewrite always captures a folded set, so `All` is
-                // unreachable here; treat it as the conservative wholesale clear
-                // rather than silently skipping a clear it did materialize.
-                RewriteScope::All => self.clear_all_deletion_caches(),
-                // Position-delete tables held `write_lock` across the whole
-                // rewrite, so no tombstone interleaved and clearing them all is
-                // exactly correct — but a mem-tier checkpoint can still have
-                // published a protected snapshot the scan never folded, so that
-                // half is narrowed to `folded`.
+                // `All` is unreachable here (this rewrite always captures a
+                // folded set) and the position-delete scope clears every
+                // tombstone below the datalake cap: both through the shared
+                // in-memory clear, which keeps the tombstones above the cap.
+                RewriteScope::All => self.clear_deletion_caches_for_rewrite(None, cold_cap),
                 RewriteScope::AllTombstonesFoldedSnapshots { folded } => {
-                    self.clear_deletion_caches_retaining_unfolded_snapshots(folded);
+                    self.clear_deletion_caches_for_rewrite(Some(folded), cold_cap);
                 }
                 // Key-delete tables ran the encode concurrently with writers.
                 // Drop only what the rewrite materialized (`seq <= cutoff` +
                 // the folded protected snapshots); deletes/upserts that raced
                 // the rewrite (`seq > cutoff`, or a protected snapshot created
-                // during the window) are preserved. Capped at the cold
-                // manifest's max sequence: this rewrite never touches cold
-                // objects, so tombstones masking cold-resident keys must
-                // survive until a promotion applies them.
+                // during the window) are preserved. Capped at the oldest cold
+                // file's sequence, as the catalog commit was: this rewrite never
+                // touches cold objects, so tombstones masking cold-resident keys
+                // must survive while the files they mask remain.
                 RewriteScope::Fenced { cutoff, folded } => {
-                    let cold_cap = self.cold_tombstone_prune_cap().await;
                     let prune_cutoff = cold_cap.map_or(*cutoff, |cap| (*cutoff).min(cap));
                     self.prune_deletion_caches_after_full_rewrite(prune_cutoff, folded);
                     // The rewritten files are gone, and the rows any position delete
@@ -26921,9 +27086,10 @@ impl CayenneTableProvider {
                 file_url,
                 row_count,
                 file_size_bytes: i64::try_from(meta.size).unwrap_or(i64::MAX),
-                // v1 promotion re-materializes the whole table, so a per-file
-                // lower bound isn't meaningful; 0 keeps the cold file always
-                // eligible for the phase-2 max_sequence-keyed GC/retention reader.
+                // No per-file lower bound is tracked; 0 is a valid one, keeps the
+                // cold file always eligible for the phase-2 max_sequence-keyed
+                // GC/retention reader, and pins the orphaned-DV floor (see
+                // `cold_snapshot_floor`).
                 min_sequence: 0,
                 max_sequence,
                 statistics_blob,
@@ -27022,23 +27188,27 @@ impl CayenneTableProvider {
         Ok(Some(bloom.to_bytes()))
     }
 
-    /// Cold-tier graduation (storage-cascade bottom tier; incremental
-    /// carry-forward — promotion cost is proportional to the CHANGED data,
-    /// not total table size).
+    /// Cold-tier graduation (storage-cascade bottom tier; promotion cost is
+    /// proportional to the warm tier, not total table size).
     ///
     /// When the warm tier has grown past `cayenne_datalake_warm_max_bytes` /
-    /// `_files`: flush the in-RAM/inline tiers, classify the existing cold
-    /// manifest into dirty/clean against the durable tombstones
-    /// ([`Self::partition_cold_manifest_for_promotion`]), read the canonical
-    /// visible stream restricted to warm + dirty cold files (all deletes
-    /// applied, single-version per key — the proven rewrite read with a
-    /// [`super::cold_partition::ColdScanFiles`] session extension),
-    /// cluster it along the curve, write read-optimized Vortex to the cold store, then
-    /// atomically register the new files PLUS the carried-forward clean
-    /// manifest rows + overwrite-clear the warm tier + flip to a fresh empty
-    /// warm snapshot. Subsequent CDC writes accumulate in warm again until the
-    /// next graduation. Reuses `commit_overwrite` semantics, so a crash is
+    /// `_files`: flush the in-RAM/inline tiers, decide which durable tombstones
+    /// must survive the promotion ([`Self::cold_tombstone_retention`]), read the
+    /// canonical visible stream of the warm tier alone (all deletes applied,
+    /// single-version per key — the proven rewrite read with an empty
+    /// [`super::cold_partition::ColdScanFiles`] session extension), cluster it
+    /// along the curve, write read-optimized Vortex to the cold store, then
+    /// atomically register the new files PLUS every existing cold manifest row
+    /// (carried forward verbatim, never re-read) + overwrite-clear the warm tier
+    /// and every tombstone that can no longer hide a cold row + flip to a fresh
+    /// empty warm snapshot. Subsequent CDC writes accumulate in warm again until
+    /// the next graduation. Reuses `commit_overwrite` semantics, so a crash is
     /// all-or-nothing.
+    ///
+    /// The existing cold files keep the rows that upserts and deletes have since
+    /// superseded; the kept tombstones hide them at read time, each applied to a
+    /// cold file only when it is newer than the file's `max_sequence` (see
+    /// [`ColdTierBranch`]).
     ///
     /// Returns `Ok(true)` if a graduation committed, `Ok(false)` if the cold tier
     /// is disabled, unsupported (position-delete), or not yet triggered.
@@ -27102,43 +27272,47 @@ impl CayenneTableProvider {
         result
     }
 
-    /// Classify the cold manifest into dirty/clean for the carry-forward
-    /// promotion (see [`super::cold_partition`]).
+    /// Decide which durable tombstones a promotion keeps: every tombstone at or
+    /// above the lowest delete sequence that may still hide a row of one of
+    /// `cold_files`, the existing manifest the promotion carries forward (see
+    /// [`super::cold_partition`]). The files the promotion writes hold the warm
+    /// tier's live rows at the promotion's own sequence, which no existing
+    /// tombstone is newer than, so they never need one.
     ///
     /// Tombstoned keys come from the DURABLE deletion vectors — the in-memory
     /// key index stores only key hashes, but the DV rows persist the
     /// `RowConverter`-encoded key bytes (Int64-PK tables persist raw
     /// big-endian `i64`). The caller runs after the mem-tier/inline
-    /// checkpoints, so the durable set is complete.
+    /// checkpoints, so the durable set is complete. A key-based vector whose
+    /// file is missing cannot be read, so its tombstones count as hiding a cold
+    /// row whenever its sequence is newer than some cold file.
     ///
     /// # Errors
     ///
     /// Returns an error when the deletion vectors cannot be listed/read or the
     /// tombstone keys cannot be decoded — the promotion executor handles it
     /// (warn + skip the pass); this function never logs or applies policy.
-    async fn partition_cold_manifest_for_promotion(
+    async fn cold_tombstone_retention(
         &self,
-        cold_files: Vec<crate::metadata::ColdTierFile>,
-    ) -> Result<super::cold_partition::ColdFilePartition> {
+        cold_files: &[crate::metadata::ColdTierFile],
+    ) -> Result<ColdTombstoneRetention> {
         use super::cold_partition::{
-            ColdFilePartition, decode_int64_tombstone_keys, decode_tombstone_keys,
-            encode_int64_bloom_probes, partition_cold_files,
+            decode_int64_tombstone_keys, decode_tombstone_keys, encode_int64_bloom_probes,
+            lowest_cold_relevant_tombstone_sequence,
         };
 
         let internal = |message: String| Error::Internal {
             table: self.table_metadata.table_name.clone(),
             message,
         };
+        let keep_none = ColdTombstoneRetention {
+            retain_above: None,
+            tombstones: 0,
+        };
 
-        if cold_files.is_empty() {
-            return Ok(ColdFilePartition {
-                dirty: Vec::new(),
-                clean: Vec::new(),
-                tombstones: 0,
-                cleared_by_min_max: 0,
-                cleared_by_bloom: 0,
-            });
-        }
+        let Some(oldest_cold_sequence) = cold_files.iter().map(|f| f.max_sequence).min() else {
+            return Ok(keep_none);
+        };
 
         // Durable tombstone keys (bytes) from the deletion-vector files.
         let delete_files = self
@@ -27146,40 +27320,36 @@ impl CayenneTableProvider {
             .get_table_delete_files(&self.table_metadata.table_id)
             .await?;
         if delete_files.is_empty() {
-            // No tombstones can touch cold data: everything carries forward.
-            return Ok(ColdFilePartition {
-                dirty: Vec::new(),
-                clean: cold_files,
-                tombstones: 0,
-                cleared_by_min_max: 0,
-                cleared_by_bloom: 0,
-            });
+            return Ok(keep_none);
         }
-        let (_, deleted_row_keys, _, _) = tokio::task::spawn_blocking(move || {
+        let (_, deleted_row_keys, _, missing) = tokio::task::spawn_blocking(move || {
             super::delete::detect_deletion_type_and_read(delete_files)
         })
         .await
         .map_err(|join_error| {
             internal(format!(
-                "carry-forward classification reader task failed: {join_error}"
+                "datalake tombstone retention reader task failed: {join_error}"
             ))
         })??;
+        let unreadable_floor = missing
+            .iter()
+            .map(|vector| vector.sequence_number)
+            .filter(|sequence| *sequence > oldest_cold_sequence)
+            .min();
         if deleted_row_keys.is_empty() {
-            return Ok(ColdFilePartition {
-                dirty: Vec::new(),
-                clean: cold_files,
+            return Ok(ColdTombstoneRetention {
+                retain_above: unreadable_floor.map(|sequence| sequence.saturating_sub(1)),
                 tombstones: 0,
-                cleared_by_min_max: 0,
-                cleared_by_bloom: 0,
             });
         }
 
         // Decode the key bytes into per-column scalars for the rectangle test.
-        let key_bytes: Vec<Box<[u8]>> = deleted_row_keys.into_keys().collect();
+        let (key_bytes, delete_sequences): (Vec<Box<[u8]>>, Vec<i64>) =
+            deleted_row_keys.into_iter().unzip();
         let decoded = if let Some(converter) = self.pk_row_converter.as_deref() {
             decode_tombstone_keys(converter, &key_bytes).map_err(|e| {
                 internal(format!(
-                    "carry-forward classification failed to decode tombstone keys: {e}"
+                    "datalake tombstone retention failed to decode tombstone keys: {e}"
                 ))
             })?
         } else if matches!(
@@ -27188,12 +27358,12 @@ impl CayenneTableProvider {
         ) {
             decode_int64_tombstone_keys(&key_bytes).map_err(|e| {
                 internal(format!(
-                    "carry-forward classification found malformed Int64 tombstone keys: {e}"
+                    "datalake tombstone retention found malformed Int64 tombstone keys: {e}"
                 ))
             })?
         } else {
             return Err(internal(
-                "carry-forward classification has no key decoder for this deletion strategy"
+                "datalake tombstone retention has no key decoder for this deletion strategy"
                     .to_string(),
             ));
         };
@@ -27201,7 +27371,7 @@ impl CayenneTableProvider {
         // Bloom probe bytes, index-aligned with `decoded`: composite DV keys
         // are already the converter row encoding the per-file blooms insert;
         // Int64 DV keys are raw BE and must be re-encoded. `None` merely
-        // disables the bloom refinement (rectangle-only classification).
+        // disables the bloom refinement (rectangle-only decision).
         let bloom_probes: Option<Vec<Box<[u8]>>> = if self.pk_row_converter.is_some() {
             Some(key_bytes)
         } else {
@@ -27210,13 +27380,23 @@ impl CayenneTableProvider {
                 .and_then(|converter| encode_int64_bloom_probes(&converter, &decoded))
         };
 
-        Ok(partition_cold_files(
+        let tombstones: Vec<(Vec<ScalarValue>, i64)> =
+            decoded.into_iter().zip(delete_sequences).collect();
+        let lowest_relevant = lowest_cold_relevant_tombstone_sequence(
             cold_files,
-            &decoded,
+            &tombstones,
             bloom_probes.as_deref(),
             &self.table_metadata.schema,
             &self.pk_column_indices,
-        ))
+        );
+        let lowest_kept = [lowest_relevant, unreadable_floor]
+            .into_iter()
+            .flatten()
+            .min();
+        Ok(ColdTombstoneRetention {
+            retain_above: lowest_kept.map(|sequence| sequence.saturating_sub(1)),
+            tombstones: tombstones.len(),
+        })
     }
 
     async fn promote_warm_to_cold_inner(&self) -> Result<bool> {
@@ -27342,19 +27522,17 @@ impl CayenneTableProvider {
 
         let max_sequence = self.sequence_high_water().await;
 
-        // ---- Carry-forward partition (incremental promotion). Classify the
-        // existing cold manifest into DIRTY files (may contain a tombstoned
-        // key — must be re-read and rewritten) and CLEAN files (provably
-        // untouched — carried forward by manifest reference, never re-read).
-        // Promotion cost is thereby proportional to the changed data, not
-        // total table size.
+        // Every existing cold file is carried forward by manifest reference and
+        // never re-read, so promotion cost tracks the warm tier rather than the
+        // total table size. What a carried file's superseded rows need instead
+        // is the tombstones that hide them, so decide here which survive.
         let prior_cold = self
             .catalog
             .list_cold_tier_files(&self.table_metadata.table_id)
             .await?;
         let prior_cold_len = prior_cold.len();
-        let partition = match self.partition_cold_manifest_for_promotion(prior_cold).await {
-            Ok(partition) => partition,
+        let retention = match self.cold_tombstone_retention(&prior_cold).await {
+            Ok(retention) => retention,
             Err(error) => {
                 tracing::warn!(
                     target: "cayenne::compaction",
@@ -27373,35 +27551,19 @@ impl CayenneTableProvider {
         tracing::debug!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
-            tombstones = partition.tombstones,
-            dirty_files = partition.dirty.len(),
-            carried_files = partition.clean.len(),
-            cleared_by_min_max = partition.cleared_by_min_max,
-            cleared_by_bloom = partition.cleared_by_bloom,
-            "Classified datalake manifest for carry-forward"
+            tombstones = retention.tombstones,
+            carried_files = prior_cold_len,
+            retain_tombstones_above = ?retention.retain_above,
+            "Decided which tombstones the datalake move keeps"
         );
-        // Deliberately no dirty-fraction guardrail: clean files are always
-        // carried, so carried files' PK ranges may increasingly overlap new
-        // files' across promotions. Watch `datalake_rewrite_selectivity`; if it
-        // ratchets up, the counter-measure is a recluster policy (full rewrite
-        // past a dirty-fraction threshold).
-        let (dirty_cold, clean_cold) = (Arc::new(partition.dirty), partition.clean);
 
-        // Canonical visible read (all tiers, all deletes applied, single-version
-        // per key) — reuses the proven rewrite read so cold is correct by
-        // construction. The session's `ColdScanFiles` extension SUPPLIES its
-        // cold branch the dirty files: clean files stay out of the stream
-        // entirely.
-        //
-        // The extension carries the classified rows themselves, so the rewrite
-        // reads exactly the listing this promotion classified. Handing down
-        // their URLs instead would leave the scan to select them out of its own
-        // later manifest capture, and a dirty file absent from that capture
-        // would be dropped from the rewrite while the commit below still
-        // retires it — silent row loss (#12708).
+        // Canonical visible read of the warm tier (all deletes applied,
+        // single-version per key) — reuses the proven rewrite read. The
+        // session's `ColdScanFiles` extension supplies its cold branch no files,
+        // so no existing cold file is read: each is carried forward as is.
         let ctx = self.create_compaction_session_context_with_config(
             util::session_state::session_config().with_extension(Arc::new(
-                super::cold_partition::ColdScanFiles(Arc::clone(&dirty_cold)),
+                super::cold_partition::ColdScanFiles(Arc::new(Vec::new())),
             )),
         );
         let (plan, _generation_before) = self.rewrite_scan_plan(&ctx).await?;
@@ -27443,12 +27605,10 @@ impl CayenneTableProvider {
             total_rows,
             "Datalake write complete"
         );
-        if cold_files.is_empty() && dirty_cold.is_empty() {
-            // Nothing rewritten and nothing to drop. Gate on files-written, not
-            // `total_rows`: a written file whose footer row count couldn't be
-            // inferred must still be committed, not silently orphaned. (No new
-            // files with dirty files present IS a legitimate commit: every
-            // dirty row was deleted.)
+        if cold_files.is_empty() {
+            // Nothing written. Gate on files-written, not `total_rows`: a written
+            // file whose footer row count couldn't be inferred must still be
+            // committed, not silently orphaned.
             maintenance_metrics::track_compaction(
                 table_name,
                 CompactionKind::Datalake,
@@ -27457,16 +27617,16 @@ impl CayenneTableProvider {
             return Ok(false);
         }
 
-        // Commit: atomically register the NEW cold files plus the
-        // carried-forward CLEAN manifest rows (verbatim — their objects were
-        // never touched), overwrite-clear warm + the prior cold manifest, and
-        // flip to a fresh empty warm snapshot, then sync in-memory state. The
-        // deletion index is cleared by the same commit: every tombstone was
-        // physically applied by this rewrite (warm-resident keys by the warm
-        // stream, cold-resident keys by the dirty-file stream; conservative
-        // detection guarantees no tombstoned key hides in a carried file).
+        // Commit: atomically register the NEW cold files plus every existing
+        // manifest row (verbatim — their objects were never touched),
+        // overwrite-clear warm + the prior cold manifest, and flip to a fresh
+        // empty warm snapshot, then sync in-memory state. The same commit clears
+        // every tombstone at or below `retention.retain_above` (all of them when
+        // `None`): the warm stream applied each one to the rows it read, and none
+        // can hide a row of a carried file. The tombstones above it stay, durably
+        // and in memory, to keep hiding the superseded rows of carried files.
         let written_files = cold_files.len();
-        let carried_datalake_files = clean_cold.len();
+        let carried_datalake_files = prior_cold_len;
         // Newly WRITTEN bytes only (carried files cost zero object-store IO) —
         // the production check that promotion cost tracks the CHANGED data.
         let written_bytes: u64 = cold_files
@@ -27474,7 +27634,7 @@ impl CayenneTableProvider {
             .map(|f| u64::try_from(f.file_size_bytes.max(0)).unwrap_or(0))
             .sum();
         let mut cold_files = cold_files;
-        cold_files.extend(clean_cold);
+        cold_files.extend(prior_cold);
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         if !self.table_metadata.path.starts_with("s3://") {
             let dir = self.snapshot_dir_path_for(&new_snapshot_id);
@@ -27506,6 +27666,12 @@ impl CayenneTableProvider {
         // carry the min/max + NDV aggregate over from here rather than re-reading a
         // row that no longer exists. See `write_rebaselined_row_count`.
         let stats_baseline = self.load_persisted_table_statistics().await;
+        // The kept tombstones, pruned from the live index before the fence so the
+        // publish below only stores them. Writers are excluded (`write_lock`), so
+        // the index cannot change between this read and the publish.
+        let retained_tombstones = retention
+            .retain_above
+            .map(|cutoff| self.deletion_index_retained_above(cutoff));
         // Demote the served exactness BEFORE publishing. The commit below clears the
         // deletion index, so `has_pending_deletions()` — the mask that has been
         // keeping a delete-staled count off the `Exact` path — goes false the moment
@@ -27523,12 +27689,19 @@ impl CayenneTableProvider {
                     &self.table_metadata.table_id,
                     &new_snapshot_id,
                     &cold_files,
+                    retention.retain_above,
                 )
                 .await?;
             // Cold graduation's content is the registered cold files; the overwrite
             // clear drops the warm tier's inline corpus with nothing to replace it,
             // so there are no inline rows to republish.
             self.publish_overwrite_snapshot_fenced(&new_snapshot_id, new_listing_table, None, None);
+            // The publish cleared the whole deletion index; restore the tombstones
+            // the commit kept, under the same fence, so no scan pairs the new cold
+            // manifest with an index missing them.
+            if let Some(retained) = retained_tombstones {
+                self.install_retained_tombstones(retained);
+            }
             // The third publication step, under the same fence: hand the manifest
             // this commit just wrote to the scan path as the cold half of the new
             // snapshot. Every subsequent capture then resolves both halves with no
@@ -27537,19 +27710,20 @@ impl CayenneTableProvider {
         }
 
         // Re-baseline the maintained live row count from the manifest this commit
-        // just registered. Promotion is a full-rewrite fold: it applies every
-        // tombstone physically and clears the deletion index, which drops
-        // `has_pending_deletions()` — the only thing masking a count a standalone
-        // delete left stale. Compaction and overwrite `Set` their count for the
-        // same reason; without this, promotion instead restores `Exact` over the
-        // stale value, and an exact statistic may be substituted into a result
-        // (a distributed `COUNT(*)` then over-counts by the deleted rows).
+        // just registered. A promotion that kept no tombstone has applied every
+        // one and cleared the deletion index, which drops `has_pending_deletions()`
+        // — the only thing masking a count a standalone delete left stale.
+        // Compaction and overwrite `Set` their count for the same reason; without
+        // this, promotion instead restores `Exact` over the stale value, and an
+        // exact statistic may be substituted into a result (a distributed
+        // `COUNT(*)` then over-counts by the deleted rows).
         //
-        // The committed manifest IS the whole live set: warm and the prior cold
-        // manifest were overwrite-cleared, and the mem/inline tiers were
-        // checkpointed into the rewrite above. Its sum may only be claimed exact
+        // With no tombstone kept, the committed manifest IS the whole live set:
+        // warm and the prior cold manifest were overwrite-cleared, the mem/inline
+        // tiers were checkpointed into the read above, and no carried file holds
+        // a row any tombstone hides. Its sum may only be claimed exact
         // when every entry's count is known, judged over the WHOLE manifest — a
-        // carried-forward clean file's count comes from the prior manifest, where
+        // carried-forward file's count comes from the prior manifest, where
         // an earlier promotion may have left the placeholder 0 for a footer it
         // could not read, so checking only the files this promotion wrote would
         // mark the sum `Exact` while omitting every row in that carried file. Any
@@ -27576,7 +27750,22 @@ impl CayenneTableProvider {
                 "Datalake manifest carries an unknown row count; leaving the maintained count inexact"
             );
         }
-        if counts_known {
+        if retention.retain_above.is_some() {
+            // Kept tombstones still hide rows the manifest counts, so its sum
+            // over-counts and nothing here knows by how much. The promotion moved
+            // rows without changing which are live, so the record captured before
+            // the commit (which deleted it) still describes the live count; it is
+            // written back held inexact, as `has_pending_deletions()` also holds
+            // the served count while those tombstones remain.
+            self.write_rebaselined_row_count(
+                stats_baseline,
+                RowCountUpdate::Delta {
+                    delta: 0,
+                    exact: false,
+                },
+            )
+            .await;
+        } else if counts_known {
             self.set_persisted_row_count(stats_baseline, live_rows)
                 .await;
         } else {
@@ -27592,9 +27781,9 @@ impl CayenneTableProvider {
             );
         }
         self.schedule_old_snapshot_cleanup();
-        // Physical GC of the cold objects this promotion orphans is NOT inline —
-        // it runs as a periodic mark-and-sweep on the background tick
-        // (`run_cold_tier_gc_tick`), self-healing across restarts.
+        // Physical GC of orphaned cold objects (a write whose commit never landed)
+        // is NOT inline — it runs as a periodic mark-and-sweep on the background
+        // tick (`run_cold_tier_gc_tick`), self-healing across restarts.
 
         // Bytes WRITTEN this promotion (carried files cost nothing), reported to
         // the shared cross-kind `cayenne_compaction_merged_bytes` metric —
@@ -27609,11 +27798,11 @@ impl CayenneTableProvider {
         );
 
         // Trace fields come in three pairs: input (warm_files/warm_bytes),
-        // classification (rewritten/carried datalake files — sums to the prior
-        // manifest size), output (written_files/written_bytes). The headline
+        // existing datalake files (rewritten/carried — sums to the prior manifest
+        // size), output (written_files/written_bytes). The headline
         // `datalake_rewrite_selectivity` is the fraction of existing datalake
-        // files selected for rewrite — lower is better.
-        let rewritten_datalake_files = dirty_cold.len();
+        // files rewritten, which is always none: every one is carried forward.
+        let rewritten_datalake_files: usize = 0;
         let datalake_rewrite_selectivity = if prior_cold_len == 0 {
             "n/a (first move, no existing datalake files)".to_string()
         } else {
@@ -27643,6 +27832,258 @@ impl CayenneTableProvider {
             "Moved warm-tier data to the datalake"
         );
         Ok(true)
+    }
+
+    /// Merge a size tier of datalake (cold) generations into one, so the number
+    /// of generations, the number of cold files, and the tombstones kept to hide
+    /// their superseded rows all stay bounded.
+    ///
+    /// A generation is the set of cold files sharing one `max_sequence` — one
+    /// promotion's output, or one earlier merge's. Generations are size-tiered
+    /// exactly as protected snapshots are ([`select_protected_snapshot_merge_tier`]):
+    /// the lowest tier holding at least [`COLD_MERGE_MIN_RUNS`] generations is
+    /// merged, oldest first, up to [`COLD_MERGE_MAX_WIDTH`]. Each input file is
+    /// read with its own cutoff — only tombstones newer than its `max_sequence`
+    /// apply ([`ColdDeletionFilterExec`]) — so the merged rows are exactly the
+    /// inputs' live rows, written by [`Self::write_stream_to_cold`] (per-file PK
+    /// blooms and statistics) with `max_sequence` = the newest input's. That is
+    /// sound because every tombstone a reader applies to the output with that
+    /// cutoff is newer than every input, and every tombstone it no longer
+    /// applies (at or below it) was either applied by this read or older than
+    /// the input it would have hidden a row of.
+    ///
+    /// Publication is conditional: [`MetadataCatalog::swap_cold_tier_files`]
+    /// replaces the inputs with the output only if every input is still in the
+    /// manifest, and the in-memory manifest is swapped under the same
+    /// `listing_fence` write. Warm data and delete files are untouched by the
+    /// swap. Afterwards the tombstones that can no longer hide any cold row are
+    /// cleared, durably and in memory, at or below the newest cold file's
+    /// sequence.
+    ///
+    /// Locks: `compaction_lock` for the whole pass, which serializes it with
+    /// promotion and warm-tier compaction (both rewrite what the retention
+    /// decision reads); no `write_lock` while reading, encoding, and uploading;
+    /// `write_lock` then `listing_fence` for writing around the swap, and
+    /// `write_lock` again around the tombstone clear, so a DELETE — which
+    /// captures its datalake sources and scans them inside one `write_lock`
+    /// hold — sees either the inputs with every tombstone they need or the
+    /// output, and no file it reads leaves the manifest while it runs.
+    ///
+    /// Returns `Ok(true)` when a merge was published, `Ok(false)` when the tier
+    /// is disabled, nothing qualifies, or the swap found an input gone (an
+    /// overwrite replaced the table meanwhile; the written files are left to
+    /// the cold GC).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manifest cannot be read, or the merge's read,
+    /// write, or catalog swap fails. The manifest is unchanged on every error
+    /// before the swap commits.
+    #[doc(hidden)]
+    pub async fn compact_cold_tier(&self) -> Result<bool> {
+        let vc = &self.table_metadata.vortex_config;
+        if !vc.cold_tier_enabled() || self.pk_deletion_strategy.is_position_based() {
+            return Ok(false);
+        }
+        // `cold_tier_enabled()` guarantees a non-empty location.
+        let cold_location = vc.cold_tier_location.clone().unwrap_or_default();
+        let table_id = self.table_metadata.table_id.clone();
+
+        let _compaction_guard = self.compaction_lock.write().await;
+        if !self.maintenance_still_admitted() {
+            return Ok(false);
+        }
+
+        // Group the manifest into generations, oldest first.
+        let manifest = self.catalog.list_cold_tier_files(&table_id).await?;
+        let mut generations: BTreeMap<i64, (u64, Vec<crate::metadata::ColdTierFile>)> =
+            BTreeMap::new();
+        for file in manifest {
+            let generation = generations.entry(file.max_sequence).or_default();
+            generation.0 = generation
+                .0
+                .saturating_add(u64::try_from(file.file_size_bytes.max(0)).unwrap_or(0));
+            generation.1.push(file);
+        }
+        let runs: Vec<(String, i64, u64)> = generations
+            .iter()
+            .map(|(max_sequence, (bytes, _))| (max_sequence.to_string(), *max_sequence, *bytes))
+            .collect();
+        // The same per-pass input budget as a protected-snapshot merge, so a tier
+        // of large generations merges a few at a time.
+        let ProtectedMergeSelection::Merge(selected) = select_protected_snapshot_merge_tier(
+            &runs,
+            COLD_MERGE_MIN_RUNS,
+            COLD_MERGE_MAX_WIDTH,
+            COLD_TIER_BASE_BYTES,
+            COLD_TIER_GROWTH,
+            self.protected_merge_input_budget_bytes(),
+            None,
+        ) else {
+            return Ok(false);
+        };
+        let selected_sequences: HashSet<i64> = selected.iter().map(|(_, seq)| *seq).collect();
+        let Some(output_max_sequence) = selected_sequences.iter().copied().max() else {
+            return Ok(false);
+        };
+        let generation_count = generations.len();
+        let inputs: Vec<crate::metadata::ColdTierFile> = generations
+            .into_iter()
+            .filter(|(max_sequence, _)| selected_sequences.contains(max_sequence))
+            .flat_map(|(_, (_, files))| files)
+            .collect();
+
+        // Taken after the manifest: every tombstone that can hide an input row
+        // was published before the promotion that wrote the newest cold file, so
+        // it is here; any published later is newer than every cold file and
+        // keeps applying to the output after the swap.
+        let deletions = self.pk_deletion_snapshot();
+
+        let pass_start = Instant::now();
+        let ctx = self.create_compaction_session_context();
+        let schema = self.table_schema();
+        let Some(branch) = self
+            .build_cold_tier_scan_plan(ColdTierScan {
+                state: &ctx.state(),
+                projection: None,
+                filters: &[],
+                limit: None,
+                scan_config: &ctx.copied_config(),
+                read_schema_override: None,
+                file_statistics_schema: Arc::clone(&schema),
+                cold_files: &inputs,
+                selective: false,
+                per_file_thresholds: cold_files_need_deletion_filter(&deletions, &inputs),
+            })
+            .await?
+        else {
+            return Ok(false);
+        };
+        let plan = self.apply_cold_deletion_filter(branch, &self.pk_column_indices, &deletions)?;
+        let clustering = self.resolve_cold_clustering_indices();
+        let clustering_is_empty = clustering.is_empty();
+        let task_ctx = ctx.task_ctx();
+        let stream = self.cluster_runs_stream(plan, &clustering, &task_ctx)?;
+        let (written, total_rows) = self
+            .write_stream_to_cold(
+                &cold_location,
+                self.cold_object_store_config.as_ref(),
+                stream,
+                output_max_sequence,
+                if clustering_is_empty {
+                    EncodeFanOut::Sized
+                } else {
+                    EncodeFanOut::Serial
+                },
+            )
+            .await?;
+
+        let removed: Vec<String> = inputs.iter().map(|f| f.file_url.clone()).collect();
+        let swapped = {
+            // A DELETE captures its datalake sources and scans them inside one
+            // `write_lock` hold. Swapping inside the same lock keeps every file a
+            // running DELETE reads in the manifest until it finishes, so the cold
+            // GC can never remove one from under it.
+            let _write_guard = self.write_lock_arc().lock_owned().await;
+            let _fence = self.listing_fence.write().await;
+            let swapped = self
+                .catalog
+                .swap_cold_tier_files(&table_id, &removed, &written)
+                .await?;
+            if swapped {
+                // Re-read under the fence, so the published manifest is the
+                // catalog's (a schema change may have cleared statistics blobs
+                // since the capture), and scans resolve it with no metastore read.
+                let files = Arc::new(self.catalog.list_cold_tier_files(&table_id).await?);
+                self.store_cold_manifest(&self.get_current_snapshot_id(), &schema, &files);
+                self.notify_scan_input_change();
+            }
+            swapped
+        };
+        if !swapped {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Datalake compaction found an input already replaced; discarding its output"
+            );
+            return Ok(false);
+        }
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            merged_generations = selected_sequences.len(),
+            generations_before = generation_count,
+            input_files = inputs.len(),
+            written_files = written.len(),
+            total_rows,
+            duration_ms = u64::try_from(pass_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "Merged datalake generations"
+        );
+
+        self.clear_tombstones_no_cold_row_needs().await;
+        Ok(true)
+    }
+
+    /// Clear the tombstones that can no longer hide any row of the current
+    /// datalake manifest, durably and in memory, after a cold compaction raised
+    /// the oldest generation's sequence.
+    ///
+    /// The cutoff is the retention decision's ([`Self::cold_tombstone_retention`])
+    /// capped at the newest cold file's sequence: a tombstone at or below it was
+    /// published before the promotion that wrote that file, so the warm tier no
+    /// longer holds a row it hides either, while a tombstone above it may be a
+    /// write that raced this pass. Best effort — a failure keeps tombstones,
+    /// which costs memory, never a row.
+    async fn clear_tombstones_no_cold_row_needs(&self) {
+        let table_id = &self.table_metadata.table_id;
+        let manifest = match self.catalog.list_cold_tier_files(table_id).await {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    "Could not re-read the datalake manifest; keeping every tombstone this pass"
+                );
+                return;
+            }
+        };
+        let Some(newest_cold_sequence) = manifest.iter().map(|f| f.max_sequence).max() else {
+            return;
+        };
+        let retention = match self.cold_tombstone_retention(&manifest).await {
+            Ok(retention) => retention,
+            Err(error) => {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    "Could not decide which tombstones the datalake still needs; keeping every tombstone this pass"
+                );
+                return;
+            }
+        };
+        let cutoff = retention
+            .retain_above
+            .map_or(newest_cold_sequence, |cutoff| {
+                cutoff.min(newest_cold_sequence)
+            });
+
+        let _write_guard = self.write_lock_arc().lock_owned().await;
+        if let Err(error) = self
+            .catalog
+            .clear_key_tombstones_at_or_below(table_id, cutoff)
+            .await
+        {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                "Could not clear the tombstones the datalake no longer needs; keeping them in memory too"
+            );
+            return;
+        }
+        self.prune_deletion_index_at_or_below(cutoff);
     }
 
     /// Fast, write-lock-free consolidation of a size-tiered subset of the
@@ -29206,9 +29647,9 @@ impl CayenneTableProvider {
             .bake_clean_prefix_holds(&selected_set, prefix_cutoff)
             .await;
 
-        // The bake rewrote WARM snapshots only; a tombstone above the cold
-        // manifest's max sequence still masks a superseded cold-resident row
-        // and must survive until a promotion applies it to the cold tier.
+        // The bake rewrote WARM snapshots only; a tombstone above the oldest
+        // cold file's sequence may still mask a superseded cold-resident row
+        // and must survive while that file is in the manifest.
         // Computed outside the fence (metastore read); pruning less than
         // `prefix_cutoff` is always safe — the physically-applied warm rows
         // are gone, so a retained tombstone just probe-misses them.
@@ -30114,9 +30555,9 @@ impl CayenneTableProvider {
     }
 
     /// [`Self::create_compaction_session_context`] with an explicit config —
-    /// the carry-forward promotion attaches its
+    /// the datalake promotion attaches its empty
     /// [`super::cold_partition::ColdScanFiles`] extension here so its private
-    /// session's cold branch reads only the dirty files being rewritten.
+    /// session's read covers the warm tier and no cold file.
     fn create_compaction_session_context_with_config(
         &self,
         config: SessionConfig,
@@ -30722,6 +31163,27 @@ impl CayenneTableProvider {
         );
     }
 
+    /// In-memory clear for a rewrite whose scope clears every tombstone, matching
+    /// its catalog commit ([`Self::commit_snapshot_rewrite`]): `folded` is the
+    /// protected set an `AllTombstonesFoldedSnapshots` rewrite folded (`None` for
+    /// `All`, which folds them all), and with datalake files present (`cold_cap`
+    /// set) the tombstones above the cap stay, since the rewrite never touched
+    /// the datalake rows they may hide.
+    pub(crate) fn clear_deletion_caches_for_rewrite(
+        &self,
+        folded: Option<&std::collections::HashSet<String>>,
+        cold_cap: Option<i64>,
+    ) {
+        let retained = cold_cap.map(|cap| self.deletion_index_retained_above(cap));
+        match folded {
+            Some(folded) => self.clear_deletion_caches_retaining_unfolded_snapshots(folded),
+            None => self.clear_all_deletion_caches(),
+        }
+        if let Some(retained) = retained {
+            self.install_retained_tombstones(retained);
+        }
+    }
+
     /// The ids of every protected snapshot currently registered on this table.
     ///
     /// Read twice around a rewrite's scan to detect a concurrent publish (see
@@ -30865,15 +31327,16 @@ impl CayenneTableProvider {
         self.refresh_deletion_memory_accounting();
     }
 
-    /// Highest commit sequence covered by the datalake (cold) manifest, when
+    /// Lowest commit sequence any datalake (cold) file was written at, when
     /// the tier holds files. Warm-only rewrites (the seq-prefix bake, the
     /// full-rewrite prune) must retain every tombstone ABOVE this cap: they
-    /// never rewrite cold objects, so a tombstone masking a cold-resident key
-    /// stays load-bearing for the cold scan branch until a promotion
-    /// physically applies it (the promotion commit then clears the index).
-    /// Pruning such a tombstone silently resurrects the stale cold version of
-    /// every key it masked (observed as CH-benCH over-counts ≈ the update
-    /// count on promoted tables).
+    /// never rewrite cold objects, and a tombstone newer than a cold file may
+    /// mask a superseded row of it — the cold scan branch applies it to every
+    /// file older than it (see [`ColdTierBranch`]) — for as long as that file
+    /// is in the manifest. A promotion carries every cold file forward, so the
+    /// OLDEST file bounds what is still load-bearing. Pruning such a tombstone
+    /// silently resurrects the stale cold version of every key it masked
+    /// (observed as CH-benCH over-counts ≈ the update count on promoted tables).
     ///
     /// `None` = no cap (tier disabled, or empty cold manifest). On a metastore
     /// error, caps at `i64::MIN` so the pass prunes nothing — the conservative
@@ -30887,7 +31350,7 @@ impl CayenneTableProvider {
             .list_cold_tier_files(&self.table_metadata.table_id)
             .await
         {
-            Ok(files) => files.iter().map(|f| f.max_sequence).max(),
+            Ok(files) => files.iter().map(|f| f.max_sequence).min(),
             Err(error) => {
                 tracing::warn!(
                     target: "cayenne::compaction",
@@ -31130,6 +31593,61 @@ impl CayenneTableProvider {
             && !bake.input_ids.iter().any(|id| protected.contains_key(id))
     }
 
+    /// The live deletion index with every delete and re-insert record at or
+    /// below `cutoff` dropped — the in-memory half of what a datalake promotion
+    /// keeps ([`Self::cold_tombstone_retention`]), matching the delete files and
+    /// insert records its commit keeps above the same cutoff. Built before the
+    /// promotion's publish clears the index, for
+    /// [`Self::install_retained_tombstones`] to store back.
+    fn deletion_index_retained_above(&self, cutoff: i64) -> RetainedTombstones {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => RetainedTombstones::Int64Pk(
+                deletion_snapshot
+                    .load()
+                    .tombstones
+                    .prune_deletes_at_or_below(cutoff),
+            ),
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => RetainedTombstones::RowConverterBased(
+                deletion_snapshot
+                    .load()
+                    .tombstones
+                    .prune_deletes_at_or_below(cutoff),
+            ),
+            PkDeletionStrategyWithCache::PositionBased { .. } => RetainedTombstones::PositionBased,
+        }
+    }
+
+    /// Publish the tombstones a datalake promotion kept, after its publish
+    /// cleared the deletion index. The caller holds `listing_fence` for writing,
+    /// so a scan sees the new cold manifest only together with these.
+    fn install_retained_tombstones(&self, retained: RetainedTombstones) {
+        match (&self.pk_deletion_strategy, retained) {
+            (
+                PkDeletionStrategyWithCache::Int64Pk {
+                    deletion_snapshot, ..
+                },
+                RetainedTombstones::Int64Pk(index),
+            ) => {
+                deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(index)));
+            }
+            (
+                PkDeletionStrategyWithCache::RowConverterBased {
+                    deletion_snapshot, ..
+                },
+                RetainedTombstones::RowConverterBased(index),
+            ) => {
+                deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_index(index)));
+            }
+            // Built from this same strategy, so nothing else pairs up.
+            _ => {}
+        }
+        self.refresh_deletion_memory_accounting();
+    }
+
     /// Seq-prefix clear of the in-memory deletion index: drop every PK tombstone
     /// whose `delete_seq <= cutoff` (= `T`) while retaining tombstones with
     /// `delete_seq > cutoff` and upsert re-insertion records with
@@ -31138,7 +31656,7 @@ impl CayenneTableProvider {
     ///
     /// COLD-TIER CONTRACT: callers whose rewrite did not touch the cold tier
     /// must cap `cutoff` at [`Self::cold_tombstone_prune_cap`] — tombstones
-    /// above the cold manifest's max sequence are the only thing hiding
+    /// above the oldest cold file's sequence are the only thing hiding
     /// superseded cold-resident rows from the cold scan branch.
     ///
     /// This is the deletion-index half of an incremental seq-prefix compaction
@@ -40179,12 +40697,14 @@ impl CayenneTableProvider {
     /// A promotion's private session overrides `cold_files` entirely with its
     /// [`super::cold_partition::ColdScanFiles`] extension — see the override
     /// below for why that is a replacement and not a filter. The returned plan
-    /// is a Vortex `DataSourceExec`; the caller wraps it with the key-based
-    /// (`Ignore`) deletion filter and unions it into the scan tree.
+    /// is a Vortex `DataSourceExec` over every surviving file; with
+    /// `per_file_thresholds` it also outputs each file's `max_sequence` as a
+    /// trailing constant column, which [`Self::apply_cold_deletion_filter`]
+    /// consumes and strips before the branch is unioned into the scan tree.
     async fn build_cold_tier_scan_plan(
         &self,
         scan: ColdTierScan<'_>,
-    ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
+    ) -> datafusion_common::Result<Option<ColdTierBranch>> {
         let ColdTierScan {
             state,
             projection,
@@ -40195,6 +40715,7 @@ impl CayenneTableProvider {
             file_statistics_schema,
             cold_files,
             selective,
+            per_file_thresholds,
         } = scan;
         // Cold tier disabled (no location) → no branch.
         if !self.table_metadata.vortex_config.cold_tier_enabled() {
@@ -40211,10 +40732,10 @@ impl CayenneTableProvider {
             Self::register_object_store_if_needed(state.runtime_env(), cold_config);
         }
 
-        // Carry-forward promotion: the promotion's PRIVATE session carries a
-        // `ColdScanFiles` config extension supplying the dirty files being
-        // rewritten. User-query sessions never carry it, so queries always see
-        // the full captured manifest.
+        // A promotion's PRIVATE session carries a `ColdScanFiles` config
+        // extension supplying the cold files its read covers — none, since a
+        // promotion reads the warm tier alone. User-query sessions never carry
+        // it, so queries always see the full captured manifest.
         let promotion_files = scan_config.get_extension::<super::cold_partition::ColdScanFiles>();
         let cold_files =
             super::cold_partition::cold_files_for_scan(cold_files, promotion_files.as_deref());
@@ -40224,17 +40745,23 @@ impl CayenneTableProvider {
 
         let base_schema =
             read_schema_override.unwrap_or_else(|| Arc::clone(&file_statistics_schema));
-        let options = Self::create_listing_options(
+        let mut options = Self::create_listing_options(
             self.context.file_format(),
             &self.pk_deletion_strategy,
             scan_config,
         );
+        // The cold tier is never partitioned (gated at config time), so the
+        // per-file threshold is the only partition column the scan can carry.
+        if per_file_thresholds {
+            options.listing.table_partition_cols =
+                vec![(COLD_MAX_SEQUENCE_COLUMN.to_string(), DataType::Int64)];
+        }
         let scan_schema = Self::snapshot_scan_schema(&base_schema, &options);
 
-        // Data-column pruning predicate (cold tier is never partitioned — gated
-        // at config time — so every filter is a data filter). Reuses the warm
-        // path's predicate + pruner; stats come from the persisted blob, so
-        // pruning costs no object-store round-trip.
+        // Data-column pruning predicate (every query filter is a data filter;
+        // none can name the threshold column). Reuses the warm path's predicate +
+        // pruner; stats come from the persisted blob, so pruning costs no
+        // object-store round-trip.
         let listing_pruning_predicate = if filters.is_empty() {
             None
         } else {
@@ -40242,7 +40769,7 @@ impl CayenneTableProvider {
         };
 
         // Candidate primary keys the filters pin, to probe each file's bloom. A
-        // promotion's private session reads its classified files whole.
+        // promotion's private session reads its supplied files whole.
         let pk_probe = if promotion_files.is_some() {
             None
         } else {
@@ -40256,7 +40783,11 @@ impl CayenneTableProvider {
             self.cold_pk_blooms.trim(&cold_files);
         }
 
-        self.cold_file_statistics.trim(&cold_files);
+        // A promotion or merge reads a subset of the manifest; trimming against
+        // it would evict the live files every query still plans.
+        if promotion_files.is_none() {
+            self.cold_file_statistics.trim(&cold_files);
+        }
 
         let table_name = self.table_metadata.table_name.clone();
         let mut object_store_url: Option<ListingTableUrl> = None;
@@ -40278,6 +40809,11 @@ impl CayenneTableProvider {
                 u64::try_from(file.file_size_bytes).unwrap_or(0),
             );
             let mut part_file = PartitionedFile::from(object_meta);
+            // Set before the statistics: `with_statistics` appends the partition
+            // column's exact min = max = value statistics from it.
+            if per_file_thresholds {
+                part_file.partition_values = vec![ScalarValue::Int64(Some(file.max_sequence))];
+            }
             if let Some(stats) = self
                 .cold_file_statistics
                 .statistics_for(file, &file_statistics_schema)
@@ -40322,13 +40858,29 @@ impl CayenneTableProvider {
         // Key-based deletion (cold tier is key-mode only) filters ABOVE the
         // Vortex scan, so a pushed row-count limit would under-deliver; suppress
         // it and rely on the outer GlobalLimitExec (mirror
-        // create_snapshot_scan_plan_with_config).
-        let scan_pushdown_limit =
-            if self.has_pending_deletions() && !self.pk_deletion_strategy.is_position_based() {
-                None
-            } else {
-                limit
-            };
+        // create_snapshot_scan_plan_with_config). A scan carrying per-file
+        // thresholds always has that filter above it.
+        let scan_pushdown_limit = if per_file_thresholds
+            || (self.has_pending_deletions() && !self.pk_deletion_strategy.is_position_based())
+        {
+            None
+        } else {
+            limit
+        };
+
+        // The threshold column follows every file column in the table schema, so
+        // it is appended to the projection and lands last in the output.
+        let threshold_index = base_schema.fields().len();
+        let (scan_projection, max_sequence_column) = match (projection, per_file_thresholds) {
+            (_, false) => (projection.cloned(), None),
+            (Some(projection), true) => {
+                let mut extended = projection.clone();
+                extended.push(threshold_index);
+                let column = projection.len();
+                (Some(extended), Some(column))
+            }
+            (None, true) => (None, Some(threshold_index)),
+        };
 
         let file_groups = FileGroup::new(kept).split_files(options.target_partitions);
         let (file_groups, statistics) =
@@ -40362,7 +40914,7 @@ impl CayenneTableProvider {
                     .with_file_groups(file_groups)
                     .with_constraints(Constraints::default())
                     .with_statistics(statistics)
-                    .with_projection_indices(projection.cloned())?
+                    .with_projection_indices(scan_projection)?
                     .with_limit(scan_pushdown_limit)
                     // Cold files are an unsorted internal union branch — never
                     // advertise an ordering.
@@ -40370,7 +40922,65 @@ impl CayenneTableProvider {
                     .build(),
             )
             .await?;
-        Ok(Some(plan))
+        Ok(Some(ColdTierBranch {
+            plan,
+            max_sequence_column,
+        }))
+    }
+
+    /// Wrap the cold-tier branch with the deletion filter its files need and
+    /// strip the per-file threshold column, so the result has exactly the
+    /// columns the caller projected.
+    ///
+    /// A branch built without per-file thresholds needs no filter: the caller
+    /// decided no tombstone is newer than any of its files
+    /// ([`cold_files_need_deletion_filter`]). Otherwise
+    /// [`ColdDeletionFilterExec`] applies each row only the tombstones newer
+    /// than its own file, with re-inserts ignored, as for protected snapshots:
+    /// the re-inserted copy lives in a newer tier or a newer cold file.
+    fn apply_cold_deletion_filter(
+        &self,
+        branch: ColdTierBranch,
+        pk_indices_in_projection: &[usize],
+        deletion_snapshot: &PkDeletionSnapshot,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let Some(threshold_column) = branch.max_sequence_column else {
+            return Ok(branch.plan);
+        };
+        let tombstones = match deletion_snapshot {
+            PkDeletionSnapshot::Int64Pk { tombstones } => Some(ColdTombstones::Int64Pk {
+                tombstones: Arc::clone(tombstones),
+                pk_column_index: pk_indices_in_projection.first().copied().ok_or_else(|| {
+                    datafusion_common::DataFusionError::Internal(
+                        "Int64 PK strategy requires exactly one PK column index".to_string(),
+                    )
+                })?,
+            }),
+            PkDeletionSnapshot::RowConverterBased { tombstones } => {
+                let row_converter = self.pk_row_converter.as_ref().ok_or_else(|| {
+                    datafusion_common::DataFusionError::Internal(format!(
+                        "Table {} has key-based deletions but no primary-key row converter",
+                        self.table_metadata.table_name
+                    ))
+                })?;
+                Some(ColdTombstones::RowKeys {
+                    tombstones: Arc::clone(tombstones),
+                    pk_column_indices: pk_indices_in_projection.to_vec(),
+                    row_converter: Arc::clone(row_converter),
+                })
+            }
+            // The cold tier is key-mode only; nothing here can hide a cold row.
+            PkDeletionSnapshot::PositionBased => None,
+        };
+        let filtered: Arc<dyn ExecutionPlan> = match tombstones {
+            Some(tombstones) => Arc::new(ColdDeletionFilterExec::new(
+                branch.plan,
+                tombstones,
+                threshold_column,
+            )),
+            None => branch.plan,
+        };
+        self.create_projection_strip(filtered, threshold_column)
     }
 
     /// Resolve a snapshot's data files from the manifest (`cayenne_snapshot_file`)
@@ -41990,9 +42600,18 @@ impl CayenneTableProvider {
     /// deletes on the main scan path. Rows guaranteed hidden by the deletion
     /// index are expressed as `pk NOT IN (...)` so Vortex can prune chunks and
     /// listing can drop non-overlapping files before decode.
+    ///
+    /// The filter reaches every branch of the scan, the cold tier included, and
+    /// a cold file holds the live copy of a key whose newest delete is not newer
+    /// than the file. `newest_cold_sequence` — the highest `max_sequence` among
+    /// the scan's cold files, if it has any — therefore bounds the keys pushed:
+    /// only a key whose newest delete is newer than every cold file is hidden in
+    /// all of them by the cold deletion filter too, so excluding it from every
+    /// branch hides nothing that filter would keep.
     fn vortex_key_delete_pushdown_filter(
         &self,
         deletion_snapshot: &PkDeletionSnapshot,
+        newest_cold_sequence: Option<i64>,
     ) -> Option<Expr> {
         let PkDeletionSnapshot::Int64Pk { tombstones } = deletion_snapshot else {
             return None;
@@ -42010,6 +42629,7 @@ impl CayenneTableProvider {
             tombstones,
             InsertRecordHandling::Apply,
             None,
+            newest_cold_sequence,
             MAX_VORTEX_KEY_DELETE_PUSHDOWN,
         )
     }
@@ -42687,8 +43307,16 @@ impl CayenneTableProvider {
         let mut scan_filters_owned = effective_filters.unwrap_or_else(|| filters.to_vec());
         let mem_tier_pruning_filters = scan_filters_owned.clone();
         if tombstone_pushdown == TombstonePushdown::Apply
-            && let Some(tombstone_filter) =
-                self.vortex_key_delete_pushdown_filter(&deletion_snapshot)
+            && let Some(tombstone_filter) = self.vortex_key_delete_pushdown_filter(
+                &deletion_snapshot,
+                cold_files.as_ref().and_then(|files| {
+                    files
+                        .iter()
+                        .filter(|f| f.file_size_bytes > 0)
+                        .map(|f| f.max_sequence)
+                        .max()
+                }),
+            )
         {
             tracing::trace!(
                 table = %self.table_metadata.table_name,
@@ -42862,11 +43490,15 @@ impl CayenneTableProvider {
         }
 
         // Build the COLD object-store tier branch (storage-cascade bottom tier) from
-        // the CAPTURED manifest. Cold files hold OLD, fully-superseded data, so they
-        // take the `Ignore`-re-inserts deletion treatment (`apply_deletion_filter`) —
-        // the same camp as protected snapshots. Using the `Apply` variant here would
-        // resurrect a stale cold row for a key re-inserted after deletion.
-        // `Ok(None)` (disabled / empty / all-pruned) adds zero plan nodes.
+        // the CAPTURED manifest. Cold files hold OLD, superseded data, so they take
+        // the `Ignore`-re-inserts deletion treatment — the same camp as protected
+        // snapshots. Using the `Apply` variant here would resurrect a stale cold
+        // row for a key re-inserted after deletion. Each file applies only the
+        // tombstones newer than it (see `ColdTierBranch`), one scan for all of
+        // them. `Ok(None)` (disabled / empty / all-pruned) adds zero plan nodes.
+        let captured_cold_files = cold_files
+            .as_ref()
+            .map_or(&[][..], |files| files.as_slice());
         let cold_plan: Option<Arc<dyn ExecutionPlan>> = self
             .build_cold_tier_scan_plan(ColdTierScan {
                 state,
@@ -42876,12 +43508,18 @@ impl CayenneTableProvider {
                 scan_config: scan_listing_config,
                 read_schema_override: Some(Arc::clone(&read_schema)),
                 file_statistics_schema: Arc::clone(&file_statistics_schema),
-                cold_files: cold_files.as_ref().map_or(&[], |files| files.as_slice()),
+                cold_files: captured_cold_files,
                 selective: is_pk_selective_scan,
+                per_file_thresholds: need_pk_deletion
+                    && cold_files_need_deletion_filter(&deletion_snapshot, captured_cold_files),
             })
             .await?
-            .map(|cold| {
-                self.apply_deletion_filter(cold, &pk_indices_in_projection, &deletion_snapshot)
+            .map(|branch| {
+                self.apply_cold_deletion_filter(
+                    branch,
+                    &pk_indices_in_projection,
+                    &deletion_snapshot,
+                )
             })
             .transpose()?;
 
@@ -43558,16 +44196,25 @@ impl CayenneTableProvider {
         })
     }
 
-    /// Build a `ListingTable` per distinct live cold-file directory (storage-
-    /// cascade bottom tier), so a key-based DELETE scan finds cold-resident keys
-    /// and records their tombstones. Empty when the cold tier is disabled/empty.
+    /// Build a `ListingTable` per distinct live cold-file directory of
+    /// `cold_files` (storage-cascade bottom tier), so a key-based DELETE scan
+    /// finds cold-resident keys and records their tombstones, each paired with
+    /// the [`ColdTierFile::max_sequence`](crate::metadata::ColdTierFile::max_sequence)
+    /// its files were written at: only tombstones newer than that hide a row of
+    /// them (see [`ColdTierBranch`]). Empty when the cold tier is disabled/empty.
     ///
-    /// Dirs are derived from the `cayenne_cold_tier_file` manifest URLs (the
-    /// authoritative live set), NOT a directory scan — so a superseded physical
-    /// cold generation left behind by replace-all promotion is never scanned.
-    async fn build_cold_tier_listing_tables(
+    /// `cold_files` is the manifest the caller captured under `listing_fence`
+    /// together with the deletion index the sources are judged by. Dirs are
+    /// derived from its URLs (the authoritative live set), NOT a directory scan
+    /// — so a superseded physical cold generation is never scanned. A promotion
+    /// or datalake merge writes every file of a directory at one sequence, so a
+    /// directory is one source; should its live files disagree, each file is
+    /// listed as a source of its own rather than judged by another file's
+    /// sequence.
+    fn build_cold_tier_listing_tables(
         &self,
-    ) -> datafusion_common::Result<Vec<Arc<ListingTable>>> {
+        cold_files: &[crate::metadata::ColdTierFile],
+    ) -> datafusion_common::Result<Vec<(i64, Arc<ListingTable>)>> {
         if !self.table_metadata.vortex_config.cold_tier_enabled() {
             return Ok(Vec::new());
         }
@@ -43576,32 +44223,22 @@ impl CayenneTableProvider {
         if let Some(ref cold_config) = self.cold_object_store_config {
             Self::register_object_store_if_needed(self.context.runtime_env(), cold_config);
         }
-        let cold_files = self
-            .catalog
-            .list_cold_tier_files(&self.table_metadata.table_id)
-            .await
-            .map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to list cold-tier files for delete on table {}: {e}",
-                    self.table_metadata.table_name
-                ))
-            })?;
-        let mut dirs: Vec<String> = Vec::new();
-        for f in &cold_files {
+        let mut dirs: Vec<(String, Vec<&crate::metadata::ColdTierFile>)> = Vec::new();
+        for f in cold_files {
             if f.file_size_bytes <= 0 {
                 continue;
             }
             if let Some(idx) = f.file_url.rfind('/') {
                 let dir = &f.file_url[..=idx];
-                if !dirs.iter().any(|d| d == dir) {
-                    dirs.push(dir.to_string());
+                match dirs.iter_mut().find(|(d, _)| d == dir) {
+                    Some((_, files)) => files.push(f),
+                    None => dirs.push((dir.to_string(), vec![f])),
                 }
             }
         }
-        let mut tables = Vec::with_capacity(dirs.len());
-        for dir in dirs {
-            let table = Self::create_listing_table(
-                &dir,
+        let listing_table = |url: &str| {
+            Self::create_listing_table(
+                url,
                 self.table_schema(),
                 self.context.file_format(),
                 &self.pk_deletion_strategy,
@@ -43610,8 +44247,20 @@ impl CayenneTableProvider {
                 datafusion_common::DataFusionError::Execution(format!(
                     "Failed to create cold-tier listing table for delete: {e}"
                 ))
-            })?;
-            tables.push(table);
+            })
+        };
+        let mut tables = Vec::with_capacity(dirs.len());
+        for (dir, files) in dirs {
+            let Some(max_sequence) = files.first().map(|f| f.max_sequence) else {
+                continue;
+            };
+            if files.iter().all(|f| f.max_sequence == max_sequence) {
+                tables.push((max_sequence, listing_table(&dir)?));
+            } else {
+                for f in files {
+                    tables.push((f.max_sequence, listing_table(&f.file_url)?));
+                }
+            }
         }
         Ok(tables)
     }
@@ -43641,11 +44290,19 @@ impl CayenneTableProvider {
             listing_fence: Arc::clone(&self.listing_fence),
             scan_state_lock: Arc::clone(&self.scan_state_lock),
         };
-        let (protected_tables, tombstones_at_capture) = {
+        // The datalake manifest joins the same capture: a datalake merge swaps the
+        // manifest under `listing_fence` and only later clears the tombstones its
+        // inputs needed, so a source list resolved apart from the index it is judged
+        // by could pair a merged-away file with a pruned index.
+        let (protected_tables, tombstones_at_capture, cold_files) = {
             let _guards = capture_locks.read().await;
+            let cold_files = self
+                .cold_manifest_under_held_fence(&self.get_current_snapshot_id())
+                .await?;
             (
                 self.build_protected_snapshot_listing_tables()?,
                 self.pk_deletion_snapshot(),
+                cold_files,
             )
         };
         let mut snapshot_tables: Vec<DeleteScanSource> = protected_tables
@@ -43676,20 +44333,23 @@ impl CayenneTableProvider {
         // key-delete filter). Cold uses key-based deletes, so this is only ever
         // non-empty for key-delete tables.
         //
-        // Cold files hold OLD, fully superseded data, so they take `Ignore` with NO
-        // cutoff — the pairing `scan` gives them through `apply_deletion_filter`, and NOT
-        // the main listing's `Apply` despite both lacking a cutoff. Treating a re-inserted
-        // key as live here would match the stale cold value and tombstone the KEY,
-        // deleting the replacement that never matched the predicate.
+        // Cold files hold OLD, superseded data, so they take `Ignore` — the pairing
+        // `scan` gives them through `apply_cold_deletion_filter`, and NOT the main
+        // listing's `Apply`. Treating a re-inserted key as live here would match the
+        // stale cold value and tombstone the KEY, deleting the replacement that never
+        // matched the predicate. Each source carries its files' sequence as the
+        // cutoff, as the scan does: a tombstone no newer than a cold file was applied
+        // when the file was written, and the key's live copy may be in that file.
+        // Judged against the index captured with the manifest as well as the live
+        // one, like the protected snapshots (see `DeleteScanSource::tombstones_at_capture`).
         snapshot_tables.extend(
-            self.build_cold_tier_listing_tables()
-                .await?
+            self.build_cold_tier_listing_tables(&cold_files)?
                 .into_iter()
-                .map(|table| DeleteScanSource {
-                    min_delete_seq: None,
+                .map(|(max_sequence, table)| DeleteScanSource {
+                    min_delete_seq: Some(max_sequence),
                     insert_records: InsertRecordHandling::Ignore,
                     table,
-                    tombstones_at_capture: None,
+                    tombstones_at_capture: Some(tombstones_at_capture.clone()),
                 }),
         );
 
@@ -44474,6 +45134,18 @@ impl super::compaction::ColdTierPromotionRunner for CayenneTableProvider {
                     "Tiering tick failed to move data to the datalake (warm tier left intact; next cycle retries): {e}"
                 );
             }
+        }
+
+        // Merge datalake generations after the move (which may have added one)
+        // and before GC, which then reclaims the merged inputs once their grace
+        // passes.
+        if let Err(e) = self.compact_cold_tier().await {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Failed to merge datalake files of table '{}', so its datalake keeps more files and deletion records until the next cycle retries. Cause: {e}",
+                self.table_metadata.table_name
+            );
         }
 
         // Physical cold GC fires about every `cold_tier_gc_interval_ms`
@@ -47115,6 +47787,38 @@ mod tests {
     }
 
     #[test]
+    fn datalake_merge_leaves_the_large_base_generation_alone() {
+        // Measured under OTLP ingest: a 300 MiB datalake base and promotion outputs
+        // of about 1.3 MiB. Four promotions merge with each other; the base is
+        // not rewritten to absorb them.
+        let mib = 1024 * 1024;
+        let inputs = vec![
+            sized("base", 300 * mib),
+            sized("p1", 1_300_000),
+            sized("p2", 1_400_000),
+            sized("p3", 2_200_000),
+            sized("p4", 900_000),
+        ];
+        assert_eq!(
+            select_protected_snapshot_merge_tier(
+                &inputs,
+                COLD_MERGE_MIN_RUNS,
+                COLD_MERGE_MAX_WIDTH,
+                COLD_TIER_BASE_BYTES,
+                COLD_TIER_GROWTH,
+                None,
+                None,
+            ),
+            ProtectedMergeSelection::Merge(
+                ["p1", "p2", "p3", "p4"]
+                    .into_iter()
+                    .map(|id| (id.to_string(), 0))
+                    .collect()
+            ),
+        );
+    }
+
+    #[test]
     fn protected_merge_input_budget_scales_with_the_pool_and_is_none_when_unbounded() {
         use datafusion::execution::memory_pool::MemoryLimit;
 
@@ -47691,6 +48395,7 @@ mod tests {
                 &RewriteScope::AllTombstonesFoldedSnapshots {
                     folded: folded.clone(),
                 },
+                None,
             )
             .await
             .expect("fenced compaction commit succeeds");
@@ -48218,6 +48923,7 @@ mod tests {
                 &provider.get_current_snapshot_id(),
                 &new_snapshot_id,
                 &RewriteScope::All,
+                None,
             )
             .await
             .expect("wholesale compaction commit succeeds");
@@ -66941,10 +67647,10 @@ mod tests {
     /// Whether `pk_row_converter` is cached is the deletion-vector key-encoding
     /// discriminator: an `Int64Pk` table's tombstone keys are raw big-endian,
     /// every other shape's are `RowConverter` `OwnedRow` encodings (see
-    /// `partition_cold_manifest_for_promotion`). Caching a converter for a
-    /// single-`Int64` primary key would decode those raw-BE keys through a
-    /// `RowConverter`, corrupting carry-forward classification and cold-file
-    /// partitioning — so pin which shape caches one.
+    /// `cold_tombstone_retention`). Caching a converter for a single-`Int64`
+    /// primary key would decode those raw-BE keys through a `RowConverter`,
+    /// corrupting the decision of which tombstones a datalake promotion keeps
+    /// — so pin which shape caches one.
     #[tokio::test]
     async fn pk_row_converter_is_none_exactly_for_the_int64_pk_strategy() {
         let ctx = SessionContext::new();
@@ -83135,6 +83841,137 @@ mod tests {
                 "a deletion file beside the table root is in no snapshot directory under it"
             );
         }
+    }
+
+    /// A keyset rebuild that captured the datalake manifest before a datalake
+    /// merge and reads the deletion index after the merge's tombstone clear
+    /// would judge the merged-away files by a pruned index, and a deleted key
+    /// would come back into the exact keyset (a later insert of it on this
+    /// do-nothing table is then dropped). The rebuild must judge the files it
+    /// captured by the tombstones captured with them.
+    #[tokio::test]
+    async fn keyset_rebuild_judges_the_datalake_by_the_tombstones_captured_with_it() {
+        use datafusion::prelude::{col, lit};
+
+        async fn load_and_promote(
+            provider: &CayenneTableProvider,
+            schema: &SchemaRef,
+            ids: std::ops::Range<i64>,
+        ) {
+            let ids: Vec<i64> = ids.collect();
+            let values: Vec<i64> = ids.iter().map(|id| id * 2).collect();
+            insert_batch(provider, id_value_batch(Arc::clone(schema), &ids, &values)).await;
+            assert!(
+                provider
+                    .promote_warm_to_cold()
+                    .await
+                    .expect("promotion runs"),
+                "promotion fires with any warm file"
+            );
+        }
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = temp_dir.path().join("metadata");
+        let data_dir = temp_dir.path().join("data");
+        let cold_dir = temp_dir.path().join("cold");
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        std::fs::create_dir_all(&cold_dir).expect("cold dir created");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!(
+                "sqlite://{}/cayenne.db",
+                metadata_dir
+                    .to_str()
+                    .expect("metadata path should be UTF-8")
+            ))
+            .expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let provider = Arc::new(
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+                .create(CreateTableOptions {
+                    table_name: "keyset_merge_race".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: data_dir.to_string_lossy().into_owned(),
+                    partition_column: None,
+                    vortex_config: VortexConfig {
+                        inline_max_rows: 0,
+                        cold_tier_location: Some(format!("file://{}", cold_dir.to_string_lossy())),
+                        cold_tier_warm_max_files: 1,
+                        cold_tier_gc_interval_ms: 300_000,
+                        cold_tier_background_interval_ms: 3_600_000,
+                        deletion_mode: crate::metadata::DeletionMode::Key,
+                        ..VortexConfig::default()
+                    },
+                })
+                .await
+                .expect("datalake table created"),
+        );
+
+        // Generation 1 holds id 5; its delete is newer than generation 1, older
+        // than every later generation, so the merge below clears it.
+        load_and_promote(&provider, &schema, 0..10).await;
+        let plan = provider
+            .delete_from(&ctx.state(), vec![col("id").eq(lit(5_i64))])
+            .await
+            .expect("delete planned");
+        datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("delete runs");
+        load_and_promote(&provider, &schema, 10..13).await;
+        load_and_promote(&provider, &schema, 13..16).await;
+        load_and_promote(&provider, &schema, 16..19).await;
+
+        // Merge the four generations between the rebuild's capture and the rest
+        // of the rebuild.
+        let merged = Arc::new(AtomicBool::new(false));
+        {
+            let merging = Arc::clone(&provider);
+            let merged = Arc::clone(&merged);
+            *provider.test_post_keyset_capture_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let did_merge = merging
+                        .compact_cold_tier()
+                        .await
+                        .expect("datalake merge runs");
+                    merged.store(did_merge, Ordering::SeqCst);
+                })
+            }));
+        }
+        let pk_indices = provider.pk_column_indices.clone();
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary-key converter");
+        let rebuilt = provider
+            .load_existing_pk_index(&pk_indices, &converter, true, None, 1)
+            .await
+            .expect("keyset rebuild");
+        assert!(
+            merged.load(Ordering::SeqCst),
+            "precondition: the merge ran inside the rebuild"
+        );
+        assert!(
+            catalog
+                .get_table_delete_files(&provider.table_metadata.table_id)
+                .await
+                .expect("list delete files")
+                .is_empty(),
+            "precondition: the merge cleared the tombstone of id 5"
+        );
+        let ShardedPkIndex::Exact(keysets) = rebuilt else {
+            panic!("a do-nothing table rebuilds an exact keyset");
+        };
+        assert_eq!(
+            keysets.iter().map(CachedPkKeyset::len).sum::<usize>(),
+            18,
+            "ids 0..19 without the deleted id 5"
+        );
     }
 
     mod layered_upsert_state;

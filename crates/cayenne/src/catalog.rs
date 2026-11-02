@@ -869,15 +869,49 @@ pub trait MetadataCatalog: Send + Sync {
     /// records, inline data, snapshot sequences, per-file/table stats, pk index)
     /// + repoint `current_snapshot_id` to `new_snapshot_id` (a fresh empty warm
     /// snapshot). All-or-nothing, so a crash mid-promotion never leaves rows in
-    /// BOTH tiers (double-count) or NEITHER (loss). The deletion state is cleared
-    /// because the cold files were written with all deletes already applied
-    /// (single-version) — exactly the semantics of `commit_overwrite`, whose new
-    /// content here lives on the cold object store instead of a warm snapshot.
+    /// BOTH tiers (double-count) or NEITHER (loss). `cold_files` is the whole
+    /// new manifest: the files this promotion wrote plus every existing cold
+    /// file it carries forward.
+    ///
+    /// `retain_tombstones_above` decides what happens to the deletion state.
+    /// `None` clears all of it, which is correct when no tombstone can hide a
+    /// row of any cold file in `cold_files`. `Some(cutoff)` keeps every
+    /// key-based delete file and every insert record whose sequence is above
+    /// `cutoff` — tombstones that still hide superseded rows of carried-forward
+    /// cold files — and clears the rest, including every position-based delete
+    /// file (those name warm files the overwrite clear retires).
     async fn commit_overwrite_to_cold(
         &self,
         table_id: &str,
         new_snapshot_id: &str,
         cold_files: &[ColdTierFile],
+        retain_tombstones_above: Option<i64>,
+    ) -> CatalogResult<()>;
+
+    /// Atomically replace datalake (cold) files: remove the manifest rows of
+    /// `removed_file_urls` and register `added`, in one transaction.
+    ///
+    /// Conditional, like [`Self::swap_protected_snapshots`]: returns `Ok(false)`
+    /// and changes nothing when any of `removed_file_urls` is no longer in the
+    /// manifest (an overwrite or another swap consumed it), so a merge built from
+    /// a stale manifest can never re-register rows twice or drop rows another
+    /// commit placed. Never touches warm data, delete files, or insert records.
+    async fn swap_cold_tier_files(
+        &self,
+        table_id: &str,
+        removed_file_urls: &[String],
+        added: &[ColdTierFile],
+    ) -> CatalogResult<bool>;
+
+    /// Clear every key-based delete file and insert record at or below
+    /// `cutoff`, in one transaction. Position-based delete files are untouched.
+    ///
+    /// The caller must have established that no tombstone at or below `cutoff`
+    /// can hide a live row anywhere in the table.
+    async fn clear_key_tombstones_at_or_below(
+        &self,
+        table_id: &str,
+        cutoff: i64,
     ) -> CatalogResult<()>;
 
     /// Upsert the persisted primary-key existence index (a bloom checkpoint),
