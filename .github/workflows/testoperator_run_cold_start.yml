@@ -51,7 +51,9 @@ jobs:
     # Dependabot-triggered runs get no Actions secrets, so the MinIO setup
     # would fail on empty credentials. Skip those; a push by a maintainer to
     # the same branch runs the job with secrets.
-    if: ${{ github.actor != 'dependabot[bot]' }}
+    # Self-hosted pool: skip PRs from forks so an approved fork run does not
+    # execute here. Non-PR events and same-repo PRs still run.
+    if: ${{ github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     # The only writer of the fixture: two concurrent first seeds would interleave
     # their Delta logs under one prefix.
     concurrency:
@@ -75,6 +77,9 @@ jobs:
     needs: seed-fixture
     runs-on: spiceai-dev-runners
     timeout-minutes: 90
+    # Self-hosted pool: skip PRs from forks so an approved fork run does not
+    # execute here. Non-PR events and same-repo PRs still run.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     strategy:
       fail-fast: false
       matrix:
