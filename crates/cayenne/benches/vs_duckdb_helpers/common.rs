@@ -6,12 +6,12 @@
 //
 //     https://www.apache.org/licenses/LICENSE-2.0
 
-//! Shared helpers for the Cayenne-vs-DuckDB micro-benchmarks.
+//! Shared helpers for the Cayenne-vs-`DuckDB` micro-benchmarks.
 //!
-//! Each `vs_duckdb_*` bench compares Cayenne and DuckDB on the same Arrow
+//! Each `vs_duckdb_*` bench compares Cayenne and `DuckDB` on the same Arrow
 //! input, doing identical logical work. Helpers in this module own the
 //! pieces that are identical across benches — schema, fixture generation,
-//! parquet materialization, and the canonical Cayenne / DuckDB setup paths.
+//! parquet materialization, and the canonical Cayenne / `DuckDB` setup paths.
 //!
 //! Included via `#[path = "vs_duckdb_helpers/common.rs"] mod common;`
 //! from each bench file. Placing the helper inside a subdirectory keeps
@@ -23,10 +23,12 @@
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::cast_sign_loss)]
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arrow::array::Array as _;
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::util::pretty::pretty_format_batches;
@@ -38,7 +40,7 @@ use datafusion::parquet::file::properties::WriterProperties;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
-use duckdb::Connection;
+use duckdb_oracle::Connection;
 use tempfile::TempDir;
 
 /// Which Cayenne metastore backend to use in a fixture.
@@ -246,7 +248,6 @@ async fn setup_cayenne_with(
 /// must run under the same memory budget as the table's write path — that
 /// mirrors spiced, which shares one `RuntimeEnv` across the accelerator and
 /// the query sessions.
-#[allow(clippy::too_many_arguments)]
 pub async fn setup_cayenne_custom(
     table_name: &str,
     metastore: Metastore,
@@ -293,7 +294,7 @@ pub async fn setup_cayenne_custom(
 
 /// Build a [`SessionContext`](datafusion::prelude::SessionContext) carrying the
 /// same Cayenne physical optimizer rules a running Spice daemon installs via its
-/// `DataFusionBuilder`, on top of DataFusion's default rules.
+/// `DataFusionBuilder`, on top of `DataFusion`'s default rules.
 ///
 /// The benches otherwise build a bare `SessionContext::new()`, which omits every
 /// Cayenne physical rule, so a benchmark would measure plans the daemon never
@@ -306,7 +307,7 @@ pub async fn setup_cayenne_custom(
 ///   (a no-op when none are declared, as in these benches).
 /// * `CayenneStatsAggregateRewriter` — folds whole-table `SUM`/`AVG` (and mixed
 ///   aggregates) from Vortex file statistics; `COUNT`/`MIN`/`MAX` already fold
-///   via DataFusion's built-in `AggregateStatistics` rule.
+///   via `DataFusion`'s built-in `AggregateStatistics` rule.
 /// * `CayenneAntiJoinSortMergeRewriter` — rewrites oversized semi/anti joins
 ///   (its memory gate defaults when no `CayenneOptimizerConfig` extension is
 ///   present, so it is safe to register on a bare session).
@@ -366,23 +367,22 @@ pub fn warm_session_with_runtime(
     ctx
 }
 
-/// A clean DuckDB file-mode database with the same schema.
+/// A clean `DuckDB` file-mode database with the same schema.
 ///
 /// File-backed (not in-memory) for parity with Cayenne, which only supports
-/// `mode: file`. Comparing Cayenne-file vs DuckDB-memory would not be fair
+/// `mode: file`. Comparing Cayenne-file vs `DuckDB`-memory would not be fair
 /// (see `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/README.md`).
 pub struct DuckDbFixture {
-    pub _temp_dir: TempDir,
+    pub temp_dir: TempDir,
     pub conn: Connection,
 }
 
 impl DuckDbFixture {
     /// Path to the on-disk `.duckdb` file. Used by the concurrent bench to
-    /// open a second connection from a background thread (DuckDB connections
-    /// are not `Send`).
+    /// open an independent connection from a background thread.
     #[must_use]
     pub fn db_path(&self) -> PathBuf {
-        self._temp_dir.path().join("duck.db")
+        self.temp_dir.path().join("duck.db")
     }
 }
 
@@ -403,13 +403,10 @@ fn setup_duckdb_with_pk(table_name: &str, with_pk: bool) -> DuckDbFixture {
         "CREATE TABLE {table_name} (id BIGINT{pk_clause}, name VARCHAR NOT NULL, value BIGINT NOT NULL);"
     ))
     .expect("duckdb create table");
-    DuckDbFixture {
-        _temp_dir: temp_dir,
-        conn,
-    }
+    DuckDbFixture { temp_dir, conn }
 }
 
-/// DuckDB fixture for the join bench: a `t` fact table (default schema) and
+/// `DuckDB` fixture for the join bench: a `t` fact table (default schema) and
 /// a `d` dim table (id, region). Both engines see the same shape so the
 /// resulting join plans are directly comparable.
 pub fn setup_duckdb_with_dim(fact_table: &str, dim_table: &str) -> DuckDbFixture {
@@ -423,7 +420,7 @@ pub fn setup_duckdb_with_dim(fact_table: &str, dim_table: &str) -> DuckDbFixture
     fixture
 }
 
-/// Upsert via DuckDB's `INSERT ... ON CONFLICT DO UPDATE`. Apples-to-apples
+/// Upsert via `DuckDB`'s `INSERT ... ON CONFLICT DO UPDATE`. Apples-to-apples
 /// with Cayenne's `OnConflict::Upsert` on the `id` primary key.
 pub fn duckdb_upsert_parquet(conn: &Connection, table_name: &str, parquet_path: &Path) {
     conn.execute_batch(&format!(
@@ -460,18 +457,20 @@ pub fn duckdb_insert_rows(conn: &Connection, table_name: &str, batch: &RecordBat
         if i > 0 {
             sql.push(',');
         }
-        sql.push_str(&format!(
+        write!(
+            sql,
             "({}, '{}', {})",
             ids.value(i),
             names.value(i).replace('\'', "''"),
             values.value(i)
-        ));
+        )
+        .expect("write SQL");
     }
     sql.push(';');
     conn.execute_batch(&sql).expect("duckdb insert rows");
 }
 
-/// Insert the rows of `batch` into DuckDB's dim table.
+/// Insert the rows of `batch` into `DuckDB`'s dim table.
 pub fn duckdb_insert_dim_rows(conn: &Connection, table_name: &str, batch: &RecordBatch) {
     use arrow::array::{Array, Int64Array, StringArray};
 
@@ -491,17 +490,19 @@ pub fn duckdb_insert_dim_rows(conn: &Connection, table_name: &str, batch: &Recor
         if i > 0 {
             sql.push(',');
         }
-        sql.push_str(&format!(
+        write!(
+            sql,
             "({}, '{}')",
             ids.value(i),
             regions.value(i).replace('\'', "''"),
-        ));
+        )
+        .expect("write SQL");
     }
     sql.push(';');
     conn.execute_batch(&sql).expect("duckdb insert dim rows");
 }
 
-/// Bulk-insert via DuckDB's native parquet loader. This is DuckDB's
+/// Bulk-insert via `DuckDB`'s native parquet loader. This is `DuckDB`'s
 /// fastest ingestion path and the apples-to-apples comparison for
 /// Cayenne's parquet-source insert path.
 pub fn duckdb_insert_parquet(conn: &Connection, table_name: &str, parquet_path: &Path) {
@@ -512,7 +513,7 @@ pub fn duckdb_insert_parquet(conn: &Connection, table_name: &str, parquet_path: 
     .expect("duckdb insert parquet");
 }
 
-/// Insert an Arrow batch through Cayenne via the DataFusion `insert_into` API.
+/// Insert an Arrow batch through Cayenne via the `DataFusion` `insert_into` API.
 /// Mirrors how spiced loads accelerator data in production.
 pub async fn cayenne_insert(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> u64 {
     use datafusion::datasource::TableProvider;
@@ -545,9 +546,9 @@ pub async fn cayenne_insert(table: &Arc<CayenneTableProvider>, batch: RecordBatc
 /// Drive Cayenne's pipelined CDC append path end-to-end for a single batch.
 ///
 /// Calls [`CayenneTableProvider::write_cdc_append_stream`] (the entry point
-/// used by `refresh_mode: changes` in spiced's accelerated_table refresh
+/// used by `refresh_mode: changes` in spiced's `accelerated_table` refresh
 /// loop) and then awaits `finish()` so the rows are fully visible — this is
-/// the apples-to-apples comparison against DuckDB's INSERT path, which has
+/// the apples-to-apples comparison against `DuckDB`'s INSERT path, which has
 /// no staged/visibility split.
 ///
 /// Takes a `task_ctx` reference rather than constructing a fresh
@@ -584,7 +585,7 @@ pub async fn cayenne_cdc_write(
     rows
 }
 
-/// Insert from a parquet file through Cayenne via DataFusion's parquet
+/// Insert from a parquet file through Cayenne via `DataFusion`'s parquet
 /// reader. Mirrors spiced's `file:` connector → accelerator ingestion path
 /// and gives parity with `duckdb_insert_parquet` (both engines now consume
 /// the same on-disk parquet, including the decode work).
@@ -668,7 +669,7 @@ pub async fn cayenne_query_warm(
 }
 
 /// Run a SQL query against two Cayenne tables registered as `t` and `d`.
-/// Used by the join bench so the SQL matches the DuckDB form.
+/// Used by the join bench so the SQL matches the `DuckDB` form.
 pub async fn cayenne_query_join(
     fact: &Arc<CayenneTableProvider>,
     dim: &Arc<CayenneTableProvider>,
@@ -692,7 +693,7 @@ pub async fn cayenne_query_join(
     df.collect().await.expect("cayenne join collect")
 }
 
-/// Capture optimized and executed plans for a Cayenne/DuckDB query pair.
+/// Capture optimized and executed plans for a Cayenne/`DuckDB` query pair.
 ///
 /// Files are written to `target/cayenne_vs_duckdb_plans/<label>.md` by default.
 /// Set `CAYENNE_DUCKDB_PLAN_DIR` to choose a different output directory.
@@ -710,7 +711,7 @@ pub async fn capture_comparison_plans(
 
     let mut content = String::new();
     content.push_str("# Cayenne vs DuckDB Plans\n\n");
-    content.push_str(&format!("## {label}\n\n"));
+    write!(content, "## {label}\n\n").expect("write plan label");
     content.push_str("### Cayenne SQL\n\n```sql\n");
     content.push_str(cayenne_sql);
     content.push_str("\n```\n\n### DuckDB SQL\n\n```sql\n");
@@ -754,7 +755,7 @@ pub async fn capture_parquet_ingest_plans(
 
     let mut content = String::new();
     content.push_str("# Cayenne vs DuckDB Plans\n\n");
-    content.push_str(&format!("## {label}\n\n"));
+    write!(content, "## {label}\n\n").expect("write plan label");
     content.push_str("### Cayenne Operation\n\n```text\n");
     content.push_str("CayenneTableProvider::insert_into(ctx.read_parquet(...))");
     content.push_str("\n```\n\n### DuckDB SQL\n\n```sql\n");
@@ -799,11 +800,7 @@ async fn cayenne_plan_text(
 
 fn duckdb_plan_text(conn: &Connection, plan_kind: &str, sql: &str) -> String {
     let explain_sql = format!("{plan_kind} {sql}");
-    let mut stmt = conn.prepare(&explain_sql).expect("duckdb explain prepare");
-    let batches: Vec<RecordBatch> = stmt
-        .query_arrow([])
-        .expect("duckdb explain query")
-        .collect();
+    let batches = conn.query(&explain_sql).expect("duckdb explain query");
     pretty_format_batches(&batches)
         .expect("format duckdb explain")
         .to_string()
@@ -853,9 +850,10 @@ async fn cayenne_parquet_insert_plan_text(
 }
 
 fn plan_output_dir() -> PathBuf {
-    std::env::var_os("CAYENNE_DUCKDB_PLAN_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target/cayenne_vs_duckdb_plans"))
+    std::env::var_os("CAYENNE_DUCKDB_PLAN_DIR").map_or_else(
+        || PathBuf::from("target/cayenne_vs_duckdb_plans"),
+        PathBuf::from,
+    )
 }
 
 fn sanitize_plan_label(label: &str) -> String {
@@ -868,24 +866,29 @@ fn sanitize_plan_label(label: &str) -> String {
         .collect()
 }
 
-/// Run a SQL query through DuckDB and return the number of rows in the
+/// Run a SQL query through `DuckDB` and return the number of rows in the
 /// result. Discarding the row content keeps the bench focused on engine
 /// work, not on Rust-side decoding.
 pub fn duckdb_query_count(conn: &Connection, sql: &str) -> i64 {
-    let mut stmt = conn.prepare(sql).expect("duckdb prepare");
-    let mut rows = stmt.query([]).expect("duckdb query");
-    let mut count: i64 = 0;
-    while let Some(_row) = rows.next().expect("duckdb row") {
-        count += 1;
-    }
-    count
+    conn.query(sql)
+        .expect("duckdb query")
+        .iter()
+        .map(|b| i64::try_from(b.num_rows()).expect("row count fits i64"))
+        .sum()
 }
 
 /// Run a SQL aggregate query that returns a single scalar i64.
 pub fn duckdb_query_scalar(conn: &Connection, sql: &str) -> i64 {
-    let mut stmt = conn.prepare(sql).expect("duckdb prepare");
-    stmt.query_row([], |row| row.get::<_, i64>(0))
-        .expect("duckdb query_row")
+    let batches = conn.query(sql).expect("duckdb query");
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    let value = arrow::compute::cast(batches[0].column(0), &arrow::datatypes::DataType::Int64)
+        .expect("scalar fits i64");
+    let value = value
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("i64 scalar");
+    assert!(!value.is_null(0), "NULL scalar");
+    value.value(0)
 }
 
 /// Execute a query purely for timing and drain its rows, forcing full
@@ -893,7 +896,5 @@ pub fn duckdb_query_scalar(conn: &Connection, sql: &str) -> i64 {
 /// scalar or a multi-column aggregate rollup — where [`duckdb_query_scalar`]'s
 /// `i64`-typed column-0 read would not.
 pub fn duckdb_exec(conn: &Connection, sql: &str) {
-    let mut stmt = conn.prepare(sql).expect("duckdb prepare");
-    let mut rows = stmt.query([]).expect("duckdb query");
-    while rows.next().expect("duckdb row").is_some() {}
+    drop(conn.query(sql).expect("duckdb query"));
 }

@@ -23,7 +23,7 @@ bollard = "0.18.1"
 chbench-driver = { path = "../chbench-driver" }
 clap.workspace = true
 datafusion.workspace = true
-duckdb = { workspace = true, features = ["bundled"] }
+duckdb-oracle = { path = "../../crates/duckdb-oracle" }
 flight_client = { path = "../../crates/flight_client" }
 futures.workspace = true
 itertools.workspace = true
