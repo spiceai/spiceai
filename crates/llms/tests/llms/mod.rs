@@ -42,6 +42,7 @@ use tokio::sync::oneshot;
 use crate::{TEST_ARGS, init_tracing};
 
 mod create;
+mod evaluate;
 mod responses;
 mod streaming_tests;
 
