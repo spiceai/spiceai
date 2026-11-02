@@ -730,16 +730,9 @@ mod accelerator_compat_tests {
         }
     }
 
-    /// Helper function to construct mode label with optional timestamp format
-    fn make_mode_label(
-        mode: &str,
-        timestamp_format: Option<&str>,
-        metastore_type: Option<&str>,
-    ) -> String {
+    /// Helper function to construct mode label with an optional metastore
+    fn make_mode_label(mode: &str, metastore_type: Option<&str>) -> String {
         let mut labels = vec![mode.to_string()];
-        if let Some(ts_fmt) = timestamp_format {
-            labels.push(format!("timestamp_format={ts_fmt}"));
-        }
         if let Some(metastore) = metastore_type {
             labels.push(format!("metastore={metastore}"));
         }
@@ -768,34 +761,25 @@ mod accelerator_compat_tests {
         Fut: std::future::Future<Output = ()>,
     {
         // Test both memory and file modes for databases
-        // For Turso accelerator, test both timestamp formats
-        // Format: (engine, mode, timestamp_format, metastore_type)
+        // Format: (engine, mode, metastore_type)
         let test_configs = vec![
             #[cfg(feature = "sqlite")]
-            (Engine::Sqlite, "memory", None, None),
+            (Engine::Sqlite, "memory", None),
             #[cfg(feature = "sqlite")]
-            (Engine::Sqlite, "file", None, None),
-            #[cfg(feature = "turso")]
-            (Engine::Turso, "memory", Some("rfc3339"), None),
-            #[cfg(feature = "turso")]
-            (Engine::Turso, "file", Some("rfc3339"), None),
-            #[cfg(feature = "turso")]
-            (Engine::Turso, "memory", Some("integer_millis"), None),
-            #[cfg(feature = "turso")]
-            (Engine::Turso, "file", Some("integer_millis"), None),
+            (Engine::Sqlite, "file", None),
             #[cfg(feature = "duckdb")]
-            (Engine::DuckDB, "memory", None, None),
+            (Engine::DuckDB, "memory", None),
             #[cfg(feature = "duckdb")]
-            (Engine::DuckDB, "file", None, None),
-            (Engine::Arrow, "memory", None, None),
-            (Engine::Cayenne, "file", None, Some("sqlite")), // Cayenne with SQLite metastore
+            (Engine::DuckDB, "file", None),
+            (Engine::Arrow, "memory", None),
+            (Engine::Cayenne, "file", Some("sqlite")), // Cayenne with SQLite metastore
         ];
 
-        for (engine, mode, timestamp_format, metastore_type) in test_configs {
+        for (engine, mode, metastore_type) in test_configs {
             // Create a unique test environment for this test run
             let test_env = TestEnvironment::new();
 
-            let mode_label = make_mode_label(mode, timestamp_format, metastore_type);
+            let mode_label = make_mode_label(mode, metastore_type);
 
             println!("Testing with engine: {:?} ({})", engine, mode_label);
 
@@ -805,12 +789,7 @@ mod accelerator_compat_tests {
             // Create appropriate location based on mode with a unique identifier per test run
             // This ensures tests don't interfere with each other by reusing the same file/directory
             let location = if mode == "file" {
-                let variant = match (timestamp_format, metastore_type) {
-                    (Some(ts_fmt), Some(metastore)) => format!("{ts_fmt}_{metastore}"),
-                    (Some(ts_fmt), None) => ts_fmt.to_string(),
-                    (None, Some(metastore)) => metastore.to_string(),
-                    (None, None) => "default".to_string(),
-                };
+                let variant = metastore_type.unwrap_or("default");
                 format!(
                     "/tmp/spice_benchmark_{:?}_{}_{}_{}.db",
                     engine,
@@ -832,11 +811,6 @@ mod accelerator_compat_tests {
 
             // Add mode option for engines that need it (e.g., Vortex)
             options.insert("mode".to_string(), mode.to_string());
-
-            // Add timestamp_format option for Turso
-            if let Some(ts_fmt) = timestamp_format {
-                options.insert("internal_timestamp_format".to_string(), ts_fmt.to_string());
-            }
 
             let constraints = if table_options.primary_key {
                 options.insert(
@@ -876,20 +850,6 @@ mod accelerator_compat_tests {
                         Ok(table) => table,
                         Err(e) => {
                             println!("  Skipping SQLite - unsupported types: {}", e);
-                            continue;
-                        }
-                    }
-                }
-                #[cfg(feature = "turso")]
-                Engine::Turso => {
-                    use accelerator_turso::TursoAccelerator;
-                    match TursoAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new(), None)
-                        .await
-                    {
-                        Ok(table) => table,
-                        Err(e) => {
-                            println!("  Skipping Turso - unsupported types: {}", e);
                             continue;
                         }
                     }
@@ -2140,14 +2100,6 @@ mod accelerator_compat_tests {
                             .await
                             .expect("SQLite table should be created")
                     }
-                    #[cfg(feature = "turso")]
-                    Engine::Turso => {
-                        use accelerator_turso::TursoAccelerator;
-                        TursoAccelerator::new()
-                            .create_external_table(external_table, None, Vec::new(), None)
-                            .await
-                            .expect("Turso table should be created")
-                    }
                     #[cfg(feature = "duckdb")]
                     Engine::DuckDB => {
                         use accelerator_duckdb::DuckDBAccelerator;
@@ -2637,14 +2589,6 @@ mod accelerator_compat_tests {
             let ctx = SessionContext::new();
             let schema = test_schema(Some(engine));
             let table_schema = table.schema();
-
-            // Turso has known issues with List/Map serialization/deserialization
-            // Skip this test for Turso until those are resolved
-            #[cfg(feature = "turso")]
-            if engine == Engine::Turso {
-                println!("  Skipping Turso - List/Map types have known serialization issues");
-                return;
-            }
 
             // Check if List and Map columns exist in the schemas
             let has_list = schema.column_with_name("list_col").is_some();
@@ -3329,10 +3273,6 @@ mod accelerator_compat_tests {
 
     fn benchmark_sizing(engine: Engine, is_memory: bool, is_file: bool) -> (usize, usize) {
         let defaults = match (engine, is_memory, is_file) {
-            #[cfg(feature = "turso")]
-            (Engine::Turso, true, _) => (100, 3),
-            #[cfg(feature = "turso")]
-            (Engine::Turso, _, true) => (1_000, 10),
             (_, true, _) => (100_000, 10),
             (_, _, true) => (1_000_000, 10),
             _ => (10_000, 10),
@@ -3349,7 +3289,7 @@ mod accelerator_compat_tests {
     }
 
     fn supports_change_delete_roundtrip(engine: Engine) -> bool {
-        !matches!(engine, Engine::Arrow | Engine::Turso)
+        !matches!(engine, Engine::Arrow)
     }
 
     fn generate_changed_test_data(
@@ -3444,7 +3384,7 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[ignore = "Run with --ignored flag: cargo test --features sqlite,turso,duckdb,cayenne -- --ignored --nocapture benchmark_roundtrip"]
+    #[ignore = "Run with --ignored flag: cargo test --features sqlite,duckdb,cayenne -- --ignored --nocapture benchmark_roundtrip"]
     async fn benchmark_roundtrip() {
         use std::sync::Mutex;
         use std::time::Instant;
@@ -3460,8 +3400,7 @@ mod accelerator_compat_tests {
                 let schema = test_schema(Some(engine));
 
                 // Memory mode has limitations, file mode can handle much more
-                // Turso has tighter page cache limits than other databases due to the comprehensive test schema
-                // Note: mode string may include timestamp format like "memory, timestamp_format=rfc3339"
+                // Note: mode string may include the metastore, like "file, metastore=sqlite"
                 let is_memory = mode.starts_with("memory");
                 let is_file = mode.starts_with("file");
 

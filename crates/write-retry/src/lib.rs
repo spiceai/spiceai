@@ -16,31 +16,6 @@ limitations under the License.
 
 use std::time::Duration;
 
-/// SQL used to begin a concurrent write transaction in Turso/libsql.
-///
-/// This should be used when issuing write transactions that may contend with
-/// other writers and are expected to be retried on conflict. It relies on
-/// libsql's MVCC support and is only valid when the database is configured
-/// with `PRAGMA journal_mode = 'mvcc'` (see [`JOURNAL_MODE_SQL_LITERAL`]).
-pub const BEGIN_CONCURRENT_SQL: &str = "BEGIN CONCURRENT";
-
-/// SQL used to begin a standard transaction.
-///
-/// Use this for transactions that do not require `BEGIN CONCURRENT` semantics
-/// (for example, when MVCC journal mode is not enabled, or when the client
-/// handles concurrency differently).
-pub const BEGIN_TRANSACTION_SQL: &str = "BEGIN TRANSACTION";
-
-/// SQL used to commit either a concurrent or standard transaction.
-pub const COMMIT_SQL: &str = "COMMIT";
-
-/// SQL literal for configuring libsql/Turso to use MVCC journal mode.
-///
-/// This is typically passed to `PRAGMA journal_mode` before using
-/// [`BEGIN_CONCURRENT_SQL`] so that concurrent write transactions can rely on
-/// MVCC semantics. The value includes SQL single-quoting.
-pub const JOURNAL_MODE_SQL_LITERAL: &str = "'mvcc'";
-
 /// Default maximum number of attempts for retrying a concurrent write
 /// transaction after retryable conflicts.
 pub const DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS: u32 = 4;
@@ -57,9 +32,8 @@ pub const DEFAULT_CONCURRENT_RETRY_BASE_DELAY_MS: u64 = 10;
 /// The backoff base is `DEFAULT_CONCURRENT_RETRY_BASE_DELAY_MS * fib(attempt)`, where
 /// `fib` walks the Fibonacci sequence `1, 1, 2, 3, 5, 8, …` (see
 /// [`fib_backoff_multiplier`]); the returned delay is then randomized within
-/// `[base / 2, base]` so that many writers contending on the same row — a Turso
-/// `BEGIN CONCURRENT` MVCC commit conflict or a `SQLite` `SQLITE_BUSY` — do not all wake
-/// on the same backoff boundary and re-collide (a retry thundering herd).
+/// `[base / 2, base]` so that many writers contending on the same row — a `SQLite`
+/// `SQLITE_BUSY`, say — do not all wake on the same backoff boundary and re-collide (a retry thundering herd).
 ///
 /// Fibonacci grows by the golden ratio (≈1.618×) per attempt rather than doubling, so
 /// retries ramp through more, smaller steps before reaching a long wait. Under moderate
@@ -93,9 +67,9 @@ fn fib_backoff_multiplier(attempt: u32) -> u64 {
 /// Apply *equal jitter* to a backoff `delay`: keep roughly half of it as a floor
 /// and randomize the rest, returning a value in `[delay / 2, delay]`.
 ///
-/// Shared by both metastore backends' retry paths — [`retry_backoff_delay`] (the
-/// write-conflict retry common to Turso `BEGIN CONCURRENT` and `SQLite` `SQLITE_BUSY`)
-/// and the `SQLite` connection-setup retry — so concurrent retriers spread across the
+/// Shared by the metastore's retry paths — [`retry_backoff_delay`] (the
+/// write-conflict retry on `SQLite` `SQLITE_BUSY`) and the `SQLite` connection-setup
+/// retry — so concurrent retriers spread across the
 /// backoff window instead of forming a thundering herd on the same boundary.
 ///
 /// Returned unchanged when there is no meaningful jitter window: delays `< 2 ms`
@@ -129,15 +103,6 @@ pub fn is_retryable_write_conflict_message(message: &str) -> bool {
         || message.contains("sqlite_locked")
         || message.contains("database is busy")
         || message.contains("database is locked")
-        // Turso BEGIN CONCURRENT MVCC raises this, from the statement that
-        // writes the row or from COMMIT, when another transaction has already
-        // written to overlapping rows. Cayenne's
-        // existing retry-on-conflict loops (in `commit_inlined_mutation`,
-        // `commit_on_conflict_deletions`, snapshot publish, etc.) need to
-        // back off and retry these the same way they do for sqlite_busy,
-        // otherwise sustained-writes workloads against Turso panic on the
-        // first cross-transaction conflict instead of converging.
-        || message.contains("write-write conflict")
 }
 
 #[cfg(test)]
@@ -267,10 +232,6 @@ mod tests {
             "Some prefix SQLITE_BUSY some suffix",
             "some SQLITE_LOCKED error",
             "database is locked by another transaction",
-            // Turso BEGIN CONCURRENT commit-time MVCC failure.
-            "Failed to commit transaction: Write-write conflict",
-            "write-write conflict",
-            "Write-Write Conflict",
         ];
 
         for message in messages {

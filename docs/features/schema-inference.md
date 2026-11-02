@@ -184,7 +184,7 @@ set one yourself:
 - **Arrow** → `sort_columns` (direction-qualified).
 - **Cayenne** → `cayenne_sort_columns` (bare column names; Cayenne sorts by
   column and ignores direction).
-- **SQLite / Turso / PostgreSQL accelerators** have no sort parameter, so sort
+- **SQLite / PostgreSQL accelerators** have no sort parameter, so sort
   inference is skipped.
 - **`refresh_mode: changes` (CDC)** — sort inference is skipped for the
   refresh-time-sorted engines (DuckDB, Arrow); the change-stream accelerator is

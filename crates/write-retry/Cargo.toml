@@ -1,11 +1,11 @@
 [package]
 authors = ["Spice.ai OSS Authors"]
-description = "Shared Turso SQL and retry helpers"
+description = "Backoff and retry helpers for writers that conflict"
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license-file.workspace = true
-name = "turso-shared"
+name = "write-retry"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
