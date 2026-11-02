@@ -160,10 +160,10 @@ pub enum Error {
         configured: Vec<String>,
     },
 
-    /// The dataset's stored table was built with settings it cannot adopt in place, and
-    /// its settings let it be rebuilt from the source
-    /// (`acceleration_source::rebuilds_on_settings_change`). Displays as the catalog's cause
-    /// clause, which the runtime's rebuild message embeds.
+    /// The dataset's stored table was built with settings it cannot adopt in place, or
+    /// its data files no longer match the metastore, and its settings let it be rebuilt
+    /// from the source (`acceleration_source::rebuilds_on_settings_change`). Displays as
+    /// the catalog's cause clause, which the runtime's rebuild message embeds.
     #[snafu(display("{source}"))]
     SettingsChangeRequiresRebuild { source: cayenne::CatalogError },
 
@@ -1323,7 +1323,10 @@ fn requires_rebuild(error: &(dyn std::error::Error + 'static)) -> bool {
             )
         ) || matches!(
             error.downcast_ref::<cayenne::CatalogError>(),
-            Some(cayenne::CatalogError::SettingsChangeRequiresRebuild { .. })
+            Some(
+                cayenne::CatalogError::SettingsChangeRequiresRebuild { .. }
+                    | cayenne::CatalogError::StoredDataFilesRequireRebuild { .. }
+            )
         )
     })
 }
@@ -3350,7 +3353,10 @@ impl CayenneAccelerator {
             Ok(cayenne_table) => cayenne_table,
             // Passed through as it is: a cause clause the runtime's rebuild message
             // embeds, not a failure to create the table.
-            Err(source @ cayenne::CatalogError::SettingsChangeRequiresRebuild { .. }) => {
+            Err(
+                source @ (cayenne::CatalogError::SettingsChangeRequiresRebuild { .. }
+                | cayenne::CatalogError::StoredDataFilesRequireRebuild { .. }),
+            ) => {
                 return Err(Error::SettingsChangeRequiresRebuild { source });
             }
             Err(source) => {
