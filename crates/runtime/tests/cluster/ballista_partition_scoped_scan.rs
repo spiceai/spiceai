@@ -119,7 +119,6 @@ async fn run_distributed(
 /// multi-file, non-accelerated dataset must return the exact row count and
 /// id sum, not a multiple of them.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn distributed_scan_reads_each_task_its_own_file_group() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new("runtime=info,warn"))

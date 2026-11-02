@@ -183,6 +183,7 @@ async fn kafka_fetch_latest_message_with_tombstone_test() -> anyhow::Result<()> 
 
             let result = KafkaConsumer::fetch_latest_message::<String, serde_json::Value>(
                 "fetch_latest_tombstone_test",
+                "fetch_latest_tombstone_test",
                 &kafka_config,
                 Duration::from_secs(10),
             )
@@ -256,6 +257,7 @@ async fn kafka_fetch_latest_message_many_tombstones_test() -> anyhow::Result<()>
             };
 
             let result = KafkaConsumer::fetch_latest_message::<String, serde_json::Value>(
+                "fetch_latest_many_tombstones_test",
                 "fetch_latest_many_tombstones_test",
                 &kafka_config,
                 Duration::from_secs(10),
@@ -345,6 +347,7 @@ async fn kafka_fetch_latest_message_multi_partition_test() -> anyhow::Result<()>
             };
 
             let result = KafkaConsumer::fetch_latest_message::<String, serde_json::Value>(
+                "fetch_latest_multi_partition_test",
                 "fetch_latest_multi_partition_test",
                 &kafka_config,
                 Duration::from_secs(10),

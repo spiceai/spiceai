@@ -510,6 +510,10 @@ fn table_reference_creator_spark(uc_table: &UCTable) -> Option<TableReference> {
 }
 
 fn table_reference_creator_delta_lake(uc_table: &UCTable) -> Option<TableReference> {
+    if uc_table.is_catalog_managed() {
+        tracing::warn!("{}", uc_table.catalog_managed_skip_warning());
+        return None;
+    }
     let storage_location = uc_table.storage_location.as_deref()?;
     // Don't append a trailing slash here — `DeltaTable::from` calls
     // `ensure_folder_location` which already adds one when needed.
@@ -677,6 +681,7 @@ mod tests {
             columns: vec![],
             storage_location: storage_location.map(ToString::to_string),
             table_id: None,
+            properties: std::collections::HashMap::new(),
         }
     }
 
@@ -744,6 +749,15 @@ mod tests {
     }
 
     #[test]
+    fn test_table_reference_creator_delta_lake_skips_catalog_managed() {
+        let mut table = make_uc_table(Some("s3://bucket/tables/t"));
+        table
+            .properties
+            .insert("delta.feature.catalogManaged".into(), "supported".into());
+        assert!(table_reference_creator_delta_lake(&table).is_none());
+    }
+
+    #[test]
     fn test_table_reference_creator_delta_lake_without_storage() {
         let table = make_uc_table(None);
         assert!(
@@ -802,6 +816,7 @@ mod tests {
             columns: vec![],
             storage_location: Some("s3://bucket/orders".to_string()),
             table_id: None,
+            properties: std::collections::HashMap::new(),
         };
         let reference =
             table_reference_creator_spark(&table).expect("spark creator should always return Some");

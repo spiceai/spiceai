@@ -253,6 +253,7 @@ mod tests {
             columns: vec![],
             storage_location: storage_location.map(ToString::to_string),
             table_id: None,
+            properties: std::collections::HashMap::new(),
         }
     }
 

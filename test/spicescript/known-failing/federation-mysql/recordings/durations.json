@@ -1,5 +1,4 @@
 {
-  "collation-semantics": 11,
-  "federated-known-failing": 12,
-  "slt-strings": 10
+  "collation-semantics": 13,
+  "federated-known-failing": 14
 }

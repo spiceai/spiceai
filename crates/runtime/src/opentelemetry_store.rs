@@ -341,8 +341,6 @@ struct StoreBuilders {
     negative_bucket_counts: ListBuilder<UInt64Builder>,
     quantiles: ListBuilder<Float64Builder>,
     quantile_values: ListBuilder<Float64Builder>,
-    /// Scratch for a point's [`encode_attributes`] bytes, reused across points.
-    encoded_attributes: Vec<u8>,
 }
 
 /// Columns shared by every row of one metric of one scope.
@@ -406,15 +404,15 @@ impl StoreBuilders {
     fn append(
         &mut self,
         ctx: &MetricContext<'_>,
-        time_unix_nano: u64,
-        start_time_unix_nano: u64,
-        attributes: &[KeyValue],
-        flags: u32,
+        point: &PointColumns,
+        prepared: &PreparedPoint,
         values: PointValues<'_>,
     ) {
-        let mut encoded = std::mem::take(&mut self.encoded_attributes);
-        encoded.clear();
-        let attributes_json = serialize_attributes(attributes, &mut encoded);
+        let PointColumns {
+            time_unix_nano,
+            start_time_unix_nano,
+            flags,
+        } = *point;
         self.metric_name.append_value(ctx.name);
         self.metric_type.append_value(ctx.metric_type);
         self.description.append_option(non_empty(ctx.description));
@@ -425,16 +423,8 @@ impl StoreBuilders {
         // OTLP uses 0 for "not set".
         self.start_time_unix_nano
             .append_option((start_time_unix_nano != 0).then_some(start_time_unix_nano));
-        self.series_hash.append_value(series_hash(
-            ctx.name,
-            &ctx.resource_attributes.encoded,
-            ctx.scope_name,
-            ctx.scope_version,
-            &ctx.scope_attributes.encoded,
-            &encoded,
-        ));
-        self.encoded_attributes = encoded;
-        self.attributes.append_value(&attributes_json);
+        self.series_hash.append_value(prepared.series_hash);
+        self.attributes.append_value(&prepared.attributes_json);
         self.resource_attributes
             .append_value(&ctx.resource_attributes.json);
         self.scope_name.append_option(non_empty(ctx.scope_name));
@@ -517,6 +507,14 @@ impl StoreBuilders {
 /// attributes are repeated on every row.
 pub const MAX_STORE_BATCH_ROWS: usize = 8192;
 
+/// String bytes per metrics store batch. This keeps every `Utf8` column well below its 32-bit
+/// Arrow offset limit when resource and scope attributes repeat across many rows.
+pub const MAX_STORE_BATCH_STRING_BYTES: usize = 256 * 1024 * 1024;
+
+/// String bytes per metrics store export, across all its batches. Resource and scope attributes
+/// repeat on every row, so a small export can otherwise expand to an unbounded size.
+pub const MAX_STORE_EXPORT_STRING_BYTES: usize = 512 * 1024 * 1024;
+
 /// One data point of an export, by reference.
 #[derive(Clone, Copy)]
 enum PointRef<'a> {
@@ -524,6 +522,17 @@ enum PointRef<'a> {
     Histogram(&'a HistogramDataPoint),
     Exponential(&'a ExponentialHistogramDataPoint),
     Summary(&'a SummaryDataPoint),
+}
+
+impl<'a> PointRef<'a> {
+    fn attributes(self) -> &'a [KeyValue] {
+        match self {
+            PointRef::Number(p) => &p.attributes,
+            PointRef::Histogram(p) => &p.attributes,
+            PointRef::Exponential(p) => &p.attributes,
+            PointRef::Summary(p) => &p.attributes,
+        }
+    }
 }
 
 /// Columns shared by every point of one metric of one scope, by index into the export's
@@ -539,6 +548,24 @@ struct OwnedContext<'a> {
     scope_name: &'a str,
     scope_version: &'a str,
     scope_attributes: usize,
+    /// String bytes of the columns this context repeats on every row.
+    string_bytes: usize,
+}
+
+/// A data point's serialized attributes, series hash and row string bytes, computed for every
+/// point before any batch is built.
+struct PreparedPoint {
+    attributes_json: String,
+    series_hash: u64,
+    string_bytes: usize,
+}
+
+/// Columns of one data point common to every point type.
+#[derive(Clone, Copy)]
+struct PointColumns {
+    time_unix_nano: u64,
+    start_time_unix_nano: u64,
+    flags: u32,
 }
 
 /// Every data point of an export, in order, ready to build metrics store batches of bounded
@@ -600,6 +627,19 @@ impl<'a> StoreExport<'a> {
                         Data::Summary(_) => ("summary", None, None),
                     };
                     let context = export.contexts.len();
+                    let string_bytes = [
+                        metric.name.len(),
+                        metric_type.len(),
+                        metric.description.len(),
+                        metric.unit.len(),
+                        temporality.map_or(0, str::len),
+                        export.resources[resource].json.len(),
+                        scope_name.len(),
+                        scope_version.len(),
+                        export.scopes[scope_attributes].json.len(),
+                    ]
+                    .into_iter()
+                    .fold(0_usize, usize::saturating_add);
                     export.contexts.push(OwnedContext {
                         name: &metric.name,
                         metric_type,
@@ -611,6 +651,7 @@ impl<'a> StoreExport<'a> {
                         scope_name,
                         scope_version,
                         scope_attributes,
+                        string_bytes,
                     });
                     match data {
                         Data::Gauge(g) => export
@@ -650,19 +691,91 @@ impl<'a> StoreExport<'a> {
         self.points.len()
     }
 
-    /// Metrics store batches of at most `max_rows` rows each, built one at a time.
+    /// Metrics store batches of at most `max_rows` rows and `max_batch_string_bytes` string
+    /// bytes each, built one at a time. Returns an invalid-argument error, before building any
+    /// batch, when one row takes more than `max_batch_string_bytes` or all rows together take
+    /// more than `max_export_string_bytes`.
     pub fn batches(
         &self,
         max_rows: usize,
-    ) -> impl Iterator<Item = Result<RecordBatch, ArrowError>> + '_ {
-        self.points
-            .chunks(max_rows.max(1))
-            .map(|chunk| self.build(chunk))
+        max_batch_string_bytes: usize,
+        max_export_string_bytes: usize,
+    ) -> Result<impl Iterator<Item = Result<RecordBatch, ArrowError>> + '_, ArrowError> {
+        let max_rows = max_rows.max(1);
+        let max_batch_string_bytes = max_batch_string_bytes.max(1);
+        let prepared = self.prepare(max_batch_string_bytes, max_export_string_bytes)?;
+        let mut start = 0;
+        Ok(std::iter::from_fn(move || {
+            if start >= self.points.len() {
+                return None;
+            }
+            let (batch, end) = self.build(&prepared, start, max_rows, max_batch_string_bytes);
+            start = end;
+            Some(batch)
+        }))
     }
 
-    fn build(&self, points: &[(usize, PointRef<'a>)]) -> Result<RecordBatch, ArrowError> {
+    fn prepare(
+        &self,
+        max_row_string_bytes: usize,
+        max_export_string_bytes: usize,
+    ) -> Result<Vec<PreparedPoint>, ArrowError> {
+        let mut prepared = Vec::with_capacity(self.points.len());
+        let mut encoded = Vec::new();
+        let mut export_string_bytes = 0_usize;
+        for (context, point) in &self.points {
+            let c = &self.contexts[*context];
+            encoded.clear();
+            let attributes_json = serialize_attributes(point.attributes(), &mut encoded);
+            let string_bytes = c.string_bytes.saturating_add(attributes_json.len());
+            if string_bytes > max_row_string_bytes {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "The OpenTelemetry metrics export contains one data point that expands to {string_bytes} string bytes, above the per-batch limit of {max_row_string_bytes} bytes; reduce its attributes or its resource and scope attributes"
+                )));
+            }
+            export_string_bytes = export_string_bytes.saturating_add(string_bytes);
+            if export_string_bytes > max_export_string_bytes {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "The OpenTelemetry metrics export expands to more than {max_export_string_bytes} string bytes, with resource and scope attributes repeated on every data point; send its data points in smaller exports"
+                )));
+            }
+            let resource = &self.resources[c.resource];
+            let scope = &self.scopes[c.scope_attributes];
+            prepared.push(PreparedPoint {
+                series_hash: series_hash(
+                    c.name,
+                    &resource.encoded,
+                    c.scope_name,
+                    c.scope_version,
+                    &scope.encoded,
+                    &encoded,
+                ),
+                attributes_json,
+                string_bytes,
+            });
+        }
+        Ok(prepared)
+    }
+
+    /// Builds one batch from the points starting at `start`, returning it and the index of the
+    /// first point it does not hold.
+    fn build(
+        &self,
+        prepared: &[PreparedPoint],
+        start: usize,
+        max_rows: usize,
+        max_string_bytes: usize,
+    ) -> (Result<RecordBatch, ArrowError>, usize) {
         let mut builders = StoreBuilders::default();
-        for (context, point) in points {
+        let mut batch_string_bytes = 0_usize;
+        let mut end = start;
+        for ((context, point), prepared) in self.points[start..].iter().zip(&prepared[start..]) {
+            if end - start == max_rows
+                || (end > start
+                    && batch_string_bytes.saturating_add(prepared.string_bytes) > max_string_bytes)
+            {
+                break;
+            }
             let c = &self.contexts[*context];
             let ctx = MetricContext {
                 name: c.name,
@@ -676,79 +789,87 @@ impl<'a> StoreExport<'a> {
                 scope_version: c.scope_version,
                 scope_attributes: &self.scopes[c.scope_attributes],
             };
-            match point {
-                PointRef::Number(p) => builders.append(
-                    &ctx,
-                    p.time_unix_nano,
-                    p.start_time_unix_nano,
-                    &p.attributes,
-                    p.flags,
-                    number_values(p.value.as_ref()),
-                ),
-                PointRef::Histogram(p) => builders.append(
-                    &ctx,
-                    p.time_unix_nano,
-                    p.start_time_unix_nano,
-                    &p.attributes,
-                    p.flags,
-                    PointValues {
-                        count: Some(p.count),
-                        sum: p.sum,
-                        min: p.min,
-                        max: p.max,
-                        explicit_bounds: Some(&p.explicit_bounds),
-                        bucket_counts: Some(&p.bucket_counts),
-                        ..PointValues::default()
-                    },
-                ),
-                PointRef::Exponential(p) => builders.append(
-                    &ctx,
-                    p.time_unix_nano,
-                    p.start_time_unix_nano,
-                    &p.attributes,
-                    p.flags,
-                    PointValues {
-                        count: Some(p.count),
-                        sum: p.sum,
-                        min: p.min,
-                        max: p.max,
-                        scale: Some(p.scale),
-                        zero_count: Some(p.zero_count),
-                        zero_threshold: Some(p.zero_threshold),
-                        positive: p
-                            .positive
-                            .as_ref()
-                            .map(|b| (b.offset, b.bucket_counts.as_slice())),
-                        negative: p
-                            .negative
-                            .as_ref()
-                            .map(|b| (b.offset, b.bucket_counts.as_slice())),
-                        ..PointValues::default()
-                    },
-                ),
-                PointRef::Summary(p) => {
-                    let (quantiles, values) = p
-                        .quantile_values
-                        .iter()
-                        .map(|q| (q.quantile, q.value))
-                        .unzip();
-                    builders.append(
-                        &ctx,
-                        p.time_unix_nano,
-                        p.start_time_unix_nano,
-                        &p.attributes,
-                        p.flags,
-                        PointValues {
-                            count: Some(p.count),
-                            sum: Some(p.sum),
-                            quantiles: Some((quantiles, values)),
-                            ..PointValues::default()
-                        },
-                    );
-                }
-            }
+            let (columns, values) = point_columns(*point);
+            builders.append(&ctx, &columns, prepared, values);
+            batch_string_bytes = batch_string_bytes.saturating_add(prepared.string_bytes);
+            end += 1;
         }
-        builders.finish()
+        (builders.finish(), end)
+    }
+}
+
+/// A data point's common columns and its type-specific values.
+fn point_columns(point: PointRef<'_>) -> (PointColumns, PointValues<'_>) {
+    match point {
+        PointRef::Number(p) => (
+            PointColumns {
+                time_unix_nano: p.time_unix_nano,
+                start_time_unix_nano: p.start_time_unix_nano,
+                flags: p.flags,
+            },
+            number_values(p.value.as_ref()),
+        ),
+        PointRef::Histogram(p) => (
+            PointColumns {
+                time_unix_nano: p.time_unix_nano,
+                start_time_unix_nano: p.start_time_unix_nano,
+                flags: p.flags,
+            },
+            PointValues {
+                count: Some(p.count),
+                sum: p.sum,
+                min: p.min,
+                max: p.max,
+                explicit_bounds: Some(&p.explicit_bounds),
+                bucket_counts: Some(&p.bucket_counts),
+                ..PointValues::default()
+            },
+        ),
+        PointRef::Exponential(p) => (
+            PointColumns {
+                time_unix_nano: p.time_unix_nano,
+                start_time_unix_nano: p.start_time_unix_nano,
+                flags: p.flags,
+            },
+            PointValues {
+                count: Some(p.count),
+                sum: p.sum,
+                min: p.min,
+                max: p.max,
+                scale: Some(p.scale),
+                zero_count: Some(p.zero_count),
+                zero_threshold: Some(p.zero_threshold),
+                positive: p
+                    .positive
+                    .as_ref()
+                    .map(|b| (b.offset, b.bucket_counts.as_slice())),
+                negative: p
+                    .negative
+                    .as_ref()
+                    .map(|b| (b.offset, b.bucket_counts.as_slice())),
+                ..PointValues::default()
+            },
+        ),
+        PointRef::Summary(p) => {
+            let (quantiles, values) = p
+                .quantile_values
+                .iter()
+                .map(|q| (q.quantile, q.value))
+                .unzip();
+            (
+                PointColumns {
+                    time_unix_nano: p.time_unix_nano,
+                    start_time_unix_nano: p.start_time_unix_nano,
+                    flags: p.flags,
+                },
+                PointValues {
+                    count: Some(p.count),
+                    sum: Some(p.sum),
+                    quantiles: Some((quantiles, values)),
+                    ..PointValues::default()
+                },
+            )
+        }
     }
 }
 
@@ -762,7 +883,10 @@ fn export_to_store_batch(
     if export.rows() == 0 {
         return Ok(None);
     }
-    export.batches(usize::MAX).next().transpose()
+    export
+        .batches(usize::MAX, usize::MAX, usize::MAX)?
+        .next()
+        .transpose()
 }
 
 fn number_values(value: Option<&Value>) -> PointValues<'static> {
@@ -1232,10 +1356,110 @@ mod tests {
         )]);
         let export = StoreExport::new(&req);
         let sizes: Vec<usize> = export
-            .batches(2)
+            .batches(2, usize::MAX, usize::MAX)
+            .expect("within the export limit")
             .map(|b| b.expect("batch").num_rows())
             .collect();
         assert_eq!(sizes, vec![2, 2, 1]);
+    }
+
+    /// Five gauge points of metric "m" whose resource attributes are `{"k":"vvv…"}` with 100
+    /// `v`s. Each row's strings are "m", "gauge", the 108-byte resource attributes, "runtime",
+    /// "1.0", and "{}" for the scope and point attributes: 128 bytes.
+    fn large_resource_request() -> ExportMetricsServiceRequest {
+        let points: Vec<NumberDataPoint> = (0..5)
+            .map(|i| number_point(i, Value::AsInt(1), vec![]))
+            .collect();
+        let mut req = request(vec![metric(
+            "m",
+            "",
+            Data::Gauge(Gauge {
+                data_points: points,
+            }),
+        )]);
+        req.resource_metrics[0]
+            .resource
+            .as_mut()
+            .expect("resource")
+            .attributes = vec![s("k", &"v".repeat(100))];
+        req
+    }
+
+    fn batch_sizes(
+        export: &StoreExport<'_>,
+        max_batch_string_bytes: usize,
+    ) -> Result<Vec<usize>, ArrowError> {
+        export
+            .batches(usize::MAX, max_batch_string_bytes, usize::MAX)?
+            .map(|b| b.map(|b| b.num_rows()))
+            .collect()
+    }
+
+    #[test]
+    fn repeated_resource_attributes_split_batches_at_the_byte_limit() {
+        let req = large_resource_request();
+        let export = StoreExport::new(&req);
+        assert_eq!(batch_sizes(&export, 256).expect("batches"), vec![2, 2, 1]);
+        assert_eq!(
+            batch_sizes(&export, 255).expect("batches"),
+            vec![1, 1, 1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn a_data_point_larger_than_the_byte_limit_is_invalid() {
+        let req = large_resource_request();
+        let export = StoreExport::new(&req);
+        assert_eq!(batch_sizes(&export, 128).expect("batches").len(), 5);
+        let Err(ArrowError::InvalidArgumentError(message)) = batch_sizes(&export, 127) else {
+            panic!("a data point over the per-batch limit must be an invalid argument");
+        };
+        assert_eq!(
+            message,
+            "The OpenTelemetry metrics export contains one data point that expands to 128 string bytes, above the per-batch limit of 127 bytes; reduce its attributes or its resource and scope attributes"
+        );
+    }
+
+    #[test]
+    fn an_oversized_data_point_after_full_batches_is_rejected_before_any_batch() {
+        let mut req = large_resource_request();
+        let Some(Data::Gauge(gauge)) = req.resource_metrics[0].scope_metrics[0].metrics[0]
+            .data
+            .as_mut()
+        else {
+            panic!("gauge");
+        };
+        gauge.data_points.push(number_point(
+            5,
+            Value::AsInt(1),
+            vec![s("k", &"v".repeat(200))],
+        ));
+        let export = StoreExport::new(&req);
+        assert!(
+            export.batches(2, 256, usize::MAX).is_err(),
+            "the sixth point is over the per-batch limit, so no batch of the first five is built"
+        );
+    }
+
+    #[test]
+    fn an_export_that_expands_past_the_export_limit_is_invalid() {
+        let req = large_resource_request();
+        let export = StoreExport::new(&req);
+        let rows: usize = export
+            .batches(2, usize::MAX, 5 * 128)
+            .expect("an export at the limit is stored")
+            .map(|b| b.expect("batch").num_rows())
+            .sum();
+        assert_eq!(rows, 5);
+        let Err(ArrowError::InvalidArgumentError(message)) =
+            export.batches(2, usize::MAX, 5 * 128 - 1)
+        else {
+            panic!("an export one byte over the limit must be an invalid argument");
+        };
+        assert_eq!(
+            message,
+            "The OpenTelemetry metrics export expands to more than 639 string bytes, with resource and scope attributes repeated on every data point; send its data points in smaller exports"
+        );
     }
 
     #[test]

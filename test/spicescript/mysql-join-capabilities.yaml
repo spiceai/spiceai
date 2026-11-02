@@ -1,0 +1,37 @@
+name: mysql-join-capabilities
+description: Full joins stay local for MySQL while supported joins still federate.
+sources:
+  my: { kind: mysql }
+  pg: { kind: postgres }
+variants:
+  federated: {}
+  postgres: { datasets: { l: { from: 'postgres:l', params: '${sources.pg.params}' }, r: { from: 'postgres:r', params: '${sources.pg.params}' } } }
+  cayenne: { datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mysql-join-capabilities
+  datasets:
+    - { from: 'mysql:l', name: l, params: '${sources.my.params}' }
+    - { from: 'mysql:r', name: r, params: '${sources.my.params}' }
+defaults:
+  expect: { oracle: pg }
+  compare-variants: false
+steps:
+  - source-exec:
+      my: CREATE TABLE l (id INT PRIMARY KEY, v INT); INSERT INTO l VALUES (1,NULL),(2,2),(4,NULL); CREATE TABLE r (id INT PRIMARY KEY, v INT); INSERT INTO r VALUES (2,NULL),(3,3),(4,4);
+  - source-exec:
+      pg: CREATE TABLE l (id INT PRIMARY KEY, v INT); INSERT INTO l VALUES (1,NULL),(2,2),(4,NULL); CREATE TABLE r (id INT PRIMARY KEY, v INT); INSERT INTO r VALUES (2,NULL),(3,3),(4,4);
+  - start: {}
+  - query: SELECT l.id AS lid, r.id AS rid, l.v AS lv, r.v AS rv FROM l FULL JOIN r ON l.id = r.id
+  - query: SELECT count(*) AS n, count(l.id) AS nl, count(r.id) AS nr FROM l FULL JOIN r ON l.id = r.id
+  - query: SELECT l.id AS lid, r.id AS rid FROM (SELECT * FROM l WHERE id < 0) l FULL JOIN r ON l.id = r.id
+  - query: SELECT l.id AS lid, r.id AS rid FROM l LEFT JOIN r ON l.id = r.id
+  - query: SELECT l.id AS lid, r.id AS rid FROM l JOIN r ON l.id = r.id
+  - explain: SELECT l.id AS lid, r.id AS rid FROM l FULL JOIN r ON l.id = r.id
+    contains: [HashJoinExec, VirtualExecutionPlan]
+    omits: ['FULL JOIN']
+    only: federated
+  - explain: SELECT l.id AS lid, r.id AS rid FROM l JOIN r ON l.id = r.id
+    contains: [VirtualExecutionPlan]
+    only: federated

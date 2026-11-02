@@ -26,6 +26,11 @@ pub mod datafusion_scheduler_ext;
 pub fn datafusion_and_cluster_physical_optimizers()
 -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let mut rules = PhysicalOptimizer::new().rules;
+    // Executors decode `sum` by name to checked `SUM`; the rule's own
+    // built-in merges must plan the same partial state.
+    runtime_datafusion::checked_arithmetic::install_checked_eager_aggregation_for_distributed(
+        &mut rules,
+    );
     rules.extend(cluster_physical_optimizers());
     rules
 }

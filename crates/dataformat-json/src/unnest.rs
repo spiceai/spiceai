@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::{Array, RecordBatch, StructArray};
+use arrow::array::{Array, RecordBatch, StructArray, make_array};
+use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -429,7 +430,10 @@ impl FieldTree {
             Some(Field::new(
                 self.name.clone(),
                 DataType::Struct(fields),
-                false,
+                // JSON null for a parent (`{"user": null}`) must decode as a
+                // null struct so flattened children (`user.name`) are NULL.
+                // A non-nullable struct is rejected as `expected { got null`.
+                true,
             ))
         } else {
             None
@@ -533,7 +537,7 @@ fn extract_column_by_path(batch: &RecordBatch, path_parts: &[&str]) -> Option<Ar
         .iter()
         .position(|f| f.name() == root_field_name)?;
 
-    let mut current_column = batch.column(root_field_index);
+    let mut current_column = Arc::clone(batch.column(root_field_index));
     let batch_schema = batch.schema();
     let mut current_field = batch_schema.field(root_field_index);
 
@@ -546,14 +550,31 @@ fn extract_column_by_path(batch: &RecordBatch, path_parts: &[&str]) -> Option<Ar
             // Find the field in the struct
             let field_index = struct_fields.iter().position(|f| f.name() == field_name)?;
 
-            current_column = struct_array.column(field_index);
+            current_column =
+                mask_child_with_parent_nulls(struct_array.column(field_index), struct_array);
             current_field = &struct_fields[field_index];
         } else {
             return None; // Can't navigate further, not a struct
         }
     }
 
-    Some(Arc::clone(current_column))
+    Some(current_column)
+}
+
+fn mask_child_with_parent_nulls(child: &Arc<dyn Array>, parent: &StructArray) -> Arc<dyn Array> {
+    let Some(parent_nulls) = parent.nulls() else {
+        return Arc::clone(child);
+    };
+    if parent_nulls.null_count() == 0 {
+        return Arc::clone(child);
+    }
+    let combined = NullBuffer::union(Some(parent_nulls), child.nulls());
+    child
+        .to_data()
+        .into_builder()
+        .nulls(combined)
+        .build()
+        .map_or_else(|_| Arc::clone(child), make_array)
 }
 
 #[cfg(test)]
