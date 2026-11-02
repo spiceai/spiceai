@@ -385,9 +385,9 @@ impl Runtime {
 
     /// Reloads each model of `app` that can use one of the changed Spicepod `tools` or
     /// `function_tools`, because a model gets its tools when it loads. Skips the models in
-    /// `loaded`, except those whose tools come from the installed app's `tools:` (`auto`, `all`,
-    /// `search_registry`), which `loaded` got from the app before this change. Those never get
-    /// function tools, so only a change to `tools` reloads them.
+    /// `loaded`, except on a change to `tools` for those that use the installed app's `tools:`
+    /// (`auto`, `all`, `search_registry`), which `loaded` got from the app before this change.
+    /// That grouping never includes function tools.
     pub(crate) async fn reload_models_using_tools(
         self: &Arc<Self>,
         app: &App,
@@ -399,18 +399,18 @@ impl Runtime {
             return;
         }
         for model in &app.models {
+            let names_changed = |names: &[String]| {
+                !loaded.contains(&model.name)
+                    && names.iter().any(|name| {
+                        function_tools.contains(name)
+                            || tools
+                                .contains(name.split_once(':').map_or(name.as_str(), |(c, _)| c))
+                    })
+            };
             let reload = match model_tool_use(model) {
                 ToolUse::None => false,
-                ToolUse::Configured => !tools.is_empty(),
-                ToolUse::Named(names) => {
-                    !loaded.contains(&model.name)
-                        && names.iter().any(|name| {
-                            function_tools.contains(name)
-                                || tools.contains(
-                                    name.split_once(':').map_or(name.as_str(), |(c, _)| c),
-                                )
-                        })
-                }
+                ToolUse::Configured(names) => !tools.is_empty() || names_changed(&names),
+                ToolUse::Named(names) => names_changed(&names),
             };
             if reload {
                 tracing::info!(
@@ -426,8 +426,8 @@ impl Runtime {
 /// Which tools a model's `tools` param selects.
 enum ToolUse {
     None,
-    /// The installed app's `tools:` and the built-in tools.
-    Configured,
+    /// The installed app's `tools:` and the built-in tools, plus any tools named beside them.
+    Configured(Vec<String>),
     /// Tools and tool catalogs by name; `catalog:tool` names one tool of a catalog.
     Named(Vec<String>),
 }
@@ -446,7 +446,7 @@ fn model_tool_use(model: &SpicepodModel) -> ToolUse {
     match spec.parse::<SpiceToolsOptions>() {
         Ok(
             SpiceToolsOptions::Auto | SpiceToolsOptions::All | SpiceToolsOptions::SearchRegistry,
-        ) => ToolUse::Configured,
+        ) => ToolUse::Configured(vec![]),
         // A list can include a grouping, e.g. `auto, my_other_tool`.
         Ok(SpiceToolsOptions::Specific(names))
             if names.iter().any(|name| {
@@ -454,7 +454,7 @@ fn model_tool_use(model: &SpicepodModel) -> ToolUse {
                     .is_ok_and(|o| o.includes_all_available_tools())
             }) =>
         {
-            ToolUse::Configured
+            ToolUse::Configured(names)
         }
         Ok(SpiceToolsOptions::Specific(names)) => ToolUse::Named(names),
         Ok(SpiceToolsOptions::Nsql | SpiceToolsOptions::Disabled) | Err(_) => ToolUse::None,
@@ -712,6 +712,50 @@ mod tests {
     #[tokio::test]
     async fn a_model_with_auto_in_its_tool_list_reloads_when_any_tool_changes() {
         assert!(reloaded_by("auto, lookup", "1", "2").await);
+    }
+
+    /// `auto` never includes function tools, so one named beside it reaches the model by name.
+    #[tokio::test]
+    async fn a_model_reloads_when_a_function_tool_it_names_beside_auto_changes() {
+        let provider = Arc::new(Provider::default());
+        provider.accepting.store(true, Ordering::SeqCst);
+        let mut model = model_served_by(&provider).await;
+        model.params.insert(
+            "tools".to_string(),
+            Value::String("auto, add_one".to_string()),
+        );
+        let mut runtime = spicepod::component::runtime::Runtime::default();
+        runtime.functions.enabled = true;
+        let app = |description: &str| {
+            let function = serde_json::from_value(json!({
+                "name": "add_one",
+                "from": "sql",
+                "description": description,
+                "signature": {"args": [{"name": "x", "type": "int64"}], "returns": "int64"},
+                "body": "x + 1",
+                "as_tool": true,
+            }))
+            .expect("a valid function");
+            Arc::new(
+                AppBuilder::new("function_tool_reload")
+                    .with_runtime(runtime.clone())
+                    .with_function(function)
+                    .with_model(model.clone())
+                    .build(),
+            )
+        };
+        let rt = Arc::new(
+            Runtime::builder()
+                .with_app(app("1").as_ref().clone())
+                .build()
+                .await,
+        );
+        Arc::clone(&rt).load_models().await;
+        let loads = provider.requests.load(Ordering::SeqCst);
+        assert!(loads > 0, "the model never reached the provider");
+
+        assert!(Arc::clone(&rt).apply_app(app("2")).await);
+        assert!(provider.requests.load(Ordering::SeqCst) > loads);
     }
 
     /// A model removed from the Spicepod while its first attempt waits on the provider is

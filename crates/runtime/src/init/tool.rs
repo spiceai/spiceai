@@ -199,16 +199,12 @@ impl Runtime {
         self.tool_loads.stop(name).await;
         let mut tools_map = self.tools.write().await;
         // A function exposed as a tool under the same name belongs to the function diff.
-        match tools_map.get(name) {
-            Some(Tooling::Tool(_)) => {
-                tools_map.remove(name);
-                metrics::tools::COUNT.add(-1, &[KeyValue::new("tool", name.to_string())]);
-            }
-            Some(Tooling::Catalog { .. }) => {
-                tools_map.remove(name);
-                metrics::tools::COUNT.add(-1, &[KeyValue::new("tool_catalog", name.to_string())]);
-            }
-            Some(Tooling::FunctionTool(_)) | None => {}
+        if matches!(
+            tools_map.get(name),
+            Some(Tooling::Tool(_) | Tooling::Catalog { .. })
+        ) {
+            tools_map.remove(name);
+            metrics::tools::COUNT.add(-1, &[KeyValue::new("tool", name.to_string())]);
         }
         #[cfg(feature = "mcp")]
         self.refresh_mcp_tool_schemas(&tools_map);
