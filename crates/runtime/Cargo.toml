@@ -239,7 +239,7 @@ typetag = "0.2.22"
 url.workspace = true
 util = { path = "../util", features = ["datafusion", "http"] }
 utoipa = { workspace = true, features = ["axum_extras"], optional = true }
-utoipa-swagger-ui = { version = "9", features = [
+utoipa-swagger-ui = { version = "10", features = [
     "axum",
     "vendored",
 ], optional = true }
