@@ -220,7 +220,7 @@ arrow-json = "59.3.0"
 arrow-odbc = "25.3" # 25.2+ accepts arrow ">=29, <60", so it resolves to the workspace Arrow 59
 arrow-row = "59.3.0"
 arrow-schema = "59.3.0"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "307eaf407cbf71afa967f3008250ba96c79626b7", features = [
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "c1bf4a090c50e18f27663b008dac4c108e49b994", features = [
     "byot",
     "embedding",
     "chat-completion",
@@ -508,7 +508,7 @@ turso-shared = { path = "crates/turso-shared" }
 twox-hash = "2.1.2"
 url = { version = "2.5", features = ["serde"] }
 util = { path = "crates/util", default-features = false }
-utoipa = { version = "5" }
+utoipa = { version = "6" }
 uuid = "1"
 # Specification and proof vocabulary for every crate that opts into
 # `[package.metadata.verus]`. A normal `cargo build` erases the specifications,
