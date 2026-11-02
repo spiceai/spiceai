@@ -114,7 +114,11 @@ async fn assert_count_held_inexact(
     phase: &str,
 ) -> TestResult<()> {
     let expected = i64::try_from(expected)?;
-    assert_eq!(scan_row_count(ctx).await?, expected, "scanned rows ({phase})");
+    assert_eq!(
+        scan_row_count(ctx).await?,
+        expected,
+        "scanned rows ({phase})"
+    );
     let counted = ctx
         .sql(&format!("SELECT COUNT(*) FROM {TABLE}"))
         .await?

@@ -797,7 +797,8 @@ impl CayenneDeletionSink {
                 if delete_sequence.is_none() {
                     return Ok(None);
                 }
-                self.prepare_staged_pk_deletions(staged, Some(live_pks.len())).map(Some)
+                self.prepare_staged_pk_deletions(staged, Some(live_pks.len()))
+                    .map(Some)
             }
             PkDeletionStrategyWithCache::RowConverterBased { .. } => {
                 let Some(ref row_converter) = self.pk_row_converter else {
@@ -869,7 +870,8 @@ impl CayenneDeletionSink {
                 if delete_sequence.is_none() {
                     return Ok(None);
                 }
-                self.prepare_staged_pk_deletions(staged, Some(live_keys.len())).map(Some)
+                self.prepare_staged_pk_deletions(staged, Some(live_keys.len()))
+                    .map(Some)
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
                 // Position-based deletion for "delete all" (delete w/o filters)
@@ -1298,7 +1300,8 @@ impl CayenneDeletionSink {
         if self.filters.is_empty() {
             // Delete-all tombstones every key; the thresholds only decide which keys
             // it counts.
-            self.prepare_delete_all_rows_from_tables(&ctx, &all_tables).await
+            self.prepare_delete_all_rows_from_tables(&ctx, &all_tables)
+                .await
         } else if self.pk_deletion_strategy.is_position_based() {
             // As in `delete_from`: a position tombstone can only hide the version it
             // matched, so the per-snapshot visibility rules carry nothing for it.
@@ -1496,12 +1499,10 @@ impl CayenneDeletionSink {
             live_count.unwrap_or_else(|| staged.new_count()),
             "deleted row count",
         )
-        .map_err(|error| {
-                Error::Internal {
-                    table: self.table_metadata.table_name.clone(),
-                    message: error.to_string(),
-                }
-            })?;
+        .map_err(|error| Error::Internal {
+            table: self.table_metadata.table_name.clone(),
+            message: error.to_string(),
+        })?;
         let (delete_files, publish) = match &mut staged {
             StagedPkDelete::Int64 {
                 new_pks,
@@ -1569,7 +1570,8 @@ impl DeletionSink for CayenneDeletionSink {
 
         let prepared = if self.filters.is_empty() {
             // See above: the thresholds only decide which keys delete-all counts.
-            self.prepare_delete_all_rows_from_tables(&ctx, &all_tables).await
+            self.prepare_delete_all_rows_from_tables(&ctx, &all_tables)
+                .await
         } else if self.pk_deletion_strategy.is_position_based() {
             // A position tombstone names a file and row position, so it can only ever
             // hide the version it matched — the per-snapshot thresholds that keep a key

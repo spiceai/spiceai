@@ -483,11 +483,7 @@ async fn overwrite(table: &Arc<CayenneTableProvider>, rows: &[(i64, i64)]) -> Te
 /// away and every memory workload fails with rows the model deleted still served
 /// (regression coverage for spiceai/spiceai#12008 under `cdc_durability: memory`;
 /// `mode: memory`, which never checkpoints, is still uncovered).
-async fn delete_predicate(
-    table: &Arc<CayenneTableProvider>,
-    lo: i64,
-    hi: i64,
-) -> TestResult<u64> {
+async fn delete_predicate(table: &Arc<CayenneTableProvider>, lo: i64, hi: i64) -> TestResult<u64> {
     delete_filter(
         table,
         col("value").gt_eq(lit(lo)).and(col("value").lt(lit(hi))),
@@ -500,10 +496,9 @@ async fn delete_predicate(
 fn expected_delete_count(model: &Model, op: &Op) -> Option<u64> {
     let rows = match op {
         Op::Delete { key } => usize::from(model.contains_key(key)),
-        Op::DeletePredicate { lo, hi } => model
-            .values()
-            .filter(|v| **v >= *lo && **v < *hi)
-            .count(),
+        Op::DeletePredicate { lo, hi } => {
+            model.values().filter(|v| **v >= *lo && **v < *hi).count()
+        }
         _ => return None,
     };
     u64::try_from(rows).ok()
