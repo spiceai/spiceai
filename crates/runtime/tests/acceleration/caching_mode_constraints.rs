@@ -337,8 +337,7 @@ fn duckdb_params(dir: &std::path::Path, extra: Vec<(&str, &str)>) -> Vec<(String
 /// Cayenne rather than `DuckDB` because the defect is above both engines and
 /// Cayenne had no coverage of the budgets at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-// Cayenne is not built on Windows, so neither is a test that loads it.
-#[cfg(all(feature = "sqlite", not(target_os = "windows")))]
+#[cfg(feature = "sqlite")]
 async fn the_item_budget_is_enforced_on_cayenne_with_a_primary_key() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
     register_test_connectors().await;
@@ -676,8 +675,7 @@ async fn a_refreshed_entry_sheds_rows_the_response_no_longer_returns() -> Result
 /// still read all of them as one: every lookup returns its row, and keys cached
 /// earlier are served without another fetch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-// Cayenne is not built on Windows, so neither is a test that loads it.
-#[cfg(all(feature = "sqlite", not(target_os = "windows")))]
+#[cfg(feature = "sqlite")]
 async fn a_point_lookup_reads_every_cayenne_scan_partition() -> Result<(), anyhow::Error> {
     use arrow::util::display::array_value_to_string;
     use futures::TryStreamExt;

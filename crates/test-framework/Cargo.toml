@@ -22,12 +22,7 @@ bytes.workspace = true
 chrono.workspace = true
 dashmap = "6.1.0"
 datafusion.workspace = true
-duckdb = { optional = true, workspace = true, features = [
-    "bundled",
-    "r2d2",
-    "vtab",
-    "vtab-arrow",
-] }
+duckdb-oracle = { optional = true, path = "../duckdb-oracle" }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 indicatif = "0.18.4"
@@ -92,7 +87,7 @@ spark = []
 sqlite = []
 turso = []
 
-file_append = ["dep:duckdb"]
+file_append = ["dep:duckdb-oracle"]
 
 [lints]
 workspace = true

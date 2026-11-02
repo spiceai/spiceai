@@ -66,7 +66,7 @@ fn env_i64(name: &str, default: i64) -> i64 {
 
 fn compare_standalone(
     query: &Query,
-    duck: &duckdb::Connection,
+    duck: &duckdb_oracle::Connection,
     sqlite: &rusqlite::Connection,
 ) -> ParityOutcome {
     let sql = query.sql.as_ref();

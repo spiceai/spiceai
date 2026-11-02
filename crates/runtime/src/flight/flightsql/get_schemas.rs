@@ -25,8 +25,8 @@ use tonic::{Request, Response, Status};
 use crate::{
     datafusion::request_context_extension::get_current_datafusion,
     flight::{
-        Service, metrics, record_batches_to_flight_stream, to_tonic_err,
-        util::set_flightsql_protocol,
+        Service, flightsql::check_filter_pattern, metrics, record_batches_to_flight_stream,
+        to_tonic_err, util::set_flightsql_protocol,
     },
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -59,6 +59,11 @@ pub(crate) async fn do_get(
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
     let start = metrics::track_flight_request("do_get", Some("get_db_schemas")).await;
     set_flightsql_protocol().await;
+
+    check_filter_pattern(
+        "db_schema_filter_pattern",
+        query.db_schema_filter_pattern.as_deref(),
+    )?;
 
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);

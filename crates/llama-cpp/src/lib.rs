@@ -25,6 +25,7 @@ limitations under the License.
 )]
 
 mod context;
+mod devices;
 mod log;
 mod model;
 mod mtp;
@@ -36,11 +37,12 @@ use std::sync::OnceLock;
 use snafu::Snafu;
 
 pub use context::{Batch, Context, ContextParams, Truncation};
+pub use devices::gpu_free_memory;
 pub use model::{Model, ModelParams, Vocab};
 pub use mtp::{DraftKind, Mtp, MtpParams};
 pub use sampler::Sampler;
 
-/// The llama.cpp release this crate is built from, such as `b11803`.
+/// The llama.cpp release this crate is built from, such as `b11999`.
 pub const RELEASE: &str = env!("LLAMA_CPP_RELEASE");
 
 mod sys {

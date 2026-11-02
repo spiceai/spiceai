@@ -6,7 +6,7 @@
 //
 //     https://www.apache.org/licenses/LICENSE-2.0
 
-//! Scan-under-write contention: Cayenne vs DuckDB.
+//! Scan-under-write contention: Cayenne vs `DuckDB`.
 //!
 //! For each lane, the bench preloads `BASE_ROWS` rows, then spawns a
 //! background writer that loops forever appending small bursts of new rows.
@@ -16,10 +16,10 @@
 //! mixed OLAP performance under concurrent write load).
 //!
 //! - Cayenne: background appends run on the Tokio runtime; each burst goes
-//!   through the full append path (acquire write_lock, write Vortex files,
+//!   through the full append path (acquire `write_lock`, write Vortex files,
 //!   refresh listing, persist stats, commit catalog metadata).
-//! - DuckDB:  background appends run on a dedicated `std::thread` with its
-//!   own `Connection` to the same file-backed DB. DuckDB serializes writes
+//! - `DuckDB`:  background appends run on a dedicated `std::thread` with its
+//!   own `Connection` to the same file-backed DB. `DuckDB` serializes writes
 //!   internally; concurrent scans see snapshot-isolated state.
 //!
 //! Background lifecycle is RAII: dropping a `RunningWriter` signals the
@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use duckdb::Connection;
+use duckdb_oracle::Connection;
 use tokio::runtime::Runtime;
 
 use common::{
@@ -95,7 +95,7 @@ impl Drop for CayenneBgWriter {
     }
 }
 
-/// Background writer handle for the DuckDB lane. Drop to stop + join.
+/// Background writer handle for the `DuckDB` lane. Drop to stop + join.
 struct DuckDbBgWriter {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,

@@ -22,26 +22,6 @@
     },
     {
       "run": "clickhouse-decimals",
-      "who": "cayenne",
-      "key": "query: SELECT id, d FROM neg ORDER BY id",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for neg: Acceleration not ready; loading initial data for neg",
-      "varies": true,
-      "group": "clickhouse",
-      "may-pass": true
-    },
-    {
-      "run": "clickhouse-decimals",
-      "who": "cayenne",
-      "key": "query: SELECT id FROM neg WHERE d < -0.01 ORDER BY id",
-      "kind": "error",
-      "signature": "Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for neg: Acceleration not ready; loading initial data for neg",
-      "varies": true,
-      "group": "clickhouse",
-      "may-pass": true
-    },
-    {
-      "run": "clickhouse-decimals",
       "who": "federated",
       "key": "query: SELECT id, d FROM wide ORDER BY id",
       "kind": "error",
@@ -53,12 +33,10 @@
     {
       "run": "clickhouse-decimals",
       "who": "federated",
-      "key": "query: SELECT id, d FROM neg ORDER BY id",
+      "key": "query: SELECT id FROM wide WHERE d > 0 ORDER BY id",
       "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to convert query result to Arrow: Failed to parse decimal string as BigInteger '0.-50000': invalid digit found in string\":",
-      "varies": true,
-      "group": "clickhouse",
-      "may-pass": true
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nFailed to execute ClickHouse query: Input/output error: `Other error: `Unsupported column type \\\"Decimal(38, 10)\\\".``\": code: 'Client specified an invalid argument', message: \"Fai",
+      "group": "clickhouse"
     }
   ],
   "clickhouse-literals-known": [

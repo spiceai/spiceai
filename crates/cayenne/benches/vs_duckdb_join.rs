@@ -6,7 +6,7 @@
 //
 //     https://www.apache.org/licenses/LICENSE-2.0
 
-//! Two-table inner join: Cayenne vs DuckDB.
+//! Two-table inner join: Cayenne vs `DuckDB`.
 //!
 //! Fact table `t` (default schema: id, name, value) joined against a small
 //! "dim" table `d` (id, region). Two query shapes are measured per row count:
@@ -17,10 +17,9 @@
 //!   exercises join-side pushdown (the optimizer should restrict the build
 //!   side to one region before probing).
 //!
-//! Lanes (compile-time gated):
-//! - `cayenne`       — Cayenne with the SQLite metastore (default)
-//! - `cayenne_turso` — Cayenne with the Turso metastore (--features turso)
-//! - `duckdb`        — DuckDB file-mode
+//! Lanes:
+//! - `cayenne`       — Cayenne with the SQLite metastore
+//! - `duckdb`        — `DuckDB` file-mode
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::cast_possible_wrap)]

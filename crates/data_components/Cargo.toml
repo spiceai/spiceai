@@ -39,6 +39,7 @@ datafusion.workspace = true
 datafusion-datasource.workspace = true
 datafusion-datasource-csv.workspace = true
 datafusion-federation = { workspace = true }
+datafusion-substrait.workspace = true
 # `federation` is always on: `crate::federation` needs the `impl SQLExecutor for
 # SqlTable` it gates, and the unparser guards in `src/federation.rs` must run in a
 # plain `cargo test -p data_components` (#13625). It adds no crate, since
@@ -74,7 +75,7 @@ mysql_async = { workspace = true, optional = true }
 # Value-only row-image parsing (mysql_replication::binlog::TableMapRowDecoder):
 # `ParseBuf` is not re-exported by mysql_async; the version matches the
 # mysql_async pin so this adds no extra compilation unit.
-mysql_common = { version = "0.35.5", default-features = false, features = ["binlog"], optional = true }
+mysql_common = { version = "0.37.1", default-features = false, features = ["binlog"], optional = true }
 # Included-column bitmaps in mysql_common's rows-event API are bitvec slices.
 bitvec = { version = "1", optional = true }
 num_cpus = "1.16"
@@ -86,6 +87,7 @@ rustc-hash = "2"
 oracle = { version = "0.6", optional = true }
 native-tls = { workspace = true, optional = true }
 percent-encoding.workspace = true
+prost.workspace = true
 pgwire-replication = { workspace = true, optional = true }
 postgres-native-tls = { workspace = true, optional = true }
 postgres-protocol = { workspace = true, optional = true }
@@ -141,9 +143,6 @@ apache-avro = { version = "0.21", optional = true, default-features = false, fea
     "zstandard",
 ] }
 
-[target.'cfg(windows)'.dependencies]
-rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
-
 [features]
 bench = [] # Feature for benchmarking that exposes internal functions
 adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "datafusion-table-providers/adbc-federation"]
@@ -153,6 +152,7 @@ default = []
 delta_lake = ["dep:delta_kernel", "dep:delta_kernel_default_engine"]
 elasticsearch = ["dep:elasticsearch"]
 duckdb = [
+    "adbc",
     "dep:duckdb",
     "db_connection_pool/duckdb",
     "datafusion-table-providers/duckdb",

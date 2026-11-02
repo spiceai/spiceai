@@ -29,12 +29,13 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, AsArray, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
+    Array, AsArray, Int32Array, Int64Array, LargeStringArray, OffsetSizeTrait, StringArray,
+    StringViewArray,
 };
 use arrow::datatypes::{
-    ArrowPrimitiveType, DataType, Date32Type, FieldRef, Int32Type, Int64Type, IntervalMonthDayNano,
-    TimeUnit, TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType,
+    ArrowNativeType, ArrowPrimitiveType, DataType, Date32Type, FieldRef, Int32Type, Int64Type,
+    IntervalMonthDayNano, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
+    TimestampNanosecondType, TimestampSecondType,
 };
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::{ExprSchema, Result, ScalarValue};
@@ -53,6 +54,9 @@ use datafusion::logical_expr::{
 /// over `rows` rows.
 type OutputBytes = fn(args: &[ColumnarValue], rows: usize) -> u128;
 
+/// Rewrites arguments into an equivalent form before the call.
+type PrepareArgs = fn(args: &mut [ColumnarValue]);
+
 fn output_bytes_for(name: &str) -> Option<OutputBytes> {
     match name {
         "repeat" => Some(repeat_bytes),
@@ -61,6 +65,13 @@ fn output_bytes_for(name: &str) -> Option<OutputBytes> {
         "array_resize" => Some(array_resize_bytes),
         "range" => Some(range_bytes::<false>),
         "generate_series" => Some(range_bytes::<true>),
+        _ => None,
+    }
+}
+
+fn prepare_args_for(name: &str) -> Option<PrepareArgs> {
+    match name {
+        "lpad" | "rpad" => Some(clamp_negative_pad_lengths),
         _ => None,
     }
 }
@@ -77,6 +88,7 @@ pub(crate) fn reserve_argument_sized_outputs(state: &mut SessionState, pool: &Ar
                 inner: Arc::clone(udf.inner()),
                 pool: Arc::clone(pool),
                 output_bytes,
+                prepare_args: prepare_args_for(udf.name()),
             })
         })
         .collect();
@@ -92,6 +104,7 @@ struct ReservedOutput {
     inner: Arc<dyn ScalarUDFImpl>,
     pool: Arc<dyn MemoryPool>,
     output_bytes: OutputBytes,
+    prepare_args: Option<PrepareArgs>,
 }
 
 impl PartialEq for ReservedOutput {
@@ -145,7 +158,10 @@ impl ScalarUDFImpl for ReservedOutput {
         self.inner.is_strict()
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if let Some(prepare_args) = self.prepare_args {
+            prepare_args(&mut args.args);
+        }
         let rows = if args
             .args
             .iter()
@@ -167,6 +183,7 @@ impl ScalarUDFImpl for ReservedOutput {
                 inner: Arc::clone(udf.inner()),
                 pool: Arc::clone(&self.pool),
                 output_bytes: self.output_bytes,
+                prepare_args: self.prepare_args,
             })
         })
     }
@@ -337,37 +354,124 @@ fn repeat_bytes(args: &[ColumnarValue], rows: usize) -> u128 {
     sum_rows(rows, |row| string.get(row).saturating_mul(count.count(row)))
 }
 
-/// `lpad`/`rpad(string, n[, fill])`: `n` characters, at least `n` bytes. With
-/// an empty fill the string is only truncated, so nothing is counted.
+/// `lpad`/`rpad(string, n[, fill])`: the functions allocate `n` bytes for each
+/// row before they pad or truncate, also when an empty fill only truncates.
 fn pad_bytes(args: &[ColumnarValue], rows: usize) -> u128 {
-    let (length, fill) = match args {
-        [_, length] => (length, None),
-        [_, length, fill] => (length, StrLens::new(fill)),
-        _ => return 0,
+    let ([_, length] | [_, length, _]) = args else {
+        return 0;
     };
     let Some(length) = Ints::new(length) else {
         return 0;
     };
-    sum_rows(rows, |row| match &fill {
-        Some(fill) if fill.get(row) == 0 => 0,
-        _ => length.count(row),
-    })
+    sum_rows(rows, |row| length.count(row))
 }
 
-/// `array_repeat(element, n)`: `n` copies of the element.
+/// `lpad`/`rpad` pad a negative length to an empty string, but size their
+/// output buffer from the length cast to `usize`, so negative lengths are
+/// passed as 0.
+fn clamp_negative_pad_lengths(args: &mut [ColumnarValue]) {
+    let Some(ColumnarValue::Array(lengths)) = args.get(1) else {
+        return;
+    };
+    let Some(lengths) = lengths.as_primitive_opt::<Int64Type>() else {
+        return;
+    };
+    if arrow::compute::min(lengths).is_some_and(|min| min < 0) {
+        let clamped: Int64Array = lengths.unary(|length| length.max(0));
+        args[1] = ColumnarValue::Array(Arc::new(clamped));
+    }
+}
+
+/// `array_repeat(element, n)`: `n` copies of the element, plus the 8-byte take
+/// index the function builds for each value it copies. A list element is
+/// copied value by value, so it needs one index per value of the list.
 fn array_repeat_bytes(args: &[ColumnarValue], rows: usize) -> u128 {
     let [element, count] = args else { return 0 };
     let Some(count) = Ints::new(count) else {
         return 0;
     };
-    let strings = StrLens::new(element);
-    let width = value_width(&element.data_type());
-    sum_rows(rows, |row| {
-        let element_bytes = strings
-            .as_ref()
-            .map_or(width, |strings| strings.get(row).max(1));
-        count.count(row).saturating_mul(element_bytes)
-    })
+    let copy_bytes = |element: &dyn Array, row: usize| {
+        let indices = match element.data_type() {
+            DataType::List(_) => list_range(element.as_list::<i32>().value_offsets(), row).len(),
+            DataType::LargeList(_) => {
+                list_range(element.as_list::<i64>().value_offsets(), row).len()
+            }
+            _ => 1,
+        };
+        value_bytes(element, row).saturating_add((indices as u128).saturating_mul(8))
+    };
+    match element {
+        ColumnarValue::Array(element) => sum_rows(rows, |row| {
+            count
+                .count(row)
+                .saturating_mul(copy_bytes(element.as_ref(), row))
+        }),
+        ColumnarValue::Scalar(scalar) => {
+            let Ok(element) = scalar.to_array() else {
+                return 0;
+            };
+            let copy_bytes = copy_bytes(element.as_ref(), 0);
+            sum_rows(rows, |row| count.count(row).saturating_mul(copy_bytes))
+        }
+    }
+}
+
+/// A lower bound of the bytes the value at `row` takes in an array of its
+/// type: lists, maps and structs count their nested values.
+fn value_bytes(array: &dyn Array, row: usize) -> u128 {
+    if let Some(width) = array.data_type().primitive_width() {
+        return width as u128;
+    }
+    let nested = |values: &dyn Array, range: std::ops::Range<usize>| {
+        if let Some(width) = values.data_type().primitive_width() {
+            return (range.len() as u128).saturating_mul(width as u128);
+        }
+        range.fold(0, |total: u128, value| {
+            total.saturating_add(value_bytes(values, value))
+        })
+    };
+    match array.data_type() {
+        DataType::Utf8 => 4 + array.as_string::<i32>().value(row).len() as u128,
+        DataType::LargeUtf8 => 8 + array.as_string::<i64>().value(row).len() as u128,
+        DataType::Utf8View => 16 + array.as_string_view().value(row).len() as u128,
+        DataType::Binary => 4 + array.as_binary::<i32>().value(row).len() as u128,
+        DataType::LargeBinary => 8 + array.as_binary::<i64>().value(row).len() as u128,
+        DataType::BinaryView => 16 + array.as_binary_view().value(row).len() as u128,
+        DataType::FixedSizeBinary(width) => u128::try_from(*width).unwrap_or(0),
+        DataType::List(_) => {
+            let list = array.as_list::<i32>();
+            4 + nested(
+                list.values().as_ref(),
+                list_range(list.value_offsets(), row),
+            )
+        }
+        DataType::LargeList(_) => {
+            let list = array.as_list::<i64>();
+            8 + nested(
+                list.values().as_ref(),
+                list_range(list.value_offsets(), row),
+            )
+        }
+        DataType::Map(..) => {
+            let map = array.as_map();
+            4 + nested(map.entries(), list_range(map.value_offsets(), row))
+        }
+        DataType::FixedSizeList(..) => {
+            let list = array.as_fixed_size_list();
+            let start = list.value_offset(row).as_usize();
+            let len = list.value_length().as_usize();
+            nested(list.values().as_ref(), start..start + len)
+        }
+        DataType::Struct(_) => array.as_struct().columns().iter().fold(0, |total, column| {
+            total.saturating_add(value_bytes(column.as_ref(), row))
+        }),
+        DataType::Dictionary(key, _) => value_width(key),
+        _ => 0,
+    }
+}
+
+fn list_range<O: OffsetSizeTrait>(offsets: &[O], row: usize) -> std::ops::Range<usize> {
+    offsets[row].as_usize()..offsets[row + 1].as_usize()
 }
 
 /// `array_resize(array, n[, value])`: `n` elements per row.
@@ -568,8 +672,14 @@ mod tests {
     use std::sync::Arc;
 
     use crate::dataaccelerator::AcceleratorEngineRegistry;
+    use arrow::array::{ArrayRef, AsArray, Int64Array, ListArray, StringArray, StructArray};
+    use arrow::datatypes::{DataType, Field, Int32Type, Int64Type};
     use arrow::util::pretty::pretty_format_batches;
+    use datafusion::common::ScalarValue;
     use datafusion::error::DataFusionError;
+    use datafusion::logical_expr::ColumnarValue;
+
+    use super::{array_repeat_bytes, clamp_negative_pad_lengths, pad_bytes};
 
     use crate::datafusion::builder::DataFusionBuilder;
     use crate::status;
@@ -607,8 +717,25 @@ mod tests {
                 format!("SELECT length(rpad('a', 67108864 + v - v, 'b')) {one_row}"),
             ),
             (
+                "lpad",
+                format!("SELECT length(lpad('a', 67108864 + v - v, '')) {one_row}"),
+            ),
+            (
                 "array_repeat",
                 format!("SELECT cardinality(array_repeat(v, 8388608 + v - v)) {one_row}"),
+            ),
+            (
+                "array_repeat",
+                format!(
+                    "SELECT cardinality(array_repeat(range(v - v, 1024), 4096 + v - v)) {one_row}"
+                ),
+            ),
+            (
+                "array_repeat",
+                format!(
+                    "SELECT cardinality(array_repeat(CAST(repeat('a', 1024 + v - v) AS BYTEA), \
+                     65536 + v - v)) {one_row}"
+                ),
             ),
             (
                 "array_resize",
@@ -652,6 +779,149 @@ mod tests {
         }
     }
 
+    async fn pad_lengths(
+        df: &crate::datafusion::DataFusion,
+        sql: &str,
+    ) -> Result<Vec<i32>, DataFusionError> {
+        let batches = df.ctx.sql(sql).await?.collect().await?;
+        Ok(batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int32Type>()
+                    .iter()
+                    .map(|length| length.expect("a length"))
+                    .collect::<Vec<_>>()
+            })
+            .collect())
+    }
+
+    /// An empty fill only truncates, but the functions still allocate the
+    /// requested length, so it is charged like any other fill.
+    #[tokio::test]
+    async fn pad_with_an_empty_fill_is_charged_its_requested_length() {
+        let df = session();
+        let mib = 1024 * 1024;
+        let one_row = "FROM (SELECT value AS v FROM generate_series(1, 1)) t";
+        for function in ["lpad", "rpad"] {
+            let under = format!(
+                "SELECT length({function}('abc', {} + v - v, '')) {one_row}",
+                MEMORY_LIMIT - mib
+            );
+            assert_eq!(
+                pad_lengths(&df, &under).await.expect("run under the limit"),
+                vec![3]
+            );
+            let over = format!(
+                "SELECT length({function}('abc', {} + v - v, '')) {one_row}",
+                MEMORY_LIMIT + mib
+            );
+            let error = pad_lengths(&df, &over)
+                .await
+                .expect_err("an empty fill over the limit must fail");
+            assert!(
+                matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+                "{over}: expected resources exhausted, got {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pad_with_negative_lengths_returns_empty_strings() {
+        let df = session();
+        let lengths = pad_lengths(
+            &df,
+            "SELECT length(lpad('abc', v - 3)) + length(rpad('abc', v - 3, 'xy')) \
+             FROM (SELECT value AS v FROM generate_series(1, 5)) t ORDER BY v",
+        )
+        .await
+        .expect("run the query");
+        assert_eq!(lengths, vec![0, 0, 0, 2, 4]);
+    }
+
+    #[test]
+    fn pad_sizing_counts_non_negative_lengths_for_every_fill() {
+        let lengths = ColumnarValue::Array(Arc::new(Int64Array::from(vec![
+            Some(4),
+            Some(-7),
+            None,
+            Some(2),
+        ])));
+        let string = ColumnarValue::Scalar(ScalarValue::Utf8(Some("a".to_string())));
+        let empty = ColumnarValue::Scalar(ScalarValue::Utf8(Some(String::new())));
+        let fill = ColumnarValue::Scalar(ScalarValue::Utf8(Some("xy".to_string())));
+        assert_eq!(pad_bytes(&[string.clone(), lengths.clone()], 4), 6);
+        assert_eq!(pad_bytes(&[string.clone(), lengths.clone(), empty], 4), 6);
+        assert_eq!(pad_bytes(&[string.clone(), lengths.clone(), fill], 4), 6);
+
+        let mut args = [string, lengths];
+        clamp_negative_pad_lengths(&mut args);
+        let ColumnarValue::Array(clamped) = &args[1] else {
+            panic!("lengths stay an array");
+        };
+        assert_eq!(
+            clamped.as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![Some(4), Some(0), None, Some(2)])
+        );
+    }
+
+    #[test]
+    fn array_repeat_sizing_counts_element_values_and_take_indices() {
+        let count = ColumnarValue::Scalar(ScalarValue::Int64(Some(10)));
+        let list = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![
+            Some(1),
+            Some(2),
+            Some(3),
+        ])]);
+        let strukt = StructArray::from(vec![
+            (
+                Arc::new(Field::new("a", DataType::Int64, true)),
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("b", DataType::Utf8, true)),
+                Arc::new(StringArray::from(vec!["xy"])) as ArrayRef,
+            ),
+        ]);
+        let cases = [
+            (ScalarValue::Int64(Some(1)), 10 * (8 + 8)),
+            (ScalarValue::Utf8(Some("abc".to_string())), 10 * (4 + 3 + 8)),
+            (ScalarValue::Boolean(Some(true)), 10 * 8),
+            (ScalarValue::Null, 10 * 8),
+            (ScalarValue::Binary(Some(vec![0; 5])), 10 * (4 + 5 + 8)),
+            (ScalarValue::List(Arc::new(list)), 10 * (4 + 3 * 8 + 3 * 8)),
+            (ScalarValue::Struct(Arc::new(strukt)), 10 * (8 + 4 + 2 + 8)),
+        ];
+        let (expected, charged): (Vec<_>, Vec<_>) = cases
+            .into_iter()
+            .map(|(element, bytes)| {
+                let data_type = element.data_type();
+                let charged =
+                    array_repeat_bytes(&[ColumnarValue::Scalar(element), count.clone()], 1);
+                ((data_type.clone(), bytes), (data_type, charged))
+            })
+            .unzip();
+        assert_eq!(charged, expected);
+
+        let lists = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(1), Some(2)]),
+            None,
+            Some(vec![Some(3)]),
+        ]);
+        let counts = Int64Array::from(vec![Some(2), Some(5), Some(3)]);
+        assert_eq!(
+            array_repeat_bytes(
+                &[
+                    ColumnarValue::Array(Arc::new(lists)),
+                    ColumnarValue::Array(Arc::new(counts)),
+                ],
+                3
+            ),
+            2 * (4 + 2 * 8 + 2 * 8) + 5 * 4 + 3 * (4 + 8 + 8)
+        );
+    }
+
     #[tokio::test]
     async fn argument_sized_functions_within_the_limit_return_their_results() {
         let df = session();
@@ -659,7 +929,8 @@ mod tests {
             .ctx
             .sql(
                 "SELECT repeat('ab', 3 + v - v) AS r, lpad('x', 4 + v - v, 'yz') AS l, \
-                 rpad('x', 4 + v - v) AS p, array_repeat(v, 2) AS a, array_resize([v], 3, 0) AS z, \
+                 rpad('x', 4 + v - v) AS p, array_repeat(v, 2) AS a, array_repeat([v, v], 2) AS b, \
+                 array_resize([v], 3, 0) AS z, \
                  range(v - v, 3) AS g, generate_series(v, 3) AS s \
                  FROM (SELECT value AS v FROM generate_series(1, 2)) t ORDER BY v",
             )

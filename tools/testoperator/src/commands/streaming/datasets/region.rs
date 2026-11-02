@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use duckdb::Connection;
+use duckdb_oracle::Connection;
 use test_framework::anyhow::{Context, Result};
 
 use super::DatasetType;
@@ -65,39 +65,18 @@ impl StreamingDataset for RegionDataset {
         conn.execute_batch(&format!("CALL dbgen(sf={scale_factor});"))
             .context("Failed to generate TPCH data")?;
 
-        let mut stmt = conn
-            .prepare(
+        let batches = conn
+            .query(
                 "SELECT r_regionkey, r_name, r_comment
                 FROM region
                 ORDER BY r_regionkey",
             )
-            .context("Failed to prepare region query")?;
+            .context("Failed to query region query")?;
 
-        let mut r_regionkey = Vec::new();
-        let mut r_name = Vec::new();
-        let mut r_comment = Vec::new();
-
-        let mut rows = stmt.query([]).context("Failed to query region data")?;
-        while let Some(row) = rows.next().context("Failed to read row")? {
-            r_regionkey.push(row.get::<_, i64>(0)?);
-            r_name.push(row.get::<_, String>(1)?);
-            r_comment.push(row.get::<_, String>(2)?);
-        }
-
-        let record_count = r_regionkey.len();
-        println!("Generated {record_count} region records");
-
-        let batch = RecordBatch::try_new(
-            Arc::new(Self::schema()),
-            vec![
-                Arc::new(Int64Array::from(r_regionkey)),
-                Arc::new(StringArray::from(r_name)),
-                Arc::new(StringArray::from(r_comment)),
-            ],
-        )
-        .context("Failed to create Arrow RecordBatch")?;
-
-        Ok(vec![batch])
+        let batches = super::with_dataset_schema(batches, Self::schema())?;
+        let record_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        println!("Generated {record_count} records");
+        Ok(batches)
     }
 
     fn marker_record(&self) -> Result<RecordBatch> {

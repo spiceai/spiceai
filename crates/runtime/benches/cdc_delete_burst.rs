@@ -33,7 +33,6 @@ limitations under the License.
 //!   - `monolithic` — `cap = N` (one durable plan, the pre-fix behavior), vs
 //!   - `chunked`    — `cap = 2048` (the default; `⌈N/2048⌉` plans).
 
-#![cfg(not(windows))]
 #![allow(clippy::expect_used)]
 
 use std::collections::HashMap;

@@ -483,6 +483,9 @@ impl Path {
             Path::Responses => {
                 if capabilities.has(Capability::Responses) {
                     vec!["/v1/responses"]
+                } else if capabilities.has(Capability::Chat) {
+                    // A provider without a Responses API is answered through its chat.
+                    vec![chat]
                 } else {
                     vec![]
                 }
@@ -493,14 +496,12 @@ impl Path {
                 None => vec![],
             },
             Path::Decisions | Path::AiIf => decisions,
-            // A model with chat reranks through it, even one with native decisions.
-            Path::Rerank => {
-                if capabilities.has(Capability::Chat) {
-                    vec![chat]
-                } else {
-                    decisions
-                }
-            }
+            // A model with native decisions reranks through them, even one with chat.
+            Path::Rerank => match capabilities.decisions() {
+                Some(DecisionsBackend::Native) => decisions,
+                _ if capabilities.has(Capability::Chat) => vec![chat],
+                _ => decisions,
+            },
         }
     }
 }
