@@ -60,7 +60,12 @@ fn batch(start: i64) -> TestResult<RecordBatch> {
     let pick = |vals: &[&str], salt: i64| -> StringArray {
         (start..start + ROWS_PER_PROMOTION)
             .map(|i| {
-                Some(vals[usize::try_from((i + salt).rem_euclid(vals.len() as i64)).expect("idx")])
+                Some(
+                    vals[usize::try_from(
+                        (i + salt).rem_euclid(i64::try_from(vals.len()).expect("len")),
+                    )
+                    .expect("idx")],
+                )
             })
             .collect()
     };
@@ -74,7 +79,8 @@ fn batch(start: i64) -> TestResult<RecordBatch> {
             Arc::new(pick(&["200", "201", "404", "500", "503"], 2)),
             Arc::new(pick(&["pods", "nodes", "services", "deployments"], 3)),
             Arc::new(Float64Array::from_iter_values(
-                (start..start + ROWS_PER_PROMOTION).map(|i| (i % 997) as f64 * 0.5),
+                (start..start + ROWS_PER_PROMOTION)
+                    .map(|i| f64::from(i32::try_from(i % 997).expect("i % 997 fits i32")) * 0.5),
             )),
             Arc::new(Int64Array::from_iter_values(
                 (start..start + ROWS_PER_PROMOTION).map(|i| i % 13),
