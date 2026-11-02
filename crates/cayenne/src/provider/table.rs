@@ -64404,8 +64404,8 @@ mod tests {
 
     /// A bake that takes out tombstones the index held when the table opened
     /// cannot count the rows a rewrite removed before then, so it records no
-    /// yield. The bake after it, holding only tombstones recorded since open,
-    /// measures again.
+    /// yield. Once it has taken them all out, the table stops tracking them, so
+    /// the next reclaim measures again.
     #[tokio::test]
     async fn a_bake_of_tombstones_from_open_keeps_its_trigger() {
         let ctx = SessionContext::new();
