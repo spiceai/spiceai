@@ -179,7 +179,22 @@ pub struct KnnQuery {
 pub struct SearchResponse {
     #[serde(default)]
     pub pit_id: Option<String>,
+    /// Whether the search stopped at its timeout. Elasticsearch still answers with the hits
+    /// it gathered by then, and no error.
+    #[serde(default)]
+    pub timed_out: bool,
+    /// How many shards answered. A search some shards failed still succeeds, with only the
+    /// other shards' hits.
+    #[serde(default, rename = "_shards")]
+    pub shards: Option<ShardsSummary>,
     pub hits: HitsEnvelope,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShardsSummary {
+    pub total: u64,
+    #[serde(default)]
+    pub failed: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -204,6 +219,38 @@ pub struct Hit {
     pub sort: Option<Vec<serde_json::Value>>,
     #[serde(default, rename = "_source")]
     pub source: serde_json::Value,
+    /// The document's sequence number, returned when the search asks for
+    /// `seq_no_primary_term`.
+    #[serde(default, rename = "_seq_no")]
+    pub seq_no: Option<i64>,
+    /// The primary term `seq_no` was assigned under, returned alongside it.
+    #[serde(default, rename = "_primary_term")]
+    pub primary_term: Option<i64>,
+    /// The concrete index holding the document. A search through an alias names the index
+    /// behind it.
+    #[serde(default, rename = "_index")]
+    pub index: Option<String>,
+    /// The custom routing the document was written with, if any (for example by a write
+    /// through an alias that sets `routing`). Without it, a request for this `_id` goes to
+    /// the shard the `_id` hashes to, which need not be the one holding the document.
+    #[serde(default, rename = "_routing")]
+    pub routing: Option<String>,
+}
+
+/// A document as one write left it: any later write to the same `_id` assigns a new
+/// `(seq_no, primary_term)`, so a delete conditioned on this pair removes the document only
+/// if nothing has rewritten it since.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentVersion {
+    /// The concrete index the version was read from. `(seq_no, primary_term)` is assigned per
+    /// shard of one index, so it identifies a document only in that index, not in another
+    /// index an alias points to later.
+    pub index: String,
+    pub id: String,
+    /// The document's custom routing, which a request has to repeat to reach its shard.
+    pub routing: Option<String>,
+    pub seq_no: i64,
+    pub primary_term: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -591,7 +638,6 @@ impl Client {
         index: &str,
         docs: &[(Option<String>, serde_json::Value)],
     ) -> Result<serde_json::Value> {
-        let url = format!("{}/_bulk", self.base_url);
         let mut ndjson = String::new();
         for (id, doc) in docs {
             let action = if let Some(id) = id {
@@ -604,13 +650,19 @@ impl Client {
             ndjson.push_str(&serde_json::to_string(doc).context(JsonSerializeSnafu)?);
             ndjson.push('\n');
         }
+        self.post_bulk("bulk_index", ndjson).await
+    }
+
+    /// Send an NDJSON `_bulk` body, retrying transient failures.
+    async fn post_bulk(&self, op: &'static str, ndjson: String) -> Result<serde_json::Value> {
+        let url = format!("{}/_bulk", self.base_url);
         let url_ref = &url;
         // Freeze the NDJSON payload into `Bytes` so retries reuse the same
         // underlying buffer (cheap refcount clone) instead of copying the
         // entire payload on every attempt.
         let ndjson_bytes = Bytes::from(ndjson);
         let ndjson_ref = &ndjson_bytes;
-        self.with_retry("bulk_index", |c| async move {
+        self.with_retry(op, |c| async move {
             let resp = c
                 .auth(c.http.post(url_ref))
                 .header(CONTENT_TYPE, "application/x-ndjson")
@@ -622,6 +674,34 @@ impl Client {
             resp.json().await.context(JsonParseSnafu)
         })
         .await
+    }
+
+    /// Delete each document in `docs` via `POST /_bulk`, but only while it is still at the
+    /// given version (`if_seq_no` / `if_primary_term`). A document rewritten since is reported
+    /// with a per-item `409` version conflict and left in place; the bulk response is returned
+    /// for the caller to inspect.
+    pub async fn bulk_delete_if_unchanged(
+        &self,
+        docs: &[DocumentVersion],
+    ) -> Result<serde_json::Value> {
+        let mut ndjson = String::new();
+        for doc in docs {
+            let mut delete = serde_json::json!({
+                "_index": doc.index,
+                "_id": doc.id,
+                "if_seq_no": doc.seq_no,
+                "if_primary_term": doc.primary_term,
+            });
+            if let Some(routing) = &doc.routing {
+                delete["routing"] = serde_json::Value::String(routing.clone());
+            }
+            let action = serde_json::json!({ "delete": delete });
+            ndjson.push_str(&serde_json::to_string(&action).context(JsonSerializeSnafu)?);
+            ndjson.push('\n');
+        }
+        // Safe to retry: a delete that already applied reports `404` on the retry, and one
+        // whose document was rewritten in between reports `409`; neither removes anything new.
+        self.post_bulk("bulk_delete_if_unchanged", ndjson).await
     }
 
     /// Delete every document matching `query` via `POST /<index>/_delete_by_query`.
@@ -808,6 +888,8 @@ pub trait Elasticsearch: std::fmt::Debug + Send + Sync {
         index: &str,
         query: &serde_json::Value,
     ) -> Result<serde_json::Value>;
+    async fn bulk_delete_if_unchanged(&self, docs: &[DocumentVersion])
+    -> Result<serde_json::Value>;
 }
 
 #[async_trait::async_trait]
@@ -899,6 +981,13 @@ impl Elasticsearch for Client {
         query: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         Client::delete_by_query(self, index, query).await
+    }
+
+    async fn bulk_delete_if_unchanged(
+        &self,
+        docs: &[DocumentVersion],
+    ) -> Result<serde_json::Value> {
+        Client::bulk_delete_if_unchanged(self, docs).await
     }
 }
 

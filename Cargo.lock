@@ -19852,6 +19852,7 @@ dependencies = [
  "itertools 0.14.0",
  "llms",
  "parking_lot",
+ "reqwest 0.13.4",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
  "runtime-query-engine",

@@ -7,6 +7,7 @@ license-file.workspace = true
 name = "search"
 repository.workspace = true
 rust-version.workspace = true
+autotests = false
 version.workspace = true
 
 [dependencies]
@@ -53,9 +54,14 @@ text_search = ["dep:tantivy", "dep:tantivy_datafusion_filter"]
 
 [dev-dependencies]
 insta = { workspace = true, features = ["json"] }
+reqwest.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
