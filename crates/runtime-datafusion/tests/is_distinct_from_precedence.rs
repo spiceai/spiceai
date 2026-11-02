@@ -39,7 +39,10 @@ const CASES: &[(&str, &str)] = &[
     ("SELECT true IS NOT DISTINCT FROM true AND false", "false"),
     // Integer operands. These failed to plan with "Cannot infer common
     // argument type for logical boolean operation Int64 OR Boolean".
-    ("SELECT 1 IS DISTINCT FROM 2 OR 3 IS DISTINCT FROM 3", "true"),
+    (
+        "SELECT 1 IS DISTINCT FROM 2 OR 3 IS DISTINCT FROM 3",
+        "true",
+    ),
     ("SELECT 1 IS DISTINCT FROM 1 OR 2 = 2", "true"),
     ("SELECT 1 IS NOT DISTINCT FROM 1 AND 2 = 3", "false"),
     (
@@ -82,9 +85,8 @@ async fn single_value(ctx: &SessionContext, sql: &str) -> String {
     let values: Vec<String> = batches
         .iter()
         .flat_map(|b| {
-            (0..b.num_rows()).map(move |row| {
-                array_value_to_string(b.column(0), row).expect("render value")
-            })
+            (0..b.num_rows())
+                .map(move |row| array_value_to_string(b.column(0), row).expect("render value"))
         })
         .collect();
     assert_eq!(values.len(), 1, "`{sql}` returned {values:?}");
@@ -102,7 +104,9 @@ async fn is_distinct_from_returns_the_postgres_answer() {
         for &(sql, expected) in CASES {
             let got = single_value(ctx, sql).await;
             if got != expected {
-                failures.push(format!("[{name}] `{sql}`: got {got}, PostgreSQL {expected}"));
+                failures.push(format!(
+                    "[{name}] `{sql}`: got {got}, PostgreSQL {expected}"
+                ));
             }
         }
     }
@@ -127,11 +131,31 @@ fn select_expr(dialect: &dyn Dialect, sql: &str) -> Expr {
 fn and_or_after_is_distinct_from_is_the_root_of_the_expression() {
     let cases = [
         ("SELECT a IS DISTINCT FROM b OR c", BinaryOperator::Or, true),
-        ("SELECT a IS DISTINCT FROM b AND c", BinaryOperator::And, true),
-        ("SELECT a IS NOT DISTINCT FROM b OR c", BinaryOperator::Or, false),
-        ("SELECT a IS NOT DISTINCT FROM b AND c", BinaryOperator::And, false),
-        ("SELECT 1 IS DISTINCT FROM 2 OR 3 = 3", BinaryOperator::Or, true),
-        ("SELECT 1 IS NOT DISTINCT FROM 2 AND 3 = 3", BinaryOperator::And, false),
+        (
+            "SELECT a IS DISTINCT FROM b AND c",
+            BinaryOperator::And,
+            true,
+        ),
+        (
+            "SELECT a IS NOT DISTINCT FROM b OR c",
+            BinaryOperator::Or,
+            false,
+        ),
+        (
+            "SELECT a IS NOT DISTINCT FROM b AND c",
+            BinaryOperator::And,
+            false,
+        ),
+        (
+            "SELECT 1 IS DISTINCT FROM 2 OR 3 = 3",
+            BinaryOperator::Or,
+            true,
+        ),
+        (
+            "SELECT 1 IS NOT DISTINCT FROM 2 AND 3 = 3",
+            BinaryOperator::And,
+            false,
+        ),
     ];
     for dialect in [&PostgreSqlDialect {} as &dyn Dialect, &GenericDialect {}] {
         for (sql, op, distinct) in &cases {
