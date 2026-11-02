@@ -116,7 +116,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
 | [datafusion](#datafusion) | `77b231d1654fcc393ed198884c245062ae50262c` | `spiceai-55` |
-| [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
+| [datafusion-ballista](#datafusion-ballista) | `6e7a8775a6deb99c2ebf924f1ff5b3111d38e615` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `300acfcfb51abfa9c477f57bff3e0529ec4f5f1a` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `d323656c3bebc04fdce2ebc1cec31081f53b100d` | `spiceai-55` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
@@ -431,7 +431,16 @@ so the rows below name the contracts, not every commit.
 | Task statuses re-delivered after a failed `poll_work` (fork PR #57) | An executor that fails to deliver a batch of task statuses drops them, so the scheduler never learns those tasks finished and the stage waits on work that is already done | silent (hang) | **GAP** — needs a cluster and an induced `poll_work` failure |
 | Terminal job status persisted before the job leaves the active cache (fork PR #59; upstreamed as `persist_terminal_and_evict`, apache/datafusion-ballista#2037) | `succeed_job` removed the job from the active execution-graph cache before the `save_job` write completed, so a concurrent `get_job_status` fell through to the not-yet-updated shared state and answered a stale `Running`. The distributed query client polls on a 2s budget, so it reported a timeout for a query that had in fact succeeded | silent (a successful query reported as a timeout) | **GAP** — a race between a status poll and a save, so any test of it is a timing test; measured by the fork against the client's poll budget |
 | Stuck-query detection (fork PR #39) | A distributed query that stops making progress is not reported, so it has to be diagnosed by rerunning it | not carried | none — not carried. There is no watchdog or progress sampler at this pin or the previous one, and `SPICE_FORK_CHANGES.md` records the patch lost; restoring it would need a row with a guard |
-| A task's vcore lent while all of the task waits on remote I/O marked with `io_wait()`: `VcoreHook` and `VcorePermit` (`core/src/vcore_permit.rs`, re-exported from the executor), every pull-scheduled task run through the permit, the shuffle writers' own spawns carried into it, and the poll loop no longer waiting for a vcore itself (fork PR #76 with spiceai/datafusion#258, [#15049](https://github.com/spiceai/spiceai/issues/15049)) | Losing `VcoreHook` breaks the build. Losing the execution-loop half leaves the hook set and counting nothing, so a distributed task waiting on a slow HTTP source holds its slot for the whole wait again and a cluster querying that source answers a few queries per minute, queuing everything else behind idle tasks | build; silent (throughput) | `crates/runtime/tests/cluster/io_wait_lending.rs::a_task_waiting_on_http_lends_its_slot_to_another_query` |
+| A task's vcore lent while all of the task waits on remote I/O marked with `io_wait()`: `VcoreHook` and `VcorePermit` (`core/src/vcore_permit.rs`, re-exported from the executor), every pull-scheduled task run through the permit, the shuffle writers' own spawns carried into it, and the poll loop no longer waiting for a vcore itself. Lending reserves no hypothetical memory share; actual allocations remain governed by the runtime pool (fork PRs #76 and #77 with spiceai/datafusion#258, [#15049](https://github.com/spiceai/spiceai/issues/15049)) | Losing `VcoreHook` breaks the build. Losing the execution-loop half leaves the hook set and counting nothing, so a distributed task waiting on a slow HTTP source holds its slot for the whole wait again and a cluster querying that source answers a few queries per minute, queuing everything else behind idle tasks | build; silent (throughput) | `crates/runtime/tests/cluster/io_wait_lending.rs::a_task_waiting_on_http_lends_its_slot_to_another_query` |
+
+At `6e7a8775`, fork PR #77 removes per-lend memory promises and enforces a
+shared actual-allocation budget across the standalone executor's per-task spill
+pools. Spice uses its existing shared runtime pool. The fork's HTTP regressions
+exercise six held requests on two vcores, allocation failure at the actual budget,
+and recovery after memory is freed, with both shared and per-task pools. The
+Spice integration guard above covers lending with one waiting query per slot;
+it does not yet cover more than twice the slot count. The other fork patches
+listed above are unchanged by this revision.
 
 ## datafusion-federation and datafusion-table-providers
 
