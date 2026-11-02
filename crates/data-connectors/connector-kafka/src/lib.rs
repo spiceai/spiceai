@@ -508,6 +508,7 @@ async fn init_kafka_consumer(
     }
 
     let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
+        &dataset.name.to_string(),
         &metadata.consumer_group_id,
         kafka_config,
         &metadata.offsets,
