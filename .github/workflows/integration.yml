@@ -134,12 +134,20 @@ jobs:
               - 'crates/runtime/tests/mongo/**'
 
       # Every listed release line except each source's newest, which the
-      # partitions below already run as the default.
+      # partitions below already run as the default, and except a line with a
+      # `paused` reason, which warns on every run until the field is removed.
       - name: List federated source versions
         id: source_versions
         run: |
           set -euo pipefail
-          matrix="$(jq -c '[to_entries[] | select(.key != "description") | .key as $source | .value.versions[:-1][] | {source: $source, version: .version, end_of_life: .end_of_life}]' test/source_versions.json)"
+          # The partitions run each source's newest line regardless, so pausing it would skip nothing.
+          paused_default="$(jq -r '[to_entries[] | select(.key != "description") | select(.value.versions[-1].paused != null) | "\(.key) \(.value.versions[-1].version)"] | join(", ")' test/source_versions.json)"
+          if [ -n "${paused_default}" ]; then
+            echo "::error::test/source_versions.json pauses a source's newest line (${paused_default}), which the integration partitions run as the default; only an older line can be paused"
+            exit 1
+          fi
+          matrix="$(jq -c '[to_entries[] | select(.key != "description") | .key as $source | .value.versions[:-1][] | select(.paused == null) | {source: $source, version: .version, end_of_life: .end_of_life}]' test/source_versions.json)"
+          jq -r 'to_entries[] | select(.key != "description") | .key as $source | .value.versions[] | select(.paused != null) | "::warning title=Paused source version::\($source) \(.version) integration tests are paused: \(.paused). Remove `paused` from test/source_versions.json to run them again"' test/source_versions.json
           today="$(date -u +%F)"
           jq -r --arg today "$today" 'to_entries[] | select(.key != "description") | .key as $source | .value.versions[] | select(.end_of_life <= $today) | "::warning title=Unsupported source version::\($source) \(.version) reached end of life on \(.end_of_life); remove it from test/source_versions.json"' test/source_versions.json
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
