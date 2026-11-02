@@ -1377,6 +1377,169 @@ async fn test_pending_writer_wal_survives_compaction_trigger_impl(
 }
 
 // ============================================================================
+// Test 20: A plain append whose request is cancelled after its staging WAL is
+// written must not wedge the table once compaction moves the current snapshot.
+// An OTLP export that times out drops its request future mid-publish; the
+// table must stay writable and every row must appear exactly once.
+// ============================================================================
+
+test_with_backends!(test_cancelled_plain_append_does_not_wedge_after_compaction_impl);
+
+async fn test_cancelled_plain_append_does_not_wedge_after_compaction_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const ROWS: i64 = 1500;
+    let name = "cancelled_plain_append";
+    let (table, ctx) = setup_table_with_aggressive_compaction(&fixture, name).await;
+
+    // Committed appends that give compaction small files to merge. Holding the
+    // compaction lock makes their post-write passes decline without spending
+    // the trigger, so the explicit pass below is the one that moves the snapshot.
+    let compaction_hold = table.hold_compaction().await;
+    for batch_idx in 0..4_i64 {
+        append_batch(&table, large_batch(1 + batch_idx * ROWS, ROWS)).await?;
+    }
+    assert_eq!(row_count(&ctx, name).await, usize::try_from(4 * ROWS)?);
+
+    // Park the next append's publish: it writes its staging WAL, then waits on
+    // the listing fence held here. Dropping its future there is what a client
+    // timeout does to an in-progress OTLP export.
+    let cancelled_start = 10_001;
+    let fence = table.lock_listing_fence_write_owned().await;
+    let writer = {
+        let table = Arc::clone(&table);
+        tokio::spawn(async move {
+            append_batch(&table, large_batch(cancelled_start, ROWS))
+                .await
+                .map_err(|e| e.to_string())
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while staging_wal_paths(&table).is_empty() {
+        assert!(
+            !writer.is_finished(),
+            "append finished before writing its staging WAL: {:?}",
+            writer.await
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "append never wrote its staging WAL"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    writer.abort();
+    assert!(
+        writer.await.expect_err("aborted writer").is_cancelled(),
+        "writer must be cancelled while parked on the listing fence"
+    );
+    drop(fence);
+
+    // The cancelled append had already staged its rows and written its WAL, so
+    // it commits: its publish finishes even though its caller is gone.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut cancelled_rows = row_count(&ctx, name).await;
+    while cancelled_rows != usize::try_from(5 * ROWS)? && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancelled_rows = row_count(&ctx, name).await;
+    }
+
+    // Move the current snapshot.
+    drop(compaction_hold);
+    assert!(
+        table.maybe_compact_small_files().await?,
+        "compaction must run so the current snapshot moves"
+    );
+
+    // The table must still accept writes.
+    let next_start = 20_001;
+    append_batch(&table, large_batch(next_start, ROWS)).await?;
+
+    assert_eq!(
+        cancelled_rows,
+        usize::try_from(5 * ROWS)?,
+        "the cancelled append's publish must complete"
+    );
+    let mut expected: Vec<i64> = (1..=4 * ROWS).collect();
+    expected.extend(cancelled_start..cancelled_start + ROWS);
+    expected.extend(next_start..next_start + ROWS);
+    let ids: Vec<i64> = query_all(&ctx, name)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        ids, expected,
+        "rows after a cancelled append and compaction"
+    );
+    assert_eq!(
+        count_star(&ctx, name).await,
+        expected.len(),
+        "COUNT(*) must match the rows a scan returns"
+    );
+    assert!(
+        staging_wal_paths(&table).is_empty(),
+        "no staging WAL may remain"
+    );
+
+    // And it must reopen with the same rows.
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let reopened_ctx = SessionContext::new();
+    let reopened = cayenne::CayenneTableProviderBuilder::new(catalog, reopened_ctx.runtime_env())
+        .open(name)
+        .await?;
+    reopened_ctx.register_table(name, Arc::new(reopened) as Arc<dyn TableProvider>)?;
+    let ids: Vec<i64> = query_all(&reopened_ctx, name)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(ids, expected, "rows after reopening");
+    assert_eq!(
+        count_star(&reopened_ctx, name).await,
+        expected.len(),
+        "COUNT(*) after reopening"
+    );
+
+    Ok(())
+}
+
+async fn count_star(ctx: &SessionContext, table_name: &str) -> usize {
+    let batches = ctx
+        .sql(&format!("SELECT COUNT(*) FROM {table_name}"))
+        .await
+        .expect("count query")
+        .collect()
+        .await
+        .expect("collect count");
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("COUNT(*) is Int64")
+        .value(0);
+    usize::try_from(count).expect("non-negative count")
+}
+
+async fn append_batch(
+    provider: &CayenneTableProvider,
+    batch: RecordBatch,
+) -> datafusion_common::Result<()> {
+    let ctx = SessionContext::new();
+    let schema = Arc::clone(batch.schema_ref());
+    let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+        &[vec![batch]],
+        schema,
+        None,
+    )?;
+    let plan = provider
+        .insert_into(&ctx.state(), exec, InsertOp::Append)
+        .await?;
+    collect(plan, ctx.task_ctx()).await?;
+    Ok(())
+}
+
+// ============================================================================
 // S3-specific regression test for pre-recovery audit with partial upload
 // ============================================================================
 
