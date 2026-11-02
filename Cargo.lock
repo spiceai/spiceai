@@ -1329,7 +1329,7 @@ dependencies = [
 [[package]]
 name = "async-openai"
 version = "0.32.0"
-source = "git+https://github.com/spiceai/async-openai?rev=307eaf407cbf71afa967f3008250ba96c79626b7#307eaf407cbf71afa967f3008250ba96c79626b7"
+source = "git+https://github.com/spiceai/async-openai?rev=c1bf4a090c50e18f27663b008dac4c108e49b994#c1bf4a090c50e18f27663b008dac4c108e49b994"
 dependencies = [
  "async-openai-macros",
  "base64 0.22.1",
@@ -1351,13 +1351,13 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "url",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
 name = "async-openai-macros"
 version = "0.3.0"
-source = "git+https://github.com/spiceai/async-openai?rev=307eaf407cbf71afa967f3008250ba96c79626b7#307eaf407cbf71afa967f3008250ba96c79626b7"
+source = "git+https://github.com/spiceai/async-openai?rev=c1bf4a090c50e18f27663b008dac4c108e49b994#c1bf4a090c50e18f27663b008dac4c108e49b994"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1531,15 +1531,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7a8bbe9949e43a1edaa043038c68703b04774156afdfb62ba2cef5bf93d67be"
 dependencies = [
  "num-traits",
-]
-
-[[package]]
-name = "atoi_simd"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2a49e05797ca52e312a0c658938b7d00693ef037799ef7187678f212d7684cf"
-dependencies = [
- "debug_unsafe",
 ]
 
 [[package]]
@@ -3550,28 +3541,11 @@ checksum = "ade8366b8bd5ba243f0a58f036cc0ca8a2f069cff1a2351ef1cac6b083e16fc0"
 
 [[package]]
 name = "calamine"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15e02a18e79de779a78b0a6ec84a3deed1ff0607dd970a11369f993263f99f1a"
-dependencies = [
- "atoi_simd 0.16.1",
- "byteorder",
- "codepage",
- "encoding_rs",
- "fast-float2",
- "log",
- "quick-xml 0.37.5",
- "serde",
- "zip 4.6.1",
-]
-
-[[package]]
-name = "calamine"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9ca341b94bc4b29e08970b1a03914fad2dfe177e2ecb67fcd6de9046004aafb"
 dependencies = [
- "atoi_simd 0.18.1",
+ "atoi_simd",
  "byteorder",
  "codepage",
  "encoding_rs",
@@ -8026,7 +8000,7 @@ version = "2.5.0-unstable"
 dependencies = [
  "async-trait",
  "bytes",
- "calamine 0.37.0",
+ "calamine",
  "docx-rs",
  "flate2",
  "liteparse",
@@ -8106,7 +8080,6 @@ version = "1.4.4"
 source = "git+https://github.com/spiceai/duckdb-rs.git?rev=40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9#40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9"
 dependencies = [
  "arrow",
- "calamine 0.28.0",
  "cast",
  "fallible-iterator 0.3.0",
  "fallible-streaming-iterator",
@@ -8550,7 +8523,7 @@ dependencies = [
  "serde_json",
  "snafu",
  "tokio",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -16600,16 +16573,6 @@ checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
 
 [[package]]
 name = "quick-xml"
-version = "0.37.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
-dependencies = [
- "encoding_rs",
- "memchr",
-]
-
-[[package]]
-name = "quick-xml"
 version = "0.38.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
@@ -18188,7 +18151,7 @@ dependencies = [
  "typetag",
  "url",
  "util",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
  "utoipa-swagger-ui",
  "uuid 1.23.2",
  "vortex",
@@ -18251,7 +18214,7 @@ dependencies = [
  "twox-hash",
  "url",
  "util",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
  "uuid 1.23.2",
 ]
 
@@ -18261,7 +18224,7 @@ version = "2.5.0-unstable"
 dependencies = [
  "serde",
  "serde_json",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -18926,7 +18889,7 @@ dependencies = [
  "tonic",
  "tracing",
  "util",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -19069,7 +19032,7 @@ dependencies = [
  "tracing",
  "twox-hash",
  "util",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -19160,7 +19123,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "util",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
  "uuid 1.23.2",
 ]
 
@@ -19190,40 +19153,6 @@ dependencies = [
  "libsqlite3-sys",
  "smallvec 1.15.1",
  "sqlite-wasm-rs",
-]
-
-[[package]]
-name = "rust-embed"
-version = "8.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04113cb9355a377d83f06ef1f0a45b8ab8cd7d8b1288160717d66df5c7988d27"
-dependencies = [
- "rust-embed-impl",
- "rust-embed-utils",
- "walkdir",
-]
-
-[[package]]
-name = "rust-embed-impl"
-version = "8.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da0902e4c7c8e997159ab384e6d0fc91c221375f6894346ae107f47dd0f3ccaa"
-dependencies = [
- "proc-macro2",
- "quote",
- "rust-embed-utils",
- "syn 2.0.117",
- "walkdir",
-]
-
-[[package]]
-name = "rust-embed-utils"
-version = "8.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bcdef0be6fe7f6fa333b1073c949729274b05f123a0ad7efcb8efd878e5c3b1"
-dependencies = [
- "sha2 0.10.9",
- "walkdir",
 ]
 
 [[package]]
@@ -24181,7 +24110,6 @@ checksum = "6ba0b99ee52df3028635d93840c797102da61f8a7bb3cf751032455895b52ef8"
 dependencies = [
  "proc-macro2",
  "quote",
- "regex",
  "syn 2.0.117",
 ]
 
@@ -24193,33 +24121,33 @@ checksum = "d935f1c83fdf8b88f09bbe050d0cea78ea4afee6d7b0317403228c1200b2c8ab"
 dependencies = [
  "proc-macro2",
  "quote",
+ "regex",
  "syn 3.0.6",
 ]
 
 [[package]]
 name = "utoipa-swagger-ui"
-version = "9.0.2"
+version = "10.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d047458f1b5b65237c2f6dc6db136945667f40a7668627b3490b9513a3d43a55"
+checksum = "4f1fd2f9615838885c6ff4115fde8a2b58825dc7b4617f78d29c167377a15c92"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "mime_guess",
  "regex",
- "rust-embed",
  "serde",
  "serde_json",
  "url",
- "utoipa 5.5.0",
+ "utoipa 6.0.0",
  "utoipa-swagger-ui-vendored",
- "zip 3.0.0",
+ "zip 9.1.3",
 ]
 
 [[package]]
 name = "utoipa-swagger-ui-vendored"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2eebbbfe4093922c2b6734d7c679ebfebd704a0d7e56dfcb0d05818ce28977d"
+checksum = "552a64d6a0d251ae28bc021838800943cce60c9ec2e60ff331f54e79f696268f"
 
 [[package]]
 name = "uuid"
@@ -26696,34 +26624,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "70b40401a28d86ce16a330b863b86fd7dbee4d7c940587ab09ab8c019f9e3fdf"
 dependencies = [
  "num-traits",
-]
-
-[[package]]
-name = "zip"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12598812502ed0105f607f941c386f43d441e00148fce9dec3ca5ffb0bde9308"
-dependencies = [
- "arbitrary",
- "crc32fast",
- "flate2",
- "indexmap 2.14.0",
- "memchr",
- "zopfli",
-]
-
-[[package]]
-name = "zip"
-version = "4.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "caa8cd6af31c3b31c6631b8f483848b91589021b28fffe50adada48d4f4d2ed1"
-dependencies = [
- "arbitrary",
- "crc32fast",
- "flate2",
- "indexmap 2.14.0",
- "memchr",
- "zopfli",
 ]
 
 [[package]]

@@ -108,7 +108,7 @@ own section below — a count here would be one more thing to keep true by hand.
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `6e4119ac2007c6647702a1817505d6849b07e0e0` | `spiceai-24` |
 | [arrow-rs](#arrow-rs) | `36fc2c9a9f34e530385c2028adde690c24ab5ef3` | `spiceai-59` |
-| [async-openai](#async-openai) | `307eaf407cbf71afa967f3008250ba96c79626b7` | `spiceai` |
+| [async-openai](#async-openai) | `c1bf4a090c50e18f27663b008dac4c108e49b994` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `829b57522e601ea169b04e2d4a375c3abe3ed58c` | `spiceai` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
 | [candle-index-select-cu](#candle-and-its-kernel-crates) | `75fc0b689b33a327907d36dd479f7d242640ca71` | `master` |
@@ -623,6 +623,7 @@ Upstream [64bit/async-openai](https://github.com/64bit/async-openai).
 | Response `service_tier` keeps a tier the enum does not name (`ServiceTierResponse::Other`, fork PRs #42, #44) | A provider reply naming a new tier fails to deserialize, so every request answered on that tier errors | silent (request failure) | `crates/llms/src/openai/chat.rs::tests::a_reply_naming_an_unknown_service_tier_keeps_it_verbatim`, for both the reply and a streamed chunk, with a named tier as the control |
 | Chat Completions `allowed_tools` is one `{mode, tools}` object, not a list (fork PR #43) | A `tool_choice` in OpenAI's shape is refused with 422, and the list shape is forwarded to OpenAI, which rejects it with 400 | build + silent (request failure) | compile-guarded by `crates/runtime/src/model/tool_use.rs` and `crates/llms/src/openai/responses_adapter.rs`; `crates/llms/src/openai/mod.rs::allowed_tools_wire_tests::an_allowed_tools_choice_reaches_the_provider_as_one_object` reads a request in OpenAI's shape and asserts the body a local endpoint receives carries the same object; `crates/llms/src/chat/mistral.rs::tests::allowed_tools_keeps_its_mode_and_tools` deserializes OpenAI's shape |
 | A JSON request carries one `Content-Type` (fork commit `f63bb212`) | `HostedModelConfig` (Anthropic, Databricks, Spice.ai) carries `Content-Type` in its default headers and the client appends another, so every request carries two and a server can refuse it as an unsupported content type | silent (request failure) | `crates/llms/src/spiceai/chat.rs::tests::a_hosted_model_request_carries_one_content_type`, which reads the headers a one-shot local endpoint received |
+| Built with `utoipa` 6 (fork PR #46) | Spice builds its OpenAPI document with `utoipa` 6, so `ToSchema` impls from `utoipa` 5 on these request and response types do not satisfy its traits and the document does not compile | build | compile-guarded by `runtime`'s `openapi` feature, which references these types in its API schema |
 
 ## clickhouse-rs
 
