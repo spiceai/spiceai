@@ -1620,10 +1620,27 @@ impl CayenneCatalog {
         if table.path.starts_with("s3://") || options.vortex_config.memory_mode {
             return Ok(());
         }
-        let manifest = self
-            .get_snapshot_files(&table.table_id, &table.current_snapshot_id)
-            .await?;
-        let Some(damage) = inspect_stored_data_files(table, manifest).await? else {
+        // Scans read the current snapshot and every protected one (rows staged
+        // by CDC upserts and checkpoints live in their own snapshots), so each is
+        // checked; the first damaged one is reported.
+        let mut protected: Vec<String> = self
+            .get_all_snapshot_sequences(&table.table_id)
+            .await?
+            .into_keys()
+            .filter(|snapshot_id| *snapshot_id != table.current_snapshot_id)
+            .collect();
+        protected.sort();
+        let mut found = None;
+        for snapshot_id in std::iter::once(table.current_snapshot_id.clone()).chain(protected) {
+            let manifest = self
+                .get_snapshot_files(&table.table_id, &snapshot_id)
+                .await?;
+            if let Some(damage) = inspect_stored_data_files(table, &snapshot_id, manifest).await? {
+                found = Some(damage);
+                break;
+            }
+        }
+        let Some(damage) = found else {
             return Ok(());
         };
         let table_name = table.table_name.as_str();
@@ -6169,6 +6186,7 @@ impl std::fmt::Display for StoredFileDamage {
 /// written before the manifest was kept), which leaves nothing to compare.
 async fn inspect_stored_data_files(
     table: &TableMetadata,
+    snapshot_id: &str,
     manifest: Vec<SnapshotFile>,
 ) -> CatalogResult<Option<StoredFileDamage>> {
     if manifest.is_empty() {
@@ -6176,7 +6194,7 @@ async fn inspect_stored_data_files(
     }
     let snapshot_dir = std::path::PathBuf::from(&table.path)
         .join(&table.table_id)
-        .join(&table.current_snapshot_id);
+        .join(snapshot_id);
     tokio::task::spawn_blocking(move || {
         let mut damage = StoredFileDamage {
             recorded_files: manifest.len(),
@@ -13197,6 +13215,71 @@ mod tests {
                 && message.contains("restarting once with `mode: file_create`"),
             "{message}"
         );
+    }
+
+    /// Rows staged by CDC upserts and checkpoints live in protected snapshots
+    /// that scans read alongside the current one, so losing a protected
+    /// snapshot's directory is caught even when the current one is intact.
+    #[tokio::test]
+    async fn reopening_a_table_whose_protected_snapshot_is_gone_does_not_serve_it() {
+        let (catalog, base_path, snapshot_dir, _db, _root) =
+            table_with_stored_files("protected").await;
+        let table = catalog.get_table("protected").await.expect("get table");
+        let protected_id = "protected-snapshot";
+        catalog
+            .set_snapshot_sequence(&table.table_id, protected_id, 7)
+            .await
+            .expect("register the protected snapshot");
+        catalog
+            .replace_snapshot_files(
+                &table.table_id,
+                protected_id,
+                &[SnapshotFile {
+                    table_id: table.table_id.clone(),
+                    snapshot_id: protected_id.to_string(),
+                    file_path: "staged.vortex".to_string(),
+                    row_count: 1,
+                    file_size_bytes: 5,
+                    min_sequence: 7,
+                    max_sequence: 7,
+                    digest: None,
+                }],
+            )
+            .await
+            .expect("record the protected manifest");
+        let protected_dir = snapshot_dir
+            .parent()
+            .expect("the snapshot directory has a table directory")
+            .join(protected_id);
+        assert!(!protected_dir.exists());
+
+        let error = catalog
+            .create_table(reopen_options(
+                "protected",
+                &base_path,
+                SettingsChangeAction::KeepStored,
+            ))
+            .await
+            .expect_err("a table missing a protected snapshot is not served");
+        let message = error.to_string();
+        assert!(
+            message.contains(protected_id)
+                && message
+                    .contains("is missing, with the 1 data files the metastore records for it"),
+            "{message}"
+        );
+
+        std::fs::create_dir_all(&protected_dir).expect("restore the protected snapshot");
+        std::fs::write(protected_dir.join("staged.vortex"), vec![0_u8; 5])
+            .expect("restore the staged file");
+        catalog
+            .create_table(reopen_options(
+                "protected",
+                &base_path,
+                SettingsChangeAction::KeepStored,
+            ))
+            .await
+            .expect("a table whose protected snapshot is in place reopens");
     }
 
     /// Retention drops the manifest rows of the files it deletes, so a restart
