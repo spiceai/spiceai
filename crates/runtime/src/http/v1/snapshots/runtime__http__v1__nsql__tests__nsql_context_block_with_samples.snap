@@ -31,7 +31,7 @@ expression: nsql_context_block_with_samples_for_test()
 - Indexes:
     - `customer_id`: `customer_id` (enabled, spicepod.acceleration.indexes)
 - Search indexes:
-    - vector search on `customer_id` using `embed_model`. Syntax: `vector_search(sales.orders, 'query text', customer_id)`. Engine/index: `duckdb_vector_index`. Row id: `order_id`.
+    - vector search on `customer_id` using `embed_model`. Syntax: `vector_search(sales.orders, 'query text', customer_id)`. Engine/index: `s3_vectors`. Row id: `order_id`.
     - full-text search on `customer_id` using `tantivy`. Syntax: `text_search(sales.orders, 'query text', customer_id)`. Row id: `order_id`.
 
 ## SQL Functions

@@ -53,6 +53,14 @@ pub enum Error {
     ))]
     InvalidAccelerationConfiguration { source: acceleration::ParseError },
 
+    /// The view selects the `duckdb` vector engine, removed in v2.5.
+    #[snafu(display(
+        "Failed to load view '{}': {}",
+        view_name.escape_debug(),
+        crate::vector_engine::removed_vector_engine_message()
+    ))]
+    VectorEngineRemoved { view_name: String },
+
     #[snafu(display(
         "Configuration of '{view_name}' view is invalid: {reason}. Update the configuration and retry. For details, visit: https://spiceai.org/docs/components/views"
     ))]
@@ -260,6 +268,13 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
             .map(acceleration::Acceleration::try_from)
             .transpose()
             .context(InvalidAccelerationConfigurationSnafu)?;
+
+        if crate::vector_engine::uses_removed_vector_engine(view.vectors.as_ref(), &view.columns) {
+            return VectorEngineRemovedSnafu {
+                view_name: view.name,
+            }
+            .fail();
+        }
 
         // verify that the acceleration configuration is fully supported
         if let Some(acc) = &acceleration {

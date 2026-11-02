@@ -1,0 +1,5 @@
+---
+source: crates/runtime/src/component/view.rs
+expression: err.to_string()
+---
+Failed to load view 'daily_docs': the vector engine `duckdb` is no longer supported as of v2.5 and cannot be used. Remove the `vectors` block and use `acceleration.engine: cayenne`, which indexes embedding columns for `vector_search` itself. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration#migrating-the-duckdb-vector-engine
