@@ -5322,6 +5322,33 @@ mod tests {
         }));
     }
 
+    /// Data files lost from a rebuildable acceleration make the runtime drop and
+    /// reload it, reported by what was lost; a damaged one that cannot be
+    /// rebuilt fails to load instead.
+    #[test]
+    fn stored_data_files_that_do_not_match_the_metastore_rebuild_only_when_asked() {
+        let lost = Error::SettingsChangeRequiresRebuild {
+            source: cayenne::CatalogError::StoredDataFilesRequireRebuild {
+                table_name: "trips".to_string(),
+                damage: "1 of the 2 data files the metastore records in '/d' are missing: b.vortex"
+                    .to_string(),
+            },
+        };
+        assert_eq!(
+            lost.to_string(),
+            "the existing acceleration of dataset 'trips' does not match its Cayenne metastore (1 of the 2 data files the metastore records in '/d' are missing: b.vortex)"
+        );
+        assert!(requires_rebuild(&lost));
+
+        assert!(!requires_rebuild(&Error::AccelerationCreationFailed {
+            source: Box::new(cayenne::CatalogError::StoredDataFilesDamaged {
+                table_name: "trips".to_string(),
+                damage: "its snapshot directory '/d' is missing".to_string(),
+                remedy: "Restore the files.".to_string(),
+            }),
+        }));
+    }
+
     #[test]
     fn a_timestamp_filter_against_a_string_literal_evaluates() {
         use arrow::array::{Int32Array, TimestampMicrosecondArray};
