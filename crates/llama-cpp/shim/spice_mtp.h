@@ -30,6 +30,19 @@ extern "C" {
 
 typedef struct spice_mtp spice_mtp;
 
+// How a draft model drafts: an MTP head reads the target's hidden states; a DFlash drafter
+// reads the target's layer inputs; a DSpark drafter is a DFlash drafter with a Markov head.
+typedef enum spice_draft_kind {
+    SPICE_DRAFT_NONE = 0,
+    SPICE_DRAFT_MTP = 1,
+    SPICE_DRAFT_DFLASH = 2,
+    SPICE_DRAFT_DSPARK = 3,
+} spice_draft_kind;
+
+// SPICE_DRAFT_DFLASH or SPICE_DRAFT_DSPARK for a GGUF whose architecture is `dflash`, read from
+// its header; SPICE_DRAFT_NONE for any other file, or one that cannot be read.
+spice_draft_kind spice_dflash_kind(const char * path);
+
 typedef enum spice_mtp_status {
     SPICE_MTP_OK = 0,
     // The call was made out of order or with bad arguments; see spice_mtp_error.
@@ -38,10 +51,11 @@ typedef enum spice_mtp_status {
     SPICE_MTP_FAILED = -2,
 } spice_mtp_status;
 
-// Returns NULL when llama.cpp cannot draft with these contexts. `draft` must be an MTP
-// context created with `target` as its `ctx_other`. Neither context is owned.
+// Returns NULL when llama.cpp cannot draft with these contexts. `draft` must be a context of
+// the draft model created with `target` as its `ctx_other` (an MTP context for an MTP head).
+// Neither context is owned.
 spice_mtp * spice_mtp_init(struct llama_context * target, struct llama_context * draft,
-                           int32_t n_max, int32_t n_min, float p_min);
+                           spice_draft_kind kind, int32_t n_max, int32_t n_min, float p_min);
 void spice_mtp_free(spice_mtp * mtp);
 
 // The message of the last call that did not return SPICE_MTP_OK; valid until the next call.

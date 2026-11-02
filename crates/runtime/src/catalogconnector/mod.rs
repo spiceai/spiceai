@@ -183,7 +183,6 @@ pub(crate) fn stub_udf_called_with(
 
 #[cfg(feature = "adbc")]
 pub mod adbc;
-#[cfg(not(windows))]
 pub mod cayenne;
 #[cfg(feature = "databricks")]
 pub mod databricks;
@@ -373,7 +372,7 @@ pub async fn register_all() {
         ),
     );
 
-    #[cfg(all(not(windows), feature = "spicebench"))]
+    #[cfg(feature = "spicebench")]
     registry.insert(
         cayenne::PREFIX.to_string(),
         CatalogConnectorFactory::new(
@@ -678,14 +677,14 @@ mod tests {
                 guard.contains_key(oracle::PREFIX),
                 "oracle should be registered"
             );
-            #[cfg(all(not(windows), feature = "spicebench"))]
+            #[cfg(feature = "spicebench")]
             assert!(
                 guard.contains_key(cayenne::PREFIX),
                 "cayenne should be registered"
             );
             // Guard against accidental re-registration: by default (without the
             // `spicebench` feature) the Cayenne catalog connector must NOT be registered.
-            #[cfg(all(not(windows), not(feature = "spicebench")))]
+            #[cfg(not(feature = "spicebench"))]
             assert!(
                 !guard.contains_key(cayenne::PREFIX),
                 "cayenne should not be registered without the spicebench feature"

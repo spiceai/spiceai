@@ -22,8 +22,8 @@
 //!   writer task per table pumps `write_cdc_append_stream + finish()` (the
 //!   production `refresh_mode: changes` path) with a long-lived per-writer
 //!   `SessionContext`, batches of `WRITE_BATCH_ROWS` appends per tick.
-//! - **DuckDB**: one file-backed database with N tables; one writer thread
-//!   per table, each with its own `Connection`. DuckDB serializes writers
+//! - **`DuckDB`**: one file-backed database with N tables; one writer thread
+//!   per table, each with its own `Connection`. `DuckDB` serializes writers
 //!   internally — the single-global-writer architecture Cayenne's
 //!   per-table encoders are traded against.
 //!
@@ -45,7 +45,7 @@ use std::time::Duration;
 use criterion::{
     BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
 };
-use duckdb::Connection;
+use duckdb_oracle::Connection;
 use tokio::runtime::Runtime;
 
 use common::{
@@ -58,7 +58,7 @@ use common::{
 const TABLE_COUNTS: &[usize] = &[1, 2, 4, 8, 16];
 
 /// Rows per CDC batch per table per tick — matches
-/// `vs_duckdb_scaling`'s WRITE_BATCH_ROWS so the N=1 lane of this bench is
+/// `vs_duckdb_scaling`'s `WRITE_BATCH_ROWS` so the N=1 lane of this bench is
 /// directly comparable to that bench's concurrency=1 CDC lane.
 const WRITE_BATCH_ROWS: usize = 1_024;
 
@@ -110,8 +110,8 @@ impl CayenneTableWriter {
     }
 }
 
-/// Persistent CDC-analog writer thread bound to ONE DuckDB table in the
-/// shared database file. Own `Connection` (connections are not `Send`).
+/// Persistent CDC-analog writer thread bound to ONE `DuckDB` table in the
+/// shared database file, with its own `Connection` for concurrent execution.
 struct DuckDbTableWriter {
     handle: std::thread::JoinHandle<()>,
 }
@@ -208,9 +208,9 @@ fn bench_cdc_multitable(c: &mut Criterion) {
                                          (worker exited?)",
                                     i + 1
                                 ),
-                                Err(_) => panic!(
+                                Err(error) => panic!(
                                     "{bench_ctx}: stalled waiting for writer completion \
-                                         {}/{n} after {COMPLETION_TIMEOUT:?}",
+                                         {}/{n} after {COMPLETION_TIMEOUT:?}: {error}",
                                     i + 1
                                 ),
                             }

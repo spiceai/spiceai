@@ -31,6 +31,7 @@ pub(crate) mod rate_limit;
 pub mod rerank;
 mod responses;
 mod responses_tool_history;
+mod responses_via_chat;
 mod tool_trace;
 mod tool_use;
 mod tool_use_messages;
@@ -47,6 +48,7 @@ pub use model_context::{
 };
 pub use rerank::{RerankerModelStore, try_to_rerank_model};
 pub use responses::{LLMResponsesModelStore, try_to_responses_model};
+pub use responses_via_chat::ResponsesViaChat;
 pub use tool_use::ToolUsingChat;
 pub use tool_use_responses::ToolUsingResponses;
 

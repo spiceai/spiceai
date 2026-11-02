@@ -1969,8 +1969,8 @@ impl CayenneTableProvider {
             }
 
             // The provider-local pointer can be stale if cancellation happens
-            // while the metastore COMMIT is in flight: both SQLite and Turso
-            // may complete that COMMIT after the coordinator future is dropped,
+            // while the metastore COMMIT is in flight: SQLite may complete that
+            // COMMIT after the coordinator future is dropped,
             // before its synchronous publication block runs. Classify protected
             // targets from the durable catalog pointer so recovery never deletes
             // a snapshot that the catalog has committed.

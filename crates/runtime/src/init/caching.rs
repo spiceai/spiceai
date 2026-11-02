@@ -17,7 +17,9 @@ limitations under the License.
 use std::{sync::Arc, time::Duration};
 
 use cache::{Caching, QueryResultsCacheProvider, SimpleCache, get_hash_builder, lru_cache};
-use spicepod::component::caching::{CacheConfig, Caching as CachingConfig, SQLResultsCacheConfig};
+use spicepod::component::caching::{
+    CacheConfig, Caching as CachingConfig, HashingAlgorithm, SQLResultsCacheConfig,
+};
 
 use crate::{Runtime, datafusion::SPICE_RUNTIME_SCHEMA};
 
@@ -44,6 +46,18 @@ impl Runtime {
             .embeddings
             .clone()
             .unwrap_or(CacheConfig::default());
+
+        for (cache, hashing_algorithm) in [
+            ("sql_results", sql_results_config.hashing_algorithm),
+            ("search_results", search_results_config.hashing_algorithm),
+            ("embeddings", embeddings_config.hashing_algorithm),
+        ] {
+            if hashing_algorithm == HashingAlgorithm::XXH32 {
+                tracing::warn!(
+                    "`runtime.caching.{cache}.hashing_algorithm: xxh32` is deprecated, use `xxh3` (the default) instead",
+                );
+            }
+        }
 
         if sql_results_config.enabled {
             match QueryResultsCacheProvider::try_new(

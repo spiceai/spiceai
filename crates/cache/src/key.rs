@@ -65,6 +65,9 @@ impl SearchKey {
 #[derive(Clone, Copy)]
 pub enum CacheKey<'a> {
     LogicalPlan(&'a LogicalPlan),
+    /// Digest of a serialized plan, with its decoded plan retained for normal
+    /// cache eligibility, table invalidation, and background revalidation.
+    SerializedPlan(&'a str, &'a LogicalPlan),
     Query(&'a str, Option<&'a ParamValues>),
     Search(&'a SearchKey),
     /// A caller-supplied key (`Spice-Cache-Key` / `client_supplied`). This is an
@@ -93,13 +96,26 @@ impl<'a> From<(&'a str, &'a EmbeddingInput)> for CacheKey<'a> {
     }
 }
 
-impl CacheKey<'_> {
+impl<'a> CacheKey<'a> {
+    /// The key for a query plan: the digest of its serialized form when it
+    /// arrived serialized, otherwise the plan itself.
+    #[must_use]
+    pub fn for_plan(plan: &'a LogicalPlan, serialized_digest: Option<&'a str>) -> Self {
+        serialized_digest.map_or(Self::LogicalPlan(plan), |digest| {
+            Self::SerializedPlan(digest, plan)
+        })
+    }
+
     /// Hash this key's payload into `hasher`. Used by both [`Self::as_raw_key`]
     /// and [`Self::as_raw_key_in_namespace`] so the payload byte stream stays
     /// identical regardless of whether a namespace prefix was mixed in.
     fn hash_payload<T: Hasher>(&self, hasher: &mut T) {
         match self {
             Self::LogicalPlan(logical_plan) => logical_plan.hash(hasher),
+            Self::SerializedPlan(digest, _) => {
+                b"spice:serialized-plan:v1".hash(hasher);
+                digest.hash(hasher);
+            }
             Self::Search(search_key) => search_key.hash(hasher),
             Self::EmbeddingRequest(embedding_request) => embedding_request.hash(hasher),
             Self::EmbeddingInput(model_name, embedding_input) => {
@@ -343,6 +359,34 @@ mod tests {
         let hash2 = hasher2.finish();
 
         assert_eq!(hash1, hash2);
+    }
+
+    /// A key is the whole entry identity, so a million point lookups must get a
+    /// million keys under every configured algorithm.
+    #[test]
+    fn distinct_queries_get_distinct_keys() {
+        use spicepod::component::caching::HashingAlgorithm;
+
+        for algorithm in [
+            HashingAlgorithm::Ahash,
+            HashingAlgorithm::Siphash,
+            HashingAlgorithm::Blake3,
+            HashingAlgorithm::XXH3,
+            HashingAlgorithm::XXH32,
+            HashingAlgorithm::XXH64,
+            HashingAlgorithm::XXH128,
+        ] {
+            let builder = crate::get_hash_builder(algorithm).expect("a supported algorithm");
+            let keys: std::collections::HashSet<u64> = (0..1_000_000)
+                .map(|id| {
+                    let sql = format!("SELECT * FROM accounts WHERE id = {id}");
+                    CacheKey::Query(&sql, None)
+                        .as_raw_key_in_namespace(builder.build_hasher(), 0, b"")
+                        .as_u64()
+                })
+                .collect();
+            assert_eq!(keys.len(), 1_000_000, "{algorithm:?}");
+        }
     }
 
     /// A plan's key is the value of hashing that plan write by write, for every

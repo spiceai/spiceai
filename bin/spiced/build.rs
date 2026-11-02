@@ -17,6 +17,17 @@ limitations under the License.
 use std::process::Command;
 
 fn main() {
+    // This script has no build dependencies, so it runs at the start of the build: a
+    // native Windows build stops here with the supported path rather than on the first
+    // dependency with no Windows code (the `compile_error!` in `lib.rs` is only reached
+    // once every dependency has compiled).
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!(
+            "cargo::error=spiced does not build for native Windows. Run it under WSL or in Docker. See: https://spiceai.org/docs/installation"
+        );
+        return;
+    }
+
     let git_hash: String = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
@@ -28,6 +39,18 @@ fn main() {
     println!("cargo:rustc-env=GIT_COMMIT_HASH={git_hash}");
     println!("cargo:rustc-env=SPICED_BUILD_PROFILE={}", build_profile());
     println!("cargo:rustc-env=SPICED_BUILD_FEATURES={}", build_features());
+
+    // macOS exports every global symbol of an executable, and dyld binds a weak
+    // definition (a C++ template instantiation, an inline function, a vtable)
+    // to the first image that exports it. `duckdb:` and `ducklake:` load the
+    // installed libduckdb through ADBC, so the bundled DuckDB's and ICU's
+    // exports would replace parts of that library with code from another
+    // DuckDB release and corrupt its state. Export nothing, as the Linux build
+    // does: the bundled DuckDB links its extensions statically and needs no
+    // exports of its own.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rustc-link-arg-bins=-Wl,-exported_symbol,__mh_execute_header");
+    }
 }
 
 /// The cargo profile the binary is being built with.

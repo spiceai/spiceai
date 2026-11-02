@@ -86,9 +86,14 @@ pub async fn execute_add_or_connect(
     }
 
     // Fetch the Spicepod
-    let download_path = registry::get_pod(pod_path, ctx.pods_dir(), &headers, ctx.http_client())
-        .await
-        .map_err(|e| registry_error(&e))?;
+    let download_path = registry::get_pod(
+        pod_path,
+        ctx.pods_dir(),
+        &headers,
+        ctx.registry_http_client(),
+    )
+    .await
+    .map_err(|e| registry_error(&e))?;
 
     // Get relative path for display
     let relative_path = get_relative_path(ctx.app_dir(), &download_path);
