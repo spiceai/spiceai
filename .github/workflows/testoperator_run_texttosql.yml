@@ -67,6 +67,13 @@ jobs:
     name: Run Text-to-SQL tests
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
+    # Holds the Anthropic workload identity federation IDs (`ANTHROPIC_*` secrets).
+    environment: ci
+    permissions:
+      contents: read
+      actions: read
+      # Anthropic access tokens are minted from this job's GitHub OIDC token.
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -144,6 +151,16 @@ jobs:
           queryset_name: ${{ github.event.inputs.benchmark_queryset }}
           use_evidence: ${{ github.event.inputs.use_evidence }}
 
+      # spiced holds this one token for the whole run and does not refresh it, so a run longer than
+      # the federation rule's token lifetime (`expires_in` in this step's log) loses Anthropic.
+      - name: Mint an Anthropic access token
+        uses: ./.github/actions/anthropic-token
+        with:
+          federation-rule-id: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
+          organization-id: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
+          service-account-id: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          workspace-id: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         run: |
           rm -rf .spice/data
@@ -198,7 +215,6 @@ jobs:
           MINIO_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           MINIO_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-          SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
           SPICE_BEDROCK_ACCESS_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
           SPICE_BEDROCK_SECRET_KEY: ${{ secrets.AWS_BEDROCK_SECRET }}
