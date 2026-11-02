@@ -234,7 +234,11 @@ print-rust-gate-features:
 # large to load (dyld aborts before `main`, failing the whole run).
 # `runtime`'s `chat_tool_use` binary drives `/v1/chat/completions` through the
 # tool-use loop against an in-process mock of the Anthropic Messages API.
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache|safetensors_hf_cache|gguf_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use))
+# `duckdb-oracle`'s `integration` binary checks the installed-libduckdb driver
+# every DuckDB result-correctness lane compares against: Arrow types, NULLs and
+# settings round-trip through ADBC, and a database file reopens. It loads the
+# libduckdb `nextest` installs, needing no credentials and no service.
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache|safetensors_hf_cache|gguf_hf_cache)::/)) + (binary_id(=llms-llamacpp::integration) & test(/^load_errors::/)) + binary_id(=llama-cpp::integration) + binary_id(=duckdb-oracle::integration) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth)) + (package(=runtime) & binary(=chat_tool_use))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
@@ -254,10 +258,22 @@ endif
 # and `verify-cli` so both build the same graph.
 _NEXTEST_TARGETS_CMD = $(PYTHON) scripts/nextest_build_targets.py --filter '$(_NEXTEST_FILTER)' -- $(NEXTEST_SELECTION) $(NEXTEST_FLAG)
 .PHONY: nextest
+# The DuckDB result-correctness lane loads an installed libduckdb through ADBC
+# rather than a DuckDB built into the test binaries. `scripts/libduckdb.py` installs the newest release
+# `test/duckdb_versions.json` lists, checked against its recorded SHA-256 and
+# cached under ~/.cache/spice/libduckdb, so only a machine's first sign-off for a
+# release downloads it. Its manifest goes first on ADBC_DRIVER_PATH, so every
+# sign-off and merge-queue run tests the same release whatever else is installed
+# (LIBDUCKDB_VERSION picks another listed one). A failed install stops the gate:
+# a lane that cannot load its oracle must not pass by not running.
+_WITH_LIBDUCKDB = libduckdb="$$($(PYTHON) scripts/libduckdb.py)" || exit $$?; \
+	export ADBC_DRIVER_PATH="$$libduckdb$${ADBC_DRIVER_PATH:+:$$ADBC_DRIVER_PATH}";
+
 nextest:
 	@echo 'note: the chDB result-correctness lane is not in this run (it needs libchdb; CI runs it in correctness_chdb.yml).' >&2
 	@echo '      to run it here: cargo test -p cayenne --features result-correctness-chdb --test result_correctness_vs_chdb_test' >&2
-	@targets="$$($(_NEXTEST_TARGETS_CMD))" || exit $$?; \
+	@$(_WITH_LIBDUCKDB) \
+	targets="$$($(_NEXTEST_TARGETS_CMD))" || exit $$?; \
 	cargo nextest run $(NEXTEST_SELECTION) $$targets $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
@@ -294,7 +310,8 @@ verify-cli:
 .PHONY: nextest-packages
 nextest-packages:
 	@test -n "$(strip $(PACKAGES))" || { echo 'nextest-packages requires PACKAGES="crate1 crate2"' >&2; exit 1; }
-	@cargo nextest run --no-tests=pass $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
+	@$(_WITH_LIBDUCKDB) \
+	cargo nextest run --no-tests=pass $(_LINT_PKG_FLAGS) --lib $(_FEATURES_FLAGS) $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
