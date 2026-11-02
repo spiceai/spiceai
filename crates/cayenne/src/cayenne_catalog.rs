@@ -1562,8 +1562,9 @@ impl CayenneCatalog {
             return Ok(());
         }
         // Scans read the current snapshot and every protected one (rows staged
-        // by CDC upserts and checkpoints live in their own snapshots), so each is
-        // checked; the first damaged one is reported.
+        // by CDC upserts and checkpoints live in their own snapshots), so every
+        // live snapshot is checked before deciding: a tolerated mismatch in one
+        // must not hide unreadable rows in another.
         let mut protected: Vec<String> = self
             .get_all_snapshot_sequences(&table.table_id)
             .await?
@@ -1571,19 +1572,24 @@ impl CayenneCatalog {
             .filter(|snapshot_id| *snapshot_id != table.current_snapshot_id)
             .collect();
         protected.sort();
-        let mut found = None;
+        let mut damages = Vec::new();
         for snapshot_id in std::iter::once(table.current_snapshot_id.clone()).chain(protected) {
             let manifest = self
                 .get_snapshot_files(&table.table_id, &snapshot_id)
                 .await?;
             if let Some(damage) = inspect_stored_data_files(table, &snapshot_id, manifest).await? {
-                found = Some(damage);
-                break;
+                damages.push(damage);
             }
         }
-        let Some(damage) = found else {
+        if damages.is_empty() {
             return Ok(());
-        };
+        }
+        let leaves_rows_unreadable = damages.iter().any(StoredFileDamage::leaves_rows_unreadable);
+        let damage = damages
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
         let table_name = table.table_name.as_str();
         match options.vortex_config.settings_change {
             SettingsChangeAction::Rebuild => {
@@ -1592,21 +1598,21 @@ impl CayenneCatalog {
                 );
                 Err(CatalogError::StoredDataFilesRequireRebuild {
                     table_name: table_name.to_string(),
-                    damage: damage.to_string(),
+                    damage,
                 })
             }
             SettingsChangeAction::HoldUntilSourceReadable => {
                 Err(CatalogError::StoredDataFilesDamaged {
                     table_name: table_name.to_string(),
-                    damage: damage.to_string(),
+                    damage,
                     remedy: "It is reloaded from the source once the source can be read."
                         .to_string(),
                 })
             }
-            SettingsChangeAction::KeepStored if damage.leaves_rows_unreadable() => {
+            SettingsChangeAction::KeepStored if leaves_rows_unreadable => {
                 Err(CatalogError::StoredDataFilesDamaged {
                     table_name: table_name.to_string(),
-                    damage: damage.to_string(),
+                    damage,
                     remedy: "It is not reloaded automatically, because its settings can keep rows a reload from the source would not bring back. Restore the files, or reload it from the source by restarting once with `mode: file_create` and then setting the mode back; rows that exist only in the acceleration are not kept. See: https://spiceai.org/docs/components/data-accelerators/cayenne".to_string(),
                 })
             }
@@ -12873,6 +12879,9 @@ mod tests {
             .expect("the snapshot directory has a table directory")
             .join(protected_id);
         assert!(!protected_dir.exists());
+        // A missing-only mismatch in the current snapshot is tolerated on its own
+        // (legacy retention left such rows), but must not hide the protected one.
+        std::fs::remove_file(snapshot_dir.join("b.vortex")).expect("remove a current file");
 
         let error = catalog
             .create_table(reopen_options(
@@ -12886,7 +12895,9 @@ mod tests {
         assert!(
             message.contains(protected_id)
                 && message
-                    .contains("is missing, with the 1 data files the metastore records for it"),
+                    .contains("is missing, with the 1 data files the metastore records for it")
+                && message.contains("1 of the 2 data files the metastore records in")
+                && message.contains("b.vortex"),
             "{message}"
         );
 
@@ -12900,7 +12911,7 @@ mod tests {
                 SettingsChangeAction::KeepStored,
             ))
             .await
-            .expect("a table whose protected snapshot is in place reopens");
+            .expect("a table whose protected snapshot is back reopens, warning about the missing current file");
     }
 
     /// Retention drops the manifest rows of the files it deletes, so a restart
