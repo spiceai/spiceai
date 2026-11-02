@@ -39,11 +39,6 @@ pub use sqlite::recover_interrupted_sqlite_restore;
 #[cfg(feature = "sqlite")]
 pub use sqlite::wait_for_sqlite_restore;
 
-#[cfg(feature = "turso")]
-mod turso;
-#[cfg(feature = "turso")]
-pub use turso::TursoSnapshotEngine;
-
 #[derive(Debug, Snafu)]
 pub enum SnapshotEngineError {
     #[snafu(display("DuckDB snapshot error: {source}"))]
@@ -58,16 +53,12 @@ pub enum SnapshotEngineError {
     #[cfg(feature = "sqlite")]
     Sqlite { source: sqlite::SqliteSnapshotError },
 
-    #[snafu(display("Turso snapshot error: {source}"))]
-    #[cfg(feature = "turso")]
-    Turso { source: turso::TursoSnapshotError },
-
     /// Placeholder variant for when no snapshot-capable feature is enabled.
     #[snafu(display(
         "No snapshot engine is available. Enable a snapshot engine feature \
-         (e.g., 'duckdb', 'sqlite', or 'turso')."
+         (e.g., 'duckdb' or 'sqlite')."
     ))]
-    #[cfg(not(any(feature = "duckdb", feature = "sqlite", feature = "turso")))]
+    #[cfg(not(any(feature = "duckdb", feature = "sqlite")))]
     Generic,
 
     /// Open-ended variant used by engines that live outside `runtime-acceleration`
@@ -92,7 +83,7 @@ impl SnapshotEngineError {
 pub trait SnapshotEngine: Send + Sync {
     /// Hook invoked on the **live** accelerator file *before* it is copied to a
     /// temporary snapshot location. An engine that buffers writes outside the
-    /// primary file — `DuckDB`, `SQLite` and `Turso` all keep a write-ahead log —
+    /// primary file — `DuckDB` and `SQLite` both keep a write-ahead log —
     /// must checkpoint here so that the subsequent `fs::copy` produces a
     /// self-contained file. An engine with nothing to flush returns `Ok(())`.
     ///
@@ -334,8 +325,6 @@ pub fn create_snapshot_engine(
         }
         #[cfg(feature = "sqlite")]
         AccelerationEngine::Sqlite => Arc::new(SqliteSnapshotEngine::new()),
-        #[cfg(feature = "turso")]
-        AccelerationEngine::Turso => Arc::new(TursoSnapshotEngine::new()),
         AccelerationEngine::Cayenne => Arc::new(DefaultSnapshotEngine),
     }
 }

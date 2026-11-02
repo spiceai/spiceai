@@ -36,7 +36,7 @@ pub use acceleration::Acceleration;
 pub use acceleration::ParseError as AccelerationParseError;
 pub use acceleration_source::AccelerationSource;
 pub use cayenne_workload::{CayenneAccelerationDemand, CayenneWorkload};
-pub use engine::Engine;
+pub use engine::{CAYENNE_MIGRATION_DOCS, Engine, removed_engine_message};
 pub use schema_change::OnSchemaChange;
 pub use sidecar::{AcceleratorSidecar, OpenOption};
 pub use snapshot::{SnapshotDownloadInfo, SnapshotPoll, SnapshotPollOutcome};
@@ -44,9 +44,12 @@ pub use snapshot::{SnapshotDownloadInfo, SnapshotPoll, SnapshotPollOutcome};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Unknown acceleration engine '{name}'. Valid engines are: arrow, duckdb, sqlite, turso, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
+        "Unknown acceleration engine '{name}'. Valid engines are: arrow, duckdb, sqlite, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
     ))]
     AcceleratorEngineNotAvailable { name: String },
+
+    #[snafu(display("{}", engine::removed_engine_message(name)))]
+    AcceleratorEngineRemoved { name: &'static str },
 }
 
 /// Indicates whether a data accelerator was bootstrapped (initialized from existing data)

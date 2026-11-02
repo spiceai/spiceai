@@ -2768,7 +2768,6 @@ mod test {
             Some(QueryOverrides::DynamoDB),
             Some(QueryOverrides::Arrow),
             Some(QueryOverrides::Cayenne),
-            Some(QueryOverrides::Turso),
             Some(QueryOverrides::BigQuery),
             Some(QueryOverrides::ScyllaDB),
             Some(QueryOverrides::ChbenchSkipSlow),

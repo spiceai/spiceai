@@ -4,8 +4,7 @@ description: >
   (default, sorted, clustered, partitioned, zstd), DuckDB and SQLite with
   indexes answer the extended corpus and ternary logic partitioning as
   PostgreSQL does, under full refresh and change capture, before and after
-  updates, deletes and inserts at the source. (Turso, an accelerator being
-  retired, is not covered.)
+  updates, deletes and inserts at the source.
 
 sources:
   src: { kind: postgres }

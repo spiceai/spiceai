@@ -4478,7 +4478,7 @@ mod tests {
         /// `SQLExecutor::supports_sort_pushdown`. Accepting a sort declares the
         /// remote's order exact and removes `DataFusion`'s own sort, so an
         /// executor that has not said its engine orders rows as `DataFusion` would
-        /// (Flight, Flight SQL, Spark Connect and Turso here) must keep the sort
+        /// (Flight, Flight SQL and Spark Connect here) must keep the sort
         /// local. The statement is the one the `SqlTable` above sends sorted.
         #[tokio::test]
         async fn an_executor_that_does_not_opt_in_keeps_the_sort_local() {

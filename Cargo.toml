@@ -72,7 +72,6 @@ members = [
     "crates/runtime-checkpoint-duckdb",
     "crates/runtime-checkpoint-sqlite",
     "crates/runtime-checkpoint-postgres",
-    "crates/runtime-checkpoint-turso",
     "crates/runtime-auth",
     "crates/runtime-metrics",
     "crates/runtime-async",
@@ -117,7 +116,7 @@ members = [
     "crates/telemetry",
     "crates/test-framework",
     "crates/token_provider",
-    "crates/turso-shared",
+    "crates/write-retry",
     "crates/vortex",
     "crates/tools",
     "crates/util",
@@ -503,8 +502,7 @@ tracing = "0.1.43"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-turso = { version = "0.8.2", default-features = false }
-turso-shared = { path = "crates/turso-shared" }
+write-retry = { path = "crates/write-retry" }
 twox-hash = "2.1.2"
 url = { version = "2.5", features = ["serde"] }
 util = { path = "crates/util", default-features = false }

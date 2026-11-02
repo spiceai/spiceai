@@ -57,7 +57,6 @@ on:
           - 'bigquery'
           - 'dynamodb'
           - 'scylladb'
-          - 'turso'
       scale_factor:
         description: 'Scale factor for the data and queries'
         required: false

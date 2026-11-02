@@ -27,7 +27,7 @@ limitations under the License.
 //! sidecar (its connection plus the dataset name) and hands back the stores; the
 //! runtime asks the engine for a sidecar and never learns which engine answered. That
 //! is what keeps the engines off the runtime's dependency graph: without this seam the
-//! runtime has to name `DuckDBAccelerator`/`SqliteAccelerator`/`TursoAccelerator` to
+//! runtime has to name `DuckDBAccelerator`/`SqliteAccelerator` to
 //! borrow their connection pools.
 //!
 //! The store traits themselves live in `runtime-checkpoint-api`, which is deliberately
@@ -71,7 +71,7 @@ pub enum OpenOption {
 /// engine's connection, so every method below is a pure lookup rather than another
 /// round of resolution.
 ///
-/// Implemented once per engine in the `runtime-checkpoint-{duckdb,sqlite,turso,postgres}`
+/// Implemented once per engine in the `runtime-checkpoint-{duckdb,sqlite,postgres}`
 /// crates. **Every method must be answered explicitly** — an engine that cannot host a
 /// store returns [`CheckpointError::Store`] naming itself, so adding a store to this
 /// trait cannot silently no-op on an engine that forgot to implement it.
@@ -159,7 +159,7 @@ pub trait AcceleratorSidecar: Send + Sync {
 pub fn unsupported_sidecar(engine: &str, store: &str) -> CheckpointError {
     CheckpointError::Store {
         source: format!(
-            "The {engine} accelerator does not store {store} state. Accelerate this dataset with an engine that does (duckdb, sqlite, turso, or postgres), or remove the setting that needs it. See: https://spiceai.org/docs/components/data-accelerators"
+            "The {engine} accelerator does not store {store} state. Accelerate this dataset with an engine that does (duckdb, sqlite, or postgres), or remove the setting that needs it. See: https://spiceai.org/docs/components/data-accelerators"
         )
         .into(),
     }

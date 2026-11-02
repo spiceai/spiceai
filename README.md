@@ -104,7 +104,7 @@ Spice extends Apache Ballista with **multi-active scheduler HA coordinated throu
 
 ### Spice Cayenne — the acceleration engine that powers Spice
 
-Cayenne is built on the [Vortex columnar format](https://github.com/vortex-data/vortex) and a transactional SQLite (or Turso) metastore, and is tuned end to end for high-rate CDC ingestion and low-latency queries on the same table — multi-file acceleration without DuckDB's single-file ceiling. **Generally available** since v2.0, it runs fully in RAM (`mode: memory`) or durably on local disk or S3 Express One Zone (`mode: file`), with an optional cold tier on object storage.
+Cayenne is built on the [Vortex columnar format](https://github.com/vortex-data/vortex) and a transactional SQLite metastore, and is tuned end to end for high-rate CDC ingestion and low-latency queries on the same table — multi-file acceleration without DuckDB's single-file ceiling. **Generally available** since v2.0, it runs fully in RAM (`mode: memory`) or durably on local disk or S3 Express One Zone (`mode: file`), with an optional cold tier on object storage.
 
 - **Point lookups and selective joins** — `indexes` builds secondary indexes, so a lookup that pins every indexed column to a value reads the matching rows instead of scanning, and in `mode: file` a selective hash join probes the index with its join keys instead of scanning the table.
 - **A data layout that prunes** — In `mode: file`, `cayenne_cluster_by` (or `CREATE TABLE … CLUSTER BY`) clusters the rows in every tier's data files on one or more columns, and full refreshes write key-range files, so filtered queries open only the files that can match.

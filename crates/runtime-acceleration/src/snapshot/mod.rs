@@ -386,7 +386,7 @@ pub struct CurrentSnapshot {
     /// The id `current-snapshot-id` names.
     pub snapshot_id: u64,
     /// The acceleration engine that created the snapshot, lowercase as recorded
-    /// (`cayenne`, `duckdb`, `sqlite`, `turso`).
+    /// (`cayenne`, `duckdb`, `sqlite`).
     pub engine: String,
     /// The dataset schema recorded for the snapshot.
     pub schema: SchemaRef,
@@ -490,7 +490,7 @@ fn recorded_snapshot_engine(entry: &SnapshotEntry, dataset: &DatasetMetadata) ->
         .or_else(|| {
             let file_name = entry.snapshot.rsplit('/').next()?;
             let (_, extension) = file_name.rsplit_once('.')?;
-            ["cayenne", "duckdb", "sqlite", "turso"]
+            ["cayenne", "duckdb", "sqlite"]
                 .into_iter()
                 .find(|engine| extension.eq_ignore_ascii_case(engine))
                 .map(str::to_string)
@@ -951,8 +951,6 @@ pub enum AccelerationEngine {
     DuckDB,
     #[cfg(feature = "sqlite")]
     Sqlite,
-    #[cfg(feature = "turso")]
-    Turso,
 }
 
 impl AccelerationEngine {
@@ -965,8 +963,6 @@ impl AccelerationEngine {
             Self::DuckDB => ".duckdb",
             #[cfg(feature = "sqlite")]
             Self::Sqlite => ".sqlite",
-            #[cfg(feature = "turso")]
-            Self::Turso => ".turso",
         }
     }
 }
@@ -978,8 +974,6 @@ impl std::fmt::Display for AccelerationEngine {
             Self::DuckDB => write!(f, "duckdb"),
             #[cfg(feature = "sqlite")]
             Self::Sqlite => write!(f, "sqlite"),
-            #[cfg(feature = "turso")]
-            Self::Turso => write!(f, "turso"),
         }
     }
 }
@@ -2416,7 +2410,7 @@ impl SnapshotManager {
         );
 
         // Step 0: Engine-specific live checkpoint while the lock is held.
-        // For DuckDB/SQLite/Turso this drains the write-ahead log into the main
+        // For DuckDB/SQLite this drains the write-ahead log into the main
         // file so that the subsequent `fs::copy` produces a self-contained
         // snapshot. Engines with nothing to flush return `Ok(())`.
         self.snapshot_engine
@@ -3289,7 +3283,7 @@ impl SnapshotManager {
             // to bring the local DB in line with the snapshot.
             //
             // For engines whose snapshot *does* normally include the
-            // checkpoint row (DuckDB / SQLite / Turso), this branch is
+            // checkpoint row (DuckDB / SQLite), this branch is
             // unreachable in practice; if a corrupted snapshot reaches
             // it the self-heal is harmless because we trust the metadata
             // schema (it's the same one we just validated above for
@@ -4645,7 +4639,7 @@ mod tests {
     }
 
     /// Writes a sample local accelerator file appropriate for the engine.
-    /// For `DuckDB`/`SQLite`/`Turso`, creates a real (empty) database so that the
+    /// For `DuckDB`/`SQLite`, creates a real (empty) database so that the
     /// engine's `checkpoint_live` hook can open it. For other engines, writes opaque
     /// test bytes since no engine-side validation runs against the file pre-snapshot.
     fn write_sample_local_db(path: &std::path::Path, engine: &AccelerationEngine) {
@@ -4657,8 +4651,8 @@ mod tests {
                     .expect("create sample table");
                 drop(conn);
             }
-            #[cfg(any(feature = "sqlite", feature = "turso"))]
-            engine if matches!(engine.snapshot_extension(), ".sqlite" | ".turso") => {
+            #[cfg(feature = "sqlite")]
+            AccelerationEngine::Sqlite => {
                 let conn = rusqlite::Connection::open(path).expect("open sample sqlite db");
                 conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
                     .expect("set wal");
@@ -8736,12 +8730,6 @@ mod tests {
         generic_an_absent_accelerator_file_fails_the_snapshot(&AccelerationEngine::Sqlite).await;
     }
 
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn turso_an_absent_accelerator_file_fails_the_snapshot() {
-        generic_an_absent_accelerator_file_fails_the_snapshot(&AccelerationEngine::Turso).await;
-    }
-
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn duckdb_download_snapshot_with_valid_metadata() {
@@ -8752,32 +8740,6 @@ mod tests {
     #[test]
     fn duckdb_engine_supports_compaction() {
         generic_engine_compaction_support(&AccelerationEngine::DuckDB, true);
-    }
-
-    // ==================== Turso Engine Tests ====================
-
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn turso_download_returns_none_without_metadata() {
-        generic_download_returns_none_without_metadata(&AccelerationEngine::Turso).await;
-    }
-
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn turso_create_snapshot_updates_metadata() {
-        generic_create_snapshot_updates_metadata(&AccelerationEngine::Turso).await;
-    }
-
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn turso_download_snapshot_with_valid_metadata() {
-        generic_download_snapshot_with_valid_metadata(&AccelerationEngine::Turso).await;
-    }
-
-    #[cfg(feature = "turso")]
-    #[test]
-    fn turso_engine_does_not_support_compaction() {
-        generic_engine_compaction_support(&AccelerationEngine::Turso, false);
     }
 
     // ==================== OnChange Policy Tests ====================
