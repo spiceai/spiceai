@@ -218,6 +218,10 @@ impl RequestDefaults {
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl Chat for RequestDefaults {
+    async fn token_limits(&self) -> llms::chat::TokenLimits {
+        self.chat.token_limits().await
+    }
+
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,
