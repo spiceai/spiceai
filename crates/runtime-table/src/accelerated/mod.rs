@@ -412,6 +412,21 @@ pub struct AcceleratedTable {
     fallback_retention_keep: Option<fallback_retention::FallbackRetentionKeep>,
     /// See [`Builder::node_local`].
     node_local: bool,
+    /// See [`Builder::groups_appends_by`].
+    append_grouping: Option<Arc<AppendGrouping>>,
+}
+
+/// How concurrent appends to an accelerated table may be written together (see
+/// [`Builder::groups_appends_by`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendGrouping {
+    /// The columns the accelerator keeps one row per value of; empty when it
+    /// keeps every row. No two appends written together share a value of them.
+    pub key: Arc<[String]>,
+    /// Every column the accelerator may refuse a null in, `key` among them. An
+    /// append with a null in one is written alone: in a group, the accelerator
+    /// refusing it would fail every member.
+    pub non_null: Arc<[String]>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -564,6 +579,7 @@ pub struct Builder {
     /// Where an append refresh keeps the source snapshot it last loaded.
     append_cursor_store: Option<refresh_task::append_cursor::AppendCursorStore>,
     node_local: bool,
+    append_grouping: Option<Arc<AppendGrouping>>,
 }
 
 impl Builder {
@@ -627,6 +643,7 @@ impl Builder {
             fallback_retention_keep: None,
             append_cursor_store: None,
             node_local: false,
+            append_grouping: None,
         }
     }
 
@@ -730,6 +747,17 @@ impl Builder {
     /// A cluster scheduler reads such a table itself; executors do not have its rows.
     pub fn node_local(&mut self) -> &mut Self {
         self.node_local = true;
+        self
+    }
+
+    /// Lets concurrent appends to this table be written together as one append,
+    /// so long as no two of them share a value of `grouping.key`.
+    ///
+    /// Only for an accelerator whose append of several callers' rows, with no
+    /// key shared between callers, stores exactly what the callers' appends
+    /// would store one after another, and counts the same superseded rows.
+    pub fn groups_appends_by(&mut self, grouping: AppendGrouping) -> &mut Self {
+        self.append_grouping = Some(Arc::new(grouping));
         self
     }
 
@@ -1579,6 +1607,7 @@ impl Builder {
             user_facing_schema: self.user_facing_schema,
             fallback_retention_keep,
             node_local: self.node_local,
+            append_grouping: self.append_grouping,
         };
         if let Some(prepared_child) = prepared_child {
             let rows = prepared_child.publish().map_err(|source| {
@@ -1882,6 +1911,27 @@ impl AcceleratedTable {
     #[must_use]
     pub fn is_accelerator_only(&self) -> bool {
         matches!(self.write_mode, WriteMode::AcceleratorOnly)
+    }
+
+    /// The lock every write to this table's accelerator holds for its whole
+    /// length. `#[doc(hidden)]` for integration tests that hold a write back
+    /// behind it; not a stable API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn accelerator_write_lock(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.accelerator_write_mutex)
+    }
+
+    /// How concurrent appends to this table may be written together (see
+    /// [`Builder::groups_appends_by`]), or `None` when they must each be written
+    /// alone: the table was not built for it, or its writes do not go to the
+    /// accelerator alone.
+    #[must_use]
+    pub fn append_grouping(&self) -> Option<&Arc<AppendGrouping>> {
+        if !self.is_accelerator_only() || self.refresh_mode == RefreshMode::Snapshot {
+            return None;
+        }
+        self.append_grouping.as_ref()
     }
 
     /// Whether writes go to the federated source, from which the refresh

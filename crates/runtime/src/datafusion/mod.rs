@@ -28,7 +28,7 @@ use crate::accelerated::{
     self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
 };
 use crate::accelerated::{
-    AcceleratedTable, Retention,
+    AcceleratedTable, AppendGrouping, Retention,
     refresh::{Refresh, VersionsByTime},
 };
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
@@ -106,7 +106,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::execution::{SendableRecordBatchStream, SessionState};
+use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
@@ -151,6 +151,7 @@ use util::{RetryError, retry};
 pub mod query;
 
 pub mod app_context_extension;
+pub(crate) mod append_coalescer;
 pub mod builder;
 pub(crate) mod caching_retention;
 mod change_generations;
@@ -205,6 +206,10 @@ const MAX_STREAMING_BROADCAST_BYTES: usize = 128 * 1024 * 1024;
 /// the number of datasets a runtime serves, so real datasets keep their lock between writes
 /// and only a flood of unknown table names triggers a cleanup.
 const MAX_SCHEMA_EVOLVE_LOCKS: usize = 1024;
+
+/// Entry count at which `append_queues` drops the queues nobody is using, as
+/// `schema_evolve_locks` does at [`MAX_SCHEMA_EVOLVE_LOCKS`].
+const MAX_APPEND_QUEUES: usize = 1024;
 
 #[derive(Default)]
 struct StreamingBroadcastBuffer {
@@ -382,6 +387,11 @@ pub enum Error {
         table_name: String,
         source: DataFusionError,
     },
+
+    #[snafu(display(
+        "Failed to write to dataset {table_name}: the shared write holding these rows stopped before reporting its outcome, so they may or may not be stored. Check the dataset before retrying; a retry can store them twice if the dataset has no primary key."
+    ))]
+    AppendGroupOutcomeUnknown { table_name: String },
 
     #[snafu(display("No executors available to forward write for table {table_name}"))]
     NoExecutorsAvailable { table_name: String },
@@ -1469,6 +1479,12 @@ pub struct DataFusion {
     /// dataset shares one lock (see `schema_evolve_lock`); created on first use and dropped
     /// again once unused, so unknown table names cannot grow the map without bound.
     schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::RwLock<()>>>>,
+    /// Per dataset whose appends may be written together, the appends waiting
+    /// for its turn (see [`append_coalescer`]). Keyed by the table reference
+    /// `get_table_provider` resolves (see `queue_key`), so every name for one
+    /// dataset shares its queue and datasets of one name in different schemas do
+    /// not; created on a dataset's first eligible append.
+    append_queues: ParkingMutex<HashMap<TableReference, Arc<append_coalescer::AppendQueue>>>,
     change_generations: ChangeGenerations,
     bootstrap_owners: ParkingMutex<HashMap<ResolvedTableReference, Weak<BootstrapOwner>>>,
     /// Snapshot managers by dataset, so shutdown can resign their writer leases.
@@ -3236,7 +3252,7 @@ impl DataFusion {
         // that completes through a provider being replaced by a schema evolution succeeds,
         // but its rows are invisible to the new provider.
         let rebind_lock = self.schema_evolve_lock(table_reference).await;
-        let rebind_guard = rebind_lock.read().await;
+        let rebind_guard = rebind_lock.read_owned().await;
 
         let table_provider = self.get_table_provider(table_reference).await?;
 
@@ -3261,42 +3277,43 @@ impl DataFusion {
             UpdateType::Changes => InsertOp::Replace,
         };
 
-        {
-            let insert_data = Arc::clone(&update_data);
-            let insert_stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
-                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-                    Arc::clone(&update_schema),
-                    Box::pin(futures::stream::iter((0..insert_data.len()).map(
-                        move |batch_index| {
-                            Ok::<_, DataFusionError>(insert_data[batch_index].clone())
-                        },
-                    ))),
-                ),
-            );
-
-            let insert_plan = table_provider
-                .insert_into(
-                    &self.ctx.state(),
-                    Arc::new(StreamingDataUpdateExecutionPlan::new(insert_stream)),
-                    overwrite,
-                )
-                .await
-                .map_err(find_datafusion_root)
-                .context(UnableToPlanTableInsertSnafu {
-                    table_name: table_reference.to_string(),
-                })?;
-
-            let _ = collect(insert_plan, self.ctx.task_ctx())
-                .await
-                .map_err(find_datafusion_root)
-                .context(UnableToExecuteTableInsertSnafu {
-                    table_name: table_reference.to_string(),
-                })?;
+        // Releases the hold on the provider once the rows are written, so evolution
+        // is free to swap it.
+        let written = self
+            .insert_update(
+                table_reference,
+                &table_provider,
+                &update_schema,
+                &update_data,
+                overwrite,
+                rebind_guard,
+            )
+            .await?;
+        if written == Written::Alone {
+            self.after_write(
+                table_reference,
+                &table_provider,
+                update_type,
+                update_schema,
+                update_data,
+            )
+            .await;
         }
 
-        // The write is done, so evolution is free to swap the provider now.
-        drop(rebind_guard);
+        Ok(())
+    }
 
+    /// The work every committed `write_data` call is followed by: forwarding to
+    /// Drasi, invalidating cached query state, marking the dataset ready, and
+    /// broadcasting the rows to subscribers.
+    async fn after_write(
+        &self,
+        table_reference: &TableReference,
+        table_provider: &Arc<dyn TableProvider>,
+        update_type: UpdateType,
+        update_schema: SchemaRef,
+        update_data: Arc<Vec<RecordBatch>>,
+    ) {
         // Queue the committed write for Drasi, when `runtime.drasi` names this
         // table. After the write, so Drasi only sees rows the runtime kept; and
         // a queue rather than an await, so a Drasi outage cannot stall the
@@ -3350,8 +3367,265 @@ impl DataFusion {
                 )
                 .await;
         }
+    }
 
-        Ok(())
+    /// Insert one `write_data` call's rows into `table_provider`, then release
+    /// `rebind_guard`.
+    ///
+    /// An append to a dataset whose appends may be written together (see
+    /// [`append_coalescer`]) that finds another append to it being written, or
+    /// queued, queues behind them, to share one write with the appends queued
+    /// beside it. It returns once that write has returned, with that write's
+    /// outcome: never success before the accelerator has stored its rows. Every
+    /// other insert, and an append that finds none being written or queued, runs
+    /// at once on its own.
+    async fn insert_update(
+        &self,
+        table_reference: &TableReference,
+        table_provider: &Arc<dyn TableProvider>,
+        schema: &SchemaRef,
+        data: &Arc<Vec<RecordBatch>>,
+        overwrite: InsertOp,
+        rebind_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    ) -> Result<Written> {
+        let queue = if overwrite == InsertOp::Append {
+            self.append_queue(table_reference, table_provider)
+        } else {
+            None
+        };
+        let Some((queue, grouping)) = queue else {
+            let result = self
+                .insert_alone(table_provider, schema, data, overwrite)
+                .await;
+            drop(rebind_guard);
+            return result
+                .map(|()| Written::Alone)
+                .map_err(|failure| insert_error(table_reference, failure));
+        };
+
+        // The turn is taken at once only when it is free and no append is
+        // queued. An append that finds it free with appends queued goes behind
+        // them, and writes them before its own, so it never overtakes an earlier
+        // append of the same key.
+        let mut turn = match queue.try_take_turn() {
+            Some(append_coalescer::FreeTurn::Idle(turn)) => {
+                let result = self
+                    .insert_alone(table_provider, schema, data, overwrite)
+                    .await;
+                drop(turn);
+                drop(rebind_guard);
+                return result
+                    .map(|()| Written::Alone)
+                    .map_err(|failure| insert_error(table_reference, failure));
+            }
+            Some(append_coalescer::FreeTurn::Behind(turn)) => Some(turn),
+            None => None,
+        };
+
+        // An append too large to share a write, or with rows the accelerator
+        // refuses, is still queued, in a group of its own, so that it too keeps
+        // its place behind earlier appends.
+        let keys = append_coalescer::row_keys(&grouping, schema, data);
+        let mut queued = queue.enqueue(
+            table_reference.clone(),
+            Arc::clone(table_provider),
+            Arc::clone(schema),
+            Arc::clone(data),
+            keys,
+            rebind_guard,
+        );
+        loop {
+            let woken = if let Some(turn) = turn.take() {
+                Woken::Turn(turn)
+            } else {
+                tokio::select! {
+                    biased;
+                    outcome = &mut queued.outcome => Woken::Outcome(outcome),
+                    _ = &mut queued.claimed => Woken::Claimed,
+                    turn = queue.take_turn() => Woken::Turn(turn),
+                }
+            };
+            match woken {
+                Woken::Outcome(outcome) => {
+                    return member_result(table_reference, outcome).map(|()| Written::InGroup);
+                }
+                Woken::Claimed => break,
+                Woken::Turn(turn) => {
+                    // Claiming the group and spawning its write happen with no
+                    // `.await` between them, so a cancelled caller cannot leave
+                    // claimed rows unwritten.
+                    match queue.claim(&queued) {
+                        Some(group) => {
+                            self.spawn_group_insert(Arc::clone(&queue), group, turn);
+                        }
+                        // Another append's group holds these rows; its outcome
+                        // follows. Hand the turn to the next group.
+                        None => break,
+                    }
+                }
+            }
+        }
+        let outcome = (&mut queued.outcome).await;
+        member_result(table_reference, outcome).map(|()| Written::InGroup)
+    }
+
+    /// Insert `data` on its own, as one statement.
+    async fn insert_alone(
+        &self,
+        table_provider: &Arc<dyn TableProvider>,
+        schema: &SchemaRef,
+        data: &Arc<Vec<RecordBatch>>,
+        overwrite: InsertOp,
+    ) -> std::result::Result<(), append_coalescer::InsertFailure> {
+        insert_batches(
+            Arc::clone(table_provider),
+            self.ctx.state(),
+            self.ctx.task_ctx(),
+            Arc::clone(schema),
+            data.as_ref().clone(),
+            overwrite,
+        )
+        .await
+    }
+
+    /// Write `group` as one append, on a task of its own that owns `turn` until
+    /// the write returns, then run each member's [`Self::after_write`] and tell
+    /// each member the outcome.
+    ///
+    /// The task does not depend on the appends' callers. Once a group has
+    /// claimed an append's rows they are written whether or not its caller still
+    /// waits, so the work that follows a committed write runs here, for every
+    /// member, rather than in the caller, which may be gone. It runs before any
+    /// member is told the outcome, so a caller still sees it done when
+    /// `write_data` returns, as for a write of its own.
+    ///
+    /// The task holds `queue` until it hands the turn on. Without that, a queue
+    /// whose members have all gone could be dropped from `append_queues` while
+    /// its group still writes, and a new queue for the dataset would find its
+    /// turn free and write ahead of the group.
+    fn spawn_group_insert(
+        &self,
+        queue: Arc<append_coalescer::AppendQueue>,
+        group: append_coalescer::AppendGroup,
+        turn: tokio::sync::OwnedMutexGuard<()>,
+    ) {
+        let state = self.ctx.state();
+        let task_ctx = self.ctx.task_ctx();
+        let datafusion = self.datafusion_ref.get().cloned();
+        let append_coalescer::AppendGroup {
+            provider,
+            schema,
+            batches,
+            rows,
+            members,
+            rebind_guards,
+            completion,
+        } = group;
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = insert_batches(
+                Arc::clone(&provider),
+                state,
+                task_ctx,
+                Arc::clone(&schema),
+                batches,
+                InsertOp::Append,
+            )
+            .await;
+            // The rows are written, so evolution is free to swap the provider.
+            drop(rebind_guards);
+            let appends = members.len();
+            if result.is_ok()
+                && let Some(datafusion) = datafusion.as_ref().and_then(Weak::upgrade)
+            {
+                for member in members {
+                    datafusion
+                        .after_write(
+                            &member.table_reference,
+                            &provider,
+                            UpdateType::Append,
+                            Arc::clone(&schema),
+                            member.data,
+                        )
+                        .await;
+                }
+            }
+            tracing::debug!(
+                appends,
+                rows,
+                written = result.is_ok(),
+                duration_ms = started.elapsed().as_millis(),
+                "Wrote {appends} concurrent appends as one write"
+            );
+            completion.complete(&result);
+            drop(turn);
+            drop(queue);
+        });
+    }
+
+    /// The queue appends to `table_reference` wait in to be written together,
+    /// with how they may be grouped, or `None` when its appends are each written
+    /// alone (see `AcceleratedTable::append_grouping`).
+    fn append_queue(
+        &self,
+        table_reference: &TableReference,
+        table_provider: &Arc<dyn TableProvider>,
+    ) -> Option<(Arc<append_coalescer::AppendQueue>, Arc<AppendGrouping>)> {
+        // A group runs its members' `after_write` through this; without it,
+        // appends are written alone.
+        self.datafusion_ref.get()?;
+        let grouping = append_grouping_of(table_provider)?;
+        let mut queues = self.append_queues.lock();
+        if queues.len() >= MAX_APPEND_QUEUES {
+            queues.retain(|_, queue| Arc::strong_count(queue) > 1);
+        }
+        let queue = Arc::clone(queues.entry(queue_key(table_reference)).or_default());
+        Some((queue, grouping))
+    }
+
+    /// Take `table_reference`'s turn to append, so the appends that arrive while
+    /// the guard is held queue to be written together; `None` when its appends
+    /// are each written alone. `#[doc(hidden)]` for integration tests; not a
+    /// stable API.
+    #[doc(hidden)]
+    pub async fn hold_append_turn(
+        &self,
+        table_reference: &TableReference,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let table_provider = self.get_table_provider(table_reference).await.ok()?;
+        let (queue, _) = self.append_queue(table_reference, &table_provider)?;
+        Some(queue.take_turn().await)
+    }
+
+    /// Hold `table_reference`'s accelerator write lock, which every write to its
+    /// acceleration holds for its whole length, until the guard is dropped;
+    /// `None` when it is not an accelerated dataset. `#[doc(hidden)]` for
+    /// integration tests; not a stable API.
+    #[doc(hidden)]
+    pub async fn hold_accelerator_write_lock(
+        &self,
+        table_reference: &TableReference,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let table_provider = self.get_table_provider(table_reference).await.ok()?;
+        let lock = accelerated_table_of(&table_provider, AcceleratedTable::accelerator_write_lock)?;
+        Some(lock.lock_owned().await)
+    }
+
+    /// How many appends to `table_reference` wait to be written together, and
+    /// how many groups and appends have been written together so far.
+    /// `#[doc(hidden)]` for integration tests; not a stable API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn append_queue_counts(&self, table_reference: &TableReference) -> (usize, u64, u64) {
+        let queue = self
+            .append_queues
+            .lock()
+            .get(&queue_key(table_reference))
+            .cloned();
+        queue.map_or((0, 0, 0), |queue| {
+            let (groups, members) = queue.claimed();
+            (queue.queued(), groups, members)
+        })
     }
 
     /// Resolves when a streaming write has completed since the previous call.
@@ -4346,6 +4620,13 @@ impl DataFusion {
         accelerated_table_builder.cdc_apply_runtime(self.cdc_apply_runtime().cloned());
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
         accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
+        if let Some(grouping) = append_grouping(
+            &acceleration_settings,
+            &source_table_provider,
+            &accelerated_table_provider,
+        ) {
+            accelerated_table_builder.groups_appends_by(grouping);
+        }
         accelerated_table_builder.cdc_param_overrides(
             crate::accelerated::refresh_task::changes::extract_cdc_param_overrides(
                 &acceleration_settings.params,
@@ -7485,6 +7766,212 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
     }
 
     None
+}
+
+/// Insert `batches` into `provider` as one statement.
+async fn insert_batches(
+    provider: Arc<dyn TableProvider>,
+    state: SessionState,
+    task_ctx: Arc<TaskContext>,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+    overwrite: InsertOp,
+) -> std::result::Result<(), append_coalescer::InsertFailure> {
+    use append_coalescer::{InsertFailure, InsertStage};
+    let insert_stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>)),
+        ),
+    );
+    let insert_plan = provider
+        .insert_into(
+            &state,
+            Arc::new(StreamingDataUpdateExecutionPlan::new(insert_stream)),
+            overwrite,
+        )
+        .await
+        .map_err(|error| InsertFailure::new(InsertStage::Plan, find_datafusion_root(error)))?;
+    collect(insert_plan, task_ctx)
+        .await
+        .map_err(|error| InsertFailure::new(InsertStage::Execute, find_datafusion_root(error)))?;
+    Ok(())
+}
+
+/// The error `write_data` returns for an insert into `table_reference` that failed.
+fn insert_error(
+    table_reference: &TableReference,
+    failure: append_coalescer::InsertFailure,
+) -> Error {
+    let table_name = table_reference.to_string();
+    let stage = failure.stage;
+    let source = failure.into_error();
+    match stage {
+        append_coalescer::InsertStage::Plan => {
+            Error::UnableToPlanTableInsert { table_name, source }
+        }
+        append_coalescer::InsertStage::Execute => {
+            Error::UnableToExecuteTableInsert { table_name, source }
+        }
+    }
+}
+
+/// The key of `table_reference`'s append queue: the catalog, schema and table
+/// `DataFusion::get_table_provider` resolves it to, defaults filled in as there.
+/// One dataset's appends must share a queue whatever name they use, or one
+/// queue's append could be written ahead of an earlier append queued in another.
+fn queue_key(table_reference: &TableReference) -> TableReference {
+    TableReference::full(
+        table_reference
+            .catalog()
+            .unwrap_or(SPICE_DEFAULT_CATALOG)
+            .to_string(),
+        table_reference
+            .schema()
+            .unwrap_or(SPICE_DEFAULT_SCHEMA)
+            .to_string(),
+        table_reference.table().to_string(),
+    )
+}
+
+/// Who runs a `write_data` call's [`DataFusion::after_write`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Written {
+    /// The call wrote its rows itself and follows the write up itself.
+    Alone,
+    /// A group wrote its rows and followed the write up before telling it.
+    InGroup,
+}
+
+/// What woke an append waiting to be written together with others.
+enum Woken {
+    Outcome(
+        std::result::Result<
+            append_coalescer::MemberOutcome,
+            tokio::sync::oneshot::error::RecvError,
+        >,
+    ),
+    Claimed,
+    Turn(tokio::sync::OwnedMutexGuard<()>),
+}
+
+/// The result a queued append returns to its caller.
+fn member_result(
+    table_reference: &TableReference,
+    outcome: std::result::Result<
+        append_coalescer::MemberOutcome,
+        tokio::sync::oneshot::error::RecvError,
+    >,
+) -> Result<()> {
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(failure)) => Err(insert_error(table_reference, failure)),
+        Err(_) => AppendGroupOutcomeUnknownSnafu {
+            table_name: table_reference.to_string(),
+        }
+        .fail(),
+    }
+}
+
+/// How `provider`'s accelerated table groups concurrent appends, or `None` when
+/// it writes each alone or is not an accelerated table.
+fn append_grouping_of(provider: &Arc<dyn TableProvider>) -> Option<Arc<AppendGrouping>> {
+    accelerated_table_of(provider, |accelerated| {
+        accelerated.append_grouping().map(Arc::clone)
+    })
+    .flatten()
+}
+
+/// `read` of the accelerated table `provider` wraps, or `None` when it wraps none.
+/// Unwraps what registration stacks around the accelerated table, as
+/// `DataFusion::get_accelerated_table_provider` does.
+fn accelerated_table_of<T>(
+    provider: &Arc<dyn TableProvider>,
+    read: impl FnOnce(&AcceleratedTable) -> T,
+) -> Option<T> {
+    let mut table = Arc::clone(provider);
+    loop {
+        if let Some(adaptor) = table.downcast_ref::<FederatedTableProviderAdaptor>() {
+            let nested_table = adaptor.table_provider.clone()?;
+            table = nested_table;
+            continue;
+        }
+        if let Some(layered) = table.downcast_ref::<spice_table::SpiceTable>() {
+            if let Some(accelerated) = layered.layer_as::<AcceleratedTable>() {
+                return Some(read(accelerated));
+            }
+            let inner = Arc::clone(layered.below());
+            table = inner;
+            continue;
+        }
+        return None;
+    }
+}
+
+/// How concurrent appends to a dataset may be written together, or `None` when
+/// its appends must each be written alone (see [`append_coalescer`]).
+///
+/// Only an unpartitioned, file-backed Cayenne acceleration: it keeps the last
+/// arrival of a key within one append as across appends, and counts the copies an
+/// append repeats itself as superseded, so a group whose members share no key
+/// stores and counts what the members would one after another.
+///
+/// The key is the one the table resolves: the primary key the opened
+/// acceleration reports, which is its stored one even when it kept that through a
+/// settings change it cannot apply in place. Without one, it is the key Cayenne
+/// creates a table with: the acceleration's `primary_key` when it names columns,
+/// otherwise the source's. A key other than the one the table resolves would only
+/// let a key two members share into the superseded count; the rows stored are the
+/// same. A null, though, fails the whole write, so every column any of these keys
+/// names keeps an append with a null in it out of groups.
+fn append_grouping(
+    acceleration: &Acceleration,
+    source: &FederatedTable,
+    accelerator: &Arc<dyn TableProvider>,
+) -> Option<AppendGrouping> {
+    if acceleration.engine != Engine::Cayenne
+        || matches!(acceleration.mode, Mode::Memory)
+        || !acceleration.partition_by.is_empty()
+    {
+        return None;
+    }
+    let stored: Vec<String> = accelerator
+        .constraints()
+        .map(|constraints| {
+            data_accelerator_api::get_primary_keys_from_constraints(
+                constraints,
+                &accelerator.schema(),
+            )
+        })
+        .unwrap_or_default();
+    let requested: Vec<String> = acceleration
+        .primary_key
+        .as_ref()
+        .map(|primary_key| primary_key.iter().map(str::to_string).collect())
+        .unwrap_or_default();
+    let from_source: Vec<String> = source
+        .constraints()
+        .map(|constraints| {
+            data_accelerator_api::get_primary_keys_from_constraints(constraints, &source.schema())
+        })
+        .unwrap_or_default();
+    let key = if !stored.is_empty() {
+        stored.clone()
+    } else if !requested.is_empty() {
+        requested.clone()
+    } else {
+        from_source.clone()
+    };
+    let mut non_null: Vec<String> = Vec::new();
+    for column in stored.into_iter().chain(requested).chain(from_source) {
+        if !non_null.contains(&column) {
+            non_null.push(column);
+        }
+    }
+    Some(AppendGrouping {
+        key: key.into(),
+        non_null: non_null.into(),
+    })
 }
 
 /// Whether a write failed the schema check the runtime runs before inserting anything.
