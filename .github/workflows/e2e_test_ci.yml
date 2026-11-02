@@ -1634,13 +1634,12 @@ jobs:
       matrix:
         acceleration: [
             { engine: arrow, mode: memory },
+            { engine: cayenne, mode: memory },
             { engine: cayenne, mode: file },
             { engine: duckdb, mode: memory },
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: memory },
             { engine: sqlite, mode: file },
-            { engine: turso, mode: memory },
-            { engine: turso, mode: file },
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 

@@ -1,4 +1,86 @@
 {
+  "duckdb-types-known": [
+    {
+      "run": "duckdb-types-known",
+      "who": "arrow",
+      "key": "query: SELECT id, t_interval FROM iv ORDER BY id #2",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: could not decode the HTTP JSON answer as Flight's schema; body: [{\"id\":1,\"t_interval\":\"1.000000000 secs\"},{\"id\":2,\"t_interval\":\"2.000000000 secs\"},{\"id\":3,\"t_interval\":\"0 secs\"},{\"id\":4,\"t_interval\":null}]: Not yet implement",
+      "group": "duckdb"
+    },
+    {
+      "run": "duckdb-types-known",
+      "who": "cayenne",
+      "key": "query: SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_name IN ('iv', 'dec') ORDER BY table_name, ordinal_position",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 4, actual: 2 }",
+      "group": "duckdb"
+    },
+    {
+      "run": "duckdb-types-known",
+      "who": "cayenne",
+      "key": "query: SELECT id, t_interval FROM iv ORDER BY id",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Flight rejected the query: Query execution failed. table 'spice.public.iv' not found: table 'spice.public.iv' not found",
+      "group": "duckdb"
+    },
+    {
+      "run": "duckdb-types-known",
+      "who": "cayenne",
+      "key": "query: SELECT id, t_interval FROM iv ORDER BY id #2",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Flight rejected the query: Query execution failed. table 'spice.public.iv' not found: table 'spice.public.iv' not found",
+      "group": "duckdb"
+    },
+    {
+      "run": "duckdb-types-known",
+      "who": "duckdb",
+      "key": "query: SELECT id, t_interval FROM iv ORDER BY id #2",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: could not decode the HTTP JSON answer as Flight's schema; body: [{\"id\":1,\"t_interval\":\"1.000000000 secs\"},{\"id\":2,\"t_interval\":\"2.000000000 secs\"},{\"id\":3,\"t_interval\":\"0 secs\"},{\"id\":4,\"t_interval\":null}]: Not yet implement",
+      "group": "duckdb"
+    },
+    {
+      "run": "duckdb-types-known",
+      "who": "federated",
+      "key": "query: SELECT id, t_interval FROM iv ORDER BY id #2",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: could not decode the HTTP JSON answer as Flight's schema; body: [{\"id\":1,\"t_interval\":\"1.000000000 secs\"},{\"id\":2,\"t_interval\":\"2.000000000 secs\"},{\"id\":3,\"t_interval\":\"0 secs\"},{\"id\":4,\"t_interval\":null}]: Not yet implement",
+      "group": "duckdb"
+    },
+    {
+      "run": "duckdb-types-known",
+      "who": "sqlite",
+      "key": "query: SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_name IN ('iv', 'dec') ORDER BY table_name, ordinal_position",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 4, actual: 2 }",
+      "group": "duckdb"
+    },
+    {
+      "run": "duckdb-types-known",
+      "who": "sqlite",
+      "key": "query: SELECT id, t_interval FROM iv ORDER BY id",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Flight rejected the query: Query execution failed. table 'spice.public.iv' not found: table 'spice.public.iv' not found",
+      "group": "duckdb"
+    },
+    {
+      "run": "duckdb-types-known",
+      "who": "sqlite",
+      "key": "query: SELECT id, t_interval FROM iv ORDER BY id #2",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Flight rejected the query: Query execution failed. table 'spice.public.iv' not found: table 'spice.public.iv' not found",
+      "group": "duckdb"
+    },
+    {
+      "run": "duckdb-types-known",
+      "who": "sqlite",
+      "key": "query: SELECT id, t_decimal_20_4 FROM dec ORDER BY id",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Flight rejected the query: Tonic error: code: 'Internal error', message: \"Unable to cast column 1 't_decimal_20_4' from Float64 to Decimal128(20, 4): Invalid argument error: 10000000000000000.0000 is too large to store in a ",
+      "group": "duckdb"
+    }
+  ],
   "vector-search-score-duckdb": [
     {
       "run": "vector-search-score-duckdb",

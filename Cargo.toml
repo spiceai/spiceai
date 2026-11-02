@@ -28,6 +28,7 @@ members = [
     "crates/dataformat-orc",
     "crates/document_parse",
     "crates/dotenv",
+    "crates/duckdb-oracle",
     "crates/duration-parse",
     "crates/http-body-limit",
     "crates/dynamodb-streams",

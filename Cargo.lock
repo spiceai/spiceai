@@ -3814,7 +3814,7 @@ dependencies = [
  "datafusion-proto",
  "datafusion-pruning",
  "datafusion-table-providers",
- "duckdb",
+ "duckdb-oracle",
  "flatbuffers",
  "futures",
  "globset",
@@ -8117,6 +8117,16 @@ dependencies = [
  "r2d2",
  "rust_decimal",
  "strum 0.27.2",
+]
+
+[[package]]
+name = "duckdb-oracle"
+version = "2.5.0-unstable"
+dependencies = [
+ "adbc_core",
+ "adbc_driver_manager",
+ "arrow",
+ "snafu",
 ]
 
 [[package]]
@@ -22237,7 +22247,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "datafusion",
- "duckdb",
+ "duckdb-oracle",
  "flight_client",
  "futures",
  "http 1.4.1",
@@ -22323,7 +22333,7 @@ dependencies = [
  "chbench-driver",
  "clap",
  "datafusion",
- "duckdb",
+ "duckdb-oracle",
  "flight_client",
  "futures",
  "insta",
