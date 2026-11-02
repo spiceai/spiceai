@@ -151,9 +151,24 @@ jobs:
           queryset_name: ${{ github.event.inputs.benchmark_queryset }}
           use_evidence: ${{ github.event.inputs.use_evidence }}
 
+      # Only a Spicepod whose models authenticate to Anthropic needs a token: any other benchmark
+      # must not depend on Anthropic credentials or availability.
+      - name: Check whether the Spicepod authenticates to Anthropic
+        id: anthropic
+        env:
+          SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
+        run: |
+          if grep -Eq 'secrets: *SPICE_ANTHROPIC_AUTH_TOKEN' "$SPICEPOD_PATH"; then
+            echo "needs_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_token=false" >> "$GITHUB_OUTPUT"
+            echo "${SPICEPOD_PATH} does not use SPICE_ANTHROPIC_AUTH_TOKEN, so no Anthropic access token is minted."
+          fi
+
       # spiced holds this one token for the whole run and does not refresh it, so a run longer than
       # the federation rule's token lifetime (`expires_in` in this step's log) loses Anthropic.
       - name: Mint an Anthropic access token
+        if: steps.anthropic.outputs.needs_token == 'true'
         uses: ./.github/actions/anthropic-token
         with:
           federation-rule-id: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
