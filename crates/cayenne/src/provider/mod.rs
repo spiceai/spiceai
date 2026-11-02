@@ -92,6 +92,7 @@ pub(crate) mod file_pruning;
 mod first_load_pk;
 pub(crate) mod fsync_tier;
 pub(crate) mod inlined_cache;
+mod io_wait_runtime;
 pub(crate) mod key_conflicts;
 pub(crate) mod lookup_index;
 pub(crate) mod maintenance;
