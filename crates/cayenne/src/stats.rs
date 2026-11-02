@@ -758,12 +758,15 @@ pub(crate) fn serialize_file_statistics(stats: &FileStatistics) -> VortexResult<
 pub fn deserialize_file_statistics(bytes: &[u8], schema: &Schema) -> VortexResult<FileStatistics> {
     let struct_dtype = vortex_struct_dtype_from_schema(schema)?;
     let fb_stats = flatbuffers::root::<vortex::flatbuffers::footer::FileStatistics>(bytes)?;
-    FileStatistics::from_flatbuffer(
-        &fb_stats,
-        &struct_dtype,
-        &vortex_session::VortexSession::default(),
-    )
+    FileStatistics::from_flatbuffer(&fb_stats, &struct_dtype, &STATISTICS_SESSION)
 }
+
+/// The session statistics blobs decode with, built once rather than per decode
+/// (building a default session registers every encoding). Decoding only reads
+/// it (scalar values look their types up), so one shared session serves every
+/// caller.
+static STATISTICS_SESSION: LazyLock<vortex_session::VortexSession> =
+    LazyLock::new(vortex_session::VortexSession::default);
 
 /// The Arrow/Vortex type conversions statistics use: the same default session
 /// the Vortex writer converts a table's schema with, so a statistics blob is typed
