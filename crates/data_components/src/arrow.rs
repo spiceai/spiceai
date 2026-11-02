@@ -229,7 +229,8 @@ impl TableProviderFactory for ArrowFactory {
                 )
             } else {
                 indexed_table
-            };
+            }
+            .with_upsert_options(upsert_options_from(&cmd.options)?);
 
             // Apply sort_columns if specified
             let indexed_table = if let Some(sort_cols_str) = cmd.options.get("sort_columns") {
@@ -265,6 +266,7 @@ impl TableProviderFactory for ArrowFactory {
                 })?,
             );
         }
+        mem_table = mem_table.with_upsert_options(upsert_options_from(&cmd.options)?);
 
         // Parse sort_columns if provided
         if let Some(sort_cols_str) = cmd.options.get("sort_columns") {
@@ -281,6 +283,25 @@ impl TableProviderFactory for ArrowFactory {
 
         Ok(Arc::new(mem_table))
     }
+}
+
+/// Reads the `on_conflict` upsert behaviour (`upsert_dedup` / `upsert_dedup_by_row_id`) that the
+/// accelerator API passes as the `upsert_remove_duplicates` / `upsert_last_write_wins` options.
+fn upsert_options_from(
+    options: &std::collections::HashMap<String, String>,
+) -> datafusion::error::Result<datafusion_table_providers::util::constraints::UpsertOptions> {
+    let flag = |name: &str| -> datafusion::error::Result<bool> {
+        options.get(name).map_or(Ok(false), |value| {
+            value.parse::<bool>().map_err(|e| {
+                DataFusionError::Configuration(format!("Invalid value '{value}' for {name}: {e}"))
+            })
+        })
+    };
+    Ok(
+        datafusion_table_providers::util::constraints::UpsertOptions::default()
+            .with_remove_duplicates(flag("upsert_remove_duplicates")?)
+            .with_last_write_wins(flag("upsert_last_write_wins")?),
+    )
 }
 
 #[cfg(test)]

@@ -25,8 +25,7 @@
 //! this standalone bench can be retired; see the plan doc.)
 //!
 //! Lanes:
-//! - `cayenne`       — Cayenne with the SQLite metastore (default)
-//! - `cayenne_turso` — Cayenne with the Turso metastore (--features turso)
+//! - `cayenne`       — Cayenne with the SQLite metastore
 //! - `chdb`          — chDB (embedded ClickHouse), MergeTree engine
 
 #![allow(clippy::expect_used)]

@@ -2,7 +2,7 @@
 // not the PostgreSQL-accelerator tests `postgres-accel` selects.
 #[cfg(feature = "postgres")]
 pub(crate) mod common;
-#[cfg(all(not(windows), feature = "postgres"))]
+#[cfg(feature = "postgres")]
 mod refresh_cayenne;
 #[cfg(all(feature = "duckdb", feature = "postgres-accel"))]
 mod refresh_duckdb;

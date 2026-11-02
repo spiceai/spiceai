@@ -23,17 +23,20 @@ limitations under the License.
 //! input is a nested search UDTF, the query string is auto-propagated to the
 //! reranker; otherwise the caller must pass `query => '...'` explicitly.
 //!
-//! Model resolution falls back gracefully:
-//!  1. `rerankers` store — used for native cross-encoder providers (Cohere,
-//!     Voyage, Jina, local BGE). Empty on first boot; populated as native
-//!     provider support lands.
-//!  2. `chat_models` store — any registered chat model can be used as a
-//!     reranker via [`llms::rerank::LlmRerank`] with a built-in listwise
-//!     prompt template. No extra configuration required.
-//!  3. `evaluate_models` store — any evaluation model (e.g. `TypeSafe` Jev) can
-//!     be used as a reranker via [`llms::rerank::EvaluateRerank`].
+//! Model resolution, in order:
+//!  1. `rerankers` store — native cross-encoder providers (Cohere, Voyage,
+//!     Jina, TEI, HTTP).
+//!  2. A model with a native decisions API (`TypeSafe` Jev, `OpenAI`
+//!     `gpt-6-luna`) reranks via decisions: [`llms::rerank::EvaluateRerank`].
+//!  3. Any other chat model reranks via chat: [`llms::rerank::LlmRerank`] with
+//!     a built-in listwise prompt template.
 //!
-//! `strategy => ...` applies to (2) and (3); native rerankers ignore it.
+//! Every chat model is also in the `evaluate_models` store, through a chat
+//! adapter, so (2) asks [`ModelCapabilities::decisions`] which models answer
+//! decisions natively. `via => 'chat' | 'decisions'` forces one path, and
+//! `prompt_template => ...` implies `via => 'chat'` because only chat uses a
+//! prompt template. `strategy => ...` applies to (2) and (3); native
+//! rerankers ignore it.
 //!
 //! Output schema: `schema(input) ∪ {rerank_score}` (after dropping the input's
 //! `_score`/`_fused_score` to avoid confusion). Rows are sorted by
@@ -69,7 +72,9 @@ use futures::TryStreamExt;
 use llms::chat::Chat;
 use llms::evaluate::{Evaluate, EvaluateModelStore};
 use llms::rerank::{EvaluateRerank, LlmRerank, LlmStrategy, Rerank, RerankerModelStore};
-use model_capabilities::{Capability, CapabilityStore, require};
+use model_capabilities::{
+    Capability, CapabilityStore, DecisionsBackend, ModelCapabilities, Refusal, require,
+};
 use runtime_query_engine::query_engine::QueryEngine;
 use tokio::sync::RwLock;
 use tracing::Instrument;
@@ -96,6 +101,7 @@ pub static RERANK_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
         "limit".to_string(),
         "strategy".to_string(),
         "prompt_template".to_string(),
+        "via".to_string(),
     ];
     match Signature::user_defined(Volatility::Volatile).with_parameter_names(param_names) {
         Ok(sig) => sig,
@@ -119,7 +125,7 @@ static RERANK_DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Document
         ),
         (
             "model".to_string(),
-            "Configured reranker or chat model name.".to_string(),
+            "Configured reranker, decision or chat model name.".to_string(),
         ),
         (
             "document".to_string(),
@@ -139,7 +145,12 @@ static RERANK_DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Document
         ),
         (
             "prompt_template".to_string(),
-            "Optional prompt template when reranking with a chat model.".to_string(),
+            "Optional prompt template when reranking with a chat model. Implies via => 'chat'."
+                .to_string(),
+        ),
+        (
+            "via".to_string(),
+            "Optional 'chat' or 'decisions'. Default: decisions if native, else chat.".to_string(),
         ),
     ]),
     alternative_syntax: None,
@@ -183,8 +194,65 @@ pub struct RerankTableFuncArgs {
     /// Strategy for chat and evaluation models used as rerankers (ignored by
     /// native rerankers).
     pub strategy: Option<LlmStrategy>,
-    /// Optional override of the built-in prompt template for LLM rerankers.
-    pub prompt_template: Option<String>,
+    /// Whether a non-native reranker scores via chat or decisions.
+    pub path: RerankPath,
+}
+
+/// How a model that is not a native reranker scores candidates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RerankVia {
+    /// An LLM-as-judge prompt sent as a chat completion ([`LlmRerank`]).
+    Chat,
+    /// One "is this relevant" question per candidate ([`EvaluateRerank`]).
+    Decisions,
+}
+
+impl RerankVia {
+    fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "chat" => Ok(Self::Chat),
+            "decisions" | "decision" => Ok(Self::Decisions),
+            other => Err(format!(
+                "{RERANK_UDTF_NAME}: unknown via '{other}'. Expected 'chat' or 'decisions'."
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for RerankVia {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Chat => "chat",
+            Self::Decisions => "decisions",
+        })
+    }
+}
+
+/// The `via => ...` and `prompt_template => ...` arguments of one call. A
+/// prompt template exists only on the chat path, because the decisions
+/// question text is fixed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RerankPath {
+    /// Decisions for a model with a native decisions API, else chat.
+    #[default]
+    Auto,
+    /// Chat, with an optional override of the built-in prompt template.
+    Chat { prompt_template: Option<String> },
+    /// Decisions, also for a chat model that answers them through its chat adapter.
+    Decisions,
+}
+
+impl RerankPath {
+    fn parse(via: Option<RerankVia>, prompt_template: Option<String>) -> Result<Self, String> {
+        match (via, prompt_template) {
+            (None, None) => Ok(Self::Auto),
+            (None | Some(RerankVia::Chat), prompt_template) => Ok(Self::Chat { prompt_template }),
+            (Some(RerankVia::Decisions), None) => Ok(Self::Decisions),
+            (Some(RerankVia::Decisions), Some(_)) => Err(format!(
+                "{RERANK_UDTF_NAME}: 'prompt_template' applies only to via => 'chat'; the decisions path asks a fixed relevance question."
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -343,7 +411,7 @@ impl RerankTableFuncArgs {
         // results. Fail fast with the list of recognized named args.
         if positional.len() > 1 {
             return Err(DataFusionError::Plan(format!(
-                "{RERANK_UDTF_NAME} only accepts one positional argument (the input); additional parameters must be named. Got {} positional arg(s). Recognized named args: model, document, query, limit, strategy, prompt_template.",
+                "{RERANK_UDTF_NAME} only accepts one positional argument (the input); additional parameters must be named. Got {} positional arg(s). Recognized named args: model, document, query, limit, strategy, prompt_template, via.",
                 positional.len()
             )));
         }
@@ -390,7 +458,12 @@ impl RerankTableFuncArgs {
             None => None,
         };
 
+        let via = match extract_string_named(&named, "via") {
+            Some(s) => Some(RerankVia::parse(&s).map_err(DataFusionError::Plan)?),
+            None => None,
+        };
         let prompt_template = extract_string_named(&named, "prompt_template");
+        let path = RerankPath::parse(via, prompt_template).map_err(DataFusionError::Plan)?;
 
         Ok(Self {
             input,
@@ -399,7 +472,7 @@ impl RerankTableFuncArgs {
             query,
             limit,
             strategy,
-            prompt_template,
+            path,
         })
     }
 }
@@ -415,7 +488,7 @@ fn extract_string_named(named: &HashMap<&str, &Expr>, key: &str) -> Option<Strin
     }
 }
 
-/// The stores a `rerank(model => ...)` name resolves against, in lookup order.
+/// The stores a `rerank(model => ...)` name resolves against.
 #[derive(Clone)]
 pub struct RerankModelStores {
     pub rerankers: Arc<RwLock<RerankerModelStore>>,
@@ -434,43 +507,97 @@ impl RerankModelStores {
         names
     }
 
-    /// Native reranker, else a model with chat wrapped in [`LlmRerank`], else a model
-    /// that answers decisions wrapped in [`EvaluateRerank`]. A model with both, such as
-    /// `gpt-6-luna`, reranks through chat.
-    async fn resolve(&self, name: &str, args: &RerankTableFuncArgs) -> Option<Arc<dyn Rerank>> {
+    /// Native reranker, else the adapter for the path in `args.path`. Under
+    /// [`RerankPath::Auto`], a model with a native decisions API (such as
+    /// `gpt-6-luna`) reranks via decisions, and any other model via chat; each
+    /// falls back to the other path when it has no handler for the first.
+    async fn resolve(
+        &self,
+        name: &str,
+        args: &RerankTableFuncArgs,
+    ) -> DataFusionResult<Arc<dyn Rerank>> {
         if let Some(rr) = self.rerankers.read().await.get(name) {
-            return Some(Arc::clone(rr));
+            if args.path != RerankPath::Auto {
+                return Err(DataFusionError::Plan(format!(
+                    "{RERANK_UDTF_NAME}: model '{name}' is a native reranker; 'via' and 'prompt_template' apply only to decision and chat models."
+                )));
+            }
+            return Ok(Arc::clone(rr));
         }
         let capabilities = self.capabilities.read().await;
-        let chat = require(
-            &capabilities,
-            &*self.chat_models.read().await,
-            name,
-            Capability::Chat,
-        );
-        if let Ok(chat) = chat {
-            let mut adapter = LlmRerank::new(name, chat);
-            if let Some(strategy) = args.strategy {
-                adapter = adapter.with_strategy(strategy);
+        let chat_models = self.chat_models.read().await;
+        let evaluate_models = self.evaluate_models.read().await;
+
+        let build = |via: RerankVia| -> Result<Arc<dyn Rerank>, Refusal> {
+            match via {
+                RerankVia::Chat => {
+                    let chat = require(&capabilities, &*chat_models, name, Capability::Chat)?;
+                    let mut adapter = LlmRerank::new(name, chat);
+                    if let Some(strategy) = args.strategy {
+                        adapter = adapter.with_strategy(strategy);
+                    }
+                    if let RerankPath::Chat {
+                        prompt_template: Some(tpl),
+                    } = &args.path
+                    {
+                        adapter = adapter.with_prompt_template(Some(tpl.clone()));
+                    }
+                    Ok(Arc::new(adapter) as Arc<dyn Rerank>)
+                }
+                RerankVia::Decisions => {
+                    let evaluator: Arc<dyn Evaluate> = require(
+                        &capabilities,
+                        &*evaluate_models,
+                        name,
+                        Capability::Decisions,
+                    )?;
+                    let mut adapter = EvaluateRerank::new(name, evaluator);
+                    if let Some(strategy) = args.strategy {
+                        adapter = adapter.with_strategy(strategy);
+                    }
+                    Ok(Arc::new(adapter) as Arc<dyn Rerank>)
+                }
             }
-            if let Some(tpl) = &args.prompt_template {
-                adapter = adapter.with_prompt_template(Some(tpl.clone()));
-            }
-            return Some(Arc::new(adapter));
+        };
+
+        let native_decisions = capabilities
+            .get(name)
+            .and_then(ModelCapabilities::decisions)
+            == Some(DecisionsBackend::Native);
+        let (first, fallback) = match &args.path {
+            RerankPath::Auto if native_decisions => (RerankVia::Decisions, Some(RerankVia::Chat)),
+            RerankPath::Auto => (RerankVia::Chat, Some(RerankVia::Decisions)),
+            RerankPath::Chat { .. } => (RerankVia::Chat, None),
+            RerankPath::Decisions => (RerankVia::Decisions, None),
+        };
+        match build(first) {
+            Ok(reranker) => Ok(reranker),
+            Err(refusal) => match fallback.map(build) {
+                Some(Ok(reranker)) => Ok(reranker),
+                _ => Err(refusal_error(name, first, &refusal)),
+            },
         }
-        let evaluator: Arc<dyn Evaluate> = require(
-            &capabilities,
-            &*self.evaluate_models.read().await,
-            name,
-            Capability::Decisions,
-        )
-        .ok()?;
-        let mut adapter = EvaluateRerank::new(name, evaluator);
-        if let Some(strategy) = args.strategy {
-            adapter = adapter.with_strategy(strategy);
-        }
-        Some(Arc::new(adapter))
     }
+}
+
+/// The plan error for a model with no handler for the `via` path.
+fn refusal_error(name: &str, via: RerankVia, refusal: &Refusal) -> DataFusionError {
+    DataFusionError::Plan(match refusal {
+        Refusal::NotFound => format!(
+            "{RERANK_UDTF_NAME}: model '{name}' not found in rerankers, chat models, or evaluation models."
+        ),
+        Refusal::Unavailable => format!(
+            "{RERANK_UDTF_NAME}: model '{name}' cannot rerank via {via} because it is not ready. Check the model's status."
+        ),
+        Refusal::Unsupported(_) => match via {
+            RerankVia::Chat => format!(
+                "{RERANK_UDTF_NAME}: model '{name}' has no chat completions, so it cannot rerank via chat or use 'prompt_template'. Remove 'via' and 'prompt_template' to rerank via decisions."
+            ),
+            RerankVia::Decisions => format!(
+                "{RERANK_UDTF_NAME}: model '{name}' cannot answer decisions, so it cannot rerank via decisions."
+            ),
+        },
+    })
 }
 
 /// The UDTF scaffold. Analogous to [`VectorSearchTableFunc`] — holds a weak
@@ -659,11 +786,7 @@ impl RerankUDTFProvider {
                 }
             }
         };
-        self.models.resolve(&name, &self.args).await.ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "{RERANK_UDTF_NAME}: model '{name}' not found in rerankers, chat models, or evaluation models."
-            ))
-        })
+        self.models.resolve(&name, &self.args).await
     }
 
     /// Extract the configured document column from a record batch. Returns a
@@ -1600,6 +1723,64 @@ mod tests {
         assert_eq!(parsed.strategy, Some(LlmStrategy::Pointwise));
     }
 
+    fn parse_path(extra: &[(&str, &str)]) -> DataFusionResult<RerankPath> {
+        let mut args = vec![
+            vector_search_call("q"),
+            named_lit_utf8("document", "content"),
+        ];
+        args.extend(extra.iter().map(|(k, v)| named_lit_utf8(k, v)));
+        RerankTableFuncArgs::from_udtf_args(&args).map(|parsed| parsed.path)
+    }
+
+    #[test]
+    fn parse_args_path_defaults_to_auto() {
+        assert_eq!(parse_path(&[]).expect("parse ok"), RerankPath::Auto);
+    }
+
+    #[test]
+    fn parse_args_parses_via() {
+        assert_eq!(
+            parse_path(&[("via", "chat")]).expect("parse ok"),
+            RerankPath::Chat {
+                prompt_template: None
+            }
+        );
+        assert_eq!(
+            parse_path(&[("via", "Decisions")]).expect("parse ok"),
+            RerankPath::Decisions
+        );
+        parse_path(&[("via", "cross_encoder")]).expect_err("unknown via must error");
+    }
+
+    /// Only the chat path uses a prompt template, so a template selects it.
+    #[test]
+    fn parse_args_prompt_template_implies_chat() {
+        let template = Some("Q: {query} D: {documents}".to_string());
+        assert_eq!(
+            parse_path(&[("prompt_template", "Q: {query} D: {documents}")]).expect("parse ok"),
+            RerankPath::Chat {
+                prompt_template: template.clone()
+            }
+        );
+        assert_eq!(
+            parse_path(&[
+                ("via", "chat"),
+                ("prompt_template", "Q: {query} D: {documents}")
+            ])
+            .expect("parse ok"),
+            RerankPath::Chat {
+                prompt_template: template
+            }
+        );
+    }
+
+    #[test]
+    fn parse_args_rejects_prompt_template_via_decisions() {
+        let err = parse_path(&[("via", "decisions"), ("prompt_template", "{query}")])
+            .expect_err("a template cannot apply to decisions");
+        assert!(err.to_string().contains("prompt_template"), "{err}");
+    }
+
     #[test]
     fn parse_args_parses_limit() {
         let meta = FieldMetadata::new(BTreeMap::from([(
@@ -2054,5 +2235,258 @@ mod tests {
         let (ids, requests) = rerank_with_evaluate_model("").await;
         assert_eq!(ids, vec![1, 5, 4, 2, 3]);
         assert_eq!(requests, 5);
+    }
+
+    /// Chat model that answers a listwise rerank prompt with `1 - score` from
+    /// [`MockEvaluate`], so the two paths order rows differently. Records the prompts.
+    #[derive(Debug, Default)]
+    struct MockChat {
+        prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl MockChat {
+        const DOCUMENTS: [&str; 5] = [
+            "great battery life and performance",
+            "terrible battery drains fast",
+            "amazing screen quality",
+            "average product nothing special",
+            "best purchase ever made",
+        ];
+
+        fn requests(&self) -> usize {
+            self.prompts.lock().expect("prompts lock").len()
+        }
+
+        /// Finds each document as `N. <document>` in the prompt and scores it by id.
+        fn listwise_answer(prompt: &str) -> String {
+            let entries: Vec<String> = Self::DOCUMENTS
+                .iter()
+                .filter_map(|document| {
+                    let at = prompt.find(&format!(". {document}"))?;
+                    let id: String = prompt[..at]
+                        .chars()
+                        .rev()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
+                    let score = 1.0 - MockEvaluate::score(document);
+                    Some(format!(r#"{{"id":{id},"score":{score}}}"#))
+                })
+                .collect();
+            format!("[{}]", entries.join(","))
+        }
+    }
+
+    #[async_trait]
+    impl Chat for MockChat {
+        fn as_sql(&self) -> Option<&dyn llms::chat::nsql::SqlGeneration> {
+            None
+        }
+
+        async fn run(&self, prompt: String) -> llms::chat::Result<Option<String>> {
+            let answer = Self::listwise_answer(&prompt);
+            self.prompts.lock().expect("prompts lock").push(prompt);
+            Ok(Some(answer))
+        }
+    }
+
+    /// Row order when [`MockChat`] scores `test_docs`.
+    const CHAT_ORDER: [i64; 5] = [3, 2, 4, 5, 1];
+    /// Row order when [`MockEvaluate`] scores `test_docs`.
+    const DECISIONS_ORDER: [i64; 5] = [1, 5, 4, 2, 3];
+
+    /// A session with one model named `name`, loaded as the runtime loads `from`:
+    /// a chat handler when the provider has chat, and an evaluation handler for
+    /// every model that answers decisions (natively or through chat).
+    struct ModelFixture {
+        ctx: Arc<SessionContext>,
+        models: RerankModelStores,
+        chat: Arc<MockChat>,
+        evaluate: Arc<MockEvaluate>,
+        // The rerank UDTF holds the engine weakly; it must outlive each query.
+        _engine: Arc<TestQueryEngine>,
+    }
+
+    impl ModelFixture {
+        async fn new(from: &str, name: &str) -> Self {
+            let (ctx, models, test_engine) = make_rerank_session();
+            setup_test_table(&ctx, &models.rerankers, vec![0.0; 5])
+                .await
+                .expect("test table");
+            if let Ok(provider) = ctx.table_provider(TableReference::bare("test_docs")).await {
+                test_engine.register_table("test_docs", provider);
+            }
+            // `setup_test_table` registers a native reranker; this fixture tests
+            // one model only, so auto-pick can find it.
+            models.rerankers.write().await.clear();
+
+            let capabilities =
+                ModelCapabilities::of(&spicepod::component::model::Model::new(from, name))
+                    .expect("a known provider");
+            let chat = Arc::new(MockChat::default());
+            let evaluate = Arc::new(MockEvaluate::default());
+            if capabilities.has(Capability::Chat) {
+                models
+                    .chat_models
+                    .write()
+                    .await
+                    .insert(name.to_string(), Arc::clone(&chat) as Arc<dyn Chat>);
+            }
+            if capabilities.has(Capability::Decisions) {
+                models
+                    .evaluate_models
+                    .write()
+                    .await
+                    .insert(name.to_string(), Arc::clone(&evaluate) as Arc<dyn Evaluate>);
+            }
+            models
+                .capabilities
+                .write()
+                .await
+                .insert(name.to_string(), capabilities);
+            Self {
+                ctx,
+                models,
+                chat,
+                evaluate,
+                _engine: test_engine,
+            }
+        }
+
+        /// Runs `rerank(test_docs, ...{args})` and returns the ids in output order.
+        async fn rerank(&self, args: &str) -> DataFusionResult<Vec<i64>> {
+            let sql = format!(
+                "SELECT id FROM rerank(test_docs, document => 'content', query => 'battery'{args})"
+            );
+            let batches = self.ctx.sql(&sql).await?.collect().await?;
+            Ok(batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .expect("int64 ids")
+                        .values()
+                        .to_vec()
+                })
+                .collect())
+        }
+
+        fn requests(&self) -> (usize, usize) {
+            (
+                self.chat.requests(),
+                self.evaluate
+                    .requests
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            )
+        }
+    }
+
+    /// A model with a native decisions API reranks via decisions (pointwise by
+    /// default), although it also has chat.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rerank_native_decision_model_uses_decisions() {
+        let fixture = ModelFixture::new("openai:gpt-6-luna", "luna").await;
+        let ids = fixture.rerank(", model => 'luna'").await.expect("rerank");
+        assert_eq!(ids, DECISIONS_ORDER);
+        assert_eq!(fixture.requests(), (0, 5));
+    }
+
+    /// A chat model answers decisions only through its chat adapter, so it
+    /// keeps the chat path (listwise by default).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rerank_chat_model_uses_chat() {
+        let fixture = ModelFixture::new("openai:gpt-4o-mini", "mini").await;
+        let ids = fixture.rerank(", model => 'mini'").await.expect("rerank");
+        assert_eq!(ids, CHAT_ORDER);
+        assert_eq!(fixture.requests(), (1, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rerank_via_chat_overrides_native_decisions() {
+        let fixture = ModelFixture::new("openai:gpt-6-luna", "luna").await;
+        let ids = fixture
+            .rerank(", model => 'luna', via => 'chat'")
+            .await
+            .expect("rerank");
+        assert_eq!(ids, CHAT_ORDER);
+        assert_eq!(fixture.requests(), (1, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rerank_via_decisions_uses_chat_adapter_evaluator() {
+        let fixture = ModelFixture::new("openai:gpt-4o-mini", "mini").await;
+        let ids = fixture
+            .rerank(", model => 'mini', via => 'decisions', strategy => 'listwise'")
+            .await
+            .expect("rerank");
+        assert_eq!(ids, DECISIONS_ORDER);
+        assert_eq!(fixture.requests(), (0, 1));
+    }
+
+    /// `prompt_template` selects the chat path, the only one that uses it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rerank_prompt_template_selects_chat_for_native_decision_model() {
+        let fixture = ModelFixture::new("openai:gpt-6-luna", "luna").await;
+        let ids = fixture
+            .rerank(", model => 'luna', prompt_template => 'CUSTOM {query} {documents}'")
+            .await
+            .expect("rerank");
+        assert_eq!(ids, CHAT_ORDER);
+        assert_eq!(fixture.requests(), (1, 0));
+        let prompts = fixture.chat.prompts.lock().expect("prompts lock");
+        assert!(prompts[0].starts_with("CUSTOM battery"), "{}", prompts[0]);
+    }
+
+    /// A decisions-only model cannot use a prompt template, and says so instead
+    /// of ignoring it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rerank_prompt_template_errors_for_decisions_only_model() {
+        let fixture = ModelFixture::new("typesafe:jev", "jev").await;
+        let err = fixture
+            .rerank(", model => 'jev', prompt_template => '{query} {documents}'")
+            .await
+            .expect_err("jev has no chat");
+        assert!(err.to_string().contains("no chat completions"), "{err}");
+        assert_eq!(fixture.requests(), (0, 0));
+    }
+
+    /// Without `model =>`, the only model is picked, and still reranks via its
+    /// native decisions API. It is counted once, although it is in both stores.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rerank_auto_pick_counts_a_model_once() {
+        let fixture = ModelFixture::new("openai:gpt-6-luna", "luna").await;
+        let ids = fixture.rerank("").await.expect("rerank");
+        assert_eq!(ids, DECISIONS_ORDER);
+        assert_eq!(fixture.requests(), (0, 5));
+    }
+
+    /// A native reranker with the same name wins over a decision or chat model,
+    /// and rejects the arguments that only those paths use.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rerank_native_reranker_is_first() {
+        let fixture = ModelFixture::new("openai:gpt-6-luna", "luna").await;
+        let native: Arc<dyn llms::rerank::Rerank> = Arc::new(MockRerank {
+            scores: vec![0.5, 0.4, 0.3, 0.2, 0.1],
+        });
+        fixture
+            .models
+            .rerankers
+            .write()
+            .await
+            .insert("luna".to_string(), native);
+
+        let ids = fixture.rerank(", model => 'luna'").await.expect("rerank");
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+        assert_eq!(fixture.requests(), (0, 0));
+
+        let err = fixture
+            .rerank(", model => 'luna', via => 'chat'")
+            .await
+            .expect_err("via does not apply to a native reranker");
+        assert!(err.to_string().contains("native reranker"), "{err}");
     }
 }

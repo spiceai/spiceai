@@ -108,7 +108,7 @@ pub(crate) async fn get(
     let resp = catalogs
         .iter()
         .map(|d| CatalogResponseItem {
-            from: d.from.clone(),
+            from: super::redact_source_credentials(&d.from),
             name: d.name.clone(),
         })
         .collect::<Vec<_>>();

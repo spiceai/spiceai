@@ -16,7 +16,8 @@ limitations under the License.
 //! Multi-token-prediction (MTP) speculative decoding: a draft head proposes the next tokens
 //! from the target's hidden states, and one target pass verifies them.
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
+use std::path::Path;
 use std::ptr::NonNull;
 
 use snafu::OptionExt;
@@ -25,9 +26,46 @@ use crate::context::{Batch, Context, ContextParams};
 use crate::model::Model;
 use crate::{CreateContextSnafu, Error, MtpInitSnafu, Result, Token, sys};
 
+/// How a draft model drafts for its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DraftKind {
+    /// A multi-token-prediction head, which reads the target's hidden states.
+    #[default]
+    Mtp,
+    /// A `DFlash` drafter, which reads the target's layer inputs.
+    DFlash,
+    /// A `DSpark` drafter: a `DFlash` drafter with a Markov head.
+    DSpark,
+}
+
+impl DraftKind {
+    /// `DFlash` or `DSpark` for a GGUF whose architecture is `dflash`, from its header; `None`
+    /// for any other file, or one that cannot be read.
+    #[must_use]
+    pub fn dflash_of(path: &Path) -> Option<Self> {
+        let path = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+        // SAFETY: a NUL-terminated path for the call; the shim reads the header and frees it.
+        match unsafe { sys::spice_dflash_kind(path.as_ptr()) } {
+            sys::spice_draft_kind_SPICE_DRAFT_DFLASH => Some(Self::DFlash),
+            sys::spice_draft_kind_SPICE_DRAFT_DSPARK => Some(Self::DSpark),
+            _ => None,
+        }
+    }
+
+    fn raw(self) -> sys::spice_draft_kind {
+        match self {
+            Self::Mtp => sys::spice_draft_kind_SPICE_DRAFT_MTP,
+            Self::DFlash => sys::spice_draft_kind_SPICE_DRAFT_DFLASH,
+            Self::DSpark => sys::spice_draft_kind_SPICE_DRAFT_DSPARK,
+        }
+    }
+}
+
 /// How the draft head drafts, as llama.cpp's `--spec-draft-*` options set it.
 #[derive(Debug, Clone, Copy)]
 pub struct MtpParams {
+    /// What kind of draft model drafts.
+    pub kind: DraftKind,
     /// The most tokens drafted per step.
     pub n_max: i32,
     /// Drafts shorter than this are dropped.
@@ -60,7 +98,9 @@ impl<'m> Mtp<'m> {
     ) -> Result<Self> {
         crate::log::clear_last_error();
         // SAFETY: the draft context reads `target`, which `Self` keeps alive longer.
-        let draft = unsafe { sys::llama_init_from_model(head.as_ptr(), params.raw(Some(&target))) };
+        let draft = unsafe {
+            sys::llama_init_from_model(head.as_ptr(), params.raw(Some((&target, mtp.kind))))
+        };
         let draft = Context::from_raw(NonNull::new(draft).with_context(|| CreateContextSnafu {
             reason: crate::log::last_error(),
         })?);
@@ -69,6 +109,7 @@ impl<'m> Mtp<'m> {
             sys::spice_mtp_init(
                 target.as_ptr(),
                 draft.as_ptr(),
+                mtp.kind.raw(),
                 mtp.n_max,
                 mtp.n_min,
                 mtp.p_min,
@@ -116,6 +157,12 @@ impl<'m> Mtp<'m> {
 
     /// Drafts the tokens to follow `last` at position `n_past`; `history` is every token
     /// before `last`. A non-empty draft must be followed by [`Mtp::accept`].
+    /// The most tokens one draft proposes.
+    #[must_use]
+    pub fn n_max(&self) -> usize {
+        self.n_max
+    }
+
     pub fn draft(&mut self, n_past: i32, last: Token, history: &[Token]) -> Result<Vec<Token>> {
         let mut out = vec![Token(0); self.n_max];
         let mut written = 0usize;

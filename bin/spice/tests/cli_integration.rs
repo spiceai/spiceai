@@ -1680,3 +1680,1069 @@ mod env_vars {
             .success();
     }
 }
+
+// ============================================================================
+// Coding agent tests (`spice claude`, `spice codex`, ...)
+// ============================================================================
+
+/// The real `spice` binary launching stub agents against stub runtimes: what
+/// reaches the agent, and what happens to the runtime around it.
+#[cfg(unix)]
+mod coding_agents {
+    use super::*;
+    use std::fmt::Write as _;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    const MODELS: &str = r#"{"object":"list","data":[{"id":"qwen","object":"model","owned_by":"openai:qwen3","status":"Ready","context_window":40960}]}"#;
+
+    /// The Spicepod the stub runtimes serve.
+    const SPICEPODS: &str = r#"[{"name":"proj-a","version":"v1","datasets_count":0,"models_count":1,"dependencies_count":0}]"#;
+
+    /// How long a stub gets to reach the state a test waits for; only an upper
+    /// bound on something that normally takes milliseconds.
+    const BUDGET: Duration = Duration::from_secs(30);
+
+    /// A runtime the user started, answering `/health` and `/v1/models` from a
+    /// thread of this process. Returns its endpoint.
+    fn user_runtime() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the stub runtime");
+        let port = listener.local_addr().expect("stub runtime address").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Ok(reader) = stream.try_clone() else {
+                    continue;
+                };
+                let mut reader = BufReader::new(reader);
+                let mut request = String::new();
+                if reader.read_line(&mut request).is_err() {
+                    continue;
+                }
+                let mut header = String::new();
+                while reader.read_line(&mut header).is_ok_and(|n| n > 0) && header != "\r\n" {
+                    header.clear();
+                }
+                let path = request.split_whitespace().nth(1).unwrap_or_default();
+                let (status, body) = if path == "/health" {
+                    ("200 OK", "ok")
+                } else if path.starts_with("/v1/models") {
+                    ("200 OK", MODELS)
+                } else if path == "/v1/spicepods" {
+                    ("200 OK", SPICEPODS)
+                } else {
+                    ("404 Not Found", "")
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn write_executable(path: &Path, script: &str) {
+        fs::create_dir_all(path.parent().expect("a parent")).expect("create the directory");
+        fs::write(path, script).expect("write the script");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("make it executable");
+    }
+
+    /// An agent that records its arguments, then `vars` from its environment,
+    /// one per line, and exits with `code`.
+    fn stub_agent(bin: &Path, name: &str, record: &Path, vars: &[&str], code: i32) {
+        let mut script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+            record.display()
+        );
+        for var in vars {
+            let _ = writeln!(
+                script,
+                "printf '{var}=%s\\n' \"${{{var}-<unset>}}\" >> '{}'",
+                record.display()
+            );
+        }
+        let _ = writeln!(script, "exit {code}");
+        write_executable(&bin.join(name), &script);
+    }
+
+    /// `spice` with a private home (for `~/.spice/run`) and only `bin` and the
+    /// system directories on `PATH`.
+    fn agent_cmd(home: &Path, bin: &Path) -> Command {
+        let mut cmd = spice_cmd();
+        cmd.env("HOME", home)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env_remove("SPICE_API_KEY")
+            .timeout(BUDGET);
+        cmd
+    }
+
+    #[test]
+    fn claude_code_reaches_the_running_runtime_with_every_argument_unchanged() {
+        let endpoint = user_runtime();
+        let dir = TempDir::new().expect("tempdir");
+        let (home, bin, record) = (
+            dir.path().join("home"),
+            dir.path().join("bin"),
+            dir.path().join("record"),
+        );
+        stub_agent(
+            &bin,
+            "claude",
+            &record,
+            &[
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_MODEL",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_API_KEY",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+            ],
+            3,
+        );
+
+        agent_cmd(&home, &bin)
+            .env("ANTHROPIC_API_KEY", "sk-ant-vendor-key")
+            .args([
+                "--http-endpoint",
+                &endpoint,
+                "claude",
+                "--resume",
+                "a b",
+                "-v",
+                "--model",
+                "qwen",
+            ])
+            .assert()
+            .code(3);
+
+        let recorded = fs::read_to_string(&record).expect("the agent ran");
+        let (settings, rest) = after_routing_settings(&recorded);
+        assert!(settings.ends_with("/claude/settings.json"), "{settings}");
+        assert_eq!(
+            rest,
+            format!(
+                "--resume\na b\n-v\n--model\nqwen\nANTHROPIC_BASE_URL={endpoint}\nANTHROPIC_MODEL=qwen\nANTHROPIC_AUTH_TOKEN=spice\nANTHROPIC_API_KEY=<unset>\nCLAUDE_CODE_MAX_CONTEXT_TOKENS=40960\n"
+            ),
+            "the agent's own arguments arrive unchanged, and the vendor key never reaches it"
+        );
+        // A runtime spice did not start is left running.
+        assert!(
+            std::net::TcpStream::connect(endpoint.trim_start_matches("http://")).is_ok(),
+            "the user's runtime must still be serving"
+        );
+    }
+
+    /// What the agent prints is all that reaches stdout, so `spice claude -p … |
+    /// jq` reads Claude Code's answer; spice's own messages go to stderr.
+    #[test]
+    fn an_agents_stdout_is_its_own() {
+        let endpoint = user_runtime();
+        let dir = TempDir::new().expect("tempdir");
+        let (home, bin) = (dir.path().join("home"), dir.path().join("bin"));
+        write_executable(
+            &bin.join("claude"),
+            "#!/bin/sh\necho '{\"answer\":\"pong\"}'\n",
+        );
+
+        agent_cmd(&home, &bin)
+            .args(["--http-endpoint", &endpoint, "claude", "-p", "hi"])
+            .assert()
+            .success()
+            .stdout("{\"answer\":\"pong\"}\n")
+            .stderr(predicate::str::contains(
+                "Starting Claude Code with Spice model 'qwen'",
+            ));
+    }
+
+    #[test]
+    fn codex_gets_its_provider_before_the_users_arguments() {
+        let endpoint = user_runtime();
+        let dir = TempDir::new().expect("tempdir");
+        let (home, bin, record) = (
+            dir.path().join("home"),
+            dir.path().join("bin"),
+            dir.path().join("record"),
+        );
+        stub_agent(&bin, "codex", &record, &[], 0);
+
+        agent_cmd(&home, &bin)
+            .args([
+                "--http-endpoint",
+                &endpoint,
+                "codex",
+                "--yolo",
+                "exec",
+                "hi",
+            ])
+            .assert()
+            .success();
+
+        assert_eq!(
+            fs::read_to_string(&record).expect("the agent ran"),
+            format!(
+                "-c\nmodel_provider=\"spice\"\n-c\nmodel_providers.spice.name=\"Spice\"\n-c\nmodel_providers.spice.base_url=\"{endpoint}/v1\"\n-c\nmodel_providers.spice.wire_api=\"responses\"\n-c\nmodel=\"qwen\"\n-c\nmodel_context_window=40960\n--yolo\nexec\nhi\n"
+            )
+        );
+    }
+
+    #[test]
+    fn an_unknown_model_is_refused_before_the_agent_starts() {
+        let endpoint = user_runtime();
+        let dir = TempDir::new().expect("tempdir");
+        let (home, bin, record) = (
+            dir.path().join("home"),
+            dir.path().join("bin"),
+            dir.path().join("record"),
+        );
+        stub_agent(&bin, "codex", &record, &[], 0);
+
+        agent_cmd(&home, &bin)
+            .args(["--http-endpoint", &endpoint, "codex", "-m", "gpt-x"])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains(
+                "the Spice runtime has no model 'gpt-x'. Available models: qwen.",
+            ));
+        assert!(
+            !record.exists(),
+            "the agent must not start on a model the runtime lacks"
+        );
+    }
+
+    /// `OpenCode` reads `-m qwen` as no model at all: it names models with
+    /// their provider, `spice/qwen`.
+    #[test]
+    fn a_spice_model_named_without_its_provider_is_refused_with_the_fix() {
+        let endpoint = user_runtime();
+        let dir = TempDir::new().expect("tempdir");
+        let (home, bin, record) = (
+            dir.path().join("home"),
+            dir.path().join("bin"),
+            dir.path().join("record"),
+        );
+        stub_agent(&bin, "opencode", &record, &[], 0);
+
+        agent_cmd(&home, &bin)
+            .args([
+                "--http-endpoint",
+                &endpoint,
+                "opencode",
+                "run",
+                "-m",
+                "qwen",
+                "hi",
+            ])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "OpenCode names a model with its provider, so 'qwen' names no Spice model. Rerun with `spice opencode -m spice/qwen`.",
+            ));
+        assert!(
+            !record.exists(),
+            "the agent must not start on a model it cannot resolve"
+        );
+    }
+
+    #[test]
+    fn a_missing_agent_says_how_to_install_it() {
+        let endpoint = user_runtime();
+        let dir = TempDir::new().expect("tempdir");
+        let (home, bin) = (dir.path().join("home"), dir.path().join("bin"));
+        fs::create_dir_all(&bin).expect("create bin");
+
+        agent_cmd(&home, &bin)
+            .args(["--http-endpoint", &endpoint, "grok"])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains(
+                "Failed to start Grok Build: it is not installed (no `grok` on PATH). Install it with `curl -fsSL https://x.ai/cli/install.sh | bash`. Then rerun `spice grok`.",
+            ));
+    }
+
+    /// Grok Build applies an endpoint in its own config over the one spice
+    /// gives it, which would send the runtime key elsewhere: refused, naming
+    /// the file and the setting, before Grok starts.
+    #[test]
+    fn a_grok_endpoint_in_its_own_config_is_refused_before_grok_starts() {
+        let endpoint = user_runtime();
+        let dir = TempDir::new().expect("tempdir");
+        let (home, bin, record) = (
+            dir.path().join("home"),
+            dir.path().join("bin"),
+            dir.path().join("record"),
+        );
+        stub_agent(&bin, "grok", &record, &[], 0);
+        let config = home.join(".grok/config.toml");
+        fs::create_dir_all(config.parent().expect("a parent")).expect("create ~/.grok");
+        fs::write(
+            &config,
+            "[endpoints]\nmodels_base_url = \"http://127.0.0.1:9/v1\"\n",
+        )
+        .expect("write Grok's config");
+
+        agent_cmd(&home, &bin)
+            .env_remove("GROK_HOME")
+            .args(["--http-endpoint", &endpoint, "grok", "-p", "hi"])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains(format!(
+                "Failed to start Grok Build: '{}' sets `endpoints.models_base_url` to 'http://127.0.0.1:9/v1', which Grok Build applies over the endpoint spice gives it, so its requests and the runtime key would go there instead of to Spice. Remove `endpoints.models_base_url` from that file to run Grok Build on Spice.",
+                config.display()
+            )));
+        assert!(!record.exists(), "Grok must not start");
+    }
+
+    /// With no runtime to use and no Spicepod to start one for, nothing is
+    /// started: a runtime without a Spicepod answers every request with an
+    /// error.
+    #[test]
+    fn a_directory_without_a_spicepod_says_how_to_get_a_runtime() {
+        let lab = Lab::new(Duration::ZERO);
+        fs::remove_file(lab.app.join("spicepod.yaml")).expect("remove the Spicepod");
+        let address = free_address();
+        let mut session = lab.session("only", &format!("http://{address}"));
+        let status = session.wait();
+        let output = lab.output("only");
+        assert_eq!(status.code(), Some(1), "{output}");
+        assert!(
+            output.contains(&format!(
+                "Failed to start the Spice runtime for pi: there is no spicepod.yaml in '{}', and no Spice runtime answers at http://{address}. Run `spice pi` in your Spicepod's directory, start a runtime there with `spice run`, or create a Spicepod here with `spice init` and add a model with `spice model add my-model --from openai:gpt-4o-mini`.",
+                fs::canonicalize(&lab.app)
+                    .expect("resolve the app directory")
+                    .display()
+            )),
+            "{output}"
+        );
+        assert_eq!(lab.runtime_pid(), None, "no runtime was started");
+        assert!(!lab.agent_started("only"));
+    }
+
+    /// A runtime at an endpoint the user named is used whichever Spicepod it
+    /// serves, and the session says which one that is.
+    #[test]
+    fn a_named_runtime_serving_another_spicepod_is_used_and_named() {
+        let endpoint = user_runtime();
+        let dir = TempDir::new().expect("tempdir");
+        let (home, bin, record, project) = (
+            dir.path().join("home"),
+            dir.path().join("bin"),
+            dir.path().join("record"),
+            dir.path().join("proj-b"),
+        );
+        stub_agent(&bin, "codex", &record, &[], 0);
+        fs::create_dir_all(&project).expect("create the project");
+        fs::write(
+            project.join("spicepod.yaml"),
+            "version: v1\nkind: Spicepod\nname: proj-b\n",
+        )
+        .expect("write the Spicepod");
+
+        agent_cmd(&home, &bin)
+            .current_dir(&project)
+            .args(["--http-endpoint", &endpoint, "codex", "exec", "hi"])
+            .assert()
+            .success()
+            .stderr(predicate::str::contains(format!(
+                "Using the Spice runtime already serving the Spicepod 'proj-a' at {endpoint}, not the Spicepod 'proj-b' in this directory, since --http-endpoint names it"
+            )));
+        assert!(record.exists(), "the agent ran");
+    }
+
+    /// `spice help claude` is the one way to read the command's own help, since
+    /// `--help` after the command is Claude Code's.
+    #[test]
+    fn the_commands_help_is_reached_through_spice_help() {
+        spice_cmd()
+            .args(["help", "claude"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "Every argument after `claude` is passed to Claude Code unchanged",
+            ));
+    }
+
+    /// A stub `spiced`: writes its PID, waits `delay`, then serves `/health`
+    /// and `/v1/models` on the `--http` address it is given. It exits on
+    /// SIGTERM, and once the test's directory is gone, so a failing test
+    /// cannot leave it running. It binds without `HTTPServer`'s lookup of the
+    /// host's name, which waits on DNS: on a host whose resolver did not answer
+    /// it, the stub never listened within the test's budget.
+    fn stub_runtime(path: &Path, pid_file: &Path, delay: Duration) {
+        let python = python3();
+        let test_dir = pid_file.parent().expect("the PID file's directory");
+        write_executable(
+            path,
+            &format!(
+                r#"#!{python}
+import http.server, os, signal, socketserver, sys, threading, time
+args = sys.argv[1:]
+host, port = args[args.index("--http") + 1].rsplit(":", 1)
+signal.signal(signal.SIGTERM, lambda *args: os._exit(0))
+def watch():
+    while os.path.isdir({test_dir:?}):
+        time.sleep(0.2)
+    os._exit(0)
+threading.Thread(target=watch, daemon=True).start()
+open({pid_file:?}, "w").write(str(os.getpid()))
+time.sleep({delay})
+MODELS = {MODELS:?}.encode()
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"ok" if self.path == "/health" else MODELS if self.path.startswith("/v1/models") else b""
+        self.send_response(200 if body else 404)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+class Server(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = host, int(port)
+Server((host, int(port)), Handler).serve_forever()
+"#,
+                python = python.display(),
+                test_dir = test_dir.display().to_string(),
+                pid_file = pid_file.display().to_string(),
+                delay = delay.as_secs_f64(),
+            ),
+        );
+    }
+
+    fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + BUDGET;
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn serving(address: &str) -> bool {
+        std::net::TcpStream::connect(address).is_ok()
+    }
+
+    fn free_address() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address").to_string();
+        drop(listener);
+        address
+    }
+
+    /// A spawned `spice` session, killed with its agent if the test fails
+    /// before it exits on its own.
+    struct Session(std::process::Child);
+
+    impl Session {
+        fn wait(&mut self) -> std::process::ExitStatus {
+            self.0.wait().expect("wait for the session")
+        }
+
+        fn interrupt(&self) {
+            let status = std::process::Command::new("/bin/kill")
+                .args(["-INT", &self.0.id().to_string()])
+                .status()
+                .expect("run kill");
+            assert!(status.success(), "send SIGINT to the session");
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    /// A Spicepod directory, a private home, and a stub runtime for `spice` to
+    /// start, with a `pi` on `PATH` that says it is running, then waits to be
+    /// told to exit.
+    struct Lab {
+        dir: TempDir,
+        home: std::path::PathBuf,
+        bin: std::path::PathBuf,
+        app: std::path::PathBuf,
+        spiced: std::path::PathBuf,
+        pid_file: std::path::PathBuf,
+    }
+
+    impl Lab {
+        /// `runtime_delay` is how long the stub runtime takes to start serving.
+        fn new(runtime_delay: Duration) -> Self {
+            let dir = TempDir::new().expect("tempdir");
+            let root = dir.path().to_path_buf();
+            let lab = Self {
+                home: root.join("home"),
+                bin: root.join("bin"),
+                app: root.join("app"),
+                spiced: root.join("runtime").join("spiced"),
+                pid_file: root.join("spiced.pid"),
+                dir,
+            };
+            fs::create_dir_all(&lab.app).expect("create the app directory");
+            fs::write(
+                lab.app.join("spicepod.yaml"),
+                "version: v1\nkind: Spicepod\nname: lab\n",
+            )
+            .expect("write the Spicepod");
+            stub_runtime(&lab.spiced, &lab.pid_file, runtime_delay);
+            write_executable(
+                &lab.bin.join("pi"),
+                &format!(
+                    "#!/bin/sh\ntouch '{d}/started-'\"$SESSION\"\nwhile [ -d '{d}' ] && [ ! -e '{d}/exit-'\"$SESSION\" ]; do sleep 0.05; done\n",
+                    d = root.display()
+                ),
+            );
+            lab
+        }
+
+        /// `spice --http-endpoint {endpoint} pi`, as the session `name`.
+        fn session(&self, name: &str, endpoint: &str) -> Session {
+            self.run(name, endpoint, "pi")
+        }
+
+        /// `spice --http-endpoint {endpoint} {command}`, as the session `name`.
+        fn run(&self, name: &str, endpoint: &str, command: &str) -> Session {
+            let log = fs::File::create(self.dir.path().join(format!("session-{name}.log")))
+                .expect("create the session log");
+            Session(
+                std::process::Command::new(assert_cmd::cargo::cargo_bin!("spice"))
+                    .current_dir(&self.app)
+                    .env("HOME", &self.home)
+                    .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
+                    .env("SPICED_PATH", &self.spiced)
+                    .env("SESSION", name)
+                    .env_remove("SPICE_API_KEY")
+                    .args(["--http-endpoint", endpoint, command])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(log.try_clone().expect("clone the session log"))
+                    .stderr(log)
+                    .spawn()
+                    .unwrap_or_else(|error| panic!("start spice {command}: {error}")),
+            )
+        }
+
+        /// What the session `name` printed.
+        fn output(&self, name: &str) -> String {
+            fs::read_to_string(self.dir.path().join(format!("session-{name}.log")))
+                .unwrap_or_default()
+        }
+
+        fn agent_started(&self, name: &str) -> bool {
+            self.dir.path().join(format!("started-{name}")).exists()
+        }
+
+        fn release(&self, name: &str) {
+            fs::write(self.dir.path().join(format!("exit-{name}")), "").expect("release the agent");
+        }
+
+        /// The stub runtime's PID, once it has been launched.
+        fn runtime_pid(&self) -> Option<i32> {
+            fs::read_to_string(&self.pid_file).ok()?.trim().parse().ok()
+        }
+
+        /// The runtimes the sessions have recorded as theirs to stop.
+        fn records(&self) -> Vec<String> {
+            fs::read_dir(self.home.join(".spice/run"))
+                .map(|entries| {
+                    entries
+                        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+                        .filter(|name| {
+                            Path::new(name)
+                                .extension()
+                                .is_some_and(|extension| extension == "json")
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    /// Two agents share the runtime the first one started: it outlives the
+    /// first agent, and the second one stops it.
+    #[test]
+    fn a_started_runtime_is_shared_and_stopped_by_the_last_agent_to_exit() {
+        let lab = Lab::new(Duration::ZERO);
+        let address = free_address();
+        let endpoint = format!("http://{address}");
+
+        let mut first = lab.session("first", &endpoint);
+        wait_for("the first agent", || lab.agent_started("first"));
+        assert!(serving(&address), "the first session started the runtime");
+        let mut second = lab.session("second", &endpoint);
+        wait_for("the second agent", || lab.agent_started("second"));
+
+        lab.release("first");
+        assert!(first.wait().success(), "{}", lab.output("first"));
+        assert!(
+            serving(&address),
+            "the runtime outlives the first agent while the second still uses it"
+        );
+
+        lab.release("second");
+        assert!(second.wait().success(), "{}", lab.output("second"));
+        let pid = lab.runtime_pid().expect("the runtime wrote its PID");
+        wait_for("the runtime to stop", || {
+            !serving(&address) && !process_exists(pid)
+        });
+        assert_eq!(
+            lab.records(),
+            Vec::<String>::new(),
+            "the record of the stopped runtime is removed"
+        );
+    }
+
+    /// Spellings of one endpoint share its runtime: a session on `localhost`
+    /// keeps alive the runtime a session on `127.0.0.1` started, and is the
+    /// one that stops it.
+    #[test]
+    fn a_started_runtime_is_shared_across_spellings_of_its_endpoint() {
+        let lab = Lab::new(Duration::ZERO);
+        let address = free_address();
+        let port = address.rsplit(':').next().expect("a port");
+
+        let mut first = lab.session("first", &format!("http://{address}"));
+        wait_for("the first agent", || lab.agent_started("first"));
+        let mut second = lab.session("second", &format!("http://localhost:{port}"));
+        wait_for("the second agent", || lab.agent_started("second"));
+
+        lab.release("first");
+        assert!(first.wait().success(), "{}", lab.output("first"));
+        assert!(
+            serving(&address),
+            "the runtime outlives the first agent while the second uses it under another spelling"
+        );
+
+        lab.release("second");
+        assert!(second.wait().success(), "{}", lab.output("second"));
+        let pid = lab.runtime_pid().expect("the runtime wrote its PID");
+        wait_for("the runtime to stop", || {
+            !serving(&address) && !process_exists(pid)
+        });
+        assert_eq!(lab.records(), Vec::<String>::new());
+    }
+
+    /// A spelling of the address that does not reach the runtime another
+    /// session started is refused with the endpoint to use, and the runtime is
+    /// left to the session using it: `[::1]` does not reach a runtime bound to
+    /// `127.0.0.1`.
+    #[test]
+    fn a_spelling_that_does_not_reach_another_sessions_runtime_is_refused() {
+        let lab = Lab::new(Duration::ZERO);
+        let address = free_address();
+        let port = address.rsplit(':').next().expect("a port");
+        let endpoint = format!("http://{address}");
+
+        let mut first = lab.session("first", &endpoint);
+        wait_for("the first agent", || lab.agent_started("first"));
+        let mut second = lab.session("second", &format!("http://[::1]:{port}"));
+        let status = second.wait();
+        let output = lab.output("second");
+        assert_eq!(status.code(), Some(1), "{output}");
+        assert!(
+            output.contains(&format!(
+                "another `spice` session is using the runtime it started at {endpoint}, which does not answer at http://[::1]:{port}. Rerun with `--http-endpoint {endpoint}`"
+            )),
+            "{output}"
+        );
+        assert!(!lab.agent_started("second"));
+        assert!(
+            serving(&address),
+            "the runtime the first session uses keeps running"
+        );
+
+        lab.release("first");
+        assert!(first.wait().success(), "{}", lab.output("first"));
+        let pid = lab.runtime_pid().expect("the runtime wrote its PID");
+        wait_for("the runtime to stop", || !process_exists(pid));
+        assert_eq!(lab.records(), Vec::<String>::new());
+    }
+
+    /// Ctrl-C while the runtime is starting stops the runtime the session
+    /// launched, since no agent will ever use it.
+    #[test]
+    fn interrupting_a_runtime_start_stops_the_runtime() {
+        // Longer than the test runs: the runtime is still starting when Ctrl-C comes.
+        let lab = Lab::new(Duration::from_secs(600));
+        let address = free_address();
+
+        let mut session = lab.session("only", &format!("http://{address}"));
+        wait_for("the runtime to be launched", || lab.runtime_pid().is_some());
+        let pid = lab.runtime_pid().expect("the runtime wrote its PID");
+        wait_for("the session to record the runtime", || {
+            !lab.records().is_empty()
+        });
+
+        session.interrupt();
+        let status = session.wait();
+        assert_eq!(status.code(), Some(130), "{}", lab.output("only"));
+        wait_for("the runtime to stop", || !process_exists(pid));
+        assert_eq!(lab.records(), Vec::<String>::new());
+        assert!(!lab.agent_started("only"));
+    }
+
+    /// A runtime that exits before it serves fails the session with one error
+    /// line that names the full log, below the runtime's last output.
+    #[test]
+    fn a_runtime_that_exits_before_serving_is_reported_on_one_line() {
+        let lab = Lab::new(Duration::ZERO);
+        write_executable(
+            &lab.spiced,
+            "#!/bin/sh\necho 'spiced: loading the Spicepod'\necho 'spiced: the Spicepod is not valid' >&2\nexit 3\n",
+        );
+        let port = free_address()
+            .rsplit_once(':')
+            .map(|(_, port)| port.to_string())
+            .expect("a port");
+        let endpoint = format!("http://127.0.0.1:{port}");
+
+        let status = lab.session("only", &endpoint).wait();
+        let output = lab.output("only");
+        assert!(!status.success(), "{output}");
+        assert!(!lab.agent_started("only"), "{output}");
+        let log = lab.home.join(format!(".spice/run/localhost_{port}.log"));
+        let error = format!(
+            "ERROR Failed to start the Spice runtime at {endpoint}, so the coding agent was not started: the runtime exited (exit status: 3) before it started serving; its last output is above. The full log is at '{}'. See: https://spiceai.org/docs/cli",
+            log.display()
+        );
+        let lines: Vec<&str> = output.lines().collect();
+        let error_at = lines
+            .iter()
+            .position(|line| *line == error)
+            .unwrap_or_else(|| panic!("no line is the whole error {error:?} in:\n{output}"));
+        let cause_at = lines
+            .iter()
+            .position(|line| *line == "spiced: the Spicepod is not valid")
+            .unwrap_or_else(|| panic!("the runtime's output is not shown in:\n{output}"));
+        assert!(
+            cause_at < error_at,
+            "the runtime's output comes first:\n{output}"
+        );
+    }
+
+    /// Ctrl-C ends a session that is waiting for another to finish starting the
+    /// runtime at once, not when the other session lets go.
+    #[test]
+    fn interrupting_a_wait_for_another_sessions_start_ends_at_once() {
+        // Longer than the test runs: the first session is still starting the runtime.
+        let lab = Lab::new(Duration::from_secs(600));
+        let endpoint = format!("http://{}", free_address());
+
+        let _starting = lab.session("first", &endpoint);
+        wait_for("the runtime to be launched", || lab.runtime_pid().is_some());
+        let mut waiting = lab.session("second", &endpoint);
+        wait_for("the second session to wait for the first", || {
+            lab.output("second")
+                .contains("Waiting for another `spice` session to finish starting")
+        });
+
+        let interrupted = std::time::Instant::now();
+        waiting.interrupt();
+        let deadline = interrupted + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = waiting.0.try_wait().expect("poll the session") {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the interrupted session still runs {:?} after Ctrl-C: {}",
+                interrupted.elapsed(),
+                lab.output("second")
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(130), "{}", lab.output("second"));
+        assert!(!lab.agent_started("second"));
+    }
+
+    /// A stub Claude Code's recorded arguments, one per line: the path of the
+    /// `--settings` file spice routes it with, which comes first, and the rest.
+    fn after_routing_settings(recorded: &str) -> (&str, &str) {
+        recorded
+            .strip_prefix("--settings\n")
+            .and_then(|rest| rest.split_once('\n'))
+            .expect("Claude Code's routing settings come first")
+    }
+
+    /// The `python3` the stubs of the runtime and of Orca run on.
+    fn python3() -> std::path::PathBuf {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .expect("python3 is needed to stand in for the runtime and Orca")
+    }
+
+    /// A stub of Orca's `orca` command, installed where `spice orca` looks for
+    /// it: inside an `Orca.app` linked onto `PATH` on macOS, as `orca-ide` on
+    /// Linux. Every call is logged to `<root>/orca.log` as a JSON line.
+    ///
+    /// `orca open` starts a stand-in for the app — a process whose arguments
+    /// carry `--user-data-dir=<profile>`, as Orca's do — which imports the
+    /// profile's seed, but with Codex's command changed the way a user could
+    /// in Orca's settings, then answers `settings.get` on a Unix socket until
+    /// `<root>/quit-orca` appears. `orca status` exits 3.
+    fn stub_orca(root: &Path, bin: &Path) {
+        let script = format!(
+            r#"#!{python}
+import json, os, socket, subprocess, sys, threading, time
+ROOT = {root:?}
+args = sys.argv[1:]
+user_data = os.environ.get("ORCA_USER_DATA_PATH", "")
+if args[:1] != ["--app"]:
+    with open(os.path.join(ROOT, "orca.log"), "a") as log:
+        log.write(json.dumps({{"args": args, "user_data": user_data, "cwd": os.getcwd()}}) + "\n")
+def gone():
+    return not os.path.isdir(ROOT) or os.path.exists(os.path.join(ROOT, "quit-orca"))
+if args[:1] == ["open"]:
+    subprocess.Popen([sys.executable, __file__, "--app", "--user-data-dir=" + user_data],
+                     start_new_session=True, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    metadata = os.path.join(user_data, "orca-runtime.json")
+    while not os.path.exists(metadata) and not gone():
+        time.sleep(0.02)
+    sys.exit(0)
+if args[:1] == ["--app"]:
+    user_data = args[1].split("=", 1)[1]
+    seed = json.load(open(os.path.join(user_data, "orca-data.json")))
+    commands = dict(seed["settings"]["agentCmdOverrides"])
+    commands["codex"] = "codex"
+    path = "/tmp/spice-orca-test-%d.sock" % os.getpid()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(path)
+    server.listen()
+    def answer():
+        while True:
+            connection, _ = server.accept()
+            request = json.loads(connection.makefile().readline())
+            reply = {{"id": request["id"], "ok": False}}
+            if request.get("authToken") == "t0k" and request.get("method") == "settings.get":
+                reply = {{"id": request["id"], "ok": True, "result": {{"settings": {{"agentCmdOverrides": commands}}}}}}
+            connection.sendall(b'{{"_keepalive": true}}\n' + json.dumps(reply).encode() + b"\n")
+            connection.close()
+    threading.Thread(target=answer, daemon=True).start()
+    staged = os.path.join(user_data, "orca-runtime.json.tmp")
+    json.dump({{"pid": os.getpid(), "transports": [{{"kind": "unix", "endpoint": path}}], "authToken": "t0k"}}, open(staged, "w"))
+    os.rename(staged, os.path.join(user_data, "orca-runtime.json"))
+    while not gone():
+        time.sleep(0.05)
+    os.unlink(path)
+    sys.exit(0)
+if args[:2] == ["repo", "add"]:
+    print(json.dumps({{"ok": True}}))
+    sys.exit(0)
+if args[:1] == ["status"]:
+    sys.exit(3)
+"#,
+            python = python3().display(),
+            root = root.display().to_string(),
+        );
+        if cfg!(target_os = "macos") {
+            let app_script = root.join("apps/Orca.app/Contents/Resources/bin/orca");
+            write_executable(&app_script, &script);
+            fs::create_dir_all(bin).expect("create bin");
+            std::os::unix::fs::symlink(&app_script, bin.join("orca"))
+                .expect("link Orca's command onto PATH");
+        } else {
+            write_executable(&bin.join("orca-ide"), &script);
+        }
+    }
+
+    /// The calls the stub `orca` logged.
+    fn orca_calls(root: &Path) -> Vec<serde_json::Value> {
+        fs::read_to_string(root.join("orca.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a JSON log line"))
+            .collect()
+    }
+
+    /// `spice orca` opens Orca on the Spice profile, which it seeds with every
+    /// agent running through its launcher; keeps the runtime it started while
+    /// Orca is open; warns about the agent whose command a user changed; adds
+    /// the git repository it ran in to Orca's projects; and stops the runtime
+    /// once Orca has quit.
+    #[test]
+    fn orca_runs_every_agent_through_spice_and_keeps_the_runtime_until_it_quits() {
+        let lab = Lab::new(Duration::ZERO);
+        let root = lab.dir.path();
+        stub_orca(root, &lab.bin);
+        let git = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&lab.app)
+            .status()
+            .expect("run git");
+        assert!(git.success(), "git init");
+        let address = free_address();
+        let endpoint = format!("http://{address}");
+        let mut session = lab.run("orca", &endpoint, "orca");
+        let output = || lab.output("orca");
+
+        let codex_warning = format!(
+            "Orca runs Codex CLI with the command 'codex', so Codex CLI sessions in Orca do not use Spice. Set Codex CLI's command in Orca's Settings, under Agents, to `'{}/.spice/orca/bin/spice-agent' codex`.",
+            lab.home.display()
+        );
+        wait_for("the warning about Codex CLI's command", || {
+            output().contains(&codex_warning)
+        });
+        let project = fs::canonicalize(&lab.app).expect("resolve the project");
+        wait_for("the project to be added", || {
+            orca_calls(root).iter().any(|call| {
+                call["args"]
+                    == serde_json::json!([
+                        "repo",
+                        "add",
+                        "--path",
+                        project.display().to_string(),
+                        "--json"
+                    ])
+            })
+        });
+        let profile = lab.home.join(".spice/orca/profile");
+        let calls = orca_calls(root);
+        assert_eq!(
+            calls[0]["args"],
+            serde_json::json!(["open"]),
+            "`orca open` by default"
+        );
+        assert_eq!(calls[0]["user_data"], profile.display().to_string());
+
+        // Orca is open: the session holds the runtime it started.
+        assert!(matches!(session.0.try_wait(), Ok(None)), "{}", output());
+        assert!(serving(&address), "the runtime serves while Orca is open");
+        let runtime = lab.runtime_pid().expect("the runtime wrote its PID");
+
+        let launcher = lab.home.join(".spice/orca/bin/spice-agent");
+        let command = |agent: &str| format!("'{}' {agent}", launcher.display());
+        assert_eq!(
+            fs::read_to_string(profile.join("orca-data.json")).expect("the profile was seeded"),
+            serde_json::json!({ "settings": { "agentCmdOverrides": {
+                "antigravity": command("agy"),
+                "claude": command("claude"),
+                "codex": command("codex"),
+                "copilot": command("copilot"),
+                "cursor": command("cursor"),
+                "grok": command("grok"),
+                "opencode": command("opencode"),
+                "pi": command("pi"),
+            }}})
+            .to_string()
+        );
+        let spice = assert_cmd::cargo::cargo_bin!("spice");
+        assert_eq!(
+            fs::read_to_string(&launcher).expect("the launcher was written"),
+            format!(
+                "#!/bin/sh\n# Written by `spice orca`, which rewrites it on every run. Orca runs each coding\n# agent as `spice-agent <agent> [ARGS]`, which starts it on the Spice runtime.\nexec '{}' --http-endpoint '{endpoint}' \"$@\"\n",
+                spice.display()
+            )
+        );
+        assert!(
+            !output().contains("Orca runs Claude Code"),
+            "only the changed command is warned about: {}",
+            output()
+        );
+
+        fs::write(root.join("quit-orca"), "").expect("quit Orca");
+        wait_for("spice orca to exit once Orca has quit", || {
+            matches!(session.0.try_wait(), Ok(Some(_)))
+        });
+        assert!(session.wait().success(), "{}", output());
+        wait_for("the runtime to stop", || !process_exists(runtime));
+        assert_eq!(lab.records(), Vec::<String>::new());
+    }
+
+    /// Arguments reach Orca's command unchanged, and its exit code is
+    /// `spice orca`'s; the launcher it leaves then starts an agent through
+    /// spice, on the endpoint the session used.
+    #[test]
+    fn orca_gets_every_argument_and_its_launcher_starts_agents_through_spice() {
+        let endpoint = user_runtime();
+        let dir = TempDir::new().expect("tempdir");
+        let (root, home, bin, record) = (
+            dir.path(),
+            dir.path().join("home"),
+            dir.path().join("bin"),
+            dir.path().join("record"),
+        );
+        stub_orca(root, &bin);
+        stub_agent(&bin, "claude", &record, &["ANTHROPIC_BASE_URL"], 0);
+
+        agent_cmd(&home, &bin)
+            .args([
+                "--http-endpoint",
+                &endpoint,
+                "orca",
+                "status",
+                "-v",
+                "--json",
+            ])
+            .assert()
+            .code(3);
+        let calls = orca_calls(root);
+        assert_eq!(
+            calls.len(),
+            1,
+            "no follow-up for a command that opens nothing"
+        );
+        assert_eq!(
+            calls[0]["args"],
+            serde_json::json!(["status", "-v", "--json"])
+        );
+
+        let launcher = home.join(".spice/orca/bin/spice-agent");
+        let ran = std::process::Command::new(&launcher)
+            .args(["claude", "--model", "qwen", "-p", "hi"])
+            .env("HOME", &home)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env_remove("SPICE_API_KEY")
+            .stdin(std::process::Stdio::null())
+            .status()
+            .expect("run the launcher");
+        assert!(ran.success(), "the agent ran through the launcher");
+        let recorded = fs::read_to_string(&record).expect("the agent ran");
+        let (_, rest) = after_routing_settings(&recorded);
+        assert_eq!(
+            rest,
+            format!("--model\nqwen\n-p\nhi\nANTHROPIC_BASE_URL={endpoint}\n")
+        );
+    }
+
+    #[test]
+    fn a_missing_orca_says_how_to_install_it() {
+        if Path::new("/Applications/Orca.app").exists() {
+            eprintln!("skipped: this machine has Orca installed in /Applications");
+            return;
+        }
+        let endpoint = user_runtime();
+        let dir = TempDir::new().expect("tempdir");
+        let (home, bin) = (dir.path().join("home"), dir.path().join("bin"));
+        fs::create_dir_all(&bin).expect("create bin");
+        let expected = if cfg!(target_os = "macos") {
+            "Failed to start Orca: it is not installed (no `orca` on PATH). Install it with `brew install --cask stablyai/orca/orca`, or download it from https://onorca.dev/download. Then rerun `spice orca`. See: https://www.onorca.dev/docs/install"
+        } else {
+            "Failed to start Orca: it is not installed (no `orca-ide` on PATH). Download it from https://onorca.dev/download, and register its `orca-ide` command in Orca's Settings, under General. Then rerun `spice orca`. See: https://www.onorca.dev/docs/install"
+        };
+        agent_cmd(&home, &bin)
+            .args(["--http-endpoint", &endpoint, "orca"])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains(expected));
+        assert!(
+            !home.join(".spice/orca").exists(),
+            "nothing is written for an Orca that is not installed"
+        );
+    }
+
+    /// Whether a signal could be sent to `pid`, without sending one.
+    fn process_exists(pid: i32) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+}

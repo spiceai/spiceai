@@ -148,8 +148,6 @@ mod staged_append_test;
 mod stats_edge_cases_test;
 mod string_bounds_statistics_test;
 mod timestamp_unit_roundtrip_test;
-#[cfg(feature = "turso")]
-mod turso_0_7_2_open_compat_test;
 mod update_test;
 mod upsert_with_pending_deletions_test;
 mod vortex_compressible_test;

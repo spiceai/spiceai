@@ -24,7 +24,9 @@ use arrow_flight::{
 };
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::SchemaRef;
-use arrow_tools::ipc::{declares_ipc_data, declares_record_batch};
+use arrow_tools::ipc::{
+    check_declared_decompressed_size, declares_ipc_data, declares_record_batch,
+};
 use arrow_tools::map_entries::{self, MapEntriesNormalizer};
 use arrow_tools::schema::verify_schema;
 use datafusion::{
@@ -456,6 +458,14 @@ impl MapEntriesGuard {
         if !declares_batch {
             return Ok(None);
         }
+
+        check_declared_decompressed_size(&message.data_header, &message.data_body).map_err(
+            |e| {
+                let message = decode_failure_message(path, &e);
+                tracing::error!(dataset = %path, "{message}");
+                Status::invalid_argument(message)
+            },
+        )?;
 
         let batch = arrow_flight::utils::flight_data_to_arrow_batch(
             message,

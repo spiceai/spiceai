@@ -1055,26 +1055,6 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
                     })?;
             }
 
-            #[cfg(windows)]
-            if dest_path.exists() {
-                ensure_existing_destination_is_safe(&dest_path, &dest_root)?;
-                if dest_path.is_dir() {
-                    let _ = fs::remove_file(&temp_path);
-                    return Err(ArchiveError::UnsafeArchivePath {
-                        path: dest_path,
-                        reason: "archive file entry conflicts with an existing directory"
-                            .to_string(),
-                    });
-                }
-                fs::remove_file(&dest_path).map_err(|source| {
-                    let _ = fs::remove_file(&temp_path);
-                    ArchiveError::ExtractArchive {
-                        path: dest_path.clone(),
-                        source,
-                    }
-                })?;
-            }
-
             // Atomic rename
             fs::rename(&temp_path, &dest_path).map_err(|source| {
                 // Cleanup temp file on rename failure

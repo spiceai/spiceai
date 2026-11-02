@@ -68,7 +68,6 @@ fn accelerator_crates_register_their_engines() {
         engines.iter().any(|engine| engine == "duckdb"),
         "the duckdb accelerator is not registered in this test binary; linked engines: {engines:?}"
     );
-    #[cfg(not(windows))]
     assert!(
         engines.iter().any(|engine| engine == "cayenne"),
         "the cayenne accelerator is not registered in this test binary; linked engines: {engines:?}"
@@ -84,9 +83,7 @@ mod adbc;
 mod append_coalescing;
 mod cache;
 mod catalog;
-#[cfg(not(windows))]
 mod cayenne;
-#[cfg(not(windows))]
 mod cayenne_catalog_ddl;
 #[cfg(feature = "duckdb")]
 mod clickbench;
@@ -143,9 +140,7 @@ mod iceberg;
 mod iceberg_api;
 mod json;
 
-#[cfg(not(windows))]
 mod cayenne_catalog_tuning;
-#[cfg(not(windows))]
 mod cdc_cayenne;
 #[cfg(feature = "debezium")]
 mod cdc_ingest;
@@ -166,11 +161,8 @@ mod mysql;
 mod odbc;
 #[cfg(feature = "oracle")]
 mod oracle;
-#[cfg(not(windows))]
 mod otel_ingest_races;
-#[cfg(not(windows))]
 mod otel_logs;
-#[cfg(not(windows))]
 mod otel_restart;
 mod plan_capture;
 #[cfg(feature = "postgres")]
@@ -206,8 +198,7 @@ mod schema_evolution;
 mod sharepoint;
 #[cfg(feature = "snapshots")]
 mod snapshot_integration;
-// Cayenne does not build on Windows.
-#[cfg(all(feature = "snapshots", feature = "duckdb", not(windows)))]
+#[cfg(all(feature = "snapshots", feature = "duckdb"))]
 mod snapshot_source;
 #[cfg(feature = "snowflake")]
 mod snowflake;

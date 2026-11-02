@@ -26,6 +26,7 @@ limitations under the License.
 mod block_to_arrow;
 mod conn;
 mod factory;
+mod federation;
 mod pool;
 
 use async_trait::async_trait;
@@ -43,7 +44,6 @@ use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use pool::ClickhouseConnectionPool;
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParamLookup, ParameterSpec, Parameters};
-use runtime_udfs_api::deny_spice_specific_functions;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
@@ -188,11 +188,7 @@ impl DataConnectorFactory for ClickhouseFactory {
                         config.db,
                         config.compute_context,
                     );
-                    // Install the Spice function deny-list so Spice-only UDFs
-                    // (json_get_str, etc.) are evaluated locally instead of pushed
-                    // into ClickHouse SQL, which would reject them (#10703).
-                    let clickhouse_factory = ClickhouseTableFactory::new(Arc::new(pool))
-                        .with_function_support(deny_spice_specific_functions().as_ref().clone());
+                    let clickhouse_factory = ClickhouseTableFactory::new(Arc::new(pool));
                     Ok(Arc::new(Clickhouse { clickhouse_factory }) as Arc<dyn DataConnector>)
                 }
 

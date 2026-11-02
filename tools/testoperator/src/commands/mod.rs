@@ -453,7 +453,7 @@ pub(crate) async fn get_app_and_start_request(
     // remains unset and all metric operations are no-ops.
 
     let app = load_app(args).await?;
-    let start_request = start_request_from_app(args, app.clone())?;
+    let start_request = start_request_from_app(args, app.clone()).await?;
 
     Ok((app, start_request))
 }
@@ -462,7 +462,7 @@ pub(crate) async fn get_dataset_app_and_start_request(
     args: &DatasetTestArgs,
 ) -> anyhow::Result<(App, StartRequest)> {
     let app = prepare_dataset_app(args).await?;
-    let start_request = start_request_from_app(&args.common, app.clone())?;
+    let start_request = start_request_from_app(&args.common, app.clone()).await?;
 
     Ok((app, start_request))
 }
@@ -476,7 +476,7 @@ pub(crate) async fn get_htap_app_and_start_request(
     ensure_layout_applies(args)?;
     let mut app = load_app(&args.common).await?;
     apply_layout_option(args, &mut app)?;
-    let start_request = start_request_from_app(&args.common, app.clone())?;
+    let start_request = start_request_from_app(&args.common, app.clone()).await?;
     Ok((app, start_request))
 }
 
@@ -517,8 +517,14 @@ fn apply_layout_option(args: &DatasetTestArgs, app: &mut App) -> anyhow::Result<
     Ok(())
 }
 
-fn start_request_from_app(args: &CommonArgs, app: App) -> anyhow::Result<StartRequest> {
-    let mut start_request = StartRequest::new(args.spiced_path_buf(), from_app(app))?;
+async fn start_request_from_app(args: &CommonArgs, app: App) -> anyhow::Result<StartRequest> {
+    let mut spicepod = from_app(app);
+    // `from_app` writes the newest spicepod version, which releases before 2.0
+    // reject; `spiced` gets the version the spicepod file declares.
+    spicepod.version = Spicepod::load_exact(args.spicepod_path.clone())
+        .await?
+        .version;
+    let mut start_request = StartRequest::new(args.spiced_path_buf(), spicepod)?;
 
     if let Some(ref data_dir) = args.data_dir {
         start_request = start_request.with_data_dir(data_dir.clone());
