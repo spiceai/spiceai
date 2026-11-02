@@ -276,7 +276,7 @@ Testing focus DRIs are responsible for:
 - [ ] If this is a **minor** release, update the scheduled benchmark job `dispatch-scheduled` in [`testoperator_dispatch.yml`](https://github.com/spiceai/spiceai/blob/trunk/.github/workflows/testoperator_dispatch.yml) to use the new release branch.
 - [ ] Update [brew taps](https://github.com/spiceai/homebrew-spiceai/actions/workflows/update-formula.yml) after the final build completes.
 - [ ] Remove or mark the released version in the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md).
-- [ ] Update the supported version in `SECURITY.md` if necessary.
+- [ ] Update the latest release in `SECURITY.md` (open source supports only the latest release; older versions are supported in Spice.ai Enterprise).
 - [ ] Confirm docs/install refs for Skills point at the matching release (or trunk if intentional).
 
 ## Announcement Checklist

@@ -47,4 +47,4 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
 
 ## Post-Release Housekeeping
 
-- [ ] Update the supported version in `SECURITY.md` if necessary.
+- [ ] Update the latest release in `SECURITY.md` (open source supports only the latest release; older versions are supported in Spice.ai Enterprise).
