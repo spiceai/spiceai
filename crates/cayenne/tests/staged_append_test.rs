@@ -1463,8 +1463,15 @@ async fn test_cancelled_plain_append_does_not_wedge_after_compaction_impl(
     let mut expected: Vec<i64> = (1..=4 * ROWS).collect();
     expected.extend(cancelled_start..cancelled_start + ROWS);
     expected.extend(next_start..next_start + ROWS);
-    let ids: Vec<i64> = query_all(&ctx, name).await.into_iter().map(|(id, _)| id).collect();
-    assert_eq!(ids, expected, "rows after a cancelled append and compaction");
+    let ids: Vec<i64> = query_all(&ctx, name)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        ids, expected,
+        "rows after a cancelled append and compaction"
+    );
     assert_eq!(
         count_star(&ctx, name).await,
         expected.len(),
