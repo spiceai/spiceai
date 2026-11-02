@@ -21,7 +21,7 @@
     "image": "docker.io/library/mongo",
     "versions": [
       { "version": "7.0", "end_of_life": "2027-08-31" },
-      { "version": "8.0", "end_of_life": "2029-10-31", "paused": "MongoDB 8.x refuses to start on Ubuntu 7.0 kernels, which the CI runners use (kernel 7.0.0-43); see https://jira mongodb.org/browse/SERVER-136848" },
+      { "version": "8.0", "end_of_life": "2029-10-31", "paused": "MongoDB 8.x refuses to start on Ubuntu 7.0 kernels, which the CI runners use (kernel 7.0.0-43); see https://jira.mongodb.org/browse/SERVER-136848" },
       { "version": "9.0", "end_of_life": "2031-10-31" }
     ]
   }
