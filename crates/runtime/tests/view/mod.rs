@@ -1067,3 +1067,136 @@ async fn test_failing_dataset_only_blocks_dependent_views() -> Result<(), anyhow
         })
         .await
 }
+
+async fn view_row_count(rt: &Arc<Runtime>, view: &str) -> Result<usize, String> {
+    let batches = rt
+        .datafusion()
+        .query_builder(&format!("SELECT * FROM {view}"))
+        .build()
+        .run()
+        .await
+        .map_err(|e| e.to_string())?
+        .data
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(batches.iter().map(RecordBatch::num_rows).sum())
+}
+
+/// A Spicepod change that replaces or removes a dataset re-registers the views
+/// that read it, directly, through other views or through a `localpod` child the
+/// change reloads, so they read what the Spicepod now declares.
+#[tokio::test]
+async fn test_view_follows_a_replaced_or_removed_dataset() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = tempfile::tempdir().expect("create temp dir");
+            let file =
+                |name: &str| format!("file:{}", temp_dir.path().join(name).to_string_lossy());
+            std::fs::write(temp_dir.path().join("a.csv"), "id\n1\n2").expect("write file");
+            std::fs::write(temp_dir.path().join("b.csv"), "id\n1\n2\n3").expect("write file");
+
+            let accelerated = |mut dataset: Dataset| {
+                dataset.acceleration = Some(Acceleration {
+                    enabled: true,
+                    engine: Some("arrow".to_string()),
+                    refresh_mode: Some(RefreshMode::Full),
+                    ..Acceleration::default()
+                });
+                dataset
+            };
+            let view = |name: &str, sql: &str| {
+                let mut view = View::new(name.to_string());
+                view.sql = Some(sql.to_string());
+                view
+            };
+            let views = [
+                view("v", "SELECT * FROM t"),
+                // Reads `v` by a qualified name.
+                view("w", "SELECT * FROM public.v"),
+                // Reads `v` only in a subquery.
+                view(
+                    "s",
+                    "SELECT id FROM (VALUES (1), (2), (3)) AS x(id) WHERE id IN (SELECT id FROM v)",
+                ),
+                // Reads a `localpod` child whose parent the change edits.
+                view("vc", "SELECT * FROM c"),
+            ];
+            let app = |t: Option<&str>, p: &str| {
+                let mut builder =
+                    app::AppBuilder::new("test_view_follows_a_replaced_or_removed_dataset")
+                        .with_dataset(accelerated(Dataset::new(file(p), "p")))
+                        .with_dataset(accelerated(Dataset::new("localpod:p", "c")));
+                if let Some(t) = t {
+                    builder = builder.with_dataset(Dataset::new(file(t), "t"));
+                }
+                for view in &views {
+                    builder = builder.with_view(view.clone());
+                }
+                builder.build()
+            };
+            let counts = async |rt: &Arc<Runtime>| {
+                let mut counts = Vec::new();
+                for view in ["v", "w", "s", "vc"] {
+                    counts.push(view_row_count(rt, view).await);
+                }
+                counts
+            };
+
+            configure_test_datafusion();
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app(Some("a.csv"), "a.csv"))
+                    .build()
+                    .await,
+            );
+            Arc::clone(&rt).load_components().await;
+            runtime_ready_check(&rt).await;
+            assert_eq!(counts(&rt).await, vec![Ok(2); 4]);
+
+            assert!(
+                Arc::clone(&rt)
+                    .apply_app(Arc::new(app(Some("b.csv"), "b.csv")))
+                    .await
+            );
+            let mut last = Vec::new();
+            for _ in 0..120 {
+                last = counts(&rt).await;
+                if last == vec![Ok(3); 4] {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            assert_eq!(
+                last,
+                vec![Ok(3); 4],
+                "v, w, s and vc must read the replaced datasets' 3 rows"
+            );
+
+            assert!(
+                Arc::clone(&rt)
+                    .apply_app(Arc::new(app(None, "b.csv")))
+                    .await
+            );
+            let mut last = Vec::new();
+            for _ in 0..120 {
+                last = counts(&rt).await;
+                if last[..3].iter().all(Result::is_err) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            assert!(
+                last[..3].iter().all(Result::is_err),
+                "v, w and s must stop answering once `t` is removed, got {last:?}"
+            );
+            assert_eq!(last[3], Ok(3), "vc does not read `t`");
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}

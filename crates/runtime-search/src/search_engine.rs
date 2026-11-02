@@ -510,7 +510,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                 })
                 .await;
             match (cache_control, cached) {
-                (CacheControl::NoCache, _) => {
+                (CacheControl::NoCache | CacheControl::Revalidate(_), _) => {
                     tracing::trace!("Search cache bypass");
                     let read_started_at = Instant::now();
                     let results = self.search(req).await?;

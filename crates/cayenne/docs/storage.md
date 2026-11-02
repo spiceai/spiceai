@@ -4,11 +4,11 @@ What Cayenne persists, and where. Cayenne splits storage across **two stores plu
 
 | Store | Holds | Durability |
 |-------|-------|------------|
-| **Metastore** (SQLite / Turso) | *all* metadata — table rows, snapshot pointers, file manifests, delete-file refs, statistics, sequence numbers, the inline memtable | transactional (`BEGIN…COMMIT`) |
+| **Metastore** (SQLite) | *all* metadata — table rows, snapshot pointers, file manifests, delete-file refs, statistics, sequence numbers, the inline memtable | transactional (`BEGIN…COMMIT`) |
 | **Data lake** (local FS / S3 Express One Zone) | immutable **Vortex** data files + Arrow-IPC deletion files, grouped under per-snapshot directories | atomic file rename + snapshot-pointer flip |
 | **LSM level-0** | small writes absorbed as Arrow-IPC blobs in the metastore (`cayenne_inlined_*`) and, under the CDC profile, an in-RAM mem-tier | metastore tier is durable; RAM tier is discarded on crash and re-streamed exactly-once |
 
-> **Source of truth:** the DDL in `crates/cayenne/src/metastore/sqlite.rs` (mirrored verbatim in `turso.rs`) and the column lists in `metastore::EXPECTED_TABLES`. `validate_existing_schema` checks **column names and ordering** at startup (types are not compared — SQLite/libSQL type affinity makes exact matching unreliable). This document reflects the 11 tables in `EXPECTED_TABLES`.
+> **Source of truth:** the DDL in `crates/cayenne/src/metastore/sqlite.rs` and the column lists in `metastore::EXPECTED_TABLES`. `validate_existing_schema` checks **column names and ordering** at startup (types are not compared — SQLite type affinity makes exact matching unreliable). This document reflects the 11 tables in `EXPECTED_TABLES`.
 
 ---
 
@@ -115,7 +115,7 @@ One row per deleted-then-reinserted PK of a CDC burst (20K–55K rows on hot ups
 | `pk_bytes` | BLOB NOT NULL | **PK** part — PK row key (Arrow `RowConverter` bytes) |
 | `sequence_number` | BIGINT NOT NULL | re-insertion sequence |
 
-Declared `WITHOUT ROWID` on SQLite (clustered on `(table_id, pk_bytes)`); a plain rowid table on Turso (no `WITHOUT ROWID` under its MVCC journal mode). The legacy `insert_record_id` UUID column was dropped — it was never read.
+Declared `WITHOUT ROWID` (clustered on `(table_id, pk_bytes)`). The legacy `insert_record_id` UUID column was dropped — it was never read.
 
 #### `cayenne_pk_index` — persisted PK existence checkpoint
 
@@ -441,6 +441,6 @@ Locks (`write_lock`, `compaction_lock`, `seq_allocator` mutex), staging trackers
 - **Sequence numbers** — monotonically increasing, reserved from the metastore (`reserve_sequence_numbers` batches reservations to cut round-trips). Every insert, delete, and re-insertion carries one; the scan path uses them to resolve "deleted, and re-inserted after that?".
 - **Visibility** — the authoritative state is `cayenne_table.current_snapshot_id`; a write or compaction becomes visible by an atomic flip of that pointer under the listing fence, never by mutating files in place.
 - **Schema validation** — `validate_existing_schema` compares column **names and ordering** only; a mismatch returns `CatalogError::SchemaMismatch` with an actionable "clear your acceleration data" message.
-- **Backends** — SQLite uses `BEGIN IMMEDIATE`; Turso uses `BEGIN CONCURRENT` (MVCC). DDL is identical across both except `WITHOUT ROWID` (SQLite-only).
+- **Backend** — SQLite uses `BEGIN IMMEDIATE`.
 
 > The DDL source (`metastore/sqlite.rs`) is authoritative; treat this as a quick reference. See [`README.md`](../README.md) for how these structures are used.

@@ -31,9 +31,52 @@ mod substrait_consumer;
 
 use std::sync::{Arc, OnceLock};
 
-use arrow_flight::FlightData;
+use arrow_flight::{FlightData, error::FlightError};
 use arrow_schema::SchemaRef;
 use arrow_tools::map_entries;
+use tonic::Status;
+
+/// Longest `LIKE` filter pattern, in bytes, that a metadata request may carry. A pattern with
+/// wildcards compiles to a regex whose size grows with the pattern.
+const MAX_FILTER_PATTERN_LEN: usize = 1024;
+
+/// Rejects a `field` filter pattern longer than [`MAX_FILTER_PATTERN_LEN`] bytes.
+pub(crate) fn check_filter_pattern(field: &str, pattern: Option<&str>) -> Result<(), Status> {
+    match pattern {
+        Some(pattern) if pattern.len() > MAX_FILTER_PATTERN_LEN => {
+            Err(Status::invalid_argument(format!(
+                "{field} is {} bytes long; the limit is {MAX_FILTER_PATTERN_LEN} bytes",
+                pattern.len()
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Most entries that one list field of a metadata request may carry.
+const MAX_LIST_ENTRIES: usize = 1024;
+
+/// Returns `values` sorted and deduplicated, or rejects a `field` list longer than
+/// [`MAX_LIST_ENTRIES`] entries.
+pub(crate) fn bounded_list<T: Ord>(field: &str, mut values: Vec<T>) -> Result<Vec<T>, Status> {
+    if values.len() > MAX_LIST_ENTRIES {
+        return Err(Status::invalid_argument(format!(
+            "{field} lists {} entries; the limit is {MAX_LIST_ENTRIES}",
+            values.len()
+        )));
+    }
+    values.sort_unstable();
+    values.dedup();
+    Ok(values)
+}
+
+/// Passes `message` through unless it is a compressed batch that declares too large a
+/// decompressed size for its body (see `arrow_tools::ipc::check_declared_decompressed_size`).
+pub(crate) fn within_decompression_bound(message: FlightData) -> Result<FlightData, FlightError> {
+    arrow_tools::ipc::check_declared_decompressed_size(&message.data_header, &message.data_body)
+        .map_err(|error| FlightError::Tonic(Box::new(Status::invalid_argument(error))))?;
+    Ok(message)
+}
 
 /// Keeps a `DoPut` stream decodable when a client declares a `MAP`'s `entries` field nullable.
 ///
@@ -68,5 +111,64 @@ impl DecodableSchema {
     /// no substitution was needed and the decoder's own report is the client's.
     pub(crate) fn declared(&self, decoded: SchemaRef) -> SchemaRef {
         self.0.get().map_or(decoded, Arc::clone)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_list_at_the_limit_is_accepted_and_deduplicated() {
+        let ids = (0..MAX_LIST_ENTRIES)
+            .map(|i| u32::try_from(i % 4).expect("small id"))
+            .collect();
+        let ids = bounded_list("GetSqlInfo info", ids).expect("a list at the limit was rejected");
+        assert_eq!(ids, vec![0, 1, 2, 3]);
+
+        let types = vec![
+            "VIEW".to_string(),
+            "BASE TABLE".to_string(),
+            "VIEW".to_string(),
+        ];
+        let types =
+            bounded_list("GetTables table_types", types).expect("a short list was rejected");
+        assert_eq!(types, vec!["BASE TABLE".to_string(), "VIEW".to_string()]);
+    }
+
+    #[test]
+    fn a_list_over_the_limit_is_rejected() {
+        let status = bounded_list(
+            "GetTables table_types",
+            vec![String::new(); MAX_LIST_ENTRIES + 1],
+        )
+        .expect_err("a list over the limit was accepted");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "GetTables table_types lists 1025 entries; the limit is 1024"
+        );
+    }
+
+    #[test]
+    fn a_filter_pattern_at_the_limit_is_accepted() {
+        let pattern = format!("{}%", "a".repeat(MAX_FILTER_PATTERN_LEN - 1));
+        check_filter_pattern("table_name_filter_pattern", Some(&pattern))
+            .expect("a pattern at the limit was rejected");
+        check_filter_pattern("table_name_filter_pattern", Some("orders_%"))
+            .expect("a short pattern was rejected");
+        check_filter_pattern("table_name_filter_pattern", None).expect("no pattern was rejected");
+    }
+
+    #[test]
+    fn a_filter_pattern_over_the_limit_is_rejected() {
+        let pattern = format!("{}%", "a".repeat(MAX_FILTER_PATTERN_LEN));
+        let status = check_filter_pattern("db_schema_filter_pattern", Some(&pattern))
+            .expect_err("a pattern over the limit was accepted");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "db_schema_filter_pattern is 1025 bytes long; the limit is 1024 bytes"
+        );
     }
 }

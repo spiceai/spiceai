@@ -1,0 +1,186 @@
+name: snapshots-source-replication
+description: >
+  An S3 file_format: snapshot reader starts before publication, discovers
+  Cayenne from metadata without a source connector, and follows replacements,
+  deletions, empty tables and new rows. Concurrent queries see whole generations.
+  A store outage is counted as a snapshot refresh error while the loaded rows
+  remain queryable; recovery catches up, and a fresh reader restores without
+  Postgres or the writer. The reader rejects writes.
+
+# Each instance's Postgres namespace holds the same deterministic rows for
+# oracle checks. The reader's Spicepod connects only to the snapshot store.
+sources:
+  src: { kind: postgres }
+  lake: { kind: rustfs }
+
+variants:
+  writer: {}
+  reader:
+    spicepod:
+      runtime: { state: null }
+      datasets:
+        - from: s3://${sources.lake.shared_bucket}/state/snapshots/
+          name: t
+          params:
+            file_format: snapshot
+            s3_endpoint: ${sources.lake.endpoint}
+            s3_region: us-east-1
+            s3_auth: key
+            s3_key: ${sources.lake.key}
+            s3_secret: ${sources.lake.secret}
+            allow_http: 'true'
+            client_timeout: 2s
+          acceleration:
+            refresh_check_interval: 1s
+            indexes: { grp: enabled }
+            params: { cayenne_file_path: '${instance.dir}/reader-1/data', cayenne_metadata_dir: '${instance.dir}/reader-1/meta' }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: snapshots-source-replication
+  runtime:
+    state:
+      location: s3://${sources.lake.shared_bucket}/state/
+      params:
+        s3_endpoint: ${sources.lake.endpoint}
+        s3_region: us-east-1
+        s3_auth: key
+        s3_key: ${sources.lake.key}
+        s3_secret: ${sources.lake.secret}
+        allow_http: 'true'
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        refresh_check_interval: 1h
+        snapshots: create_only
+        primary_key: id
+        indexes: { grp: enabled }
+
+defaults:
+  run-variants: side-by-side
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, grp int, v text);
+        INSERT INTO t SELECT i, i % 97, 'old' FROM generate_series(1, 10000) i;
+        INSERT INTO t VALUES (0, NULL, NULL);
+  - start: { ready: false }
+    only: reader
+  - assert-log: { contains: 'waiting|no snapshot' }
+    eventually: 30s
+    only: reader
+  - start: {}
+    only: writer
+  - query: SELECT * FROM t
+    expect: { oracle: src }
+    only: writer
+  - query: SELECT count(*) AS n, sum(id) AS ids, count(v) AS nonnull FROM t
+    expect: { rows: [['10001', '50005000', '10000']] }
+    eventually: 60s
+    only: reader
+  - query: SELECT * FROM t
+    expect: { oracle: src }
+    only: reader
+  - assert-log: { contains: "loads the cayenne snapshots" }
+    only: reader
+  - background:
+      id: whole-generation
+      concurrency: 2
+      every: 100ms
+      query: SELECT ${round} AS sample, count(*) AS n, count(DISTINCT id) AS keys, count(DISTINCT v) AS generations, sum(id) AS ids, count(v) AS nonnull, count(*) FILTER (WHERE v IS NOT NULL AND v NOT IN ('old', 'new', 'recovered')) AS bad FROM t
+      expect: { n: '10001', keys: '10001', generations: '1', ids: '50005000', nonnull: '10000', bad: '0' }
+    only: reader
+
+  - source-exec: { src: "UPDATE t SET v = 'new', grp = 42 WHERE id > 0" }
+  - refresh: t
+    only: writer
+  - query: SELECT count(*) AS n FROM t WHERE v = 'new'
+    expect: { rows: [['10000']] }
+    eventually: 60s
+    only: reader
+  - query: SELECT id, grp, v FROM t WHERE id IN (0, 1, 10000)
+    expect: { rows: [['0', null, null], ['1', '42', new], ['10000', '42', new]] }
+    only: reader
+  - query: SELECT * FROM t
+    expect: { oracle: src }
+    only: reader
+  - explain: SELECT * FROM t WHERE grp = 42
+    contains: lookup_index=grp
+    only: reader
+  - spice-exec: INSERT INTO t VALUES (20000, 42, 'forbidden')
+    expect-error: "INSERT operations are not allowed on read-only dataset"
+    only: reader
+  - query: SELECT * FROM t
+    expect: { oracle: src }
+    only: reader
+
+  # A stopped store must affect refresh accounting, not loaded query results.
+  - mark-metrics: before-outage
+    only: reader
+  - stop-source: lake
+    only: writer
+  - wait-metric:
+      name: dataset_acceleration_refresh_errors
+      labels: { dataset: t, mode: snapshot, reason: other }
+      increased-by: 1
+      since: before-outage
+      timeout: 3m
+    only: reader
+  - query: SELECT id, grp, v FROM t WHERE id IN (0, 1, 10000)
+    expect: { rows: [['0', null, null], ['1', '42', new], ['10000', '42', new]] }
+    only: reader
+  - start-source: lake
+    only: writer
+  - source-exec: { src: "UPDATE t SET v = 'recovered' WHERE id > 0" }
+  - refresh: t
+    only: writer
+  - query: SELECT count(*) AS n FROM t WHERE v = 'recovered'
+    expect: { rows: [['10000']] }
+    eventually: 60s
+    only: reader
+  - query: SELECT * FROM t
+    expect: { oracle: src }
+    only: reader
+  - stop-background: { id: whole-generation }
+    only: reader
+
+  - source-exec: { src: 'DELETE FROM t' }
+  - refresh: t
+    only: writer
+  - query: SELECT * FROM t
+    expect: { rows: [] }
+    expect-empty: true
+    eventually: 60s
+    only: reader
+  - source-exec: { src: "INSERT INTO t VALUES (7, 42, NULL), (9, NULL, '')" }
+  - refresh: t
+    only: writer
+  - query: SELECT * FROM t
+    expect: { rows: [['7', '42', null], ['9', null, '']] }
+    eventually: 60s
+    only: reader
+
+  - kill-spiced: {}
+    only: writer
+  - stop-source: src
+    only: writer
+  - restart:
+      kill: KILL
+      patch:
+        datasets:
+          t: { acceleration: { params: { cayenne_file_path: '${instance.dir}/reader-2/data', cayenne_metadata_dir: '${instance.dir}/reader-2/meta' } } }
+    only: reader
+  - query: SELECT * FROM t
+    expect: { rows: [['7', '42', null], ['9', null, '']] }
+    only: reader
+  - assert-log: { contains: 'Snapshot restored' }
+    only: reader

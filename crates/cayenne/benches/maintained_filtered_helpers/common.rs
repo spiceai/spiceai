@@ -15,8 +15,7 @@
 //! Shared Cayenne-side fixture for the maintained-filtered-aggregate benches.
 //!
 //! `vs_duckdb_maintained_filtered_groupby` and `vs_chdb_maintained_filtered_groupby`
-//! must be separate bench binaries (DuckDB and chDB, both bundled, abort if driven
-//! in one process). This module keeps the Cayenne fixture — schema, filtered spec,
+//! use separate bench binaries. This module keeps the Cayenne fixture — schema, filtered spec,
 //! row generator, registry load, and serve decode — identical across both so the
 //! registry/spec contract can't drift between them. Each bench pulls it in via
 //! `#[path = "maintained_filtered_helpers/common.rs"] mod common;`.

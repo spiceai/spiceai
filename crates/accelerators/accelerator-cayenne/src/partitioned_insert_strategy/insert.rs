@@ -62,7 +62,7 @@ use super::{
 /// 2. **Apply** (single shared transaction): open one transaction on the
 ///    shared [`CayenneCatalog`]. For every receipt, call
 ///    `PreparedOverwrite::apply_in_txn` inside that transaction. Commit
-///    once. Retries on transient `SQLITE_BUSY` / Turso `BEGIN CONCURRENT`
+///    once. Retries on transient `SQLITE_BUSY` / `SQLITE_LOCKED`
 ///    conflicts with bounded backoff.
 /// 3. **Finish** (parallel-safe per partition): for every receipt, run
 ///    `PreparedOverwrite::finish` to publish the new snapshot in-memory and
@@ -323,9 +323,8 @@ impl CayennePartitionedOverwriteSink {
     /// [`cayenne::MetadataCatalog::commit_compaction`] but for the batched
     /// cross-partition case.
     ///
-    /// Retries on `SQLITE_BUSY` / `SQLITE_LOCKED` (and the equivalent Turso
-    /// `BEGIN CONCURRENT` write-write conflict, which a partition's statement can
-    /// raise as well as the commit). Each retry opens a
+    /// Retries on `SQLITE_BUSY` / `SQLITE_LOCKED`, which a partition's statement
+    /// can raise as well as the commit. Each retry opens a
     /// fresh transaction and re-runs every `PreparedOverwrite::apply_in_txn`
     /// — the prepared receipts are immutable (data already on disk in their
     /// new snapshot directories), so re-applying their catalog mutations is

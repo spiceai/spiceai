@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use duckdb::Connection;
+use duckdb_oracle::Connection;
 use test_framework::anyhow::{Context, Result};
 
 use super::DatasetType;
@@ -68,47 +68,20 @@ impl StreamingDataset for PartsuppDataset {
         conn.execute_batch(&format!("CALL dbgen(sf={scale_factor});"))
             .context("Failed to generate TPCH data")?;
 
-        let mut stmt = conn
-            .prepare(
+        let batches = conn
+            .query(
                 "SELECT ps_partkey, ps_suppkey, ps_availqty,
                         CAST(ps_supplycost AS DOUBLE) as ps_supplycost,
                         ps_comment
                 FROM partsupp
                 ORDER BY ps_partkey, ps_suppkey",
             )
-            .context("Failed to prepare partsupp query")?;
+            .context("Failed to query partsupp query")?;
 
-        let mut ps_partkey = Vec::new();
-        let mut ps_suppkey = Vec::new();
-        let mut ps_availqty = Vec::new();
-        let mut ps_supplycost = Vec::new();
-        let mut ps_comment = Vec::new();
-
-        let mut rows = stmt.query([]).context("Failed to query partsupp data")?;
-        while let Some(row) = rows.next().context("Failed to read row")? {
-            ps_partkey.push(row.get::<_, i64>(0)?);
-            ps_suppkey.push(row.get::<_, i64>(1)?);
-            ps_availqty.push(row.get::<_, i64>(2)?);
-            ps_supplycost.push(row.get::<_, f64>(3)?);
-            ps_comment.push(row.get::<_, String>(4)?);
-        }
-
-        let record_count = ps_partkey.len();
-        println!("Generated {record_count} partsupp records");
-
-        let batch = RecordBatch::try_new(
-            Arc::new(Self::schema()),
-            vec![
-                Arc::new(Int64Array::from(ps_partkey)),
-                Arc::new(Int64Array::from(ps_suppkey)),
-                Arc::new(Int64Array::from(ps_availqty)),
-                Arc::new(Float64Array::from(ps_supplycost)),
-                Arc::new(StringArray::from(ps_comment)),
-            ],
-        )
-        .context("Failed to create Arrow RecordBatch")?;
-
-        Ok(vec![batch])
+        let batches = super::with_dataset_schema(batches, Self::schema())?;
+        let record_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        println!("Generated {record_count} records");
+        Ok(batches)
     }
 
     fn marker_record(&self) -> Result<RecordBatch> {

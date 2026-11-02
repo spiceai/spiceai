@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::iter::once;
 
 use fnv::FnvHashSet;
@@ -770,7 +771,43 @@ fn negate(expr: UserInputAst) -> UserInputAst {
     expr.unary(Occur::MustNot)
 }
 
+/// Maximum number of nested `leaf` levels in one query. Each group (`(..)`, `field:(..)`) and
+/// each `NOT` prefix adds a level, and `ast` re-parses a group when its first alternative fails,
+/// so parse time grows exponentially with depth; this limit keeps both time and stack bounded.
+const MAX_NESTING_DEPTH: usize = 16;
+
+thread_local! {
+    static NESTING_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// One level of query nesting, released when dropped.
+struct NestingGuard;
+
+impl NestingGuard {
+    /// Returns `None` when entering would exceed [`MAX_NESTING_DEPTH`].
+    fn enter() -> Option<Self> {
+        NESTING_DEPTH.with(|depth| {
+            let next = depth.get() + 1;
+            if next > MAX_NESTING_DEPTH {
+                return None;
+            }
+            depth.set(next);
+            Some(NestingGuard)
+        })
+    }
+}
+
+impl Drop for NestingGuard {
+    fn drop(&mut self) {
+        NESTING_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
 fn leaf(inp: &str) -> IResult<&str, UserInputAst> {
+    let Some(_guard) = NestingGuard::enter() else {
+        // `Failure` stops `alt` from retrying other branches at every outer level.
+        return Err(nom::Err::Failure(Error::new(inp, ErrorKind::TooLarge)));
+    };
     alt((
         delimited(char('('), ast, char(')')),
         map(
@@ -790,6 +827,18 @@ fn leaf(inp: &str) -> IResult<&str, UserInputAst> {
 }
 
 fn leaf_infallible(inp: &str) -> JResult<&str, Option<UserInputAst>> {
+    let Some(_guard) = NestingGuard::enter() else {
+        return Ok((
+            "",
+            (
+                None,
+                vec![LenientErrorInternal {
+                    pos: inp.len(),
+                    message: "query nesting too deep".to_string(),
+                }],
+            ),
+        ));
+    };
     alt_infallible(
         (
             (
@@ -1616,6 +1665,44 @@ mod test {
         test_parse_query_to_ast_helper("(a OR abc )", "(?a ?abc)");
         test_parse_query_to_ast_helper("(a OR  abc) ", "(?a ?abc)");
         test_is_parse_err("(a OR  abc ", "(?a ?abc)");
+    }
+
+    #[test]
+    fn nesting_guard_allows_up_to_the_limit() {
+        let guards: Vec<_> = (0..MAX_NESTING_DEPTH)
+            .map(|_| NestingGuard::enter().expect("within the nesting limit"))
+            .collect();
+        assert!(NestingGuard::enter().is_none());
+        drop(guards);
+        assert!(NestingGuard::enter().is_some());
+    }
+
+    fn nested_groups(levels: usize, open: &str) -> String {
+        format!("{}a{}", open.repeat(levels), ")".repeat(levels))
+    }
+
+    #[test]
+    fn query_nesting_past_the_limit_is_an_error() {
+        // The innermost literal is one level, so `MAX_NESTING_DEPTH - 1` groups is the deepest
+        // query accepted.
+        for open in ["(", "f:("] {
+            let at_limit = nested_groups(MAX_NESTING_DEPTH - 1, open);
+            assert!(parse_to_ast(&at_limit).is_ok(), "{at_limit}");
+            let (_, errs) = parse_to_ast_lenient(&at_limit);
+            assert!(errs.is_empty(), "{at_limit}: {errs:?}");
+
+            let past_limit = nested_groups(MAX_NESTING_DEPTH, open);
+            assert!(parse_to_ast(&past_limit).is_err(), "{past_limit}");
+            let (_, errs) = parse_to_ast_lenient(&past_limit);
+            assert!(
+                errs.iter().any(|e| e.message == "query nesting too deep"),
+                "{past_limit}: {errs:?}"
+            );
+        }
+
+        let not_chain = |n: usize| format!("{}a", "NOT ".repeat(n));
+        assert!(parse_to_ast(&not_chain(MAX_NESTING_DEPTH - 1)).is_ok());
+        assert!(parse_to_ast(&not_chain(MAX_NESTING_DEPTH)).is_err());
     }
 
     #[test]

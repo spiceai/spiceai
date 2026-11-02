@@ -145,7 +145,11 @@ impl CacheResponse {
 /// text, or the key its client supplied — chosen by its cache key type.
 enum KeyUse {
     LookUp,
-    /// `no-cache`: the request does not use the results cache at all.
+    /// A client `no-cache` on the request's kind of key: nothing is looked up,
+    /// but the fresh result is stored under this key for later requests.
+    Revalidate,
+    /// The runtime's own [`CacheControl::NoCache`]: the request does not use
+    /// the results cache at all.
     Bypass,
     /// The request's cache key type is looked up under another kind of key.
     WrongKeyType,
@@ -159,7 +163,7 @@ impl KeyUse {
                 | CacheControl::MaxStale(CacheKeyType::Default, _)
                 | CacheControl::MinFresh(CacheKeyType::Default, _)
                 | CacheControl::OnlyIfCached(CacheKeyType::Default),
-                CacheKey::LogicalPlan(_),
+                CacheKey::LogicalPlan(_) | CacheKey::SerializedPlan(_, _),
             )
             | (
                 CacheControl::Cache(CacheKeyType::Raw)
@@ -175,6 +179,12 @@ impl KeyUse {
                 | CacheControl::OnlyIfCached(CacheKeyType::ClientSupplied),
                 CacheKey::ClientSupplied(_),
             ) => Self::LookUp,
+            (CacheControl::Revalidate(CacheKeyType::Default), CacheKey::LogicalPlan(_))
+            | (CacheControl::Revalidate(CacheKeyType::Raw), CacheKey::Query(_, _))
+            | (
+                CacheControl::Revalidate(CacheKeyType::ClientSupplied),
+                CacheKey::ClientSupplied(_),
+            ) => Self::Revalidate,
             (CacheControl::NoCache, _) => Self::Bypass,
             _ => Self::WrongKeyType,
         }
@@ -201,6 +211,9 @@ enum StalePolicy {
     Window(std::time::Duration),
     /// The request's `max-stale` has no value: only the provider age cap applies.
     AnyAge,
+    /// The request's `min-fresh`: the entry must stay within `item_ttl` for
+    /// this much longer, and is never served stale.
+    FreshFor(std::time::Duration),
 }
 
 fn stale_policy(
@@ -210,6 +223,7 @@ fn stale_policy(
     match cache_control {
         CacheControl::MaxStale(_, Some(duration)) => StalePolicy::Window(duration),
         CacheControl::MaxStale(_, None) => StalePolicy::AnyAge,
+        CacheControl::MinFresh(_, duration) => StalePolicy::FreshFor(duration),
         _ => match stale_while_revalidate_ttl {
             Some(duration) => StalePolicy::Window(duration),
             None => StalePolicy::FreshOnly,
@@ -230,6 +244,7 @@ fn max_age_for(
         StalePolicy::FreshOnly => ttl,
         StalePolicy::Window(stale_duration) => ttl.saturating_add(stale_duration),
         StalePolicy::AnyAge => max_servable_age,
+        StalePolicy::FreshFor(fresh_for) => ttl.saturating_sub(fresh_for),
     };
     requested.min(max_servable_age)
 }
@@ -263,7 +278,9 @@ fn apply_age_eligibility(
         tracing::debug!("Cache entry is past its eligible age, treating as cache miss");
         return false;
     }
-    if !matches!(policy, StalePolicy::FreshOnly) && entry.cached_result.is_stale(ttl, now) {
+    if matches!(policy, StalePolicy::Window(_) | StalePolicy::AnyAge)
+        && entry.cached_result.is_stale(ttl, now)
+    {
         tracing::debug!(
             "Cache entry is stale (beyond TTL), triggering background revalidation for stale-while-revalidate"
         );
@@ -474,6 +491,7 @@ impl Query {
         tracker: Option<QueryTracker>,
         pre_parsed_plan: Option<Box<LogicalPlan>>,
         already_looked_up: Option<RawCacheKey>,
+        serialized_plan_cache_key: Option<&str>,
     ) -> super::Result<PlanOrCached> {
         let cache_control = request_context.cache_control();
         let cache_namespace = request_context.cache_namespace();
@@ -550,7 +568,7 @@ impl Query {
             df,
             &request_context,
             tracker,
-            &CacheKey::LogicalPlan(&plan),
+            &CacheKey::for_plan(&plan, serialized_plan_cache_key),
             sql,
             already_looked_up,
             // A `LogicalPlan` key carries the parameter values already bound
@@ -570,15 +588,34 @@ impl Query {
             response => response,
         };
 
+        if matches!(cache_control, CacheControl::OnlyIfCached(_)) {
+            let error = super::Error::NotCached;
+            if let Some(t) = tracker {
+                t.finish_with_error(
+                    &request_context,
+                    error.to_string(),
+                    ErrorCode::QueryPlanningError,
+                );
+            }
+            return Err(error);
+        }
+
         let request_raw_cache_key = match request_context.cache_control() {
             CacheControl::Cache(CacheKeyType::Default)
             | CacheControl::MaxStale(CacheKeyType::Default, _)
             | CacheControl::MinFresh(CacheKeyType::Default, _)
-            | CacheControl::OnlyIfCached(CacheKeyType::Default) => plan_raw_cache_key,
+            | CacheControl::OnlyIfCached(CacheKeyType::Default)
+            | CacheControl::Revalidate(CacheKeyType::Default) => plan_raw_cache_key,
             _ => sql_or_client_raw_key,
         }
         .unwrap_or(sql_raw_cache_key);
 
+        // A `no-cache` request reports `BYPASS` whichever of its two lookups
+        // matched its key type; the other reports a wrong-key-type miss.
+        let status = match cache_control {
+            CacheControl::Revalidate(_) => CacheStatus::CacheBypass,
+            _ => status,
+        };
         let cache_status = Self::should_cache_results(df, &plan, status);
         tracker = tracker.map(|t| t.results_cache_hit(false));
 
@@ -737,9 +774,26 @@ impl Query {
 
         let cache_control = request_context.cache_control();
 
+        let raw_key = |provider: &QueryResultsCacheProvider| {
+            let ns = request_context.cache_namespace();
+            let (ns_tag, ns_id) = ns.hash_inputs();
+            key.as_raw_key_in_namespace(provider.hasher(), ns_tag, ns_id)
+        };
+
         // Validate that the provided cache key is the correct type for this request
         match KeyUse::of(cache_control, key) {
             KeyUse::LookUp => {}
+            // Skip the read, but hand back the key: the query's fresh result is
+            // stored under it, replacing whatever entry was there, so the next
+            // request without `no-cache` reads what this one returned.
+            KeyUse::Revalidate => {
+                return Ok(CacheResponse::from(
+                    CacheResult::MissOrSkipped,
+                    CacheStatus::CacheBypass,
+                )
+                .with_query_tracker(tracker)
+                .with_raw_key(Some(raw_key(cache_provider.as_ref()))));
+            }
             KeyUse::Bypass => {
                 return Ok(CacheResponse::from(
                     CacheResult::MissOrSkipped,
@@ -756,11 +810,7 @@ impl Query {
             }
         }
 
-        let raw_key = {
-            let ns = request_context.cache_namespace();
-            let (ns_tag, ns_id) = ns.hash_inputs();
-            key.as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id)
-        };
+        let raw_key = raw_key(cache_provider.as_ref());
 
         // Looked up before planning, and nothing servable was there.
         if already_looked_up == Some(raw_key) {
@@ -774,7 +824,7 @@ impl Query {
 
         // Extract plan from cache key if available to avoid re-parsing
         let plan = match key {
-            CacheKey::LogicalPlan(p) => Some(*p),
+            CacheKey::LogicalPlan(p) | CacheKey::SerializedPlan(_, p) => Some(*p),
             _ => None,
         };
         let cache_status = entry.cache_status;
@@ -827,6 +877,10 @@ impl Query {
             return CacheProbe::Skipped;
         };
         let cache_control = request_context.cache_control();
+        // A `no-cache` request is never answered from the cache.
+        if matches!(cache_control, CacheControl::Revalidate(_)) {
+            return CacheProbe::Skipped;
+        }
         let Some(cache_key_type) = cache_control.cache_key_type() else {
             return CacheProbe::Skipped;
         };
@@ -867,11 +921,8 @@ impl Query {
                     };
                     cached_plan.insert(plan)
                 };
-                CacheKey::LogicalPlan(plan).as_raw_key_in_namespace(
-                    cache_provider.hasher(),
-                    ns_tag,
-                    ns_id,
-                )
+                CacheKey::for_plan(plan, self.serialized_plan_cache_key.as_deref())
+                    .as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id)
             }
         };
 
@@ -926,7 +977,8 @@ fn entry_tables_changed(entry: &ServableEntry, provider: &QueryResultsCacheProvi
 }
 
 /// Cache keys with a stale-while-revalidate background revalidation pending or
-/// running, each held by the claim that took it.
+/// running, each held by the claim that took it, and the permits that bound how
+/// many run at once.
 ///
 /// A claim is taken on the stale hit's request path, so it is a sharded-map entry
 /// rather than a write to a cache that runs its own maintenance inline.
@@ -934,6 +986,7 @@ struct RevalidationClaims {
     held: DashMap<u64, HeldClaim>,
     time_to_live: std::time::Duration,
     next_generation: std::sync::atomic::AtomicU64,
+    running: Arc<tokio::sync::Semaphore>,
 }
 
 /// The claim currently holding a key.
@@ -945,17 +998,19 @@ struct HeldClaim {
 
 impl RevalidationClaims {
     /// `time_to_live` bounds how long a revalidation that never ends can keep its
-    /// key from being claimed again.
-    fn new(time_to_live: std::time::Duration) -> Self {
+    /// key from being claimed again. At most `max_running` claims are held at once.
+    fn new(time_to_live: std::time::Duration, max_running: usize) -> Self {
         Self {
             held: DashMap::new(),
             time_to_live,
             next_generation: std::sync::atomic::AtomicU64::new(0),
+            running: Arc::new(tokio::sync::Semaphore::new(max_running)),
         }
     }
 
     /// Claims `key` for one revalidation, or returns `None` while another claim
-    /// holds it. A claim older than the time-to-live no longer holds its key.
+    /// holds it or `max_running` claims are held. A claim older than the
+    /// time-to-live no longer holds its key.
     fn claim(&self, key: u64) -> Option<RevalidationClaim<'_>> {
         let generation = self
             .next_generation
@@ -965,21 +1020,27 @@ impl RevalidationClaims {
             generation,
             claimed_at,
         };
-        match self.held.entry(key) {
+        let permit = match self.held.entry(key) {
             dashmap::Entry::Occupied(mut held) => {
                 if claimed_at.duration_since(held.get().claimed_at) < self.time_to_live {
                     return None;
                 }
+                let permit = Arc::clone(&self.running).try_acquire_owned().ok()?;
                 held.insert(claim);
+                permit
             }
             dashmap::Entry::Vacant(vacant) => {
+                let permit = Arc::clone(&self.running).try_acquire_owned().ok()?;
                 vacant.insert(claim);
+                permit
             }
-        }
+        };
         Some(RevalidationClaim {
             claims: self,
             key,
             generation,
+            expires_at: claimed_at + self.time_to_live,
+            _running: permit,
         })
     }
 }
@@ -990,6 +1051,9 @@ struct RevalidationClaim<'a> {
     claims: &'a RevalidationClaims,
     key: u64,
     generation: u64,
+    /// When the claim stops holding its key.
+    expires_at: std::time::Instant,
+    _running: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl Drop for RevalidationClaim<'_> {
@@ -1391,9 +1455,21 @@ impl Query {
         // taken inside the spawned task coalesces only the revalidations that overlap
         // in time: a task that starts after the first one finished runs the same query
         // again.
+        //
+        // Revalidations wait in the same admission queue as client queries, so at most a
+        // quarter of the admission limit (the CPU-sized one when admission is unbounded) run
+        // at once. A stale hit past that limit is served without one; the entry stays stale
+        // and a later hit revalidates it.
         static REVALIDATION_CLAIMS: OnceLock<RevalidationClaims> = OnceLock::new();
-        let claims = REVALIDATION_CLAIMS
-            .get_or_init(|| RevalidationClaims::new(std::time::Duration::from_mins(5)));
+        let claims = REVALIDATION_CLAIMS.get_or_init(|| {
+            RevalidationClaims::new(
+                std::time::Duration::from_mins(5),
+                (df.query_admission_limit()
+                    .unwrap_or_else(|| cpu_budget::cpu_budget().max_concurrent_queries())
+                    / 4)
+                .max(1),
+            )
+        });
 
         let cache_key_u64 = cache_key.as_u64();
         // Released when the revalidation ends, whether it stores, fails, or is dropped
@@ -1401,7 +1477,7 @@ impl Query {
         let Some(claim) = claims.claim(cache_key_u64) else {
             tracing::debug!(
                 cache_key = cache_key_u64,
-                "Background revalidation already in progress for this cache key, skipped"
+                "Background revalidation already in progress for this cache key, or the revalidation limit is reached; skipped"
             );
             cache::metrics::sql_results::STALE_WHILE_REVALIDATE_SKIPPED.add(1, &[]);
             return;
@@ -1417,6 +1493,8 @@ impl Query {
 
         // Get optional dedicated refresh runtime, fall back to current runtime if not configured
         let refresh_runtime = df.refresh_runtime().cloned();
+        let deadline = tokio::time::Instant::from_std(claim.expires_at);
+        let cancel_token = background_context.cancellation_token().clone();
 
         // Build the background task
         let background_task = async move {
@@ -1441,62 +1519,80 @@ impl Query {
             // is ordered after this point and rejects the write.
             let revalidation_started_at = std::time::Instant::now();
 
-            let result = background_context
-                .scope(async move { query.run().await })
-                .await;
+            // A revalidation holds one of the limited running permits, so one that hangs is
+            // cancelled when its claim expires rather than keeping the permit.
+            let revalidation = async {
+                let result = background_context
+                    .scope(async move { query.run().await })
+                    .await;
 
-            match result {
-                Ok(query_result) => {
-                    let schema = query_result
-                        .cached_schema()
-                        .unwrap_or_else(|| query_result.schema());
-                    let physical_plan = query_result.physical_plan();
-                    tracing::debug!(
-                        cache_key = cache_key_u64,
-                        "Background query execution succeeded, collecting batches"
-                    );
-                    match query_result.collect_batches().await {
-                        Ok(batches) => {
-                            tracing::debug!(
-                                cache_key = cache_key_u64,
-                                num_batches = batches.len(),
-                                "Collected batches, now caching"
-                            );
-                            Self::cache_revalidation_result(
-                                &df,
-                                &cache_key,
-                                batches,
-                                schema,
-                                input_tables,
-                                revalidation_started_at,
-                                physical_plan,
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                cache_key = cache_key_u64,
-                                "Background revalidation failed during collection: {}",
-                                e
-                            );
-                            record_revalidation_outcome(failed_revalidation_outcome(
-                                &e,
-                                RevalidationOutcome::CollectFailed,
-                            ));
+                match result {
+                    Ok(query_result) => {
+                        let schema = query_result
+                            .cached_schema()
+                            .unwrap_or_else(|| query_result.schema());
+                        let physical_plan = query_result.physical_plan();
+                        tracing::debug!(
+                            cache_key = cache_key_u64,
+                            "Background query execution succeeded, collecting batches"
+                        );
+                        match query_result.collect_batches().await {
+                            Ok(batches) => {
+                                tracing::debug!(
+                                    cache_key = cache_key_u64,
+                                    num_batches = batches.len(),
+                                    "Collected batches, now caching"
+                                );
+                                Self::cache_revalidation_result(
+                                    &df,
+                                    &cache_key,
+                                    batches,
+                                    schema,
+                                    input_tables,
+                                    revalidation_started_at,
+                                    physical_plan,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    cache_key = cache_key_u64,
+                                    "Background revalidation failed during collection: {}",
+                                    e
+                                );
+                                record_revalidation_outcome(failed_revalidation_outcome(
+                                    &e,
+                                    RevalidationOutcome::CollectFailed,
+                                ));
+                            }
                         }
                     }
+                    Err(e) => {
+                        tracing::debug!(
+                            cache_key = cache_key_u64,
+                            "Background revalidation query failed: {}",
+                            e
+                        );
+                        record_revalidation_outcome(failed_revalidation_outcome(
+                            &e,
+                            RevalidationOutcome::QueryFailed,
+                        ));
+                    }
                 }
-                Err(e) => {
-                    tracing::debug!(
-                        cache_key = cache_key_u64,
-                        "Background revalidation query failed: {}",
-                        e
-                    );
-                    record_revalidation_outcome(failed_revalidation_outcome(
-                        &e,
-                        RevalidationOutcome::QueryFailed,
-                    ));
-                }
+            };
+            if tokio::time::timeout_at(deadline, revalidation)
+                .await
+                .is_err()
+            {
+                tracing::debug!(
+                    cache_key = cache_key_u64,
+                    "Background revalidation did not finish before its deadline, cancelled"
+                );
+                // The query runs in its own task on the query runtime, so dropping the wait
+                // for it leaves that task queued for admission or planning; cancelling the
+                // context's token ends it too.
+                cancel_token.cancel();
+                record_revalidation_outcome(RevalidationOutcome::TimedOut);
             }
 
             tracing::debug!(
@@ -1534,6 +1630,7 @@ impl Query {
                 datasets,
                 read_started_at,
                 Some(physical_plan),
+                df.ctx.task_ctx().memory_pool(),
             )
         } else {
             stream
@@ -1797,6 +1894,81 @@ mod tests {
             StalePolicy::AnyAge,
             now,
         ));
+    }
+
+    #[test]
+    fn a_min_fresh_request_is_served_only_an_entry_fresh_for_that_much_longer() {
+        assert_eq!(
+            stale_policy(
+                CacheControl::MinFresh(CacheKeyType::Default, Duration::from_millis(600)),
+                Some(Duration::from_secs(10)),
+            ),
+            StalePolicy::FreshFor(Duration::from_millis(600))
+        );
+        let now = std::time::Instant::now();
+        let policy = StalePolicy::FreshFor(Duration::from_millis(600));
+        for (age_ms, servable) in [(300, true), (500, false), (1_500, false)] {
+            let mut entry =
+                dummy_servable_entry_cached_at(cached_ago(now, Duration::from_millis(age_ms)));
+            assert_eq!(
+                apply_age_eligibility(
+                    &mut entry,
+                    Duration::from_secs(1),
+                    Duration::from_secs(11),
+                    policy,
+                    now,
+                ),
+                servable,
+                "an entry {age_ms} ms old with a 1 s item_ttl and min-fresh of 600 ms"
+            );
+            assert!(!entry.revalidate);
+            assert_eq!(entry.cache_status, CacheStatus::CacheHit);
+        }
+    }
+
+    /// An `only-if-cached` request is answered from the cache or refused; it never
+    /// runs the query.
+    #[tokio::test]
+    async fn an_only_if_cached_request_fails_on_a_miss_and_is_served_a_hit() {
+        for (key_type, cache_key_type) in [
+            (
+                spicepod::component::caching::CacheKeyType::Plan,
+                CacheKeyType::Default,
+            ),
+            (
+                spicepod::component::caching::CacheKeyType::Sql,
+                CacheKeyType::Raw,
+            ),
+        ] {
+            let df = prepare_runtime(Some(SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                cache_key_type: key_type,
+                ..Default::default()
+            }))
+            .await;
+            let only_if_cached =
+                create_test_request_context(CacheControl::OnlyIfCached(cache_key_type), None);
+
+            let miss = Arc::clone(&only_if_cached)
+                .scope(QueryBuilder::new("SELECT 7", Arc::clone(&df)).build().run())
+                .await;
+            assert!(
+                matches!(miss, Err(super::super::Error::NotCached)),
+                "{key_type:?}: a miss must be refused, got {:?}",
+                miss.map(|result| result.cache_status)
+            );
+
+            let (status, value) =
+                create_test_request_context(CacheControl::Cache(cache_key_type), None)
+                    .scope(run_i64_query(&df, "SELECT 7", ResultsCacheMode::Default))
+                    .await;
+            assert_eq!((status, value), (CacheStatus::CacheMiss, 7));
+
+            let (status, value) = only_if_cached
+                .scope(run_i64_query(&df, "SELECT 7", ResultsCacheMode::Default))
+                .await;
+            assert_eq!((status, value), (CacheStatus::CacheHit, 7), "{key_type:?}");
+        }
     }
 
     #[test]
@@ -4180,12 +4352,61 @@ body: SELECT CAST(random() * 1000000000000 AS BIGINT) AS v
             .await;
     }
 
+    /// Stale hits on more keys than the limit start no more revalidations than the
+    /// limit. A refused key is left unclaimed, so a later stale hit can revalidate it
+    /// once a running revalidation ends.
+    #[test]
+    fn stale_hits_past_the_revalidation_limit_wait_for_a_running_one_to_end() {
+        let claims = RevalidationClaims::new(Duration::from_mins(5), 2);
+        let first = claims.claim(1).expect("the first key is claimed");
+        let _second = claims.claim(2).expect("the second key is claimed");
+
+        assert!(
+            claims.claim(3).is_none(),
+            "a third revalidation must not start while two run"
+        );
+        assert!(
+            claims.held.get(&3).is_none(),
+            "a refused key must stay unclaimed"
+        );
+
+        drop(first);
+        assert!(
+            claims.claim(3).is_some(),
+            "the refused key is claimed once a running revalidation ends"
+        );
+    }
+
+    /// An expired claim refused for want of a permit stays the holder of its key, so
+    /// releasing it frees both the key and the permit.
+    #[test]
+    fn an_expired_claim_refused_at_the_revalidation_limit_keeps_its_key() {
+        let claims = RevalidationClaims::new(Duration::ZERO, 1);
+        let expired = claims.claim(1).expect("an unheld key is claimed");
+
+        assert!(
+            claims.claim(1).is_none(),
+            "an expired claim is not replaced while no permit is free"
+        );
+        assert_eq!(
+            claims.held.get(&1).map(|held| held.generation),
+            Some(expired.generation),
+            "a refused replacement must leave the expired claim holding the key"
+        );
+
+        drop(expired);
+        assert!(
+            claims.claim(1).is_some(),
+            "the key and its permit are free once the expired claim is released"
+        );
+    }
+
     /// A claim whose revalidation outlives the time-to-live is replaced by a later
     /// claim on the same key. Releasing the expired claim must leave its replacement
     /// held, or a third stale hit would start a revalidation alongside the second.
     #[test]
     fn releasing_an_expired_revalidation_claim_keeps_its_replacement_held() {
-        let claims = RevalidationClaims::new(Duration::from_millis(50));
+        let claims = RevalidationClaims::new(Duration::from_millis(50), 4);
         let expired = claims.claim(7).expect("an unheld key is claimed");
         assert!(claims.claim(7).is_none(), "a held key is not claimed twice");
 
@@ -4372,6 +4593,106 @@ body: SELECT CAST(random() * 1000000000000 AS BIGINT) AS v
             )
             .expect("should register table");
         scans
+    }
+
+    /// A client's `Cache-Control: no-cache` skips the cached lookup, runs the
+    /// query, and stores the fresh result, so the next request without the
+    /// header reads it rather than the entry the revalidation replaced. Holds
+    /// under every cache key type: plan, SQL text, and a client-supplied key.
+    #[tokio::test]
+    async fn a_no_cache_request_stores_its_fresh_result_for_later_reads() {
+        use spicepod::component::caching::CacheKeyType as ConfiguredCacheKeyType;
+
+        for (configured, key_type, client_key) in [
+            (ConfiguredCacheKeyType::Plan, CacheKeyType::Default, None),
+            (ConfiguredCacheKeyType::Sql, CacheKeyType::Raw, None),
+            (
+                ConfiguredCacheKeyType::Plan,
+                CacheKeyType::ClientSupplied,
+                Some("no-cache-writeback".to_string()),
+            ),
+        ] {
+            const SQL: &str = "SELECT scan FROM no_cache_writeback";
+            let df = prepare_runtime(Some(SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                cache_key_type: configured,
+                ..Default::default()
+            }))
+            .await;
+            let scans = register_counted_table(&df, "no_cache_writeback");
+            let cached =
+                create_test_request_context(CacheControl::Cache(key_type), client_key.clone());
+            let no_cache =
+                create_test_request_context(CacheControl::Revalidate(key_type), client_key.clone());
+            let run = |context: &Arc<RequestContext>| {
+                Arc::clone(context).scope(run_i64_query(&df, SQL, ResultsCacheMode::Default))
+            };
+
+            assert_eq!(
+                run(&cached).await,
+                (CacheStatus::CacheMiss, 1),
+                "{key_type:?}"
+            );
+            assert_eq!(
+                run(&cached).await,
+                (CacheStatus::CacheHit, 1),
+                "{key_type:?}"
+            );
+
+            // `no-cache` never serves the cached entry: it runs the query.
+            assert_eq!(
+                run(&no_cache).await,
+                (CacheStatus::CacheBypass, 2),
+                "{key_type:?}"
+            );
+            // ...and the next plain read is served what it returned.
+            assert_eq!(
+                run(&cached).await,
+                (CacheStatus::CacheHit, 2),
+                "{key_type:?}: the read after no-cache must see the fresh result"
+            );
+
+            assert_eq!(
+                run(&no_cache).await,
+                (CacheStatus::CacheBypass, 3),
+                "{key_type:?}"
+            );
+            assert_eq!(
+                run(&cached).await,
+                (CacheStatus::CacheHit, 3),
+                "{key_type:?}"
+            );
+            assert_eq!(
+                scans.load(std::sync::atomic::Ordering::SeqCst),
+                3,
+                "{key_type:?}"
+            );
+        }
+    }
+
+    /// The runtime's own [`CacheControl::NoCache`] keeps bypassing the cache
+    /// for reads, so a background revalidation never serves itself a hit.
+    #[tokio::test]
+    async fn the_runtime_no_cache_control_never_serves_a_cached_result() {
+        const SQL: &str = "SELECT scan FROM runtime_no_cache";
+        let df = prepare_runtime(None).await;
+        let scans = register_counted_table(&df, "runtime_no_cache");
+        let cached = create_test_request_context(CacheControl::Cache(CacheKeyType::Default), None);
+        let bypass = create_test_request_context(CacheControl::NoCache, None);
+
+        assert_eq!(
+            Arc::clone(&cached)
+                .scope(run_i64_query(&df, SQL, ResultsCacheMode::Default))
+                .await,
+            (CacheStatus::CacheMiss, 1)
+        );
+        assert_eq!(
+            Arc::clone(&bypass)
+                .scope(run_i64_query(&df, SQL, ResultsCacheMode::Default))
+                .await,
+            (CacheStatus::CacheBypass, 2)
+        );
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// A hit is served where the request arrived: it has nothing to plan or execute, so it

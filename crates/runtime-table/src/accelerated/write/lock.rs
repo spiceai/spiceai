@@ -70,6 +70,7 @@ use std::sync::atomic::AtomicI64;
 use datafusion::common::TableReference;
 
 use arrow_schema::SchemaRef;
+use data_accelerator_api::pk_write_guard::rewrite_internal_data_table_error;
 use datafusion::common::Result as DataFusionResult;
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
@@ -257,6 +258,9 @@ impl ExecutionPlan for AcceleratorWriteLockExec {
                         return None;
                     };
 
+                    let dataset = finished.dataset_name.table();
+                    let batch =
+                        batch.map_err(|error| rewrite_internal_data_table_error(error, dataset));
                     let failed = failed || batch.is_err();
                     Some((batch, (input_stream, guard, finished, failed)))
                 },

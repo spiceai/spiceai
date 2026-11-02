@@ -295,7 +295,6 @@ async fn turso_surfaces_vs_standalone_engines() {
     run("turso").await;
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn cayenne_surfaces_vs_standalone_engines() {
     run("cayenne").await;

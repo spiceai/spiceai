@@ -342,6 +342,22 @@ impl From<PoolConfig> for Option<Pool> {
     }
 }
 
+impl PoolConfig {
+    /// The pooling a model's `1_Pooling/config.json` selects, as `text-embeddings-inference` reads it.
+    /// `None` when the file is absent, unreadable, or selects no supported pooling.
+    pub(crate) fn pool_from_dir(root: &Path) -> Option<Pool> {
+        let path = root.join("1_Pooling/config.json");
+        let contents = fs::read_to_string(&path).ok()?;
+        match serde_json::from_str::<PoolConfig>(&contents) {
+            Ok(config) => config.into(),
+            Err(e) => {
+                tracing::warn!("Failed to parse '{}': {e}", path.display());
+                None
+            }
+        }
+    }
+}
+
 pub(crate) fn pool_from_str(p: &str) -> Option<Pool> {
     match p {
         "cls" => Some(Pool::Cls),
@@ -354,7 +370,8 @@ pub(crate) fn pool_from_str(p: &str) -> Option<Pool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TeiWeights, load_tokenizer, tei_files};
+    use super::{PoolConfig, TeiWeights, load_tokenizer, tei_files};
+    use tei_backend::Pool;
     use tempfile::tempdir;
     use tokenizers::models::bpe::BPE;
     use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
@@ -469,5 +486,25 @@ mod tests {
             loaded.get_truncation().is_none(),
             "load_tokenizer must clear the baked-in truncation"
         );
+    }
+
+    #[test]
+    fn pool_is_read_from_the_pooling_config() {
+        let pool_in = |config: Option<&str>| {
+            let dir = tempdir().expect("temp dir");
+            if let Some(config) = config {
+                std::fs::create_dir(dir.path().join("1_Pooling")).expect("create dir");
+                std::fs::write(dir.path().join("1_Pooling/config.json"), config).expect("write");
+            }
+            PoolConfig::pool_from_dir(dir.path())
+        };
+        let cls = r#"{"pooling_mode_cls_token": true, "pooling_mode_mean_tokens": false}"#;
+        let mean = r#"{"pooling_mode_cls_token": false, "pooling_mode_mean_tokens": true}"#;
+        let last = r#"{"pooling_mode_cls_token": false, "pooling_mode_mean_tokens": false, "pooling_mode_lasttoken": true}"#;
+        assert_eq!(pool_in(Some(cls)), Some(Pool::Cls));
+        assert_eq!(pool_in(Some(mean)), Some(Pool::Mean));
+        assert_eq!(pool_in(Some(last)), Some(Pool::LastToken));
+        assert_eq!(pool_in(Some("not json")), None);
+        assert_eq!(pool_in(None), None);
     }
 }
