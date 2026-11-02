@@ -891,6 +891,13 @@ pub trait MetadataCatalog: Send + Sync {
         file_names: &[String],
     ) -> CatalogResult<()>;
 
+    /// Check, when reopening an existing table outside `create_table` (as
+    /// partition children are), that the data files its live snapshots record
+    /// are still on disk, with the non-rebuildable (`KeepStored`) handling:
+    /// a missing snapshot directory or a resized file is an error, and files
+    /// that are only missing are logged at WARN.
+    async fn verify_existing_stored_data_files(&self, table_name: &str) -> CatalogResult<()>;
+
     /// List every cold-tier file for a table (the cold scan's file source).
     /// Read under the scan's listing fence so the cold file set is captured
     /// consistently with the warm snapshot and deletion snapshot.

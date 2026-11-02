@@ -1617,7 +1617,21 @@ impl CayenneCatalog {
         table: &TableMetadata,
         options: &CreateTableOptions,
     ) -> CatalogResult<()> {
-        if table.path.starts_with("s3://") || options.vortex_config.memory_mode {
+        self.verify_stored_data_files_with(
+            table,
+            options.vortex_config.memory_mode,
+            options.vortex_config.settings_change,
+        )
+        .await
+    }
+
+    async fn verify_stored_data_files_with(
+        &self,
+        table: &TableMetadata,
+        memory_mode: bool,
+        settings_change: SettingsChangeAction,
+    ) -> CatalogResult<()> {
+        if table.path.starts_with("s3://") || memory_mode {
             return Ok(());
         }
         // Scans read the current snapshot and every protected one (rows staged
@@ -1650,7 +1664,7 @@ impl CayenneCatalog {
             .collect::<Vec<_>>()
             .join("; ");
         let table_name = table.table_name.as_str();
-        match options.vortex_config.settings_change {
+        match settings_change {
             SettingsChangeAction::Rebuild => {
                 tracing::warn!(
                     "Dataset '{table_name}': the acceleration's data files do not match the Cayenne metastore ({damage}). Dropping it and reloading it from the source."
@@ -4417,6 +4431,16 @@ impl MetadataCatalog for CayenneCatalog {
                 params: vec![MetastoreValue::Text(table_id.to_string())],
             })
             .await
+    }
+
+    async fn verify_existing_stored_data_files(&self, table_name: &str) -> CatalogResult<()> {
+        let table = self.get_table(table_name).await?;
+        self.verify_stored_data_files_with(
+            &table,
+            table.vortex_config.memory_mode,
+            SettingsChangeAction::KeepStored,
+        )
+        .await
     }
 
     async fn remove_snapshot_files(
@@ -13291,6 +13315,34 @@ mod tests {
             ))
             .await
             .expect("a table whose protected snapshot is back reopens, warning about the missing current file");
+    }
+
+    /// Partition children reopen through `open`, not `create_table`, so they
+    /// are checked on their own, as tables that are not rebuilt.
+    #[tokio::test]
+    async fn verifying_an_existing_table_refuses_unreadable_rows_and_tolerates_missing_files() {
+        let (catalog, _base_path, snapshot_dir, _db, _root) =
+            table_with_stored_files("child").await;
+        catalog
+            .verify_existing_stored_data_files("child")
+            .await
+            .expect("a table whose files are in place passes");
+
+        std::fs::remove_file(snapshot_dir.join("b.vortex")).expect("remove a data file");
+        catalog
+            .verify_existing_stored_data_files("child")
+            .await
+            .expect("a table only missing files is kept, with a WARN");
+
+        std::fs::write(snapshot_dir.join("a.vortex"), vec![0_u8; 3]).expect("truncate a file");
+        let error = catalog
+            .verify_existing_stored_data_files("child")
+            .await
+            .expect_err("a table with a truncated file is refused");
+        assert!(
+            matches!(error, CatalogError::StoredDataFilesDamaged { .. }),
+            "{error:?}"
+        );
     }
 
     /// Retention drops the manifest rows of the files it deletes, so a restart
