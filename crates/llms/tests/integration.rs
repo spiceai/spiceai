@@ -24,6 +24,7 @@ pub mod llms;
 // Credential-free tests that run in `make nextest`; `llms` calls live provider
 // APIs and runs in `integration_llms.yml`.
 mod anthropic_stream_errors;
+mod bedrock_nova_reasoning;
 #[cfg(feature = "local_llm")]
 mod gguf_hf_cache;
 mod list_models_errors;

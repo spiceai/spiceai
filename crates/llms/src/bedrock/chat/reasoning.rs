@@ -66,6 +66,8 @@ pub(super) struct ReasoningRequest {
     pub(super) additional_model_request_fields: Document,
     /// `maxTokens` to send in place of the request's own value.
     pub(super) max_tokens: Option<u32>,
+    /// Whether the model rejects Converse inference parameters while reasoning at high effort.
+    pub(super) omit_inference_parameters: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -201,7 +203,10 @@ impl ReasoningControl {
             return Ok(None);
         };
 
-        let (fields, max_tokens) = match (self, Effort::nearest(effort)) {
+        let nearest_effort = Effort::nearest(effort);
+        let omit_inference_parameters =
+            matches!((self, nearest_effort), (Self::Nova, Some(Effort::High)));
+        let (fields, max_tokens) = match (self, nearest_effort) {
             // Thinking is off by default on these models.
             (Self::ClaudeBudget | Self::Nova, None) => return Ok(None),
             (Self::ClaudeBudget, Some(effort)) => {
@@ -236,7 +241,11 @@ impl ReasoningControl {
                         max_reasoning_effort: effort,
                     },
                 },
-                max_tokens,
+                if omit_inference_parameters {
+                    None
+                } else {
+                    max_tokens
+                },
             ),
             (Self::GptOss, Some(effort)) => (
                 AdditionalModelRequestFields::GptOss {
@@ -264,6 +273,7 @@ impl ReasoningControl {
         Ok(Some(ReasoningRequest {
             additional_model_request_fields: value_to_document(fields),
             max_tokens,
+            omit_inference_parameters,
         }))
     }
 }
@@ -324,9 +334,18 @@ mod tests {
     }
 
     fn expected(value: Value, max_tokens: Option<u32>) -> ReasoningRequest {
+        expected_with_inference_parameters(value, max_tokens, false)
+    }
+
+    fn expected_with_inference_parameters(
+        value: Value,
+        max_tokens: Option<u32>,
+        omit_inference_parameters: bool,
+    ) -> ReasoningRequest {
         ReasoningRequest {
             additional_model_request_fields: value_to_document(value),
             max_tokens,
+            omit_inference_parameters,
         }
     }
 
@@ -490,12 +509,27 @@ mod tests {
     fn nova_sends_a_reasoning_config() {
         // Shape from the Amazon Nova 2 extended thinking page.
         assert_eq!(
-            fields("us.amazon.nova-2-lite-v1:0", &ReasoningEffort::Medium, None),
+            fields(
+                "us.amazon.nova-2-lite-v1:0",
+                &ReasoningEffort::Medium,
+                Some(1024)
+            ),
             Some(expected(
                 json!({"reasoningConfig": {"type": "enabled", "maxReasoningEffort": "medium"}}),
-                None
+                Some(1024)
             ))
         );
+        for effort in [ReasoningEffort::High, ReasoningEffort::Xhigh] {
+            assert_eq!(
+                fields("us.amazon.nova-2-lite-v1:0", &effort, Some(1024)),
+                Some(expected_with_inference_parameters(
+                    json!({"reasoningConfig": {"type": "enabled", "maxReasoningEffort": "high"}}),
+                    None,
+                    true
+                )),
+                "{effort:?}"
+            );
+        }
         assert_eq!(
             fields("us.amazon.nova-2-lite-v1:0", &ReasoningEffort::None, None),
             None
