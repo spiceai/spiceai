@@ -1,0 +1,185 @@
+{
+  "operator-values": [
+    {
+      "run": "sql-operator-values-known",
+      "who": "default",
+      "key": "query: SELECT 6 ^ 3 AS value",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"value\", row_number: 1, expected: \"\\\"5\\\"\", actual: \"\\\"216\\\"\" }",
+      "group": "sql-protocols"
+    }
+  ],
+  "sql-surface": [
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: SELECT list_min([CAST(1 AS BIGINT), 2, 2, NULL]) AS value",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Invalid function 'list_min'.\\nDid you mean 'list_zip'?\": code: 'Client specified an invalid argument', message: \"Invalid function 'list_min'.\\nDid you mean 'list_zip'?\"",
+      "group": "sql-protocols",
+      "pattern": "^Spice rejected the query: FlightSql rejected the query: Tonic error: code: 'Client specified an invalid argument', message: .*Invalid function 'list_min'"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: WITH input(id, n, i, d, s, a, dt, ts, j) AS ( VALUES (1, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}'), (2, CAST(-0.5 AS DOUBLE), CAST(-2 AS BIGINT), CAST(-1.255 AS DECIMAL(10,3)), '', CAST([] AS BIGINT[]), DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59', '{}'), (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (4, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}') ) SELECT id, list_min(a) AS value FROM input ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Invalid function 'list_min'.\\nDid you mean 'list_zip'?\": code: 'Client specified an invalid argument', message: \"Invalid function 'list_min'.\\nDid you mean 'list_zip'?\"",
+      "group": "sql-protocols",
+      "pattern": "^Spice rejected the query: FlightSql rejected the query: Tonic error: code: 'Client specified an invalid argument', message: .*Invalid function 'list_min'"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: WITH input(id, n, i, d, s, a, dt, ts, j) AS ( VALUES (1, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}'), (2, CAST(-0.5 AS DOUBLE), CAST(-2 AS BIGINT), CAST(-1.255 AS DECIMAL(10,3)), '', CAST([] AS BIGINT[]), DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59', '{}'), (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (4, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}') ) SELECT id, list_min(a) AS value FROM input WHERE id < 0",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Invalid function 'list_min'.\\nDid you mean 'list_zip'?\": code: 'Client specified an invalid argument', message: \"Invalid function 'list_min'.\\nDid you mean 'list_zip'?\"",
+      "group": "sql-protocols",
+      "pattern": "^Spice rejected the query: FlightSql rejected the query: Tonic error: code: 'Client specified an invalid argument', message: .*Invalid function 'list_min'"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: WITH input(id, n, i, d, s, a, dt, ts, j) AS ( VALUES (1, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}'), (2, CAST(-0.5 AS DOUBLE), CAST(-2 AS BIGINT), CAST(-1.255 AS DECIMAL(10,3)), '', CAST([] AS BIGINT[]), DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59', '{}'), (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (4, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}') ) SELECT id, round(d, CAST(2 AS BIGINT)) AS value FROM input ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Flight SQL advertised schema Schema { fields: [Field { name: \"id\", data_type: Int64 }, Field { name: \"value\", data_type: Decimal128(11, 3), nullable: true }], metadata: {} }, streamed Schema { fields: [Field { name: \"id\", data_type: Int64 }, Fi",
+      "group": "sql-protocols"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: WITH input(id, n, i, d, s, a, dt, ts, j) AS ( VALUES (1, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}'), (2, CAST(-0.5 AS DOUBLE), CAST(-2 AS BIGINT), CAST(-1.255 AS DECIMAL(10,3)), '', CAST([] AS BIGINT[]), DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59', '{}'), (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (4, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}') ) SELECT id, round(d, 1 + 1) AS value FROM input ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Flight SQL advertised schema Schema { fields: [Field { name: \"id\", data_type: Int64 }, Field { name: \"value\", data_type: Decimal128(11, 3), nullable: true }], metadata: {} }, streamed Schema { fields: [Field { name: \"id\", data_type: Int64 }, Fi",
+      "group": "sql-protocols"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: WITH input(id, n, i, d, s, a, dt, ts, j) AS ( VALUES (1, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}'), (2, CAST(-0.5 AS DOUBLE), CAST(-2 AS BIGINT), CAST(-1.255 AS DECIMAL(10,3)), '', CAST([] AS BIGINT[]), DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59', '{}'), (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (4, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}') ) SELECT grouping(i) AS value FROM input GROUP BY GROUPING SETS ((i), ())",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Flight SQL advertised schema Schema { fields: [Field { name: \"value\", data_type: Int32 }], metadata: {} }, streamed Schema { fields: [Field { name: \"value\", data_type: Int32, nullable: true }], metadata: {} }",
+      "group": "sql-protocols"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: WITH input(id, n, i, d, s, a, dt, ts, j) AS ( VALUES (1, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}'), (2, CAST(-0.5 AS DOUBLE), CAST(-2 AS BIGINT), CAST(-1.255 AS DECIMAL(10,3)), '', CAST([] AS BIGINT[]), DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59', '{}'), (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (4, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}') ) SELECT grouping(i) AS value FROM input WHERE id < 0 GROUP BY GROUPING SETS ((i), ())",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Flight SQL advertised schema Schema { fields: [Field { name: \"value\", data_type: Int32 }], metadata: {} }, streamed Schema { fields: [Field { name: \"value\", data_type: Int32, nullable: true }], metadata: {} }",
+      "group": "sql-protocols"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: WITH input(id, n, i, d, s, a, dt, ts, j) AS ( VALUES (1, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}'), (2, CAST(-0.5 AS DOUBLE), CAST(-2 AS BIGINT), CAST(-1.255 AS DECIMAL(10,3)), '', CAST([] AS BIGINT[]), DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59', '{}'), (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (4, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}') ) SELECT * EXCLUDE (a) FROM input",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Expected: end of statement, found: EXCLUDE at Line: 10, Column: 10\": code: 'Client specified an invalid argument', message: \"Expected: end of statement, found: EXCLUDE at Line",
+      "group": "sql-protocols"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: WITH input(id, n, i, d, s, a, dt, ts, j) AS ( VALUES (1, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}'), (2, CAST(-0.5 AS DOUBLE), CAST(-2 AS BIGINT), CAST(-1.255 AS DECIMAL(10,3)), '', CAST([] AS BIGINT[]), DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59', '{}'), (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (4, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}') ) SELECT * EXCEPT (a) FROM input",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Expected: SELECT, VALUES, or a subquery in the query body, found: a at Line: 10, Column: 18\": code: 'Client specified an invalid argument', message: \"Expected: SELECT, VALUES,",
+      "group": "sql-protocols"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: WITH input(id, n, i, d, s, a, dt, ts, j) AS ( VALUES (1, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}'), (2, CAST(-0.5 AS DOUBLE), CAST(-2 AS BIGINT), CAST(-1.255 AS DECIMAL(10,3)), '', CAST([] AS BIGINT[]), DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59', '{}'), (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (4, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}') ) SELECT * REPLACE (abs(i) AS i) FROM input",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Expected: end of statement, found: ( at Line: 10, Column: 18\": code: 'Client specified an invalid argument', message: \"Expected: end of statement, found: ( at Line: 10, Column",
+      "group": "sql-protocols"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: WITH input(id, n, i, d, s, a, dt, ts, j) AS ( VALUES (1, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}'), (2, CAST(-0.5 AS DOUBLE), CAST(-2 AS BIGINT), CAST(-1.255 AS DECIMAL(10,3)), '', CAST([] AS BIGINT[]), DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59', '{}'), (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (4, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}') ) SELECT * ILIKE 'd%' FROM input",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Expected: end of statement, found: 'd%' at Line: 10, Column: 16\": code: 'Client specified an invalid argument', message: \"Expected: end of statement, found: 'd%' at Line: 10, ",
+      "group": "sql-protocols"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: WITH input(id, n, i, d, s, a, dt, ts, j) AS ( VALUES (1, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}'), (2, CAST(-0.5 AS DOUBLE), CAST(-2 AS BIGINT), CAST(-1.255 AS DECIMAL(10,3)), '', CAST([] AS BIGINT[]), DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59', '{}'), (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (4, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}') ) SELECT i, id FROM input ORDER BY ALL",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"No field named \\\"ALL\\\".\\nValid fields are input.i, input.id, input.id, input.n, input.i, input.d, input.s, input.a, input.dt, input.ts, input.j.\": code: 'Client specified an i",
+      "group": "sql-protocols"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: WITH input(id, n, i, d, s, a, dt, ts, j) AS ( VALUES (1, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}'), (2, CAST(-0.5 AS DOUBLE), CAST(-2 AS BIGINT), CAST(-1.255 AS DECIMAL(10,3)), '', CAST([] AS BIGINT[]), DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59', '{}'), (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (4, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}') ) SELECT i, n, grouping(i,n) AS g FROM input GROUP BY GROUPING SETS ((i),(n),())",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Flight SQL advertised schema Schema { fields: [Field { name: \"i\", data_type: Int64, nullable: true }, Field { name: \"n\", data_type: Float64, nullable: true }, Field { name: \"g\", data_type: Int32 }], metadata: {} }, streamed Schema { fields: [Fi",
+      "group": "sql-protocols"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: SELECT x.id, (SELECT max(y.i) FROM t y WHERE y.id <= x.id) AS value FROM t x",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Unsupported Query. Physical plan does not support logical expression ScalarSubquery(<subquery>)\": code: 'Client specified an invalid argument', message: \"Unsupported Query. Ph",
+      "group": "sql-protocols"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: SELECT id, i = ANY(SELECT i FROM t WHERE id < 3) AS value FROM t",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Unsupported Query. Physical plan does not support logical expression Exists(Exists { subquery: <subquery>, negated: false })\": code: 'Client specified an invalid argument', me",
+      "group": "sql-protocols"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: SELECT id, i >= ALL(SELECT i FROM t WHERE id < 3) AS value FROM t",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Unsupported Query. Physical plan does not support logical expression Exists(Exists { subquery: <subquery>, negated: false })\": code: 'Client specified an invalid argument', me",
+      "group": "sql-protocols"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: WITH input(id, n, i, d, s, a, dt, ts, j) AS ( VALUES (1, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}'), (2, CAST(-0.5 AS DOUBLE), CAST(-2 AS BIGINT), CAST(-1.255 AS DECIMAL(10,3)), '', CAST([] AS BIGINT[]), DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59', '{}'), (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (4, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}') ) SELECT id, (i > 0) IS TRUE AS value FROM input ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Flight SQL advertised schema Schema { fields: [Field { name: \"id\", data_type: Int64 }, Field { name: \"value\", data_type: Boolean }], metadata: {} }, streamed Schema { fields: [Field { name: \"id\", data_type: Int64 }, Field { name: \"value\", data_",
+      "group": "sql-protocols"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: WITH input(id, n, i, d, s, a, dt, ts, j) AS ( VALUES (1, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}'), (2, CAST(-0.5 AS DOUBLE), CAST(-2 AS BIGINT), CAST(-1.255 AS DECIMAL(10,3)), '', CAST([] AS BIGINT[]), DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59', '{}'), (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (4, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}') ) SELECT id, (i > 0) IS NOT TRUE AS value FROM input ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Flight SQL advertised schema Schema { fields: [Field { name: \"id\", data_type: Int64 }, Field { name: \"value\", data_type: Boolean }], metadata: {} }, streamed Schema { fields: [Field { name: \"id\", data_type: Int64 }, Field { name: \"value\", data_",
+      "group": "sql-protocols"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: WITH input(id, n, i, d, s, a, dt, ts, j) AS ( VALUES (1, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}'), (2, CAST(-0.5 AS DOUBLE), CAST(-2 AS BIGINT), CAST(-1.255 AS DECIMAL(10,3)), '', CAST([] AS BIGINT[]), DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59', '{}'), (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (4, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}') ) SELECT id, (i > 0) IS FALSE AS value FROM input ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Flight SQL advertised schema Schema { fields: [Field { name: \"id\", data_type: Int64 }, Field { name: \"value\", data_type: Boolean }], metadata: {} }, streamed Schema { fields: [Field { name: \"id\", data_type: Int64 }, Field { name: \"value\", data_",
+      "group": "sql-protocols"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: WITH input(id, n, i, d, s, a, dt, ts, j) AS ( VALUES (1, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}'), (2, CAST(-0.5 AS DOUBLE), CAST(-2 AS BIGINT), CAST(-1.255 AS DECIMAL(10,3)), '', CAST([] AS BIGINT[]), DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59', '{}'), (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), (4, CAST(0.5 AS DOUBLE), CAST(2 AS BIGINT), CAST(1.255 AS DECIMAL(10,3)), 'banana na\u00efve', [CAST(1 AS BIGINT),2,2,NULL], DATE '2024-02-29', TIMESTAMP '2024-02-29 12:34:56', '{\"text\":\"hello\",\"int\":42,\"float\":1.5,\"bool\":true,\"array\":[1,null,3],\"object\":{\"x\":1}}') ) SELECT id, (i > 0) IS UNKNOWN AS value FROM input ORDER BY id",
+      "kind": "error",
+      "signature": "Spice rejected the query: FlightSql rejected the query: Flight SQL advertised schema Schema { fields: [Field { name: \"id\", data_type: Int64 }, Field { name: \"value\", data_type: Boolean }], metadata: {} }, streamed Schema { fields: [Field { name: \"id\", data_type: Int64 }, Field { name: \"value\", data_",
+      "group": "sql-protocols"
+    },
+    {
+      "run": "sql-surface-known",
+      "who": "default",
+      "key": "query: SELECT CAST('NaN' AS DOUBLE) AS nan, CAST('Infinity' AS DOUBLE) AS inf, CAST('-Infinity' AS DOUBLE) AS neg_inf, CAST('-0.0' AS DOUBLE) AS zero",
+      "kind": "error",
+      "signature": "Spice rejected the query: could not decode the HTTP JSON answer as Flight's schema; body: [{\"inf\":null,\"nan\":null,\"neg_inf\":null,\"zero\":-0.0}]: Json error: Encountered unmasked nulls in non-nullable StructArray child: Field { \"nan\": Float64 }",
+      "group": "sql-protocols"
+    }
+  ]
+}

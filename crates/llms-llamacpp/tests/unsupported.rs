@@ -33,11 +33,13 @@ async fn an_encoder_decoder_model_is_refused_as_an_unsupported_architecture() {
     let dir = llms::chat::hf_files::download_model(
         &format!("{T5}:{T5_REVISION}"),
         &[T5_FILE],
+        llms::chat::hf_files::Budget::Unmeasured,
         llms::hf::HubParams::default(),
         "flan-t5-small",
     )
     .await
-    .expect("flan-t5-small downloads");
+    .expect("flan-t5-small downloads")
+    .dir;
     let weights = [dir.join(T5_FILE)];
     let engine = llms::chat::engine::engine_for(&weights).expect("a .gguf goes to llama.cpp");
     let options = LocalModelOptions {

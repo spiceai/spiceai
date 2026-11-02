@@ -6,7 +6,7 @@
 //
 //     https://www.apache.org/licenses/LICENSE-2.0
 
-//! Ingest throughput: Cayenne vs DuckDB.
+//! Ingest throughput: Cayenne vs `DuckDB`.
 //!
 //! Both engines load from the same pre-materialized parquet file
 //! (written once outside the timed region) so the measurement is
@@ -14,10 +14,10 @@
 //! engine's write path:
 //! * `cayenne` — `ctx.read_parquet(...)` → `CayenneTableProvider::insert_into`
 //! * `duckdb`  — `INSERT INTO ... SELECT * FROM read_parquet(...)`,
-//!               DuckDB's recommended bulk-ingestion path
+//!   `DuckDB`'s recommended bulk-ingestion path
 //!
 //! Both engines materialize to local disk (Cayenne to a temp directory,
-//! DuckDB to a temp `.duckdb` file) so the comparison is file-mode vs
+//! `DuckDB` to a temp `.duckdb` file) so the comparison is file-mode vs
 //! file-mode — see `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/README.md`
 //! for why that's the only fair pairing (Cayenne does not support
 //! in-memory mode).

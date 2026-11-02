@@ -116,7 +116,6 @@ mod test {
     /// it would break. Building the engine directly cannot show any of that: passing a
     /// default config from the builder would leave every engine-side test green while
     /// silently dropping the operator's setting.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn a_runtime_param_reaches_the_registered_engine() {
         use accelerator_cayenne::CayenneAccelerator;
@@ -165,7 +164,6 @@ mod test {
     /// what catch a wrong mapping. That the classification then reaches the table's actual
     /// configuration is covered engine-side by
     /// `unset_cdc_refresh_mode_keeps_background_compaction`.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn the_pre_init_and_post_init_write_profiles_agree() {
         use crate::component::dataset::acceleration::RefreshMode;
@@ -771,7 +769,6 @@ mod accelerator_compat_tests {
     {
         // Test both memory and file modes for databases
         // For Turso accelerator, test both timestamp formats
-        // For Cayenne, test both SQLite and Turso metastore backends
         // Format: (engine, mode, timestamp_format, metastore_type)
         let test_configs = vec![
             #[cfg(feature = "sqlite")]
@@ -791,10 +788,7 @@ mod accelerator_compat_tests {
             #[cfg(feature = "duckdb")]
             (Engine::DuckDB, "file", None, None),
             (Engine::Arrow, "memory", None, None),
-            #[cfg(not(windows))]
             (Engine::Cayenne, "file", None, Some("sqlite")), // Cayenne with SQLite metastore
-            #[cfg(all(not(windows), feature = "turso"))]
-            (Engine::Cayenne, "file", None, Some("turso")), // Cayenne with Turso metastore
         ];
 
         for (engine, mode, timestamp_format, metastore_type) in test_configs {
@@ -927,7 +921,6 @@ mod accelerator_compat_tests {
                         }
                     }
                 }
-                #[cfg(not(windows))]
                 Engine::Cayenne => {
                     use crate::component::dataset::builder::DatasetBuilder;
                     use accelerator_cayenne::CayenneAccelerator;
@@ -2170,7 +2163,6 @@ mod accelerator_compat_tests {
                             .await
                             .expect("Arrow table should be created")
                     }
-                    #[cfg(not(windows))]
                     Engine::Cayenne => {
                         use crate::component::dataset::builder::DatasetBuilder;
                         use accelerator_cayenne::CayenneAccelerator; // Clean up any existing files and metadata
@@ -2224,9 +2216,6 @@ mod accelerator_compat_tests {
                         // Use test environment's metadata directory for Cayenne
                         params.insert("cayenne_metadata_dir".to_string(), metadata_dir.clone());
                         params.insert("unsupported_type_action".to_string(), "error".to_string());
-                        if _mode.contains("metastore=turso") {
-                            params.insert("cayenne_metastore".to_string(), "turso".to_string());
-                        }
 
                         dataset.acceleration = Some(Acceleration {
                             enabled: true,
@@ -2941,7 +2930,7 @@ mod accelerator_compat_tests {
             print!("║ {:20}", "Metric");
             for result in &mode_results {
                 let engine_label = if matches!(result.engine, Engine::Cayenne) {
-                    // Extract metastore type from mode string (e.g., "file, metastore=turso")
+                    // Extract metastore type from mode string (e.g., "file, metastore=sqlite")
                     if let Some(metastore) = result.mode.split("metastore=").nth(1) {
                         format!("Cayenne({})", metastore)
                     } else {

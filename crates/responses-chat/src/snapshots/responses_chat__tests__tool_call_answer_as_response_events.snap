@@ -1,0 +1,316 @@
+---
+source: crates/responses-chat/src/tests.rs
+expression: "pretty(&normalized(&Value::Array(events)))"
+---
+[
+  {
+    "response": {
+      "created_at": "<timestamp>",
+      "id": "<resp_1>",
+      "model": "gpt",
+      "object": "response",
+      "output": [],
+      "parallel_tool_calls": true,
+      "status": "in_progress",
+      "tool_choice": "auto",
+      "tools": [
+        {
+          "name": "read_file",
+          "type": "function"
+        },
+        {
+          "description": "Sub-agents.",
+          "name": "multi_agent_v1",
+          "tools": [
+            {
+              "name": "spawn_agent",
+              "type": "function"
+            }
+          ],
+          "type": "namespace"
+        }
+      ]
+    },
+    "sequence_number": 0,
+    "type": "response.created"
+  },
+  {
+    "response": {
+      "created_at": "<timestamp>",
+      "id": "<resp_1>",
+      "model": "gpt",
+      "object": "response",
+      "output": [],
+      "parallel_tool_calls": true,
+      "status": "in_progress",
+      "tool_choice": "auto",
+      "tools": [
+        {
+          "name": "read_file",
+          "type": "function"
+        },
+        {
+          "description": "Sub-agents.",
+          "name": "multi_agent_v1",
+          "tools": [
+            {
+              "name": "spawn_agent",
+              "type": "function"
+            }
+          ],
+          "type": "namespace"
+        }
+      ]
+    },
+    "sequence_number": 1,
+    "type": "response.in_progress"
+  },
+  {
+    "item": {
+      "content": [],
+      "id": "<msg_1>",
+      "role": "assistant",
+      "status": "in_progress",
+      "type": "message"
+    },
+    "output_index": 0,
+    "sequence_number": 2,
+    "type": "response.output_item.added"
+  },
+  {
+    "content_index": 0,
+    "item_id": "<msg_1>",
+    "output_index": 0,
+    "part": {
+      "annotations": [],
+      "logprobs": [],
+      "text": "",
+      "type": "output_text"
+    },
+    "sequence_number": 3,
+    "type": "response.content_part.added"
+  },
+  {
+    "content_index": 0,
+    "delta": "Reading it.",
+    "item_id": "<msg_1>",
+    "logprobs": [],
+    "output_index": 0,
+    "sequence_number": 4,
+    "type": "response.output_text.delta"
+  },
+  {
+    "content_index": 0,
+    "item_id": "<msg_1>",
+    "logprobs": [],
+    "output_index": 0,
+    "sequence_number": 5,
+    "text": "Reading it.",
+    "type": "response.output_text.done"
+  },
+  {
+    "content_index": 0,
+    "item_id": "<msg_1>",
+    "output_index": 0,
+    "part": {
+      "annotations": [],
+      "logprobs": [],
+      "text": "Reading it.",
+      "type": "output_text"
+    },
+    "sequence_number": 6,
+    "type": "response.content_part.done"
+  },
+  {
+    "item": {
+      "content": [
+        {
+          "annotations": [],
+          "logprobs": [],
+          "text": "Reading it.",
+          "type": "output_text"
+        }
+      ],
+      "id": "<msg_1>",
+      "role": "assistant",
+      "status": "completed",
+      "type": "message"
+    },
+    "output_index": 0,
+    "sequence_number": 7,
+    "type": "response.output_item.done"
+  },
+  {
+    "item": {
+      "arguments": "",
+      "call_id": "call_1",
+      "id": "<fc_1>",
+      "name": "read_file",
+      "status": "in_progress",
+      "type": "function_call"
+    },
+    "output_index": 1,
+    "sequence_number": 8,
+    "type": "response.output_item.added"
+  },
+  {
+    "delta": "{\"path\":",
+    "item_id": "<fc_1>",
+    "output_index": 1,
+    "sequence_number": 9,
+    "type": "response.function_call_arguments.delta"
+  },
+  {
+    "delta": "\"a.rs\"}",
+    "item_id": "<fc_1>",
+    "output_index": 1,
+    "sequence_number": 10,
+    "type": "response.function_call_arguments.delta"
+  },
+  {
+    "arguments": "{\"path\":\"a.rs\"}",
+    "item_id": "<fc_1>",
+    "name": "read_file",
+    "output_index": 1,
+    "sequence_number": 11,
+    "type": "response.function_call_arguments.done"
+  },
+  {
+    "item": {
+      "arguments": "{\"path\":\"a.rs\"}",
+      "call_id": "call_1",
+      "id": "<fc_1>",
+      "name": "read_file",
+      "status": "completed",
+      "type": "function_call"
+    },
+    "output_index": 1,
+    "sequence_number": 12,
+    "type": "response.output_item.done"
+  },
+  {
+    "item": {
+      "arguments": "",
+      "call_id": "call_2",
+      "id": "<fc_2>",
+      "name": "spawn_agent",
+      "namespace": "multi_agent_v1",
+      "status": "in_progress",
+      "type": "function_call"
+    },
+    "output_index": 2,
+    "sequence_number": 13,
+    "type": "response.output_item.added"
+  },
+  {
+    "delta": "{\"message\":",
+    "item_id": "<fc_2>",
+    "output_index": 2,
+    "sequence_number": 14,
+    "type": "response.function_call_arguments.delta"
+  },
+  {
+    "delta": "\"help\"}",
+    "item_id": "<fc_2>",
+    "output_index": 2,
+    "sequence_number": 15,
+    "type": "response.function_call_arguments.delta"
+  },
+  {
+    "arguments": "{\"message\":\"help\"}",
+    "item_id": "<fc_2>",
+    "name": "spawn_agent",
+    "output_index": 2,
+    "sequence_number": 16,
+    "type": "response.function_call_arguments.done"
+  },
+  {
+    "item": {
+      "arguments": "{\"message\":\"help\"}",
+      "call_id": "call_2",
+      "id": "<fc_2>",
+      "name": "spawn_agent",
+      "namespace": "multi_agent_v1",
+      "status": "completed",
+      "type": "function_call"
+    },
+    "output_index": 2,
+    "sequence_number": 17,
+    "type": "response.output_item.done"
+  },
+  {
+    "response": {
+      "completed_at": "<timestamp>",
+      "created_at": "<timestamp>",
+      "id": "<resp_1>",
+      "model": "gpt",
+      "object": "response",
+      "output": [
+        {
+          "content": [
+            {
+              "annotations": [],
+              "logprobs": [],
+              "text": "Reading it.",
+              "type": "output_text"
+            }
+          ],
+          "id": "<msg_1>",
+          "role": "assistant",
+          "status": "completed",
+          "type": "message"
+        },
+        {
+          "arguments": "{\"path\":\"a.rs\"}",
+          "call_id": "call_1",
+          "id": "<fc_1>",
+          "name": "read_file",
+          "status": "completed",
+          "type": "function_call"
+        },
+        {
+          "arguments": "{\"message\":\"help\"}",
+          "call_id": "call_2",
+          "id": "<fc_2>",
+          "name": "spawn_agent",
+          "namespace": "multi_agent_v1",
+          "status": "completed",
+          "type": "function_call"
+        }
+      ],
+      "parallel_tool_calls": true,
+      "status": "completed",
+      "tool_choice": "auto",
+      "tools": [
+        {
+          "name": "read_file",
+          "type": "function"
+        },
+        {
+          "description": "Sub-agents.",
+          "name": "multi_agent_v1",
+          "tools": [
+            {
+              "name": "spawn_agent",
+              "type": "function"
+            }
+          ],
+          "type": "namespace"
+        }
+      ],
+      "usage": {
+        "input_tokens": 120,
+        "input_tokens_details": {
+          "cached_tokens": 100
+        },
+        "output_tokens": 30,
+        "output_tokens_details": {
+          "reasoning_tokens": 12
+        },
+        "total_tokens": 150
+      }
+    },
+    "sequence_number": 18,
+    "type": "response.completed"
+  }
+]

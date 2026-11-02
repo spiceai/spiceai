@@ -1,0 +1,86 @@
+name: snapshots-reader-concurrent
+description: >
+  Concurrent queries see one complete generation while a snapshot reader swaps
+  providers: the original 200 rows, or the replacement 100 rows with ten changed
+  values. The key set and values agree with that generation on every query.
+  Results caching is disabled, and the background workload reports P99 latency
+  for before/after comparisons using the same script and engine.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  engine: [cayenne, duckdb, sqlite, turso]
+
+variants:
+  writer:
+    datasets: { t: { acceleration: { refresh_mode: full, snapshots: create_only } } }
+  reader:
+    datasets: { t: { acceleration: { refresh_mode: snapshot, snapshots: bootstrap_only, refresh_check_interval: 1s } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: snapshots-reader-concurrent
+  runtime:
+    caching:
+      sql_results: { enabled: false }
+  snapshots:
+    enabled: true
+    location: file://${instance.dir}/../shared-snapshots/
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file }
+
+defaults:
+  run-variants: side-by-side
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text);
+        INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 200) i;
+  - start: { ready: false }
+  - query: SELECT count(*) AS n, sum(id) AS s FROM t
+    expect: { rows: [['200', '20100']] }
+    eventually: 60s
+    only: reader
+  - assert-log: { contains: 'Snapshot restored' }
+    eventually: 30s
+    only: reader
+  - background:
+      id: whole-generation
+      concurrency: 4
+      every: 10ms
+      query: >
+        SELECT CASE WHEN count(*) = count(DISTINCT id) AND count(v) = count(*)
+          AND min(id) = 1
+          AND count(*) FILTER (WHERE id > 10 AND v <> 'v' || CAST(id AS VARCHAR)) = 0
+          AND ((count(*) = 200 AND max(id) = 200 AND sum(id) = 20100
+                AND count(*) FILTER (WHERE id <= 10 AND v = 'v' || CAST(id AS VARCHAR)) = 10)
+            OR (count(*) = 100 AND max(id) = 100 AND sum(id) = 5050
+                AND count(*) FILTER (WHERE id <= 10 AND v = 'new') = 10))
+          THEN 1 ELSE 0 END AS whole FROM t
+      expect: { whole: '1' }
+    only: reader
+  - query: SELECT count(*) AS n, sum(id) AS s FROM t
+    expect: { rows: [['200', '20100']] }
+    consistently: 5s
+    only: reader
+  - source-exec: { src: "DELETE FROM t WHERE id > 100; UPDATE t SET v = 'new' WHERE id <= 10" }
+    only: writer
+  - refresh: t
+    only: writer
+  - query: SELECT count(*) AS n, sum(id) AS s, count(*) FILTER (WHERE v = 'new') AS changed FROM t
+    expect: { rows: [['100', '5050', '10']] }
+    eventually: 60s
+    only: reader
+  - query: SELECT count(*) AS n, sum(id) AS s FROM t
+    expect: { rows: [['100', '5050']] }
+    consistently: 5s
+    only: reader
+  - stop-background: { id: whole-generation }
+    only: reader

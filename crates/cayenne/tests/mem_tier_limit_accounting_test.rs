@@ -30,7 +30,6 @@ limitations under the License.
 //! same data either way, and that what it reports as resident at rejection is
 //! memory the process actually gave up.
 
-#![cfg(not(windows))]
 #![allow(clippy::expect_used, clippy::cast_precision_loss)]
 
 use crate::common;

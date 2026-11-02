@@ -299,7 +299,8 @@ async fn file_connector_partition_only_scan_reads_a_computed_partition_alias()
                 ),
                 (
                     "SELECT p FROM (SELECT CAST(p AS BIGINT) - 1 AS p FROM hivepart) s GROUP BY p ORDER BY p",
-                    "CAST(p@2 AS Int64) - 1 as p",
+                    // Integer `-` runs as the checked kernel (overflow errors).
+                    "__spice_checked_sub(CAST(p@2 AS Int64), 1) as p",
                     ["0", "1", "2"],
                 ),
             ] {

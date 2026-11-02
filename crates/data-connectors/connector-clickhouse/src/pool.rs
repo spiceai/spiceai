@@ -55,6 +55,11 @@ impl ClickhouseConnectionPool {
     // Creates a new instance of `ClickhouseConnectionPool`.
     #[must_use]
     pub fn new(options: Options, db: Arc<str>, compute_context: String) -> Self {
+        // Match SQL null extension and empty-set aggregate semantics on every
+        // connection, including handles acquired directly for streaming queries.
+        let options = options
+            .with_setting("join_use_nulls", 1_u64, true)
+            .with_setting("aggregate_functions_null_for_empty", 1_u64, true);
         let pool = Pool::new(options);
 
         Self {

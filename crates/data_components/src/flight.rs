@@ -20,7 +20,7 @@ use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
 };
-use arrow_flight::error::FlightError;
+use arrow_flight::{decode::FlightRecordBatchStream, error::FlightError};
 use arrow_tools::map_entries::{self, StreamNormalizer};
 use async_stream::stream;
 use async_trait::async_trait;
@@ -54,6 +54,7 @@ use self::write::FlightTableWriter;
 pub(crate) mod dictionary_id_fixture;
 pub mod federation;
 pub mod stream;
+mod substrait;
 pub mod write;
 
 #[derive(Debug, Snafu)]
@@ -97,6 +98,7 @@ pub struct FlightFactory {
     dialect: Arc<dyn Dialect>,
     extra_compute_context: Option<Arc<str>>,
     function_support: Option<FunctionSupport>,
+    substrait: bool,
 }
 
 impl std::fmt::Debug for FlightFactory {
@@ -118,12 +120,20 @@ impl FlightFactory {
             dialect,
             extra_compute_context: None,
             function_support: None,
+            substrait: false,
         }
     }
 
     #[must_use]
     pub fn client(&self) -> FlightClient {
         self.client.clone()
+    }
+
+    /// Use plan federation for reads from another Spice runtime.
+    #[must_use]
+    pub fn with_substrait(mut self, substrait: bool) -> Self {
+        self.substrait = substrait;
+        self
     }
 
     /// Install the federation function deny-list so Spice-only UDFs are evaluated
@@ -159,10 +169,15 @@ impl FlightFactory {
                 self.extra_compute_context.as_ref().map(Arc::clone),
             )
             .await?
-            .with_function_support(self.function_support.clone()),
+            .with_function_support(self.function_support.clone())
+            .with_substrait(self.substrait),
         );
 
-        let table_provider = Arc::new(table_provider.create_federated_table_provider());
+        let table_provider = if self.substrait {
+            Arc::new(substrait::federated_provider(table_provider))
+        } else {
+            Arc::new(table_provider.create_federated_table_provider())
+        };
 
         Ok(table_provider)
     }
@@ -205,6 +220,7 @@ pub struct FlightTable {
     /// as `json_get_str`) are evaluated locally instead of pushed into the SQL
     /// sent to the Flight server. See issue #10703.
     function_support: Option<FunctionSupport>,
+    substrait: bool,
 }
 
 impl std::fmt::Debug for FlightTable {
@@ -246,6 +262,7 @@ impl FlightTable {
             dialect,
             table_reference,
             function_support: None,
+            substrait: false,
         })
     }
 
@@ -273,6 +290,7 @@ impl FlightTable {
             dialect,
             table_reference,
             function_support: None,
+            substrait: false,
         }
     }
 
@@ -280,6 +298,11 @@ impl FlightTable {
     #[must_use]
     pub fn with_function_support(mut self, function_support: Option<FunctionSupport>) -> Self {
         self.function_support = function_support;
+        self
+    }
+
+    fn with_substrait(mut self, substrait: bool) -> Self {
+        self.substrait = substrait;
         self
     }
 
@@ -391,6 +414,14 @@ impl TableProvider for FlightTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        if self.substrait {
+            // Unsupported expressions remain local. Federation handles supported
+            // filters as part of a typed logical plan, including fallback scans.
+            return Ok(vec![
+                TableProviderFilterPushDown::Unsupported;
+                filters.len()
+            ]);
+        }
         let mut filter_push_down = vec![];
         for filter in filters {
             match to_sql_preserving_precedence(filter) {
@@ -413,6 +444,9 @@ impl TableProvider for FlightTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if self.substrait {
+            return substrait::scan(self, projection, filters, limit);
+        }
         return self.create_physical_plan(projection, &self.schema(), filters, limit);
     }
 }
@@ -559,11 +593,27 @@ fn query_to_stream(
     sql: String,
     table: String,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+    normalized_batches(
+        async move {
+            client
+                .query(sql.as_str())
+                .await
+                .map_err(|source| to_execution_error(Error::Flight { source }))
+        },
+        table,
+    )
+}
+
+/// The batches of the Flight stream that `query` opens, with their map entries normalized.
+fn normalized_batches(
+    query: impl Future<Output = DataFusionResult<FlightRecordBatchStream>> + Send,
+    table: String,
+) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     stream! {
         // The stream's schema is whatever its batches carry, so the normalizer is resolved from
         // the first one and reused for the rest.
         let mut normalizer = StreamNormalizer::new();
-        match client.query(sql.as_str()).await {
+        match query.await {
             Ok(mut stream) => {
                 while let Some(batch) = stream.next().await {
                     match batch {
@@ -576,7 +626,7 @@ fn query_to_stream(
                     }
                 }
             }
-            Err(error) => yield Err(to_execution_error(Error::Flight{ source: error}))
+            Err(error) => yield Err(error),
         }
     }
 }

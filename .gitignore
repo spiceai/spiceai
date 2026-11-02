@@ -19,6 +19,7 @@ spicepod.yaml
 !examples/cosmosdb-connector/spicepod.yaml
 !examples/cdc-debezium-ingest/spicepod.yaml
 !test/spicepods/chbench/local-writeback/spicepod.yaml
+!.cursor/skills/verify-integer-overflow/spicepod.yaml
 
 target/
 

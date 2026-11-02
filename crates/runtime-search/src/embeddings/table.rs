@@ -27,16 +27,21 @@ use arrow_tools::schema;
 use async_trait::async_trait;
 use chunking::ChunkingConfig;
 use datafusion::catalog::Session;
-use datafusion::common::{Statistics, project_schema};
+use datafusion::common::{DFSchema, Statistics, project_schema};
 use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::TableProviderFilterPushDown;
+use datafusion::logical_expr::expr_rewriter::unnormalize_cols;
+use datafusion::logical_expr::utils::conjunction;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::filter::FilterExecBuilder;
 use datafusion::{
     datasource::TableProvider,
     logical_expr::{Expr, LogicalPlan},
 };
 use itertools::Itertools;
 use snafu::prelude::*;
+use util::expr::cannot_be_evaluated_at_scan;
 
 use super::EmbeddingModelStore;
 use super::common::base_col;
@@ -865,23 +870,21 @@ impl EmbeddingTable {
             tracing::trace!(
                 "For `EmbeddingTable`, no additional embedding columns to compute. Forwarding entirely to base table."
             );
-            return self
-                .base_table
-                .scan(
-                    state,
-                    projection
-                        .as_ref()
-                        .map(|p| {
-                            p.iter()
-                                .filter(|&&idx| idx < num_base_cols)
-                                .copied()
-                                .collect()
-                        })
-                        .as_ref(),
-                    filters,
-                    limit,
-                )
-                .await;
+            let base_projection: Option<Vec<usize>> = projection.map(|p| {
+                p.iter()
+                    .filter(|&&idx| idx < num_base_cols)
+                    .copied()
+                    .collect()
+            });
+            let (base_plan, predicate) =
+                Self::scan_below(below, state, base_projection.as_ref(), filters, limit).await?;
+            let Some(predicate) = predicate else {
+                return Ok(base_plan);
+            };
+            let filter = FilterExecBuilder::new(predicate, base_plan)
+                .apply_projection(base_projection.map(|p| (0..p.len()).collect()))?
+                .build()?;
+            return Ok(Arc::new(filter));
         }
         tracing::trace!(
             "For `EmbeddingTable`, additional embedding columns to compute: {columns_to_embed:?}"
@@ -915,19 +918,81 @@ impl EmbeddingTable {
         };
 
         let projected_schema = project_schema(schema, projection)?;
-        let base_plan = self
-            .base_table
-            .scan(state, projection_for_base_table.as_ref(), filters, limit)
-            .await?;
+        let (base_plan, predicate) = Self::scan_below(
+            below,
+            state,
+            projection_for_base_table.as_ref(),
+            filters,
+            limit,
+        )
+        .await?;
 
+        // The predicate and limit are applied inside `EmbeddingTableExec`, not as
+        // plan nodes: its `children()` are `base_plan`'s, so a node at the root of
+        // `base_plan` would be visible to the optimizer only as a parent of the
+        // scan, which then repartitions the scan and reads all of it.
         Ok(Arc::new(EmbeddingTableExec::new(
             &projected_schema,
-            filters,
+            predicate,
             limit,
             base_plan,
             Arc::new(scan_embed_columns),
             Arc::clone(&self.embedding_models),
         )) as Arc<dyn ExecutionPlan>)
+    }
+
+    /// Scans `below` with the filters it applies exactly, and returns the rest as
+    /// one predicate the caller applies before computing any embedding.
+    ///
+    /// This layer reports filters as `Exact` (see `supports_filters_pushdown`),
+    /// so no `Filter` or `Limit` runs above it, after the embeddings are computed
+    /// (#15632). `limit` reaches `below` only when there is no predicate. The scan
+    /// reads `projection` followed by any column only the predicate reads.
+    async fn scan_below(
+        below: &Arc<dyn TableProvider>,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<(Arc<dyn ExecutionPlan>, Option<Arc<dyn PhysicalExpr>>)> {
+        let support = below.supports_filters_pushdown(&filters.iter().collect_vec())?;
+        let mut pushed = Vec::with_capacity(filters.len());
+        let mut residual = Vec::new();
+        for (idx, filter) in filters.iter().enumerate() {
+            match support
+                .get(idx)
+                .unwrap_or(&TableProviderFilterPushDown::Unsupported)
+            {
+                TableProviderFilterPushDown::Exact => pushed.push(filter.clone()),
+                TableProviderFilterPushDown::Inexact => {
+                    pushed.push(filter.clone());
+                    residual.push(filter.clone());
+                }
+                TableProviderFilterPushDown::Unsupported => residual.push(filter.clone()),
+            }
+        }
+
+        let Some(predicate) = conjunction(unnormalize_cols(residual)) else {
+            return Ok((below.scan(state, projection, &pushed, limit).await?, None));
+        };
+
+        let below_schema = below.schema();
+        let scanned = projection
+            .map(|requested| -> DataFusionResult<Vec<usize>> {
+                let mut scanned = requested.clone();
+                for column in predicate.column_refs() {
+                    let idx = below_schema.index_of(column.name())?;
+                    if !scanned.contains(&idx) {
+                        scanned.push(idx);
+                    }
+                }
+                Ok(scanned)
+            })
+            .transpose()?;
+        let plan = below.scan(state, scanned.as_ref(), &pushed, None).await?;
+        let predicate =
+            state.create_physical_expr(predicate, &DFSchema::try_from(plan.schema())?)?;
+        Ok((plan, Some(predicate)))
     }
 }
 
@@ -970,43 +1035,34 @@ impl TableLayer for EmbeddingTable {
         self.schema_over(below)
     }
 
-    /// Any filter in [`filters`] can still be exact
+    /// A filter on base columns is `Exact`: it is applied before any embedding
+    /// is computed (see [`EmbeddingTable::scan_below`]).
     fn supports_filters_pushdown(
         &self,
         below: &Arc<dyn TableProvider>,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        let base_field_names: HashSet<String> = self
-            .base_table
-            .schema()
+        let below_schema = below.schema();
+        let base_field_names: HashSet<&str> = below_schema
             .fields
             .iter()
-            .map(|f| f.name().clone())
+            .map(|f| f.name().as_str())
             .collect();
 
-        let push_downs = filters
+        Ok(filters
             .iter()
             .map(|&f| {
-                // If all columns in the filter are in the base table, we can push down the filter
-                // dependent on the [`EmbeddingTable::base_table`]'s [`supports_filters_pushdown`].
-                let additional_fields_count = f
+                let base_columns_only = f
                     .column_refs()
                     .iter()
-                    .filter(|c| !base_field_names.contains(c.name()))
-                    .count();
-
-                if additional_fields_count == 0 {
-                    below.supports_filters_pushdown(&[f]).map(|v| {
-                        v.first()
-                            .cloned()
-                            .unwrap_or(TableProviderFilterPushDown::Unsupported)
-                    })
+                    .all(|c| base_field_names.contains(c.name()));
+                if base_columns_only && !cannot_be_evaluated_at_scan(f) {
+                    TableProviderFilterPushDown::Exact
                 } else {
-                    Ok(TableProviderFilterPushDown::Unsupported)
+                    TableProviderFilterPushDown::Unsupported
                 }
             })
-            .collect::<DataFusionResult<Vec<_>>>()?;
-        Ok(push_downs)
+            .collect())
     }
 
     fn statistics(&self, below: &Arc<dyn TableProvider>) -> Option<Statistics> {

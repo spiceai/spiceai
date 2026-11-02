@@ -28,6 +28,12 @@ limitations under the License.
 //!   - A range of Postgres data types (`int4`, `int8`, `text`, `float8`,
 //!     `date`) surviving INSERT/UPDATE/DELETE across the WAL path.
 //!
+//! After the bootstrap and after each committed insert, update, and delete,
+//! the statements in `ORACLE_QUERIES` run on Spice and on the source, and the
+//! schema and row multiset must match: each table, a three-way join with a
+//! `LEFT JOIN`, a grouped aggregation, and a date filter. Pausing the source
+//! container at the end proves those answers came from the acceleration.
+//!
 //! Uses a minimal hand-seeded TPC-H subset (nation, region, customer, orders)
 //! so the test stays fast and self-contained — no dbgen / external fixtures.
 
@@ -40,17 +46,19 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use app::AppBuilder;
-use arrow::array::RecordBatch;
-use arrow::util::pretty::pretty_format_batches;
+use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
+use arrow::datatypes::{DataType, Date32Type, Float64Type, Int64Type};
 use futures::TryStreamExt;
 use runtime::Runtime;
 use secrecy::ExposeSecret;
 use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode};
+use spicepod::component::caching::SQLResultsCacheConfig;
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
 use spicepod::partitioning::PartitionedBy;
 use tokio::time::sleep;
 use tokio_postgres::NoTls;
+use tokio_postgres::types::Type;
 
 use crate::postgres::common;
 use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
@@ -381,6 +389,318 @@ async fn assert_scalar_f64_approx(
 }
 
 // ---------------------------------------------------------------------------
+// PostgreSQL as the oracle
+// ---------------------------------------------------------------------------
+
+/// Statements run with the same text on Spice and on the source, whose
+/// `search_path` resolves `tpch_*` to the replicated `public` tables. Each
+/// answer is compared as a schema and a row multiset, so no statement orders
+/// rows and collation or NULL placement cannot decide a comparison. `SUM` over
+/// `int8` is cast back to `bigint` because `PostgreSQL` widens it to `numeric`.
+/// No statement sums a `float8`, whose result depends on the order rows are
+/// added in.
+const ORACLE_QUERIES: &[(&str, &str)] = &[
+    ("region", "SELECT * FROM tpch_region"),
+    ("nation", "SELECT * FROM tpch_nation"),
+    ("customer", "SELECT * FROM tpch_customer"),
+    ("orders", "SELECT * FROM tpch_orders"),
+    (
+        "customer_orders",
+        "SELECT c.c_custkey, c.c_name, n.n_name, r.r_name, o.o_orderkey, \
+         o.o_totalprice, o.o_orderdate \
+         FROM tpch_customer c \
+         JOIN tpch_nation n ON c.c_nationkey = n.n_nationkey \
+         JOIN tpch_region r ON n.n_regionkey = r.r_regionkey \
+         LEFT JOIN tpch_orders o ON o.o_custkey = c.c_custkey",
+    ),
+    (
+        "nation_balances",
+        "SELECT n.n_name, COUNT(*) AS customers, \
+         CAST(SUM(c.c_custkey) AS BIGINT) AS custkey_sum, \
+         MIN(c.c_acctbal) AS min_acctbal, MAX(c.c_acctbal) AS max_acctbal \
+         FROM tpch_customer c \
+         JOIN tpch_nation n ON c.c_nationkey = n.n_nationkey \
+         GROUP BY n.n_name",
+    ),
+    (
+        "orders_since_1995",
+        "SELECT o_orderkey, o_orderstatus, o_orderdate FROM tpch_orders \
+         WHERE o_orderdate >= DATE '1995-01-01'",
+    ),
+];
+
+/// How long a query may take to answer from the acceleration while the source
+/// is paused. A query that reads the source instead gets no response at all.
+const PAUSED_SOURCE_QUERY_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Int,
+    Float,
+    Text,
+    Date,
+}
+
+/// `Float` holds the `f64` bits, so values compare exactly. `Date` is days
+/// since the Unix epoch.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Cell {
+    Null,
+    Int(i64),
+    Float(u64),
+    Text(String),
+    Date(i32),
+}
+
+/// `rows` is sorted when the answer is built, so equal multisets compare equal.
+#[derive(Debug)]
+struct Answer {
+    columns: Vec<String>,
+    kinds: Vec<Kind>,
+    rows: Vec<Vec<Cell>>,
+}
+
+/// Fail unless Spice returns the rows the source returns for every statement
+/// in [`ORACLE_QUERIES`]. Returns the source's answers.
+async fn assert_matches_source(
+    rt: &Runtime,
+    source: &tokio_postgres::Client,
+    engine: &str,
+    stage: &str,
+) -> Result<Vec<Answer>, anyhow::Error> {
+    let mut answers = Vec::with_capacity(ORACLE_QUERIES.len());
+    for (name, sql) in ORACLE_QUERIES {
+        let postgres = answer_from_postgres(source, sql).await?;
+        let spice = answer_from_batches(&run_query(rt, sql).await?)?;
+        assert_same_answer(engine, stage, name, sql, &spice, &postgres)?;
+        answers.push(postgres);
+    }
+    Ok(answers)
+}
+
+/// Pause the source, then fail unless every statement in [`ORACLE_QUERIES`]
+/// still answers with `expected`. A query that reads the source rather than
+/// the acceleration gets no response from a paused container, so this proves
+/// the rows compared at the earlier stages came from the acceleration.
+async fn assert_answers_from_acceleration(
+    rt: &Runtime,
+    container: &crate::docker::RunningContainer,
+    engine: &str,
+    expected: &[Answer],
+) -> Result<(), anyhow::Error> {
+    container.pause().await?;
+    let outcome = async {
+        for ((name, sql), postgres) in ORACLE_QUERIES.iter().zip(expected) {
+            let batches = tokio::time::timeout(PAUSED_SOURCE_QUERY_TIMEOUT, run_query(rt, sql))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "{engine} paused-source {name}: no answer within \
+                         {PAUSED_SOURCE_QUERY_TIMEOUT:?} while the source was paused, so \
+                         the query did not read the acceleration\n  sql: {sql}"
+                    )
+                })??;
+            let spice = answer_from_batches(&batches)?;
+            assert_same_answer(engine, "paused-source", name, sql, &spice, postgres)?;
+        }
+        Ok(())
+    }
+    .await;
+    container.unpause().await?;
+    outcome
+}
+
+fn assert_same_answer(
+    engine: &str,
+    stage: &str,
+    name: &str,
+    sql: &str,
+    spice: &Answer,
+    postgres: &Answer,
+) -> Result<(), anyhow::Error> {
+    if spice.rows.is_empty() || postgres.rows.is_empty() {
+        return Err(anyhow!(
+            "{engine} {stage} {name}: an empty answer compares nothing\n  sql: {sql}\n  \
+             spice: {spice:?}\n  postgres: {postgres:?}"
+        ));
+    }
+    if (&spice.columns, &spice.kinds) != (&postgres.columns, &postgres.kinds) {
+        return Err(anyhow!(
+            "{engine} {stage} {name}: schema differs\n  sql: {sql}\n  spice: {:?} {:?}\n  \
+             postgres: {:?} {:?}",
+            spice.columns,
+            spice.kinds,
+            postgres.columns,
+            postgres.kinds
+        ));
+    }
+    if spice.rows != postgres.rows {
+        return Err(anyhow!(
+            "{engine} {stage} {name}: rows differ\n  sql: {sql}\n  spice: {:?}\n  \
+             postgres: {:?}",
+            spice.rows,
+            postgres.rows
+        ));
+    }
+    eprintln!(
+        "compared engine={engine} stage={stage} query={name} rows={} columns={:?}",
+        spice.rows.len(),
+        spice.columns
+    );
+    Ok(())
+}
+
+async fn answer_from_postgres(
+    source: &tokio_postgres::Client,
+    sql: &str,
+) -> Result<Answer, anyhow::Error> {
+    let statement = source
+        .prepare(sql)
+        .await
+        .map_err(|e| anyhow!("prepare `{sql}` on PostgreSQL: {e}"))?;
+    let rows = source
+        .query(&statement, &[])
+        .await
+        .map_err(|e| anyhow!("query `{sql}` on PostgreSQL: {e}"))?;
+    let columns = statement
+        .columns()
+        .iter()
+        .map(|column| column.name().to_string())
+        .collect();
+    let kinds = statement
+        .columns()
+        .iter()
+        .map(|column| pg_kind(column.type_()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = rows
+        .iter()
+        .map(|row| {
+            (0..row.len())
+                .map(|idx| pg_cell(row, idx))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.sort();
+    Ok(Answer {
+        columns,
+        kinds,
+        rows,
+    })
+}
+
+fn pg_kind(ty: &Type) -> Result<Kind, anyhow::Error> {
+    match *ty {
+        Type::INT2 | Type::INT4 | Type::INT8 => Ok(Kind::Int),
+        Type::FLOAT8 => Ok(Kind::Float),
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR => Ok(Kind::Text),
+        Type::DATE => Ok(Kind::Date),
+        _ => Err(anyhow!("unsupported PostgreSQL type {}", ty.name())),
+    }
+}
+
+fn pg_cell(row: &tokio_postgres::Row, idx: usize) -> Result<Cell, anyhow::Error> {
+    let cell = match *row.columns()[idx].type_() {
+        Type::INT2 => row
+            .try_get::<_, Option<i16>>(idx)?
+            .map(|v| Cell::Int(i64::from(v))),
+        Type::INT4 => row
+            .try_get::<_, Option<i32>>(idx)?
+            .map(|v| Cell::Int(i64::from(v))),
+        Type::INT8 => row.try_get::<_, Option<i64>>(idx)?.map(Cell::Int),
+        Type::FLOAT8 => row
+            .try_get::<_, Option<f64>>(idx)?
+            .map(|v| Cell::Float(v.to_bits())),
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR => {
+            row.try_get::<_, Option<String>>(idx)?.map(Cell::Text)
+        }
+        Type::DATE => row
+            .try_get::<_, Option<chrono::NaiveDate>>(idx)?
+            .map(|date| {
+                let days = date
+                    .signed_duration_since(chrono::DateTime::UNIX_EPOCH.date_naive())
+                    .num_days();
+                i32::try_from(days).map(Cell::Date)
+            })
+            .transpose()?,
+        ref other => return Err(anyhow!("unsupported PostgreSQL type {}", other.name())),
+    };
+    Ok(cell.unwrap_or(Cell::Null))
+}
+
+fn answer_from_batches(batches: &[RecordBatch]) -> Result<Answer, anyhow::Error> {
+    let Some(first) = batches.first() else {
+        return Ok(Answer {
+            columns: Vec::new(),
+            kinds: Vec::new(),
+            rows: Vec::new(),
+        });
+    };
+    let schema = first.schema();
+    let batch = arrow::compute::concat_batches(&schema, batches)
+        .map_err(|e| anyhow!("concat Spice batches: {e}"))?;
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    let mut kinds = Vec::with_capacity(batch.num_columns());
+    let mut column_cells = Vec::with_capacity(batch.num_columns());
+    for (field, array) in schema.fields().iter().zip(batch.columns()) {
+        let (kind, cells) = arrow_cells(field.name(), array)?;
+        columns.push(field.name().clone());
+        kinds.push(kind);
+        column_cells.push(cells);
+    }
+    let mut rows: Vec<Vec<Cell>> = (0..batch.num_rows())
+        .map(|row| {
+            column_cells
+                .iter()
+                .map(|cells| cells[row].clone())
+                .collect()
+        })
+        .collect();
+    rows.sort();
+    Ok(Answer {
+        columns,
+        kinds,
+        rows,
+    })
+}
+
+fn arrow_cells(name: &str, array: &ArrayRef) -> Result<(Kind, Vec<Cell>), anyhow::Error> {
+    let value_type = match array.data_type() {
+        DataType::Dictionary(_, value) => value.as_ref().clone(),
+        other => other.clone(),
+    };
+    let (kind, target) = match value_type {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32 => (Kind::Int, DataType::Int64),
+        DataType::Float64 => (Kind::Float, DataType::Float64),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => (Kind::Text, DataType::Utf8),
+        DataType::Date32 => (Kind::Date, DataType::Date32),
+        other => return Err(anyhow!("column '{name}' has unsupported type {other}")),
+    };
+    let casted = arrow::compute::cast(array.as_ref(), &target)
+        .map_err(|e| anyhow!("cast column '{name}' to {target}: {e}"))?;
+    let cell_at = |idx: usize| -> Result<Cell, anyhow::Error> {
+        if casted.is_null(idx) {
+            return Ok(Cell::Null);
+        }
+        Ok(match kind {
+            Kind::Int => Cell::Int(casted.as_primitive::<Int64Type>().value(idx)),
+            Kind::Float => Cell::Float(casted.as_primitive::<Float64Type>().value(idx).to_bits()),
+            Kind::Text => Cell::Text(casted.as_string::<i32>().value(idx).to_string()),
+            Kind::Date => Cell::Date(casted.as_primitive::<Date32Type>().value(idx)),
+        })
+    };
+    let cells = (0..casted.len())
+        .map(cell_at)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((kind, cells))
+}
+
+// ---------------------------------------------------------------------------
 // Test
 // ---------------------------------------------------------------------------
 
@@ -390,7 +710,6 @@ async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
 }
 
 /// The same lifecycle on Cayenne, keyed by `primary_key` alone.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn tpch_postgres_replication_end_to_end_cayenne() -> Result<(), anyhow::Error> {
     run_tpch_postgres_replication("cayenne", false).await
@@ -400,7 +719,6 @@ async fn tpch_postgres_replication_end_to_end_cayenne() -> Result<(), anyhow::Er
 /// primary key, then a restart. Regression test for #14947: each update kept
 /// the row's earlier versions, and a restart read every partition's earlier
 /// snapshots again.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn tpch_postgres_replication_end_to_end_cayenne_partitioned() -> Result<(), anyhow::Error> {
     run_tpch_postgres_replication("cayenne", true).await
@@ -439,7 +757,13 @@ async fn run_tpch_postgres_replication(
             let acceleration_dir = tempfile::tempdir()?;
             let partitioned_in = partitioned.then_some(acceleration_dir.path());
             let app = || {
-                let mut builder = AppBuilder::new(format!("tpch_replication_integration_{engine}"));
+                // With the SQL results cache on, a repeated statement can be
+                // answered from a cached result instead of the acceleration.
+                let mut builder = AppBuilder::new(format!("tpch_replication_integration_{engine}"))
+                    .with_sql_cache(SQLResultsCacheConfig {
+                        enabled: false,
+                        ..Default::default()
+                    });
                 for ds in TPCH_DATASETS {
                     builder =
                         builder.with_dataset(make_dataset(ds, &pg_params, engine, partitioned_in));
@@ -467,6 +791,7 @@ async fn run_tpch_postgres_replication(
             for ds in TPCH_DATASETS {
                 wait_for_row_count(&rt, ds.dataset_name, ds.expected_initial_count).await?;
             }
+            assert_matches_source(&rt, &source, engine, "bootstrap").await?;
 
             // Snapshot a few aggregations to prove type fidelity across the
             // WAL → Arrow → accelerator path.
@@ -530,6 +855,7 @@ async fn run_tpch_postgres_replication(
                 2,
             )
             .await?;
+            assert_matches_source(&rt, &source, engine, "insert").await?;
 
             // -------------------------------------------------------------
             // 5. UPDATE path — change string, float, and date columns.
@@ -607,6 +933,7 @@ async fn run_tpch_postgres_replication(
                 }
                 sleep(Duration::from_millis(250)).await;
             }
+            assert_matches_source(&rt, &source, engine, "update").await?;
 
             // -------------------------------------------------------------
             // 6. DELETE path.
@@ -649,18 +976,8 @@ async fn run_tpch_postgres_replication(
             )
             .await?;
 
-            // Final pretty-printed snapshot of the small region table for
-            // regression sensitivity on the full row shape. Using an Insta
-            // named snapshot to match the rest of the runtime test suite —
-            // run `INSTA_UPDATE=1 cargo nextest run ...` to refresh.
-            let regions = run_query(
-                &rt,
-                "SELECT r_regionkey, r_name FROM tpch_region ORDER BY r_regionkey",
-            )
-            .await?;
-            let pretty =
-                pretty_format_batches(&regions).map_err(|e| anyhow!("format regions: {e}"))?;
-            insta::assert_snapshot!("tpch_postgres_replication_regions", pretty);
+            let final_answers = assert_matches_source(&rt, &source, engine, "delete").await?;
+            assert_answers_from_acceleration(&rt, &container, engine, &final_answers).await?;
             assert_one_row_per_key(&rt).await?;
             rt.shutdown().await;
 
@@ -691,6 +1008,7 @@ async fn run_tpch_postgres_replication(
                     0.01,
                 )
                 .await?;
+                assert_matches_source(&rt, &source, engine, "restart").await?;
                 rt.shutdown().await;
             }
             Ok(())

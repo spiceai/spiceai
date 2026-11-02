@@ -49,7 +49,7 @@ inputs:
     required: false
     default: '../../target'
   minio_endpoint:
-    description: 'MinIO endpoint for sccache (Linux/Windows)'
+    description: 'MinIO endpoint for sccache (Linux)'
     required: false
   minio_access_key:
     description: 'MinIO access key for sccache'
@@ -145,12 +145,8 @@ runs:
             echo "os=darwin" >> $GITHUB_OUTPUT
             echo "ext=" >> $GITHUB_OUTPUT
             ;;
-          Windows)
-            echo "os=windows" >> $GITHUB_OUTPUT
-            echo "ext=.exe" >> $GITHUB_OUTPUT
-            ;;
           *)
-            echo "Unsupported OS: $RUNNER_OS"
+            echo "Unsupported OS: $RUNNER_OS. spiced does not build for native Windows; it runs under WSL or in Docker."
             exit 1
             ;;
         esac
@@ -295,11 +291,9 @@ runs:
           fi
         fi
 
-        if [ "${{ steps.detect-os.outputs.os }}" != "windows" ]; then
-          chmod +x "spiced${EXT}"
-          if [ "${{ inputs.build_cli }}" = "true" ]; then
-            chmod +x "spice${EXT}"
-          fi
+        chmod +x "spiced${EXT}"
+        if [ "${{ inputs.build_cli }}" = "true" ]; then
+          chmod +x "spice${EXT}"
         fi
 
     - name: Set output paths
@@ -312,24 +306,13 @@ runs:
         fi
 
     - name: Print spiced version
-      if: steps.detect-os.outputs.os != 'windows'
       shell: bash
       run: ./spiced --version
 
-    - name: Print spiced version (Windows)
-      if: steps.detect-os.outputs.os == 'windows'
-      shell: pwsh
-      run: .\spiced.exe --version
-
     - name: Print spice version
-      if: inputs.build_cli == 'true' && steps.detect-os.outputs.os != 'windows'
+      if: inputs.build_cli == 'true'
       shell: bash
       run: ./spice version
-
-    - name: Print spice version (Windows)
-      if: inputs.build_cli == 'true' && steps.detect-os.outputs.os == 'windows'
-      shell: pwsh
-      run: .\spice.exe version
 
     - name: Upload spiced artifact
       if: inputs.upload_artifact == 'true' && inputs.build_cli != 'true'
