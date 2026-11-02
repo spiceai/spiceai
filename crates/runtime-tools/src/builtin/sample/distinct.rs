@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 
 use super::SampleFrom;
+use crate::utils::{MAX_TOOL_RESULT_BYTES, collect_batches_bounded};
 
 // Max columns for parallel distinct sampling per tool call
 const MAX_CONCURRENT_COLUMNS_SCANS: usize = 5;
@@ -69,6 +70,7 @@ impl DistinctColumnsParams {
         tbl: &TableReference,
         column: &str,
         n: usize,
+        max_bytes: usize,
     ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
         // Ensure that we still get `n` rows when `len(distinct(col)) < n`, whilst
         // stilling getting all possible distinct values.
@@ -87,6 +89,7 @@ impl DistinctColumnsParams {
             ORDER BY priority, {col}
             LIMIT {n}"
             ),
+            max_bytes,
         )
         .await
     }
@@ -96,12 +99,14 @@ impl DistinctColumnsParams {
         tbl: &TableReference,
         col: &str,
         n: usize,
+        max_bytes: usize,
     ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
         let tbl_quoted = quote_table_reference(tbl);
         let col = quote_sql_identifier(col);
         Self::_sample_col(
             Arc::clone(&df),
             &format!("SELECT {col} FROM {tbl_quoted} LIMIT {n}"),
+            max_bytes,
         )
         .await
     }
@@ -109,13 +114,12 @@ impl DistinctColumnsParams {
     async fn _sample_col(
         df: Arc<dyn QueryEngine>,
         query: &str,
+        max_bytes: usize,
     ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
         let stream = df.execute_query(QueryRequest::new(query)).await?;
 
-        let column = stream
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+        let column = collect_batches_bounded(stream, max_bytes)
+            .await?
             .iter()
             .map(|batch| Arc::clone(batch.column(0)))
             .collect_vec();
@@ -145,6 +149,7 @@ impl SampleFrom for DistinctColumnsParams {
         let mut result: Vec<ArrayRef> = Vec::with_capacity(columns.len());
 
         let current_span = Span::current();
+        let column_max_bytes = MAX_TOOL_RESULT_BYTES / columns.len().max(1);
 
         let data_sample_futures = columns.iter().map(|column| {
             let tbl = tbl.clone();
@@ -159,9 +164,17 @@ impl SampleFrom for DistinctColumnsParams {
                             .as_ref()
                             .is_some_and(|cols| cols.contains(column.name())))
                 {
-                    Self::sample_distinct_from_column(df, &tbl, column.name(), self.limit).await
+                    Self::sample_distinct_from_column(
+                        df,
+                        &tbl,
+                        column.name(),
+                        self.limit,
+                        column_max_bytes,
+                    )
+                    .await
                 } else {
-                    Self::sample_from_column(df, &tbl, column.name(), self.limit).await
+                    Self::sample_from_column(df, &tbl, column.name(), self.limit, column_max_bytes)
+                        .await
                 }
             }
             .instrument(span)

@@ -845,4 +845,38 @@ mod test {
             "a removed schedule must not run again"
         );
     }
+
+    /// Runs on the paused clock: the run that starts at 1s would finish at 11s. Removing the
+    /// schedule at 2s stops it, so it never finishes.
+    #[tokio::test(start_paused = true)]
+    async fn removing_a_schedule_stops_its_running_task() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let schedule = Schedule::new(
+            Arc::from("removing_a_schedule_stops_its_running_task"),
+            Arc::new(LongComponent {
+                executions: Arc::clone(&executions),
+                wait: 10,
+            }),
+        )
+        .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
+        let scheduler = Scheduler::<NotStarted>::new(
+            "removing_a_schedule_stops_its_running_task".into(),
+            vec![Arc::new(schedule)],
+        );
+        let scheduler = scheduler.start().await.expect("Scheduler should start");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        scheduler
+            .remove_schedule(Arc::from("removing_a_schedule_stops_its_running_task"))
+            .await
+            .expect("To remove schedule");
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        scheduler.stop().await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            0,
+            "the run in progress when its schedule was removed must not finish"
+        );
+    }
 }
