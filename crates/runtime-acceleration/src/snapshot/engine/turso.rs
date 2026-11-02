@@ -95,6 +95,16 @@ impl SnapshotEngine for TursoSnapshotEngine {
         result.map_err(|e| super::SnapshotEngineError::Turso { source: e })
     }
 
+    /// Checks the database header only: a connection, even a read-only one, can create
+    /// a journal or WAL beside the downloaded file.
+    async fn verify_downloaded_file(
+        &self,
+        downloaded: &Path,
+        dataset_name: &str,
+    ) -> Result<(), super::SnapshotEngineError> {
+        super::verify_sqlite_header(downloaded, dataset_name, "turso").await
+    }
+
     async fn prepare_for_upload(
         &self,
         source_path: &Path,

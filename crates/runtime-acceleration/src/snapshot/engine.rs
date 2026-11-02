@@ -70,6 +70,18 @@ pub enum SnapshotEngineError {
     #[cfg(not(any(feature = "duckdb", feature = "sqlite", feature = "turso")))]
     Generic,
 
+    /// A downloaded snapshot file that the engine cannot open, so it must not replace
+    /// the accelerator's file.
+    #[snafu(display(
+        "the downloaded snapshot of dataset '{dataset}' at {path:?} is not a {engine} database that this build can open: {reason}"
+    ))]
+    Unopenable {
+        dataset: String,
+        path: PathBuf,
+        engine: &'static str,
+        reason: String,
+    },
+
     /// Open-ended variant used by engines that live outside `runtime-acceleration`
     /// (e.g. `CayenneSnapshotEngine` in the runtime crate). The owning crate
     /// formats its rich error to a string and wraps it here.
@@ -107,6 +119,21 @@ pub trait SnapshotEngine: Send + Sync {
     async fn checkpoint_live(
         &self,
         live_path: &Path,
+        dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError>;
+
+    /// Checks that a downloaded single-file snapshot opens as this engine's database,
+    /// before it replaces the accelerator's file. A file can match its recorded checksum
+    /// and still be one the engine cannot open, for example a file written by an
+    /// incompatible engine version. Once it replaces the accelerator's file, the dataset
+    /// cannot load again after a restart.
+    ///
+    /// **Deliberately has no default**, for the reason given on [`Self::checkpoint_live`].
+    /// The check must not change `downloaded` or create files beside it. Only the
+    /// file-layout restore invokes it.
+    async fn verify_downloaded_file(
+        &self,
+        downloaded: &Path,
         dataset_name: &str,
     ) -> Result<(), SnapshotEngineError>;
 
@@ -304,6 +331,15 @@ impl SnapshotEngine for DefaultSnapshotEngine {
         Ok(())
     }
 
+    /// Nothing to check: this engine does not know the file's format.
+    async fn verify_downloaded_file(
+        &self,
+        _downloaded: &Path,
+        _dataset_name: &str,
+    ) -> Result<(), SnapshotEngineError> {
+        Ok(())
+    }
+
     async fn prepare_for_upload(
         &self,
         source_path: &Path,
@@ -314,6 +350,42 @@ impl SnapshotEngine for DefaultSnapshotEngine {
 
     fn supports_compaction(&self) -> bool {
         false
+    }
+}
+
+/// The first bytes of every `SQLite` database file, which Turso shares.
+#[cfg(any(feature = "sqlite", feature = "turso"))]
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+/// Checks that `path` starts with the `SQLite` database header. Reads the file only, so a
+/// connection cannot leave a journal or WAL beside it.
+#[cfg(any(feature = "sqlite", feature = "turso"))]
+async fn verify_sqlite_header(
+    path: &Path,
+    dataset_name: &str,
+    engine: &'static str,
+) -> Result<(), SnapshotEngineError> {
+    use tokio::io::AsyncReadExt;
+
+    let unopenable = |reason: String| SnapshotEngineError::Unopenable {
+        dataset: dataset_name.to_string(),
+        path: path.to_path_buf(),
+        engine,
+        reason,
+    };
+    let mut header = [0_u8; 16];
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|err| unopenable(format!("the file cannot be read: {err}")))?;
+    match file.read_exact(&mut header).await {
+        Ok(_) if &header == SQLITE_HEADER => Ok(()),
+        Ok(_) => Err(unopenable(
+            "the file does not start with the SQLite database header".to_string(),
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Err(unopenable(
+            "the file is shorter than the SQLite database header".to_string(),
+        )),
+        Err(err) => Err(unopenable(format!("the file cannot be read: {err}"))),
     }
 }
 

@@ -634,6 +634,13 @@ pub enum SnapshotDownloadError {
     },
     #[snafu(display("Snapshot {path} uses unsupported checksum algorithm {algorithm}"))]
     UnsupportedChecksumAlgorithm { path: String, algorithm: String },
+    #[snafu(display(
+        "Snapshot {path} matches its checksum but cannot be opened, so it did not replace the local acceleration: {source}"
+    ))]
+    Unopenable {
+        path: String,
+        source: Box<engine::SnapshotEngineError>,
+    },
     #[snafu(display("Snapshot {path} size mismatch. expected={expected} actual={actual}"))]
     SizeMismatch {
         path: String,
@@ -901,6 +908,75 @@ impl SnapshotUploadError {
     }
 }
 
+/// A snapshot's object key below the snapshot location, in the form the object store
+/// stores it: each segment percent-encoded by [`PathPart`] (`ord#ers` is stored as
+/// `ord%23ers`).
+///
+/// Snapshot URIs in `metadata.json` carry this form after the location URI, so it is
+/// joined back onto the location as it is. Building an [`ObjectPath`] from it with
+/// `ObjectPath::from` encodes every `%` a second time and names an object that does not
+/// exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelativeKey {
+    /// Stored segments; each one is a valid [`PathPart`] as it is.
+    segments: Vec<String>,
+}
+
+impl RelativeKey {
+    /// The key of `location` below `base`, or `None` when `location` is not below it or is
+    /// `base` itself.
+    fn below(location: &ObjectPath, base: &ObjectPath) -> Option<Self> {
+        let segments: Vec<String> = location
+            .prefix_match(base)?
+            .map(|part| part.as_ref().to_string())
+            .collect();
+        (!segments.is_empty()).then_some(Self { segments })
+    }
+
+    /// Reads the key from the part of a snapshot URI after its location. Every URI this
+    /// runtime records holds stored segments. A segment in another form, such as a raw
+    /// `#` in a URI written by hand, is encoded the way the object store stores it.
+    fn from_uri_suffix(suffix: &str) -> Self {
+        Self {
+            segments: suffix
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .map(stored_segment)
+                .collect(),
+        }
+    }
+
+    /// The stored key, segments joined by `/`.
+    fn to_key(&self) -> String {
+        self.segments.join("/")
+    }
+
+    /// The object path of this key below `base`.
+    fn under(&self, base: &ObjectPath) -> ObjectPath {
+        self.segments.iter().fold(base.clone(), |path, segment| {
+            // Each segment is a valid `PathPart` by construction; `parse` keeps it as
+            // stored where `PathPart::from` would encode it again.
+            match PathPart::parse(segment) {
+                Ok(part) => path.join(part),
+                Err(_) => path.join(PathPart::from(segment.as_str())),
+            }
+        })
+    }
+}
+
+/// `segment` as the object store stores it. A segment already in that form is kept, and
+/// any other is percent-encoded by [`PathPart`].
+fn stored_segment(segment: &str) -> String {
+    let already_stored = PathPart::parse(segment).is_ok()
+        && ObjectPath::from_url_path(segment)
+            .is_ok_and(|decoded| PathPart::from(decoded.to_string()).as_ref() == segment);
+    if already_stored {
+        segment.to_string()
+    } else {
+        PathPart::from(segment).as_ref().to_string()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SnapshotPathLayout<'a> {
     dataset_name: &'a str,
@@ -1054,6 +1130,95 @@ impl std::fmt::Debug for SnapshotManager {
 #[derive(Clone, Copy)]
 pub struct ForceCreate(pub bool);
 
+/// What the local acceleration holds when a snapshot of it is created, as far as this
+/// run knows.
+///
+/// A published snapshot becomes the dataset's current snapshot, which every instance
+/// that bootstraps later restores. A snapshot is therefore published only from data at
+/// least as new as the current snapshot it replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalData {
+    /// Written by a refresh from the source, or restored from a snapshot, in this run.
+    /// `last_updated_at` is when it was last written, in milliseconds since the UNIX
+    /// epoch, when known.
+    Synced { last_updated_at: Option<i64> },
+    /// Left on disk by an earlier run, and neither refreshed nor restored since. It can
+    /// be older than the current snapshot, so it is published only when the dataset has
+    /// no current snapshot.
+    Unsynced,
+}
+
+impl LocalData {
+    #[must_use]
+    pub fn synced(last_updated_at: Option<i64>) -> Self {
+        Self::Synced { last_updated_at }
+    }
+
+    /// When the data was last written, in milliseconds since the UNIX epoch, when known.
+    #[must_use]
+    pub fn last_updated_at(self) -> Option<i64> {
+        match self {
+            Self::Synced { last_updated_at } => last_updated_at,
+            Self::Unsynced => None,
+        }
+    }
+
+    /// Why this data must not replace `current`, the dataset's current snapshot, or
+    /// `None` when it may. A writer clock behind the one that published `current` can
+    /// refuse data that is newer; that only delays the next publish.
+    fn staleness(self, current: Option<&SnapshotEntry>) -> Option<Staleness> {
+        let current = current?;
+        match self {
+            Self::Unsynced => Some(Staleness::Unsynced {
+                current_id: current.snapshot_id,
+            }),
+            Self::Synced {
+                last_updated_at: Some(last_updated_at),
+            } => current
+                .snapshot_last_updated_at_ms
+                .filter(|current_last_updated_at| last_updated_at < *current_last_updated_at)
+                .map(|current_last_updated_at| Staleness::Older {
+                    last_updated_at,
+                    current_id: current.snapshot_id,
+                    current_last_updated_at,
+                }),
+            Self::Synced {
+                last_updated_at: None,
+            } => None,
+        }
+    }
+}
+
+/// Why local data must not replace the dataset's current snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Staleness {
+    /// The data is of unknown age and a current snapshot exists.
+    Unsynced { current_id: u64 },
+    /// The data was last written before the data of the current snapshot.
+    Older {
+        last_updated_at: i64,
+        current_id: u64,
+        current_last_updated_at: i64,
+    },
+}
+
+impl Staleness {
+    fn message(self, dataset: &str) -> String {
+        match self {
+            Self::Unsynced { current_id } => format!(
+                "Did not publish a snapshot of dataset '{dataset}': its local acceleration was not refreshed from the source or restored from a snapshot since this instance started, so it can be older than the current snapshot {current_id}. The dataset keeps serving it, and publishes a snapshot after its next refresh writes data. See: {SNAPSHOTS_DOCS}"
+            ),
+            Self::Older {
+                last_updated_at,
+                current_id,
+                current_last_updated_at,
+            } => format!(
+                "Did not publish a snapshot of dataset '{dataset}': its local acceleration was last updated at {last_updated_at} ms, before the data of the current snapshot {current_id} ({current_last_updated_at} ms), so publishing it would roll the dataset back. The dataset publishes a snapshot after its next refresh writes data. See: {SNAPSHOTS_DOCS}"
+            ),
+        }
+    }
+}
+
 /// What a snapshot holds until the acceleration is copied or archived: the
 /// accelerator write lock, and optionally an engine guard such as a Cayenne pin.
 pub struct SnapshotLockGuard {
@@ -1088,6 +1253,9 @@ enum Publication {
     /// A later generation of the dataset's writer lease published a snapshot
     /// first, so this one was left unpublished.
     Superseded,
+    /// The current snapshot can hold newer data than this one, so this one was left
+    /// unpublished.
+    Stale(Staleness),
 }
 
 /// The retention applied by the write of `metadata.json` that published a snapshot.
@@ -1117,6 +1285,8 @@ struct Sweep {
 enum PublishRefusal {
     /// A later generation of the dataset's writer lease published a snapshot first.
     Superseded,
+    /// The current snapshot can hold newer data than the uploaded one.
+    Stale(Staleness),
     Failed(Box<SnapshotUploadError>),
 }
 
@@ -1142,6 +1312,43 @@ impl Not for &ForceCreate {
     }
 }
 
+/// A downloaded single-file snapshot that matched its recorded size and checksum and
+/// that the engine opened. Only this can replace the accelerator's file, so a download
+/// the engine cannot open never takes the place of a file it can.
+pub(crate) struct VerifiedDownload {
+    path: PathBuf,
+}
+
+impl VerifiedDownload {
+    /// Has `engine` open the download at `path`, which already matched its checksum.
+    /// `snapshot` names the snapshot in the error.
+    async fn verify(
+        engine: &dyn SnapshotEngine,
+        path: &Path,
+        dataset_name: &str,
+        snapshot: &str,
+    ) -> Result<Self, SnapshotDownloadError> {
+        engine
+            .verify_downloaded_file(path, dataset_name)
+            .await
+            .map_err(|source| SnapshotDownloadError::Unopenable {
+                path: snapshot.to_string(),
+                source: Box::new(source),
+            })?;
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// For tests of the replacement itself, which hand it a file directly.
+    #[cfg(all(test, feature = "sqlite"))]
+    pub(crate) fn assume_verified(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+}
+
 /// Renames a downloaded snapshot file over the accelerator's file.
 ///
 /// [`SnapshotEngine::prepare_file_restore`] runs first. If the rename does not
@@ -1149,10 +1356,11 @@ impl Not for &ForceCreate {
 /// whatever that call moved aside before this returns the rename error.
 pub(crate) async fn replace_downloaded_file(
     engine: &dyn SnapshotEngine,
-    temp_path: &Path,
+    download: &VerifiedDownload,
     local_path: &Path,
     dataset_name: &str,
 ) -> Result<(), SnapshotDownloadError> {
+    let temp_path = download.path.as_path();
     // Finish a previous process's interrupted restore before this attempt
     // takes the journal. The guard then keeps a pool open in this process
     // from putting the parked WAL back while the rename is still in progress.
@@ -1265,22 +1473,16 @@ impl SnapshotManager {
         )
     }
 
+    /// The URI recorded in `metadata.json` for the snapshot at `location`: the snapshot
+    /// location URI followed by the stored key below it. See [`RelativeKey`].
     fn snapshot_uri_for_location(&self, location: &ObjectPath) -> String {
         let base = self.snapshot_location_uri.trim_end_matches('/').to_string();
-        let relative = location
-            .prefix_match(&self.snapshots_location)
-            .map(|parts| {
-                parts
-                    .map(|p| p.as_ref().to_string())
-                    .collect::<Vec<_>>()
-                    .join("/")
-            })
-            .filter(|rel| !rel.is_empty());
+        let relative = RelativeKey::below(location, &self.snapshots_location);
 
         match (base.is_empty(), relative) {
-            (true, Some(rel)) => rel,
+            (true, Some(rel)) => rel.to_key(),
             (true, None) => location.to_string(),
-            (false, Some(rel)) => format!("{base}/{rel}"),
+            (false, Some(rel)) => format!("{base}/{}", rel.to_key()),
             (false, None) => base,
         }
     }
@@ -1387,7 +1589,8 @@ impl SnapshotManager {
 
         // Check if actual snapshot files exist in object store
         let layout = SnapshotPathLayout::new(&self.dataset_name, &self.engine);
-        let dataset_partition = layout.dataset_partition_raw();
+        // Listed keys hold the partition as stored, percent-encoded by `PathPart`.
+        let dataset_partition = PathPart::from(layout.dataset_partition_raw());
 
         let mut list_stream = self.object_store.list(Some(&self.snapshots_location));
         while let Some(result) = list_stream.next().await {
@@ -1396,8 +1599,7 @@ impl SnapshotManager {
                 // Using contains() would incorrectly match prefix names (e.g., dataset=foo matches dataset=foobar).
                 if meta
                     .location
-                    .as_ref()
-                    .split('/')
+                    .parts()
                     .any(|segment| segment == dataset_partition)
                 {
                     return true;
@@ -1406,6 +1608,23 @@ impl SnapshotManager {
         }
 
         false
+    }
+
+    /// Why `local` must not replace the dataset's current snapshot, as `metadata.json`
+    /// records it now. `None` when it may, or when the metadata cannot be read: the
+    /// publish then reports that failure, and its metadata update checks again.
+    async fn staleness_against_current(&self, local: LocalData) -> Option<Staleness> {
+        if local == LocalData::synced(None) {
+            return None;
+        }
+        let handle = self.load_metadata().await.ok()??;
+        local.staleness(
+            handle
+                .metadata
+                .datasets
+                .get(&self.dataset_name)
+                .and_then(DatasetMetadata::current_snapshot),
+        )
     }
 
     pub async fn try_new(
@@ -1985,13 +2204,14 @@ impl SnapshotManager {
     /// * `schema` - The schema of the dataset.
     /// * `lock_guard` - The accelerator write lock, with any engine guard, held until the
     ///   acceleration is copied or archived.
-    /// * `last_updated_at` - Optional timestamp (ms since epoch) of the last `insert_into`.
+    /// * `local` - What the local acceleration holds. See [`LocalData`].
     /// * `row_count` - Optional number of rows in the accelerated dataset at snapshot time.
     ///
     /// # Returns
     /// * `Ok(Some(path))` - Snapshot was created at the given path.
-    /// * `Ok(None)` - Snapshot was skipped: no updates since the last snapshot,
-    ///   or another instance holds the dataset's snapshot writer lease.
+    /// * `Ok(None)` - Snapshot was skipped: no updates since the last snapshot, the
+    ///   local acceleration may be older than the current snapshot, or another instance
+    ///   holds the dataset's snapshot writer lease.
     ///
     /// # Errors
     ///
@@ -2001,7 +2221,7 @@ impl SnapshotManager {
         &self,
         schema: &SchemaRef,
         lock_guard: impl Into<SnapshotLockGuard>,
-        last_updated_at: Option<i64>,
+        local: LocalData,
         row_count: Option<u64>,
         force_create: ForceCreate,
     ) -> Result<Option<ObjectPath>, SnapshotUploadError> {
@@ -2020,7 +2240,7 @@ impl SnapshotManager {
             .create_snapshot_as_writer(
                 schema,
                 lock_guard.into(),
-                last_updated_at,
+                local,
                 row_count,
                 force_create,
                 writer_generation,
@@ -2039,11 +2259,12 @@ impl SnapshotManager {
         &self,
         schema: &SchemaRef,
         lock_guard: SnapshotLockGuard,
-        last_updated_at: Option<i64>,
+        local: LocalData,
         row_count: Option<u64>,
         force_create: ForceCreate,
         writer_generation: Option<u64>,
     ) -> Result<Option<ObjectPath>, SnapshotUploadError> {
+        let last_updated_at = local.last_updated_at();
         // If no existing snapshots (in metadata or as actual files), treat as force_create.
         // This ensures at least one snapshot exists at all times.
         let force_create = if force_create.0 {
@@ -2085,6 +2306,14 @@ impl SnapshotManager {
             }
         }
 
+        // Checked before the upload so a refused snapshot is not uploaded. The metadata
+        // update checks again against the `metadata.json` it replaces.
+        if let Some(staleness) = self.staleness_against_current(local).await {
+            tracing::warn!("{}", staleness.message(&self.dataset_name));
+            metrics::record_snapshot_skipped(&self.dataset_name);
+            return Ok(None);
+        }
+
         let start_time = Instant::now();
         let now = Utc::now();
         let layout = SnapshotPathLayout::new(&self.dataset_name, &self.engine);
@@ -2122,19 +2351,27 @@ impl SnapshotManager {
                 total_bytes,
                 timestamp_ms,
                 schema,
-                last_updated_at,
+                local,
                 row_count,
                 writer_generation,
                 sweep.as_ref().map(|sweep| &sweep.gone),
                 &committed,
             )
             .await?;
-        if publication == Publication::Superseded {
-            tracing::warn!(
-                "{}",
-                superseded_message(&self.dataset_name, &destination_location)
-            );
-            return Ok(None);
+        match publication {
+            Publication::Published => {}
+            Publication::Superseded => {
+                tracing::warn!(
+                    "{}",
+                    superseded_message(&self.dataset_name, &destination_location)
+                );
+                return Ok(None);
+            }
+            Publication::Stale(staleness) => {
+                tracing::warn!("{}", staleness.message(&self.dataset_name));
+                metrics::record_snapshot_skipped(&self.dataset_name);
+                return Ok(None);
+            }
         }
 
         let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -2939,7 +3176,8 @@ impl SnapshotManager {
                         | SnapshotDownloadError::SizeMismatch { ref path, .. }
                         | SnapshotDownloadError::UnsupportedChecksumAlgorithm {
                             ref path, ..
-                        } => {
+                        }
+                        | SnapshotDownloadError::Unopenable { ref path, .. } => {
                             tracing::warn!(
                                 "Snapshot integrity issue; attempting next available snapshot. dataset={} snapshot={path} sha={sha}",
                                 self.dataset_name,
@@ -3021,27 +3259,15 @@ impl SnapshotManager {
             if !relative.is_empty() && !relative.starts_with('/') {
                 continue;
             }
-            let relative = relative.trim_start_matches('/');
-            let combined = if relative.is_empty() {
-                self.snapshots_location.to_string()
-            } else {
-                format!("{}/{}", self.snapshots_location, relative)
-            };
-            return Ok(ObjectPath::from(combined));
+            return Ok(RelativeKey::from_uri_suffix(relative).under(&self.snapshots_location));
         }
 
         match Url::parse(uri) {
             Ok(parsed_uri) => {
-                let mut combined = self.snapshots_location.to_string();
-                if let Some(host) = parsed_uri.host_str() {
-                    combined = format!("{combined}/{host}");
-                }
-                let path = parsed_uri.path().trim_start_matches('/').trim();
-                if path.is_empty() {
-                    Ok(ObjectPath::from(combined))
-                } else {
-                    Ok(ObjectPath::from(format!("{combined}/{path}")))
-                }
+                let host = parsed_uri.host_str().unwrap_or_default();
+                let path = parsed_uri.path().trim();
+                Ok(RelativeKey::from_uri_suffix(&format!("{host}/{path}"))
+                    .under(&self.snapshots_location))
             }
             Err(parse_err) => {
                 if uri.contains("://") {
@@ -3050,7 +3276,7 @@ impl SnapshotManager {
                         source: parse_err,
                     })
                 } else {
-                    Ok(ObjectPath::from(uri))
+                    Ok(RelativeKey::from_uri_suffix(uri).under(&ObjectPath::ROOT))
                 }
             }
         }
@@ -3431,6 +3657,22 @@ impl SnapshotManager {
                 return Err(e);
             }
         };
+        // A file can match its checksum and still be one the engine cannot open. Once
+        // it replaced the primary path, the dataset could not load after a restart.
+        let verified = match VerifiedDownload::verify(
+            self.snapshot_engine.as_ref(),
+            &temp_path,
+            &self.dataset_name,
+            path_display,
+        )
+        .await
+        {
+            Ok(verified) => verified,
+            Err(e) => {
+                let _ = fs::remove_file(&temp_path).await;
+                return Err(e);
+            }
+        };
 
         // `tokio::fs::rename` defers to `std::fs::rename`, which on every
         // tier-1 platform we ship for performs a destination-replacing move:
@@ -3457,7 +3699,7 @@ impl SnapshotManager {
         // the file. See `replace_downloaded_file`.
         replace_downloaded_file(
             self.snapshot_engine.as_ref(),
-            &temp_path,
+            &verified,
             local_path,
             &self.dataset_name,
         )
@@ -3687,12 +3929,13 @@ impl SnapshotManager {
         size: u64,
         timestamp_ms: i64,
         schema: &SchemaRef,
-        last_updated_at: Option<i64>,
+        local: LocalData,
         row_count: Option<u64>,
         writer_generation: Option<u64>,
         gone: Option<&HashSet<String>>,
         committed: &parking_lot::Mutex<Option<Committed>>,
     ) -> Result<Publication, SnapshotUploadError> {
+        let last_updated_at = local.last_updated_at();
         let dataset_name = &self.dataset_name;
         let snapshot_uri = self.snapshot_uri_for_location(location);
         let none_gone = HashSet::new();
@@ -3751,6 +3994,12 @@ impl SnapshotManager {
                 && !claim_publication(dataset_entry, generation)
             {
                 return Err(PublishRefusal::Superseded);
+            }
+
+            // Another instance can have published newer data since the check before
+            // the upload.
+            if let Some(staleness) = local.staleness(dataset_entry.current_snapshot()) {
+                return Err(PublishRefusal::Stale(staleness));
             }
 
             // Metadata written before recorded schemas were conformed keeps the invalid
@@ -3930,6 +4179,9 @@ impl SnapshotManager {
             MetadataUpdateError::Load(err) => err.into(),
             MetadataUpdateError::Update(PublishRefusal::Superseded) => {
                 return Ok(Publication::Superseded);
+            }
+            MetadataUpdateError::Update(PublishRefusal::Stale(staleness)) => {
+                return Ok(Publication::Stale(staleness));
             }
             MetadataUpdateError::Update(PublishRefusal::Failed(err)) => *err,
             MetadataUpdateError::Serialize(source) => {
@@ -6179,7 +6431,13 @@ mod tests {
         let mutex = Arc::new(Mutex::new(()));
         let lock_guard = mutex.lock_owned().await;
         manager
-            .create_snapshot(schema, lock_guard, None, None, ForceCreate(true))
+            .create_snapshot(
+                schema,
+                lock_guard,
+                LocalData::synced(None),
+                None,
+                ForceCreate(true),
+            )
             .await
     }
 
@@ -6742,7 +7000,13 @@ mod tests {
         let lock_guard = mutex.lock_owned().await;
 
         let uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                LocalData::synced(None),
+                None,
+                ForceCreate(true),
+            )
             .await
             .expect("create snapshot")
             .expect("snapshot should be created");
@@ -6835,7 +7099,7 @@ mod tests {
             .create_snapshot(
                 &schema,
                 Arc::clone(&mutex).lock_owned().await,
-                None,
+                LocalData::synced(None),
                 None,
                 ForceCreate(true),
             )
@@ -6852,7 +7116,7 @@ mod tests {
             .create_snapshot(
                 &widened_schema,
                 Arc::clone(&mutex).lock_owned().await,
-                None,
+                LocalData::synced(None),
                 None,
                 ForceCreate(true),
             )
@@ -6906,7 +7170,7 @@ mod tests {
             .create_snapshot(
                 &schema,
                 Arc::clone(&mutex).lock_owned().await,
-                None,
+                LocalData::synced(None),
                 None,
                 ForceCreate(true),
             )
@@ -6924,7 +7188,7 @@ mod tests {
             .create_snapshot(
                 &incompatible_schema,
                 Arc::clone(&mutex).lock_owned().await,
-                None,
+                LocalData::synced(None),
                 None,
                 ForceCreate(true),
             )
@@ -6971,7 +7235,7 @@ mod tests {
             .create_snapshot(
                 &schema,
                 lock_guard,
-                last_updated_at,
+                LocalData::synced(last_updated_at),
                 None,
                 ForceCreate(true),
             )
@@ -7028,7 +7292,13 @@ mod tests {
 
         // Create snapshot with None updated_at
         let _uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                LocalData::synced(None),
+                None,
+                ForceCreate(true),
+            )
             .await
             .expect("create snapshot")
             .expect("snapshot should be created");
@@ -7792,7 +8062,13 @@ mod tests {
 
         let guard = Arc::new(Mutex::new(())).lock_owned().await;
         let result = manager
-            .create_snapshot(&schema, guard, None, None, ForceCreate(true))
+            .create_snapshot(
+                &schema,
+                guard,
+                LocalData::synced(None),
+                None,
+                ForceCreate(true),
+            )
             .await;
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755))
             .expect("restore permissions");
@@ -8117,7 +8393,13 @@ mod tests {
         let lock_guard = mutex.lock_owned().await;
 
         let uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                LocalData::synced(None),
+                None,
+                ForceCreate(true),
+            )
             .await
             .expect("create snapshot")
             .expect("snapshot should be created");
@@ -8232,7 +8514,13 @@ mod tests {
         let lock_guard = mutex.lock_owned().await;
 
         let uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                LocalData::synced(None),
+                None,
+                ForceCreate(true),
+            )
             .await
             .expect("create snapshot")
             .expect("path");
@@ -8272,11 +8560,13 @@ mod tests {
 
     /// Generic test: Download snapshot succeeds with valid metadata (for any engine).
     async fn generic_download_snapshot_with_valid_metadata(engine: &AccelerationEngine) {
-        download_and_verify_snapshot(
-            engine,
-            Bytes::from_static(b"engine-agnostic-snapshot-bytes"),
-        )
-        .await;
+        // A database of the engine's own format: a file engine refuses to restore one it
+        // cannot open.
+        let source_dir = TempDir::new().expect("create temp dir");
+        let source = source_dir.path().join("published.db");
+        write_sample_local_db(&source, engine);
+        let contents = Bytes::from(std::fs::read(&source).expect("read the sample database"));
+        download_and_verify_snapshot(engine, contents).await;
     }
 
     /// Publishes `contents` as the current snapshot, downloads it, and checks the result.
@@ -8407,7 +8697,7 @@ mod tests {
             .create_snapshot(
                 &schema,
                 Arc::clone(&mutex).lock_owned().await,
-                None,
+                LocalData::synced(None),
                 None,
                 ForceCreate(true),
             )
@@ -8420,7 +8710,7 @@ mod tests {
             .create_snapshot(
                 &schema,
                 Arc::clone(&mutex).lock_owned().await,
-                None,
+                LocalData::synced(None),
                 None,
                 ForceCreate(true),
             )
@@ -8432,7 +8722,7 @@ mod tests {
             .create_snapshot(
                 &schema,
                 Arc::clone(&mutex).lock_owned().await,
-                None,
+                LocalData::synced(None),
                 None,
                 ForceCreate(false),
             )
@@ -8470,7 +8760,7 @@ mod tests {
             .create_snapshot_as_writer(
                 &schema,
                 Arc::clone(&mutex).lock_owned().await.into(),
-                None,
+                LocalData::synced(None),
                 None,
                 ForceCreate(true),
                 Some(2),
@@ -8485,7 +8775,7 @@ mod tests {
             .create_snapshot_as_writer(
                 &schema,
                 Arc::clone(&mutex).lock_owned().await.into(),
-                None,
+                LocalData::synced(None),
                 None,
                 ForceCreate(true),
                 Some(1),
@@ -8534,7 +8824,7 @@ mod tests {
             .create_snapshot(
                 &schema,
                 Arc::clone(&mutex).lock_owned().await,
-                None,
+                LocalData::synced(None),
                 None,
                 ForceCreate(true),
             )
@@ -8546,7 +8836,7 @@ mod tests {
             .create_snapshot(
                 &schema,
                 Arc::clone(&mutex).lock_owned().await,
-                None,
+                LocalData::synced(None),
                 None,
                 ForceCreate(true),
             )
@@ -8643,7 +8933,13 @@ mod tests {
         let mutex = Arc::new(Mutex::new(()));
         let lock_guard = mutex.lock_owned().await;
         let uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                LocalData::synced(None),
+                None,
+                ForceCreate(true),
+            )
             .await
             .expect("create snapshot")
             .expect("snapshot should be created");
@@ -8697,7 +8993,13 @@ mod tests {
         let mutex = Arc::new(Mutex::new(()));
         let lock_guard = mutex.lock_owned().await;
         let err = manager
-            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                LocalData::synced(None),
+                None,
+                ForceCreate(true),
+            )
             .await
             .expect_err("an absent accelerator file must fail the snapshot");
 
@@ -8820,7 +9122,7 @@ mod tests {
             .create_snapshot(
                 &schema,
                 lock_guard,
-                Some(1_704_153_600_000_i64),
+                LocalData::synced(Some(1_704_153_600_000_i64)),
                 None,
                 ForceCreate(true),
             )
@@ -8832,7 +9134,13 @@ mod tests {
         // because there are existing snapshots but no new writes
         let lock_guard2 = Arc::clone(&mutex).lock_owned().await;
         let result = manager
-            .create_snapshot(&schema, lock_guard2, None, None, ForceCreate(false))
+            .create_snapshot(
+                &schema,
+                lock_guard2,
+                LocalData::synced(None),
+                None,
+                ForceCreate(false),
+            )
             .await
             .expect("create_snapshot should not error");
 
@@ -8872,7 +9180,7 @@ mod tests {
             .create_snapshot(
                 &schema,
                 lock_guard,
-                Some(timestamp),
+                LocalData::synced(Some(timestamp)),
                 None,
                 ForceCreate(true),
             )
@@ -8888,7 +9196,7 @@ mod tests {
             .create_snapshot(
                 &schema,
                 lock_guard2,
-                Some(timestamp),
+                LocalData::synced(Some(timestamp)),
                 None,
                 ForceCreate(false),
             )
@@ -8926,7 +9234,7 @@ mod tests {
             .create_snapshot(
                 &schema,
                 lock_guard,
-                Some(timestamp),
+                LocalData::synced(Some(timestamp)),
                 None,
                 ForceCreate(false),
             )
@@ -8969,7 +9277,7 @@ mod tests {
             .create_snapshot(
                 &schema,
                 lock_guard,
-                Some(first_timestamp),
+                LocalData::synced(Some(first_timestamp)),
                 None,
                 ForceCreate(true),
             )
@@ -8987,7 +9295,7 @@ mod tests {
             .create_snapshot(
                 &schema,
                 lock_guard2,
-                Some(second_timestamp),
+                LocalData::synced(Some(second_timestamp)),
                 None,
                 ForceCreate(false),
             )
@@ -9026,7 +9334,13 @@ mod tests {
         // With Always policy, snapshot should be created even with None last_updated_at
         // (also, no existing snapshots means force_create is automatically set)
         let result = manager
-            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                LocalData::synced(None),
+                None,
+                ForceCreate(false),
+            )
             .await
             .expect("create_snapshot should not error");
 
@@ -9057,7 +9371,13 @@ mod tests {
         // Even with OnChange policy and None last_updated_at, snapshot should be created
         // because no metadata exists (no prior snapshots)
         let result = manager
-            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                LocalData::synced(None),
+                None,
+                ForceCreate(false),
+            )
             .await
             .expect("create_snapshot should not error");
 
@@ -9099,7 +9419,13 @@ mod tests {
         // Even with OnChange policy and None last_updated_at, snapshot should be created
         // because metadata exists but has no snapshots for THIS dataset
         let result = manager
-            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                LocalData::synced(None),
+                None,
+                ForceCreate(false),
+            )
             .await
             .expect("create_snapshot should not error");
 
@@ -9159,7 +9485,13 @@ mod tests {
         // Even with OnChange policy and None last_updated_at, snapshot should be created
         // because metadata has snapshots but actual files don't exist
         let result = manager
-            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                LocalData::synced(None),
+                None,
+                ForceCreate(false),
+            )
             .await
             .expect("create_snapshot should not error");
 
@@ -10570,7 +10902,7 @@ mod tests {
             .create_snapshot(
                 &live_schema,
                 mutex.lock_owned().await,
-                None,
+                LocalData::synced(None),
                 None,
                 ForceCreate(true),
             )
@@ -11358,5 +11690,532 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ========== Snapshot keys of names the object store percent-encodes ==========
+
+    /// Names with characters that `object_store::path` percent-encodes in a key.
+    const ENCODED_NAMES: [&str; 6] = ["ord#ers", "ord~ers", "ord[1]", "100%", "a|b", "q?x"];
+
+    /// The entries `metadata.json` at `metadata_path` holds for `dataset`.
+    async fn entries_of(
+        store: &dyn ObjectStore,
+        metadata_path: &Path,
+        dataset: &str,
+    ) -> Vec<SnapshotEntry> {
+        let bytes = store
+            .get(metadata_path)
+            .await
+            .expect("metadata stored")
+            .bytes()
+            .await
+            .expect("read metadata");
+        let metadata: SnapshotMetadata = serde_json::from_slice(&bytes).expect("parse metadata");
+        metadata
+            .datasets
+            .get(dataset)
+            .map(|dataset| dataset.snapshots.clone())
+            .unwrap_or_default()
+    }
+
+    /// The URI a publish records resolves to the object the publish wrote, for dataset
+    /// names and location prefixes the object store percent-encodes. Each `%` used to be
+    /// encoded again on lookup (`ord%23ers` became `ord%2523ers`).
+    #[test]
+    fn a_recorded_snapshot_uri_resolves_to_the_key_written() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let locations = [
+            (SNAPSHOT_BASE_PATH, SNAPSHOT_URI_PREFIX.to_string()),
+            // `ObjectPath::from` stores the `~` of a location prefix as `%7E`.
+            (
+                "te~am/snapshots",
+                "s3://bucket/te~am/snapshots/".to_string(),
+            ),
+        ];
+        for (prefix, location_uri) in locations {
+            for name in ENCODED_NAMES {
+                let mut manager = build_manager_over(
+                    Arc::clone(&store) as Arc<dyn ObjectStore>,
+                    PathBuf::from("/tmp/unused"),
+                    &schema,
+                );
+                manager.dataset_name = name.to_string();
+                manager.snapshots_location = Path::from(prefix);
+                manager.snapshot_location_uri.clone_from(&location_uri);
+
+                let written = SnapshotPathLayout::new(name, &manager.engine)
+                    .build_location(&manager.snapshots_location, Utc::now());
+                let uri = manager.snapshot_uri_for_location(&written);
+                for recorded_location in [None, Some(location_uri.as_str())] {
+                    let resolved = manager
+                        .snapshot_uri_to_object_path(&uri, recorded_location)
+                        .expect("resolve the recorded uri");
+                    assert_eq!(
+                        resolved, written,
+                        "name={name} location={location_uri} uri={uri}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A URI written by hand with the raw name resolves to the key the store holds.
+    #[test]
+    fn a_hand_written_uri_with_raw_characters_resolves_to_the_stored_key() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let manager = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            PathBuf::from("/tmp/unused"),
+            &schema,
+        );
+        let resolved = manager
+            .snapshot_uri_to_object_path(
+                &format!("{SNAPSHOT_URI_PREFIX}/month=2026-10/day=2026-10-27/dataset=ord#ers/ord#ers_1.cayenne"),
+                None,
+            )
+            .expect("resolve");
+        assert_eq!(
+            resolved.to_string(),
+            "snapshots/month=2026-10/day=2026-10-27/dataset=ord%23ers/ord%23ers_1.cayenne"
+        );
+
+        for (segment, stored) in [
+            ("ord%23ers", "ord%23ers"),
+            ("ord#ers", "ord%23ers"),
+            ("100%25", "100%25"),
+            ("100%", "100%25"),
+            ("ord~ers", "ord%7Eers"),
+            ("ord%5B1%5D", "ord%5B1%5D"),
+            ("a b", "a b"),
+            ("..", "%2E%2E"),
+        ] {
+            assert_eq!(stored_segment(segment), stored, "segment={segment}");
+        }
+    }
+
+    /// A dataset whose name the object store encodes bootstraps from its published
+    /// snapshot, and `has_existing_snapshots` finds the snapshot's file.
+    #[tokio::test]
+    async fn a_dataset_whose_name_is_encoded_bootstraps_from_its_snapshot() {
+        let schema = sample_schema();
+        for name in ENCODED_NAMES {
+            let store = Arc::new(InMemory::new());
+            let dir = TempDir::new().expect("tempdir");
+            let local_path = dir.path().join("accelerated.db");
+            let mut writer = build_manager_over(
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
+                local_path.clone(),
+                &schema,
+            );
+            writer.dataset_name = name.to_string();
+            publish_contents(&writer, &local_path, "rows", &schema).await;
+            assert!(
+                writer.has_existing_snapshots().await,
+                "name={name}: the published file is found"
+            );
+
+            let reader_dir = TempDir::new().expect("tempdir");
+            let restored_path = reader_dir.path().join("restored.db");
+            let mut reader = build_manager_for_engine(
+                Arc::clone(&store),
+                restored_path.clone(),
+                BootstrapOnFailureBehavior::Warn,
+                &schema,
+                &AccelerationEngine::Cayenne,
+                false,
+            );
+            reader.dataset_name = name.to_string();
+            let info = reader
+                .download_latest_snapshot()
+                .await
+                .expect("the snapshot downloads")
+                .expect("a snapshot is published");
+            assert_eq!(info.snapshot_id, 0, "name={name}");
+            assert_eq!(
+                std::fs::read(&restored_path).expect("restored file"),
+                b"rows",
+                "name={name}"
+            );
+        }
+    }
+
+    /// Retention keeps the entries and files of a dataset whose name the object store
+    /// encodes. The sweep used to resolve each entry to a key that does not exist, so
+    /// once an entry was a day old it was dropped as gone and its file deleted as an
+    /// orphan.
+    #[tokio::test]
+    async fn retention_keeps_the_snapshots_of_a_dataset_whose_name_is_encoded() {
+        let schema = sample_schema();
+        for name in ENCODED_NAMES {
+            let store = Arc::new(InMemory::new());
+            let dir = TempDir::new().expect("tempdir");
+            let local_path = dir.path().join("accelerated.db");
+            let mut writer = build_manager_over(
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
+                local_path.clone(),
+                &schema,
+            );
+            writer.dataset_name = name.to_string();
+            let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+            for publish_number in 0..3 {
+                publish_contents(
+                    &writer,
+                    &local_path,
+                    &format!("publish {publish_number}"),
+                    &schema,
+                )
+                .await;
+            }
+
+            *writer.next_sweep.lock() = None;
+            writer.cleanup_clock = CleanupClock::ahead_by(2 * DAY);
+            publish_contents(&writer, &local_path, "publish 3", &schema).await;
+
+            let entries = entries_of(store.as_ref(), &metadata_path, name).await;
+            assert_eq!(entry_ids(&entries), vec![0, 1, 2, 3], "name={name}");
+            for entry in &entries {
+                let path = writer
+                    .snapshot_uri_to_object_path(&entry.snapshot, None)
+                    .expect("snapshot path");
+                assert!(
+                    object_exists(store.as_ref(), &path).await,
+                    "name={name}: {path} stays"
+                );
+            }
+        }
+    }
+
+    // ========== A download the engine cannot open ==========
+
+    /// Writes `contents` at a key of its own and returns its entry as `snapshot_id`.
+    #[cfg(feature = "duckdb")]
+    async fn put_duckdb_snapshot(
+        store: &InMemory,
+        snapshot_id: u64,
+        contents: &Bytes,
+    ) -> SnapshotEntry {
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let instant = Utc
+            .with_ymd_and_hms(
+                2026,
+                10,
+                27,
+                4,
+                0,
+                u32::try_from(snapshot_id).expect("small id"),
+            )
+            .single()
+            .expect("valid time");
+        let location = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB)
+            .build_location(&base, instant);
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+        SnapshotEntry {
+            snapshot_id,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: compute_sha256_hex(contents.as_ref()),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+            snapshot_engine: Some("duckdb".to_string()),
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        }
+    }
+
+    /// A newer snapshot whose file matches its checksum but that `DuckDB` cannot open
+    /// must not replace the file of the snapshot a reader serves. It used to be renamed
+    /// over that file before the reload found it unreadable, so the dataset failed to
+    /// load after the next restart. The poll reports the snapshot as not loaded instead,
+    /// and a bootstrap continues without it.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn a_snapshot_the_engine_cannot_open_does_not_replace_the_local_file() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("accelerated.db");
+        write_sample_local_db(&local_path, &AccelerationEngine::DuckDB);
+        let loaded = Bytes::from(std::fs::read(&local_path).expect("read the loaded file"));
+
+        let good = put_duckdb_snapshot(&store, 0, &loaded).await;
+        let junk = put_duckdb_snapshot(&store, 1, &Bytes::from(vec![0x5a_u8; 8192])).await;
+        let metadata = SnapshotMetadata {
+            format_version: SNAPSHOT_METADATA_FORMAT_VERSION,
+            location: SNAPSHOT_URI_PREFIX.to_string(),
+            last_updated_ms: Utc::now().timestamp_millis(),
+            datasets: HashMap::from([(
+                DATASET_NAME.to_string(),
+                dataset_metadata(&schema, vec![good, junk], Some(1)),
+            )]),
+        };
+        write_metadata(
+            &store,
+            &Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME),
+            &metadata,
+        )
+        .await;
+
+        let manager = build_manager_for_engine(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            &AccelerationEngine::DuckDB,
+            false,
+        );
+        let poll = manager
+            .download_if_newer(Some(0), None, None)
+            .await
+            .expect("the poll succeeds");
+        match &poll.outcome {
+            SnapshotPollOutcome::DownloadFailed {
+                published_id: 1,
+                loaded_id: 0,
+                cause,
+            } => assert!(cause.contains("cannot be opened"), "{cause}"),
+            other => panic!("expected DownloadFailed, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&local_path).expect("read the local file"),
+            loaded.as_ref(),
+            "the served file stays in place"
+        );
+        let leftover = std::fs::read_dir(temp_dir.path())
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .any(|name| name.to_string_lossy().contains("download"));
+        assert!(!leftover, "the download is removed");
+
+        let bootstrap_dir = TempDir::new().expect("create temp dir");
+        let bootstrap_path = bootstrap_dir.path().join("accelerated.db");
+        let bootstrapping = build_manager_for_engine(
+            Arc::clone(&store),
+            bootstrap_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            &AccelerationEngine::DuckDB,
+            false,
+        );
+        let restored = bootstrapping
+            .download_latest_snapshot()
+            .await
+            .expect("a bootstrap that fails continues");
+        assert!(restored.is_none());
+        assert!(
+            !bootstrap_path.exists(),
+            "a bootstrap leaves no file the engine cannot open"
+        );
+    }
+
+    // ========== Publishing only data at least as new as the current snapshot ==========
+
+    fn entry_updated_at(snapshot_id: u64, last_updated_at: Option<i64>) -> SnapshotEntry {
+        SnapshotEntry {
+            snapshot_id,
+            timestamp_ms: 0,
+            snapshot: format!("{SNAPSHOT_URI_PREFIX}/{snapshot_id}.cayenne"),
+            snapshot_checksum: String::new(),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: 0,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: last_updated_at,
+        }
+    }
+
+    #[test]
+    fn local_data_may_replace_only_a_current_snapshot_that_is_not_newer() {
+        let current = entry_updated_at(4, Some(200));
+        let unrecorded = entry_updated_at(4, None);
+        let cases = [
+            (LocalData::Unsynced, None, None),
+            (
+                LocalData::Unsynced,
+                Some(&current),
+                Some(Staleness::Unsynced { current_id: 4 }),
+            ),
+            (
+                LocalData::Unsynced,
+                Some(&unrecorded),
+                Some(Staleness::Unsynced { current_id: 4 }),
+            ),
+            (
+                LocalData::synced(Some(100)),
+                Some(&current),
+                Some(Staleness::Older {
+                    last_updated_at: 100,
+                    current_id: 4,
+                    current_last_updated_at: 200,
+                }),
+            ),
+            (LocalData::synced(Some(200)), Some(&current), None),
+            (LocalData::synced(Some(300)), Some(&current), None),
+            (LocalData::synced(Some(100)), Some(&unrecorded), None),
+            (LocalData::synced(None), Some(&current), None),
+        ];
+        for (local, current, expected) in cases {
+            assert_eq!(
+                local.staleness(current),
+                expected,
+                "local={local:?} current={current:?}"
+            );
+        }
+    }
+
+    async fn publish_local(
+        manager: &SnapshotManager,
+        local_path: &std::path::Path,
+        contents: &str,
+        local: LocalData,
+        schema: &SchemaRef,
+    ) -> Option<ObjectPath> {
+        std::fs::write(local_path, contents).expect("write accelerator file");
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        manager
+            .create_snapshot(schema, lock_guard, local, None, ForceCreate(true))
+            .await
+            .expect("create_snapshot does not fail")
+    }
+
+    /// An instance that restarts on an acceleration an earlier run left on disk must not
+    /// publish it over a newer snapshot that another instance published meanwhile, even
+    /// when forced: every instance that bootstraps later would restore the older data.
+    /// It may publish it when the dataset has no current snapshot, and it publishes once
+    /// a refresh wrote data at least as new as the current snapshot's.
+    #[tokio::test]
+    async fn data_older_than_the_current_snapshot_is_not_published_over_it() {
+        let store = Arc::new(InMemory::new());
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        let schema = sample_schema();
+        let manager = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path.clone(),
+            &schema,
+        );
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+
+        // With no current snapshot, data of unknown age is the best there is.
+        assert!(
+            publish_local(
+                &manager,
+                &local_path,
+                "a: 3 rows",
+                LocalData::Unsynced,
+                &schema
+            )
+            .await
+            .is_some()
+        );
+        // Another instance publishes newer data.
+        assert!(
+            publish_local(
+                &manager,
+                &local_path,
+                "b: 5 rows",
+                LocalData::synced(Some(2_000)),
+                &schema,
+            )
+            .await
+            .is_some()
+        );
+
+        for local in [LocalData::Unsynced, LocalData::synced(Some(1_000))] {
+            assert_eq!(
+                publish_local(&manager, &local_path, "a: 3 rows", local, &schema).await,
+                None,
+                "{local:?} must not replace the current snapshot"
+            );
+        }
+        let entries = dataset_entries(store.as_ref(), &metadata_path).await;
+        assert_eq!(entry_ids(&entries), vec![0, 1]);
+        assert_eq!(
+            read_dataset_metadata(&store).await.current_snapshot_id,
+            Some(1)
+        );
+
+        assert!(
+            publish_local(
+                &manager,
+                &local_path,
+                "a: refreshed",
+                LocalData::synced(Some(3_000)),
+                &schema,
+            )
+            .await
+            .is_some(),
+            "data refreshed after the current snapshot's is published"
+        );
+        assert_eq!(
+            read_dataset_metadata(&store).await.current_snapshot_id,
+            Some(2)
+        );
+    }
+
+    /// The metadata update refuses older data too, so data checked before its upload
+    /// still loses to a newer snapshot published while it uploaded.
+    #[tokio::test]
+    async fn the_metadata_update_refuses_data_older_than_the_current_snapshot() {
+        let store = Arc::new(InMemory::new());
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        let schema = sample_schema();
+        let manager = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path.clone(),
+            &schema,
+        );
+        publish_local(
+            &manager,
+            &local_path,
+            "newer",
+            LocalData::synced(Some(2_000)),
+            &schema,
+        )
+        .await
+        .expect("published");
+
+        let location = SnapshotPathLayout::new(DATASET_NAME, &manager.engine)
+            .build_location(&manager.snapshots_location, Utc::now());
+        let committed = parking_lot::Mutex::new(None);
+        for (local, expected) in [
+            (
+                LocalData::synced(Some(1_000)),
+                Staleness::Older {
+                    last_updated_at: 1_000,
+                    current_id: 0,
+                    current_last_updated_at: 2_000,
+                },
+            ),
+            (LocalData::Unsynced, Staleness::Unsynced { current_id: 0 }),
+        ] {
+            let publication = manager
+                .update_metadata_after_upload(
+                    &location,
+                    "checksum".to_string(),
+                    5,
+                    Utc::now().timestamp_millis(),
+                    &schema,
+                    local,
+                    None,
+                    None,
+                    None,
+                    &committed,
+                )
+                .await
+                .expect("the update completes");
+            assert_eq!(publication, Publication::Stale(expected), "{local:?}");
+        }
+        assert_eq!(
+            read_dataset_metadata(&store).await.snapshots.len(),
+            1,
+            "nothing was published"
+        );
     }
 }

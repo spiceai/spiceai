@@ -2380,6 +2380,19 @@ impl RefreshTask {
         {
             Ok(p) => p,
             Err(e) => {
+                // The provider of the loaded snapshot is still swapped in, so it keeps
+                // serving, and the failure counts as a snapshot that could not be
+                // loaded, as a failed download does.
+                if let Some(loaded_id) = current_local_id {
+                    let error = super::Error::SnapshotDownloadFailed {
+                        location: state.manager.snapshot_location().to_string(),
+                        published_id: info.snapshot_id,
+                        cause: format!("the accelerator could not reload from it: {e}"),
+                    };
+                    return Ok(self
+                        .keep_serving_loaded_snapshot(&error, loaded_id, dataset_metrics_label_sets)
+                        .await);
+                }
                 tracing::error!(
                     dataset = %self.dataset_name,
                     snapshot_id = info.snapshot_id,
