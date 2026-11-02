@@ -15,16 +15,16 @@ Security fixes ship as a patch release of the latest minor version, or in the ne
 
 [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise) provides full support, including security updates for:
 
-- **The latest release and the two prior minor release lines** (latest minus two).
+- **The latest release and the previous minor release line** (latest minus one).
 - **Long-term support (LTS) releases.**
 
 If you cannot upgrade to every release as it ships, see [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise).
 
-|                               | Open source        | Spice.ai Enterprise |
-| ----------------------------- | ------------------ | ------------------- |
-| Latest release                | :white_check_mark: | :white_check_mark:  |
-| Two prior minor release lines | :x:                | :white_check_mark:  |
-| LTS releases                  | :x:                | :white_check_mark:  |
+|                             | Open source        | Spice.ai Enterprise |
+| --------------------------- | ------------------ | ------------------- |
+| Latest release              | :white_check_mark: | :white_check_mark:  |
+| Previous minor release line | :x:                | :white_check_mark:  |
+| LTS releases                | :x:                | :white_check_mark:  |
 
 ## Reporting a Vulnerability
 
