@@ -1510,6 +1510,7 @@ impl DataFusionBuilder {
             cdc_apply_runtime: OnceLock::new(),
             compaction_runtime: OnceLock::new(),
             compaction_runtime_env,
+            internal_table_ctx: OnceLock::new(),
             compaction_memory_bytes,
             query_memory_pool_bytes,
             mem_tier_budget_bytes,

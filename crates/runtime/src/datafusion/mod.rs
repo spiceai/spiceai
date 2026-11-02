@@ -1557,6 +1557,9 @@ pub struct DataFusion {
     // Cayenne acceleration is configured and dedicated thread pools are enabled; compaction
     // executes against it so its memory is accounted separately and cannot starve queries.
     compaction_runtime_env: Option<Arc<RuntimeEnv>>,
+    // The session context internal tables (`runtime.task_history`, `runtime.metrics`)
+    // are created with, built on first use by `internal_table_context`.
+    internal_table_ctx: OnceLock<Arc<SessionContext>>,
     // Size in bytes of the carved compaction memory pool, retained for the
     // startup confirmation log + the `cayenne_compaction_memory_pool_bytes` gauge.
     compaction_memory_bytes: Option<u64>,
@@ -2611,6 +2614,28 @@ impl DataFusion {
             self.mem_tier_budget_bytes,
             self.total_memory,
         );
+    }
+
+    /// The session context internal tables (`runtime.task_history`, `runtime.metrics`)
+    /// are created with: the query context's state over a runtime environment that
+    /// shares its object stores, caches and disk manager but has a memory pool of its
+    /// own. What an internal table holds resident, such as Cayenne's primary-key
+    /// keyset, is charged there rather than to `runtime.query.memory_limit`, so the
+    /// runtime's own bookkeeping never takes memory from user queries. Queries that
+    /// read these tables still run under the query pool.
+    pub fn internal_table_context(&self) -> Arc<SessionContext> {
+        Arc::clone(self.internal_table_ctx.get_or_init(|| {
+            let mut runtime_env = (*self.ctx.runtime_env()).clone();
+            runtime_env.memory_pool =
+                crate::internal_table::internal_table_memory_pool(self.total_memory);
+            let state =
+                datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
+                    self.ctx.state(),
+                )
+                .with_runtime_env(Arc::new(runtime_env))
+                .build();
+            Arc::new(SessionContext::new_with_state(state))
+        }))
     }
 
     /// Set the dedicated compaction runtime for background Cayenne compaction
