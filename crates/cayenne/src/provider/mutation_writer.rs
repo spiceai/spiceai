@@ -337,6 +337,25 @@ pub(super) struct AppendMutationWriter<'a> {
     into_empty_table: bool,
 }
 
+/// What a write whose rows are already visible hands to
+/// [`AppendMutationWriter::finish_published_write`].
+struct PublishedWrite {
+    /// Rows the write stored.
+    rows: u64,
+    /// Column statistics of the stored rows, for post-write maintenance.
+    stats: Arc<ColumnStatsAccumulator>,
+    /// Primary-key digests the write validated, recorded in the keyset.
+    validated_keys: PkDigestSet,
+    /// Existing rows the write replaced; the live-row delta is
+    /// `rows - superseded`.
+    superseded: usize,
+    /// The sequence the write drew for its primary-key OCC stamp; `None` when it
+    /// drew none, in which case the stamp falls back to the high water.
+    append_sequence: Option<i64>,
+    /// The write published a new snapshot, so maintenance refreshes the listing.
+    wrote_new_snapshot: bool,
+}
+
 impl<'a> AppendMutationWriter<'a> {
     #[must_use]
     pub(super) fn new(
@@ -1509,13 +1528,15 @@ impl<'a> AppendMutationWriter<'a> {
         // This arm draws its own sequence while writing its snapshot (and none when
         // it writes no rows), so the primary-key OCC stamp falls back to the high water.
         self.finish_published_write(
-            rows,
-            stats_acc,
-            validated_keys,
-            superseded,
-            None,
+            PublishedWrite {
+                rows,
+                stats: stats_acc,
+                validated_keys,
+                superseded,
+                append_sequence: None,
+                wrote_new_snapshot: true,
+            },
             reserved_live_rows_delta,
-            true,
         )
         .await
     }
@@ -1555,37 +1576,34 @@ impl<'a> AppendMutationWriter<'a> {
         self.table.commit_on_conflict_publish(update, None).await;
 
         self.finish_published_write(
-            rows,
-            stats_acc,
-            validated_keys,
-            superseded,
-            append_sequence,
+            PublishedWrite {
+                rows,
+                stats: stats_acc,
+                validated_keys,
+                superseded,
+                append_sequence,
+                wrote_new_snapshot: false,
+            },
             reserved_live_rows_delta,
-            false,
         )
         .await
     }
 
     /// Account for a write whose rows are already visible: the live-row delta,
     /// post-write maintenance and the primary-key keyset.
-    ///
-    /// `append_sequence` is the sequence the write drew for its primary-key OCC
-    /// stamp, `None` when it drew none, in which case the stamp falls back to the
-    /// high water.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a published write has seven independent outcome parts, and both commit paths hand them over in one call"
-    )]
     async fn finish_published_write(
         &self,
-        total_rows: u64,
-        write_stats_acc: Arc<ColumnStatsAccumulator>,
-        validated_keys: PkDigestSet,
-        superseded: usize,
-        append_sequence: Option<i64>,
+        write: PublishedWrite,
         reserved_live_rows_delta: super::maintenance::OutstandingLiveRowsDelta,
-        needs_new_snapshot: bool,
     ) -> Result<u64> {
+        let PublishedWrite {
+            rows: total_rows,
+            stats: write_stats_acc,
+            validated_keys,
+            superseded,
+            append_sequence,
+            wrote_new_snapshot,
+        } = write;
         // `superseded` = existing rows replaced by this upsert (deleted as part
         // of the conflict resolution). The live-row delta is `inserted -
         // superseded`, which keeps the metastore `num_rows` tracking COUNT(*)
@@ -1602,7 +1620,7 @@ impl<'a> AppendMutationWriter<'a> {
             .saturating_sub(i64::try_from(superseded).unwrap_or(i64::MAX));
         self.table.schedule_post_write_maintenance(
             Some(write_stats_acc),
-            needs_new_snapshot,
+            wrote_new_snapshot,
             retention_requested,
             live_rows_delta,
             published_live_rows_delta,
