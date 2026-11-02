@@ -329,7 +329,10 @@ pub async fn create_internal_accelerated_table(
     );
     builder.cpu_runtime(runtime.datafusion().refresh_runtime().cloned());
     builder.write_to_accelerator_only();
+    // Nothing loads into an internal table before it can serve: it is servable, and so
+    // reports `Ready`, as soon as it is built.
     builder.initial_load_complete(true);
+    builder.initial_status(status::ComponentStatus::Ready);
     builder.node_local();
 
     builder.retention(retention);
