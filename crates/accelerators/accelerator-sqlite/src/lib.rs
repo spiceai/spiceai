@@ -665,6 +665,10 @@ impl DataAccelerator for SqliteAccelerator {
             keep_first::NanKey::Null,
         );
 
+        // SQLite evaluates the `UPDATE` and `DELETE` the writer renders.
+        let write_provider =
+            runtime_datafusion::checked_arithmetic::with_plain_arithmetic_writes(write_provider);
+
         let table_provider =
             Arc::new(PolyTableProvider::new(write_provider, read_provider)).into_table();
 
