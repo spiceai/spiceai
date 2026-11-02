@@ -137,6 +137,7 @@
   "slt-strings": 8,
   "source-down-at-start": 36,
   "sql-explain-protocols": 1,
+  "sql-is-distinct-from-precedence": 1,
   "sql-operator-values": 1,
   "sql-predicate-precedence": 17,
   "sql-schema-protocols": 1,
