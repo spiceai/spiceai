@@ -17,6 +17,16 @@ Security fixes ship as a patch release of the latest minor version, or in the ne
 
 - **The latest release and the previous minor release line** (latest minus one).
 - **Long-term support (LTS) releases.**
+- **Pre-releases of the next minor version.**
+
+For example, Spice.ai Enterprise currently supports:
+
+| Version | Supported as                | Supported          |
+| ------- | --------------------------- | ------------------ |
+| 2.5.x   | Pre-release                 | :white_check_mark: |
+| 2.4.x   | Latest release, LTS         | :white_check_mark: |
+| 2.3.x   | Previous minor release line | :white_check_mark: |
+| 1.11.x  | LTS                         | :white_check_mark: |
 
 If you cannot upgrade to every release as it ships, see [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise).
 
@@ -25,6 +35,7 @@ If you cannot upgrade to every release as it ships, see [Spice.ai Enterprise](ht
 | Latest release              | :white_check_mark: | :white_check_mark:  |
 | Previous minor release line | :x:                | :white_check_mark:  |
 | LTS releases                | :x:                | :white_check_mark:  |
+| Pre-releases                | :x:                | :white_check_mark:  |
 
 ## Reporting a Vulnerability
 
