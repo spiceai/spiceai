@@ -1820,13 +1820,22 @@ struct ColdTombstoneRetention {
 /// file, which a promotion rewrites into delete files of their own in place of
 /// every existing one.
 struct KeptKeyTombstones {
-    /// Each kept tombstone: its key as the delete files store it, its newest
-    /// delete sequence, and its newest re-insert sequence when that is above
-    /// the retention cutoff.
-    keys: Vec<(Box<[u8]>, i64, Option<i64>)>,
+    /// Each kept tombstone.
+    keys: Vec<KeptKeyTombstone>,
     /// The key-based delete files the decision read, which the promotion's
     /// commit replaces.
     superseded: Vec<crate::metadata::DeleteFile>,
+}
+
+/// One tombstone a datalake promotion keeps (see [`KeptKeyTombstones`]).
+struct KeptKeyTombstone {
+    /// The key as the delete files store it.
+    key: Box<[u8]>,
+    /// The key's newest delete sequence.
+    delete_sequence: i64,
+    /// The key's newest re-insert sequence, when that is above the retention
+    /// cutoff.
+    reinsert_sequence: Option<i64>,
 }
 
 /// The in-memory deletion index a datalake promotion keeps, built before the
@@ -27669,11 +27678,15 @@ impl CayenneTableProvider {
                     .zip(&relevant)
                     .filter(|(_, relevant)| **relevant)
                     .map(|((key, (_, delete_sequence)), _)| {
-                        let reinsert = reinserted_row_keys
+                        let reinsert_sequence = reinserted_row_keys
                             .get(&key)
                             .copied()
                             .filter(|sequence| *sequence > cutoff);
-                        (key, *delete_sequence, reinsert)
+                        KeptKeyTombstone {
+                            key,
+                            delete_sequence: *delete_sequence,
+                            reinsert_sequence,
+                        }
                     })
                     .collect(),
                 superseded,
@@ -32450,7 +32463,7 @@ impl CayenneTableProvider {
     fn deletion_index_retained_keys(
         &self,
         cutoff: i64,
-        keys: &[(Box<[u8]>, i64, Option<i64>)],
+        keys: &[KeptKeyTombstone],
     ) -> RetainedTombstones {
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk {
@@ -32458,7 +32471,11 @@ impl CayenneTableProvider {
             } => {
                 let Some(pks) = keys
                     .iter()
-                    .map(|(key, _, _)| <[u8; 8]>::try_from(&key[..]).ok().map(i64::from_be_bytes))
+                    .map(|kept| {
+                        <[u8; 8]>::try_from(&kept.key[..])
+                            .ok()
+                            .map(i64::from_be_bytes)
+                    })
                     .collect::<Option<HashSet<i64>>>()
                 else {
                     return self.deletion_index_retained_above(cutoff);
@@ -32473,7 +32490,7 @@ impl CayenneTableProvider {
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
             } => {
-                let keys: Vec<Box<[u8]>> = keys.iter().map(|(key, _, _)| key.clone()).collect();
+                let keys: Vec<Box<[u8]>> = keys.iter().map(|kept| kept.key.clone()).collect();
                 RetainedTombstones::RowConverterBased(
                     deletion_snapshot
                         .load()
@@ -32495,20 +32512,25 @@ impl CayenneTableProvider {
         snapshot_id: &str,
         kept: &KeptKeyTombstones,
     ) -> Result<Vec<crate::metadata::DeleteFile>> {
-        let mut groups: BTreeMap<(i64, Option<i64>), Vec<Box<[u8]>>> = BTreeMap::new();
-        for (key, delete_sequence, reinsert_sequence) in &kept.keys {
-            groups
-                .entry((*delete_sequence, *reinsert_sequence))
-                .or_default()
-                .push(key.clone());
-        }
+        let sequences = |kept: &&KeptKeyTombstone| (kept.delete_sequence, kept.reinsert_sequence);
+        let mut sorted: Vec<&KeptKeyTombstone> = kept.keys.iter().collect();
+        sorted.sort_unstable_by_key(sequences);
+        let groups: Vec<&[&KeptKeyTombstone]> = sorted
+            .chunk_by(|a, b| sequences(a) == sequences(b))
+            .collect();
         let mut table = self.table_metadata.clone();
         table.current_snapshot_id = snapshot_id.to_string();
-        let reinserts: Vec<Option<i64>> = groups.keys().map(|(_, reinsert)| *reinsert).collect();
+        let reinserts: Vec<Option<i64>> = groups
+            .iter()
+            .map(|group| group[0].reinsert_sequence)
+            .collect();
         let specs = groups
-            .into_iter()
-            .map(|((delete_sequence, _), keys)| {
-                DeletionVectorWriteSpec::new_key_based(keys).with_sequence_number(delete_sequence)
+            .iter()
+            .map(|group| {
+                DeletionVectorWriteSpec::new_key_based(
+                    group.iter().map(|kept| kept.key.clone()).collect(),
+                )
+                .with_sequence_number(group[0].delete_sequence)
             })
             .collect();
         let written = DeletionVectorWriter::new(&table).write(specs).await?;
