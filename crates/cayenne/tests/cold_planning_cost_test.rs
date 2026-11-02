@@ -51,11 +51,17 @@ fn schema() -> Arc<Schema> {
 }
 
 fn batch(start: i64) -> TestResult<RecordBatch> {
-    let ts: Vec<i64> = (start..start + ROWS_PER_PROMOTION).map(|i| i * 1_000_000).collect();
-    let hash: Vec<i64> = (start..start + ROWS_PER_PROMOTION).map(|i| i.wrapping_mul(0x9E37_79B9)).collect();
+    let ts: Vec<i64> = (start..start + ROWS_PER_PROMOTION)
+        .map(|i| i * 1_000_000)
+        .collect();
+    let hash: Vec<i64> = (start..start + ROWS_PER_PROMOTION)
+        .map(|i| i.wrapping_mul(0x9E37_79B9))
+        .collect();
     let pick = |vals: &[&str], salt: i64| -> StringArray {
         (start..start + ROWS_PER_PROMOTION)
-            .map(|i| Some(vals[usize::try_from((i + salt).rem_euclid(vals.len() as i64)).expect("idx")]))
+            .map(|i| {
+                Some(vals[usize::try_from((i + salt).rem_euclid(vals.len() as i64)).expect("idx")])
+            })
             .collect()
     };
     Ok(RecordBatch::try_new(
@@ -70,12 +76,17 @@ fn batch(start: i64) -> TestResult<RecordBatch> {
             Arc::new(Float64Array::from_iter_values(
                 (start..start + ROWS_PER_PROMOTION).map(|i| (i % 997) as f64 * 0.5),
             )),
-            Arc::new(Int64Array::from_iter_values((start..start + ROWS_PER_PROMOTION).map(|i| i % 13))),
+            Arc::new(Int64Array::from_iter_values(
+                (start..start + ROWS_PER_PROMOTION).map(|i| i % 13),
+            )),
         ],
     )?)
 }
 
-async fn create_table(fixture: &common::TestFixture, ctx: &SessionContext) -> TestResult<Arc<CayenneTableProvider>> {
+async fn create_table(
+    fixture: &common::TestFixture,
+    ctx: &SessionContext,
+) -> TestResult<Arc<CayenneTableProvider>> {
     let cold_dir = fixture.temp_dir.path().join("cold");
     std::fs::create_dir_all(&cold_dir)?;
     let options = CreateTableOptions {
@@ -94,8 +105,10 @@ async fn create_table(fixture: &common::TestFixture, ctx: &SessionContext) -> Te
             ..VortexConfig::default()
         },
     };
-    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let table =
+        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
     ctx.register_table(TABLE, Arc::clone(&table) as Arc<dyn TableProvider>)?;
     Ok(table)
 }
@@ -126,13 +139,19 @@ fn test_cold_planning_cost_grows_with_cold_files_sqlite() -> Result<(), String> 
     )
 }
 
-async fn test_cold_planning_cost_grows_with_cold_files_impl(fixture: common::TestFixture) -> TestResult<()> {
+async fn test_cold_planning_cost_grows_with_cold_files_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
     let ctx = SessionContext::new();
     let table = create_table(&fixture, &ctx).await?;
     let mut next = 0_i64;
     for target in [20_usize, 80, 160] {
         loop {
-            let files = fixture.catalog.list_cold_tier_files(table.table_id()).await?.len();
+            let files = fixture
+                .catalog
+                .list_cold_tier_files(table.table_id())
+                .await?
+                .len();
             if files >= target {
                 break;
             }
@@ -142,9 +161,17 @@ async fn test_cold_planning_cost_grows_with_cold_files_impl(fixture: common::Tes
             let _ = table.checkpoint_mem_tier().await;
             assert!(table.promote_warm_to_cold().await?, "promotion should fire");
         }
-        let files = fixture.catalog.list_cold_tier_files(table.table_id()).await?.len();
+        let files = fixture
+            .catalog
+            .list_cold_tier_files(table.table_id())
+            .await?
+            .len();
         let (p50, p90) = plan_times(&ctx, next).await?;
-        eprintln!("COLD_PLANNING files={files} plan_p50_us={} plan_p90_us={}", p50.as_micros(), p90.as_micros());
+        eprintln!(
+            "COLD_PLANNING files={files} plan_p50_us={} plan_p90_us={}",
+            p50.as_micros(),
+            p90.as_micros()
+        );
     }
     Ok(())
 }
