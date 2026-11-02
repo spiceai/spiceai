@@ -272,6 +272,27 @@ pub enum CatalogError {
 /// Result type for catalog operations.
 pub type CatalogResult<T> = std::result::Result<T, CatalogError>;
 
+/// The durable deletion state a warm-to-datalake promotion keeps; see
+/// [`MetadataCatalog::commit_overwrite_to_cold`].
+#[derive(Debug, Clone, Copy)]
+pub enum ColdTombstoneKeep<'a> {
+    /// Clear all of it: no tombstone can hide a row of any datalake file.
+    Nothing,
+    /// Keep every key-based delete file and insert record whose sequence is
+    /// above this one, and clear the rest.
+    Above(i64),
+    /// Replace every key-based delete file with `delete_files` — the tombstones
+    /// that may still hide a datalake row, rewritten into files of their own —
+    /// and keep the insert records whose sequence is above
+    /// `insert_records_above`.
+    Rewritten {
+        /// The rewritten key-based delete files to register.
+        delete_files: &'a [DeleteFile],
+        /// Insert records at or below this sequence are cleared.
+        insert_records_above: i64,
+    },
+}
+
 /// Snapshot sequence metadata to commit atomically with a related catalog mutation.
 #[derive(Debug, Clone)]
 pub struct SnapshotSequenceCommit {
@@ -873,19 +894,17 @@ pub trait MetadataCatalog: Send + Sync {
     /// new manifest: the files this promotion wrote plus every existing cold
     /// file it carries forward.
     ///
-    /// `retain_tombstones_above` decides what happens to the deletion state.
-    /// `None` clears all of it, which is correct when no tombstone can hide a
-    /// row of any cold file in `cold_files`. `Some(cutoff)` keeps every
-    /// key-based delete file and every insert record whose sequence is above
-    /// `cutoff` — tombstones that still hide superseded rows of carried-forward
-    /// cold files — and clears the rest, including every position-based delete
-    /// file (those name warm files the overwrite clear retires).
+    /// `keep` decides what happens to the deletion state (see
+    /// [`ColdTombstoneKeep`]): the tombstones that still hide superseded rows of
+    /// carried-forward cold files survive, the rest are cleared. Every
+    /// position-based delete file is cleared regardless — those name warm files
+    /// the overwrite clear retires.
     async fn commit_overwrite_to_cold(
         &self,
         table_id: &str,
         new_snapshot_id: &str,
         cold_files: &[ColdTierFile],
-        retain_tombstones_above: Option<i64>,
+        keep: ColdTombstoneKeep<'_>,
     ) -> CatalogResult<()>;
 
     /// Atomically replace datalake (cold) files: remove the manifest rows of

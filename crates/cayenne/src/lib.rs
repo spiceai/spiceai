@@ -124,7 +124,7 @@ pub mod stats;
 pub mod stats_aggregate;
 
 pub use catalog::MetadataCatalog;
-pub use catalog::{CatalogError, CatalogResult};
+pub use catalog::{CatalogError, CatalogResult, ColdTombstoneKeep};
 pub use catalog_provider::{
     CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider,
 };
