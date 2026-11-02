@@ -761,7 +761,12 @@ pub struct Runtime {
     dataset_loads: Arc<init::dataset_loads::DatasetLoads>,
     /// The model loads in progress, so a Spicepod change can stop the load of a
     /// configuration it replaces or removes.
-    model_loads: Arc<init::model::ModelLoads>,
+    model_loads: Arc<init::model::LoadTasks>,
+    /// The Spicepod tool loads in progress, so a Spicepod change can stop the load of a
+    /// configuration it replaces or removes.
+    tool_loads: Arc<init::model::LoadTasks>,
+    /// Names of the SQL functions registered for `as_sql` tools.
+    tool_udfs: Arc<parking_lot::Mutex<HashSet<String>>>,
     /// Startup view registrations still waiting, cancelled when a Spicepod change replaces or removes the view.
     view_loads: Arc<init::view_loads::ViewLoads>,
 
