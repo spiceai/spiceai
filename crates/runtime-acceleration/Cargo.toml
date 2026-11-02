@@ -27,10 +27,7 @@ spice-table = { path = "../spice-table" }
 duckdb = { workspace = true, features = [
     "bundled",
     "r2d2",
-    "json",
-    "parquet",
-    "vtab-arrow",
-    "appender-arrow",
+    "extensions-full",
 ], optional = true }
 fundu.workspace = true
 futures.workspace = true
