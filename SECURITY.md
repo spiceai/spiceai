@@ -2,66 +2,40 @@
 
 ## Supported Versions
 
-Spice.ai has released 2.4.0 🎉
+The open-source Spice.ai runtime and CLI receive security updates **only in the latest release**, currently **v2.4.1**.
 
-In the latest major version, the last 2 minor version series are supported for security updates.
+Security fixes ship as a patch release of the latest minor version, or in the next release. Earlier versions, including earlier patches of the latest minor version, do not receive fixes. To stay protected, upgrade to the latest release.
 
-| Version | Supported          |
-|---------|--------------------|
-| 2.4.0   | :white_check_mark: |
-| 2.3.3   | :white_check_mark: |
-| 2.3.2   | :white_check_mark: |
-| 2.3.1   | :white_check_mark: |
-| 2.3.0   | :white_check_mark: |
-| 2.2.2   | :x:                |
-| 2.2.1   | :x:                |
-| 2.2.0   | :x:                |
-| 2.1.5   | :x:                |
-| 2.1.4   | :x:                |
-| 2.1.3   | :x:                |
-| 2.1.2   | :x:                |
-| 2.1.1   | :x:                |
-| 2.1.0   | :x:                |
-| 2.0.1   | :x:                |
-| 2.0.0   | :x:                |
-| 1.11.6  | :x:                |
-| 1.11.5  | :x:                |
-| 1.11.4  | :x:                |
-| 1.11.3  | :x:                |
-| 1.11.2  | :x:                |
-| 1.11.1  | :x:                |
-| 1.11.0  | :x:                |
-| 1.10.4  | :x:                |
-| 1.10.3  | :x:                |
-| 1.10.2  | :x:                |
-| 1.10.1  | :x:                |
-| 1.10.0  | :x:                |
-| 1.9.2   | :x:                |
-| 1.9.1   | :x:                |
-| 1.9.0   | :x:                |
-| 1.8.3   | :x:                |
-| 1.8.2   | :x:                |
-| 1.8.1   | :x:                |
-| 1.8.0   | :x:                |
-| 1.7.3   | :x:                |
-| 1.7.2   | :x:                |
-| 1.7.1   | :x:                |
-| 1.7.0   | :x:                |
-| 1.6.1   | :x:                |
-| 1.6.0   | :x:                |
-| 1.5.2   | :x:                |
-| 1.5.1   | :x:                |
-| 1.5.0   | :x:                |
-| 1.4.0   | :x:                |
-| 1.3.2   | :x:                |
-| 1.3.1   | :x:                |
-| 1.3.0   | :x:                |
-| 1.2.2   | :x:                |
-| 1.2.1   | :x:                |
-| 1.2.0   | :x:                |
-| 1.1.x   | :x:                |
-| 1.0.x   | :x:                |
-| < 1.0.0 | :x:                |
+| Version          | Supported          |
+| ---------------- | ------------------ |
+| 2.4.1 (latest)   | :white_check_mark: |
+| < 2.4.1          | :x:                |
+
+### Extended support with Spice.ai Enterprise
+
+[Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise) provides full support, including security updates for:
+
+- **The latest release and the previous minor release line** (latest minus one).
+- **Long-term support (LTS) releases.**
+- **Pre-releases of the next minor version.**
+
+For example, Spice.ai Enterprise currently supports:
+
+| Version | Supported as                | Supported          |
+| ------- | --------------------------- | ------------------ |
+| 2.5.x   | Pre-release                 | :white_check_mark: |
+| 2.4.x   | Latest release, LTS         | :white_check_mark: |
+| 2.3.x   | Previous minor release line | :white_check_mark: |
+| 1.11.x  | LTS                         | :white_check_mark: |
+
+If you cannot upgrade to every release as it ships, see [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise).
+
+|                             | Open source        | Spice.ai Enterprise |
+| --------------------------- | ------------------ | ------------------- |
+| Latest release              | :white_check_mark: | :white_check_mark:  |
+| Previous minor release line | :x:                | :white_check_mark:  |
+| LTS releases                | :x:                | :white_check_mark:  |
+| Pre-releases                | :x:                | :white_check_mark:  |
 
 ## Reporting a Vulnerability
 
