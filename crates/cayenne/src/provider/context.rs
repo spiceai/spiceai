@@ -92,6 +92,9 @@ pub struct CayenneContext {
     /// little of the deletion index to have been worth running (see
     /// [`Self::record_bake_prune`]).
     bake_futile: Arc<std::sync::atomic::AtomicBool>,
+    /// Rows subset merges removed by deletion filter since the last bake
+    /// (measurement only; logged by the bake).
+    subset_rows_removed_since_bake: Arc<std::sync::atomic::AtomicU64>,
     /// Per-table query-side observations (p99 latency + QPH), shared with the
     /// process-global query registry so the runtime can push query metrics *down*
     /// into this table's tuner; read on the background tick to derive the
@@ -328,6 +331,7 @@ impl CayenneContext {
             live_actuators,
             ingest_stats: Arc::new(IngestStats::new()),
             bake_futile: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            subset_rows_removed_since_bake: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             query_observations,
             goals,
             tuning_bounds,
@@ -734,6 +738,23 @@ impl CayenneContext {
     pub(crate) fn record_deletion_index_yield(&self, rows_removed: u64, tombstones_reclaimed: u64) {
         self.deletion_index_yield
             .record(rows_removed, tombstones_reclaimed);
+    }
+
+    /// The last measured reclaim yield, in rows per thousand tombstones.
+    pub(crate) fn deletion_index_yield_per_thousand(&self) -> u32 {
+        self.deletion_index_yield.rows_per_thousand()
+    }
+
+    /// Count rows a committed subset merge removed by deletion filter.
+    pub(crate) fn add_subset_rows_removed(&self, rows: u64) {
+        self.subset_rows_removed_since_bake
+            .fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Rows subset merges removed since the last call.
+    pub(crate) fn take_subset_rows_removed(&self) -> u64 {
+        self.subset_rows_removed_since_bake
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Apply-back-pressure gate for the seq-prefix bake: `true` when the CDC

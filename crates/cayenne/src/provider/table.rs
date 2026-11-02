@@ -29087,6 +29087,7 @@ impl CayenneTableProvider {
         // spread every key across every output file and leave a predicate on the
         // key nothing to prune.
         let range_bounds = self.merge_range_bounds(&input_statistics, &merged_plan, write_shards);
+        let merged_plan_for_metrics = Arc::clone(&merged_plan);
         let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
         let plan_build_ms = phase2_start.elapsed().as_millis();
 
@@ -29268,6 +29269,8 @@ impl CayenneTableProvider {
         #[cfg(test)]
         self.run_test_pre_publish_hook().await;
 
+        self.context
+            .add_subset_rows_removed(rows_deleted_by(&merged_plan_for_metrics));
         // Catalog committed — bring the in-memory protected set into agreement
         // under the scan fence. Scans capture the deletion snapshot and
         // protected-snapshot map while holding `listing_fence.read()`, so the
@@ -30224,6 +30227,18 @@ impl CayenneTableProvider {
                 held_before_prune.saturating_sub(self.pk_deletion_snapshot().delete_len());
             self.record_reclaim_yield(&bake_plan, bake_position_deletes, reclaimed);
             self.context.record_bake_prune(held_before_prune, reclaimed);
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                held_before_prune,
+                tombstones_reclaimed = reclaimed,
+                bake_rows_removed = rows_deleted_by(&bake_plan),
+                subset_rows_removed = self.context.take_subset_rows_removed(),
+                position_deletes = bake_position_deletes,
+                yield_per_thousand = self.context.deletion_index_yield_per_thousand(),
+                effective_trigger = self.context.effective_bake_deletion_index_trigger(),
+                "Seq-prefix bake yield"
+            );
         } else {
             // The prune was withheld: the bake pruned nothing.
             self.context
