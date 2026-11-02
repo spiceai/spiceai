@@ -20,13 +20,19 @@ limitations under the License.
 //! them apart: a merge may claim only unclaimed, still-published runs, at a tier
 //! strictly below every running merge, and within the pass budget left by the
 //! running merges. The catalog CAS remains the correctness backstop.
+//!
+//! A datalake merge also holds the compaction lock shared. It rewrites no
+//! protected run, so it claims no run and no tier, but it reserves its input
+//! bytes here, so the table's concurrent merges together stay within one pass
+//! budget.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-/// Protected-snapshot runs that in-flight subset merges are rewriting.
+/// Protected-snapshot runs that in-flight subset merges are rewriting, and the
+/// input bytes of an in-flight datalake merge.
 #[derive(Debug, Default)]
 pub(crate) struct ProtectedMergeClaims {
     next_claim_id: u64,
@@ -37,7 +43,8 @@ pub(crate) struct ProtectedMergeClaims {
 struct ProtectedMergeClaim {
     claim_id: u64,
     snapshot_ids: Vec<String>,
-    tier: u32,
+    /// `None` for a datalake merge, which reserves bytes but no tier.
+    tier: Option<u32>,
     bytes: u64,
 }
 
@@ -51,8 +58,12 @@ impl ProtectedMergeClaims {
                 .flat_map(|claim| claim.snapshot_ids.iter().cloned())
                 .collect(),
             bytes: self.claimed_bytes(),
-            min_tier: self.claims.iter().map(|claim| claim.tier).min(),
-            merges: self.claims.len(),
+            min_tier: self.claims.iter().filter_map(|claim| claim.tier).min(),
+            merges: self
+                .claims
+                .iter()
+                .filter(|claim| claim.tier.is_some())
+                .count(),
         }
     }
 
@@ -74,11 +85,14 @@ impl ProtectedMergeClaims {
         max_pass_bytes: Option<u64>,
         is_live: impl Fn(&str) -> bool,
     ) -> Option<u64> {
-        if self.claims.iter().any(|claim| claim.tier <= tier) {
+        if self
+            .claims
+            .iter()
+            .any(|claim| claim.tier.is_some_and(|held| held <= tier))
+        {
             return None;
         }
-        if max_pass_bytes.is_some_and(|budget| self.claimed_bytes().saturating_add(bytes) > budget)
-        {
+        if !self.fits(bytes, max_pass_bytes) {
             return None;
         }
         let overlaps = snapshot_ids.iter().any(|id| {
@@ -91,6 +105,24 @@ impl ProtectedMergeClaims {
         if overlaps {
             return None;
         }
+        Some(self.push(snapshot_ids, Some(tier), bytes))
+    }
+
+    /// Reserves `bytes` of the pass budget for a datalake merge. Returns the
+    /// claim id, or `None` if the reservation would exceed `max_pass_bytes`
+    /// together with the running merges.
+    fn try_reserve(&mut self, bytes: u64, max_pass_bytes: Option<u64>) -> Option<u64> {
+        if !self.fits(bytes, max_pass_bytes) {
+            return None;
+        }
+        Some(self.push(Vec::new(), None, bytes))
+    }
+
+    fn fits(&self, bytes: u64, max_pass_bytes: Option<u64>) -> bool {
+        max_pass_bytes.is_none_or(|budget| self.claimed_bytes().saturating_add(bytes) <= budget)
+    }
+
+    fn push(&mut self, snapshot_ids: Vec<String>, tier: Option<u32>, bytes: u64) -> u64 {
         let claim_id = self.next_claim_id;
         self.next_claim_id = self.next_claim_id.wrapping_add(1);
         self.claims.push(ProtectedMergeClaim {
@@ -99,7 +131,7 @@ impl ProtectedMergeClaims {
             tier,
             bytes,
         });
-        Some(claim_id)
+        claim_id
     }
 
     fn remove(&mut self, claim_id: u64) {
@@ -160,6 +192,20 @@ impl ProtectedMergeClaimGuard {
             claims
                 .lock()
                 .try_insert(snapshot_ids, tier, bytes, max_pass_bytes, is_live)?;
+        Some(Self {
+            claims: Arc::clone(claims),
+            claim_id,
+        })
+    }
+
+    /// Reserves `bytes` of the pass budget for a datalake merge, released on
+    /// drop. `None` if the running merges leave too little of `max_pass_bytes`.
+    pub(crate) fn try_reserve(
+        claims: &Arc<Mutex<ProtectedMergeClaims>>,
+        bytes: u64,
+        max_pass_bytes: Option<u64>,
+    ) -> Option<Self> {
+        let claim_id = claims.lock().try_reserve(bytes, max_pass_bytes)?;
         Some(Self {
             claims: Arc::clone(claims),
             claim_id,
@@ -299,6 +345,42 @@ mod tests {
             .is_none(),
             "reading liveness inside the callback rejects them"
         );
+    }
+
+    /// A datalake merge's reservation counts against the pass budget a subset
+    /// merge sees and is admitted under, without holding a tier or a run.
+    #[test]
+    fn datalake_reservation_shares_the_budget_but_no_tier() {
+        let budget = Some(1_000);
+        let claims = Arc::new(Mutex::new(ProtectedMergeClaims::default()));
+
+        let datalake = ProtectedMergeClaimGuard::try_reserve(&claims, 700, budget)
+            .expect("the reservation fits the budget");
+        let view = claims.lock().view();
+        assert_eq!(view.remaining_budget(budget), Some(300));
+        assert_eq!(view.min_tier(), None, "a reservation holds no tier");
+        assert_eq!(view.len(), 0, "a reservation is not a subset merge");
+
+        assert!(
+            ProtectedMergeClaimGuard::try_claim(&claims, ids(&["a", "b"]), 3, 400, budget, live)
+                .is_none(),
+            "700 + 400 exceeds the 1,000-byte budget"
+        );
+        let subset =
+            ProtectedMergeClaimGuard::try_claim(&claims, ids(&["a", "b"]), 3, 300, budget, live)
+                .expect("a subset merge at any tier fits the remaining 300 bytes");
+        assert!(
+            ProtectedMergeClaimGuard::try_reserve(&claims, 1, budget).is_none(),
+            "the budget is full"
+        );
+        assert!(
+            ProtectedMergeClaimGuard::try_reserve(&claims, u64::MAX, None).is_some(),
+            "an unbounded budget admits any reservation"
+        );
+
+        drop(datalake);
+        assert_eq!(claims.lock().view().remaining_budget(budget), Some(700));
+        drop(subset);
     }
 
     #[test]
