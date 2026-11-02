@@ -60,7 +60,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         let app = super::load_app(&args.common).await.context(
             "--validate against an already-running spiced instance requires -p <spicepod.yaml> so the reference schema can be detected",
         )?;
-        let (_, builder) = super::build_test_with_validation(args, &app, test).await?;
+        let (_, builder) = super::build_test_with_validation(args, &app, test, None).await?;
         builder
     } else {
         let query_set = args.load_query_set()?;
