@@ -53,15 +53,15 @@ impl Runtime {
     pub(crate) async fn load_models(self: Arc<Self>) {
         let app_lock = self.app.read().await;
 
+        // Load tools before loading models.
+        Arc::clone(&self).load_tools().await;
+
         if !cfg!(feature = "models") && app_lock.as_ref().is_some_and(|s| !s.models.is_empty()) {
             tracing::error!(
                 "Cannot load models without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}"
             );
             return;
         }
-
-        // Load tools before loading models.
-        Arc::clone(&self).load_tools().await;
 
         if let Some(app) = app_lock.as_ref() {
             for model in &app.models {

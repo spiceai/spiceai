@@ -160,7 +160,8 @@ pub async fn execute(ctx: &RuntimeContext, args: &CodingAgentArgs) -> Result<i32
     );
     let home = dirs::home_dir();
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let Some(orca) = find_orca(&path, home.as_deref(), cfg!(target_os = "macos")) else {
+    let macos_applications = cfg!(target_os = "macos").then(|| Path::new("/Applications"));
+    let Some(orca) = find_orca(&path, home.as_deref(), macos_applications) else {
         return not_installed();
     };
     let profile = Profile::new(ctx.spice_runtime_dir());
@@ -406,10 +407,18 @@ async fn add_project(orca: &Path, profile: &Profile, project: &Path) {
 /// that resolves anywhere else is another program — Plotly's image exporter
 /// has the name too — so it is passed over for the app's own copy. On Linux
 /// the command is `orca-ide`: the GNOME screen reader owns `orca`.
-fn find_orca(path: &OsStr, home: Option<&Path>, macos: bool) -> Option<PathBuf> {
-    if !macos {
+///
+/// `macos_applications` is the system Applications folder on macOS and `None`
+/// elsewhere; it is a parameter so tests do not see an Orca installed on the
+/// machine running them.
+fn find_orca(
+    path: &OsStr,
+    home: Option<&Path>,
+    macos_applications: Option<&Path>,
+) -> Option<PathBuf> {
+    let Some(system_applications) = macos_applications else {
         return find_program(path, &["orca-ide"], &[".local/bin/orca-ide"], home);
-    }
+    };
     let on_path = std::env::split_paths(path)
         .map(|dir| dir.join("orca"))
         .find(|candidate| {
@@ -418,7 +427,7 @@ fn find_orca(path: &OsStr, home: Option<&Path>, macos: bool) -> Option<PathBuf> 
         });
     on_path.or_else(|| {
         let applications = [
-            Some(PathBuf::from("/Applications")),
+            Some(system_applications.to_path_buf()),
             home.map(|home| home.join("Applications")),
         ];
         applications
@@ -891,6 +900,10 @@ mod tests {
     #[test]
     fn on_macos_only_the_apps_own_orca_is_used() {
         let dir = tempfile::tempdir().expect("create tempdir");
+        // The system Applications folder, standing in for `/Applications` so
+        // an Orca installed on this machine is not seen.
+        let system = dir.path().join("system/Applications");
+        std::fs::create_dir_all(&system).expect("create the directory");
         let app_script = dir
             .path()
             .join("Applications/Orca.app/Contents/Resources/bin/orca");
@@ -905,12 +918,19 @@ mod tests {
 
         let path = std::env::join_paths([dir.path().join("other"), dir.path().join("linked")])
             .expect("join PATH");
-        assert_eq!(find_orca(&path, None, true), Some(linked));
+        assert_eq!(find_orca(&path, None, Some(&system)), Some(linked));
 
         // With only the other program on PATH, the app is found where it is
-        // installed.
+        // installed: in the user's Applications folder, or the system's.
         let path = std::env::join_paths([dir.path().join("other")]).expect("join PATH");
-        assert_eq!(find_orca(&path, Some(dir.path()), true), Some(app_script));
+        assert_eq!(find_orca(&path, None, Some(&system)), None);
+        assert_eq!(
+            find_orca(&path, Some(dir.path()), Some(&system)),
+            Some(app_script)
+        );
+        let system_script = system.join(MACOS_SCRIPT);
+        executable(&system_script);
+        assert_eq!(find_orca(&path, None, Some(&system)), Some(system_script));
     }
 
     #[test]
@@ -918,11 +938,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         executable(&dir.path().join("bin/orca"));
         let path = std::env::join_paths([dir.path().join("bin")]).expect("join PATH");
-        assert_eq!(find_orca(&path, Some(dir.path()), false), None);
+        assert_eq!(find_orca(&path, Some(dir.path()), None), None);
 
         let registered = dir.path().join(".local/bin/orca-ide");
         executable(&registered);
-        assert_eq!(find_orca(&path, Some(dir.path()), false), Some(registered));
+        assert_eq!(find_orca(&path, Some(dir.path()), None), Some(registered));
     }
 
     #[test]

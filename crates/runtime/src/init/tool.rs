@@ -36,17 +36,17 @@ use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::tool::Tool;
 use tokio::sync::oneshot;
-use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
+
+/// How long startup waits for a Spicepod tool to load before it loads models and workers.
+const TOOL_LOAD_WAIT: Duration = Duration::from_mins(2);
 
 impl Runtime {
     /// Loads the built-in tool catalogs, then every Spicepod `tools:` entry.
     ///
     /// The built-ins need nothing outside the runtime, so they register first: a Spicepod tool
     /// that cannot load must not keep them (e.g. `sql`) out of the tool list. Spicepod tools
-    /// load concurrently, each in its own task, and this returns once each has made its first
-    /// attempt. A tool that fails is logged, left out of the tool list, and retried in the
-    /// background unless its configuration is invalid; it does not hold up the other tools or
-    /// `/v1/ready`.
+    /// load concurrently; [`Self::load_tool`] says how long this waits for each.
     pub(crate) async fn load_tools(self: Arc<Self>) {
         let mut spawned_tasks = vec![];
         let mut builtin_names = HashSet::new();
@@ -75,7 +75,7 @@ impl Runtime {
         if let Some(app) = self.read_app().await {
             join_all(app.tools.iter().map(|tool| {
                 tracing::debug!("Loading tool [{}] from {}...", tool.name, tool.from);
-                self.load_tool(tool, Arc::clone(&builtin_names))
+                Arc::clone(&self).load_tool(tool.clone(), Arc::clone(&builtin_names))
             }))
             .await;
         }
@@ -175,13 +175,16 @@ impl Runtime {
         }
     }
 
-    /// Loads `tool` in its own task: a failed attempt is retried in the background with
-    /// backoff until it succeeds, unless the tool's configuration is invalid. Returns after the
-    /// first attempt.
-    async fn load_tool(self: &Arc<Self>, tool: &Tool, builtin_names: Arc<HashSet<String>>) {
+    /// Loads `tool`, retrying until it loads or the runtime shuts down, unless its configuration
+    /// is invalid, which no retry can clear. Returns once it loads or fails for good, or after
+    /// [`TOOL_LOAD_WAIT`] with the retries still running, so that one tool cannot hold back
+    /// models and workers. A model loaded before the tool does not get it.
+    async fn load_tool(self: Arc<Self>, tool: Tool, builtin_names: Arc<HashSet<String>>) {
+        // Loading the tools again replaces the retries of an earlier load instead of adding to
+        // them.
         self.tool_loads.stop(&tool.name).await;
         // A tool that already failed stays failed until an attempt succeeds, so loading the
-        // tools again (the cluster executor does it twice) does not make it block readiness.
+        // tools again does not make it block readiness.
         let already_failed = matches!(
             self.status
                 .get_component_status(&format!("tool:{}", tool.name)),
@@ -191,42 +194,49 @@ impl Runtime {
             self.status
                 .update_tool(&tool.name, status::ComponentStatus::Initializing);
         }
-        let (first_attempt_done, first_attempt) = oneshot::channel();
-        self.tool_loads.start(
-            &tool.name,
-            Arc::clone(self).load_tool_until_loaded(
-                tool.clone(),
-                builtin_names,
-                first_attempt_done,
-            ),
-        );
-        // Dropped without a send when the load is stopped.
-        let _ = first_attempt.await;
+        let (done_tx, done) = oneshot::channel();
+        let shutdown = self.status.shutdown_token();
+        let name = tool.name.clone();
+        let rt = Arc::clone(&self);
+        self.tool_loads.start(&name, async move {
+            tokio::select! {
+                () = rt.load_tool_until_loaded(&tool, &builtin_names) => {
+                    let _ = done_tx.send(());
+                }
+                () = shutdown.cancelled() => {}
+            }
+        });
+        // `done` also resolves, without a send, when the load is stopped or shut down.
+        if tokio::time::timeout(TOOL_LOAD_WAIT, done).await.is_err() {
+            tracing::warn!(
+                "Tool '{name}' did not load within {} seconds. Models and workers load without it while it keeps retrying.",
+                TOOL_LOAD_WAIT.as_secs()
+            );
+        }
     }
 
+    /// Attempts to load `tool` until an attempt succeeds or fails for a reason no retry can
+    /// clear.
     async fn load_tool_until_loaded(
-        self: Arc<Self>,
-        tool: Tool,
-        builtin_names: Arc<HashSet<String>>,
-        first_attempt_done: oneshot::Sender<()>,
+        self: &Arc<Self>,
+        tool: &Tool,
+        builtin_names: &HashSet<String>,
     ) {
-        let shutdown = self.status.shutdown_token();
-        let attempts = async {
-            let mut retry = needs_retry(&self.try_load_tool(&tool, &builtin_names).await);
-            let _ = first_attempt_done.send(());
-            let mut backoff = FibonacciBackoffBuilder::new()
-                .max_retries(None)
-                .max_duration(Some(Duration::from_mins(1)))
-                .build();
-            while retry && let Some(delay) = backoff.next_duration() {
-                tokio::time::sleep(delay).await;
-                retry = needs_retry(&self.try_load_tool(&tool, &builtin_names).await);
-            }
-        };
-        tokio::select! {
-            () = attempts => {}
-            () = shutdown.cancelled() => {}
-        }
+        let retry_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(None)
+            .max_duration(Some(Duration::from_mins(1)))
+            .build();
+
+        let _ = retry(retry_strategy, || async {
+            self.try_load_tool(tool, builtin_names).await.map_err(|e| {
+                if is_permanent_tool_failure(&e) {
+                    RetryError::permanent(e)
+                } else {
+                    RetryError::transient(e)
+                }
+            })
+        })
+        .await;
     }
 
     /// One attempt to load `tool`, reported in its status, metrics and logs. The status stays
@@ -293,12 +303,6 @@ impl Runtime {
     }
 }
 
-fn needs_retry(attempt: &Result<(), crate::Error>) -> bool {
-    attempt
-        .as_ref()
-        .is_err_and(|err| !is_permanent_tool_failure(err))
-}
-
 /// Returns `true` when a tool load failure is a mistake in the Spicepod, which no retry can
 /// clear: a `from` no tool factory handles, or an invalid MCP directive or `mcp_args`.
 fn is_permanent_tool_failure(err: &crate::Error) -> bool {
@@ -320,10 +324,13 @@ fn is_permanent_tool_failure(err: &crate::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use app::AppBuilder;
     use serde_json::json;
 
     use super::*;
+    use crate::tools::factory::ToolFactory;
 
     fn tool(name: &str, from: &str) -> Tool {
         serde_json::from_value(json!({ "name": name, "from": from })).expect("a valid tool")
@@ -343,19 +350,89 @@ mod tests {
         rt.status.get_component_status(&format!("tool:{name}"))
     }
 
+    /// One load attempt, as the tool's factory saw it: whether it came after the tools loaded
+    /// again, the tool's status, and whether the runtime reported ready.
+    type Attempt = (bool, Option<status::ComponentStatus>, bool);
+
+    /// A tool source whose server is never reachable. Each attempt is recorded.
+    struct Unreachable {
+        status: Arc<status::RuntimeStatus>,
+        reloaded: Arc<AtomicBool>,
+        attempts: Arc<parking_lot::Mutex<Vec<Attempt>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl runtime_tools::factory::ToolCatalogFactory for Unreachable {
+        async fn construct(
+            &self,
+            component: &Tool,
+            _params_with_secrets: HashMap<String, SecretString>,
+            _env: HashMap<String, SecretString>,
+        ) -> Result<Arc<dyn SpiceToolCatalog>, Box<dyn std::error::Error + Send + Sync>> {
+            self.attempts.lock().push((
+                self.reloaded.load(Ordering::SeqCst),
+                self.status
+                    .get_component_status(&format!("tool:{}", component.name)),
+                self.status.is_ready(),
+            ));
+            Err("the server is unreachable".into())
+        }
+    }
+
+    /// Registers [`Unreachable`] as the `unreachable` tool source.
+    async fn register_unreachable(
+        rt: &Runtime,
+    ) -> (Arc<AtomicBool>, Arc<parking_lot::Mutex<Vec<Attempt>>>) {
+        let reloaded = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::default();
+        rt.tool_factories().lock().await.insert(
+            "unreachable".to_string(),
+            ToolFactory::Catalog(Arc::new(Unreachable {
+                status: Arc::clone(&rt.status),
+                reloaded: Arc::clone(&reloaded),
+                attempts: Arc::clone(&attempts),
+            })),
+        );
+        (reloaded, attempts)
+    }
+
+    #[tokio::test]
+    async fn a_tool_that_never_loads_does_not_hold_back_models() {
+        let tool: Tool = serde_json::from_value(
+            serde_json::json!({"from": "unreachable:tool", "name": "broken"}),
+        )
+        .expect("a valid tool");
+        let app = AppBuilder::new("tool_load_wait").with_tool(tool).build();
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+        let (_, attempts) = register_unreachable(&rt).await;
+
+        tokio::time::pause();
+        tokio::time::timeout(TOOL_LOAD_WAIT * 2, Arc::clone(&rt).load_models())
+            .await
+            .expect("models load without the tool that never loads");
+        assert!(!rt.tools.read().await.contains_key("broken"));
+        assert!(
+            attempts.lock().len() > 1,
+            "the tool is retried while models wait for it"
+        );
+    }
+
     /// A Spicepod tool that cannot load is left out, and the tools around it, including the
     /// built-ins, still load and the runtime reports ready.
     #[tokio::test]
     async fn a_failing_tool_does_not_hide_the_other_tools_or_block_readiness() {
         let rt = runtime_with(vec![
             tool("my_sql", "builtin:sql"),
-            tool("missing", "not_a_source:anything"),
+            tool("broken", "unreachable:x"),
         ])
         .await;
+        register_unreachable(&rt).await;
 
-        tokio::time::timeout(Duration::from_secs(30), Arc::clone(&rt).load_tools())
-            .await
-            .expect("loading the tools finishes after each tool's first attempt");
+        tokio::time::pause();
+        let load = tokio::spawn(Arc::clone(&rt).load_tools());
+        // While the broken tool is still retrying and `load_tools` still waits on it.
+        tokio::time::sleep(TOOL_LOAD_WAIT / 2).await;
+        assert!(!load.is_finished(), "load_tools waits for the broken tool");
 
         let loaded = rt.tools.read().await;
         assert!(
@@ -366,10 +443,10 @@ mod tests {
             loaded.contains_key("my_sql"),
             "the good Spicepod tool is missing"
         );
-        assert!(!loaded.contains_key("missing"));
+        assert!(!loaded.contains_key("broken"));
         drop(loaded);
         assert!(matches!(
-            tool_status(&rt, "missing"),
+            tool_status(&rt, "broken"),
             Some(status::ComponentStatus::Error(_))
         ));
         assert!(matches!(
@@ -380,6 +457,7 @@ mod tests {
             rt.status.is_ready(),
             "a failed tool must not block /v1/ready"
         );
+        load.await.expect("load_tools finishes");
     }
 
     /// A Spicepod tool named like a built-in does not replace the built-in.
@@ -400,32 +478,125 @@ mod tests {
         );
     }
 
-    /// A Spicepod mistake is not retried; an unreachable server is.
+    /// A failed tool stays failed through its background retries and when the tools load again
+    /// (a second `load_models` does that), so neither puts it back to initializing and blocks
+    /// readiness, and loading again replaces its retries instead of adding to them.
+    #[tokio::test]
+    async fn a_failed_tool_stays_failed_across_retries_and_reloads() {
+        let rt = runtime_with(vec![tool("flaky", "unreachable:x")]).await;
+        let (reloaded, attempts) = register_unreachable(&rt).await;
+
+        tokio::time::pause();
+        Arc::clone(&rt).load_tools().await;
+        tokio::time::sleep(Duration::from_mins(3)).await;
+        let first_load = attempts.lock().len();
+        reloaded.store(true, Ordering::SeqCst);
+        Arc::clone(&rt).load_tools().await;
+        tokio::time::sleep(Duration::from_mins(3)).await;
+
+        let attempts = attempts.lock().clone();
+        let reload = attempts.len() - first_load;
+        assert!(
+            first_load > 1,
+            "the first load was not retried: {attempts:?}"
+        );
+        assert!(reload > 1, "the reload was not retried: {attempts:?}");
+        // Retries back off the same way after each load, so one retry loop makes about as many
+        // attempts in the same time, and two would make about twice as many.
+        assert!(
+            reload <= first_load + 1,
+            "loading the tools again added a second retry loop: {first_load} attempts, then {reload}"
+        );
+        assert!(
+            matches!(
+                attempts[0],
+                (false, Some(status::ComponentStatus::Initializing), false)
+            ),
+            "the first attempt: {:?}",
+            attempts[0]
+        );
+        for attempt in &attempts[1..] {
+            assert!(
+                matches!(attempt, (_, Some(status::ComponentStatus::Error(_)), true)),
+                "a retry or a reload put the failed tool back to initializing or blocked readiness: {attempt:?}"
+            );
+        }
+    }
+
+    /// Counts `Unable to load tool '<name>'` warnings, one per failed attempt.
+    #[derive(Default, Clone)]
+    struct LoadWarnings(Arc<parking_lot::Mutex<HashMap<String, usize>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LoadWarnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            if let Some(rest) = message.0.strip_prefix("Unable to load tool '")
+                && let Some((name, _)) = rest.split_once('\'')
+            {
+                *self.0.lock().entry(name.to_string()).or_default() += 1;
+            }
+        }
+    }
+
+    /// A Spicepod mistake (a `from` no tool source handles, invalid `mcp_args`) is attempted once
+    /// and not retried; an unreachable MCP server is retried.
     #[cfg(feature = "mcp")]
     #[tokio::test]
-    async fn only_a_spicepod_mistake_is_permanent() {
+    async fn only_a_spicepod_mistake_is_not_retried() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let warnings = LoadWarnings::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
         let unused = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
         let refused_from = format!(
             "mcp:http://{}/mcp",
             unused.local_addr().expect("the free port's address")
         );
         drop(unused);
+        let bad_args: Tool = serde_json::from_value(json!({
+            "name": "bad_args",
+            "from": "mcp:echo",
+            "params": { "mcp_args": "\"unterminated" }
+        }))
+        .expect("a valid tool");
+        let rt = runtime_with(vec![
+            tool("unknown", "not_a_source:anything"),
+            bad_args,
+            tool("refused", &refused_from),
+        ])
+        .await;
 
-        let refused_tool = tool("refused", &refused_from);
-        let unknown_tool = tool("unknown", "not_a_source:anything");
-        let rt = runtime_with(vec![refused_tool.clone(), unknown_tool.clone()]).await;
-        let builtin_names = HashSet::new();
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        Arc::clone(&rt).load_tools().await;
+        tokio::time::sleep(Duration::from_mins(10).saturating_sub(started.elapsed())).await;
 
-        let refused = rt
-            .try_load_tool(&refused_tool, &builtin_names)
-            .await
-            .expect_err("nothing listens on the port");
-        assert!(!is_permanent_tool_failure(&refused), "{refused}");
-
-        let unknown = rt
-            .try_load_tool(&unknown_tool, &builtin_names)
-            .await
-            .expect_err("no such source");
-        assert!(is_permanent_tool_failure(&unknown), "{unknown}");
+        let warnings = warnings.0.lock().clone();
+        assert_eq!(warnings.get("unknown"), Some(&1), "{warnings:?}");
+        assert_eq!(warnings.get("bad_args"), Some(&1), "{warnings:?}");
+        assert!(
+            warnings
+                .get("refused")
+                .is_some_and(|attempts| *attempts > 1),
+            "an unreachable server is retried: {warnings:?}"
+        );
     }
 }

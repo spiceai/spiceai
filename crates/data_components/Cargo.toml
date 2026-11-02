@@ -152,6 +152,7 @@ default = []
 delta_lake = ["dep:delta_kernel", "dep:delta_kernel_default_engine"]
 elasticsearch = ["dep:elasticsearch"]
 duckdb = [
+    "adbc",
     "dep:duckdb",
     "db_connection_pool/duckdb",
     "datafusion-table-providers/duckdb",

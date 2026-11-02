@@ -16,12 +16,12 @@
 //! Three workloads are exercised, each across `[1, 2, 4, 8, 16, 32, 64, 128]`
 //! concurrency levels (64 covers the stated single-machine goal, 128 covers
 //! oversubscription on common 64-core SMT-2 boxes) and across every lane in
-//! `CAYENNE_LANES`. DuckDB runs once per workload as the external baseline.
+//! `CAYENNE_LANES`. `DuckDB` runs once per workload as the external baseline.
 //!
 //! * **`vs_duckdb_scaling_reads`** — N concurrent `SELECT COUNT(*)` queries
 //!   against one pre-loaded 1M-row table. Cayenne uses one long-lived warm
 //!   `SessionContext` shared across the N reader tasks (mirrors a running
-//!   Spice runtime). DuckDB opens one fresh `Connection` per OS thread
+//!   Spice runtime). `DuckDB` opens one fresh `Connection` per OS thread
 //!   from the shared on-disk database path. The bench shows whether
 //!   reader-side scaling is bounded by mutex contention or runs cleanly
 //!   to the core count. The Cayenne lane id is `cayenne_warm`.
@@ -37,8 +37,8 @@
 //! * **`vs_duckdb_scaling_cdc`** — same shape as writes, but pumping
 //!   `CayenneTableProvider::write_cdc_append_stream` + `finish()` (the
 //!   production CDC pipelined path used by `refresh_mode: changes`) instead
-//!   of `insert_into`. Compares against DuckDB INSERT as the closest analog
-//!   since DuckDB has no CDC-pipelined entry point of its own.
+//!   of `insert_into`. Compares against `DuckDB` INSERT as the closest analog
+//!   since `DuckDB` has no CDC-pipelined entry point of its own.
 //!
 //! Workers in every lane are pooled per concurrency level (spawned once,
 //! signaled per iteration via `mpsc` channels), so worker-spawn cost
@@ -46,8 +46,8 @@
 //! bounded-timeout receives (`tokio::time::timeout` over
 //! `tokio::sync::mpsc` for the async Cayenne reader lane,
 //! `std::sync::mpsc::Receiver::recv_timeout` via `wait_for_completions`
-//! for the threaded DuckDB and write/CDC lanes) — no CPU-burning
-//! `spin_loop`, no AtomicUsize counter, and a stalled or panicked worker
+//! for the threaded `DuckDB` and write/CDC lanes) — no CPU-burning
+//! `spin_loop`, no `AtomicUsize` counter, and a stalled or panicked worker
 //! surfaces as a labeled panic naming the bench, lane, and completion
 //! number instead of hanging indefinitely.
 //!
@@ -68,7 +68,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use duckdb::Connection;
+use duckdb_oracle::Connection;
 use tokio::runtime::Runtime;
 
 /// Bounded-timeout wait for `n` writer-completion signals. Replaces the
@@ -117,18 +117,16 @@ const WRITE_BATCH_ROWS: usize = 1_024;
 // ---------------------------------------------------------------------------
 
 /// Pre-built read-side state shared across all Cayenne metastore lanes and
-/// concurrency levels. The DuckDB side stores the on-disk database path
-/// rather than a shared `Connection` because `duckdb::Connection` is not
-/// `Send` in this codebase (`vs_duckdb_concurrent.rs:108` follows the same
-/// pattern — each thread calls `Connection::open(&db_path)` so every thread
-/// owns its own connection). Reader threads do the same.
+/// concurrency levels. The `DuckDB` side stores the on-disk database path
+/// so each reader thread opens its own connection. Sharing a connection would
+/// serialize queries on the oracle connection mutex.
 struct DuckDbReadFixture {
     db_path: std::path::PathBuf,
     _temp: tempfile::TempDir,
     _parquet_dir: tempfile::TempDir,
 }
 
-/// Build the DuckDB side once, returning a path other threads can open
+/// Build the `DuckDB` side once, returning a path other threads can open
 /// fresh connections against. The corresponding Cayenne fixture is built
 /// per-lane inside `bench_read_scaling` so each metastore backend gets
 /// its own independent metastore + data dir.
@@ -140,7 +138,7 @@ fn build_duckdb_read_fixture(batch: &arrow::array::RecordBatch) -> DuckDbReadFix
     duckdb_insert_parquet(&duckdb_fixture.conn, "scaling_read", &parquet_path);
     DuckDbReadFixture {
         db_path: duckdb_fixture.db_path(),
-        _temp: duckdb_fixture._temp_dir,
+        _temp: duckdb_fixture.temp_dir,
         _parquet_dir: parquet_dir,
     }
 }
@@ -177,12 +175,11 @@ impl CayenneReader {
     }
 }
 
-/// Persistent DuckDB reader worker. OS thread with the same channel shape
+/// Persistent `DuckDB` reader worker. OS thread with the same channel shape
 /// as `CayenneReader` — its own `go_rx` for per-worker ticks, a shared
 /// `done_tx` for completion signals. Each worker opens its own
-/// `Connection` from the shared on-disk database (DuckDB connections are
-/// not `Send` in this codebase, see `vs_duckdb_concurrent.rs:108` for the
-/// same pattern). Reused across every criterion sample so the
+/// `Connection` from the shared on-disk database for concurrent execution.
+/// Reused across every criterion sample so the
 /// thread-spawn cost is paid exactly once per concurrency level.
 struct DuckDbReader {
     handle: std::thread::JoinHandle<()>,
@@ -199,12 +196,7 @@ impl DuckDbReader {
             // `recv()` returns Err when the bench drops its sender — exit
             // cleanly on teardown.
             while go_rx.recv().is_ok() {
-                let mut stmt = conn
-                    .prepare("SELECT COUNT(*) FROM scaling_read")
-                    .expect("prepare");
-                let mut rows = stmt.query([]).expect("query");
-                let row = rows.next().expect("next").expect("row");
-                let value: i64 = row.get(0).expect("count");
+                let value = common::duckdb_query_scalar(&conn, "SELECT COUNT(*) FROM scaling_read");
                 black_box(value);
                 let _ = done_tx.send(());
             }
@@ -289,8 +281,8 @@ fn bench_read_scaling(c: &mut Criterion) {
                                         "{bench_ctx}: done channel closed at completion {}/{concurrency} (worker exited?)",
                                         i + 1
                                     ),
-                                    Err(_) => panic!(
-                                        "{bench_ctx}: stalled waiting for reader completion {}/{concurrency} after 30s",
+                                    Err(error) => panic!(
+                                        "{bench_ctx}: stalled waiting for reader completion {}/{concurrency} after 30s: {error}",
                                         i + 1
                                     ),
                                 }
@@ -303,8 +295,7 @@ fn bench_read_scaling(c: &mut Criterion) {
             // Tear down Cayenne workers for this (lane, concurrency).
             cayenne_go_txs.clear();
             for w in cayenne_workers.drain(..) {
-                rt.block_on(async { w.handle.await })
-                    .expect("cayenne reader task");
+                rt.block_on(w.handle).expect("cayenne reader task");
             }
         }
 
@@ -413,10 +404,9 @@ impl CayenneBgWriter {
     }
 }
 
-/// Per-iteration DuckDB writer. Same go/done channel shape as
+/// Per-iteration `DuckDB` writer. Same go/done channel shape as
 /// [`CayenneBgWriter`], running on a dedicated OS thread with its own
-/// `Connection` opened from the shared DB path (`vs_duckdb_concurrent.rs:108`
-/// follows the same pattern — DuckDB connections aren't `Send`).
+/// `Connection` opened from the shared DB path for concurrent execution.
 struct DuckDbBgWriter {
     handle: std::thread::JoinHandle<u64>,
 }
@@ -520,7 +510,7 @@ fn bench_write_scaling(c: &mut Criterion) {
             // receiver, then await each writer.
             cayenne_go_txs.clear();
             for w in cayenne_workers.drain(..) {
-                let _ = rt.block_on(async { w.handle.await });
+                let _ = rt.block_on(w.handle);
             }
             drop(cayenne_fixture);
         }
@@ -677,7 +667,7 @@ fn bench_cdc_scaling(c: &mut Criterion) {
 
             cayenne_go_txs.clear();
             for w in cayenne_workers.drain(..) {
-                let _ = rt.block_on(async { w.handle.await });
+                let _ = rt.block_on(w.handle);
             }
             drop(cayenne_fixture);
         }

@@ -1,4 +1,5 @@
 {
+  "adbc-duckdb-catalog": 1,
   "append-embeddings": 13,
   "append-kill": 7,
   "append-time-column": 8,
@@ -30,6 +31,7 @@
   "distinct-on-scopes": 5,
   "duckdb-nested-union-all": 4,
   "duckdb-timestamp-deletes": 4,
+  "duckdb-types-acceleration": 2,
   "ducklake-coverage": 25,
   "ducklake-refresh": 28,
   "duplicate-keys": 7,
@@ -41,7 +43,7 @@
   "federated-result-columns": 12,
   "federation-differential": 12,
   "federation-matrix": 21,
-  "feed-chaos": 172,
+  "feed-chaos": 232,
   "feed-generate": 38,
   "feed-write-boundaries": 10,
   "file-tables-federated-freshness": 15,
@@ -66,6 +68,7 @@
   "iceberg-refresh": 11,
   "iceberg-write": 5,
   "index-equivalence": 10,
+  "int64-overflow": 1,
   "kafka": 11,
   "kafka-partitions": 11,
   "kafka-sasl": 11,
@@ -117,6 +120,7 @@
   "readiness": 64,
   "readiness-failures": 9,
   "readiness-mixed": 33,
+  "refresh-api-overrides": 6,
   "refresh-api-sql": 5,
   "refresh-data-window": 3,
   "results-cache": 11,
@@ -150,6 +154,7 @@
   "unparse-projected-exists": 4,
   "unparse-pruned-aggregate": 15,
   "unparse-set-operations": 5,
+  "unparse-sort-keys": 14,
   "unsigned-negation": 5,
   "views": 11
 }

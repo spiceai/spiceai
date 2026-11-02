@@ -693,7 +693,7 @@
       "who": "federated",
       "key": "query: SELECT id, char_length(s) AS chars, octet_length(s) AS bytes FROM t WHERE s IS NOT NULL",
       "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: No function matches the given name and argument types 'octet_length(VARCHAR)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\toctet_length(BLO",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nInternal: Binder Error: No function matches the given name and argument types 'octet_length(VARCHAR)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\toctet_",
       "group": "files-and-lakes"
     }
   ],
@@ -704,14 +704,6 @@
       "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
-      "group": "datafusion"
-    },
-    {
-      "run": "edge-values",
-      "who": "arrow",
-      "key": "query: SELECT id, -i8 AS neg FROM e WHERE id = 3",
-      "kind": "error",
-      "signature": "the query succeeded, but the script expected an error:",
       "group": "datafusion"
     },
     {
@@ -728,14 +720,6 @@
       "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
-      "group": "cayenne"
-    },
-    {
-      "run": "edge-values",
-      "who": "cayenne",
-      "key": "query: SELECT id, -i8 AS neg FROM e WHERE id = 3",
-      "kind": "error",
-      "signature": "the query succeeded, but the script expected an error:",
       "group": "cayenne"
     },
     {
@@ -1811,14 +1795,6 @@
     {
       "run": "postgres-cdc-edge-values[identity=default]",
       "who": "cayenne",
-      "key": "query: SELECT id, -i8 AS neg FROM e WHERE id = 3",
-      "kind": "error",
-      "signature": "the query succeeded, but the script expected an error:",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-edge-values[identity=default]",
-      "who": "cayenne",
       "key": "query: SELECT id, octet_length(bin) AS n FROM e",
       "kind": "error",
       "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
@@ -1830,14 +1806,6 @@
       "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-edge-values[identity=default]",
-      "who": "cayenne",
-      "key": "query: SELECT id, -i8 AS neg FROM e WHERE id = 3 #2",
-      "kind": "error",
-      "signature": "the query succeeded, but the script expected an error:",
       "group": "cayenne"
     },
     {
@@ -1923,14 +1891,6 @@
     {
       "run": "postgres-cdc-edge-values[identity=full]",
       "who": "cayenne",
-      "key": "query: SELECT id, -i8 AS neg FROM e WHERE id = 3",
-      "kind": "error",
-      "signature": "the query succeeded, but the script expected an error:",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-edge-values[identity=full]",
-      "who": "cayenne",
       "key": "query: SELECT id, octet_length(bin) AS n FROM e",
       "kind": "error",
       "signature": "Spice rejected the query: Query execution failed. Function 'octet_length' requires String, but received Binary (DataType: Binary).",
@@ -1942,14 +1902,6 @@
       "key": "query: SELECT id, f FROM e ORDER BY f DESC NULLS LAST, id #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: SortOrderViolation { side: \"right\", violation: SortOrderViolation { column: \"id\", row_number: 9, previous: \"5\", current: \"4\" } }",
-      "group": "cayenne"
-    },
-    {
-      "run": "postgres-cdc-edge-values[identity=full]",
-      "who": "cayenne",
-      "key": "query: SELECT id, -i8 AS neg FROM e WHERE id = 3 #2",
-      "kind": "error",
-      "signature": "the query succeeded, but the script expected an error:",
       "group": "cayenne"
     },
     {
@@ -2361,6 +2313,198 @@
   ],
   "query-coverage": [
     {
+      "run": "query-coverage[backend=ducklake]",
+      "who": "duckdb",
+      "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata: {} }, field_qualifiers: [None, None], functional_",
+      "group": "sql-unparser"
+    },
+    {
+      "run": "query-coverage[backend=ducklake]",
+      "who": "duckdb",
+      "key": "query: SELECT id, char_length(s) AS chars, octet_length(s) AS bytes FROM t WHERE s IS NOT NULL",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: No function matches the given name and argument types 'octet_length(VARCHAR)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\toctet_length(BLO",
+      "group": "duckdb"
+    },
+    {
+      "run": "query-coverage[backend=ducklake]",
+      "who": "federated",
+      "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata: {} }, field_qualifiers: [None, None], functional_",
+      "group": "sql-unparser"
+    },
+    {
+      "run": "query-coverage[backend=ducklake]",
+      "who": "federated",
+      "key": "query: SELECT id, char_length(s) AS chars, octet_length(s) AS bytes FROM t WHERE s IS NOT NULL",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nInternal: Binder Error: No function matches the given name and argument types 'octet_length(VARCHAR)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\toctet_",
+      "group": "duckdb"
+    },
+    {
+      "run": "query-coverage[backend=ducklake]",
+      "who": "sqlite",
+      "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata: {} }, field_qualifiers: [None, None], functional_",
+      "group": "sql-unparser"
+    },
+    {
+      "run": "query-coverage[backend=ducklake]",
+      "who": "sqlite",
+      "key": "query: SELECT id, dt + INTERVAL '1 day' AS next_day, ts - INTERVAL '2 hours' AS earlier FROM t WHERE id < 30",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"earlier\", row_number: 1, expected: \"\\\"2024-10-24 02:51:51.074325\\\"\", actual: \"\\\"2024-10-24 02:51:51.000000\\\"\" }",
+      "group": "sqlite"
+    },
+    {
+      "run": "query-coverage[backend=ducklake]",
+      "who": "sqlite",
+      "key": "query: SELECT id, position('a' IN s) AS p, left(s, 2) AS l2, right(s, 2) AS r2 FROM t WHERE s IS NOT NULL",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: strpos in SELECT `t`.`id`, strpos(`t`.`s`, 'a') AS `p`, left(`t`.`s`, 2) AS `l2`, right(`t`.`s`, 2) AS `r2` FROM `t` WHERE `t`.`s` IS NOT",
+      "group": "sqlite"
+    },
+    {
+      "run": "query-coverage[backend=ducklake]",
+      "who": "sqlite",
+      "key": "query: SELECT id, lpad(s, 8, '*') AS padded, rpad(s, 8, '.') AS rpadded FROM t WHERE s IS NOT NULL AND char_length(s) < 8",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: lpad in SELECT `t`.`id`, lpad(`t`.`s`, 8, '*') AS `padded`, rpad(`t`.`s`, 8, '.') AS `rpadded` FROM `t` WHERE (`t`.`s` IS NOT NULL AND (l",
+      "group": "sqlite"
+    },
+    {
+      "run": "query-coverage[backend=ducklake]",
+      "who": "sqlite",
+      "key": "query: SELECT id, starts_with(s, 'ap') AS sw FROM t WHERE s IS NOT NULL",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: starts_with in SELECT `t`.`id`, starts_with(`t`.`s`, 'ap') AS `sw` FROM `t` WHERE `t`.`s` IS NOT NULL at offset 17\\\")\": code: 'Client spe",
+      "group": "sqlite"
+    },
+    {
+      "run": "query-coverage[backend=ducklake]",
+      "who": "sqlite",
+      "key": "query: SELECT id, greatest(i, 0) AS g, least(i, 0) AS l FROM t",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: greatest in SELECT `t`.`id`, greatest(`t`.`i`, 0) AS `g`, least(`t`.`i`, 0) AS `l` FROM `t` at offset 17\\\")\": code: 'Client specified an ",
+      "group": "sqlite"
+    },
+    {
+      "run": "query-coverage[backend=ducklake]",
+      "who": "sqlite",
+      "key": "query: SELECT id, abs(d), round(d, 1), floor(f), ceil(f) FROM t WHERE id < 50",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: floor in SELECT `t`.`id`, abs(`t`.`d`), round(`t`.`d`, 1), floor(`t`.`f`), ceil(`t`.`f`) FROM `t` WHERE (`t`.`id` < 50) at offset 50\\\")\":",
+      "group": "sqlite"
+    },
+    {
+      "run": "query-coverage[backend=duckdb]",
+      "who": "adbc",
+      "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata: {} }, field_qualifiers: [None, None], functional_",
+      "group": "sql-unparser"
+    },
+    {
+      "run": "query-coverage[backend=duckdb]",
+      "who": "adbc",
+      "key": "query: SELECT id, char_length(s) AS chars, octet_length(s) AS bytes FROM t WHERE s IS NOT NULL",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nInternal: Binder Error: No function matches the given name and argument types 'octet_length(VARCHAR)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\toctet_",
+      "group": "duckdb"
+    },
+    {
+      "run": "query-coverage[backend=duckdb]",
+      "who": "duckdb",
+      "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata: {} }, field_qualifiers: [None, None], functional_",
+      "group": "sql-unparser"
+    },
+    {
+      "run": "query-coverage[backend=duckdb]",
+      "who": "duckdb",
+      "key": "query: SELECT id, char_length(s) AS chars, octet_length(s) AS bytes FROM t WHERE s IS NOT NULL",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nBinder Error: No function matches the given name and argument types 'octet_length(VARCHAR)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\toctet_length(BLO",
+      "group": "duckdb"
+    },
+    {
+      "run": "query-coverage[backend=duckdb]",
+      "who": "federated",
+      "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata: {} }, field_qualifiers: [None, None], functional_",
+      "group": "sql-unparser"
+    },
+    {
+      "run": "query-coverage[backend=duckdb]",
+      "who": "federated",
+      "key": "query: SELECT id, char_length(s) AS chars, octet_length(s) AS bytes FROM t WHERE s IS NOT NULL",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nInternal: Binder Error: No function matches the given name and argument types 'octet_length(VARCHAR)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\toctet_",
+      "group": "duckdb"
+    },
+    {
+      "run": "query-coverage[backend=duckdb]",
+      "who": "sqlite",
+      "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Unsupported Query. Unsupported operator: Values(Values { schema: DFSchema { inner: Schema { fields: [Field { name: \"column1\", data_type: Int64 }, Field { name: \"column2\", data_type: Utf8 }], metadata: {} }, field_qualifiers: [None, None], functional_",
+      "group": "sql-unparser"
+    },
+    {
+      "run": "query-coverage[backend=duckdb]",
+      "who": "sqlite",
+      "key": "query: SELECT id, dt + INTERVAL '1 day' AS next_day, ts - INTERVAL '2 hours' AS earlier FROM t WHERE id < 30",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"earlier\", row_number: 1, expected: \"\\\"2024-10-24 02:51:51.074325\\\"\", actual: \"\\\"2024-10-24 02:51:51.000000\\\"\" }",
+      "group": "sqlite"
+    },
+    {
+      "run": "query-coverage[backend=duckdb]",
+      "who": "sqlite",
+      "key": "query: SELECT id, position('a' IN s) AS p, left(s, 2) AS l2, right(s, 2) AS r2 FROM t WHERE s IS NOT NULL",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: strpos in SELECT `t`.`id`, strpos(`t`.`s`, 'a') AS `p`, left(`t`.`s`, 2) AS `l2`, right(`t`.`s`, 2) AS `r2` FROM `t` WHERE `t`.`s` IS NOT",
+      "group": "sqlite"
+    },
+    {
+      "run": "query-coverage[backend=duckdb]",
+      "who": "sqlite",
+      "key": "query: SELECT id, lpad(s, 8, '*') AS padded, rpad(s, 8, '.') AS rpadded FROM t WHERE s IS NOT NULL AND char_length(s) < 8",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: lpad in SELECT `t`.`id`, lpad(`t`.`s`, 8, '*') AS `padded`, rpad(`t`.`s`, 8, '.') AS `rpadded` FROM `t` WHERE (`t`.`s` IS NOT NULL AND (l",
+      "group": "sqlite"
+    },
+    {
+      "run": "query-coverage[backend=duckdb]",
+      "who": "sqlite",
+      "key": "query: SELECT id, starts_with(s, 'ap') AS sw FROM t WHERE s IS NOT NULL",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: starts_with in SELECT `t`.`id`, starts_with(`t`.`s`, 'ap') AS `sw` FROM `t` WHERE `t`.`s` IS NOT NULL at offset 17\\\")\": code: 'Client spe",
+      "group": "sqlite"
+    },
+    {
+      "run": "query-coverage[backend=duckdb]",
+      "who": "sqlite",
+      "key": "query: SELECT id, greatest(i, 0) AS g, least(i, 0) AS l FROM t",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: greatest in SELECT `t`.`id`, greatest(`t`.`i`, 0) AS `g`, least(`t`.`i`, 0) AS `l` FROM `t` at offset 17\\\")\": code: 'Client specified an ",
+      "group": "sqlite"
+    },
+    {
+      "run": "query-coverage[backend=duckdb]",
+      "who": "sqlite",
+      "key": "query: SELECT id, abs(d), round(d, 1), floor(f), ceil(f) FROM t WHERE id < 50",
+      "kind": "error",
+      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nConnectionError Error(\\\"no such function: floor in SELECT `t`.`id`, abs(`t`.`d`), round(`t`.`d`, 1), floor(`t`.`f`), ceil(`t`.`f`) FROM `t` WHERE (`t`.`id` < 50) at offset 50\\\")\":",
+      "group": "sqlite"
+    },
+    {
       "run": "query-coverage[backend=postgres]",
       "who": "duckdb",
       "key": "query: SELECT v.x, v.y, t.d FROM (VALUES (3, 'a'), (17, 'b'), (999, 'c')) AS v(x, y) LEFT JOIN t ON t.id = v.x",
@@ -2559,22 +2703,6 @@
       "kind": "error",
       "signature": "Spice rejected the query: Query execution failed. Cannot create filter with non-boolean predicate 't.b' returning Int8: Cannot create filter with non-boolean predicate 't.b' returning Int8",
       "group": "duckdb"
-    },
-    {
-      "run": "query-coverage[backend=mysql]",
-      "who": "federated",
-      "key": "query: SELECT id, b, rank() OVER (PARTITION BY b ORDER BY i NULLS LAST, id) AS r FROM t",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: DataMismatch { column: \"r\", row_number: 1, expected: \"\\\"75\\\"\", actual: \"\\\"90\\\"\" }",
-      "group": "federation-mysql"
-    },
-    {
-      "run": "query-coverage[backend=mysql]",
-      "who": "federated",
-      "key": "query: SELECT t.id, u.id AS uid FROM t FULL OUTER JOIN u ON t.id = u.t_id WHERE coalesce(t.id, 0) < 30 OR u.id < 10",
-      "kind": "error",
-      "signature": "Spice rejected the query: Tonic error: code: 'Client specified an invalid argument', message: \"Failed to execute query.\\nQuery execution failed.\\nServer error: `ERROR 1054 (42S22): Unknown column 't.id' in 'field list''\\nFor details, refer to the MySQL manual: https://dev.mysql.com/doc/mysql-errors/",
-      "group": "federation-mysql"
     },
     {
       "run": "query-coverage[backend=mysql]",

@@ -286,7 +286,7 @@ impl Runtime {
     }
 
     /// Hot-apply a new [`App`] to the running runtime, reconciling catalogs,
-    /// datasets, views, models, functions, and (without the `models` feature)
+    /// datasets, views, models, functions, and (with the `models` feature)
     /// workers against the currently-loaded app.
     ///
     /// This is the diff-based reconcile the pods watcher performs when a
@@ -372,7 +372,7 @@ impl Runtime {
             self.apply_model_diff(current_app, &new_app).await;
             crate::datafusion::udf::apply_function_diff(&self, current_app, &new_app).await;
 
-            if !cfg!(feature = "models") {
+            if cfg!(feature = "models") {
                 Arc::clone(&self)
                     .apply_worker_diff(current_app, &new_app)
                     .await;

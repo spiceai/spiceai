@@ -55,7 +55,8 @@ use crate::catalog::SpiceToolCatalog;
 use tools::SpiceModelTool;
 
 use super::{
-    Error, MAX_TOOL_RESULT_SIZE, MCPConfig, Result, UnderlyingTransportSnafu,
+    Error, MAX_TOOL_RESULT_SIZE, MCP_CALL_TOOL_TIMEOUT, MCP_HANDSHAKE_TIMEOUT, MCP_REQUEST_TIMEOUT,
+    MCPConfig, Result, UnderlyingTransportSnafu,
     http_client::BoundedHttpClient,
     server::{McpSchemaSnapshot, apply_listed_catalog_cache},
     tool::McpToolWrapper,
@@ -384,20 +385,7 @@ impl Drop for McpToolCatalog {
 
 impl McpToolCatalog {
     pub async fn try_new(cfg: MCPConfig, name: &str, description: Option<String>) -> Result<Self> {
-        Self::try_new_within(cfg, name, description, MCP_STARTUP_TIMEOUT).await
-    }
-
-    /// Connects to the MCP server and lists its tools, failing if the two together have not
-    /// finished within `startup_timeout`.
-    async fn try_new_within(
-        cfg: MCPConfig,
-        name: &str,
-        description: Option<String>,
-        startup_timeout: Duration,
-    ) -> Result<Self> {
-        // The handshake and the first `tools/list` share one startup deadline.
-        let deadline = tokio::time::Instant::now() + startup_timeout;
-        let client = Self::create_client_within(&cfg, name, startup_timeout).await?;
+        let client = Self::create_client(&cfg, name).await?;
         let client = Arc::new(RwLock::new(client));
 
         let client_clone = Arc::clone(&client);
@@ -441,7 +429,7 @@ impl McpToolCatalog {
                 // The read lock is held during the heartbeat call. The underlying
                 // McpClient wraps a RunningService which is not Clone, so we cannot
                 // clone the client to release the lock before the network call.
-                // This is acceptable because the call timeout is bounded.
+                // This is acceptable because `MCP_REQUEST_TIMEOUT` bounds each probe.
                 let heartbeat_result = {
                     let client_guard = client_clone.read().await;
                     client_guard.heartbeat().await
@@ -488,23 +476,13 @@ impl McpToolCatalog {
         // list leaves the cache empty; fail construction so the existing
         // component-load retry rebuilds the catalog instead of registering
         // one that would make rmcp cache `get_tool == None`.
-        match tokio::time::timeout_at(deadline, catalog.list_tools()).await {
-            Ok(listed) => {
-                listed.map_err(|e| Error::CouldNotConstructTool {
-                    name: name.to_string(),
-                    e: e.to_string(),
-                })?;
-            }
-            Err(_) => {
-                return Err(Error::UnderlyingTransportError {
-                    source: format!(
-                        "the MCP server did not answer tools/list within {}s of connecting",
-                        startup_timeout.as_secs_f32()
-                    )
-                    .into(),
-                });
-            }
-        }
+        catalog
+            .list_tools()
+            .await
+            .map_err(|e| Error::CouldNotConstructTool {
+                name: name.to_string(),
+                e: e.to_string(),
+            })?;
         Ok(catalog)
     }
 
@@ -561,34 +539,13 @@ impl McpToolCatalog {
     }
 
     async fn create_client(cfg: &MCPConfig, tool_name: &str) -> Result<McpClient> {
-        Self::create_client_within(cfg, tool_name, MCP_STARTUP_TIMEOUT).await
-    }
-
-    /// Connects to the MCP server, failing if the handshake has not finished within `timeout`.
-    async fn create_client_within(
-        cfg: &MCPConfig,
-        tool_name: &str,
-        timeout: Duration,
-    ) -> Result<McpClient> {
-        // An attempt that ends without a client (it timed out, failed, or the load was
-        // stopped) cancels `abandoned`, which ends the requests its handshake left open.
+        // An attempt that ends without a client (its handshake timed out or failed, or the load
+        // was stopped) cancels `abandoned`, which ends the requests its handshake left open.
         let abandoned = CancellationToken::new();
         let release_on_drop = abandoned.clone().drop_guard();
-        match tokio::time::timeout(timeout, Self::connect_client(cfg, tool_name, &abandoned)).await
-        {
-            Ok(Ok(client)) => {
-                release_on_drop.disarm();
-                Ok(client)
-            }
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(Error::UnderlyingTransportError {
-                source: format!(
-                    "the MCP server did not complete the connection handshake within {}s",
-                    timeout.as_secs_f32()
-                )
-                .into(),
-            }),
-        }
+        let client = Self::connect_client(cfg, tool_name, &abandoned).await?;
+        release_on_drop.disarm();
+        Ok(client)
     }
 
     async fn connect_client(
@@ -658,10 +615,13 @@ impl McpToolCatalog {
                 }
 
                 Ok(McpClient::Stdio(
-                    ().serve_with_lifecycle(transport, client_lifecycle())
-                        .await
-                        .boxed()
-                        .context(UnderlyingTransportSnafu)?,
+                    handshake(
+                        tool_name,
+                        ().serve_with_lifecycle(transport, client_lifecycle()),
+                    )
+                    .await?
+                    .boxed()
+                    .context(UnderlyingTransportSnafu)?,
                 ))
             }
             MCPConfig::StreamableHttp {
@@ -714,11 +674,13 @@ impl McpToolCatalog {
                 .with_protocol_version(ProtocolVersion::V_2026_07_28);
 
                 Ok(McpClient::Http(
-                    client_info
-                        .serve_with_lifecycle(transport, client_lifecycle())
-                        .await
-                        .boxed()
-                        .context(UnderlyingTransportSnafu)?,
+                    handshake(
+                        tool_name,
+                        client_info.serve_with_lifecycle(transport, client_lifecycle()),
+                    )
+                    .await?
+                    .boxed()
+                    .context(UnderlyingTransportSnafu)?,
                 ))
             }
         }
@@ -998,11 +960,29 @@ fn client_lifecycle() -> ClientLifecycleMode {
     }
 }
 
-/// Upper bound on connecting to an MCP server and listing its tools. rmcp waits 10 seconds for
-/// `server/discover` and then falls back to `initialize` with no deadline, and `tools/list` has
-/// no default deadline either, so a server that accepts the connection but never answers would
-/// otherwise keep the tool loading forever.
-const MCP_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Waits at most `timeout` for an MCP request. On timeout the request future is dropped.
+async fn bounded<T>(
+    timeout: Duration,
+    request: impl Future<Output = std::result::Result<T, ServiceError>>,
+) -> std::result::Result<T, ServiceError> {
+    tokio::time::timeout(timeout, request)
+        .await
+        .unwrap_or(Err(ServiceError::Timeout { timeout }))
+}
+
+/// Waits at most [`MCP_HANDSHAKE_TIMEOUT`] for an MCP client to start. Dropping the start
+/// future on timeout drops its transport, which stops a stdio server's child process.
+async fn handshake<T>(tool_name: &str, start: impl Future<Output = T>) -> Result<T> {
+    tokio::time::timeout(MCP_HANDSHAKE_TIMEOUT, start)
+        .await
+        .map_err(|_| Error::CouldNotConstructTool {
+            name: tool_name.to_string(),
+            e: format!(
+                "The MCP server did not complete its handshake within {} seconds",
+                MCP_HANDSHAKE_TIMEOUT.as_secs()
+            ),
+        })
+}
 
 pub enum McpClient {
     Stdio(RunningService<RoleClient, ()>),
@@ -1027,8 +1007,8 @@ impl McpClient {
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListToolsResult, ServiceError> {
         match self {
-            McpClient::Stdio(s) => s.list_tools(params).await,
-            McpClient::Http(s) => s.list_tools(params).await,
+            McpClient::Stdio(s) => bounded(MCP_REQUEST_TIMEOUT, s.list_tools(params)).await,
+            McpClient::Http(s) => bounded(MCP_REQUEST_TIMEOUT, s.list_tools(params)).await,
             #[cfg(test)]
             McpClient::Scripted(scripted) => {
                 scripted.list_calls.fetch_add(1, Ordering::SeqCst);
@@ -1045,8 +1025,8 @@ impl McpClient {
         params: CallToolRequestParams,
     ) -> Result<CallToolResult, ServiceError> {
         match self {
-            McpClient::Stdio(s) => s.call_tool(params).await,
-            McpClient::Http(s) => s.call_tool(params).await,
+            McpClient::Stdio(s) => bounded(MCP_CALL_TOOL_TIMEOUT, s.call_tool(params)).await,
+            McpClient::Http(s) => bounded(MCP_CALL_TOOL_TIMEOUT, s.call_tool(params)).await,
             #[cfg(test)]
             McpClient::Scripted(_) => Err(ServiceError::UnexpectedResponse),
         }
@@ -1062,8 +1042,8 @@ impl McpClient {
         params: CallToolRequestParams,
     ) -> Result<CallToolResponse, ServiceError> {
         match self {
-            McpClient::Stdio(s) => s.call_tool_once(params).await,
-            McpClient::Http(s) => s.call_tool_once(params).await,
+            McpClient::Stdio(s) => bounded(MCP_CALL_TOOL_TIMEOUT, s.call_tool_once(params)).await,
+            McpClient::Http(s) => bounded(MCP_CALL_TOOL_TIMEOUT, s.call_tool_once(params)).await,
             #[cfg(test)]
             McpClient::Scripted(_) => Err(ServiceError::UnexpectedResponse),
         }
@@ -1072,14 +1052,20 @@ impl McpClient {
     pub async fn ping(&self) -> Result<(), ServiceError> {
         let result = match self {
             McpClient::Stdio(s) => {
-                s.peer()
-                    .send_request(ClientRequest::PingRequest(PingRequest::default()))
-                    .await?
+                bounded(
+                    MCP_REQUEST_TIMEOUT,
+                    s.peer()
+                        .send_request(ClientRequest::PingRequest(PingRequest::default())),
+                )
+                .await?
             }
             McpClient::Http(s) => {
-                s.peer()
-                    .send_request(ClientRequest::PingRequest(PingRequest::default()))
-                    .await?
+                bounded(
+                    MCP_REQUEST_TIMEOUT,
+                    s.peer()
+                        .send_request(ClientRequest::PingRequest(PingRequest::default())),
+                )
+                .await?
             }
             #[cfg(test)]
             McpClient::Scripted(_) => return Err(ServiceError::UnexpectedResponse),
@@ -1115,14 +1101,20 @@ impl McpClient {
     async fn list_tools_uncached(&self) -> Result<ListToolsResult, ServiceError> {
         let result = match self {
             McpClient::Stdio(s) => {
-                s.peer()
-                    .send_request(ClientRequest::ListToolsRequest(ListToolsRequest::default()))
-                    .await?
+                bounded(
+                    MCP_REQUEST_TIMEOUT,
+                    s.peer()
+                        .send_request(ClientRequest::ListToolsRequest(ListToolsRequest::default())),
+                )
+                .await?
             }
             McpClient::Http(s) => {
-                s.peer()
-                    .send_request(ClientRequest::ListToolsRequest(ListToolsRequest::default()))
-                    .await?
+                bounded(
+                    MCP_REQUEST_TIMEOUT,
+                    s.peer()
+                        .send_request(ClientRequest::ListToolsRequest(ListToolsRequest::default())),
+                )
+                .await?
             }
             #[cfg(test)]
             McpClient::Scripted(scripted) => {
@@ -1252,51 +1244,13 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
 
-    /// A server that accepts the connection and never answers fails the load within the
-    /// startup timeout instead of hanging it.
+    /// A connection attempt that is given up on closes its connection. `handshake()` gives up at
+    /// `MCP_HANDSHAKE_TIMEOUT` by dropping the attempt; this drops it the same way at 500 ms.
+    /// rmcp sends the first handshake request outside its own cancellation, so without that each
+    /// retry against a server that never answers would leave one more connection, and the task
+    /// waiting on it, open.
     #[tokio::test]
-    async fn test_unresponsive_server_fails_within_startup_timeout() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a listener");
-        let addr = listener.local_addr().expect("listener address");
-        let accepted = tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((socket, _)) = listener.accept().await {
-                held.push(socket);
-            }
-        });
-        let cfg = MCPConfig::StreamableHttp {
-            url: url::Url::parse(&format!("http://{addr}/mcp")).expect("valid url"),
-            auth_token: None,
-            headers: HashMap::new(),
-        };
-
-        let started = Instant::now();
-        let result =
-            McpToolCatalog::create_client_within(&cfg, "silent", Duration::from_millis(500)).await;
-        accepted.abort();
-
-        let Err(err) = result else {
-            panic!("an unresponsive server must not connect");
-        };
-        assert!(
-            err.to_string()
-                .contains("did not complete the connection handshake"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the load must give up at the startup timeout, took {:?}",
-            started.elapsed()
-        );
-    }
-
-    /// A handshake that timed out closes its connection. rmcp sends the first handshake
-    /// request outside its own cancellation, so without that each retry against a server
-    /// that never answers would leave one more connection, and the task waiting on it, open.
-    #[tokio::test]
-    async fn test_timed_out_handshake_closes_its_connection() {
+    async fn test_abandoned_handshake_closes_its_connection() {
         use tokio::io::AsyncReadExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1317,125 +1271,19 @@ mod tests {
             headers: HashMap::new(),
         };
 
-        let result =
-            McpToolCatalog::create_client_within(&cfg, "silent", Duration::from_millis(500)).await;
-        let Err(err) = result else {
-            panic!("an unresponsive server must not connect");
-        };
-        assert!(
-            err.to_string()
-                .contains("did not complete the connection handshake"),
-            "unexpected error: {err}"
-        );
-
-        let closed = tokio::time::timeout(Duration::from_secs(5), closed_rx).await;
-        server.abort();
-        assert!(
-            matches!(closed, Ok(Ok(()))),
-            "the timed-out handshake left its connection open"
-        );
-    }
-
-    /// A server that completes the handshake but never answers the first `tools/list` fails
-    /// the load at the shared startup deadline, and the connection carrying that request is
-    /// closed.
-    #[tokio::test]
-    async fn test_unanswered_first_tools_list_fails_within_startup_timeout() {
-        use axum::{
-            Json, Router,
-            http::StatusCode,
-            response::{IntoResponse, Response},
-            routing::post,
-        };
-
-        /// Signals when the handler holding it is dropped, which is when the client closes
-        /// the connection of the request it is answering.
-        struct SignalOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
-        impl Drop for SignalOnDrop {
-            fn drop(&mut self) {
-                if let Some(closed) = self.0.take() {
-                    let _ = closed.send(());
-                }
-            }
-        }
-
-        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
-        let closed_tx = Arc::new(StdMutex::new(Some(closed_tx)));
-        let mcp = post(move |Json(message): Json<Value>| {
-            let closed_tx = Arc::clone(&closed_tx);
-            async move {
-                let id = message.get("id").cloned();
-                match message.get("method").and_then(Value::as_str) {
-                    Some("initialize") => (
-                        [("mcp-session-id", "session")],
-                        Json(json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "protocolVersion": "2025-03-26",
-                                "capabilities": { "tools": {} },
-                                "serverInfo": { "name": "silent-list", "version": "1.0.0" }
-                            }
-                        })),
-                    )
-                        .into_response(),
-                    Some("tools/list") => {
-                        let _signal = SignalOnDrop(closed_tx.lock().expect("signal lock").take());
-                        std::future::pending::<Response>().await
-                    }
-                    _ if id.is_none() => StatusCode::ACCEPTED.into_response(),
-                    // `server/discover` included: answering it as unknown makes the client
-                    // fall back to `initialize`.
-                    method => Json(json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": { "code": -32601, "message": format!("Method not found: {method:?}") }
-                    }))
-                    .into_response(),
-                }
-            }
-        })
-        .get(|| async { StatusCode::METHOD_NOT_ALLOWED })
-        .delete(|| async { StatusCode::OK });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a listener");
-        let addr = listener.local_addr().expect("listener address");
-        let server =
-            tokio::spawn(
-                async move { axum::serve(listener, Router::new().route("/mcp", mcp)).await },
-            );
-        let cfg = MCPConfig::StreamableHttp {
-            url: url::Url::parse(&format!("http://{addr}/mcp")).expect("valid url"),
-            auth_token: None,
-            headers: HashMap::new(),
-        };
-
-        let started = Instant::now();
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            McpToolCatalog::try_new_within(cfg, "silent_list", None, Duration::from_millis(500)),
+        let attempt = tokio::time::timeout(
+            Duration::from_millis(500),
+            McpToolCatalog::create_client(&cfg, "silent"),
         )
-        .await
-        .expect("the load must give up at the startup deadline, not wait on tools/list");
-        let Err(err) = result else {
-            panic!("a server that never lists its tools must not load");
-        };
-        assert!(
-            err.to_string().contains("did not answer tools/list within"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the load must give up at the startup deadline, took {:?}",
-            started.elapsed()
-        );
+        .await;
+        assert!(attempt.is_err(), "an unresponsive server must not connect");
+        drop(attempt);
 
         let closed = tokio::time::timeout(Duration::from_secs(5), closed_rx).await;
         server.abort();
         assert!(
             matches!(closed, Ok(Ok(()))),
-            "the unanswered tools/list left its connection open"
+            "the abandoned handshake left its connection open"
         );
     }
 

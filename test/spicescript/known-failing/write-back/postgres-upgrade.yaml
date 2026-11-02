@@ -1,4 +1,4 @@
-# Known failing (#15550) from 2.3.x only: v2.3.3 acknowledges the
+# Known failing (#15550) from 2.3.x only: v2.3.3 can acknowledge the
 # replication slot past what it recorded as applied, so the upgraded runtime
 # rebuilds the write-back acceleration from the source, and a rebuild loses the
 # write-back write still pending at the upgrade. From 2.4.x it passes.
@@ -122,6 +122,17 @@ steps:
         UPDATE events SET kind = 'while down' WHERE id BETWEEN 100 AND 150;
         DELETE FROM events WHERE id BETWEEN 200 AND 210;
         INSERT INTO events VALUES (5000, 'while down', 1.00, TIMESTAMPTZ '2026-06-01 00:00:00+00');
+  # Whether 2.3.x acknowledges the write-back dataset's slot past what it
+  # recorded before it stops is a race inside that release. Leave the slot as
+  # that release can, so the upgrade from 2.3.x always meets that state, and
+  # the upgrade from 2.4.x the slot as recorded.
+  - source-query:
+      src: >-
+        SELECT count(pg_replication_slot_advance(slot_name, pg_current_wal_lsn())) AS advanced
+        FROM pg_replication_slots
+          WHERE database = current_database() AND slot_name LIKE 'spice\_accounts\_%' AND NOT active
+    expect: { rows: [['1']] }
+    when: { from: 2.3.x }
   - upgrade: {}
 
   - query: SELECT * FROM on_cayenne

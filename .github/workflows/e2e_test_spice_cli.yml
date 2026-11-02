@@ -21,7 +21,26 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.resolve.outputs.version }}
+      upgrade_to: ${{ steps.resolve-target.outputs.version }}
     steps:
+      - name: Resolve upgrade target version
+        id: resolve-target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # `spice upgrade` with no `--version` installs the release GitHub marks latest
+          # (bin/spice/src/github/release.rs `get_latest_release`), whatever `rel_version`
+          # says, so the post-upgrade checks expect that release. The CLI always reads
+          # spiceai/spiceai (`new_runtime_client`), so a dispatch on a fork does too.
+          TAG=$(gh api repos/spiceai/spiceai/releases/latest --jq .tag_name)
+          if [ -z "$TAG" ]; then
+            echo "::error::Could not resolve the latest release of spiceai/spiceai, which 'spice upgrade' installs."
+            exit 1
+          fi
+          echo "spice upgrade targets $TAG"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
       - name: Resolve version
         id: resolve
         env:
@@ -150,6 +169,7 @@ jobs:
     env:
       REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
       UPGRADE_FROM_VERSION: ${{ needs.resolve-upgrade-version.outputs.version }}
+      UPGRADE_TO_VERSION: ${{ needs.resolve-upgrade-version.outputs.upgrade_to }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     needs:
       - build
@@ -240,7 +260,7 @@ jobs:
           spice version
           CLI_VERSION=$(spice version 2>&1 | grep 'CLI version:' | awk '{print $3}')
           RUNTIME_VERSION=$(spice version 2>&1 | grep 'Runtime version:' | awk '{print $3}')
-          EXPECTED="v${{ env.REL_VERSION }}"
+          EXPECTED="v${{ env.UPGRADE_TO_VERSION }}"
           # v1.11.x CLI doesn't self-upgrade (fix landed in v2.0.0)
           if [[ "$CLI_VERSION" != v1.11.* ]]; then
             if [[ "$CLI_VERSION" != "$EXPECTED"* ]]; then
@@ -262,10 +282,12 @@ jobs:
     runs-on: ${{ matrix.target.runner }}
     env:
       REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
+      UPGRADE_TO_VERSION: ${{ needs.resolve-upgrade-version.outputs.upgrade_to }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     needs:
       - build
       - setup-matrix
+      - resolve-upgrade-version
     timeout-minutes: 5
 
     strategy:
@@ -358,7 +380,7 @@ jobs:
         run: |
           spice version
           CLI_VERSION=$(spice version 2>&1 | grep 'CLI version:' | awk '{print $3}')
-          EXPECTED="v${{ env.REL_VERSION }}"
+          EXPECTED="v${{ env.UPGRADE_TO_VERSION }}"
           # v1.11.x CLI doesn't self-upgrade (fix landed in v2.0.0)
           if [[ "$CLI_VERSION" != v1.11.* ]]; then
             if [[ "$CLI_VERSION" != "$EXPECTED"* ]]; then
