@@ -557,15 +557,9 @@ mod tests {
     #[test]
     fn tombstone_exclusion_builds_negated_in_list() {
         let index = DeletionIndex::from_map(HashMap::from([(10, 1), (20, 2)]));
-        let filter = tombstone_exclusion_filter(
-            "id",
-            &index,
-            InsertRecordHandling::Ignore,
-            None,
-            None,
-            256,
-        )
-        .expect("filter");
+        let filter =
+            tombstone_exclusion_filter("id", &index, InsertRecordHandling::Ignore, None, None, 256)
+                .expect("filter");
         let Expr::InList(in_list) = filter else {
             panic!("expected negated IN list");
         };
@@ -611,15 +605,8 @@ mod tests {
     fn tombstone_exclusion_skips_reinserted_upsert_keys() {
         let index = DeletionIndex::from_maps(HashMap::from([(10, 5)]), HashMap::from([(10, 6)]));
         assert!(
-            tombstone_exclusion_filter(
-                "id",
-                &index,
-                InsertRecordHandling::Apply,
-                None,
-                None,
-                256
-            )
-            .is_none(),
+            tombstone_exclusion_filter("id", &index, InsertRecordHandling::Apply, None, None, 256)
+                .is_none(),
             "re-inserted keys must not be pushed into NOT IN"
         );
     }
