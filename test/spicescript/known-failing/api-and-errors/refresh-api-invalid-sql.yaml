@@ -1,12 +1,9 @@
 name: refresh-api-invalid-sql
 description: >
-  Known failing (#15546). The refresh API accepts `refresh_sql` it can never run —
-  another table, two statements, a DELETE — with 201 "Dataset refresh
-  triggered"; the refresh then fails in the background, where only the log
-  says why (three lines per failure, ending with advice to check the data
-  connector). The validation already exists and could answer 400 with its
-  message. A PATCH of the same SQL answers 500, a server error for a client
-  mistake (it is not kept).
+  Known failing (#15546). A refresh request with `refresh_sql` it can never run —
+  another table, two statements, a DELETE — is refused with 400 and the
+  validation's message. A PATCH of the same SQL still answers 500, a server
+  error for a client mistake (it is not kept).
 sources:
   src: { kind: postgres }
 variants:

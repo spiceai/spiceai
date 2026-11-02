@@ -115,6 +115,36 @@ impl Source for Mysql {
         parse_xml(&xml)
     }
 
+    async fn apply(
+        &self,
+        namespace: &str,
+        table: &str,
+        key: &str,
+        changes: &[super::write::RowChange],
+    ) -> Result<()> {
+        let sql = super::write::sql_changes(table, key, changes, self.dialect())?;
+        if sql.is_empty() {
+            return Ok(());
+        }
+        let mut input = std::iter::once(Ok(sql.into_bytes()));
+        let password = format!("--password={PASSWORD}");
+        self.container
+            .exec_with_input(
+                &[
+                    "mysql",
+                    "-uroot",
+                    &password,
+                    "--protocol=TCP",
+                    "-h127.0.0.1",
+                    "--default-character-set=utf8mb4",
+                    namespace,
+                ],
+                &mut input,
+            )
+            .await?;
+        Ok(())
+    }
+
     fn dialect(&self) -> crate::generate::Dialect {
         crate::generate::Dialect::Mysql
     }

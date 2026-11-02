@@ -547,6 +547,7 @@ mod tests {
         async fn expand_secret(
             &self,
             executor_id: &str,
+            _store: &str,
             key: &str,
         ) -> std::result::Result<Option<SecretString>, String> {
             Ok(Some(SecretString::from(format!("{executor_id}:{key}"))))
@@ -803,6 +804,7 @@ mod tests {
         let secrets = Arc::new(RwLock::new(Secrets::new_for_cluster_executor(
             Box::new(TestSecretExpander),
             "executor-1".to_string(),
+            Vec::new(),
         )));
         let mut params = HashMap::new();
         params.insert("account".to_string(), "account".to_string());
@@ -825,6 +827,7 @@ mod tests {
         let secrets = Arc::new(RwLock::new(Secrets::new_for_cluster_executor(
             Box::new(TestSecretExpander),
             "executor-1".to_string(),
+            Vec::new(),
         )));
         let mut params = HashMap::new();
         params.insert("s3_auth".to_string(), "key".to_string());

@@ -19,7 +19,12 @@ limitations under the License.
 //! and replication slots again.
 
 use secrecy::SecretString;
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use arrow::array::RecordBatch;
@@ -65,6 +70,8 @@ pub struct Spiced {
     >,
     /// Runs `spiced` in a container rather than as a local process.
     container: Option<ContainerRun>,
+    /// The `binary` last copied into `dir` for a container to run.
+    staged_from: Option<PathBuf>,
 }
 
 /// A container `spiced` runs in: on the host's network, so it serves on the
@@ -113,6 +120,7 @@ impl Spiced {
             extra_args: Vec::new(),
             sessions: std::collections::HashMap::new(),
             container: None,
+            staged_from: None,
         })
     }
 
@@ -229,13 +237,16 @@ impl Spiced {
             .create(true)
             .append(true)
             .open(self.log_path())?;
-        let mut command = match &self.container {
+        let mut command = match self.container.clone() {
             None => {
                 let mut command = Command::new(&self.binary);
                 command.current_dir(&self.dir).envs(&self.env);
                 command
             }
-            Some(run) => self.container_command(run)?,
+            Some(run) => {
+                let binary = self.stage_binary()?;
+                self.container_command(&run, &binary)?
+            }
         };
         let child = command
             .arg("--telemetry-enabled=false")
@@ -265,15 +276,39 @@ impl Spiced {
         Ok(())
     }
 
+    /// The binary a container runs: a copy of `binary` in this instance's
+    /// directory, made again only when `binary` changes.
+    ///
+    /// A `docker run -v` source is a path on the Docker daemon's filesystem,
+    /// which need not be this process's: under Docker-in-Docker the daemon
+    /// shares only the runner's work volume, and for a source it cannot see
+    /// it mounts an empty directory, so the container fails with
+    /// `exec /usr/local/bin/spiced failed: Permission denied`. The instance
+    /// directory is mounted into the container already, so the daemon sees
+    /// the copy wherever it sees the rest of the run.
+    fn stage_binary(&mut self) -> Result<PathBuf> {
+        let copy = std::path::absolute(self.dir.join("spiced.bin"))?;
+        if self.staged_from.as_ref() != Some(&self.binary) {
+            std::fs::copy(&self.binary, &copy).with_context(|| {
+                format!(
+                    "Failed to copy {} to {} for its container",
+                    self.binary.display(),
+                    copy.display()
+                )
+            })?;
+            self.staged_from = Some(self.binary.clone());
+        }
+        Ok(copy)
+    }
+
     /// `docker run` for `run`, in the foreground so that its output is the log
     /// and the signals `stop` sends reach `spiced`.
-    fn container_command(&self, run: &ContainerRun) -> Result<Command> {
+    fn container_command(&self, run: &ContainerRun, binary: &Path) -> Result<Command> {
         use std::os::unix::fs::MetadataExt;
         // A container left behind by an interrupted run would hold the name.
         let _ = std::process::Command::new("docker")
             .args(["rm", "-f", &run.name])
             .output();
-        let binary = std::path::absolute(&self.binary)?;
         let dir = std::path::absolute(&self.dir)?;
         let owner = std::fs::metadata(&dir)?;
         let mut command = Command::new("docker");
@@ -601,6 +636,79 @@ impl Spiced {
         Ok(stream.try_collect().await?)
     }
 
+    /// Retains the Flight stream's schema when a query returns no batches.
+    pub async fn query_with_schema(&mut self, sql: &str, key: &Key) -> Result<Vec<RecordBatch>> {
+        let client = match key {
+            Key::Default => self.flight().await?.clone(),
+            Key::None => self.connect_flight(None).await?,
+            Key::Given(key) => self.connect_flight(Some(key)).await?,
+        };
+        let mut stream = client.query(sql).await?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            batches.push(batch);
+        }
+        if batches.is_empty() {
+            let schema = stream.schema().context("Flight returned no schema")?;
+            batches.push(RecordBatch::new_empty(Arc::clone(schema)));
+        }
+        Ok(batches)
+    }
+
+    /// Runs an unprepared Flight SQL statement and consumes every endpoint.
+    pub async fn query_flightsql(&self, sql: &str, key: &Key) -> Result<Vec<RecordBatch>> {
+        use arrow_flight::sql::client::FlightSqlServiceClient;
+        let channel = flight_client::tls::new_tls_flight_channel(
+            &self.flight_endpoint(),
+            self.tls_ca.as_deref(),
+        )
+        .await?;
+        let mut client = FlightSqlServiceClient::new(channel);
+        let key = match key {
+            Key::Default => self.api_key.as_deref(),
+            Key::None => None,
+            Key::Given(key) => Some(key.as_str()),
+        };
+        if let Some(key) = key {
+            client.handshake("spicescript", key).await?;
+        }
+        let info = client.execute(sql.to_string(), None).await?;
+        Self::read_flightsql(&mut client, info).await
+    }
+
+    async fn read_flightsql(
+        client: &mut arrow_flight::sql::client::FlightSqlServiceClient<tonic::transport::Channel>,
+        info: arrow_flight::FlightInfo,
+    ) -> Result<Vec<RecordBatch>> {
+        let schema = Arc::new(info.clone().try_decode_schema()?);
+        let mut batches = Vec::new();
+        for endpoint in info.endpoint {
+            let ticket = endpoint
+                .ticket
+                .context("Flight SQL endpoint has no ticket")?;
+            let mut stream = client.do_get(ticket).await?;
+            while let Some(batch) = stream.try_next().await? {
+                ensure!(
+                    schema.as_ref() == batch.schema().as_ref(),
+                    "Flight SQL advertised schema {schema:?}, streamed {:?}",
+                    batch.schema()
+                );
+                batches.push(batch);
+            }
+            let streamed = stream
+                .schema()
+                .context("Flight SQL endpoint returned no schema")?;
+            ensure!(
+                schema.as_ref() == streamed.as_ref(),
+                "Flight SQL advertised schema {schema:?}, streamed {streamed:?}"
+            );
+        }
+        if batches.is_empty() {
+            batches.push(RecordBatch::new_empty(schema));
+        }
+        Ok(batches)
+    }
+
     /// Runs a query presenting `key` on a connection of its own.
     /// Writes `rows` (values as text, `null` for NULL) to `dataset` with a
     /// Flight `DoPut`, each column cast to the dataset's type.
@@ -676,6 +784,7 @@ impl Spiced {
         parameters: &[serde_json::Value],
         session: Option<&str>,
         key: &Key,
+        verify_schema: bool,
     ) -> Result<Vec<RecordBatch>> {
         use arrow::array::{ArrayRef, StringArray};
         use arrow_flight::sql::client::FlightSqlServiceClient;
@@ -747,14 +856,19 @@ impl Spiced {
             statement.set_parameters(batch)?;
         }
         let info = statement.execute().await?;
-        let mut batches = Vec::new();
-        for endpoint in info.endpoint {
-            let Some(ticket) = endpoint.ticket else {
-                continue;
-            };
-            let stream = client.do_get(ticket).await?;
-            batches.extend(stream.try_collect::<Vec<_>>().await?);
-        }
+        let batches = if verify_schema {
+            Self::read_flightsql(&mut client, info).await?
+        } else {
+            let mut batches = Vec::new();
+            for endpoint in info.endpoint {
+                let Some(ticket) = endpoint.ticket else {
+                    continue;
+                };
+                let stream = client.do_get(ticket).await?;
+                batches.extend(stream.try_collect::<Vec<_>>().await?);
+            }
+            batches
+        };
         let _ = statement.close().await;
         Ok(batches)
     }

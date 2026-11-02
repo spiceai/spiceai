@@ -20,6 +20,7 @@ object_store.workspace = true
 orc-rust.workspace = true
 
 [dev-dependencies]
+flate2 = "1.1"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

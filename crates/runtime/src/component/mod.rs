@@ -141,9 +141,6 @@ const DEPRECATED_ENGINE_NAMED_COMPONENTS: usize = 5;
 /// and one whose `engine` is not a known engine is left to the load path, which reports
 /// it as an error. Disabled accelerations are skipped: they use no engine.
 ///
-/// Cayenne is not built for native Windows, where `arrow` is the default, so there the
-/// remedy is to run Spice in Docker or WSL rather than to leave `engine` unset.
-///
 /// The remedy also says to delete the old engine's files and snapshots: Cayenne fills a
 /// new acceleration from its source and neither reads nor removes them. Which files, and
 /// which accelerations must not be rebuilt, is left to the linked guide.
@@ -198,13 +195,8 @@ pub(crate) fn deprecated_acceleration_engines_warning<'a>(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let switch = if cfg!(windows) {
-        "Cayenne is not available on native Windows: run Spice in Docker or WSL and set `acceleration.engine: cayenne`"
-    } else {
-        "Set `acceleration.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`"
-    };
     Some(format!(
-        "Acceleration engines other than `cayenne` are deprecated and will be removed in v2.5, so these accelerations must move to `cayenne` before upgrading: {engines}. {switch}, then delete the old engine's acceleration files and snapshots. See: {CAYENNE_MIGRATION_DOCS}"
+        "Acceleration engines other than `cayenne` are deprecated and will be removed in v2.5, so these accelerations must move to `cayenne` before upgrading: {engines}. Set `acceleration.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots. See: {CAYENNE_MIGRATION_DOCS}"
     ))
 }
 
@@ -444,7 +436,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn the_deprecated_engine_warning_is_one_line_grouped_by_engine() {
         let duckdb = acceleration(Some("duckdb"));
@@ -483,7 +474,6 @@ mod tests {
         assert!(!warning.contains("ds6"), "{warning}");
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn no_deprecated_engine_warning_without_a_deprecated_engine_in_use() {
         let cayenne = acceleration(Some("cayenne"));
@@ -523,23 +513,5 @@ mod tests {
             warning.contains("WARN forged"),
             "the name is still reported, only escaped: {warning}"
         );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn on_windows_an_unset_engine_is_deprecated_and_the_remedy_is_docker_or_wsl() {
-        let default = acceleration(None);
-        let warning = deprecated_acceleration_engines_warning([(
-            AcceleratedComponent::Dataset,
-            "orders",
-            &default,
-        )])
-        .expect("an unset engine resolves to arrow on Windows");
-        assert!(warning.contains("`arrow` (dataset 'orders')"), "{warning}");
-        assert!(
-            warning.contains("run Spice in Docker or WSL and set `acceleration.engine: cayenne`"),
-            "{warning}"
-        );
-        assert!(!warning.contains("remove `engine`"), "{warning}");
     }
 }

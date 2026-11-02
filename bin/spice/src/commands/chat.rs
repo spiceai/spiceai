@@ -26,6 +26,7 @@ use crate::sse::{SseDecoder, SseEvent};
 use clap::Args;
 use futures::StreamExt;
 use repl::util::{Spinner, create_editor_with_history, save_history};
+use runtime_api_types::v1::ModelListResponse;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use std::io::{self, Read, Write};
@@ -86,9 +87,32 @@ pub struct ChatArgs {
 /// Configuration for chat operations.
 struct ChatConfig<'a> {
     model: &'a str,
+    backend: ChatBackend,
     temperature: Option<f32>,
     endpoint: Option<&'a str>,
     custom_headers: &'a [String],
+}
+
+/// The runtime endpoint a model is chatted with.
+///
+/// A model that has a Responses API endpoint is chatted with through it, because the
+/// hosted tools configured on the model (`openai_responses_tools`, such as `web_search`) are
+/// attached to Responses requests only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatBackend {
+    /// `POST /v1/chat/completions`.
+    ChatCompletions,
+    /// `POST /v1/responses`.
+    Responses,
+}
+
+impl ChatBackend {
+    const fn path(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "/v1/chat/completions",
+            Self::Responses => "/v1/responses",
+        }
+    }
 }
 
 enum ModelSelection {
@@ -113,6 +137,16 @@ struct ChatRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
+}
+
+/// Request body for the Responses API.
+#[derive(Serialize)]
+struct ResponsesRequest<'a> {
+    model: &'a str,
+    input: &'a [Message],
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
 }
 
 /// Stream options for chat completions.
@@ -312,14 +346,7 @@ async fn get_or_select_model(
     model_selection: ModelSelection,
 ) -> Result<String> {
     let base_endpoint = endpoint.unwrap_or_else(|| ctx.http_endpoint());
-    let mut headers: Vec<(String, String)> = ctx.get_headers().into_iter().collect();
-
-    // Add custom headers from command line
-    for header in custom_headers {
-        if let Some((key, value)) = header.split_once(':') {
-            headers.push((key.trim().to_string(), value.trim().to_string()));
-        }
-    }
+    let headers = request_headers(ctx, custom_headers);
 
     match model_selection {
         ModelSelection::Interactive => {
@@ -331,6 +358,70 @@ async fn get_or_select_model(
             get_or_require_explicit_model(ctx.http_client(), base_endpoint, &headers, model).await
         }
     }
+}
+
+/// The runtime's headers followed by the `Key:Value` headers given on the command line.
+fn request_headers(ctx: &RuntimeContext, custom_headers: &[String]) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> = ctx.get_headers().into_iter().collect();
+
+    for header in custom_headers {
+        if let Some((key, value)) = header.split_once(':') {
+            headers.push((key.trim().to_string(), value.trim().to_string()));
+        }
+    }
+
+    headers
+}
+
+/// Chat with the model through its Responses API endpoint when it has one, and through chat
+/// completions otherwise.
+async fn select_backend(
+    ctx: &RuntimeContext,
+    model: &str,
+    endpoint: Option<&str>,
+    custom_headers: &[String],
+) -> Result<ChatBackend> {
+    let base_endpoint = endpoint.unwrap_or_else(|| ctx.http_endpoint());
+    let url = format!("{base_endpoint}/v1/models?metadata_fields=supports_responses_api");
+
+    let mut request = ctx.http_client().get(&url);
+    for (key, value) in request_headers(ctx, custom_headers) {
+        request = request.header(key, value);
+    }
+
+    let response = request
+        .send()
+        .await
+        .context(ConnectionFailedSnafu { endpoint: &url })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(InvalidResponseSnafu {
+            message: format!("Failed to get models: {status} - {text}"),
+        }
+        .build());
+    }
+
+    let models: ModelListResponse = response.json().await.map_err(|e| {
+        InvalidResponseSnafu {
+            message: format!("Failed to parse models response: {e}"),
+        }
+        .build()
+    })?;
+
+    let supports_responses_api = models
+        .data
+        .iter()
+        .find(|m| m.id == model)
+        .and_then(|m| m.metadata.as_ref())
+        .is_some_and(|metadata| metadata.supports_responses_api);
+
+    Ok(if supports_responses_api {
+        ChatBackend::Responses
+    } else {
+        ChatBackend::ChatCompletions
+    })
 }
 
 async fn get_or_require_explicit_model(
@@ -436,9 +527,13 @@ pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
     )
     .await?;
 
+    let backend =
+        select_backend(ctx, &model, args.endpoint.as_deref(), &args.custom_headers).await?;
+
     // Create chat config
     let config = ChatConfig {
         model: &model,
+        backend,
         temperature: args.temperature,
         endpoint: args.endpoint.as_deref(),
         custom_headers: &args.custom_headers,
@@ -596,26 +691,33 @@ async fn send_chat_streaming(
 ) -> Result<ChatResponse> {
     let start_time = Instant::now();
     let base_endpoint = config.endpoint.unwrap_or_else(|| ctx.http_endpoint());
-    let url = format!("{base_endpoint}/v1/chat/completions");
-
-    let body = ChatRequest {
-        messages: messages.to_vec(),
-        model: config.model.to_string(),
-        stream: true,
-        temperature: config.temperature,
-        stream_options: Some(StreamOptions {
-            include_usage: true,
-        }),
-    };
+    let url = format!("{base_endpoint}{}", config.backend.path());
 
     // The streamed answer's duration is the model's, not the network's, so this must not
     // go out under the control-plane client's whole-request deadline.
-    let mut request = ctx
+    let request = ctx
         .inference_http_client()
         .post(&url)
         .header("Content-Type", "application/json")
-        .header("Accept", "text/event-stream")
-        .json(&body);
+        .header("Accept", "text/event-stream");
+
+    let mut request = match config.backend {
+        ChatBackend::ChatCompletions => request.json(&ChatRequest {
+            messages: messages.to_vec(),
+            model: config.model.to_string(),
+            stream: true,
+            temperature: config.temperature,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+        }),
+        ChatBackend::Responses => request.json(&ResponsesRequest {
+            model: config.model,
+            input: messages,
+            stream: true,
+            temperature: config.temperature,
+        }),
+    };
 
     for (key, value) in ctx.get_headers() {
         request = request.header(&key, &value);
@@ -661,6 +763,8 @@ async fn send_chat_streaming(
         first_token: None,
         spinner,
         finish_reason: None,
+        backend: config.backend,
+        completed: false,
     };
 
     // An event can straddle two reads, so the bytes are reassembled into events before
@@ -693,6 +797,18 @@ async fn send_chat_streaming(
             // of the answer.
             decoder.close();
             drain_events(&mut decoder, &url, emit_tokens, start_time, &mut state).await?;
+            // Chat completions ends with `[DONE]`, which a server that only hangs up may
+            // omit; a Responses stream says it is whole with a terminal event, and one that
+            // ends without it is a cut-off answer, not a finished one.
+            if state.backend == ChatBackend::Responses && !state.completed {
+                state.stop_spinner().await;
+                return Err(InvalidResponseSnafu {
+                    message: format!(
+                        "The model at {url} ended its response before completing it. Any answer printed above is incomplete. Check the runtime's logs for the model, then retry. See: https://spiceai.org/docs/components/models"
+                    ),
+                }
+                .build());
+            }
             break 'stream;
         };
 
@@ -778,6 +894,10 @@ struct StreamState {
     /// The last reason a choice gave for ending, which is the one that describes the answer
     /// as it stands when the stream is over.
     finish_reason: Option<String>,
+    /// The endpoint the events are read as the output of.
+    backend: ChatBackend,
+    /// Whether a Responses stream has sent its terminal event.
+    completed: bool,
 }
 
 impl StreamState {
@@ -785,6 +905,20 @@ impl StreamState {
         if let Some(spinner) = self.spinner.take() {
             spinner.stop().await;
         }
+    }
+
+    /// Add `content` to the answer, printing it when `emit_tokens` is set.
+    async fn push_content(&mut self, content: &str, emit_tokens: bool, start_time: Instant) {
+        // Record first token time and stop spinner
+        if self.first_token.is_none() {
+            self.first_token = Some(start_time.elapsed());
+            self.stop_spinner().await;
+        }
+        if emit_tokens {
+            print!("{content}");
+            let _ = io::stdout().flush();
+        }
+        self.response.push_str(content);
     }
 }
 
@@ -801,6 +935,10 @@ async fn apply_event(
     start_time: Instant,
     state: &mut StreamState,
 ) -> Result<EventOutcome> {
+    if state.backend == ChatBackend::Responses {
+        return apply_responses_event(event, url, emit_tokens, start_time, state).await;
+    }
+
     // The runtime reports a mid-stream failure as an `error` event. Read as content it
     // parses as nothing, which is how it used to disappear.
     if event.name.as_deref() == Some("error") {
@@ -863,20 +1001,128 @@ async fn apply_event(
             .as_ref()
             .and_then(|delta| delta.content.as_ref())
         {
-            // Record first token time and stop spinner
-            if state.first_token.is_none() {
-                state.first_token = Some(start_time.elapsed());
-                state.stop_spinner().await;
-            }
-            if emit_tokens {
-                print!("{content}");
-                let _ = io::stdout().flush();
-            }
-            state.response.push_str(content);
+            state.push_content(content, emit_tokens, start_time).await;
         }
     }
 
     Ok(EventOutcome::Continue)
+}
+
+/// A Responses API stream event: its `type`, and the fields of the types that are read.
+#[derive(Deserialize)]
+struct ResponsesEvent {
+    #[serde(rename = "type", default)]
+    kind: String,
+    /// The text of a `response.output_text.delta` or `response.refusal.delta`.
+    #[serde(default)]
+    delta: Option<String>,
+    /// The response a `response.completed`, `response.incomplete` or `response.failed`
+    /// describes.
+    #[serde(default)]
+    response: Option<ResponsesBody>,
+    /// The reason of an `error` event.
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesBody {
+    #[serde(default)]
+    usage: Option<ResponsesUsage>,
+    #[serde(default)]
+    incomplete_details: Option<IncompleteDetails>,
+    #[serde(default)]
+    error: Option<NestedStreamError>,
+}
+
+#[derive(Deserialize)]
+struct IncompleteDetails {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesUsage {
+    input_tokens: u32,
+    output_tokens: u32,
+}
+
+impl From<ResponsesUsage> for Usage {
+    fn from(usage: ResponsesUsage) -> Self {
+        Self {
+            prompt_tokens: usage.input_tokens,
+            completion_tokens: usage.output_tokens,
+            total_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
+        }
+    }
+}
+
+/// Read one Responses API SSE event into the answer.
+///
+/// The stream interleaves the answer's text with events about reasoning, hosted tool calls
+/// such as web searches, and annotations. Those carry no text, so they are progress. What
+/// ends the stream is a terminal event, and a failure is reported by `response.failed` or
+/// `error`; both are errors rather than skips, for the reason [`apply_event`] gives.
+async fn apply_responses_event(
+    event: &SseEvent,
+    url: &str,
+    emit_tokens: bool,
+    start_time: Instant,
+    state: &mut StreamState,
+) -> Result<EventOutcome> {
+    if event.data.is_empty() {
+        return Ok(EventOutcome::Continue);
+    }
+
+    let Ok(parsed) = serde_json::from_str::<ResponsesEvent>(&event.data) else {
+        state.stop_spinner().await;
+        return Err(InvalidResponseSnafu {
+            message: format!(
+                "The model at {url} sent a response event that is not a Responses API event. Any answer printed above is incomplete. Check the runtime's logs for the model, then retry. See: https://spiceai.org/docs/components/models"
+            ),
+        }
+        .build());
+    };
+
+    match parsed.kind.as_str() {
+        "response.output_text.delta" | "response.refusal.delta" => {
+            if let Some(delta) = &parsed.delta {
+                state.push_content(delta, emit_tokens, start_time).await;
+            }
+            Ok(EventOutcome::Continue)
+        }
+        "response.completed" | "response.incomplete" => {
+            state.completed = true;
+            if let Some(body) = parsed.response {
+                state.usage = body.usage.map(Usage::from);
+                if parsed.kind == "response.incomplete" {
+                    // Named as chat completions names them, which `incomplete_notice` reads.
+                    let reason = body.incomplete_details.and_then(|d| d.reason);
+                    state.finish_reason = Some(match reason.as_deref() {
+                        Some("max_output_tokens") => "length".to_string(),
+                        Some(reason) => reason.to_string(),
+                        None => "incomplete".to_string(),
+                    });
+                }
+            }
+            Ok(EventOutcome::Stop)
+        }
+        "response.failed" | "error" => {
+            state.stop_spinner().await;
+            let detail = parsed
+                .message
+                .or_else(|| parsed.response?.error?.message)
+                .unwrap_or_else(|| "the server did not say why".to_string());
+
+            Err(InvalidResponseSnafu {
+                message: format!(
+                    "The model at {url} failed part-way through its answer: {detail}. Any answer printed above is incomplete. Check the runtime's logs for the model, then retry. See: https://spiceai.org/docs/components/models"
+                ),
+            }
+            .build())
+        }
+        _ => Ok(EventOutcome::Continue),
+    }
 }
 
 #[cfg(test)]
@@ -900,6 +1146,7 @@ mod tests {
     const fn test_chat_config() -> ChatConfig<'static> {
         ChatConfig {
             model: "test-model",
+            backend: ChatBackend::ChatCompletions,
             temperature: None,
             endpoint: None,
             custom_headers: &[],
@@ -1029,6 +1276,136 @@ mod tests {
         };
         let response = result.expect("the answer arrived in full before the terminator");
         assert_eq!(response.content, "token ".repeat(3));
+    }
+
+    /// A config for a model chatted with through the Responses API.
+    const fn responses_chat_config() -> ChatConfig<'static> {
+        ChatConfig {
+            backend: ChatBackend::Responses,
+            ..test_chat_config()
+        }
+    }
+
+    /// One Responses API SSE event of type `kind`, with `fields` as the rest of its payload.
+    fn responses_event(kind: &str, fields: &str) -> String {
+        format!("event: {kind}\ndata: {{\"type\":\"{kind}\"{fields}}}\n\n")
+    }
+
+    fn text_delta(text: &str) -> String {
+        responses_event(
+            "response.output_text.delta",
+            &format!(",\"delta\":\"{text}\""),
+        )
+    }
+
+    async fn responses_stream_from(server: &SlowServer) -> Result<ChatResponse> {
+        let ctx = unhurried_context(server.url());
+        send_chat_streaming(
+            &ctx,
+            &responses_chat_config(),
+            &one_shot_prompt(),
+            false,
+            false,
+        )
+        .await
+    }
+
+    /// A model chatted with through the Responses API is asked at `/v1/responses`, and its
+    /// answer is the text deltas, read among the events about hosted tool calls that carry
+    /// none. The usage comes from the terminal event.
+    #[tokio::test]
+    async fn a_responses_answer_is_read_from_its_text_deltas() {
+        let chunks = vec![
+            responses_event("response.created", ",\"response\":{}"),
+            responses_event("response.web_search_call.searching", ""),
+            text_delta("Hello"),
+            responses_event("response.output_text.annotation.added", ""),
+            text_delta(", world"),
+            responses_event(
+                "response.completed",
+                ",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":3,\"total_tokens\":10}}",
+            ),
+        ];
+        let server = SlowServer::dribbling_then_holding(chunks, Duration::from_millis(10));
+
+        let response = tokio::time::timeout(Duration::from_secs(5), responses_stream_from(&server))
+            .await
+            .expect("the terminal event ends the read without waiting for the server to hang up")
+            .expect("a completed Responses stream is an answer");
+
+        assert_eq!(response.content, "Hello, world");
+        let usage = response.usage.expect("the terminal event carries usage");
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (7, 3, 10)
+        );
+        assert_eq!(response.finish_reason, None);
+        assert_eq!(server.targets(), vec!["/v1/responses".to_string()]);
+    }
+
+    /// A Responses stream says it is whole with a terminal event. One that ends without it
+    /// was cut off, and its text must not be presented as the answer.
+    #[tokio::test]
+    async fn a_responses_stream_that_ends_without_completing_is_an_error() {
+        let server = SlowServer::dribbling(vec![text_delta("Hel")], Duration::from_millis(10));
+
+        let error = responses_stream_from(&server)
+            .await
+            .expect_err("a stream with no terminal event is not a whole answer");
+
+        assert!(
+            error
+                .to_string()
+                .contains("ended its response before completing it"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_response_reports_the_reason() {
+        let chunks = vec![
+            text_delta("Hel"),
+            responses_event(
+                "response.failed",
+                ",\"response\":{\"error\":{\"message\":\"rate limit exceeded\"}}",
+            ),
+        ];
+        let server = SlowServer::dribbling_then_holding(chunks, Duration::from_millis(10));
+
+        let error = responses_stream_from(&server)
+            .await
+            .expect_err("a failed response is not an answer");
+
+        assert!(
+            error.to_string().contains("rate limit exceeded"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// An incomplete response ended early, and says why in the vocabulary chat completions
+    /// uses, so the notice the user is shown is the same one on either endpoint.
+    #[tokio::test]
+    async fn an_incomplete_response_names_why_it_stopped() {
+        let chunks = vec![
+            text_delta("Hel"),
+            responses_event(
+                "response.incomplete",
+                ",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}",
+            ),
+        ];
+        let server = SlowServer::dribbling_then_holding(chunks, Duration::from_millis(10));
+
+        let response = responses_stream_from(&server)
+            .await
+            .expect("an incomplete response still delivers the text it produced");
+
+        assert_eq!(response.content, "Hel");
+        assert_eq!(response.finish_reason.as_deref(), Some("length"));
+        assert!(response.incomplete_notice().is_some());
     }
 
     /// The runtime keeps an SSE stream alive with a comment every 30 seconds

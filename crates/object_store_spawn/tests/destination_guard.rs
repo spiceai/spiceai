@@ -72,9 +72,13 @@ async fn redirecting_origin(location: String) -> (u16, Arc<AtomicUsize>) {
 }
 
 fn store(origin_port: u16, connector: SpawnedReqwestConnector) -> Arc<dyn ObjectStore> {
+    store_on("127.0.0.1", origin_port, connector)
+}
+
+fn store_on(host: &str, port: u16, connector: SpawnedReqwestConnector) -> Arc<dyn ObjectStore> {
     Arc::new(
         HttpBuilder::new()
-            .with_url(format!("http://127.0.0.1:{origin_port}/"))
+            .with_url(format!("http://{host}:{port}/"))
             .with_client_options(ClientOptions::new().with_allow_http(true))
             .with_http_connector(connector)
             .build()
@@ -191,6 +195,107 @@ async fn guard_refuses_a_host_that_resolves_to_a_blocked_address() {
         1,
         "a refusal is not retried"
     );
+}
+
+/// A guard that blocks every redirect and every loopback address, checked only for hosts
+/// other than the request's own.
+fn loopback_redirects_only_guard() -> DestinationGuard {
+    DestinationGuard::new(
+        |address| address.is_loopback(),
+        |_| true,
+        "loopback is blocked",
+    )
+    .redirects_only()
+}
+
+/// An origin on `localhost` that serves [`BODY`] at `/moved.csv` and redirects every other
+/// path there, so a read stays on the store's own host.
+async fn same_host_redirecting_origin() -> u16 {
+    serve(
+        Router::new()
+            .route("/moved.csv", axum::routing::get(|| async { BODY }))
+            .fallback(|| async { (StatusCode::FOUND, [(LOCATION, "/moved.csv")]).into_response() }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn redirects_only_guard_allows_the_requests_own_host() {
+    let port = same_host_redirecting_origin().await;
+
+    let connector = SpawnedReqwestConnector::new(Handle::current())
+        .with_destination_guard(loopback_redirects_only_guard());
+    let body = get(&store_on("localhost", port, connector))
+        .await
+        .expect("the own host and a redirect within it are allowed");
+    assert_eq!(body, BODY);
+
+    let connector = SpawnedReqwestConnector::new(Handle::current()).with_destination_guard(
+        DestinationGuard::new(
+            |address| address.is_loopback(),
+            |_| false,
+            "loopback is blocked",
+        ),
+    );
+    let message = get(&store_on("localhost", port, connector))
+        .await
+        .expect_err("a guard for every host refuses the own host")
+        .to_string();
+    assert!(
+        message.contains("Refused to connect to localhost: loopback is blocked"),
+        "unexpected error: {message}"
+    );
+}
+
+#[tokio::test]
+async fn redirects_only_guard_refuses_a_redirect_to_another_host() {
+    let (target_port, target_hits) = target().await;
+    let location = format!("http://127.0.0.1:{target_port}/data.csv");
+    let (origin_port, origin_hits) = redirecting_origin(location.clone()).await;
+
+    let connector = SpawnedReqwestConnector::new(Handle::current())
+        .with_destination_guard(loopback_redirects_only_guard());
+    let message = get(&store_on("localhost", origin_port, connector))
+        .await
+        .expect_err("the redirect is refused")
+        .to_string();
+
+    assert!(
+        message.contains(&format!(
+            "Refused to connect to {location}: loopback is blocked"
+        )),
+        "unexpected error: {message}"
+    );
+    assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(origin_hits.load(Ordering::SeqCst), 1);
+}
+
+/// The redirect names another host that resolves to a blocked address, which only the
+/// resolver can see.
+#[tokio::test]
+async fn redirects_only_guard_refuses_another_host_that_resolves_to_a_blocked_address() {
+    let (target_port, target_hits) = target().await;
+    let (origin_port, origin_hits) =
+        redirecting_origin(format!("http://localhost:{target_port}/data.csv")).await;
+
+    let guard = DestinationGuard::new(
+        |address| address.is_loopback(),
+        |_| false,
+        "loopback is blocked",
+    )
+    .redirects_only();
+    let connector = SpawnedReqwestConnector::new(Handle::current()).with_destination_guard(guard);
+    let message = get(&store(origin_port, connector))
+        .await
+        .expect_err("the resolved address is refused")
+        .to_string();
+
+    assert!(
+        message.contains("Refused to connect to localhost: loopback is blocked"),
+        "unexpected error: {message}"
+    );
+    assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(origin_hits.load(Ordering::SeqCst), 1);
 }
 
 /// The guarded client does not apply proxy options, so it refuses to build rather than ignore

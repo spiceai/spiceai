@@ -17,8 +17,8 @@ limitations under the License.
 //! Trait abstraction for metadata catalog operations.
 //!
 //! This trait defines the interface for managing table metadata
-//! and file references. It can be implemented by different RDBMS backends
-//! (`SQLite`, Turso, etc.).
+//! and file references. `CayenneCatalog` implements it over the `SQLite`
+//! metastore.
 
 use super::metadata::{
     ColdTierFile, CreateTableOptions, DeleteFile, IndexRunRecord, InlinedData, InlinedDataStats,
@@ -202,10 +202,13 @@ pub enum CatalogError {
     #[snafu(display("Failed to get partition data files. {source}"))]
     FailedToGetPartitionDataFiles { source: Box<CatalogError> },
 
+    /// The connection string names a scheme the metastore does not open. Only
+    /// `sqlite://` (or a bare path) is accepted, so a stray scheme fails here
+    /// rather than becoming part of a relative file path.
     #[snafu(display(
-        "Turso backend requested but 'turso' feature is not enabled. Enable with --features turso"
+        "Cayenne metastore connection strings must use 'sqlite://' or a bare path, but found '{scheme}://'"
     ))]
-    TursoNotEnabled,
+    UnsupportedMetastoreScheme { scheme: String },
 
     /// Constraint violation (e.g., unique constraint, foreign key constraint)
     /// Used for handling concurrent insert conflicts.

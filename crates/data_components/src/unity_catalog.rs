@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Write, sync::Arc};
+use std::{collections::HashMap, fmt::Write, sync::Arc};
 
 use datafusion::common::TableReference;
 use runtime_rate_control::RateController;
@@ -620,9 +620,31 @@ pub struct UCTable {
     /// Unique table identifier, used for credential vending.
     #[serde(default)]
     pub table_id: Option<String>,
+    /// Table properties, e.g. `delta.feature.catalogManaged`.
+    #[serde(default)]
+    pub properties: HashMap<String, String>,
 }
 
 impl UCTable {
+    /// Returns `true` for a catalog-managed Delta table, whose valid commits
+    /// are decided by Unity Catalog rather than by `_delta_log` in storage.
+    #[must_use]
+    pub fn is_catalog_managed(&self) -> bool {
+        self.properties.keys().any(|key| {
+            key.starts_with("delta.feature.catalogManaged")
+                || key.starts_with("delta.feature.catalogOwned")
+        })
+    }
+
+    /// Warning for a catalog-managed table skipped in `delta_lake` mode.
+    #[must_use]
+    pub fn catalog_managed_skip_warning(&self) -> String {
+        format!(
+            "Table '{}' is a catalog-managed Delta table and is not registered, so queries against it will not resolve. Databricks does not allow reading it directly from storage; use a catalog `mode` other than `delta_lake`. See: https://spiceai.org/docs/components/catalogs/databricks",
+            self.full_name()
+        )
+    }
+
     /// Returns the fully qualified name of the table: `catalog.schema.table`.
     #[must_use]
     pub fn full_name(&self) -> String {
@@ -898,6 +920,8 @@ impl UCPermissionsEnvelope {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
         TableOperation, TemporaryTableCredentials, UCColumn, UCPermissionsEnvelope, UCPrivilege,
         UCPrivilegeAssignment, UCTable, UCTableType,
@@ -913,7 +937,33 @@ mod tests {
             columns: Vec::<UCColumn>::new(),
             storage_location: None,
             table_id: None,
+            properties: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn catalog_managed_detected_from_properties() {
+        let mut table = make_table("MANAGED");
+        assert!(!table.is_catalog_managed());
+        table
+            .properties
+            .insert("delta.feature.catalogManaged".into(), "supported".into());
+        assert!(table.is_catalog_managed());
+
+        let mut owned = make_table("MANAGED");
+        owned.properties.insert(
+            "delta.feature.catalogOwned-preview".into(),
+            "supported".into(),
+        );
+        assert!(owned.is_catalog_managed());
+    }
+
+    #[test]
+    fn catalog_managed_skip_warning_text() {
+        assert_eq!(
+            make_table("MANAGED").catalog_managed_skip_warning(),
+            "Table 'catalog.schema.table' is a catalog-managed Delta table and is not registered, so queries against it will not resolve. Databricks does not allow reading it directly from storage; use a catalog `mode` other than `delta_lake`. See: https://spiceai.org/docs/components/catalogs/databricks"
+        );
     }
 
     fn make_permissions(privileges: &[&str]) -> UCPermissionsEnvelope {

@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::function_support::FunctionSupport;
-use crate::sql_expr::to_sql_preserving_precedence;
+use crate::sql_expr::{to_spice_sql, to_sql_preserving_precedence};
 use arrow::{
     array::{Array, RecordBatch, array},
     compute::cast,
@@ -28,13 +28,14 @@ use flight_client::{
     MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE,
     cookie::{CookieService, CookieStore},
     tls::new_tls_flight_channel,
+    within_decompression_bound,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use snafu::prelude::*;
 use std::{fmt, sync::Arc, vec};
 
 use arrow_flight::{
-    FlightEndpoint, IpcMessage,
+    FlightEndpoint, IpcMessage, Ticket,
     decode::FlightRecordBatchStream,
     error::FlightError,
     flight_service_client::FlightServiceClient,
@@ -234,6 +235,7 @@ pub struct FlightSQLTable {
     /// sent to the Flight SQL server. See issue #10703.
     function_support: Option<FunctionSupport>,
     token: Option<String>,
+    spice_sql: bool,
 }
 
 #[expect(clippy::needless_pass_by_value)]
@@ -261,6 +263,7 @@ impl FlightSQLTable {
             statistics: None,
             function_support: None,
             token: None,
+            spice_sql: false,
         })
     }
 
@@ -284,7 +287,15 @@ impl FlightSQLTable {
             statistics: None,
             function_support: None,
             token: None,
+            spice_sql: false,
         }
+    }
+
+    /// Use Spice's exact Arrow numeric SQL encoding for a trusted executor.
+    #[must_use]
+    pub fn with_spice_sql(mut self, enabled: bool) -> Self {
+        self.spice_sql = enabled;
+        self
     }
 
     /// Attach statistics to be reported by the scans this provider creates.
@@ -434,7 +445,7 @@ impl FlightSQLTable {
                 .filter_map(|ep| ep.ticket.as_ref())
             {
                 // Schema: https://github.com/apache/arrow/blob/44edc27e549d82db930421b0d4c76098941afd71/format/FlightSql.proto#L1182-L1190
-                if let Ok(stream) = client.do_get(tkt.clone()).await
+                if let Ok(stream) = guarded_do_get(&mut client, tkt.clone()).await
                     && let Ok(batch) = stream.try_collect::<Vec<_>>().await
                     && let Some(schema) =
                         Self::get_table_schema_if_present(batch, table_reference.clone())
@@ -458,13 +469,11 @@ impl FlightSQLTable {
             .iter()
             .filter_map(|ep| ep.ticket.as_ref())
         {
-            let stream =
-                client
-                    .do_get(tkt.clone())
-                    .await
-                    .context(UnableToRetrieveSchemaFlightSnafu {
-                        table_name: table_reference.to_string(),
-                    })?;
+            let stream = guarded_do_get(&mut client, tkt.clone()).await.context(
+                UnableToRetrieveSchemaFlightSnafu {
+                    table_name: table_reference.to_string(),
+                },
+            )?;
             let batches = stream.try_collect::<Vec<_>>().await.context(
                 UnableToRetrieveSchemaFlightSnafu {
                     table_name: table_reference.to_string(),
@@ -497,7 +506,9 @@ impl FlightSQLTable {
             limit,
             Arc::clone(&self.cookie_store),
         )?;
-        let exec = exec.with_token(self.token.clone());
+        let exec = exec
+            .with_token(self.token.clone())
+            .with_spice_sql(self.spice_sql);
         // Project the table-level statistics onto the scan's (projected) output
         // schema so the column-statistics list lines up with the output columns.
         //
@@ -551,7 +562,11 @@ impl TableProvider for FlightSQLTable {
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         let mut filter_push_down = vec![];
         for filter in filters {
-            match to_sql_preserving_precedence(filter) {
+            match if self.spice_sql {
+                to_spice_sql(filter)
+            } else {
+                to_sql_preserving_precedence(filter)
+            } {
                 Ok(_) => {
                     filter_push_down.push(TableProviderFilterPushDown::Exact);
                 }
@@ -596,9 +611,24 @@ pub struct FlightSqlExec {
     /// hash-join build-side selection can use them.
     statistics: Statistics,
     token: Option<String>,
+    spice_sql: bool,
 }
 
 impl FlightSqlExec {
+    /// Whether this scan targets a trusted Spice executor.
+    pub fn uses_spice_sql(&self) -> bool {
+        self.spice_sql
+    }
+
+    /// Render a filter with the same numeric encoding used by this scan.
+    pub fn filter_sql(&self, expr: &Expr) -> DataFusionResult<String> {
+        if self.spice_sql {
+            to_spice_sql(expr)
+        } else {
+            to_sql_preserving_precedence(expr)
+        }
+    }
+
     pub fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
@@ -628,7 +658,15 @@ impl FlightSqlExec {
             trace_parent: None,
             statistics,
             token: None,
+            spice_sql: false,
         })
+    }
+
+    /// Use Spice's exact Arrow numeric SQL encoding for a trusted executor.
+    #[must_use]
+    pub fn with_spice_sql(mut self, enabled: bool) -> Self {
+        self.spice_sql = enabled;
+        self
     }
 
     /// Attach statistics describing the rows this scan produces. The schema of
@@ -722,7 +760,7 @@ impl FlightSqlExec {
                 .filters
                 .iter()
                 .map(|f| {
-                    to_sql_preserving_precedence(f).map(|sql| {
+                    self.filter_sql(f).map(|sql| {
                         // Wrap each top-level filter in parentheses to preserve semantics when
                         // joining with AND, and recursively parenthesize nested binary
                         // expressions so mixed AND/OR trees inside a single filter keep the
@@ -869,6 +907,7 @@ impl ExecutionPlan for FlightSqlExec {
             trace_parent: self.trace_parent.clone(),
             statistics: self.statistics.clone(),
             token: self.token.clone(),
+            spice_sql: self.spice_sql,
         };
 
         Ok(SortOrderPushdownResult::Exact {
@@ -980,6 +1019,7 @@ impl ExecutionPlan for FlightSqlExec {
             trace_parent: self.trace_parent.clone(),
             statistics,
             token: self.token.clone(),
+            spice_sql: self.spice_sql,
         };
 
         Some(Arc::new(new_plan))
@@ -1110,8 +1150,9 @@ pub fn query_to_stream(
                             let repair = declared.clone();
                             let (headers, flight_data, _) = response.into_parts();
                             let flight_data = flight_data
-                                .map_ok(move |message| repair.repair(message))
-                                .map_err(FlightError::from);
+                                .map_err(FlightError::from)
+                                .and_then(|message| std::future::ready(within_decompression_bound(message)))
+                                .map_ok(move |message| repair.repair(message));
                             let mut flight_stream =
                                 FlightRecordBatchStream::new_from_flight_data(flight_data)
                                     .with_headers(headers);
@@ -1174,6 +1215,21 @@ impl DeclaredSchema {
 
 fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionError {
     DataFusionError::Execution(format!("{}", e.into()))
+}
+
+/// `FlightSqlServiceClient::do_get`, with each message checked by
+/// [`within_decompression_bound`] before it is decoded.
+async fn guarded_do_get(
+    client: &mut FlightSqlClient,
+    ticket: Ticket,
+) -> Result<FlightRecordBatchStream, FlightError> {
+    let (headers, flight_data, _) = client.do_get_flight_data(ticket).await?.into_parts();
+    Ok(FlightRecordBatchStream::new_from_flight_data(
+        flight_data
+            .map_err(FlightError::from)
+            .and_then(|message| std::future::ready(within_decompression_bound(message))),
+    )
+    .with_headers(headers))
 }
 
 pub async fn get_client_for_flight_endpoint(

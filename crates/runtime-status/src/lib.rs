@@ -508,10 +508,12 @@ impl RuntimeStatus {
                 };
 
                 // OnLoad readiness: a component counts as ready if it has been ready at least once.
-                // All registered components must appear in the ever-ready set before we report ready.
+                // All registered components must appear in the ever-ready set before we report ready,
+                // except disabled ones: a component removed from the Spicepod never loads.
                 statuses
-                    .keys()
-                    .all(|component| ever_ready.contains(component))
+                    .iter()
+                    .filter(|(_, state)| !matches!(state.status, ComponentStatus::Disabled))
+                    .all(|(component, _)| ever_ready.contains(component))
             }
             // OnRegistration readiness: treat Error/Disabled/Initializing as ready-enough.
             // Only components in ShuttingDown state block overall readiness.
@@ -786,6 +788,15 @@ impl RuntimeStatus {
     pub async fn wait_for_dataset_ready(&self, dataset: &TableReference) -> WaitOutcome {
         let component_name = format!("dataset:{dataset}");
         self.wait_for_component_ready(&component_name).await
+    }
+
+    /// Waits for a dataset's load to end, whether it became `Ready` or failed.
+    pub async fn wait_for_dataset_loaded_or_failed(&self, dataset: &TableReference) -> WaitOutcome {
+        let component_name = format!("dataset:{dataset}");
+        self.wait_for_component_status(&component_name, |status| {
+            matches!(status, ComponentStatus::Ready | ComponentStatus::Error(_))
+        })
+        .await
     }
 
     /// Waits for a dataset to be registered (any status other than
@@ -1089,6 +1100,23 @@ mod tests {
 
         // Once ever-ready is achieved, transient non-ready states still satisfy OnLoad mode.
         status.update_dataset(&dataset, ComponentStatus::Refreshing);
+        assert!(status.is_ready());
+    }
+
+    #[test]
+    fn test_is_ready_on_load_ignores_a_removed_component_that_never_loaded() {
+        let status = RuntimeStatus::new();
+        let good = TableReference::bare("good");
+        let bad = TableReference::bare("bad");
+
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+
+        status.update_dataset(&good, ComponentStatus::Ready);
+        status.update_dataset(&bad, ComponentStatus::error_with_message("file not found"));
+        assert!(!status.is_ready());
+
+        // Removing `bad` from the Spicepod disables it.
+        status.update_dataset(&bad, ComponentStatus::Disabled);
         assert!(status.is_ready());
     }
 

@@ -2698,11 +2698,11 @@ impl SnapshotManager {
 
     /// Attempts to download the latest snapshot, returning details if successful.
     ///
-    /// INVARIANT (Cayenne orphaned-DV cleanup): restore is wholesale and
-    /// self-contained — the downloaded archive carries its OWN data and
-    /// deletion-vector (`.arrow`) files plus metastore slice, and extraction
-    /// replaces the local table directory before the provider is (re)opened. It
-    /// never reuses the live table's files. Cayenne's orphaned-DV sweep
+    /// INVARIANT (Cayenne orphaned-DV cleanup): restore is self-contained — the
+    /// downloaded archive carries its OWN data and deletion-vector (`.arrow`)
+    /// files plus metastore slice. Extraction keeps an existing file only when its
+    /// checksum matches, after `prepare_directory_restore` has stopped the live
+    /// instance's deletions. Cayenne's orphaned-DV sweep
     /// (`CayenneTableProvider::sweep_orphaned_deletion_vectors`) deletes DV files
     /// once they fall below the surviving-sequence floor and depends on this: if
     /// restore is ever changed to reuse the live table's files (e.g. an in-place
@@ -3589,6 +3589,19 @@ impl SnapshotManager {
 
         let mut extract_options = ExtractOptions::skip_existing();
         extract_options.prefix_mappings = Some(prefix_mappings);
+
+        // Stop a live instance from deleting files extraction keeps or writes.
+        if let Err(source) = self
+            .snapshot_engine
+            .prepare_directory_restore(dirs, &self.dataset_name)
+            .await
+        {
+            let _ = fs::remove_file(&temp_archive_path).await;
+            return Err(SnapshotDownloadError::ArchiveExtract {
+                path: temp_archive_path.clone(),
+                source: std::io::Error::other(format!("engine prepare failed: {source}")),
+            });
+        }
 
         extract_archive_file_with_options(&temp_archive_path, extract_target, extract_options)
             .await

@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use duckdb::Connection;
+use duckdb_oracle::Connection;
 use test_framework::anyhow::{Context, Result};
 
 use super::DatasetType;
@@ -69,51 +69,18 @@ impl StreamingDataset for SupplierDataset {
         conn.execute_batch(&format!("CALL dbgen(sf={scale_factor});"))
             .context("Failed to generate TPCH data")?;
 
-        let mut stmt = conn
-            .prepare(
+        let batches = conn
+            .query(
                 "SELECT s_suppkey, s_name, s_address, s_nationkey, s_phone, CAST(s_acctbal AS DOUBLE) as s_acctbal, s_comment
                 FROM supplier
                 ORDER BY s_suppkey",
             )
-            .context("Failed to prepare supplier query")?;
+            .context("Failed to query supplier query")?;
 
-        let mut s_suppkey = Vec::new();
-        let mut s_name = Vec::new();
-        let mut s_address = Vec::new();
-        let mut s_nationkey = Vec::new();
-        let mut s_phone = Vec::new();
-        let mut s_acctbal = Vec::new();
-        let mut s_comment = Vec::new();
-
-        let mut rows = stmt.query([]).context("Failed to query supplier data")?;
-        while let Some(row) = rows.next().context("Failed to read row")? {
-            s_suppkey.push(row.get::<_, i64>(0)?);
-            s_name.push(row.get::<_, String>(1)?);
-            s_address.push(row.get::<_, String>(2)?);
-            s_nationkey.push(row.get::<_, i64>(3)?);
-            s_phone.push(row.get::<_, String>(4)?);
-            s_acctbal.push(row.get::<_, f64>(5)?);
-            s_comment.push(row.get::<_, String>(6)?);
-        }
-
-        let record_count = s_suppkey.len();
-        println!("Generated {record_count} supplier records");
-
-        let batch = RecordBatch::try_new(
-            Arc::new(Self::schema()),
-            vec![
-                Arc::new(Int64Array::from(s_suppkey)),
-                Arc::new(StringArray::from(s_name)),
-                Arc::new(StringArray::from(s_address)),
-                Arc::new(Int64Array::from(s_nationkey)),
-                Arc::new(StringArray::from(s_phone)),
-                Arc::new(Float64Array::from(s_acctbal)),
-                Arc::new(StringArray::from(s_comment)),
-            ],
-        )
-        .context("Failed to create Arrow RecordBatch")?;
-
-        Ok(vec![batch])
+        let batches = super::with_dataset_schema(batches, Self::schema())?;
+        let record_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        println!("Generated {record_count} records");
+        Ok(batches)
     }
 
     fn marker_record(&self) -> Result<RecordBatch> {

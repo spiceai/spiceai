@@ -3,13 +3,17 @@ description: >
   Two replicas (variants a and b, each with its own copy of the source) keep
   snapshots of one dataset in one shared state location. Only the writer
   lease holder creates snapshots, and the other says it is standing by; once
-  the holder is killed, the other takes the lease over after it lapses and
-  publishes snapshots, and the killed replica, started again on empty local
+  the holder stops gracefully or is killed, the other takes the lease over
+  (before expiry on clean shutdown, after expiry on a kill) and
+  publishes snapshots, and the stopped replica, started again on empty local
   storage with its source down, restores the new holder's latest snapshot.
 
 sources:
   src: { kind: postgres }
   lake: { kind: rustfs }
+
+matrix:
+  shutdown: [graceful, kill]
 
 variants:
   a: {}
@@ -58,8 +62,17 @@ steps:
 
   # a takes the lease and creates snapshots; b, started after, stands by
   # through several refreshes of its own.
+  # Give the graceful holder a two-hour lease, so even a slow clean
+  # shutdown cannot make expiry look like an ownership release.
+  - start:
+      patch:
+        datasets:
+          t: { acceleration: { refresh_check_interval: 1h } }
+    only: a
+    when: { shutdown: graceful }
   - start: {}
     only: a
+    when: { shutdown: kill }
   - assert-log: { contains: 'Snapshot created dataset=t' }
     eventually: 30s
     only: a
@@ -76,15 +89,27 @@ steps:
   - assert-log: { count: { 'Snapshot created dataset=t': '>=3' } }
     eventually: 30s
     only: a
+    when: { shutdown: kill }
 
-  # The holder dies; b takes over once the lease lapses (30 seconds at the
-  # least) and publishes the source's new rows.
+  # b publishes the source's new rows after the holder stops. A killed
+  # holder retains its lease until it expires (at least 30 seconds).
+  - stop: {}
+    only: a
+    when: { shutdown: graceful }
   - kill-spiced: {}
     only: a
+    when: { shutdown: kill }
   - source-exec: { src: "UPDATE t SET v = 'second' WHERE id <= 500" }
+  # Graceful shutdown must release ownership before the 30s lease expires
+  # (#15256). Killing a holder still requires expiry.
+  - assert-log: { contains: "Snapshot created dataset=t" }
+    eventually: 20s
+    only: b
+    when: { shutdown: graceful }
   - assert-log: { contains: "Dataset 't' took over its snapshot writer lease from" }
     eventually: 90s
     only: b
+    when: { shutdown: kill }
   - query: SELECT v, count(*) AS n FROM t GROUP BY v ORDER BY v
     eventually: 30s
     only: b

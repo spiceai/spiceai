@@ -52,13 +52,14 @@ limitations under the License.
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
+use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::expr::{
     AggregateFunction, NullTreatment, ScalarFunction, WindowFunction,
 };
 use datafusion::logical_expr::utils::AggregateOrderSensitivity;
 use datafusion_table_providers::util::supported_functions::{
-    AggregateCallSupport, FunctionRestriction, FunctionSupport, ScalarCallSupport,
-    WindowCallSupport,
+    AggregateCallSupport, ExpressionSupport, FunctionRestriction, FunctionSupport,
+    ScalarCallSupport, WindowCallSupport,
 };
 use linkme::distributed_slice;
 
@@ -283,9 +284,10 @@ fn excluding_native(names: impl IntoIterator<Item = String>, native: &[&str]) ->
 /// Defaults to denying every Spice function (link-time set plus user-registered)
 /// the [`DATAFUSION_CAST_BUILTINS`] and the [`PLAN_INTROSPECTION_BUILTINS`], and
 /// to refusing the aggregate and window calls whose clauses the unparser drops
-/// ([`aggregate_clauses_survive_unparsing`], [`window_clauses_survive_unparsing`]),
-/// and nothing else — correct for a source whose dialect rewrites none of the
-/// Spice functions.
+/// ([`aggregate_clauses_survive_unparsing`], [`window_clauses_survive_unparsing`])
+/// and the expression nodes the unparser renders as something else
+/// ([`expression_survives_unparsing`]), and nothing else — correct for a source
+/// whose dialect rewrites none of the Spice functions.
 #[derive(Default)]
 pub struct FunctionSupportBuilder<'a> {
     native: &'a [&'a str],
@@ -294,6 +296,7 @@ pub struct FunctionSupportBuilder<'a> {
     aggregate_call: Option<AggregateCallSupport>,
     window_call: Option<WindowCallSupport>,
     renders_aggregate_order_by: Option<fn(&str) -> bool>,
+    expression: Option<ExpressionSupport>,
 }
 
 impl<'a> FunctionSupportBuilder<'a> {
@@ -368,6 +371,22 @@ impl<'a> FunctionSupportBuilder<'a> {
         self
     }
 
+    /// A per-node check refusing the non-function expressions this backend
+    /// evaluates differently from `DataFusion`: a cast it rounds, a `/` it
+    /// answers in floating point.
+    ///
+    /// Supply it here rather than through
+    /// `FunctionSupport::with_expression_support` after [`Self::build`]: that
+    /// setter *replaces* the expression check, and [`Self::build`] installs
+    /// [`expression_survives_unparsing`] for every backend. Both are consulted,
+    /// and a node has to satisfy both to federate. A caller holding an already
+    /// built [`FunctionSupport`] adds its gate with [`and_expression_support`].
+    #[must_use]
+    pub fn expression(mut self, expression: ExpressionSupport) -> Self {
+        self.expression = Some(expression);
+        self
+    }
+
     /// The denied scalar-function names, in the order the deny-list is built:
     /// Spice functions minus the native carve-out, then user functions, then
     /// any backend-specific additions, then the [`DATAFUSION_CAST_BUILTINS`] and
@@ -410,18 +429,24 @@ impl<'a> FunctionSupportBuilder<'a> {
     /// than removed: it already denies everything registered before this call,
     /// and this closes the rest.
     ///
-    /// The aggregate and window checks are installed here for the same reason:
-    /// [`aggregate_clauses_survive_unparsing`] and
-    /// [`window_clauses_survive_unparsing`] hold for every backend, so they are
-    /// composed with the backend's own checks rather than left for each caller
-    /// to remember.
+    /// The aggregate, window and expression checks are installed here for the
+    /// same reason: [`aggregate_clauses_survive_unparsing`],
+    /// [`window_clauses_survive_unparsing`] and [`expression_survives_unparsing`]
+    /// hold for every backend, so they are composed with the backend's own
+    /// checks rather than left for each caller to remember.
     #[must_use]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one place a backend's expression check is installed: it is composed \
+                  with the every-backend check here, never replacing it"
+    )]
     pub fn build(mut self) -> FunctionSupport {
+        let backend_expression = self.expression.take();
         let backend_call = self.scalar_call.take();
         let backend_aggregate = self.aggregate_call.take();
         let backend_window = self.window_call.take();
         let renders_order_by = self.renders_aggregate_order_by;
-        FunctionSupport::new(
+        let support = FunctionSupport::new(
             Some(FunctionRestriction::Deny(self.denied_names())),
             None,
             None,
@@ -450,8 +475,55 @@ impl<'a> FunctionSupportBuilder<'a> {
                 && backend_window
                     .as_ref()
                     .is_none_or(|supports| supports(call))
-        }))
+        }));
+        support.with_expression_support(std::sync::Arc::new(
+            move |expr: &Expr, scope: Option<&datafusion::common::DFSchema>| {
+                expression_survives_unparsing(expr)
+                    && backend_expression
+                        .as_ref()
+                        .is_none_or(|supports| supports(expr, scope))
+            },
+        ))
     }
+}
+
+/// Whether the SQL the unparser writes for this expression node asks the
+/// backend for what `DataFusion` evaluates, so the node can federate.
+///
+/// The unparser renders `SIMILAR TO` as `LIKE`, keeping the pattern. A
+/// `SIMILAR TO` pattern is a regular expression (`[0-9]+`, `|`, `*`), which
+/// `LIKE` reads as literal characters, so `s SIMILAR TO 'cust_[0-9]+'` reached
+/// `DuckDB` as `s LIKE 'cust_[0-9]+'` and matched no row where `DataFusion`
+/// matches every `cust_<digits>`. No dialect has an override for it, so the
+/// node stays local on every backend until the unparser renders `SIMILAR TO`
+/// itself.
+#[must_use]
+pub fn expression_survives_unparsing(expr: &Expr) -> bool {
+    !matches!(expr, Expr::SimilarTo(_))
+}
+
+/// `support` with `gate` consulted alongside the expression check it already
+/// has, for a caller that holds a built [`FunctionSupport`] and cannot use
+/// [`FunctionSupportBuilder::expression`].
+///
+/// `FunctionSupport::with_expression_support` replaces the check instead,
+/// which would drop [`expression_survives_unparsing`] along with any backend
+/// gate already installed.
+#[must_use]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "composes with the existing check instead of replacing it"
+)]
+pub fn and_expression_support(
+    support: FunctionSupport,
+    gate: ExpressionSupport,
+) -> FunctionSupport {
+    let existing = support.clone();
+    support.with_expression_support(std::sync::Arc::new(
+        move |expr: &Expr, scope: Option<&datafusion::common::DFSchema>| {
+            existing.supports_expression(expr, scope) && gate(expr, scope)
+        },
+    ))
 }
 
 /// Aggregates whose `ORDER BY` may be dropped although `DataFusion` does not
@@ -885,5 +957,60 @@ mod tests {
             !support.supports(&aggregate(sum_udaf(), false, false), None),
             "the backend's own check must survive the one `build` installs"
         );
+    }
+
+    fn similar_to() -> Expr {
+        Expr::SimilarTo(datafusion::logical_expr::expr::Like::new(
+            false,
+            Box::new(datafusion::prelude::col("s")),
+            Box::new(Expr::Literal(ScalarValue::from("cust_[0-9]+"), None)),
+            None,
+            false,
+        ))
+    }
+
+    fn like() -> Expr {
+        datafusion::prelude::col("s").like(Expr::Literal(ScalarValue::from("cust_%"), None))
+    }
+
+    /// The unparser renders `SIMILAR TO` as `LIKE`, so every backend's support
+    /// refuses it, with or without its own expression check.
+    #[test]
+    fn similar_to_is_refused_on_every_backend() {
+        let plain = FunctionSupportBuilder::new().build();
+        let gated = FunctionSupportBuilder::new()
+            .expression(Arc::new(
+                |_: &Expr, _: Option<&datafusion::common::DFSchema>| true,
+            ))
+            .build();
+        for support in [&plain, &gated] {
+            assert!(!support.supports(&similar_to(), None));
+            assert!(support.supports(&like(), None));
+        }
+    }
+
+    /// A backend's expression check is consulted alongside the every-backend
+    /// one, through the builder and through `and_expression_support`.
+    #[test]
+    fn a_backend_expression_check_composes_with_the_every_backend_one() {
+        let refuses_like =
+            |expr: &Expr, _: Option<&datafusion::common::DFSchema>| !matches!(expr, Expr::Like(_));
+        let built = FunctionSupportBuilder::new()
+            .expression(Arc::new(refuses_like))
+            .build();
+        let added = and_expression_support(
+            FunctionSupportBuilder::new().build(),
+            Arc::new(refuses_like),
+        );
+        for support in [&built, &added] {
+            assert!(
+                !support.supports(&like(), None),
+                "the backend check must apply"
+            );
+            assert!(
+                !support.supports(&similar_to(), None),
+                "the every-backend check must survive the backend's"
+            );
+        }
     }
 }
