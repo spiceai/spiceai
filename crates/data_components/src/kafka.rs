@@ -28,10 +28,11 @@ use futures::Stream;
 use rdkafka::{
     ClientConfig, Message, Offset,
     config::RDKafkaLogLevel,
-    consumer::{BaseConsumer, CommitMode, Consumer, Rebalance, StreamConsumer},
+    consumer::{BaseConsumer, CommitMode, Consumer, RebalanceProtocol, StreamConsumer},
     message::{BorrowedMessage, Timestamp},
     metadata::MetadataPartition,
     topic_partition_list::TopicPartitionList,
+    types::{RDKafkaErrorCode, RDKafkaRespErr},
     util::get_rdkafka_version,
 };
 pub use runtime_checkpoint_api::kafka::KafkaOffset;
@@ -96,12 +97,6 @@ pub enum Error {
 
     #[snafu(display("Unable to restart Kafka offsets {message}: {source}"))]
     UnableToRestartTopic {
-        source: rdkafka::error::KafkaError,
-        message: String,
-    },
-
-    #[snafu(display("Unable to restore Kafka offsets {message}: {source}"))]
-    UnableToRestoreOffsets {
         source: rdkafka::error::KafkaError,
         message: String,
     },
@@ -281,19 +276,84 @@ pub struct KafkaMetrics {
 
 struct KafkaConsumerContext {
     metrics: Arc<KafkaMetrics>,
-    /// Offsets to seek to on the first partition assignment (restored from sidecar).
-    /// Populated at construction so the stash is in place before `subscribe()` can
-    /// trigger a rebalance. The first `Rebalance::Assign` takes the value; later
-    /// rebalances see `None` and fall back to the group-committed offset.
-    restore_offsets: std::sync::Mutex<Option<TopicPartitionList>>,
+    /// The dataset this consumer reads for, named in the lines it logs.
+    dataset: String,
+    /// The offset to resume each `(topic, partition)` from, restored from the sidecar.
+    /// Populated at construction so it is in place before `subscribe()` can trigger a
+    /// rebalance. The first assignment of a partition takes its entry; a later
+    /// assignment of it starts from the group-committed offset.
+    restore_offsets: std::sync::Mutex<HashMap<(String, i32), i64>>,
 }
 
 impl KafkaConsumerContext {
-    fn new(metrics: Arc<KafkaMetrics>, restore_offsets: Option<TopicPartitionList>) -> Self {
+    fn new(
+        metrics: Arc<KafkaMetrics>,
+        dataset: String,
+        restore_offsets: HashMap<(String, i32), i64>,
+    ) -> Self {
         Self {
             metrics,
+            dataset,
             restore_offsets: std::sync::Mutex::new(restore_offsets),
         }
+    }
+
+    /// Sets the restored offset on each partition of `assignment` that has one, so
+    /// librdkafka starts fetching it there instead of at the group-committed offset,
+    /// and returns those partitions with their offsets.
+    ///
+    /// This has to happen before `assign`: once a partition is assigned without an
+    /// offset, librdkafka asks the group coordinator for the committed one and refuses
+    /// a seek until that answer arrives. The group commit is asynchronous and can be
+    /// lost (for example while the broker restarts), so the committed offset can lag
+    /// what the acceleration already holds; starting from it would read those
+    /// messages a second time.
+    fn apply_restore_offsets(
+        &self,
+        assignment: &mut TopicPartitionList,
+    ) -> Option<TopicPartitionList> {
+        let mut restore = self
+            .restore_offsets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if restore.is_empty() {
+            return None;
+        }
+        let dataset = &self.dataset;
+        let assigned: Vec<(String, i32)> = assignment
+            .elements()
+            .iter()
+            .map(|e| (e.topic().to_string(), e.partition()))
+            .collect();
+        let mut restored = TopicPartitionList::new();
+        for (topic, partition) in assigned {
+            let Some(offset) = restore.remove(&(topic.clone(), partition)) else {
+                continue;
+            };
+            match assignment
+                .set_partition_offset(&topic, partition, Offset::Offset(offset))
+                .and_then(|()| {
+                    restored.add_partition_offset(&topic, partition, Offset::Offset(offset))
+                }) {
+                Ok(()) => {
+                    tracing::debug!(
+                        "Resuming dataset '{dataset}' at Kafka topic '{topic}' partition {partition} offset {offset}, restored from its acceleration"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to resume dataset '{dataset}' at Kafka topic '{topic}' partition {partition} offset {offset}, so it starts at the consumer group's committed offset and may append messages its acceleration already holds a second time. Cause: {e}"
+                    );
+                }
+            }
+        }
+        if restored.count() == 0 {
+            return None;
+        }
+        tracing::info!(
+            "Resuming dataset '{dataset}' from the Kafka offsets stored in its acceleration"
+        );
+        Some(restored)
     }
 }
 
@@ -393,31 +453,64 @@ impl rdkafka::ClientContext for KafkaConsumerContext {
 }
 
 impl rdkafka::consumer::ConsumerContext for KafkaConsumerContext {
-    fn post_rebalance(&self, base_consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
-        if let Rebalance::Assign(_) = rebalance {
-            // On first assignment after subscribe, seek to sidecar offsets if available.
-            // Take the offsets so this only fires once on success.
-            let offsets = self
-                .restore_offsets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-
-            if let Some(tpl) = offsets {
-                match base_consumer.seek_partitions(tpl.clone(), Duration::from_secs(5)) {
-                    Ok(_) => {
-                        tracing::info!("Restored Kafka consumer offsets from sidecar");
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to seek to restored offsets: {e}");
-                        // Re-insert offsets so the next rebalance retries the seek.
-                        *self
-                            .restore_offsets
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tpl);
-                    }
+    /// The default rebalance, with the restored offsets set on an assignment before
+    /// it is applied (see [`KafkaConsumerContext::apply_restore_offsets`]).
+    fn rebalance(
+        &self,
+        base_consumer: &BaseConsumer<Self>,
+        err: RDKafkaRespErr,
+        tpl: &mut TopicPartitionList,
+    ) {
+        let dataset = &self.dataset;
+        let cooperative = matches!(
+            base_consumer.rebalance_protocol(),
+            RebalanceProtocol::Cooperative
+        );
+        let result = match err {
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS => {
+                let restored = self.apply_restore_offsets(tpl);
+                let assigned = if cooperative {
+                    base_consumer.incremental_assign(tpl)
+                } else {
+                    base_consumer.assign(tpl)
+                };
+                // Bring the group's committed offsets up to the restored ones. A
+                // partition assigned at an explicit offset never fetches its committed
+                // offset, and the consumer lag the readiness signal waits on is
+                // measured from it, so without this commit a topic with nothing new
+                // to read would never report caught up.
+                if let (Ok(()), Some(restored)) = (&assigned, restored)
+                    && let Err(e) = base_consumer.commit(&restored, CommitMode::Async)
+                {
+                    tracing::error!(
+                        "Failed to commit the Kafka offsets dataset '{dataset}' resumed from, so the dataset may not report ready until a new message arrives. Cause: {e}"
+                    );
+                }
+                assigned
+            }
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS => {
+                if cooperative {
+                    base_consumer.incremental_unassign(tpl)
+                } else {
+                    base_consumer.unassign()
                 }
             }
+            _ => {
+                let code: RDKafkaErrorCode = err.into();
+                tracing::error!(
+                    "Kafka consumer group rebalance failed for dataset '{dataset}': {code}"
+                );
+                if cooperative {
+                    base_consumer.incremental_unassign(tpl)
+                } else {
+                    base_consumer.unassign()
+                }
+            }
+        };
+        if let Err(e) = result {
+            tracing::warn!(
+                "Failed to apply a Kafka consumer group rebalance for dataset '{dataset}', so it may not read the partitions it was assigned until the next rebalance. Cause: {e}"
+            );
         }
     }
 }
@@ -517,12 +610,17 @@ impl KafkaConsumer {
     /// offsets from the sidecar before any rebalance can fire. Pass an empty
     /// slice for `restore_offsets` when there is nothing to restore.
     pub fn create_with_existing_group_id(
+        dataset: &str,
         group_id: impl Into<String>,
         kafka_config: &KafkaConfig,
         restore_offsets: &[KafkaOffset],
     ) -> Result<Self> {
-        let restore = Self::build_restore_tpl(restore_offsets)?;
-        Self::create(group_id.into(), kafka_config, restore)
+        Self::create(
+            dataset,
+            group_id.into(),
+            kafka_config,
+            Self::restore_map(restore_offsets),
+        )
     }
 
     pub fn create_for_dataset(
@@ -531,9 +629,10 @@ impl KafkaConsumer {
         kafka_config: &KafkaConfig,
     ) -> Result<Self> {
         Self::create(
+            dataset,
             group_id.unwrap_or_else(|| Self::generate_group_id(dataset)),
             kafka_config,
-            None,
+            HashMap::new(),
         )
     }
 
@@ -636,28 +735,12 @@ impl KafkaConsumer {
             .context(UnableToCommitConsumerStateSnafu)
     }
 
-    /// Build a [`TopicPartitionList`] from sidecar offsets. Returns `None` when
-    /// the slice is empty so callers can pass the result straight into
-    /// [`KafkaConsumer::create`] for the no-restore case.
-    fn build_restore_tpl(offsets: &[KafkaOffset]) -> Result<Option<TopicPartitionList>> {
-        if offsets.is_empty() {
-            return Ok(None);
-        }
-
-        let mut topic_partition_list = TopicPartitionList::new();
-        for offset in offsets {
-            topic_partition_list
-                .add_partition_offset(
-                    &offset.topic,
-                    offset.partition,
-                    Offset::Offset(offset.next_read_offset()),
-                )
-                .context(UnableToRestoreOffsetsSnafu {
-                    message: "Failed to build topic partition list".to_string(),
-                })?;
-        }
-
-        Ok(Some(topic_partition_list))
+    /// The offset each sidecar `(topic, partition)` resumes reading from.
+    fn restore_map(offsets: &[KafkaOffset]) -> HashMap<(String, i32), i64> {
+        offsets
+            .iter()
+            .map(|o| ((o.topic.clone(), o.partition), o.next_read_offset()))
+            .collect()
     }
 
     pub fn restart_topic(&self, topic: &str) -> Result<()> {
@@ -759,9 +842,10 @@ impl KafkaConsumer {
     }
 
     fn create(
+        dataset: &str,
         group_id: String,
         kafka_config: &KafkaConfig,
-        restore_offsets: Option<TopicPartitionList>,
+        restore_offsets: HashMap<(String, i32), i64>,
     ) -> Result<Self> {
         tracing::debug!("Using kafka group_id: {}", group_id);
 
@@ -831,6 +915,7 @@ impl KafkaConsumer {
             .set_log_level(RDKafkaLogLevel::Debug)
             .create_with_context(KafkaConsumerContext::new(
                 Arc::clone(&metrics),
+                dataset.to_string(),
                 restore_offsets,
             ))
             .context(UnableToCreateConsumerSnafu)?;
@@ -982,6 +1067,7 @@ impl KafkaConsumer {
     /// partition (skipping tombstones by seeking backward), and returns the message
     /// with the newest record timestamp across all partitions.
     pub async fn fetch_latest_message<K: DeserializeOwned, V: DeserializeOwned>(
+        dataset: &str,
         topic: &str,
         kafka_config: &KafkaConfig,
         timeout: Duration,
@@ -994,7 +1080,12 @@ impl KafkaConsumer {
         // that block the calling thread for up to `remaining` (the schema-peek
         // budget, up to ~30s). Run them on the blocking pool so this
         // registration-time path doesn't stall the async runtime thread.
-        let temp_consumer = Arc::new(Self::create(temp_group_id, &peek_config, None)?);
+        let temp_consumer = Arc::new(Self::create(
+            dataset,
+            temp_group_id,
+            &peek_config,
+            HashMap::new(),
+        )?);
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         let partition_ids: Vec<i32> = {

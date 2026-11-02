@@ -103,10 +103,10 @@ impl Signal for LogsIngestService {
     const NAME: &'static str = "logs";
 
     fn decode_json(body: &[u8]) -> Result<Self::Request, String> {
-        let request: opentelemetry_proto_json::tonic::collector::logs::v1::ExportLogsServiceRequest =
-            serde_json::from_slice(body).map_err(|e| format!("Invalid OTLP JSON body: {e}"))?;
-        ExportLogsServiceRequest::decode(request.encode_to_vec().as_slice())
-            .map_err(|e| format!("Invalid OTLP JSON body: {e}"))
+        decode_json_as::<
+            opentelemetry_proto_json::tonic::collector::logs::v1::ExportLogsServiceRequest,
+            _,
+        >(body)
     }
 
     fn response_json(response: &Self::Response) -> serde_json::Value {
@@ -332,13 +332,119 @@ pub(crate) fn decompress(headers: &HeaderMap, body: Bytes) -> Result<Bytes, (Sta
     }
 }
 
-/// Decodes an OTLP JSON export. The JSON mapping is decoded with `opentelemetry-proto` 0.33.1
-/// and re-encoded to protobuf, which is wire-compatible with the types the receiver uses.
+/// Cap on the JSON values (objects, arrays, strings, numbers, booleans and nulls) in an OTLP JSON
+/// body. A value of a few bytes, such as `{}`, decodes to a full message, so the cap bounds the
+/// memory a body can decode to.
+pub(crate) const MAX_JSON_VALUES: usize = 4 * 1024 * 1024;
+
+/// Decodes an OTLP JSON metrics export.
 pub(crate) fn decode_json(body: &[u8]) -> Result<ExportMetricsServiceRequest, String> {
-    let request: opentelemetry_proto_json::tonic::collector::metrics::v1::ExportMetricsServiceRequest =
+    decode_json_as::<
+        opentelemetry_proto_json::tonic::collector::metrics::v1::ExportMetricsServiceRequest,
+        _,
+    >(body)
+}
+
+/// Decodes an OTLP JSON export with its `opentelemetry-proto` 0.33.1 JSON mapping `J`, then
+/// re-encodes it to protobuf, which is wire-compatible with the receiver's type `P`.
+fn decode_json_as<J, P>(body: &[u8]) -> Result<P, String>
+where
+    J: serde::de::DeserializeOwned + Message,
+    P: Message + Default,
+{
+    check_json_value_count(body, MAX_JSON_VALUES)?;
+    let request: J =
         serde_json::from_slice(body).map_err(|e| format!("Invalid OTLP JSON body: {e}"))?;
-    ExportMetricsServiceRequest::decode(request.encode_to_vec().as_slice())
+    P::decode(request.encode_to_vec().as_slice())
         .map_err(|e| format!("Invalid OTLP JSON body: {e}"))
+}
+
+/// Rejects a JSON body with more than `max` values. The check parses without allocating values.
+fn check_json_value_count(body: &[u8], max: usize) -> Result<(), String> {
+    use serde::de::DeserializeSeed;
+
+    let mut count = 0;
+    let counter = JsonValueCounter {
+        count: &mut count,
+        max,
+    };
+    counter
+        .deserialize(&mut serde_json::Deserializer::from_slice(body))
+        .map_err(|e| format!("Invalid OTLP JSON body: {e}"))
+}
+
+/// Counts the JSON values it visits into `count`, and fails past `max`.
+struct JsonValueCounter<'a> {
+    count: &'a mut usize,
+    max: usize,
+}
+
+impl JsonValueCounter<'_> {
+    fn nested(&mut self) -> JsonValueCounter<'_> {
+        JsonValueCounter {
+            count: self.count,
+            max: self.max,
+        }
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for JsonValueCounter<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        *self.count += 1;
+        if *self.count > self.max {
+            return Err(serde::de::Error::custom(format!(
+                "the body has more than {} JSON values; split the export into smaller requests",
+                self.max
+            )));
+        }
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for JsonValueCounter<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(mut self, mut seq: A) -> Result<(), A::Error> {
+        while seq.next_element_seed(self.nested())?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(mut self, mut map: A) -> Result<(), A::Error> {
+        while map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+            map.next_value_seed(self.nested())?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn decode<S: Signal>(
@@ -658,6 +764,20 @@ mod tests {
         )
         .expect("decodes");
         assert_eq!(decoded.code, 14);
+    }
+
+    #[test]
+    fn json_value_count_is_checked_against_the_cap() {
+        // One object, one array, two empty objects and one string.
+        let body = br#"{"resourceMetrics":[{},{}],"k":"v"}"#;
+        assert_eq!(check_json_value_count(body, 5), Ok(()));
+        let error = check_json_value_count(body, 4).expect_err("over the cap");
+        assert!(
+            error.starts_with(
+                "Invalid OTLP JSON body: the body has more than 4 JSON values; split the export into smaller requests"
+            ),
+            "{error}"
+        );
     }
 
     #[test]

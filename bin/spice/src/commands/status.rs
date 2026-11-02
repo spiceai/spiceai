@@ -17,7 +17,7 @@ limitations under the License.
 //! Status command implementation.
 
 use crate::context::RuntimeContext;
-use crate::error::{self, InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
+use crate::error::{self, InvalidResponseSnafu, Result};
 use crate::output::{OutputFormat, write_json};
 use clap::Args;
 use serde::{Deserialize, Serialize};
@@ -54,12 +54,10 @@ struct ComponentStatus {
 
 /// Execute the status command.
 pub async fn execute(ctx: &RuntimeContext, args: &StatusArgs) -> Result<()> {
-    let response = ctx.get("/v1/status").await.map_err(|_| {
-        RuntimeUnavailableSnafu {
-            endpoint: ctx.http_endpoint().to_string(),
-        }
-        .build()
-    })?;
+    let response = ctx
+        .get("/v1/status")
+        .await
+        .map_err(|e| error::runtime_unreachable(ctx.http_endpoint(), &e))?;
 
     let response = error::check_response(response, ctx.http_endpoint()).await?;
 
@@ -82,4 +80,85 @@ pub async fn execute(ctx: &RuntimeContext, args: &StatusArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TlsServer;
+
+    const STATUS_BODY: &str = r#"[{"name":"http","endpoint":"127.0.0.1:8090","status":"Ready"}]"#;
+
+    fn ctx_for(server: &TlsServer, root_cert: Option<String>) -> RuntimeContext {
+        RuntimeContext::with_args(Some(server.url().to_string()), None, None, root_cert)
+            .expect("context should build")
+    }
+
+    fn table() -> StatusArgs {
+        StatusArgs {
+            output: OutputFormat::Table,
+        }
+    }
+
+    /// `--tls-root-certificate-file` is a global flag, so the HTTP commands have to trust it
+    /// as `spice sql` does, not only the system roots.
+    #[tokio::test]
+    async fn status_trusts_the_tls_root_certificate_file() {
+        let server = TlsServer::answering(STATUS_BODY);
+        let ctx = ctx_for(&server, Some(server.ca_file()));
+
+        execute(&ctx, &table())
+            .await
+            .expect("status should succeed against a runtime whose CA was passed");
+    }
+
+    /// A certificate the client does not trust is a TLS problem with a known remedy, not a
+    /// runtime that is down.
+    #[tokio::test]
+    async fn status_reports_a_certificate_failure_rather_than_an_unavailable_runtime() {
+        let server = TlsServer::answering(STATUS_BODY);
+
+        for root_cert in [Some(server.unrelated_ca_file()), None] {
+            let ctx = ctx_for(&server, root_cert.clone());
+            let message = execute(&ctx, &table())
+                .await
+                .expect_err("status should fail when the certificate is not trusted")
+                .to_string();
+
+            assert!(
+                message.contains("TLS certificate verification failed")
+                    && message.contains(server.url())
+                    && message.contains("--tls-root-certificate-file"),
+                "root cert {root_cert:?}: expected a certificate error naming the endpoint and the flag, got: {message}"
+            );
+            assert!(
+                !message.contains("Is it running?"),
+                "root cert {root_cert:?}: a certificate failure is not an unavailable runtime, got: {message}"
+            );
+        }
+    }
+    /// The CA flag only fixes a certificate from an issuer the client does not know. A
+    /// certificate the CA vouches for but that does not cover the dialed host is not fixed by
+    /// passing a CA, so the error must not send the user there.
+    #[tokio::test]
+    async fn status_does_not_prescribe_the_ca_flag_for_a_host_name_mismatch() {
+        let server = TlsServer::answering_for_names(STATUS_BODY, vec!["spice.invalid".to_string()]);
+        let ctx = ctx_for(&server, Some(server.ca_file()));
+
+        let message = execute(&ctx, &table())
+            .await
+            .expect_err("status should fail when the certificate does not cover the host")
+            .to_string();
+
+        assert!(
+            message.contains("TLS certificate verification failed")
+                && message.contains(server.url())
+                && message.contains("not valid for"),
+            "expected a certificate error naming the endpoint and the host-name mismatch, got: {message}"
+        );
+        assert!(
+            !message.contains("Pass --tls-root-certificate-file"),
+            "a host-name mismatch is not fixed by a CA file, got: {message}"
+        );
+    }
 }

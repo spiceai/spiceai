@@ -142,6 +142,24 @@ impl Source for Postgres {
         Ok(TextResult { columns, rows })
     }
 
+    async fn apply(
+        &self,
+        namespace: &str,
+        table: &str,
+        key: &str,
+        changes: &[super::write::RowChange],
+    ) -> Result<()> {
+        let sql = super::write::sql_changes(table, key, changes, self.dialect())?;
+        if sql.is_empty() {
+            return Ok(());
+        }
+        let mut input = std::iter::once(Ok(sql.into_bytes()));
+        self.container
+            .exec_with_input(&psql_command(namespace, &[]), &mut input)
+            .await?;
+        Ok(())
+    }
+
     fn dialect(&self) -> crate::generate::Dialect {
         crate::generate::Dialect::Postgres
     }

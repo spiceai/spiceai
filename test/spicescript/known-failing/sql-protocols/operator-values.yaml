@@ -1,0 +1,28 @@
+{
+  "name": "sql-operator-values-known",
+  "description": "Documented operator semantics checked against literal expected values over both protocols.",
+  "spicepod": {
+    "version": "v1",
+    "kind": "Spicepod",
+    "name": "sql-operator-values"
+  },
+  "steps": [
+    {
+      "start": {}
+    },
+    {
+      "query": "SELECT 6 ^ 3 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "5"
+          ]
+        ]
+      }
+    }
+  ]
+}

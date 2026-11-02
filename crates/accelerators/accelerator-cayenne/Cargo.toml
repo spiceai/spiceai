@@ -26,12 +26,11 @@ description = "Cayenne data accelerator: implements data-accelerator-api::DataAc
 [dependencies]
 data-accelerator-api = { path = "../../data-accelerator-api" }
 app = { path = "../../app" }
-cayenne = { path = "../../cayenne", features = ["turso", "partition-table-provider"] }
+cayenne = { path = "../../cayenne", features = ["partition-table-provider"] }
 data_components = { path = "../../data_components" }
 runtime-acceleration = { path = "../../runtime-acceleration", features = ["sqlite"] }
 runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }
 runtime-checkpoint-sqlite = { path = "../../runtime-checkpoint-sqlite" }
-runtime-checkpoint-turso = { path = "../../runtime-checkpoint-turso" }
 runtime-object-store = { path = "../../runtime-object-store" }
 runtime-resources = { path = "../../runtime-resources" }
 runtime-datafusion = { path = "../../runtime-datafusion" }

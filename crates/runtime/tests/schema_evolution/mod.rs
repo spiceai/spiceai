@@ -550,7 +550,6 @@ async fn test_file_update_csv_sqlite() -> Result<(), anyhow::Error> {
     run_file_update_csv_phases("sqlite", params, &csv_file.to_string_lossy()).await
 }
 
-#[cfg(not(windows))]
 #[tokio::test]
 async fn test_file_update_csv_cayenne() -> Result<(), anyhow::Error> {
     let temp_dir = tempfile::tempdir()?;
@@ -580,7 +579,6 @@ async fn test_file_update_csv_cayenne() -> Result<(), anyhow::Error> {
 // `mode: file` storage. Assertions are explicit (row counts + column set) so the cases pass
 // on first CI run without pre-accepted insta `.snap` files.
 
-#[cfg(any(feature = "duckdb", feature = "sqlite", not(windows)))]
 async fn init_drop_recreate_csv_runtime(
     csv_path: &str,
     engine: &str,
@@ -599,7 +597,6 @@ async fn init_drop_recreate_csv_runtime(
     .await
 }
 
-#[cfg(any(feature = "duckdb", feature = "sqlite", not(windows)))]
 #[expect(clippy::expect_used)]
 async fn assert_csv_query(
     rt: &Arc<Runtime>,
@@ -631,7 +628,6 @@ async fn assert_csv_query(
     );
 }
 
-#[cfg(any(feature = "duckdb", feature = "sqlite", not(windows)))]
 async fn run_drop_recreate_csv_phases(
     engine: &str,
     accel_params: HashMap<String, String>,
@@ -710,7 +706,6 @@ async fn test_drop_recreate_full_csv_sqlite() -> Result<(), anyhow::Error> {
     run_drop_recreate_csv_phases("sqlite", params, &csv_file.to_string_lossy()).await
 }
 
-#[cfg(not(windows))]
 #[tokio::test]
 async fn test_drop_recreate_full_csv_cayenne() -> Result<(), anyhow::Error> {
     let temp_dir = tempfile::tempdir()?;
@@ -955,7 +950,7 @@ async fn test_schema_evolution_widening_duckdb_sync_all_columns() -> Result<(), 
 
 /// Restart-time widening on the Cayenne engine under `sync_all_columns` — same scenario
 /// as the `DuckDB` case, validating the `Cayenne` metastore schema update + provider swap.
-#[cfg(all(feature = "postgres", not(windows)))]
+#[cfg(feature = "postgres")]
 #[tokio::test]
 async fn test_schema_evolution_widening_cayenne_sync_all_columns() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));

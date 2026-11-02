@@ -1,0 +1,155 @@
+name: snapshots-reader-without-source
+description: >
+  A reader with refresh_mode: snapshot follows a writer through the snapshot
+  store alone when its original source table is missing, its credentials are
+  invalid, or its connection is refused. It bootstraps from the writer's first
+  snapshot, then serves newer ones and reports Ready (#15547), including after
+  an abrupt reader restart. Bootstrap-only and enabled consumers never publish their
+  own snapshots. A time column also exercises the enabled timestamp/lag metric
+  paths without waiting for the unavailable source.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  source: [missing-table, bad-credentials, connection-refused]
+  engine: [cayenne, duckdb, sqlite, turso]
+  snapshots: [bootstrap_only, enabled]
+
+variants:
+  writer:
+    datasets: { t: { acceleration: { refresh_mode: full, snapshots: create_only } } }
+  reader:
+    datasets: { t: { acceleration: { refresh_mode: snapshot, snapshots: '${matrix.snapshots}', refresh_check_interval: 1s } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: snapshots-reader-without-source
+  runtime:
+    metrics:
+      - { name: dataset_acceleration_max_timestamp_before_refresh_ms, enabled: true }
+      - { name: dataset_acceleration_max_timestamp_after_refresh_ms, enabled: true }
+      - { name: dataset_acceleration_refresh_lag_ms, enabled: true }
+      - { name: dataset_acceleration_ingestion_lag_ms, enabled: true }
+  snapshots:
+    enabled: true
+    location: file://${instance.dir}/../shared-snapshots/
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: unix_seconds
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file }
+
+defaults:
+  # The variants work together, so they run side by side.
+  run-variants: side-by-side
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text, ts bigint NOT NULL DEFAULT 1767225600);
+        INSERT INTO t (id, v) SELECT i, 'v' || i FROM generate_series(1, 200) i;
+    only: writer
+  # These failures are independent of a missing table. The reader's source
+  # deliberately holds different rows so reading it cannot satisfy the checks.
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text, ts bigint NOT NULL DEFAULT 1767225600);
+        INSERT INTO t (id, v) VALUES (999, 'source-only');
+    only: reader
+    when: { source: [bad-credentials, connection-refused] }
+  # Publish before starting the reader so startup and later replication are
+  # separate observations, rather than a race with the first publication.
+  - start: { ready: false }
+    only: writer
+  - assert-log: { contains: 'Snapshot created dataset=t' }
+    eventually: 30s
+    only: writer
+  - start: { ready: false }
+    only: reader
+    when: { source: missing-table }
+  - start:
+      ready: false
+      patch:
+        datasets:
+          t: { params: { pg_pass: deliberately-wrong } }
+    only: reader
+    when: { source: bad-credentials }
+  - start:
+      ready: false
+      patch:
+        datasets:
+          t: { params: { pg_port: '1' } }
+    only: reader
+    when: { source: connection-refused }
+  - query: SELECT count(*) AS n, sum(id) AS s FROM t
+    expect: { rows: [['200', '20100']] }
+    eventually: 60s
+    only: writer
+  - query: SELECT count(*) AS n, sum(id) AS s FROM t
+    expect: { rows: [['200', '20100']] }
+    eventually: 60s
+    only: reader
+
+  - assert-log: { contains: 'Snapshot restored' }
+    only: reader
+
+  - source-exec: { src: "DELETE FROM t WHERE id > 100; UPDATE t SET v = 'new' WHERE id <= 10" }
+    only: writer
+  - refresh: t
+    only: writer
+  - query: SELECT id, v FROM t
+    expect: { oracle: src }
+    only: writer
+  - wait-metric:
+      name: dataset_acceleration_max_timestamp_before_refresh_ms
+      labels: { dataset: t, mode: full }
+      above: 0
+      timeout: 10s
+    only: writer
+  - assert-log: { count: { 'Snapshot created dataset=t\b': '>=2' } }
+    eventually: 30s
+    only: writer
+  - query: SELECT count(*) AS n, sum(id) AS s, count(*) FILTER (WHERE v = 'new') AS changed FROM t
+    expect: { rows: [['100', '5050', '10']] }
+    eventually: 60s
+    only: reader
+
+  - assert-status: { dataset: t, status: Ready, ready: true }
+    eventually: 10s
+    only: reader
+  - assert-log: { lacks: 'cannot connect to its source because of its configuration' }
+    only: reader
+
+  - restart: { kill: KILL, ready: false }
+    only: reader
+  - query: SELECT count(*) AS n, sum(id) AS s, count(*) FILTER (WHERE v = 'new') AS changed FROM t
+    expect: { rows: [['100', '5050', '10']] }
+    eventually: 60s
+    only: reader
+  - source-exec: { src: "UPDATE t SET v = NULL WHERE id = 1; INSERT INTO t (id, v) VALUES (1000, NULL)" }
+    only: writer
+  - refresh: t
+    only: writer
+  - query: SELECT count(*) AS n, sum(id) AS s, count(v) AS nonnull FROM t
+    expect: { rows: [['101', '6050', '99']] }
+    eventually: 60s
+    only: reader
+  - query: SELECT id, v FROM t WHERE id IN (1, 1000)
+    expect: { rows: [['1', null], ['1000', null]] }
+    only: reader
+  - assert-status: { dataset: t, status: Ready, ready: true }
+    eventually: 10s
+    only: reader
+  - assert-log: { count: { 'Snapshot created dataset=t': 0 } }
+    only: reader
+  - wait-metric:
+      name: dataset_acceleration_refresh_duration_ms_count
+      labels: { dataset: t, mode: snapshot }
+      above: 0
+      timeout: 10s
+    only: reader

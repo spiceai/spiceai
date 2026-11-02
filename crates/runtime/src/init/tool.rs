@@ -28,15 +28,20 @@ use runtime_tools::catalog::SpiceToolCatalog;
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::tool::Tool;
+use tokio::sync::oneshot;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
+
+/// How long startup waits for a Spicepod tool to load before it loads models and workers.
+const TOOL_LOAD_WAIT: Duration = Duration::from_mins(2);
 
 impl Runtime {
     pub(crate) async fn load_tools(self: Arc<Self>) {
         if let Some(app) = self.read_app().await {
-            for tool in &app.tools {
+            join_all(app.tools.iter().map(|tool| {
                 tracing::debug!("Loading tool [{}] from {}...", tool.name, tool.from);
-                Arc::clone(&self).load_tool(tool).await;
-            }
+                Arc::clone(&self).load_tool(tool.clone())
+            }))
+            .await;
         }
 
         let mut spawned_tasks = vec![];
@@ -154,7 +159,30 @@ impl Runtime {
         }
     }
 
-    async fn load_tool(self: Arc<Self>, tool: &Tool) {
+    /// Loads `tool`, retrying until it loads or the runtime shuts down. Returns once it loads, or
+    /// after [`TOOL_LOAD_WAIT`] with the retries still running, so that one tool cannot hold back
+    /// models and workers. A model loaded before the tool does not get it.
+    async fn load_tool(self: Arc<Self>, tool: Tool) {
+        let (loaded_tx, loaded) = oneshot::channel();
+        let shutdown = self.status.shutdown_token();
+        let name = tool.name.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = self.load_tool_until_loaded(&tool) => {
+                    let _ = loaded_tx.send(());
+                }
+                () = shutdown.cancelled() => {}
+            }
+        });
+        if tokio::time::timeout(TOOL_LOAD_WAIT, loaded).await.is_err() {
+            tracing::warn!(
+                "Tool '{name}' did not load within {} seconds. Models and workers load without it while it keeps retrying.",
+                TOOL_LOAD_WAIT.as_secs()
+            );
+        }
+    }
+
+    async fn load_tool_until_loaded(self: &Arc<Self>, tool: &Tool) {
         let retry_strategy = FibonacciBackoffBuilder::new()
             .max_retries(None)
             .max_duration(Some(Duration::from_mins(1)))
@@ -172,7 +200,7 @@ impl Runtime {
             match tools::factory::forge(
                 tool,
                 params_with_secrets,
-                Arc::clone(&self),
+                Arc::clone(self),
                 env_with_secrets,
             )
             .await
@@ -199,5 +227,26 @@ impl Runtime {
             }
         })
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use app::AppBuilder;
+
+    #[tokio::test]
+    async fn a_tool_that_never_loads_does_not_hold_back_models() {
+        let tool: Tool =
+            serde_json::from_value(serde_json::json!({"from": "missing:tool", "name": "broken"}))
+                .expect("a valid tool");
+        let app = AppBuilder::new("tool_load_wait").with_tool(tool).build();
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+        tokio::time::pause();
+        tokio::time::timeout(TOOL_LOAD_WAIT * 2, Arc::clone(&rt).load_models())
+            .await
+            .expect("models load without the tool that never loads");
+        assert!(!rt.tools.read().await.contains_key("broken"));
     }
 }

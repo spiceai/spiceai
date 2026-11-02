@@ -1,6 +1,11 @@
 #syntax=docker/dockerfile:1.7
 
-ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.6.0-cudnn-runtime-ubuntu24.04
+# spiced is built against the CUDA 12.6 toolkit (.github/actions/spiced-cuda-build),
+# and CUDA 12.x runtime libraries are backward compatible with binaries built on
+# an older 12.x toolkit, so any 12.x runtime >= 12.6 works. Keep this on the
+# newest 12.x tag NVIDIA still refreshes.
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04
+ARG CUDA_COMPAT_VERSION=12-9
 
 FROM ${CUDA_RUNTIME_IMAGE} AS binary
 
@@ -37,24 +42,46 @@ RUN set -eux; \
     cp /tmp/pdfium/lib/libpdfium.so /root/libpdfium.so; \
     rm -rf /tmp/pdfium /tmp/pdfium.tgz
 
+# `duckdb:` and `ducklake:` datasets read through the DuckDB library installed
+# on the host, loaded by name at runtime. Keep DUCKDB_VERSION at the newest
+# release test/duckdb_versions.json lists.
+ARG DUCKDB_VERSION=2.0.0
+ARG DUCKDB_SHA256_AMD64=993ad89e7dfca66cd6da994c2cad090c2fc160ddf9f550498a098ab4bb13cfb1
+RUN set -eux; \
+    curl -fSLo /tmp/libduckdb.tar.gz "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb-shared-libs-linux-amd64.tar.gz"; \
+    echo "${DUCKDB_SHA256_AMD64}  /tmp/libduckdb.tar.gz" | sha256sum -c -; \
+    tar -C /root -xzf /tmp/libduckdb.tar.gz libduckdb.so; \
+    rm -f /tmp/libduckdb.tar.gz
+
 FROM ${CUDA_RUNTIME_IMAGE} AS runtime
 
 ENV CUDA_NVCC_FLAGS=-fPIE
 
 ARG CARGO_FEATURES=default
 ARG CUDA_COMPUTE_CAP=80
+ARG CUDA_COMPAT_VERSION
+# Set to a unique value per release build so the apt layer is never served
+# from the build cache and picks up the current Ubuntu security updates.
+ARG APT_CACHE_BUST=
 
 # Allow DuckDB to load extensions
 RUN mkdir /.duckdb/ && chmod 777 /.duckdb/
 
-RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates libssl3 tzdata cuda-compat-12-6 \
-    && rm -rf /var/lib/{apt,dpkg,cache,log}
+# Upgrade the base image's packages too: the CUDA base tag is not rebuilt for
+# every Ubuntu security update. Only the package lists are removed afterwards
+# so the dpkg database stays intact for image scanners.
+RUN echo "apt cache bust: ${APT_CACHE_BUST}" \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade --yes --no-install-recommends \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates libssl3 tzdata "cuda-compat-${CUDA_COMPAT_VERSION}" \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /var/log/apt/* /var/log/dpkg.log
 
 RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
     apt-get update \
     && apt-get install --yes --no-install-recommends unixodbc \
-    && rm -rf /var/lib/{apt,dpkg,cache,log}; \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /var/log/apt/* /var/log/dpkg.log; \
   fi
 
 COPY --from=binary /root/spiced /usr/local/bin/spiced
@@ -62,8 +89,12 @@ COPY --from=binary /root/spiced /usr/local/bin/spiced
 # Copy PDFium next to the binary (dlopen'd at runtime for PDF document parsing)
 COPY --from=binary /root/libpdfium.so /usr/local/bin/libpdfium.so
 
+# Copy libduckdb onto the default library path (loaded by name at runtime for
+# `duckdb:` and `ducklake:`)
+COPY --from=binary /root/libduckdb.so /usr/lib/libduckdb.so
+
 ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
-ENV LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:${LD_LIBRARY_PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda/compat:${LD_LIBRARY_PATH}
 
 WORKDIR /app
 

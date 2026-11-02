@@ -94,7 +94,6 @@ fn spicepod_cores_size_the_runtime_pools() {
     // Installing the budget also declares it to Vortex. Like the budget, the
     // declaration resolves once per process, so only the test that installs
     // the budget can assert it.
-    #[cfg(not(windows))]
     assert_eq!(
         vortex_utils::parallelism::get_available_parallelism(),
         Some(2)
