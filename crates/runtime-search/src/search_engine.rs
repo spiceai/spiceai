@@ -56,8 +56,6 @@ use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestCo
 use search::index::SearchIndex;
 use search::index::chunking::ChunkedSearchIndex;
 use search::index::compound::CompoundVectorIndex;
-#[cfg(feature = "duckdb")]
-use search::index::duckdb::DuckDBVectorIndex;
 use search::index::native_vector::NativeVectorIndex;
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
@@ -177,17 +175,6 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
             }
         }
 
-        #[cfg(feature = "duckdb")]
-        {
-            use search::index::duckdb::DuckDBVectorIndex;
-            if let Some((indexes, _)) = self
-                .explorer
-                .find_index::<DuckDBVectorIndex>(&table_provider)
-            {
-                embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
-            }
-        }
-
         Some(embedding_columns.into_iter().collect())
     }
 
@@ -291,15 +278,6 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
         #[cfg(feature = "s3_vectors")]
         if let Some((indexes, _)) = self.explorer.find_index::<S3Vector>(tbl)
-            && let Some(index) = indexes
-                .into_iter()
-                .find(|idx| idx.search_column() == embedding_column)
-        {
-            return Some(Arc::new(index.clone()) as Arc<dyn SearchIndex>);
-        }
-
-        #[cfg(feature = "duckdb")]
-        if let Some((indexes, _)) = self.explorer.find_index::<DuckDBVectorIndex>(tbl)
             && let Some(index) = indexes
                 .into_iter()
                 .find(|idx| idx.search_column() == embedding_column)

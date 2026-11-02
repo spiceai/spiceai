@@ -700,7 +700,6 @@ fn is_vector_search_index(kind: &str) -> bool {
     matches!(
         kind,
         "NativeVectorIndex"
-            | "duckdb_vector_index"
             | "elasticsearch_index"
             | "s3_vector_index"
             | "memory_vector_index"
@@ -2807,7 +2806,7 @@ mod tests {
             function: VECTOR_SEARCH_UDTF_NAME.to_string(),
             syntax: format!("{VECTOR_SEARCH_UDTF_NAME}(docs, 'query text', {column})"),
             model: "embed_model".to_string(),
-            engine: Some("duckdb_vector_index".to_string()),
+            engine: Some("s3_vectors".to_string()),
             row_id_columns: vec!["id".to_string()],
             vector_size: Some(384),
             chunked: false,

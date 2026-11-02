@@ -1,0 +1,84 @@
+name: 'Mint an Anthropic access token'
+description: >-
+  Exchanges this job's GitHub OIDC token for a short-lived Anthropic access token through
+  Anthropic workload identity federation, and exports it, masked, as SPICE_ANTHROPIC_AUTH_TOKEN
+  for the steps that follow. The token lives only as long as the federation rule allows
+  (`expires_in` is logged) and nothing refreshes it, so run this right before each step that
+  calls Anthropic. The job needs `permissions: id-token: write` and `environment: ci`, whose
+  secrets hold the identifiers. Anthropic accepts the token only as a bearer token, so a model
+  sends it as `anthropic_auth_token`, never `anthropic_api_key`.
+inputs:
+  federation-rule-id:
+    description: 'The federation rule (`fdrl_...`) that accepts this job''s GitHub OIDC token'
+    required: true
+  organization-id:
+    description: 'The Anthropic organization ID (a UUID)'
+    required: true
+  service-account-id:
+    description: 'The service account (`svac_...`) the token acts as'
+    required: true
+  workspace-id:
+    description: 'The workspace (`wrkspc_...`) to scope the token to; required when the rule spans more than one workspace'
+    required: false
+    default: ''
+runs:
+  using: 'composite'
+  steps:
+    - name: Exchange the GitHub OIDC token for an Anthropic access token
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        FEDERATION_RULE_ID: ${{ inputs.federation-rule-id }}
+        ORGANIZATION_ID: ${{ inputs.organization-id }}
+        SERVICE_ACCOUNT_ID: ${{ inputs.service-account-id }}
+        WORKSPACE_ID: ${{ inputs.workspace-id }}
+      with:
+        script: |
+          const history = 'https://platform.claude.com/settings/workload-identity-federation?tab=history';
+          // An earlier step's token may have expired: a failed exchange leaves none behind, so
+          // the step after it reports a missing token rather than an expired one.
+          core.exportVariable('SPICE_ANTHROPIC_AUTH_TOKEN', '');
+          const ids = {
+            federation_rule_id: process.env.FEDERATION_RULE_ID,
+            organization_id: process.env.ORGANIZATION_ID,
+            service_account_id: process.env.SERVICE_ACCOUNT_ID,
+          };
+          const missing = Object.entries(ids).filter(([, value]) => !value).map(([name]) => name);
+          if (missing.length > 0) {
+            core.setFailed(`Failed to mint an Anthropic access token: no ${missing.join(', ')} was given, so no step in this job can call Anthropic. Pass them from the 'ci' environment's ANTHROPIC_* secrets and give the job 'environment: ci'.`);
+            return;
+          }
+          if (process.env.WORKSPACE_ID) {
+            ids.workspace_id = process.env.WORKSPACE_ID;
+          }
+
+          let assertion;
+          try {
+            assertion = await core.getIDToken('https://api.anthropic.com');
+          } catch (error) {
+            core.setFailed(`Failed to get this job's GitHub OIDC token, so no Anthropic access token can be minted: ${error.message}. Give the job 'permissions: id-token: write'.`);
+            return;
+          }
+          core.setSecret(assertion);
+
+          const response = await fetch('https://api.anthropic.com/v1/oauth/token', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion, ...ids }),
+          });
+          const text = await response.text();
+          let body = {};
+          try {
+            body = JSON.parse(text);
+          } catch {
+            // Reported below with the raw text.
+          }
+          if (!response.ok || typeof body.access_token !== 'string') {
+            const reason = body.error?.message ?? text.slice(0, 300);
+            const requestId = response.headers.get('request-id') ?? 'unknown';
+            core.setFailed(`Failed to exchange this job's GitHub OIDC token for an Anthropic access token (HTTP ${response.status}, request ${requestId}): ${reason}. Anthropic records why it refused an exchange only in its authentication history: ${history}`);
+            return;
+          }
+          core.setSecret(body.access_token);
+          core.exportVariable('SPICE_ANTHROPIC_AUTH_TOKEN', body.access_token);
+          const expiresAt = new Date(Date.now() + body.expires_in * 1000).toISOString();
+          core.info(`Minted an Anthropic access token (scope ${body.scope}) that expires in ${body.expires_in}s, at ${expiresAt}.`);

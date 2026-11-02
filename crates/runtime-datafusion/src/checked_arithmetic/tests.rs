@@ -34,7 +34,7 @@ use crate::analyzer_rule::AnalyzerRulesBuilder;
 use crate::checked_arithmetic::op::checked_op_udf;
 use crate::checked_arithmetic::{
     CHECKED_ADD_UDF_NAME, CHECKED_MUL_UDF_NAME, CHECKED_SUB_UDF_NAME, CheckedIntegerOverflow,
-    install_checked_eager_aggregation, install_checked_single_distinct,
+    install_checked_eager_aggregation, install_checked_single_distinct, plain_arithmetic,
     register_checked_arithmetic,
 };
 use crate::session_config::get_df_default_config;
@@ -1437,4 +1437,56 @@ fn next_sql(first: &str, lines: &mut std::iter::Peekable<std::str::Lines<'_>>) -
         }
     }
     sql.trim_end_matches(';').to_string()
+}
+
+/// The plan `sql` optimizes to on `ctx`, as `EXPLAIN` indents it.
+async fn optimized_plan(ctx: &SessionContext, sql: &str) -> datafusion::logical_expr::LogicalPlan {
+    let state = ctx.state();
+    let plan = state
+        .create_logical_plan(sql)
+        .await
+        .unwrap_or_else(|error| panic!("`{sql}` plans: {error}"));
+    state
+        .optimize(&plan)
+        .unwrap_or_else(|error| panic!("`{sql}` optimizes: {error}"))
+}
+
+/// A write a provider renders for another engine carries the operators
+/// `DataFusion` itself plans, not Spice's checked kernels: restoring them in
+/// the checked session's plan gives exactly the plan of a session that never
+/// rewrote them.
+#[tokio::test]
+async fn plain_arithmetic_restores_the_operators_of_an_update_and_a_delete() {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+
+    for sql in [
+        "UPDATE t SET big = big + 1, i = i * 2 WHERE big - id > 0",
+        "DELETE FROM t WHERE big * 2 = id + 1",
+    ] {
+        let checked = optimized_plan(&checked_session(), sql).await;
+        let rendered = checked.display_indent().to_string();
+        assert!(
+            [
+                CHECKED_ADD_UDF_NAME,
+                CHECKED_SUB_UDF_NAME,
+                CHECKED_MUL_UDF_NAME
+            ]
+            .iter()
+            .any(|name| rendered.contains(name)),
+            "the checked session rewrites `{sql}`:\n{rendered}"
+        );
+
+        let restored = checked
+            .transform_up(|plan| {
+                plan.map_expressions(|expr| plain_arithmetic(expr).map(Transformed::yes))
+            })
+            .expect("restore the operators")
+            .data;
+        let vanilla = optimized_plan(&vanilla_session(), sql).await;
+        assert_eq!(
+            restored.display_indent().to_string(),
+            vanilla.display_indent().to_string(),
+            "`{sql}`"
+        );
+    }
 }

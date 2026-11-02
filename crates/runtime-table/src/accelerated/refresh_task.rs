@@ -215,10 +215,10 @@ pub(crate) fn indexes_from_federated(
 /// An external-store vector/search index (e.g. S3 Vectors, Elasticsearch) is only ever attached
 /// via `IndexLayer` on the *federated/read* side (`EmbeddingConnector::wrap_table` wraps
 /// the source connector, not the accelerator) — `collect_indexes_from_provider(accelerator)` alone
-/// finds nothing for these. The `DuckDB` vector engine is the opposite: it wraps the *accelerator*
-/// itself (`wrap_accelerator_with_duckdb_vector_indexes`), not the federated side. Both are checked
-/// here, deduplicating by pointer identity (mirroring `collect_indexes_from_provider`'s own dedup)
-/// in case an index is ever reachable through both paths.
+/// finds nothing for these, while an index layered over the *accelerator* itself is found only
+/// there. Both are checked here, deduplicating by pointer identity (mirroring
+/// `collect_indexes_from_provider`'s own dedup) in case an index is ever reachable through both
+/// paths.
 pub(crate) fn collect_all_indexes(
     accelerator: &Arc<dyn datafusion::catalog::TableProvider>,
     federated: &FederatedTable,

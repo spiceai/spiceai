@@ -255,15 +255,13 @@ jobs:
           # superset of what that target was already built with -- not because the targets
           # are ungated. They are gated: `integration_aws_sdk` gates on
           # `all(databricks, delta_lake)`, and `snapshot_refresh` gates each backend on
-          # `duckdb`/`sqlite`/`turso`. Every one of those features is in this set, so every
-          # gate that was satisfied before is still satisfied, and `turso` is the only one
-          # this set previously lacked. `integration` itself is unaffected: its lone `turso`
-          # gate sits inside an `any(...)` that `postgres`/`duckdb`/`sqlite` already satisfy.
-          # `turso` alongside `postgres`/`mysql`/`delta_lake`/`duckdb`/`sqlite` is the
-          # combination `make test-integration` runs.
+          # `duckdb`/`sqlite`. Every one of those features is in this set, so every gate
+          # that was satisfied before is still satisfied.
+          # `postgres`/`mysql`/`delta_lake`/`duckdb`/`sqlite` is the combination
+          # `make test-integration` runs.
           # `debezium` compiles the `cdc_ingest` and `cdc_cayenne` Debezium tests, which
           # are gated on it and run nowhere else.
-          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,debezium,iceberg-write,snapshots,mongodb,turso"
+          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,debezium,iceberg-write,snapshots,mongodb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
             echo "Including extended_tests"
@@ -407,7 +405,7 @@ jobs:
 
       - name: Login to DockerHub
         if: needs.check_changes.outputs.relevant_changes == 'true' && github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -619,7 +617,7 @@ jobs:
 
       - name: Login to DockerHub
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -1066,7 +1064,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -1129,7 +1127,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -1195,7 +1193,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -1309,7 +1307,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
