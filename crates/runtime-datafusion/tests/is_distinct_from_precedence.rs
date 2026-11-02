@@ -22,6 +22,11 @@ limitations under the License.
 //! (apache/datafusion-sqlparser-rs#2436). Every expected value below is what
 //! PostgreSQL 17.5 returns for the same statement.
 
+#![expect(
+    clippy::expect_used,
+    reason = "test helpers fail the test on unexpected parse or query errors"
+)]
+
 use arrow::util::display::array_value_to_string;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{BinaryOperator, Expr, SelectItem, SetExpr, Statement};
