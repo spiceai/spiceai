@@ -1574,7 +1574,7 @@ impl<'a> AppendMutationWriter<'a> {
     /// high water.
     #[expect(
         clippy::too_many_arguments,
-        reason = "experiment: one call per write arm"
+        reason = "a published write has seven independent outcome parts, and both commit paths hand them over in one call"
     )]
     async fn finish_published_write(
         &self,
