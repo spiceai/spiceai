@@ -267,6 +267,16 @@ pub enum Error {
          See: https://spiceai.org/docs/components/data-connectors/mysql"
     ))]
     AnonymousTransactionUnderGtid { dataset: String },
+
+    #[snafu(display(
+        "MySQL replication for {dataset}: this dataset is positioning by GTID, but the source \
+         committed a transaction under the tagged GTID '{gtid}'. Spice records the transactions \
+         it applied as untagged GTIDs, so it cannot record this one or resume after it, and \
+         replication stopped rather than skip or repeat transactions. Commit transactions on \
+         the source without a GTID tag. \
+         See: https://spiceai.org/docs/components/data-connectors/mysql"
+    ))]
+    TaggedTransactionUnderGtid { dataset: String, gtid: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

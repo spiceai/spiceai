@@ -1,0 +1,119 @@
+name: snapshots-index-restore
+description: >
+  A snapshot restored onto empty local storage while Postgres is offline
+  preserves every row and its secondary lookup index (#14803, #15068).
+  Deleted keys stay absent, moved keys and NULLs survive, and empty snapshots
+  replace older nonempty ones. Both runtime.state and a dataset location work,
+  including partition child tables and NULL partition keys (#13241, #14238).
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  runtime-state: {}
+  partitioned:
+    datasets:
+      t:
+        acceleration:
+          indexes: null
+          partition_by: ['bucket(4, grp)']
+  dataset-location:
+    spicepod:
+      runtime: { state: null }
+    datasets:
+      t:
+        acceleration:
+          snapshots_location: file://${instance.dir}/snapshots/
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: snapshots-index-restore
+  runtime:
+    state: { location: 'file://${instance.dir}/state/' }
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        refresh_check_interval: 1h
+        snapshots: enabled
+        primary_key: id
+        indexes: { grp: enabled }
+        params: { cayenne_file_path: '${instance.dir}/accel-1/data', cayenne_metadata_dir: '${instance.dir}/accel-1/meta' }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id bigint PRIMARY KEY, grp int, v text, amount numeric(18,2));
+        INSERT INTO t SELECT i, i % 97, 'v' || i, i * 1.25 FROM generate_series(1, 10000) i;
+        INSERT INTO t VALUES (-1, NULL, NULL, -9999999999999999.99), (0, 42, '', 9999999999999999.99);
+  - start: {}
+  - query: SELECT * FROM t
+  - assert-log: { contains: 'Snapshot created dataset=t' }
+    eventually: 30s
+  - source-exec:
+      src: |
+        DELETE FROM t WHERE grp = 43;
+        UPDATE t SET grp = 42, v = NULL, amount = NULL WHERE id BETWEEN 1 AND 50;
+        INSERT INTO t VALUES (10001, 42, 'new', 0.01);
+  - refresh: t
+  - query: SELECT * FROM t
+    id: latest
+  - query: SELECT * FROM t WHERE grp IN (42, 43)
+    id: lookup
+  - query: SELECT * FROM t WHERE grp IS NULL
+    id: nulls
+  - assert-log: { count: { 'Snapshot created dataset=t\b': '>=2' } }
+    eventually: 30s
+  - stop: {}
+  - stop-source: src
+  - start:
+      ready: false
+      patch:
+        datasets:
+          t: { acceleration: { params: { cayenne_file_path: '${instance.dir}/accel-2/data', cayenne_metadata_dir: '${instance.dir}/accel-2/meta' } } }
+  - query: SELECT * FROM t
+    expect: { same-as: latest }
+    eventually: 60s
+  - query: SELECT * FROM t WHERE grp IN (42, 43)
+    expect: { same-as: lookup }
+  - query: SELECT * FROM t WHERE grp IS NULL
+    expect: { same-as: nulls }
+  - query: SELECT * FROM t WHERE grp = 43
+    expect-empty: true
+    expect: { rows: [] }
+  - explain: SELECT * FROM t WHERE grp = 42
+    contains: lookup_index=grp
+    only: [runtime-state, dataset-location]
+  - assert-log: { contains: 'Snapshot restored' }
+
+  # A published empty table must supersede the older rows on another restore.
+  - start-source: src
+  - source-exec: { src: 'DELETE FROM t' }
+  - refresh: t
+  - query: SELECT * FROM t
+    expect-empty: true
+  - assert-log: { count: { 'Snapshot created dataset=t\b': '>=3' } }
+    eventually: 30s
+  - stop: {}
+  - stop-source: src
+  - start:
+      ready: false
+      patch:
+        datasets:
+          t: { acceleration: { params: { cayenne_file_path: '${instance.dir}/accel-3/data', cayenne_metadata_dir: '${instance.dir}/accel-3/meta' } } }
+  - query: SELECT * FROM t
+    expect: { rows: [] }
+    expect-empty: true
+    eventually: 60s
+  - query: SELECT * FROM t WHERE grp = 42
+    expect: { rows: [] }
+    expect-empty: true

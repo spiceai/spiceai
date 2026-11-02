@@ -18,8 +18,6 @@ limitations under the License.
 //! `sum`/`count`) through the real write path, including N>1 mem-tier CDC delete
 //! retraction (the lag-lever + IVM co-existence path) and spicepod runtime wiring.
 
-#![cfg(not(target_os = "windows"))]
-
 use std::sync::Arc;
 use std::time::Duration;
 

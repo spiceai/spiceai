@@ -422,16 +422,50 @@ mod tests {
         }
     }
 
+    async fn assert_rejected_drift_forgets_cached_version(
+        table: S3SingleFileCached,
+        cached_location: &str,
+    ) {
+        use crate::file_schema_drift::mark_acceleration_refresh;
+        use datafusion::prelude::{SessionConfig, SessionContext};
+
+        *table.cached_metadata.write().await =
+            Some(make_meta(cached_location, 1, 1, Some("e"), None));
+
+        let mut session = SessionConfig::new();
+        mark_acceleration_refresh(&mut session);
+        let ctx = SessionContext::new_with_config(session);
+        ctx.register_table("base", Arc::new(table) as Arc<dyn TableProvider>)
+            .expect("register");
+        let scanned = ctx
+            .sql("SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("plan")
+            .collect()
+            .await;
+        assert!(
+            matches!(scanned, Err(ref e) if e.to_string().contains("'amount_cents'")),
+            "the refresh scan must be rejected: {scanned:?}"
+        );
+
+        let provider = ctx.table_provider("base").await.expect("provider");
+        let table = provider
+            .downcast_ref::<S3SingleFileCached>()
+            .expect("the registered table");
+        assert!(
+            table.cached_metadata.read().await.is_none(),
+            "the next refresh must check the file again instead of skipping it"
+        );
+    }
+
     #[tokio::test]
     async fn rejected_drift_scan_forgets_the_cached_file_version() {
-        use crate::file_schema_drift::{FileSchemaDriftGuard, mark_acceleration_refresh};
+        use crate::file_schema_drift::FileSchemaDriftGuard;
         use arrow::array::{Int64Array, RecordBatch};
         use arrow::datatypes::{DataType, Field};
-        use datafusion::prelude::{SessionConfig, SessionContext};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("base.parquet");
-        // The source file renamed `amount_cents` to `amt`.
         let file_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, true),
             Field::new("amt", DataType::Int64, true),
@@ -464,33 +498,36 @@ mod tests {
         let table = S3SingleFileCached::try_new(listing, store, "base".to_string())
             .expect("single file")
             .with_schema_drift_guard(FileSchemaDriftGuard::new("base", registered, format));
-        *table.cached_metadata.write().await =
-            Some(make_meta("base.parquet", 1, 1, Some("e"), None));
+        assert_rejected_drift_forgets_cached_version(table, "base.parquet").await;
+    }
 
-        let mut session = SessionConfig::new();
-        mark_acceleration_refresh(&mut session);
-        let ctx = SessionContext::new_with_config(session);
-        ctx.register_table("base", Arc::new(table) as Arc<dyn TableProvider>)
-            .expect("register");
-        let scanned = ctx
-            .sql("SELECT sum(amount_cents) FROM base")
-            .await
-            .expect("plan")
-            .collect()
-            .await;
-        assert!(
-            matches!(scanned, Err(ref e) if e.to_string().contains("'amount_cents'")),
-            "the refresh scan must be rejected: {scanned:?}"
-        );
+    #[tokio::test]
+    async fn rejected_csv_drift_scan_forgets_the_cached_file_version() {
+        use crate::csv_header_projection::HeaderProjectedCsvFormat;
+        use crate::file_schema_drift::FileSchemaDriftGuard;
+        use arrow::datatypes::{DataType, Field};
+        use datafusion::datasource::file_format::csv::CsvFormat;
 
-        let provider = ctx.table_provider("base").await.expect("provider");
-        let table = provider
-            .downcast_ref::<S3SingleFileCached>()
-            .expect("the registered table");
-        assert!(
-            table.cached_metadata.read().await.is_none(),
-            "the next refresh must check the file again instead of skipping it"
-        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("base.csv");
+        std::fs::write(&path, "id,amt\n1,2\n").expect("write csv");
+
+        let registered = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("amount_cents", DataType::Int64, true),
+        ]));
+        let format =
+            HeaderProjectedCsvFormat::wrap(Arc::new(CsvFormat::default().with_has_header(true)));
+        let url = ListingTableUrl::parse(format!("file://{}", path.display())).expect("url");
+        let config = ListingTableConfig::new(url)
+            .with_listing_options(ListingOptions::new(Arc::clone(&format)))
+            .with_schema(Arc::clone(&registered));
+        let listing = Arc::new(ListingTable::try_new(config).expect("listing table"));
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+        let table = S3SingleFileCached::try_new(listing, store, "base".to_string())
+            .expect("single file")
+            .with_schema_drift_guard(FileSchemaDriftGuard::new("base", registered, format));
+        assert_rejected_drift_forgets_cached_version(table, "base.csv").await;
     }
 
     #[derive(Debug)]

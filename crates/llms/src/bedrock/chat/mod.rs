@@ -23,8 +23,8 @@ use crate::bedrock::api_error;
 use crate::bedrock::chat::guardrail::GuardRail;
 use crate::bedrock::chat::reasoning::{ReasoningControl, ReasoningRequest};
 use crate::bedrock::chat::util::{
-    chat_choice_stream, convert_usage, extract_from_content_block, into_fallible_stream,
-    to_api_error, tool_config, try_convert_finish_reason, try_convert_role, value_to_document,
+    ResponseParts, chat_choice_stream, convert_usage, into_fallible_stream, to_api_error,
+    tool_config, try_convert_finish_reason, try_convert_role, value_to_document,
 };
 use crate::bedrock::model_id::ModelId;
 use crate::chat::Chat;
@@ -600,28 +600,28 @@ impl BedrockConverse {
         let Some(choices) = output
             .output
             .map(|o| {
-                let Message { role, content, .. } =
-                    o.as_message().map_err(|e| to_api_error(format!("{e:?}")))?;
+                let Message {
+                    role,
+                    content: blocks,
+                    ..
+                } = o.as_message().map_err(|e| to_api_error(format!("{e:?}")))?;
 
-                let (texts, tool_calls): (Vec<_>, Vec<_>) = content
-                    .iter()
-                    .map(extract_from_content_block)
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .unzip();
+                let ResponseParts {
+                    content,
+                    reasoning,
+                    tool_calls,
+                } = ResponseParts::try_from_blocks(blocks)?;
 
-                // Convert tool_calls from Vec<ChatCompletionMessageToolCall> to Vec<ChatCompletionMessageToolCalls>
                 let tool_calls_enum: Vec<ChatCompletionMessageToolCalls> = tool_calls
                     .into_iter()
-                    .flatten()
                     .map(ChatCompletionMessageToolCalls::Function)
                     .collect();
 
                 Ok::<_, OpenAIError>(ChatChoice {
                     index: 0,
                     message: ChatCompletionResponseMessage {
-                        reasoning_content: None,
-                        content: Some(texts.into_iter().flatten().join("\n")),
+                        reasoning_content: (!reasoning.is_empty()).then(|| reasoning.join("\n")),
+                        content: Some(content.join("\n")),
                         // Converse has no refusal: a guardrail or content filter that stops the
                         // reply is reported through `finish_reason`.
                         refusal: None,
@@ -887,6 +887,8 @@ impl Chat for BedrockConverse {
 mod tests {
     use super::*;
     use async_openai::types::chat::ChatCompletionRequestUserMessageArgs;
+    use aws_config::{BehaviorVersion, Region, SdkConfig};
+    use aws_sdk_bedrockruntime::types::{ReasoningContentBlock, ReasoningTextBlock};
 
     #[test]
     fn prompt_cache_point_is_added_to_last_message() {
@@ -911,6 +913,109 @@ mod tests {
             Some(ContentBlock::CachePoint(cache_point))
                 if cache_point.r#type == CachePointType::Default
         ));
+    }
+
+    fn converse_reply(blocks: Vec<ContentBlock>) -> ConverseOutput {
+        let message = Message::builder()
+            .role(ConversationRole::Assistant)
+            .set_content(Some(blocks))
+            .build()
+            .expect("message should build");
+        ConverseOutput::builder()
+            .output(aws_sdk_bedrockruntime::types::ConverseOutput::Message(
+                message,
+            ))
+            .stop_reason(aws_sdk_bedrockruntime::types::StopReason::EndTurn)
+            .build()
+            .expect("converse output should build")
+    }
+
+    fn reasoning_block(text: &str) -> ContentBlock {
+        ContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(
+            ReasoningTextBlock::builder()
+                .text(text)
+                .build()
+                .expect("reasoning text should build"),
+        ))
+    }
+
+    /// A converse model with a client that is never sent a request.
+    fn converse(model_id: &str) -> BedrockConverse {
+        let config = SdkConfig::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::from_static("us-east-1"))
+            .build();
+        BedrockConverse::new(Arc::new(BedrockClient::from(&config)), model_id.to_string())
+    }
+
+    fn converted_message(blocks: Vec<ContentBlock>) -> ChatCompletionResponseMessage {
+        converse("test-model")
+            .convert_converse_output(converse_reply(blocks))
+            .expect("converse output should convert")
+            .choices
+            .into_iter()
+            .next()
+            .expect("one choice")
+            .message
+    }
+
+    // Regression test for #15406: reasoning text must not go into `content`.
+    #[test]
+    fn reasoning_text_goes_to_reasoning_content_not_content() {
+        let message = converted_message(vec![
+            ContentBlock::Text("\n\n4".to_string()),
+            reasoning_block("Okay, the user asks for 2+2."),
+        ]);
+
+        assert_eq!(message.content.as_deref(), Some("\n\n4"));
+        assert_eq!(
+            message.reasoning_content.as_deref(),
+            Some("Okay, the user asks for 2+2.")
+        );
+    }
+
+    // Regression test for #15406: a reasoning draft of a JSON answer must not reach the answer
+    // text, or `ai_*` decisions see two JSON objects.
+    #[test]
+    fn json_answer_is_the_only_content_when_reasoning_holds_a_draft() {
+        let answer = r#"{"answers":{"q000":1.0}}"#;
+        let message = converted_message(vec![
+            ContentBlock::Text(answer.to_string()),
+            reasoning_block(r#"A first draft is {"answers":{"q000":0.5}}. Let me check."#),
+        ]);
+
+        let content = message.content.expect("content should be set");
+        assert_eq!(content, answer);
+        serde_json::from_str::<Value>(&content).expect("content should be exactly one JSON value");
+        assert!(
+            message
+                .reasoning_content
+                .is_some_and(|reasoning| reasoning.contains("first draft"))
+        );
+    }
+
+    #[test]
+    fn redacted_reasoning_is_dropped_without_error() {
+        let message = converted_message(vec![
+            ContentBlock::ReasoningContent(ReasoningContentBlock::RedactedContent(
+                aws_smithy_types::Blob::new(b"encrypted".to_vec()),
+            )),
+            ContentBlock::Text("answer".to_string()),
+        ]);
+
+        assert_eq!(message.content.as_deref(), Some("answer"));
+        assert_eq!(message.reasoning_content, None);
+    }
+
+    #[test]
+    fn reply_without_reasoning_has_no_reasoning_content() {
+        let message = converted_message(vec![
+            ContentBlock::Text("first".to_string()),
+            ContentBlock::Text("second".to_string()),
+        ]);
+
+        assert_eq!(message.content.as_deref(), Some("first\nsecond"));
+        assert_eq!(message.reasoning_content, None);
     }
 
     #[test]

@@ -32,19 +32,24 @@ use adbc_driver_manager::{ManagedDatabase, ManagedDriver};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::adbc_helpers::{
-    build_db_options, dialect_for_driver, enrich_with_bigquery_metadata,
+    DUCKDB_DRIVER, build_db_options, connection_secrets, dialect_for_driver, driver_entrypoint,
+    enrich_with_bigquery_metadata, scrub_connection_secrets,
 };
 use data_components::catalog_filter::TableSelector;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
+use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
 use futures::stream::{self, StreamExt};
-use runtime_datafusion::function_support::expression_support_for_engine;
+use runtime_datafusion::dialect::new_duckdb_dialect;
+use runtime_datafusion::function_support::{
+    deny_spice_functions_for_duckdb_table_providers, expression_support_for_engine,
+};
 use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use snafu::prelude::*;
 use std::any::Any;
@@ -99,22 +104,21 @@ pub enum Error {
         source: adbc_core::error::Error,
     },
 
-    #[snafu(display(
-        "Failed to create ADBC database (driver='{driver_location}', uri='{uri}'): {source}"
-    ))]
+    /// `message` is the driver's error with the connection's credentials
+    /// scrubbed; the raw error is not kept because drivers echo the URI.
+    #[snafu(display("Failed to create ADBC database (driver='{driver_location}'): {message}"))]
     UnableToCreateDatabase {
         driver_location: String,
-        uri: String,
-        source: adbc_core::error::Error,
+        message: String,
     },
 
+    /// `message` is the pool error with the connection's credentials scrubbed.
     #[snafu(display(
-        "Failed to create ADBC connection pool (driver='{driver_location}', uri='{uri}'): {source}"
+        "Failed to create ADBC connection pool (driver='{driver_location}'): {message}"
     ))]
     UnableToCreateConnectionPool {
         driver_location: String,
-        uri: String,
-        source: datafusion_table_providers::sql::db_connection_pool::Error,
+        message: String,
     },
 
     #[snafu(display(
@@ -253,17 +257,34 @@ where
     <D::ConnectionType as adbc_core::Connection>::StatementType:
         datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement,
 {
-    // The engine's per-expression gate rides on the plain policy: a cast the
-    // engine evaluates differently from DataFusion stays local on this route
-    // as on the engine's own connector (issue #14482).
-    let function_support = deny_spice_functions_for_table_providers();
-    let function_support = match expression_support_for_engine(driver_name) {
-        Some(gate) => function_support.with_expression_support(gate),
-        None => function_support,
+    // The DuckDB dialect and policy must stay paired with
+    // `catalog_dialect_for_driver`, including its decimal avg gate (#14492).
+    let function_support = if driver_name == DUCKDB_DRIVER {
+        deny_spice_functions_for_duckdb_table_providers()
+    } else {
+        // Keep casts the engine evaluates differently from DataFusion local (#14482).
+        let support = deny_spice_functions_for_table_providers();
+        match expression_support_for_engine(driver_name) {
+            Some(gate) => runtime_udfs_api::and_expression_support(support, gate),
+            None => support,
+        }
     };
     AdbcTableFactory::new(pool)
         .with_federation_enabled(federation_enabled)
         .with_function_support(function_support)
+}
+
+/// Returns the dialect used for tables discovered through an ADBC catalog.
+///
+/// The `DuckDB` dialect and the policy in [`build_table_factory`] must stay paired.
+/// Other drivers retain the stock dialects from the shared ADBC helpers.
+#[must_use]
+pub fn catalog_dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
+    if driver_name == DUCKDB_DRIVER {
+        Some(new_duckdb_dialect())
+    } else {
+        dialect_for_driver(driver_name)
+    }
 }
 
 /// Maximum number of concurrent ADBC table provider creation tasks during catalog discovery.
@@ -293,7 +314,8 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
     let username = params.parameters.get("username").expose().ok();
     let password = params.parameters.get("password").expose().ok();
     let driver_options = params.parameters.get("driver_options").expose().ok();
-    let db_options = build_db_options(&uri_str, username, password, driver_options);
+    let db_options = build_db_options(driver_name, &uri_str, username, password, driver_options);
+    let secrets = connection_secrets(driver_name, &uri_str, password, driver_options);
 
     let parse_pool_param = |name: &str| -> Result<Option<u32>> {
         match params.parameters.get(name).expose().ok() {
@@ -327,7 +349,7 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
     tokio::task::spawn_blocking(move || -> Result<(String, Arc<ADBCPool<_>>)> {
         let mut driver = ManagedDriver::load_from_name(
             &driver_location,
-            None,
+            driver_entrypoint(&driver_name),
             AdbcVersion::V110,
             LOAD_FLAG_DEFAULT,
             None,
@@ -336,21 +358,24 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
             driver_location: driver_location.clone(),
         })?;
 
-        let db =
-            driver
-                .new_database_with_opts(db_options)
-                .context(UnableToCreateDatabaseSnafu {
-                    driver_location: driver_location.clone(),
-                    uri: uri_str.clone(),
-                })?;
+        let db = driver.new_database_with_opts(db_options).map_err(|e| {
+            UnableToCreateDatabaseSnafu {
+                driver_location: driver_location.clone(),
+                message: scrub_connection_secrets(&e.to_string(), &secrets),
+            }
+            .build()
+        })?;
 
         let pool = AdbcConnectionPoolBuilder::new(db)
             .with_max_size(pool_size)
             .with_min_idle(pool_min_idle)
             .build()
-            .context(UnableToCreateConnectionPoolSnafu {
-                driver_location,
-                uri: uri_str,
+            .map_err(|e| {
+                UnableToCreateConnectionPoolSnafu {
+                    driver_location,
+                    message: scrub_connection_secrets(&e.to_string(), &secrets),
+                }
+                .build()
             })?;
 
         Ok((driver_name, Arc::new(pool)))
@@ -485,7 +510,7 @@ impl AdbcCatalogProvider {
             std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
         let start = Instant::now();
-        let dialect = dialect_for_driver(&self.driver_name);
+        let dialect = catalog_dialect_for_driver(&self.driver_name);
         let selector = self.selector.clone();
         let schema_name_owned = schema_name.to_owned();
 

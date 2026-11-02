@@ -175,13 +175,16 @@ impl TableFunctionImpl for ExecutorTableFunc {
         let client = build_peer_client(&endpoint, df.cluster_config.client_tls_config())?;
         let cookie_store = Arc::new(CookieStore::new());
 
-        Ok(Arc::new(FlightSQLTable::create_with_schema(
-            EXECUTOR_TABLE_UDTF_NAME,
-            &endpoint,
-            client,
-            table_ref,
-            schema,
-            cookie_store,
-        )))
+        Ok(Arc::new(
+            FlightSQLTable::create_with_schema(
+                EXECUTOR_TABLE_UDTF_NAME,
+                &endpoint,
+                client,
+                table_ref,
+                schema,
+                cookie_store,
+            )
+            .with_spice_sql(true),
+        ))
     }
 }

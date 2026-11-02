@@ -20,6 +20,7 @@ use std::{
 };
 
 use super::SampleFrom;
+use crate::utils::{MAX_TOOL_RESULT_BYTES, collect_batches_bounded};
 use arrow::{array::RecordBatch, compute::concat_batches};
 use datafusion::{
     common::TableReference,
@@ -35,8 +36,8 @@ use datafusion::{
         },
     },
 };
-use futures::TryStreamExt;
 use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
+use runtime_query_engine::sql_depth_guard::ensure_data_types_within_depth_limit;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu, ensure};
@@ -106,10 +107,7 @@ impl SampleFrom for TopSamplesParams {
                     tbl = tbl_quoted,
                 )))
                 .await?;
-            stream
-                .try_collect::<Vec<RecordBatch>>()
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+            collect_batches_bounded(stream, MAX_TOOL_RESULT_BYTES).await
         }
         .instrument(current_span)
         .await?;
@@ -160,6 +158,11 @@ fn strip_order_by_prefix(order_by_raw: &str) -> Result<&str> {
 
 fn parse_order_by_expression(order_by: &str, order_by_raw: &str) -> Result<OrderByExpr> {
     let sql = format!("SELECT * FROM tbl ORDER BY {order_by}");
+    ensure_data_types_within_depth_limit(&sql, &PostgreSqlDialect {}).context(
+        UnableToParseOrderBySnafu {
+            order_by: order_by_raw.to_string(),
+        },
+    )?;
     let mut statements = DFParser::parse_sql_with_dialect(sql.as_str(), &PostgreSqlDialect {})
         .context(UnableToParseOrderBySnafu {
             order_by: order_by_raw.to_string(),

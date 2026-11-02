@@ -54,8 +54,7 @@ use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 
 use data_accelerator_api::{
-    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator, keep_first,
-    upsert_dedup,
+    AccelerationSource, BootstrapStatus, DataAccelerator, keep_first, pk_write_guard, upsert_dedup,
 };
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_checkpoint_api::CheckpointError;
@@ -428,7 +427,6 @@ impl DataAccelerator for SqliteAccelerator {
     async fn sidecar(
         &self,
         source: &dyn AccelerationSource,
-        _registry: Arc<AcceleratorEngineRegistry>,
         open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
         let sqlite_file =
@@ -637,14 +635,27 @@ impl DataAccelerator for SqliteAccelerator {
         let read_provider = Arc::clone(&sqlite_writer.read_provider);
         let sqlite_writer = Arc::new(sqlite_writer.clone());
 
-        // Wrap with upsert deduplication if needed
-        let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+        // Validate NULL primary keys and in-batch duplicates as the stream
+        // flows into SQLite. The sink otherwise reports a failed write as
+        // `Query is not read-only` (#14757); the guard records its first
+        // error and prefers it. A non-INTEGER PRIMARY KEY accepts NULL.
+        // Configured `upsert_dedup` sits above this so it can collapse a
+        // repeated key before uniqueness is judged. `keep_first` sits above
+        // both so `on_conflict: drop` still keeps the first copy.
+        let write_provider = pk_write_guard::wrap_with_pk_write_guard_if_needed(
             sqlite_writer,
+            cmd.schema.as_arrow(),
+            &cmd.constraints,
+            keep_first::NanKey::Null,
+            None,
+        );
+        let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+            write_provider,
             &cmd.options,
             cmd.constraints.clone(),
         );
         // The per-batch uniqueness check refuses a key repeated within one
-        // write before `ON CONFLICT DO NOTHING` can drop it, so `drop` keeps
+        // batch before `ON CONFLICT DO NOTHING` can drop it, so `drop` keeps
         // the first copy here.
         let write_provider = keep_first::wrap_with_keep_first_if_needed(
             write_provider,
@@ -852,16 +863,17 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::{
-        array::{Date32Array, Int64Array, RecordBatch, StringArray},
+        array::{Date32Array, Float64Array, Int64Array, RecordBatch, StringArray},
         datatypes::{DataType, Schema},
         util::pretty::pretty_format_batches,
     };
     use data_accelerator_api::DataAccelerator;
     use datafusion::{
         common::{Constraint, Constraints, TableReference, ToDFSchema},
-        execution::context::SessionContext,
+        execution::{context::SessionContext, runtime_env::RuntimeEnvBuilder},
         logical_expr::{CreateExternalTable, cast, col, dml::InsertOp, lit},
         physical_plan::collect,
+        prelude::SessionConfig,
         scalar::ScalarValue,
     };
     use datafusion_table_providers::util::test::MockExec;
@@ -999,7 +1011,7 @@ mod tests {
             .expect("insertion should be planned");
         collect(insertion, ctx.task_ctx())
             .await
-            .expect("a repeated key must not fail a drop write");
+            .expect("the write must succeed");
     }
 
     /// `(id, v)` rows the table holds, ordered by `id`.
@@ -1082,6 +1094,299 @@ mod tests {
             id_v_rows(&table).await,
             vec![(1, "a".to_string()), (2, "b".to_string())]
         );
+    }
+
+    fn nullable_id_v_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, true),
+            arrow::datatypes::Field::new("v", DataType::Utf8, false),
+        ]))
+    }
+
+    fn nullable_id_v_batch(rows: &[(Option<i64>, &str)]) -> RecordBatch {
+        RecordBatch::try_new(
+            nullable_id_v_schema(),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("nullable batch should be created")
+    }
+
+    async fn upsert_id_v_table(
+        name: &str,
+        schema: Arc<Schema>,
+    ) -> Arc<dyn datafusion::datasource::TableProvider> {
+        upsert_id_v_table_with_options(
+            name,
+            schema,
+            [("on_conflict".to_string(), "upsert:id".to_string())],
+        )
+        .await
+    }
+
+    async fn upsert_id_v_table_with_options(
+        name: &str,
+        schema: Arc<Schema>,
+        options: impl IntoIterator<Item = (String, String)>,
+    ) -> Arc<dyn datafusion::datasource::TableProvider> {
+        let external_table = CreateExternalTable {
+            schema: ToDFSchema::to_dfschema_ref(schema).expect("df schema"),
+            name: TableReference::bare(name),
+            locations: vec![],
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: options.into_iter().collect(),
+            constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        SqliteAccelerator::new()
+            .create_external_table(external_table, None, vec![], None)
+            .await
+            .expect("table should be created")
+    }
+
+    async fn write_should_fail(
+        table: &Arc<dyn datafusion::datasource::TableProvider>,
+        exec: MockExec,
+    ) -> datafusion::error::DataFusionError {
+        let ctx = SessionContext::new();
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+            .await
+            .expect("insertion should be planned");
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect_err("the write must fail")
+    }
+
+    /// Regression: a NULL primary key must be rejected, matching `DuckDB` and Cayenne.
+    #[tokio::test]
+    async fn insert_rejects_a_null_primary_key() {
+        let table = upsert_id_v_table("null_pk", nullable_id_v_schema()).await;
+        let error = write_should_fail(
+            &table,
+            MockExec::new(
+                vec![Ok(nullable_id_v_batch(&[(None, "nullpk")]))],
+                nullable_id_v_schema(),
+            ),
+        )
+        .await;
+        let message = error.to_string();
+        assert!(
+            message.contains("Primary key") && message.contains("null"),
+            "NULL primary key must be rejected as a null key, got: {message}"
+        );
+        assert!(
+            !message.contains("Query is not read-only"),
+            "NULL primary key must not be mis-reported as read-only, got: {message}"
+        );
+
+        let rows = {
+            let ctx = SessionContext::new();
+            let scan = table
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan should be planned");
+            collect(scan, ctx.task_ctx()).await.expect("scan")
+        };
+        let null_ids = rows.iter().map(RecordBatch::num_rows).sum::<usize>();
+        assert_eq!(
+            null_ids, 0,
+            "a rejected NULL primary key must not insert a row"
+        );
+    }
+
+    /// Regression: an in-batch duplicate key must surface the uniqueness
+    /// constraint, not `Query is not read-only` (#14757).
+    #[tokio::test]
+    async fn insert_reports_uniqueness_for_an_in_batch_duplicate_key() {
+        let table = upsert_id_v_table("dup_key", id_v_schema()).await;
+        let error = write_should_fail(
+            &table,
+            MockExec::new(
+                vec![Ok(id_v_batch(&[(5001, "a"), (5001, "b")]))],
+                id_v_schema(),
+            ),
+        )
+        .await;
+        let message = error.to_string();
+        assert!(
+            message.contains("uniqueness")
+                || message.contains("UNIQUE")
+                || message.contains("constraint"),
+            "in-batch duplicate key must name the uniqueness constraint, got: {message}"
+        );
+        assert!(
+            !message.contains("Query is not read-only"),
+            "in-batch duplicate key must not be mis-reported as read-only, got: {message}"
+        );
+    }
+
+    /// Regression for #14757: a failed input stream must report the stream
+    /// error, not `Query is not read-only`.
+    #[tokio::test]
+    async fn insert_reports_the_input_stream_error() {
+        let table = upsert_id_v_table("stream_err", id_v_schema()).await;
+        let error = write_should_fail(
+            &table,
+            MockExec::new(
+                vec![
+                    Ok(id_v_batch(&[(1, "ok")])),
+                    Err(datafusion::error::DataFusionError::Execution(
+                        "Arrow error: Parser error: Error while parsing value 'not-a-number' as type 'Int64'".to_string(),
+                    )),
+                ],
+                id_v_schema(),
+            ),
+        )
+        .await;
+        let message = error.to_string();
+        assert!(
+            message.contains("not-a-number") || message.contains("Parser error"),
+            "the stream's parse error must be reported, got: {message}"
+        );
+        assert!(
+            !message.contains("Query is not read-only"),
+            "a failed input stream must not be mis-reported as read-only, got: {message}"
+        );
+    }
+
+    /// A later batch of the same write may upsert a key the first batch
+    /// already admitted (`test_append_to_accelerator_duckdb` on `DuckDB`).
+    #[tokio::test]
+    async fn insert_upserts_a_key_repeated_across_batches() {
+        let table = upsert_id_v_table("cross_batch", id_v_schema()).await;
+        write_id_v(
+            &table,
+            vec![id_v_batch(&[(2, "first")]), id_v_batch(&[(2, "second")])],
+            InsertOp::Append,
+        )
+        .await;
+        assert_eq!(id_v_rows(&table).await, vec![(2, "second".to_string())]);
+    }
+
+    /// `SQLite` stores a bound NaN as NULL; a NaN primary key is rejected.
+    #[tokio::test]
+    async fn insert_rejects_a_nan_primary_key() {
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Float64, true),
+            arrow::datatypes::Field::new("v", DataType::Utf8, false),
+        ]));
+        let table = upsert_id_v_table("nan_pk", Arc::clone(&schema)).await;
+        let nan_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Float64Array::from(vec![Some(f64::NAN)])),
+                Arc::new(StringArray::from(vec!["nan"])),
+            ],
+        )
+        .expect("nan batch");
+        let error = write_should_fail(&table, MockExec::new(vec![Ok(nan_batch)], schema)).await;
+        let message = error.to_string();
+        assert!(
+            message.contains("Primary key") && message.contains("null"),
+            "NaN primary key must be rejected as a null key, got: {message}"
+        );
+        assert!(
+            !message.contains("Query is not read-only"),
+            "NaN primary key must not be mis-reported as read-only, got: {message}"
+        );
+    }
+
+    /// Configured last-write-wins must collapse a repeated key before the
+    /// uniqueness guard sees the batch.
+    #[tokio::test]
+    async fn last_write_wins_collapses_an_in_batch_duplicate_before_the_guard() {
+        let table = upsert_id_v_table_with_options(
+            "lww_before_guard",
+            id_v_schema(),
+            [
+                ("on_conflict".to_string(), "upsert:id".to_string()),
+                ("upsert_last_write_wins".to_string(), "true".to_string()),
+            ],
+        )
+        .await;
+        write_id_v(
+            &table,
+            vec![id_v_batch(&[(1, "a"), (1, "b")])],
+            InsertOp::Append,
+        )
+        .await;
+        assert_eq!(id_v_rows(&table).await, vec![(1, "b".to_string())]);
+    }
+
+    /// A write whose batches each fit in the session memory limit must succeed
+    /// even when the *total* does not. Collecting the whole write first
+    /// (`PkCollectThenInsertExec` on `774ff2260e`) charged every batch to the
+    /// pool and failed this case; streaming does not.
+    #[tokio::test]
+    async fn a_multi_batch_write_stays_within_a_per_batch_memory_limit() {
+        const LIMIT: usize = 32 * 1024;
+        let payload = "x".repeat(256);
+        let batches: Vec<RecordBatch> = (0..8)
+            .map(|batch_index| {
+                let rows: Vec<(i64, String)> = (0..64)
+                    .map(|row| {
+                        (
+                            i64::from(batch_index) * 64 + i64::from(row),
+                            payload.clone(),
+                        )
+                    })
+                    .collect();
+                RecordBatch::try_new(
+                    id_v_schema(),
+                    vec![
+                        Arc::new(Int64Array::from(
+                            rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                        )),
+                        Arc::new(StringArray::from(
+                            rows.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
+                        )),
+                    ],
+                )
+                .expect("batch")
+            })
+            .collect();
+        let per_batch = batches
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .collect::<Vec<_>>();
+        let total: usize = per_batch.iter().sum();
+        assert!(
+            per_batch.iter().all(|&size| size < LIMIT),
+            "each batch must fit in the limit, sizes={per_batch:?} limit={LIMIT}"
+        );
+        assert!(
+            total > LIMIT,
+            "the write as a whole must exceed the limit, total={total} limit={LIMIT}"
+        );
+
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(LIMIT, 1.0)
+            .build_arc()
+            .expect("runtime");
+        let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+        let table = upsert_id_v_table("memory_bound", id_v_schema()).await;
+        let exec = MockExec::new(batches.into_iter().map(Ok).collect(), id_v_schema());
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+            .await
+            .expect("insertion should be planned");
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("streaming must not charge the whole write to the memory pool");
     }
 
     /// With `drop` on two constraints, an append must not drop a row because of

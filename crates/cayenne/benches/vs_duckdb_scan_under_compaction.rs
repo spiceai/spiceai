@@ -6,7 +6,7 @@
 //
 //     https://www.apache.org/licenses/LICENSE-2.0
 
-//! Scan latency under background COMPACTION: Cayenne vs DuckDB.
+//! Scan latency under background COMPACTION: Cayenne vs `DuckDB`.
 //!
 //! Sibling of `vs_duckdb_concurrent` (scan-under-*write*). Compaction is the
 //! heavier background writer: it re-reads and re-encodes whole snapshot
@@ -26,8 +26,8 @@
 //!   drive `compact_protected_snapshots_subset(usize::MAX)` — the same
 //!   entry point the background maintenance loop calls — counting merges
 //!   that actually happened.
-//! - **DuckDB**: the background thread loops: insert a burst, then force a
-//!   `CHECKPOINT` — DuckDB's analogous reader-contending maintenance write.
+//! - **`DuckDB`**: the background thread loops: insert a burst, then force a
+//!   `CHECKPOINT` — `DuckDB`'s analogous reader-contending maintenance write.
 //!
 //! VALIDITY: after the timed region each lane asserts its background
 //! maintenance actually ran (merge count / checkpoint count > 0) — a bench
@@ -49,7 +49,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion::execution::runtime_env::RuntimeEnv;
-use duckdb::Connection;
+use duckdb_oracle::Connection;
 use tokio::runtime::Runtime;
 
 use common::{
@@ -61,7 +61,7 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
 
-/// Total preloaded rows, written as PRELOAD_SNAPSHOTS separate inserts so the
+/// Total preloaded rows, written as `PRELOAD_SNAPSHOTS` separate inserts so the
 /// table starts with a populated protected-snapshot tier for the compactor.
 const BASE_ROWS: usize = 49_152;
 const PRELOAD_SNAPSHOTS: usize = 12;
@@ -169,24 +169,24 @@ impl CayenneBgCompactor {
 impl Drop for CayenneBgCompactor {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            if let Err(join_err) = self.rt_handle.block_on(handle) {
-                // Propagate a background-compactor panic at the source —
-                // swallowed, it would resurface later as a misleading
-                // `merges = 0` validity failure (or as silently invalid
-                // numbers). Skip while already unwinding: panicking inside
-                // a panic-triggered drop aborts the process and eats the
-                // original message.
-                if join_err.is_panic() && !std::thread::panicking() {
-                    std::panic::resume_unwind(join_err.into_panic());
-                }
+        if let Some(handle) = self.handle.take()
+            && let Err(join_err) = self.rt_handle.block_on(handle)
+        {
+            // Propagate a background-compactor panic at the source —
+            // swallowed, it would resurface later as a misleading
+            // `merges = 0` validity failure (or as silently invalid
+            // numbers). Skip while already unwinding: panicking inside
+            // a panic-triggered drop aborts the process and eats the
+            // original message.
+            if join_err.is_panic() && !std::thread::panicking() {
+                std::panic::resume_unwind(join_err.into_panic());
             }
         }
     }
 }
 
-/// Background checkpointer for the DuckDB lane: insert a burst, then force a
-/// `CHECKPOINT` — the closest DuckDB analog to a maintenance rewrite that
+/// Background checkpointer for the `DuckDB` lane: insert a burst, then force a
+/// `CHECKPOINT` — the closest `DuckDB` analog to a maintenance rewrite that
 /// contends with readers. Drop to stop + join.
 struct DuckDbBgCheckpointer {
     stop: Arc<AtomicBool>,
@@ -233,14 +233,14 @@ impl DuckDbBgCheckpointer {
 impl Drop for DuckDbBgCheckpointer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            if let Err(panic_payload) = handle.join() {
-                // Same rationale as CayenneBgCompactor::drop — surface the
-                // background panic at the source instead of as a misleading
-                // checkpoint-validity failure later.
-                if !std::thread::panicking() {
-                    std::panic::resume_unwind(panic_payload);
-                }
+        if let Some(handle) = self.handle.take()
+            && let Err(panic_payload) = handle.join()
+        {
+            // Same rationale as CayenneBgCompactor::drop — surface the
+            // background panic at the source instead of as a misleading
+            // checkpoint-validity failure later.
+            if !std::thread::panicking() {
+                std::panic::resume_unwind(panic_payload);
             }
         }
     }

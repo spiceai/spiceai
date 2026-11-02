@@ -1,0 +1,448 @@
+{
+  "name": "sql-explain-protocols",
+  "description": "Documented EXPLAIN options over Flight SQL and HTTP; metric text is execution-dependent.",
+  "spicepod": {
+    "version": "v1",
+    "kind": "Spicepod",
+    "name": "sql-explain-protocols"
+  },
+  "steps": [
+    {
+      "start": {}
+    },
+    {
+      "query": "EXPLAIN ANALYZE SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect": {}
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN ANALYZE SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 200,
+        "body-contains": "plan"
+      }
+    },
+    {
+      "query": "EXPLAIN ANALYZE VERBOSE SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect": {}
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN ANALYZE VERBOSE SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 200,
+        "body-contains": "plan"
+      }
+    },
+    {
+      "query": "EXPLAIN ANALYZE FORMAT indent SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect": {}
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN ANALYZE FORMAT indent SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 200,
+        "body-contains": "plan"
+      }
+    },
+    {
+      "query": "EXPLAIN ANALYZE FORMAT tree SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect-error": "is not supported"
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN ANALYZE FORMAT tree SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 400,
+        "body-contains": "is not supported"
+      }
+    },
+    {
+      "query": "EXPLAIN ANALYZE FORMAT pgjson SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect": {}
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN ANALYZE FORMAT pgjson SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 200,
+        "body-contains": "plan"
+      }
+    },
+    {
+      "query": "EXPLAIN ANALYZE FORMAT graphviz SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect-error": "is not supported"
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN ANALYZE FORMAT graphviz SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 400,
+        "body-contains": "is not supported"
+      }
+    },
+    {
+      "query": "EXPLAIN (ANALYZE TRUE, METRICS 'all') SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect": {}
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN (ANALYZE TRUE, METRICS 'all') SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 200,
+        "body-contains": "plan"
+      }
+    },
+    {
+      "query": "EXPLAIN (ANALYZE TRUE, METRICS 'none') SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect": {}
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN (ANALYZE TRUE, METRICS 'none') SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 200,
+        "body-contains": "plan"
+      }
+    },
+    {
+      "query": "EXPLAIN (ANALYZE TRUE, METRICS 'rows,bytes') SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect": {}
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN (ANALYZE TRUE, METRICS 'rows,bytes') SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 200,
+        "body-contains": "plan"
+      }
+    },
+    {
+      "query": "EXPLAIN (ANALYZE TRUE, LEVEL summary) SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect": {}
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN (ANALYZE TRUE, LEVEL summary) SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 200,
+        "body-contains": "plan"
+      }
+    },
+    {
+      "query": "EXPLAIN (ANALYZE TRUE, LEVEL dev) SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect": {}
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN (ANALYZE TRUE, LEVEL dev) SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 200,
+        "body-contains": "plan"
+      }
+    },
+    {
+      "query": "EXPLAIN (ANALYZE TRUE, TIMING TRUE) SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect": {}
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN (ANALYZE TRUE, TIMING TRUE) SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 200,
+        "body-contains": "plan"
+      }
+    },
+    {
+      "query": "EXPLAIN (ANALYZE TRUE, TIMING FALSE) SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect": {}
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN (ANALYZE TRUE, TIMING FALSE) SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 200,
+        "body-contains": "plan"
+      }
+    },
+    {
+      "query": "EXPLAIN (ANALYZE TRUE, SUMMARY TRUE) SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect": {}
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN (ANALYZE TRUE, SUMMARY TRUE) SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 200,
+        "body-contains": "plan"
+      }
+    },
+    {
+      "query": "EXPLAIN (ANALYZE TRUE, SUMMARY FALSE) SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect": {}
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN (ANALYZE TRUE, SUMMARY FALSE) SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 200,
+        "body-contains": "plan"
+      }
+    },
+    {
+      "query": "EXPLAIN (ANALYZE ON) SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect": {}
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN (ANALYZE ON) SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 200,
+        "body-contains": "plan"
+      }
+    },
+    {
+      "query": "EXPLAIN (ANALYZE OFF) SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect": {}
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN (ANALYZE OFF) SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 200,
+        "body-contains": "plan"
+      }
+    },
+    {
+      "query": "EXPLAIN (ANALYZE 1) SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect": {}
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN (ANALYZE 1) SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 200,
+        "body-contains": "plan"
+      }
+    },
+    {
+      "query": "EXPLAIN (ANALYZE 0) SELECT 1 AS n",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect": {}
+    },
+    {
+      "http": {
+        "method": "POST",
+        "path": "/v1/sql",
+        "headers": {
+          "content-type": "text/plain"
+        },
+        "body": "EXPLAIN (ANALYZE 0) SELECT 1 AS n"
+      },
+      "expect": {
+        "status": 200,
+        "body-contains": "plan"
+      }
+    },
+    {
+      "query": "EXPLAIN (BUFFERS) SELECT 1",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect-error": "BUFFERS"
+    },
+    {
+      "query": "EXPLAIN (WAL) SELECT 1",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect-error": "WAL"
+    },
+    {
+      "query": "EXPLAIN (SETTINGS) SELECT 1",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect-error": "SETTINGS"
+    },
+    {
+      "query": "EXPLAIN (GENERIC_PLAN) SELECT 1",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect-error": "GENERIC_PLAN"
+    },
+    {
+      "query": "EXPLAIN (MEMORY) SELECT 1",
+      "protocols": [
+        "flightsql"
+      ],
+      "expect-error": "MEMORY"
+    }
+  ]
+}
