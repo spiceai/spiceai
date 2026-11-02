@@ -762,6 +762,8 @@ pub struct Runtime {
     /// The model loads in progress, so a Spicepod change can stop the load of a
     /// configuration it replaces or removes.
     model_loads: Arc<init::model::ModelLoads>,
+    /// The installed app's `row_id` keys, read by `/v1/search` and `vector_search`.
+    search_primary_keys: runtime_search::search_engine::ExplicitPrimaryKeys,
     /// Startup view registrations still waiting, cancelled when a Spicepod change replaces or removes the view.
     view_loads: Arc<init::view_loads::ViewLoads>,
 

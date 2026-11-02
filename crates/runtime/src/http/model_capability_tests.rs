@@ -256,7 +256,9 @@ async fn runtime_with(models: Vec<Model>) -> (Arc<Runtime>, Router) {
 
     let search = Arc::new(SearchEngine::new(
         Arc::clone(&rt.df) as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
-        parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
+        parse_explicit_primary_keys(Arc::clone(&rt.app))
+            .await
+            .into(),
         crate::search::util::RuntimeTableProviderExplorer,
     ));
     let routes = super::routes::routes(

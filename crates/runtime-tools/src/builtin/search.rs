@@ -97,7 +97,9 @@ impl<E: TableProviderExplorer + Clone + 'static> SpiceModelTool for SearchTool<E
 
             let vs = SearchEngine::new(
                 Arc::clone(&self.df),
-                parse_explicit_primary_keys(Arc::clone(&self.app)).await,
+                parse_explicit_primary_keys(Arc::clone(&self.app))
+                    .await
+                    .into(),
                 self.explorer.clone(),
             );
 

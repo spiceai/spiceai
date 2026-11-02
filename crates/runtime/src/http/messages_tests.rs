@@ -366,7 +366,9 @@ async fn runtime_with_options(
     Arc::clone(&rt).load_workers().await;
     let search = Arc::new(runtime_search::search_engine::SearchEngine::new(
         Arc::clone(&rt.df) as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
-        runtime_search::search_engine::parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
+        runtime_search::search_engine::parse_explicit_primary_keys(Arc::clone(&rt.app))
+            .await
+            .into(),
         crate::search::util::RuntimeTableProviderExplorer,
     ));
     super::routes::routes(
