@@ -23704,7 +23704,11 @@ impl CayenneTableProvider {
         let table = self.clone_for_write();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            table.post_write_maintenance.state.lock().retention_requested = true;
+            table
+                .post_write_maintenance
+                .state
+                .lock()
+                .retention_requested = true;
             // Claim the loop before the admission check, so a racing `quiesce`
             // either sees the claim and drains it or closes first and is seen
             // here (see `maintenance_still_admitted`).
@@ -23864,14 +23868,13 @@ impl CayenneTableProvider {
         // After a failed background pass the retry is owned by the timer that
         // `schedule_retention_retry` armed, so a pass inside the backoff window
         // leaves retention alone instead of failing again on every debounce.
-        let retention_backing_off = matches!(
-            retention_failure_action,
-            RetentionFailureAction::Requeue
-        ) && self
-            .post_write_maintenance
-            .retention_backoff
-            .lock()
-            .is_waiting(tokio::time::Instant::now());
+        let retention_backing_off =
+            matches!(retention_failure_action, RetentionFailureAction::Requeue)
+                && self
+                    .post_write_maintenance
+                    .retention_backoff
+                    .lock()
+                    .is_waiting(tokio::time::Instant::now());
         if state.retention_requested && !retention_backing_off {
             match self.apply_retention_filters().await {
                 Ok(RetentionPass::Deleted(deleted)) => {
@@ -69650,21 +69653,22 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("status", DataType::Utf8, false),
         ]));
-        let seeded = CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
-            .create(CreateTableOptions {
-                table_name: table_name.clone(),
-                schema: Arc::clone(&schema),
-                primary_key: vec![],
-                on_conflict: None,
-                base_path: data_dir,
-                partition_column: None,
-                vortex_config: VortexConfig {
-                    compaction_background_interval_ms: 3_600_000,
-                    ..VortexConfig::default()
-                },
-            })
-            .await
-            .expect("table created");
+        let seeded =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .create(CreateTableOptions {
+                    table_name: table_name.clone(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: data_dir,
+                    partition_column: None,
+                    vortex_config: VortexConfig {
+                        compaction_background_interval_ms: 3_600_000,
+                        ..VortexConfig::default()
+                    },
+                })
+                .await
+                .expect("table created");
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
