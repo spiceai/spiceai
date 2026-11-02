@@ -1136,6 +1136,33 @@ impl PkDeletionSnapshot {
         }
     }
 
+    /// Highest delete sequence in this snapshot, if any. `None` for
+    /// `PositionBased`, matching `delete_len`.
+    pub(crate) fn max_delete_sequence(&self) -> Option<i64> {
+        match self {
+            Self::PositionBased => None,
+            Self::Int64Pk { tombstones } => tombstones.max_sequence_number(),
+            Self::RowConverterBased { tombstones } => tombstones.max_sequence_number(),
+        }
+    }
+
+    /// Whether this snapshot holds a deletion at or below sequence `seq`. Walks
+    /// the index until it finds one, so it costs a full pass when none is held.
+    pub(crate) fn holds_delete_at_or_below(&self, seq: i64) -> bool {
+        let at_or_below = |entry: &crate::provider::deletion_index::TombstoneEntry| {
+            entry.delete_sequence().is_some_and(|delete| delete <= seq)
+        };
+        match self {
+            Self::PositionBased => false,
+            Self::Int64Pk { tombstones } => tombstones
+                .iter_entries()
+                .any(|(_, entry)| at_or_below(&entry)),
+            Self::RowConverterBased { tombstones } => tombstones
+                .iter_entries()
+                .any(|(_, entry)| at_or_below(&entry)),
+        }
+    }
+
     /// Count of re-insert records in this snapshot — keys whose tombstone is
     /// superseded by a later insert.
     ///

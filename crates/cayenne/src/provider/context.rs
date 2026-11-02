@@ -92,9 +92,6 @@ pub struct CayenneContext {
     /// little of the deletion index to have been worth running (see
     /// [`Self::record_bake_prune`]).
     bake_futile: Arc<std::sync::atomic::AtomicBool>,
-    /// Rows subset merges removed by deletion filter since the last bake
-    /// (measurement only; logged by the bake).
-    subset_rows_removed_since_bake: Arc<std::sync::atomic::AtomicU64>,
     /// Per-table query-side observations (p99 latency + QPH), shared with the
     /// process-global query registry so the runtime can push query metrics *down*
     /// into this table's tuner; read on the background tick to derive the
@@ -331,7 +328,6 @@ impl CayenneContext {
             live_actuators,
             ingest_stats: Arc::new(IngestStats::new()),
             bake_futile: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            subset_rows_removed_since_bake: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             query_observations,
             goals,
             tuning_bounds,
@@ -745,16 +741,36 @@ impl CayenneContext {
         self.deletion_index_yield.rows_per_thousand()
     }
 
-    /// Count rows a committed subset merge removed by deletion filter.
-    pub(crate) fn add_subset_rows_removed(&self, rows: u64) {
-        self.subset_rows_removed_since_bake
-            .fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+    /// Record a reclaim that took `tombstones_reclaimed` tombstones out of the
+    /// index without counting the rows they hid: the yield measured before it
+    /// stands.
+    pub(crate) fn record_unmeasured_deletion_index_reclaim(&self, tombstones_reclaimed: u64) {
+        self.deletion_index_yield
+            .record_unmeasured(tombstones_reclaimed);
     }
 
-    /// Rows subset merges removed since the last call.
-    pub(crate) fn take_subset_rows_removed(&self) -> u64 {
-        self.subset_rows_removed_since_bake
-            .swap(0, std::sync::atomic::Ordering::Relaxed)
+    /// Record a committed rewrite that removed `rows` rows by deletion filter and
+    /// kept their tombstones, which the next reclaim's yield counts.
+    pub(crate) fn record_rows_removed_before_reclaim(&self, rows: u64) {
+        self.deletion_index_yield
+            .record_rows_removed_before_reclaim(rows);
+    }
+
+    /// Record the highest delete sequence of the deletion index loaded at open.
+    pub(crate) fn record_tombstones_from_open(&self, max_delete_seq: Option<i64>) {
+        self.deletion_index_yield
+            .record_tombstones_from_open(max_delete_seq);
+    }
+
+    /// The highest delete sequence of the tombstones loaded at open, while one of
+    /// them may still be held.
+    pub(crate) fn tombstones_from_open_through(&self) -> Option<i64> {
+        self.deletion_index_yield.tombstones_from_open_through()
+    }
+
+    /// Record that the index no longer holds a tombstone loaded at open.
+    pub(crate) fn forget_tombstones_from_open(&self) {
+        self.deletion_index_yield.forget_tombstones_from_open();
     }
 
     /// Apply-back-pressure gate for the seq-prefix bake: `true` when the CDC
