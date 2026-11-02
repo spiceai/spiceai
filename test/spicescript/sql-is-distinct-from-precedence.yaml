@@ -1,0 +1,168 @@
+{
+  "name": "sql-is-distinct-from-precedence",
+  "description": "IS [NOT] DISTINCT FROM binds tighter than AND/OR, as in PostgreSQL (expected values from PostgreSQL 17.5). sqlparser 0.62.0 parsed `a IS DISTINCT FROM b OR c` as `a IS DISTINCT FROM (b OR c)`.",
+  "spicepod": {
+    "version": "v1",
+    "kind": "Spicepod",
+    "name": "sql-is-distinct-from-precedence"
+  },
+  "steps": [
+    {
+      "start": {}
+    },
+    {
+      "query": "SELECT true IS DISTINCT FROM true OR true AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT true IS DISTINCT FROM false AND false AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "false"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT true IS NOT DISTINCT FROM false OR true AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT true IS NOT DISTINCT FROM true AND false AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "false"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 1 IS DISTINCT FROM 2 OR 3 IS DISTINCT FROM 3 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT 1 IS NOT DISTINCT FROM 1 AND 2 = 3 AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "false"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT COUNT(*) AS value FROM (VALUES (1,'a'),(2,'b'),(3,'a')) t(x,y) WHERE (x > 1) IS DISTINCT FROM true OR y = 'a'",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "2"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT COUNT(*) AS value FROM (VALUES (1,'a'),(2,'b'),(3,'a')) t(x,y) WHERE x IS DISTINCT FROM 2 AND y = 'a'",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "2"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT COUNT(*) AS value FROM (VALUES (1,'a'),(2,'b'),(3,'a')) t(x,y) WHERE x IS NOT DISTINCT FROM 2 OR y = 'a'",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "3"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT (true IS DISTINCT FROM true) OR true AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "true"
+          ]
+        ]
+      }
+    },
+    {
+      "query": "SELECT true IS DISTINCT FROM (true OR true) AS value",
+      "protocols": [
+        "flightsql",
+        "http"
+      ],
+      "expect": {
+        "rows": [
+          [
+            "false"
+          ]
+        ]
+      }
+    }
+  ]
+}
