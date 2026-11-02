@@ -6876,9 +6876,8 @@ impl CayenneTableProvider {
                         Vec::new()
                     });
                 // The rows a capped commit keeps still name their files.
-                files.retain(|file| {
-                    clear_through.is_none_or(|bound| file.sequence_number <= bound)
-                });
+                files
+                    .retain(|file| clear_through.is_none_or(|bound| file.sequence_number <= bound));
                 files
             }
             RewriteScope::Fenced { .. } => Vec::new(),
@@ -15689,9 +15688,7 @@ impl CayenneTableProvider {
                 } => Some(Arc::clone(&deletion_snapshot.load_full().tombstones)),
                 _ => None,
             };
-            let deleted_row_keys: Option<Arc<KeyDeletionIndex>> = match &self
-                .pk_deletion_strategy
-            {
+            let deleted_row_keys: Option<Arc<KeyDeletionIndex>> = match &self.pk_deletion_strategy {
                 PkDeletionStrategyWithCache::RowConverterBased {
                     deletion_snapshot, ..
                 } => Some(Arc::clone(&deletion_snapshot.load_full().tombstones)),
@@ -27392,7 +27389,10 @@ impl CayenneTableProvider {
             &self.table_metadata.schema,
             &self.pk_column_indices,
         );
-        let lowest_kept = [lowest_relevant, unreadable_floor].into_iter().flatten().min();
+        let lowest_kept = [lowest_relevant, unreadable_floor]
+            .into_iter()
+            .flatten()
+            .min();
         Ok(ColdTombstoneRetention {
             retain_above: lowest_kept.map(|sequence| sequence.saturating_sub(1)),
             tombstones: tombstones.len(),
@@ -28065,7 +28065,9 @@ impl CayenneTableProvider {
         };
         let cutoff = retention
             .retain_above
-            .map_or(newest_cold_sequence, |cutoff| cutoff.min(newest_cold_sequence));
+            .map_or(newest_cold_sequence, |cutoff| {
+                cutoff.min(newest_cold_sequence)
+            });
 
         let _write_guard = self.write_lock_arc().lock_owned().await;
         if let Err(error) = self
@@ -43305,17 +43307,16 @@ impl CayenneTableProvider {
         let mut scan_filters_owned = effective_filters.unwrap_or_else(|| filters.to_vec());
         let mem_tier_pruning_filters = scan_filters_owned.clone();
         if tombstone_pushdown == TombstonePushdown::Apply
-            && let Some(tombstone_filter) =
-                self.vortex_key_delete_pushdown_filter(
-                    &deletion_snapshot,
-                    cold_files.as_ref().and_then(|files| {
-                        files
-                            .iter()
-                            .filter(|f| f.file_size_bytes > 0)
-                            .map(|f| f.max_sequence)
-                            .max()
-                    }),
-                )
+            && let Some(tombstone_filter) = self.vortex_key_delete_pushdown_filter(
+                &deletion_snapshot,
+                cold_files.as_ref().and_then(|files| {
+                    files
+                        .iter()
+                        .filter(|f| f.file_size_bytes > 0)
+                        .map(|f| f.max_sequence)
+                        .max()
+                }),
+            )
         {
             tracing::trace!(
                 table = %self.table_metadata.table_name,
@@ -43495,7 +43496,9 @@ impl CayenneTableProvider {
         // row for a key re-inserted after deletion. Each file applies only the
         // tombstones newer than it (see `ColdTierBranch`), one scan for all of
         // them. `Ok(None)` (disabled / empty / all-pruned) adds zero plan nodes.
-        let captured_cold_files = cold_files.as_ref().map_or(&[][..], |files| files.as_slice());
+        let captured_cold_files = cold_files
+            .as_ref()
+            .map_or(&[][..], |files| files.as_slice());
         let cold_plan: Option<Arc<dyn ExecutionPlan>> = self
             .build_cold_tier_scan_plan(ColdTierScan {
                 state,
@@ -44293,8 +44296,9 @@ impl CayenneTableProvider {
         // by could pair a merged-away file with a pruned index.
         let (protected_tables, tombstones_at_capture, cold_files) = {
             let _guards = capture_locks.read().await;
-            let cold_files =
-                self.cold_manifest_under_held_fence(&self.get_current_snapshot_id()).await?;
+            let cold_files = self
+                .cold_manifest_under_held_fence(&self.get_current_snapshot_id())
+                .await?;
             (
                 self.build_protected_snapshot_listing_tables()?,
                 self.pk_deletion_snapshot(),
@@ -83898,10 +83902,7 @@ mod tests {
                     partition_column: None,
                     vortex_config: VortexConfig {
                         inline_max_rows: 0,
-                        cold_tier_location: Some(format!(
-                            "file://{}",
-                            cold_dir.to_string_lossy()
-                        )),
+                        cold_tier_location: Some(format!("file://{}", cold_dir.to_string_lossy())),
                         cold_tier_warm_max_files: 1,
                         cold_tier_gc_interval_ms: 300_000,
                         cold_tier_background_interval_ms: 3_600_000,
