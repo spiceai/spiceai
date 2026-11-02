@@ -2,6 +2,7 @@
 description = "Parses a PDF with either the liteparse (PDFium) backend or the pdf-inspector (pure-Rust) backend so their extracted text can be compared"
 edition.workspace = true
 license-file.workspace = true
+repository.workspace = true
 name = "pdf-parse"
 rust-version.workspace = true
 version.workspace = true
