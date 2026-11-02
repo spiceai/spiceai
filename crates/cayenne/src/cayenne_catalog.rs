@@ -6124,6 +6124,14 @@ impl std::fmt::Display for StoredFileDamage {
 /// (`manifest`) with the snapshot directory on disk. `None` when they match, or
 /// when the metastore records no files for the snapshot (an empty table, or one
 /// written before the manifest was kept), which leaves nothing to compare.
+/// The local directory holding one snapshot's data files. A table path may be
+/// spelled as a `file:` URI, which is not a filesystem path as written.
+fn stored_snapshot_dir(table_path: &str, table_id: &str, snapshot_id: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(crate::metastore_layout::fs_probe_path(table_path))
+        .join(table_id)
+        .join(snapshot_id)
+}
+
 async fn inspect_stored_data_files(
     table: &TableMetadata,
     snapshot_id: &str,
@@ -6132,9 +6140,7 @@ async fn inspect_stored_data_files(
     if manifest.is_empty() {
         return Ok(None);
     }
-    let snapshot_dir = std::path::PathBuf::from(&table.path)
-        .join(&table.table_id)
-        .join(snapshot_id);
+    let snapshot_dir = stored_snapshot_dir(&table.path, &table.table_id, snapshot_id);
     tokio::task::spawn_blocking(move || {
         let mut damage = StoredFileDamage {
             recorded_files: manifest.len(),
@@ -12936,6 +12942,23 @@ mod tests {
             ))
             .await
             .expect("a table whose protected snapshot is back reopens, warning about the missing current file");
+    }
+
+    /// A table path spelled as a `file:` URI names the same directory as the
+    /// plain path, so its files are not reported missing.
+    #[test]
+    fn stored_snapshot_dir_reads_a_file_uri_table_path_as_a_local_path() {
+        for table_path in [
+            "/data/orders",
+            "file:///data/orders",
+            "file://localhost/data/orders",
+        ] {
+            assert_eq!(
+                stored_snapshot_dir(table_path, "t", "s"),
+                std::path::PathBuf::from("/data/orders/t/s"),
+                "{table_path}"
+            );
+        }
     }
 
     /// Partition children reopen through `open`, not `create_table`, so they
