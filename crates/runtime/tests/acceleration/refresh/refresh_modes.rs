@@ -796,7 +796,11 @@ fn assert_same_multiset(
     spice: &Answer,
     postgres: &Answer,
 ) {
-    let note = if query_name == "projection" {
+    // A `timestamp` `created_at` is read as UTC epoch milliseconds; Unix seconds and
+    // ISO8601 strings are compared as stored.
+    let note = if query_name == "projection"
+        && !matches!(mode, "append-unix-seconds" | "append-iso8601")
+    {
         " (created_at cells are UTC epoch milliseconds)"
     } else {
         ""
