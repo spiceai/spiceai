@@ -34,6 +34,24 @@
       ]
     }
   ],
+  "cayenne-file-create-reload": [
+    {
+      "run": "cayenne-file-create-reload",
+      "who": "default",
+      "key": "query: SELECT id, v FROM file_create_reload #2",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 16",
+      "group": "cayenne"
+    },
+    {
+      "run": "cayenne-file-create-reload",
+      "who": "default",
+      "key": "query: SELECT id, v FROM file_create_reload #3",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 24",
+      "group": "cayenne"
+    }
+  ],
   "cayenne-file-durability-date-key": [
     {
       "run": "cayenne-file-durability-date-key",
@@ -86,20 +104,20 @@
       "who": "file",
       "key": "stop-background: read-changes",
       "kind": "other",
-      "group": "cayenne",
-      "may-pass": true,
+      "signature": "iterations failed; first: invariant broken: (n|total) = (above|below) expected",
       "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected",
-      "signature": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+      "group": "cayenne",
+      "may-pass": true
     },
     {
       "run": "cayenne-torn-reads",
       "who": "file",
       "key": "stop-background: read-refresh",
       "kind": "other",
-      "group": "cayenne",
-      "may-pass": true,
+      "signature": "iterations failed; first: invariant broken: (n|total) = (above|below) expected",
       "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected",
-      "signature": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+      "group": "cayenne",
+      "may-pass": true
     },
     {
       "run": "cayenne-torn-reads",
@@ -107,19 +125,19 @@
       "key": "stop-background: read-join",
       "kind": "other",
       "signature": "<n> of <m> iterations failed; first: invariant broken: n = below expected Some(\"1000\")",
+      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected",
       "group": "cayenne",
-      "may-pass": true,
-      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+      "may-pass": true
     },
     {
       "run": "cayenne-torn-reads",
       "who": "file",
       "key": "query: SELECT count(*) AS n FROM by_changes",
       "kind": "wrong-answer",
-      "group": "cayenne",
-      "may-pass": true,
+      "signature": "answer differs from the expected one: DataMismatch \\{ column: \"n\"",
       "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\"",
-      "signature": "answer differs from the expected one: DataMismatch \\{ column: \"n\""
+      "group": "cayenne",
+      "may-pass": true
     },
     {
       "run": "cayenne-torn-reads",
@@ -127,9 +145,9 @@
       "key": "stop-background: read-changes",
       "kind": "other",
       "signature": "<n> of <m> iterations failed; first: invariant broken: n = above expected Some(\"1000\")",
+      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected",
       "group": "cayenne",
-      "may-pass": true,
-      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+      "may-pass": true
     },
     {
       "run": "cayenne-torn-reads",
@@ -137,9 +155,9 @@
       "key": "stop-background: read-refresh",
       "kind": "other",
       "signature": "<n> of <m> iterations failed; first: invariant broken: total = above expected Some(\"100000\")",
+      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected",
       "group": "cayenne",
-      "may-pass": true,
-      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+      "may-pass": true
     },
     {
       "run": "cayenne-torn-reads",
@@ -147,9 +165,9 @@
       "key": "stop-background: read-join",
       "kind": "other",
       "signature": "<n> of <m> iterations failed; first: invariant broken: n = above expected Some(\"1000\")",
+      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected",
       "group": "cayenne",
-      "may-pass": true,
-      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+      "may-pass": true
     },
     {
       "run": "cayenne-torn-reads",
@@ -157,9 +175,9 @@
       "key": "query: SELECT count(*) AS n FROM by_changes",
       "kind": "wrong-answer",
       "signature": "stopped matching after <duration> (29 attempts): answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"1000\\\"\", actual: \"\\\"1001\\\"\" }",
+      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\"",
       "group": "cayenne",
-      "may-pass": true,
-      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\""
+      "may-pass": true
     },
     {
       "run": "cayenne-torn-reads",
@@ -167,9 +185,9 @@
       "key": "stop-background: read-changes",
       "kind": "other",
       "signature": "<n> of <m> iterations failed; first: invariant broken: n = above expected Some(\"1000\")",
+      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected",
       "group": "cayenne",
-      "may-pass": true,
-      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+      "may-pass": true
     },
     {
       "run": "cayenne-torn-reads",
@@ -177,9 +195,9 @@
       "key": "stop-background: read-refresh",
       "kind": "other",
       "signature": "<n> of <m> iterations failed; first: invariant broken: n = above expected Some(\"1000\")",
+      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected",
       "group": "cayenne",
-      "may-pass": true,
-      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+      "may-pass": true
     },
     {
       "run": "cayenne-torn-reads",
@@ -187,9 +205,9 @@
       "key": "stop-background: read-join",
       "kind": "other",
       "signature": "<n> of <m> iterations failed; first: invariant broken: n = below expected Some(\"1000\")",
+      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected",
       "group": "cayenne",
-      "may-pass": true,
-      "pattern": "iterations failed; first: invariant broken: (n|total) = (above|below) expected"
+      "may-pass": true
     },
     {
       "run": "cayenne-torn-reads",
@@ -197,9 +215,9 @@
       "key": "query: SELECT count(*) AS n FROM by_changes",
       "kind": "wrong-answer",
       "signature": "stopped matching after <duration> (3 attempts): answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"1000\\\"\", actual: \"\\\"1002\\\"\" }",
+      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\"",
       "group": "cayenne",
-      "may-pass": true,
-      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\""
+      "may-pass": true
     }
   ],
   "cayenne-writes-known": [
@@ -700,20 +718,20 @@
       "who": "cayenne-64mib",
       "key": "query: SELECT count(*) AS n, sum(k) AS sk FROM big",
       "kind": "error",
-      "group": "cayenne",
-      "may-pass": true,
+      "signature": "code: 'Some resource has been exhausted'",
       "pattern": "code: 'Some resource has been exhausted'",
-      "signature": "code: 'Some resource has been exhausted'"
+      "group": "cayenne",
+      "may-pass": true
     },
     {
       "run": "memory-limit-spill",
       "who": "cayenne-64mib",
       "key": "query: SELECT id, s FROM big ORDER BY s DESC, id LIMIT 20",
       "kind": "error",
-      "group": "cayenne",
-      "may-pass": true,
+      "signature": "code: 'Some resource has been exhausted'",
       "pattern": "code: 'Some resource has been exhausted'",
-      "signature": "code: 'Some resource has been exhausted'"
+      "group": "cayenne",
+      "may-pass": true
     },
     {
       "run": "memory-limit-spill",
@@ -721,19 +739,19 @@
       "key": "query: SELECT s, id FROM (SELECT s, id, row_number() OVER (ORDER BY s, id) AS r FROM big) t WHERE r % 200000 = 0 ORDER BY r",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Additional allocation failed for ExternalSorterMerge[<n>]",
+      "pattern": "code: 'Some resource has been exhausted'",
       "group": "cayenne",
-      "may-pass": true,
-      "pattern": "code: 'Some resource has been exhausted'"
+      "may-pass": true
     },
     {
       "run": "memory-limit-spill",
       "who": "cayenne-64mib",
       "key": "query: SELECT count(*) AS groups, sum(c) AS rows FROM (SELECT k, count(*) AS c FROM big GROUP BY k) t",
       "kind": "error",
-      "group": "cayenne",
-      "may-pass": true,
+      "signature": "code: 'Some resource has been exhausted'",
       "pattern": "code: 'Some resource has been exhausted'",
-      "signature": "code: 'Some resource has been exhausted'"
+      "group": "cayenne",
+      "may-pass": true
     },
     {
       "run": "memory-limit-spill",
@@ -741,9 +759,9 @@
       "key": "query: SELECT count(DISTINCT k) AS dk, count(DISTINCT s) AS ds FROM big",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Additional allocation failed for AggregateStream[<n>]",
+      "pattern": "code: 'Some resource has been exhausted'",
       "group": "cayenne",
-      "may-pass": true,
-      "pattern": "code: 'Some resource has been exhausted'"
+      "may-pass": true
     },
     {
       "run": "memory-limit-spill",
@@ -751,9 +769,9 @@
       "key": "query: SELECT g, count(DISTINCT k) AS dk, max(s) AS ms FROM big GROUP BY g ORDER BY g",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Failed to scan dataset big (cayenne): Out of query memory. Reading one batch of it needs 1.19 MiB, which fits the 64.00 MiB query memory pool on its own but not alongside the 62.85 MiB other queries are holdin",
+      "pattern": "code: 'Some resource has been exhausted'",
       "group": "cayenne",
-      "may-pass": true,
-      "pattern": "code: 'Some resource has been exhausted'"
+      "may-pass": true
     },
     {
       "run": "memory-limit-spill",
@@ -761,9 +779,9 @@
       "key": "query: SELECT count(*) AS n, count(DISTINCT d.label) AS labels FROM big b JOIN dim d ON b.k = d.id",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Failed to scan dataset big (cayenne): Out of query memory. Reading one batch of it needs 1.00 MiB, which fits the 64.00 MiB query memory pool on its own but not alongside the 63.07 MiB other queries are holdin",
+      "pattern": "code: 'Some resource has been exhausted'",
       "group": "cayenne",
-      "may-pass": true,
-      "pattern": "code: 'Some resource has been exhausted'"
+      "may-pass": true
     },
     {
       "run": "memory-limit-spill",
@@ -771,9 +789,9 @@
       "key": "query: SELECT d.id, count(*) AS n FROM dim d JOIN big b ON b.k = d.id GROUP BY d.id ORDER BY n DESC, d.id LIMIT 10",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Additional allocation failed for ExternalSorterMerge[<n>]",
+      "pattern": "code: 'Some resource has been exhausted'",
       "group": "cayenne",
-      "may-pass": true,
-      "pattern": "code: 'Some resource has been exhausted'"
+      "may-pass": true
     },
     {
       "run": "memory-limit-spill",
@@ -781,29 +799,29 @@
       "key": "query: SELECT g, max(rk) AS top FROM (SELECT g, rank() OVER (PARTITION BY g ORDER BY v DESC, id) AS rk FROM big) t GROUP BY g ORDER BY g",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Additional allocation failed for ExternalSorterMerge[<n>]",
+      "pattern": "code: 'Some resource has been exhausted'",
       "group": "cayenne",
-      "may-pass": true,
-      "pattern": "code: 'Some resource has been exhausted'"
+      "may-pass": true
     },
     {
       "run": "memory-limit-spill",
       "who": "cayenne-256mib",
       "key": "query: SELECT count(*) AS n, sum(k) AS sk FROM big",
       "kind": "error",
-      "group": "cayenne",
-      "may-pass": true,
+      "signature": "code: 'Some resource has been exhausted'",
       "pattern": "code: 'Some resource has been exhausted'",
-      "signature": "code: 'Some resource has been exhausted'"
+      "group": "cayenne",
+      "may-pass": true
     },
     {
       "run": "memory-limit-spill",
       "who": "cayenne-256mib",
       "key": "query: SELECT id, s FROM big ORDER BY s DESC, id LIMIT 20",
       "kind": "error",
-      "group": "cayenne",
-      "may-pass": true,
+      "signature": "code: 'Some resource has been exhausted'",
       "pattern": "code: 'Some resource has been exhausted'",
-      "signature": "code: 'Some resource has been exhausted'"
+      "group": "cayenne",
+      "may-pass": true
     },
     {
       "run": "memory-limit-spill",
@@ -811,69 +829,69 @@
       "key": "query: SELECT s, id FROM (SELECT s, id, row_number() OVER (ORDER BY s, id) AS r FROM big) t WHERE r % 200000 = 0 ORDER BY r",
       "kind": "error",
       "signature": "Spice rejected the query: Tonic error: code: 'Some resource has been exhausted', message: \"Additional allocation failed for ExternalSorterMerge[<n>]",
+      "pattern": "code: 'Some resource has been exhausted'",
       "group": "cayenne",
-      "may-pass": true,
-      "pattern": "code: 'Some resource has been exhausted'"
+      "may-pass": true
     },
     {
       "run": "memory-limit-spill",
       "who": "cayenne-256mib",
       "key": "query: SELECT count(*) AS groups, sum(c) AS rows FROM (SELECT k, count(*) AS c FROM big GROUP BY k) t",
       "kind": "error",
-      "group": "cayenne",
-      "may-pass": true,
+      "signature": "code: 'Some resource has been exhausted'",
       "pattern": "code: 'Some resource has been exhausted'",
-      "signature": "code: 'Some resource has been exhausted'"
+      "group": "cayenne",
+      "may-pass": true
     },
     {
       "run": "memory-limit-spill",
       "who": "cayenne-256mib",
       "key": "query: SELECT count(DISTINCT k) AS dk, count(DISTINCT s) AS ds FROM big",
       "kind": "error",
-      "group": "cayenne",
-      "may-pass": true,
+      "signature": "code: 'Some resource has been exhausted'",
       "pattern": "code: 'Some resource has been exhausted'",
-      "signature": "code: 'Some resource has been exhausted'"
+      "group": "cayenne",
+      "may-pass": true
     },
     {
       "run": "memory-limit-spill",
       "who": "cayenne-256mib",
       "key": "query: SELECT g, count(DISTINCT k) AS dk, max(s) AS ms FROM big GROUP BY g ORDER BY g",
       "kind": "error",
-      "group": "cayenne",
-      "may-pass": true,
+      "signature": "code: 'Some resource has been exhausted'",
       "pattern": "code: 'Some resource has been exhausted'",
-      "signature": "code: 'Some resource has been exhausted'"
+      "group": "cayenne",
+      "may-pass": true
     },
     {
       "run": "memory-limit-spill",
       "who": "cayenne-256mib",
       "key": "query: SELECT count(*) AS n, count(DISTINCT d.label) AS labels FROM big b JOIN dim d ON b.k = d.id",
       "kind": "error",
-      "group": "cayenne",
-      "may-pass": true,
+      "signature": "code: 'Some resource has been exhausted'",
       "pattern": "code: 'Some resource has been exhausted'",
-      "signature": "code: 'Some resource has been exhausted'"
+      "group": "cayenne",
+      "may-pass": true
     },
     {
       "run": "memory-limit-spill",
       "who": "cayenne-256mib",
       "key": "query: SELECT d.id, count(*) AS n FROM dim d JOIN big b ON b.k = d.id GROUP BY d.id ORDER BY n DESC, d.id LIMIT 10",
       "kind": "error",
-      "group": "cayenne",
-      "may-pass": true,
+      "signature": "code: 'Some resource has been exhausted'",
       "pattern": "code: 'Some resource has been exhausted'",
-      "signature": "code: 'Some resource has been exhausted'"
+      "group": "cayenne",
+      "may-pass": true
     },
     {
       "run": "memory-limit-spill",
       "who": "cayenne-256mib",
       "key": "query: SELECT g, max(rk) AS top FROM (SELECT g, rank() OVER (PARTITION BY g ORDER BY v DESC, id) AS rk FROM big) t GROUP BY g ORDER BY g",
       "kind": "error",
-      "group": "cayenne",
-      "may-pass": true,
+      "signature": "code: 'Some resource has been exhausted'",
       "pattern": "code: 'Some resource has been exhausted'",
-      "signature": "code: 'Some resource has been exhausted'"
+      "group": "cayenne",
+      "may-pass": true
     }
   ],
   "postgres-cdc-kill-during-compaction": [
