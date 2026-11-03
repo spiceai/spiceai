@@ -64,9 +64,12 @@ steps:
         ) TO '${instance.dir}/evo/b.parquet' (FORMAT parquet);
   - start: {}
 
+  # Pin the lookup inside the Parquet scan's projection: a lookup evaluated
+  # by a ProjectionExec above a scan reading `[id, som]` would not exercise
+  # the pruning fix.
   - explain: SELECT id, som['mm']['k'] AS v FROM t
     only: federated
-    contains: ['get_field(som@1, mm, k)']
+    contains: ['projection=[id, get_field(som@1, mm, k) as v], file_type=parquet']
   - query: SELECT id, som['mm']['k'] AS v FROM t ORDER BY id
     expect: { rows: [['0', '1'], ['1', null], ['2', null]] }
   - query: SELECT som['mm']['k'] AS v FROM t
