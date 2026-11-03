@@ -190,7 +190,7 @@ jobs:
     needs: build
     env:
       ARTIFACT_DIR: ./release
-      MINIO_ENDPOINT: ${{ vars.MINIO_ENDPOINT }}
+      MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
       MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
       MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
       COMMIT_SHA: ${{ github.sha }}
