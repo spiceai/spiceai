@@ -225,6 +225,9 @@ impl Runtime {
         self.tool_loads.stop(name).await;
         let builtin = builtin_names.contains(name);
         let mut tools_map = self.tools.write().await;
+        // A built-in tool reports its status under the same `tool:<name>` key; a built-in
+        // catalog reports under `tool_catalog:<name>`, so the Spicepod entry's key is its own.
+        let builtin_tool_status = builtin && matches!(tools_map.get(name), Some(Tooling::Tool(_)));
         // A function exposed as a tool under the same name belongs to the function diff, and a
         // built-in of the same name was never replaced by the Spicepod tool, so it stays.
         if !builtin
@@ -246,8 +249,9 @@ impl Runtime {
             // A cached plan holds the function, and through it the tool.
             self.df.clear_cached_plans_and_results().await;
         }
-        // The built-in's status shares the name; it is still loaded.
-        let status = if builtin {
+        // A built-in tool's status shares the key, and it is still loaded. Any other entry,
+        // including one named like a built-in catalog, never loaded under this key.
+        let status = if builtin_tool_status {
             status::ComponentStatus::Ready
         } else {
             status::ComponentStatus::Disabled
@@ -708,6 +712,58 @@ pub(crate) mod tests {
             description("sql"),
             description("list_datasets"),
             "the Spicepod tool replaced the built-in sql tool"
+        );
+    }
+
+    /// Changing or removing a Spicepod entry named like a built-in catalog does not report the
+    /// entry as loaded: the catalog's status has its own key, so marking the entry Ready would
+    /// count a tool that never loaded as ready for good.
+    #[tokio::test]
+    async fn a_failed_entry_named_like_a_builtin_catalog_stays_unready_across_reloads() {
+        let catalog = crate::tools::builtin::catalog::BuiltinToolCatalog::name();
+        let app = |tools: Vec<Tool>| {
+            let mut builder = AppBuilder::new("tool_loading");
+            for tool in tools {
+                builder = builder.with_tool(tool);
+            }
+            Arc::new(builder.build())
+        };
+        let rt = runtime_with(vec![tool(catalog, "unreachable:a")]).await;
+        register_unreachable(&rt).await;
+
+        tokio::time::pause();
+        Arc::clone(&rt).load_tools().await;
+        assert!(
+            !rt.status.is_ready(),
+            "the failed entry keeps /v1/ready false"
+        );
+
+        assert!(
+            Arc::clone(&rt)
+                .apply_app(app(vec![tool(catalog, "unreachable:b")]))
+                .await
+        );
+        assert!(matches!(
+            tool_status(&rt, catalog),
+            Some(status::ComponentStatus::Error(_))
+        ));
+        assert!(
+            !rt.status.is_ready(),
+            "replacing a failed entry with another failing one reported ready"
+        );
+        assert!(
+            rt.tools.read().await.contains_key(catalog),
+            "the built-in catalog was removed"
+        );
+
+        assert!(Arc::clone(&rt).apply_app(app(vec![])).await);
+        assert!(matches!(
+            tool_status(&rt, catalog),
+            Some(status::ComponentStatus::Disabled)
+        ));
+        assert!(
+            rt.tools.read().await.contains_key(catalog),
+            "the built-in catalog was removed"
         );
     }
 
