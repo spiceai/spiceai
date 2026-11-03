@@ -125,6 +125,9 @@ fn main() {
     }
     // Install the default AWS LC RS crypto provider for rusttls
     let _ = CryptoProvider::install_default(crypto::aws_lc_rs::default_provider());
+    // jsonwebtoken panics on first use when Cargo feature unification enables
+    // more than one of its crypto backends, so select one explicitly.
+    let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
 
     if args.repl {
         if let Err(err) = &crash_reporting {
