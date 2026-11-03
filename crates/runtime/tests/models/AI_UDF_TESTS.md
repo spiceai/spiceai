@@ -16,7 +16,12 @@ export SPICE_HUGGINGFACE_API_KEY="your-huggingface-api-key"  # Required for loca
 export SPICE_GOOGLE_API_KEY="your-google-api-key"           # Required for Gemini tests
 ```
 
-For Anthropic, `SPICE_ANTHROPIC_AUTH_TOKEN` takes the place of `SPICE_ANTHROPIC_API_KEY` when it is set: the models then send it as `anthropic_auth_token` (`Authorization: Bearer`). CI sets it to a short-lived access token minted through Anthropic workload identity federation (`.github/actions/anthropic-token`) and has no Anthropic API key.
+CI has no OpenAI or Anthropic API key: its models authenticate with workload identity federation, exchanging the job's GitHub OIDC token and refreshing it. The tests switch to that when its IDs are set:
+
+- OpenAI: `OPENAI_IDENTITY_PROVIDER_ID` and `OPENAI_SERVICE_ACCOUNT_ID` (and `OPENAI_WIF_AUDIENCE`, default `https://api.openai.com`) take the place of `SPICE_OPENAI_API_KEY`.
+- Anthropic: `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID` and `ANTHROPIC_SERVICE_ACCOUNT_ID` (and `ANTHROPIC_WORKSPACE_ID`) take the place of `SPICE_ANTHROPIC_API_KEY`; without them, `SPICE_ANTHROPIC_AUTH_TOKEN` (sent as `anthropic_auth_token`) is used before the API key.
+
+Federation needs a GitHub Actions job with `permissions: id-token: write`; locally, use the API keys.
 
 ### Models Used
 

@@ -263,8 +263,6 @@ pub enum QueryOverridesArg {
     Postgresql,
     #[serde(rename = "mysql")]
     Mysql,
-    #[serde(rename = "dremio")]
-    Dremio,
     #[serde(rename = "spark")]
     Spark,
     #[serde(rename = "odbc-athena")]
@@ -473,7 +471,6 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Sqlite => QueryOverrides::SQLite,
             QueryOverridesArg::Postgresql => QueryOverrides::PostgreSQL,
             QueryOverridesArg::Mysql => QueryOverrides::MySQL,
-            QueryOverridesArg::Dremio => QueryOverrides::Dremio,
             QueryOverridesArg::Spark => QueryOverrides::Spark,
             QueryOverridesArg::ODBCAthena => QueryOverrides::ODBCAthena,
             QueryOverridesArg::ODBCDatabricks => QueryOverrides::ODBCDatabricks,
