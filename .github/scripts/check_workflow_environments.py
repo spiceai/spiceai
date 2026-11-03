@@ -1,30 +1,15 @@
 #!/usr/bin/env python3
 # Copyright 2024-2026 The Spice.ai OSS Authors
 #
-# GitHub Actions environment guard.
+# Ensure every GitHub Actions workflow explicitly uses environments.
 #
 # Every credential a workflow uses lives in a GitHub environment, not in the
-# repository or organization (see `docs/dev/github_actions_environments.md`).
-# That boundary only holds while two rules hold for every job under
-# `.github/workflows/`:
-#
-# 1. A job that runs steps selects an `environment:`. A job without one still
-#    resolves repository and organization secrets, so a new job that forgets the
-#    key silently bypasses the environment's ref restrictions and reviewers. A
-#    job that calls a reusable workflow (`uses:`) is the exception: GitHub does
-#    not allow `environment:` there, and the callee's own jobs select theirs.
-#
-# 2. The environment is one this repository has configured. GitHub creates any
-#    environment a job names that does not exist yet, with no protection rules,
-#    so a misspelled or new name silently gets an unprotected environment.
-#
-# 3. A job in the `secret-free` environment references no secret other than the
-#    GitHub-managed `GITHUB_TOKEN`. `secret-free` carries no protection rules, so
-#    it is what fork and Dependabot PR runs execute under; a `secrets.X` reference
-#    there either reads a repository/organization fallback the migration is meant
-#    to remove, or quietly resolves to an empty string and hides a misfiled job.
-#    A workflow-level `env:` that names a secret counts against every
-#    `secret-free` job in that workflow, because each of them inherits it.
+# repository or organization. This workflow checks
+#   1. An environment is set at all times (`secret-free` if not needing env secrets) and it is a known environment ( GitHub creates any
+#      environment a job names that does not exist yet, with no protection rules,
+#      so a misspelled or new name silently gets an unprotected environment). 
+#   2. If `secret-free` environment, no secrets are provided.
+
 """Require every workflow job to select an environment, and keep `secret-free` jobs free of secrets."""
 
 from __future__ import annotations
