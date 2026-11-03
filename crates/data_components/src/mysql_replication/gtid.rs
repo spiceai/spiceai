@@ -347,7 +347,10 @@ mod tests {
         let held: Vec<u64> = (0..=5).filter(|&gno| set.contains(u2, gno)).collect();
         assert_eq!(held, vec![3]);
         let other = Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("uuid");
-        assert!(!set.contains(other, 1), "a UUID absent from the set holds nothing");
+        assert!(
+            !set.contains(other, 1),
+            "a UUID absent from the set holds nothing"
+        );
     }
 
     #[test]
