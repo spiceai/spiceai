@@ -47,6 +47,7 @@ permissions:
 
 jobs:
   analyze:
+    environment: ci-build
     name: Analyze
     # Rust extraction and the query suite run on the spiceai-macos pool. The
     # compiler cache is spiceio, as on the other macOS jobs. MinIO credentials

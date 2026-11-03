@@ -26,6 +26,7 @@ env:
 
 jobs:
   check_changes:
+    environment: secret-free
     name: Check for code changes
     runs-on: spiceai-macos
     outputs:
@@ -41,6 +42,7 @@ jobs:
         uses: ./.github/actions/check-code-changes
 
   check:
+    environment: ci-build
     name: Rust Lint
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -122,6 +124,7 @@ jobs:
           if-no-files-found: ignore
 
   build-and-test:
+    environment: ci-build
     name: Build and Test
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'

@@ -76,6 +76,7 @@ env:
 
 jobs:
   setup-matrix:
+    environment: secret-free
     name: Setup strategy matrix
     runs-on: ubuntu-24.04
     outputs:
@@ -180,6 +181,7 @@ jobs:
             return matrix;
 
   build:
+    environment: ci-build
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
@@ -482,6 +484,7 @@ jobs:
           destination_path: spice-minio/artifacts/spice/linux-x86_64/${{ github.sha }}/
 
   publish:
+    environment: publish
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
     needs: build
     if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'

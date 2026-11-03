@@ -5,6 +5,7 @@ on:
 
 jobs:
   build:
+    environment: publish
     runs-on: ubuntu-24.04
 
     steps:

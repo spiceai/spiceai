@@ -30,6 +30,7 @@ env:
 
 jobs:
   check_commits:
+    environment: secret-free
     runs-on: ubuntu-24.04
     outputs:
       has_new_commits: ${{ steps.check_commits.outputs.has_new_commits }}
@@ -60,6 +61,7 @@ jobs:
         shell: bash
 
   setup:
+    environment: secret-free
     needs: check_commits
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
@@ -91,6 +93,7 @@ jobs:
   # ==================== BINARY BUILD JOBS ====================
 
   build-linux-x64:
+    environment: secret-free
     name: Build - Linux x64
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
@@ -160,6 +163,7 @@ jobs:
           path: spice_linux_x86_64.tar.gz
 
   build-linux-arm64:
+    environment: secret-free
     name: Build - Linux aarch64
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
@@ -231,6 +235,7 @@ jobs:
           path: spice_linux_aarch64.tar.gz
 
   build-macos-arm64:
+    environment: secret-free
     name: Build - macOS aarch64
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
@@ -392,6 +397,7 @@ jobs:
   # These jobs use pre-built spiced binaries from the CLI build jobs
 
   build-docker-arm64:
+    environment: ci-build
     name: Build Docker - ARM64
     needs: [check_commits, setup, build-linux-arm64]
     if: needs.check_commits.outputs.has_new_commits == 'true'
@@ -462,6 +468,7 @@ jobs:
           path: /tmp/image-arm64-default.tar
 
   build-docker-amd64:
+    environment: ci-build
     name: Build Docker - AMD64
     needs: [check_commits, setup, build-linux-x64]
     if: needs.check_commits.outputs.has_new_commits == 'true'
@@ -513,6 +520,7 @@ jobs:
           path: /tmp/image-amd64-default.tar
 
   publish-docker:
+    environment: publish-nightly
     name: Publish Docker Images
     needs: [check_commits, setup, build-docker-amd64, build-docker-arm64]
     if: needs.check_commits.outputs.has_new_commits == 'true' && (github.event_name == 'schedule' || inputs.publish)

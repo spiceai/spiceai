@@ -27,6 +27,7 @@ on:
 
 jobs:
   run-schema:
+    environment: ci-integration
     name: Run schema tests
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600

@@ -21,6 +21,7 @@ concurrency:
 
 jobs:
   plan:
+    environment: ci-build
     name: Plan WAL E2E legs
     # Every leg runs the change's code on persistent self-hosted runners in a
     # public repository, so a pull request from a fork or from Dependabot runs
@@ -117,6 +118,7 @@ jobs:
             return legs;
 
   qualify:
+    environment: ci-integration
     name: WAL E2E (${{ matrix.os }}, ${{ matrix.store }})
     needs: plan
     if: needs.plan.result == 'success' && needs.plan.outputs.legs != '[]'

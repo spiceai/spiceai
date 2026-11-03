@@ -108,6 +108,7 @@ concurrency:
 
 jobs:
   run-htap:
+    environment: ci-integration
     name: Run CH-BenCHmark
     runs-on: ${{ github.event.inputs.runner_type }}
     # 30-minute HTAP window plus ready_wait (up to 30 min on cold SF1000), template

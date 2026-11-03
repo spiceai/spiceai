@@ -43,6 +43,7 @@ jobs:
   # running unconditionally is intentional; step-gate on Cargo changes if queue
   # latency ever becomes a concern.
   build:
+    environment: ci-build
     name: Features Check
     # Emit the required context on pull requests without running the expensive
     # feature matrix; the real check runs on the merge-group commit.

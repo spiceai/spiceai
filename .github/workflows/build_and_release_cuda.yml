@@ -69,6 +69,7 @@ concurrency:
 
 jobs:
   setup-matrix:
+    environment: secret-free
     name: Setup CUDA matrix
     runs-on: ubuntu-24.04
     outputs:
@@ -138,6 +139,7 @@ jobs:
             return matrix;
 
   build:
+    environment: secret-free
     name: Build CUDA ${{ matrix.target.compute_cap }} binaries
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
@@ -185,6 +187,7 @@ jobs:
           rust-profile: ${{ env.RUST_PROFILE }}
 
   publish-minio:
+    environment: ci-build
     name: Publish linux-x86_64 CUDA binaries to Minio
     runs-on: spiceai-dev-runners
     needs: build
@@ -228,6 +231,7 @@ jobs:
           done
 
   publish:
+    environment: publish
     name: Publish CUDA binaries
     needs: build
     if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'

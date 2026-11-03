@@ -63,6 +63,7 @@ on:
 
 jobs:
   run-data-consistency:
+    environment: ci-integration
     name: Run data consistency tests
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600

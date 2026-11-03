@@ -44,6 +44,7 @@ concurrency:
 
 jobs:
   check-workflow-yaml:
+    environment: secret-free
     name: Validate GitHub Actions definitions
     # GitHub-hosted on purpose: this is a sub-second check and must not queue
     # behind the saturated self-hosted pool.

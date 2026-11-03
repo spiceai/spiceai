@@ -123,6 +123,7 @@ jobs:
   # GitHub-hosted on purpose. It is two API calls and must not queue behind the
   # saturated self-hosted pool — every sign-off now waits on it.
   resolve:
+    environment: secret-free
     name: "Resolve sign-off target"
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -241,6 +242,7 @@ jobs:
           echo "Targeted pre-lint base: trunk (fixed)"
 
   sign-off:
+    environment: ci-build
     name: "Sign off on ${{ inputs.pr_number && format('PR #{0}', inputs.pr_number) || github.event.inputs.branch }}"
     needs: resolve
     # The authoritative one-run-per-commit guard. Both dispatch forms reduce to

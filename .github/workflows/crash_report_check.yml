@@ -24,6 +24,7 @@ concurrency:
 
 jobs:
   crash_report:
+    environment: ci-build
     name: crash report (${{ matrix.profile }})
     runs-on: spiceai-dev-runners
     # `release-lto` links the whole graph with fat LTO; it is far slower than release.

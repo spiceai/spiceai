@@ -25,6 +25,7 @@ on:
 
 jobs:
   run-nas-bench:
+    environment: ci-integration
     name: Run network-attached storage benchmark tests
     runs-on: spiceai-macos
     timeout-minutes: 600

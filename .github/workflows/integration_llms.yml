@@ -50,6 +50,7 @@ env:
 
 jobs:
   setup-matrix:
+    environment: secret-free
     name: Setup strategy matrix
     runs-on: spiceai-dev-runners
     # Evaluates one inline script.
@@ -102,6 +103,7 @@ jobs:
             return matrix;
 
   build:
+    environment: ci-build
     name: Build Test Binary
     # `spiceai-macos-large` in the merge queue: on the `spiceai-macos` minis
     # this build queued 68 min at p90 for a runner (merge_group,
@@ -189,7 +191,7 @@ jobs:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     # Holds the Anthropic workload identity federation IDs (`ANTHROPIC_*` secrets).
-    environment: ci
+    environment: ci-ai
     permissions:
       contents: read
       actions: read
@@ -309,6 +311,7 @@ jobs:
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
   llama-cpp-engine:
+    environment: secret-free
     name: llama.cpp engine (Qwen3-0.6B GGUF)
     # The engine's model and differential tests download Qwen3-0.6B (639 MB), and its MTP
     # tests Qwen3.5-0.8B (550 MB), from Hugging Face and run them; its no-network tests run

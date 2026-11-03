@@ -39,6 +39,7 @@ on:
 
 jobs:
   dispatch-htap:
+    environment: ci-build
     name: Dispatch HTAP - ${{ github.event.inputs.scale_factor || github.event.schedule }}
     runs-on: spiceai-dev-runners
     # The dispatcher only fires the workflow_dispatch events (spaced ~80s apart) and exits; the runs

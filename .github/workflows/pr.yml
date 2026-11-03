@@ -62,6 +62,7 @@ jobs:
   # heavy jobs below and the other workflows run the full suite. This is what
   # replaces running all checks on every PR push.
   attestation:
+    environment: secret-free
     # GitHub-hosted: self-hosted runners don't run for fork PRs, which would
     # leave external contributors' required Attestation check unreported and
     # stuck.
@@ -625,6 +626,7 @@ jobs:
   # every PR push. `check_changes` lets docs-only merges skip the build and still
   # report success (a required check can't be skipped via paths-ignore).
   check_changes:
+    environment: secret-free
     if: ${{ github.event_name != 'pull_request' }}
     # The pool of the three required builds below, which all wait on this job.
     # On the `spiceai-macos` minis it queued 13.7 min at the median and 64.7 min
@@ -653,6 +655,7 @@ jobs:
 
   # Run Rust linting
   lint-rust:
+    environment: ci-build
     name: Rust Lint
     runs-on: spiceai-macos-large
     # Slowest observed success in the 2026-07-25..08-08 window: 126 min.
@@ -755,6 +758,7 @@ jobs:
 
   # Build and test
   build-test:
+    environment: ci-integration
     name: Build and Test
     runs-on: spiceai-macos-large
     # Slowest observed success in the 2026-07-25..08-08 window: 117 min.
@@ -952,6 +956,7 @@ jobs:
 
   # Release-profile installs (make install, install-cli, install-spiced)
   build-install-release:
+    environment: ci-build
     name: Build (release profile)
     runs-on: spiceai-macos-large
     # Slowest observed success in the 2026-07-25..08-08 window: 106 min.

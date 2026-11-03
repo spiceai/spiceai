@@ -56,6 +56,7 @@ env:
 
 jobs:
   mode_a_tpch:
+    environment: ci-build
     name: Mode A TPC-H
     # `spiceai-macos-large` in the merge queue: on the `spiceai-macos` minis
     # this job queued 83 min at p90 for a runner and then ran for 2.8 min at
@@ -162,6 +163,7 @@ jobs:
           if-no-files-found: ignore
 
   mode_b_tpch:
+    environment: ci-build
     name: Mode B TPC-H (${{ matrix.engine }}, ${{ matrix.mode }})
     # Nightly and on manual dispatch only. Mode B serves the suite from a trunk
     # spiced (`setup-spiced` takes the newest build among the last 10 trunk

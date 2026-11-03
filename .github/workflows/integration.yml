@@ -47,7 +47,6 @@ env:
   CARGO_HTTP_TIMEOUT: 60
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
-  HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
   INTEGRATION_TESTS_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-tests-archive/integration_tests.tar.zst
 
 jobs:
@@ -57,6 +56,7 @@ jobs:
   # nothing ran for (#13841). Queue entry is gated by the approval rules and
   # `Attestation`; the merge-group commit is what runs the suite.
   check_changes:
+    environment: secret-free
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
     # A full-history checkout (`fetch-depth: 0`) and a path diff. Measured at
@@ -146,6 +146,7 @@ jobs:
           echo "Source versions beyond each default: ${matrix}"
 
   build:
+    environment: ci-build
     name: Build Test Binary
     needs: check_changes
     if: ${{ github.event_name != 'pull_request' }}
@@ -158,6 +159,8 @@ jobs:
     # the MinIO upload) has taken at most in the same window, so the step bound
     # is what fires on a wedged build and this one stays the backstop.
     timeout-minutes: 200
+    env:
+      HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -332,6 +335,7 @@ jobs:
           key: ${{ steps.cargo-registry.outputs.cache-primary-key }}
 
   test-partitions:
+    environment: ci-integration
     name: Run Integration Tests (part ${{ matrix.label }})
     needs: [build, check_changes]
     if: ${{ github.event_name != 'pull_request' }}
@@ -354,6 +358,8 @@ jobs:
             partition: 'count:2/3'
           - label: 3
             partition: 'count:3/3'
+    env:
+      HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -557,6 +563,7 @@ jobs:
   # archive with `SPICE_TEST_<SOURCE>_VERSION` set, so nothing is rebuilt. When it
   # runs is `source_changes` in `check_changes`.
   source-versions:
+    environment: ci-integration
     name: Integration Tests (${{ matrix.source }} ${{ matrix.version }})
     needs: [build, check_changes]
     if: ${{ github.event_name != 'pull_request' && needs.check_changes.outputs.relevant_changes == 'true' && needs.check_changes.outputs.source_changes == 'true' && needs.check_changes.outputs.source_versions_matrix != '[]' }}
@@ -570,6 +577,8 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.check_changes.outputs.source_versions_matrix) }}
+    env:
+      HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -678,6 +687,7 @@ jobs:
   # lookup does not yield exactly one conclusion, the gate falls back to the
   # combined result: it can only ever be as strict as before, never laxer.
   test-part-1:
+    environment: secret-free
     name: Integration Tests (part 1)
     needs: [check_changes, test-partitions, test-github]
     if: ${{ always() && github.event_name != 'pull_request' }}
@@ -731,6 +741,7 @@ jobs:
           [ "$ok" = true ]
 
   test-part-2:
+    environment: secret-free
     name: Integration Tests (part 2)
     needs: [check_changes, test-partitions, test-github]
     if: ${{ always() && github.event_name != 'pull_request' }}
@@ -784,6 +795,7 @@ jobs:
           [ "$ok" = true ]
 
   test-part-3:
+    environment: secret-free
     name: Integration Tests (part 3)
     needs: [check_changes, test-partitions, test-github]
     if: ${{ always() && github.event_name != 'pull_request' }}
@@ -837,6 +849,7 @@ jobs:
           [ "$ok" = true ]
 
   upload-integration-snapshots:
+    environment: secret-free
     name: Upload Integration Snapshots
     if: github.event.inputs.update_snapshots == 'always'
     # A checkout, a commit and a push.
@@ -894,6 +907,7 @@ jobs:
         run: echo "No snapshot artifacts were uploaded; skipping snapshot update."
 
   test-github:
+    environment: ci-integration
     name: GitHub Connector Integration Tests
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -911,6 +925,8 @@ jobs:
     concurrency:
       group: github-connector-live-api
       queue: max
+    env:
+      HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1018,6 +1034,7 @@ jobs:
           retention-days: 1
 
   test-aws-sdk:
+    environment: ci-integration
     name: AWS SDK Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 12.4 min (run 34213792762).
@@ -1026,6 +1043,8 @@ jobs:
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: spiceai-dev-runners
+    env:
+      HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1081,6 +1100,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration_aws_sdk)'
 
   test-aws-sdk-credential-bridge:
+    environment: ci-integration
     name: AWS SDK Credential Bridge Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 9.0 min (run 34213792762).
@@ -1089,6 +1109,8 @@ jobs:
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: spiceai-dev-runners
+    env:
+      HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1148,6 +1170,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=aws-sdk-credential-bridge::credential_provider)'
 
   test-snapshot-refresh:
+    environment: ci-integration
     name: Snapshot Refresh Mode Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 10.9 min (run 34213792762).
@@ -1156,6 +1179,8 @@ jobs:
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: spiceai-dev-runners
+    env:
+      HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1209,6 +1234,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration_snapshot_refresh)'
 
   test-data-components:
+    environment: ci-integration
     name: Data Components Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 7.5 min (run 33859377810).
@@ -1217,6 +1243,8 @@ jobs:
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: spiceai-dev-runners
+    env:
+      HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1263,6 +1291,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=data_components::integration) & test(/^hadoop_catalog_test::/)'
 
   test-runtime-partition:
+    environment: ci-integration
     name: Partition Table Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 7.7 min (run 34213792762).
@@ -1270,6 +1299,8 @@ jobs:
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-dev-runners
+    env:
+      HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
