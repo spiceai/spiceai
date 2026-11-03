@@ -157,38 +157,56 @@ fn exceeds_decompression_bound(declared: u64, body_len: usize) -> bool {
 /// leaves room for the IPC header and padding below the 4 MiB default.
 pub const FLIGHT_TARGET_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 
-/// Split `batch` into zero-copy row slices of about `max_bytes` of Arrow data each, so that
-/// each slice can be sent as its own Flight message.
+/// Split `batch` into zero-copy row slices of at most `max_bytes` of Arrow data each, so
+/// that each slice can be sent as its own Flight message.
 ///
 /// Sizes come from [`crate::record_batch::slice_memory_size`], which counts only the part of
 /// each buffer a (possibly already sliced) batch references, so a narrow slice of a large
-/// decoded chunk is not split further than its own rows need. Rows are spread evenly across
-/// the slices. A batch at or under `max_bytes`, a batch with at most one row, and a
-/// `max_bytes` of zero are returned unchanged: a single row is the smallest unit Flight can
-/// send, so a row larger than the target still goes out as one message.
+/// decoded chunk is not split further than its own rows need. Rows are first spread evenly
+/// across as many slices as the batch's size calls for, and any slice still over `max_bytes`
+/// (because its rows are wider than the batch's average) is split again the same way. A
+/// batch at or under `max_bytes`, a batch with at most one row, and a `max_bytes` of zero
+/// are returned unchanged: a single row is the smallest unit Flight can send, so a row
+/// larger than the target still goes out as one message.
+///
+/// Dictionary values are not sliced: every slice of a dictionary-encoded column shares the
+/// column's whole dictionary, which is sent once.
 #[must_use]
 pub fn split_batch_for_flight(
     batch: arrow::record_batch::RecordBatch,
     max_bytes: usize,
 ) -> Vec<arrow::record_batch::RecordBatch> {
+    let mut slices = Vec::new();
+    split_into(batch, max_bytes, &mut slices);
+    slices
+}
+
+fn split_into(
+    batch: arrow::record_batch::RecordBatch,
+    max_bytes: usize,
+    slices: &mut Vec<arrow::record_batch::RecordBatch>,
+) {
     let num_rows = batch.num_rows();
     if max_bytes == 0 || num_rows <= 1 {
-        return vec![batch];
+        slices.push(batch);
+        return;
     }
     let size = crate::record_batch::slice_memory_size(&batch);
     if size <= max_bytes {
-        return vec![batch];
+        slices.push(batch);
+        return;
     }
+    // `size > max_bytes` and `num_rows >= 2`, so `pieces >= 2` and every piece has at most
+    // half the rows (rounded up): each recursion level shrinks the slices, so the depth is
+    // bounded by `log2(num_rows)`.
     let pieces = size.div_ceil(max_bytes).min(num_rows);
-    let rows_per_piece = num_rows.div_ceil(pieces).max(1);
-    let mut slices = Vec::with_capacity(pieces);
+    let rows_per_piece = num_rows.div_ceil(pieces);
     let mut offset = 0;
     while offset < num_rows {
         let length = rows_per_piece.min(num_rows - offset);
-        slices.push(batch.slice(offset, length));
+        split_into(batch.slice(offset, length), max_bytes, slices);
         offset += length;
     }
-    slices
 }
 
 #[cfg(test)]
@@ -462,6 +480,7 @@ mod split_batch_for_flight_tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{FLIGHT_TARGET_MESSAGE_BYTES, split_batch_for_flight};
+    use crate::record_batch::slice_memory_size;
 
     /// The 4 MiB receive limit tonic, grpc-go and grpc-java clients apply by default.
     const CLIENT_DEFAULT_DECODE_LIMIT: usize = 4 * 1024 * 1024;
@@ -581,5 +600,38 @@ mod split_batch_for_flight_tests {
         assert_eq!(lengths.iter().sum::<usize>(), 10_001);
         assert!(max - min < slices.len(), "uneven slices: {lengths:?}");
         assert!(slices.iter().all(|s| s.column(0).len() == s.num_rows()));
+    }
+
+    /// Rows wider than the batch's average, clustered together, are split again rather than
+    /// sent as one oversized slice: six 1 MiB strings followed by 94 one-byte strings would
+    /// put all six wide rows in the first of four even slices.
+    #[test]
+    fn clustered_wide_rows_are_split_until_each_slice_fits() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let wide = "x".repeat(1024 * 1024);
+        let values: Vec<&str> = std::iter::repeat_n(wide.as_str(), 6)
+            .chain(std::iter::repeat_n("x", 94))
+            .collect();
+        let column: ArrayRef = Arc::new(LargeStringArray::from(values));
+        let batch = RecordBatch::try_new(schema, vec![column]).expect("batch");
+
+        let slices = split_batch_for_flight(batch.clone(), FLIGHT_TARGET_MESSAGE_BYTES);
+
+        for slice in &slices {
+            assert!(
+                slice.num_rows() == 1 || slice_memory_size(slice) <= FLIGHT_TARGET_MESSAGE_BYTES,
+                "a {}-row slice of {} bytes is over the target",
+                slice.num_rows(),
+                slice_memory_size(slice)
+            );
+            assert!(encoded_message_bytes(slice) <= CLIENT_DEFAULT_DECODE_LIMIT);
+        }
+        assert_eq!(slices.iter().map(RecordBatch::num_rows).sum::<usize>(), 100);
+        let rejoined = concat_batches(&batch.schema(), &slices).expect("concat");
+        assert_eq!(rejoined, batch);
     }
 }
