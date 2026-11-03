@@ -266,7 +266,7 @@ impl Runtime {
         // them.
         self.tool_loads.stop(&tool.name).await;
         // A tool that already failed stays failed until an attempt succeeds, so loading the
-        // tools again does not make it block readiness.
+        // tools again does not report it as initializing.
         let already_failed = matches!(
             self.status
                 .get_component_status(&format!("tool:{}", tool.name)),
@@ -654,9 +654,9 @@ pub(crate) mod tests {
     }
 
     /// A Spicepod tool that cannot load is left out, and the tools around it, including the
-    /// built-ins, still load and the runtime reports ready.
+    /// built-ins, still load. The runtime does not report ready while the tool fails.
     #[tokio::test]
-    async fn a_failing_tool_does_not_hide_the_other_tools_or_block_readiness() {
+    async fn a_failing_tool_does_not_hide_the_other_tools() {
         let rt = runtime_with(vec![
             tool("my_sql", "builtin:sql"),
             tool("broken", "unreachable:x"),
@@ -689,10 +689,7 @@ pub(crate) mod tests {
             tool_status(&rt, "my_sql"),
             Some(status::ComponentStatus::Ready)
         ));
-        assert!(
-            rt.status.is_ready(),
-            "a failed tool must not block /v1/ready"
-        );
+        assert!(!rt.status.is_ready(), "a failed tool keeps /v1/ready false");
         load.await.expect("load_tools finishes");
     }
 
@@ -715,8 +712,9 @@ pub(crate) mod tests {
     }
 
     /// A failed tool stays failed through its background retries and when the tools load again
-    /// (a second `load_models` does that), so neither puts it back to initializing and blocks
-    /// readiness, and loading again replaces its retries instead of adding to them.
+    /// (a second `load_models` does that), so neither puts it back to initializing, the runtime
+    /// does not report ready meanwhile, and loading again replaces its retries instead of adding
+    /// to them.
     #[tokio::test]
     async fn a_failed_tool_stays_failed_across_retries_and_reloads() {
         let rt = runtime_with(vec![tool("flaky", "unreachable:x")]).await;
@@ -753,8 +751,8 @@ pub(crate) mod tests {
         );
         for attempt in &attempts[1..] {
             assert!(
-                matches!(attempt, (_, Some(status::ComponentStatus::Error(_)), true)),
-                "a retry or a reload put the failed tool back to initializing or blocked readiness: {attempt:?}"
+                matches!(attempt, (_, Some(status::ComponentStatus::Error(_)), false)),
+                "a retry or a reload put the failed tool back to initializing or reported ready: {attempt:?}"
             );
         }
     }
