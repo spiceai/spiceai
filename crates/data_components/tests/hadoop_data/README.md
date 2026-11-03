@@ -39,6 +39,12 @@ The `setup_file_hadoop.sh` and `setup_minio_hadoop.sh` files setup each respecti
 
 `setup_file_hadoop.sh` is configured to call `setup_minio_hadoop.sh`, and expects to be used within the Dockerfile image.
 
+## The checked-in `warehouse/`
+
+`warehouse/` is the `hadoop` bucket exactly as `setup_minio_hadoop.sh` writes it: Spark 3.5.6 with Iceberg 1.9.2, so every location in it reads `s3a://hadoop/...`. The `Data Components Integration Tests` job in `.github/workflows/integration.yml` mirrors it into the CI MinIO before each run, so the test never depends on a bucket someone seeded by hand.
+
+To regenerate it, run `setup_minio_hadoop.sh` against an empty MinIO and copy the bucket out with `mc mirror <alias>/hadoop warehouse`. The repository's `.gitignore` ignores every `data/` directory, so add the Parquet files with `git add -f crates/data_components/tests/hadoop_data/warehouse`.
+
 ## Running `hadoop_catalog_test`
 
 The test builds one catalog per backend and asserts the same expectations against each. Which
