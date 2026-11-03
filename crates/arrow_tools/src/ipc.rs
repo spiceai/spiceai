@@ -176,7 +176,7 @@ pub const FLIGHT_TARGET_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 ///
 /// Slices share the batch's buffers, except that a slice's string and binary view columns
 /// (at any nesting depth) are copied into buffers holding only its own values when the
-/// column's buffers are over `max_bytes`, because the IPC writer sends view data buffers
+/// slice's buffers add up to more than `max_bytes`, because the IPC writer sends view data buffers
 /// whole.
 #[must_use]
 pub fn split_batch_for_flight(
@@ -193,27 +193,33 @@ pub fn split_batch_for_flight(
     slices
 }
 
-/// Rewrites, in place, each column of `slice` that holds string or binary views and whose
-/// buffers add up to more than `max_bytes`, so it keeps only the view data its own rows use.
+/// Rewrites, in place, each column of `slice` that holds string or binary views, so it keeps
+/// only the view data its own rows use, when the buffers of all of `slice`'s columns add up
+/// to more than `max_bytes`.
 ///
 /// The IPC writer sends a view array's data buffers whole, so a slice of a view column, or
 /// of a struct or list holding one, would otherwise carry every value the parent batch
-/// held. Columns without views, and view columns whose buffers already fit, are left as
-/// they are, so batches without views pay nothing.
+/// held. The gate is on the whole slice, not each column: several view columns that each
+/// fit can still add up to a message over a client's limit. Batches without views, and
+/// slices whose buffers already fit, pay nothing.
 fn compact_view_columns(slice: &mut arrow::record_batch::RecordBatch, max_bytes: usize) {
     use arrow::array::Array;
 
-    let needs_compaction = |column: &arrow::array::ArrayRef| {
-        contains_view(column.data_type()) && column.get_array_memory_size() > max_bytes
-    };
-    if !slice.columns().iter().any(needs_compaction) {
+    let has_views = |column: &arrow::array::ArrayRef| contains_view(column.data_type());
+    if !slice.columns().iter().any(has_views) {
+        return;
+    }
+    let retained = slice.columns().iter().fold(0usize, |total, column| {
+        total.saturating_add(column.get_array_memory_size())
+    });
+    if retained <= max_bytes {
         return;
     }
     let columns = slice
         .columns()
         .iter()
         .map(|column| {
-            if needs_compaction(column) {
+            if has_views(column) {
                 compact_views(column)
             } else {
                 std::sync::Arc::clone(column)
@@ -1013,6 +1019,43 @@ mod split_batch_for_flight_tests {
         );
         for slice in &slices {
             assert!(encoded_message_bytes(slice) <= CLIENT_DEFAULT_DECODE_LIMIT);
+        }
+        let rejoined = concat_batches(&batch.schema(), &slices).expect("concat");
+        assert_eq!(rejoined, batch);
+    }
+
+    /// Several struct-of-view columns that each fit under the target, but together do not,
+    /// are still compacted in every slice.
+    #[test]
+    fn view_columns_that_only_add_up_past_the_target_are_compacted() {
+        use arrow::array::{StringViewArray, StructArray};
+
+        let value = "z".repeat(1_024);
+        let column = |name: &str| -> (Field, ArrayRef) {
+            let views: ArrayRef = Arc::new(StringViewArray::from_iter_values(
+                (0..1_536).map(|_| value.as_str()),
+            ));
+            let field = Arc::new(Field::new("s", DataType::Utf8View, true));
+            let structs: ArrayRef = Arc::new(StructArray::from(vec![(field, views)]));
+            (Field::new(name, structs.data_type().clone(), true), structs)
+        };
+        let (fields, columns): (Vec<_>, Vec<_>) = ["a", "b", "c"].into_iter().map(column).unzip();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("batch");
+        assert!(
+            encoded_message_bytes(&batch) > CLIENT_DEFAULT_DECODE_LIMIT,
+            "fixture must be over the client limit"
+        );
+
+        let slices = split_batch_for_flight(batch.clone(), FLIGHT_TARGET_MESSAGE_BYTES);
+
+        assert!(slices.len() > 1, "got {} slices", slices.len());
+        for slice in &slices {
+            let bytes = encoded_message_bytes(slice);
+            assert!(
+                bytes <= FLIGHT_TARGET_MESSAGE_BYTES * 2,
+                "a {}-row slice encodes to {bytes} bytes",
+                slice.num_rows()
+            );
         }
         let rejoined = concat_batches(&batch.schema(), &slices).expect("concat");
         assert_eq!(rejoined, batch);
