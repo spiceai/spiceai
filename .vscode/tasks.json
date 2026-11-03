@@ -12,7 +12,7 @@
     {
       "type": "cargo",
       "command": "build",
-      "args": ["-p", "testoperator", "--features", "models"],
+      "args": ["-p", "testoperator"],
       "problemMatcher": ["$rustc"],
       "group": {
         "kind": "build",
