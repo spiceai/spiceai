@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! PREDICATE-AWARE maintained aggregate — Cayenne vs DuckDB on the CH-benCH q1/q6
+//! PREDICATE-AWARE maintained aggregate — Cayenne vs `DuckDB` on the CH-benCH q1/q6
 //! shape: a single-table grouped aggregate over a large CDC-fed table WITH a
 //! `WHERE` filter.
 //!
@@ -28,7 +28,7 @@
 //! selects, and serves a query carrying the identical predicate from that state.
 //!
 //! - `duckdb_rescan`  — `SELECT grp, SUM(value), COUNT(*) FROM t WHERE delivery > T
-//!   GROUP BY grp` against in-memory DuckDB. O(rows): DuckDB has no CDC delta and
+//!   GROUP BY grp` against in-memory `DuckDB`. O(rows): `DuckDB` has no CDC delta and
 //!   no cross-query state, so it re-scans + re-filters + re-aggregates every call.
 //! - `cayenne_serve`  — the same answer from the real `MaintainedAggregateRegistry`
 //!   via the production serve path (`batch_for_spec`: fresh/epoch gate + filtered
@@ -37,12 +37,12 @@
 //!   PKs) to the filtered view. O(delta): the per-ingest cost the serve amortizes.
 //!
 //! The headline is `cayenne_serve` vs `duckdb_rescan`: O(groups) vs O(rows), so
-//! the ratio widens with table size. The result is asserted EQUAL to DuckDB
+//! the ratio widens with table size. The result is asserted EQUAL to `DuckDB`
 //! before any timing — a fast wrong answer is worthless.
 //!
 //! The Cayenne-side fixture is shared with the chDB sibling via
 //! `maintained_filtered_helpers/common.rs`. The chDB comparison is a SEPARATE bench
-//! binary because DuckDB and chDB (both bundled) abort if driven in one process.
+//! binary. The `DuckDB` oracle loads an installed libduckdb through ADBC.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::cast_possible_wrap)]
@@ -55,8 +55,9 @@ mod common;
 use std::collections::BTreeMap;
 use std::hint::black_box;
 
+use arrow::array::Array as _;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use duckdb::Connection;
+use duckdb_oracle::Connection;
 
 use common::{DELIVERY_MODULUS, GROUP_COUNT, ROW_COUNTS, cayenne_result, load_registry, row_batch};
 
@@ -66,7 +67,7 @@ const DELTA_ROWS: usize = 100;
 const DUCKDB_QUERY: &str = "SELECT grp, SUM(value)::BIGINT, COUNT(*)::BIGINT \
      FROM t WHERE delivery > 1000 GROUP BY grp";
 
-/// Build an in-memory DuckDB table of `rows` rows via `range()` using the SAME
+/// Build an in-memory `DuckDB` table of `rows` rows via `range()` using the SAME
 /// per-row formulas as the Cayenne side (see `common::row_batch`).
 fn load_duckdb(rows: usize) -> Connection {
     let conn = Connection::open_in_memory().expect("duckdb open_in_memory");
@@ -83,15 +84,31 @@ fn load_duckdb(rows: usize) -> Connection {
 }
 
 fn duckdb_result(conn: &Connection) -> BTreeMap<i64, (i64, i64)> {
-    let mut stmt = conn.prepare(DUCKDB_QUERY).expect("duckdb prepare");
-    let mut rows = stmt.query([]).expect("duckdb query");
+    let batches = conn.query(DUCKDB_QUERY).expect("duckdb query");
     let mut out = BTreeMap::new();
-    // Bounded: at most GROUP_COUNT groups are possible.
-    while let Some(row) = rows.next().expect("duckdb row") {
-        let grp: i64 = row.get(0).expect("grp");
-        let sum: i64 = row.get(1).expect("sum");
-        let count: i64 = row.get(2).expect("count");
-        out.insert(grp, (sum, count));
+    for batch in batches {
+        let columns: Vec<_> = batch
+            .columns()
+            .iter()
+            .map(|column| {
+                arrow::compute::cast(column, &arrow::datatypes::DataType::Int64)
+                    .expect("group value fits i64")
+            })
+            .collect();
+        for row in 0..batch.num_rows() {
+            let values: Vec<_> = columns
+                .iter()
+                .map(|column| {
+                    let column = column
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .expect("i64 column");
+                    assert!(!column.is_null(row), "NULL group value");
+                    column.value(row)
+                })
+                .collect();
+            out.insert(values[0], (values[1], values[2]));
+        }
     }
     assert!(
         out.len() <= GROUP_COUNT as usize,

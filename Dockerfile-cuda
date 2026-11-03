@@ -45,6 +45,23 @@ RUN \
     cargo build --release --features ${CARGO_FEATURES:-default} && \
     cp /build/target/release/spiced /root/spiced
 
+# `duckdb:` and `ducklake:` datasets read through the DuckDB library installed
+# on the host, loaded by name at runtime. Keep DUCKDB_VERSION at the newest
+# release test/duckdb_versions.json lists.
+ARG DUCKDB_VERSION=2.0.0
+ARG DUCKDB_SHA256_AMD64=993ad89e7dfca66cd6da994c2cad090c2fc160ddf9f550498a098ab4bb13cfb1
+ARG DUCKDB_SHA256_ARM64=c60eecf91143ca6bbac55c4f4d40dc22520488b0ac257c86e0fe9a2b451cf2b7
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64|"") duckdb_platform=linux-amd64; duckdb_sha256="${DUCKDB_SHA256_AMD64}" ;; \
+      arm64) duckdb_platform=linux-arm64; duckdb_sha256="${DUCKDB_SHA256_ARM64}" ;; \
+      *) echo "Unsupported TARGETARCH for libduckdb: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fSLo /tmp/libduckdb.tar.gz "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb-shared-libs-${duckdb_platform}.tar.gz"; \
+    echo "${duckdb_sha256}  /tmp/libduckdb.tar.gz" | sha256sum -c -; \
+    tar -C /root -xzf /tmp/libduckdb.tar.gz libduckdb.so; \
+    rm -f /tmp/libduckdb.tar.gz
+
 FROM nvidia/cuda:13.4.3-cudnn-runtime-ubuntu24.04 AS runtime
 ENV CUDA_NVCC_FLAGS=-fPIE
 ARG CARGO_FEATURES
@@ -63,6 +80,10 @@ RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
     fi
 
 COPY --from=build /root/spiced /usr/local/bin/spiced
+
+# Copy libduckdb onto the default library path (loaded by name at runtime for
+# `duckdb:` and `ducklake:`)
+COPY --from=build /root/libduckdb.so /usr/lib/libduckdb.so
 
 ENV LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:${LD_LIBRARY_PATH}
 

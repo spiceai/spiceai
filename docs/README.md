@@ -95,7 +95,6 @@ The project docs for contributors and community. For user documentation of the S
 ## Examples
 
 - [HTTP Refresh SQL Example](examples/http_refresh_sql_example.md)
-- [Turso Acceleration Example](examples/turso_acceleration_example.md)
 
 ## Feature Notes
 

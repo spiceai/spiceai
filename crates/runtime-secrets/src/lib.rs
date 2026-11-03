@@ -181,6 +181,9 @@ pub struct Secrets {
     /// separately makes surviving a reload a property of the type rather than
     /// something each caller has to remember to redo.
     builtin_stores: Vec<(String, Arc<dyn SecretStore>)>,
+    /// On a cluster executor, the scheduler's `${ secrets:KEY }` search, asked
+    /// for in one request instead of one per registered store.
+    scheduler_search: Option<Arc<dyn SecretStore>>,
 }
 
 pub struct ParamStr<'a>(pub &'a str);
@@ -207,28 +210,41 @@ impl Secrets {
         Self {
             stores: IndexMap::new(),
             builtin_stores: Vec::new(),
+            scheduler_search: None,
         }
     }
 
+    /// A registry whose stores all resolve through the scheduler: `env` and
+    /// each of `store_names` (the app's `secrets:` names), so a
+    /// `${ store:KEY }` reference to any of them is answered by that store on
+    /// the scheduler.
     #[must_use]
     pub fn new_for_cluster_executor(
         expander: Box<dyn crate::stores::scheduler_rpc::ClusterSecretExpander>,
         executor_id: String,
+        store_names: impl IntoIterator<Item = String>,
     ) -> Self {
-        // A single store, so the `secrets:` walk asks the scheduler once per
-        // key. It is named `env` so `${ env:KEY }` references resolve too.
-        let mut stores = IndexMap::new();
-        stores.insert(
-            "env".to_string(),
+        let expander: Arc<dyn crate::stores::scheduler_rpc::ClusterSecretExpander> =
+            Arc::from(expander);
+        let scheduler_store = move |store: String| -> Arc<dyn SecretStore> {
             Arc::new(SchedulerRPCSecretStore::new(
-                Arc::from(expander),
-                executor_id,
-            )) as Arc<dyn SecretStore>,
-        );
+                Arc::clone(&expander),
+                executor_id.clone(),
+                store,
+            ))
+        };
+        let mut stores = IndexMap::new();
+        for name in std::iter::once("env".to_string()).chain(store_names) {
+            if !stores.contains_key(&name) {
+                let store = scheduler_store(name.clone());
+                stores.insert(name, store);
+            }
+        }
 
         Self {
             stores,
             builtin_stores: Vec::new(),
+            scheduler_search: Some(scheduler_store(SECRETS.to_string())),
         }
     }
 
@@ -292,6 +308,7 @@ impl Secrets {
     /// requires (or disallows) a selector and the config is invalid.
     pub async fn load_from(&mut self, secrets: &[SpicepodSecret]) -> Result<()> {
         self.stores.clear();
+        self.scheduler_search = None;
 
         // Restore trunk's non-overwriting export of the default `.env` /
         // `.env.local` before any store initializes. AWS Secrets Manager
@@ -423,6 +440,9 @@ impl Secrets {
     /// Returns the last store error when every consulted store failed and none
     /// returned a healthy "not found".
     pub async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+        if let Some(search) = &self.scheduler_search {
+            return search.get_secret(key).await;
+        }
         self.get_secret_from(key, |_| true).await
     }
 
@@ -430,8 +450,8 @@ impl Secrets {
     /// the registry's precedence order.
     ///
     /// A `${ store:key }` reference names a specific store, but a caller that
-    /// only has the key — e.g. cluster `ExpandSecret`, whose RPC request
-    /// carries no store — can't otherwise honor that scoping: an unscoped
+    /// only has the key — e.g. cluster `ExpandSecret` for a `secrets` or empty
+    /// store — can't otherwise honor that scoping: an unscoped
     /// [`Self::get_secret`] would let a same-named key in an unrelated store
     /// answer in its place. Restricting the search to the referenced store(s)
     /// closes that gap.
@@ -514,6 +534,23 @@ impl Secrets {
     /// needs an explanation, not the secret.
     pub async fn check_reference(&self, store_name: &str, key: &str) -> RefStatus {
         let store_names = || self.stores.keys().cloned().collect::<Vec<_>>();
+
+        if store_name == SECRETS
+            && let Some(search) = &self.scheduler_search
+        {
+            return match search.get_secret(key).await {
+                Ok(Some(_value)) => RefStatus::Found {
+                    store: SECRETS.to_string(),
+                },
+                Ok(None) => RefStatus::NotFound {
+                    searched: vec![SECRETS.to_string()],
+                },
+                Err(e) => RefStatus::StoreError {
+                    store: SECRETS.to_string(),
+                    error: e.to_string(),
+                },
+            };
+        }
 
         if store_name == SECRETS {
             let mut last_error: Option<(String, String)> = None;
@@ -1168,10 +1205,11 @@ mod tests {
         async fn expand_secret(
             &self,
             executor_id: &str,
+            store: &str,
             key: &str,
         ) -> Result<Option<secrecy::SecretString>, String> {
             Ok(Some(secrecy::SecretString::from(format!(
-                "{executor_id}:{key}:expanded"
+                "{executor_id}:{store}:{key}:expanded"
             ))))
         }
     }
@@ -1253,6 +1291,7 @@ mod tests {
                 .map(|(name, store)| (name.to_string(), store))
                 .collect(),
             builtin_stores: Vec::new(),
+            scheduler_search: None,
         }
     }
 
@@ -2604,6 +2643,7 @@ params:
         let secrets = super::Secrets::new_for_cluster_executor(
             Box::new(MockClusterSecretExpander),
             "executor-1".to_string(),
+            Vec::new(),
         );
 
         let result = secrets
@@ -2614,7 +2654,7 @@ params:
             .await;
 
         assert_eq!(
-            "key=executor-1:AWS_ACCESS_KEY_ID:expanded",
+            "key=executor-1:env:AWS_ACCESS_KEY_ID:expanded",
             result.expose_secret()
         );
     }
