@@ -76,7 +76,7 @@ steps:
         mkdir -p /tmp/${sources.src.namespace};
         cd /debezium;
         DEBEZIUM_SINK_TYPE=http
-        DEBEZIUM_SINK_HTTP_URL=http://${sources.dbz.host_from_container}:${instance.http_port}/v1/datasets/t/cdc
+        DEBEZIUM_SINK_HTTP_URL=http://${instance.host_from_container}:${instance.http_port}/v1/datasets/t/cdc
         DEBEZIUM_SOURCE_CONNECTOR_CLASS=io.debezium.connector.postgresql.PostgresConnector
         DEBEZIUM_SOURCE_OFFSET_STORAGE_FILE_FILENAME=/tmp/${sources.src.namespace}/offsets.dat
         DEBEZIUM_SOURCE_OFFSET_FLUSH_INTERVAL_MS=0

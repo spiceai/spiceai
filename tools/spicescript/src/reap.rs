@@ -111,8 +111,7 @@ fn stop_orphaned_spiced(entries: std::fs::ReadDir, me: i32) {
                 continue;
             };
             let same = alive(pid)
-                && command_line(pid)
-                    .is_some_and(|c| c.contains(&format!("--http 127.0.0.1:{port}")));
+                && command_line(pid).is_some_and(|c| crate::spiced::serves_http_on(&c, port));
             if same {
                 println!(
                     "stopping spiced {pid} left by a runner that is gone ({})",
