@@ -37,21 +37,20 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use snafu::prelude::*;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use util::fibonacci_backoff::{Backoff as _, FibonacciBackoffBuilder};
 
 use crate::TokenProvider;
 
 /// Anthropic's token endpoint.
-pub const ANTHROPIC_TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
+const ANTHROPIC_TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
 
 /// The audience GitHub Actions is asked to issue an identity token for when exchanging it with
 /// Anthropic.
 pub const ANTHROPIC_AUDIENCE: &str = "https://api.anthropic.com";
 
 /// `OpenAI`'s token endpoint.
-pub const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
 const ANTHROPIC_AUTHENTICATION_HISTORY: &str =
     "https://platform.claude.com/settings/workload-identity-federation?tab=history";
@@ -67,8 +66,15 @@ const MAX_REFRESH_LEAD: Duration = Duration::from_mins(1);
 /// current token has left.
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(15);
 
+/// The shortest wait before exchanging again, so a token reported as already expiring cannot make
+/// the refresh loop exchange back to back.
+const MIN_REFRESH_WAIT: Duration = Duration::from_secs(1);
+
 /// Bounds the reason quoted from a provider's error response.
 const MAX_REASON_LEN: usize = 300;
+
+/// How much of an error response is read for its reason.
+const MAX_ERROR_BODY_BYTES: usize = 4096;
 
 #[derive(Debug, Snafu)]
 pub enum WorkloadIdentityError {
@@ -92,6 +98,11 @@ pub enum WorkloadIdentityError {
         "Failed to read the workload identity token GitHub Actions returned: {source}"
     ))]
     SubjectTokenResponse { source: reqwest::Error },
+
+    #[snafu(display(
+        "Failed to read the workload identity token GitHub Actions returned: {source}"
+    ))]
+    SubjectTokenBody { source: http_body_limit::Error },
 
     #[snafu(display(
         "Failed to read the workload identity token file '{}': {source}. Verify that the platform mounts the token at that path.",
@@ -131,6 +142,12 @@ pub enum WorkloadIdentityError {
     ExchangeResponse {
         provider: &'static str,
         source: reqwest::Error,
+    },
+
+    #[snafu(display("Failed to read {provider}'s token exchange response: {source}"))]
+    ExchangeBody {
+        provider: &'static str,
+        source: http_body_limit::Error,
     },
 
     #[snafu(display(
@@ -231,15 +248,17 @@ impl SubjectTokenSource {
                     .context(SubjectTokenRequestSnafu)?;
                 let status = response.status();
                 if !status.is_success() {
-                    let body = response.text().await.unwrap_or_default();
+                    let body = http_body_limit::read_prefix(response, MAX_ERROR_BODY_BYTES).await;
                     return SubjectTokenRefusedSnafu {
                         status,
-                        reason: truncate(&body),
+                        reason: truncate(&String::from_utf8_lossy(&body)),
                     }
                     .fail();
                 }
 
-                response
+                http_body_limit::buffer(response, http_body_limit::Limit::METADATA)
+                    .await
+                    .context(SubjectTokenBodySnafu)?
                     .json::<IdTokenResponse>()
                     .await
                     .context(SubjectTokenResponseSnafu)?
@@ -262,8 +281,9 @@ impl SubjectTokenSource {
     }
 }
 
-/// The provider an identity token is exchanged with, and the identifiers the exchange names.
-#[derive(Clone, Debug)]
+/// The provider an identity token is exchanged with, and the identifiers the exchange names. None
+/// of them is secret, so they also identify the provider in [`TokenProvider::dyn_hash`].
+#[derive(Clone, Debug, Hash)]
 pub enum Exchange {
     /// Anthropic's RFC 7523 `jwt-bearer` grant. `workspace_id` is required when the federation
     /// rule is enabled for more than one workspace.
@@ -371,33 +391,6 @@ impl Exchange {
             ),
         }
     }
-
-    fn hash_identifiers<H: Hasher>(&self, state: &mut H) {
-        self.provider().hash(state);
-        self.token_url().hash(state);
-        match self {
-            Self::Anthropic {
-                federation_rule_id,
-                organization_id,
-                service_account_id,
-                workspace_id,
-                ..
-            } => {
-                federation_rule_id.hash(state);
-                organization_id.hash(state);
-                service_account_id.hash(state);
-                workspace_id.hash(state);
-            }
-            Self::OpenAi {
-                identity_provider_id,
-                service_account_id,
-                ..
-            } => {
-                identity_provider_id.hash(state);
-                service_account_id.hash(state);
-            }
-        }
-    }
 }
 
 struct AccessToken {
@@ -424,11 +417,12 @@ struct TokenResponse {
 /// How long to keep a token that expires in `expires_in` before exchanging again.
 fn refresh_after(expires_in: Duration) -> Duration {
     let lead = MAX_REFRESH_LEAD.min(expires_in / 4);
-    expires_in.saturating_sub(lead)
+    expires_in.saturating_sub(lead).max(MIN_REFRESH_WAIT)
 }
 
 /// `text` as a clause of a longer message: trimmed, without a trailing period, and bounded.
 fn truncate(text: &str) -> String {
+    let text = util::single_line(text);
     let text = text.trim().trim_end_matches('.');
     match text.char_indices().nth(MAX_REASON_LEN) {
         Some((end, _)) => format!("{}…", &text[..end]),
@@ -473,17 +467,19 @@ async fn exchange(
         })?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = http_body_limit::read_prefix(response, MAX_ERROR_BODY_BYTES).await;
         return ExchangeRefusedSnafu {
             provider,
             status,
-            reason: refusal_reason(&body),
+            reason: refusal_reason(&String::from_utf8_lossy(&body)),
             hint: exchange.refusal_hint(),
         }
         .fail();
     }
 
-    let token: TokenResponse = response
+    let token: TokenResponse = http_body_limit::buffer(response, http_body_limit::Limit::METADATA)
+        .await
+        .context(ExchangeBodySnafu { provider })?
         .json()
         .await
         .context(ExchangeResponseSnafu { provider })?;
@@ -511,7 +507,6 @@ pub struct WorkloadIdentityTokenProvider {
     source: Arc<SubjectTokenSource>,
     exchange: Arc<Exchange>,
     rx: watch::Receiver<SecretString>,
-    _handle: Arc<JoinHandle<()>>,
 }
 
 impl fmt::Debug for WorkloadIdentityTokenProvider {
@@ -531,7 +526,7 @@ impl TokenProvider for WorkloadIdentityTokenProvider {
     fn dyn_hash(&self) -> String {
         // Identifiers only: never the identity token or the access token.
         let mut hasher = DefaultHasher::new();
-        self.exchange.hash_identifiers(&mut hasher);
+        self.exchange.hash(&mut hasher);
         match self.source.as_ref() {
             SubjectTokenSource::GitHubActions { audience, .. } => {
                 "github_actions".hash(&mut hasher);
@@ -581,6 +576,9 @@ impl WorkloadIdentityTokenProvider {
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
+            // An exchange never needs a redirect, and following a 307 or 308 would send the
+            // identity token in the request body to wherever it points.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context(HttpClientSnafu)?;
         let source = Arc::new(source);
@@ -598,7 +596,7 @@ impl WorkloadIdentityTokenProvider {
 
         let task_source = Arc::clone(&source);
         let task_exchange = Arc::clone(&exchange);
-        let handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             let mut backoff = FibonacciBackoffBuilder::new()
                 .max_duration(Some(MAX_RETRY_WAIT))
                 .build();
@@ -638,7 +636,6 @@ impl WorkloadIdentityTokenProvider {
             source,
             exchange,
             rx,
-            _handle: Arc::new(handle),
         })
     }
 }
@@ -722,6 +719,14 @@ mod tests {
             .into_response()
     }
 
+    async fn redirect_to_token() -> Response {
+        (
+            StatusCode::TEMPORARY_REDIRECT,
+            [(axum::http::header::LOCATION, "/token")],
+        )
+            .into_response()
+    }
+
     async fn refuse_openai() -> Response {
         (
             StatusCode::BAD_REQUEST,
@@ -739,6 +744,7 @@ mod tests {
             .route("/token", post(token))
             .route("/refuse/anthropic", post(refuse_anthropic))
             .route("/refuse/openai", post(refuse_openai))
+            .route("/redirect", post(redirect_to_token))
             .with_state(Arc::clone(&mock));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -960,6 +966,27 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_redirect_from_the_token_endpoint_is_not_followed() {
+        let (base, mock) = start(3600).await;
+        let error = WorkloadIdentityTokenProvider::try_new(
+            github_actions(&base, "https://api.openai.com"),
+            openai_at(format!("{base}/redirect")),
+        )
+        .await
+        .expect_err("a redirected exchange fails");
+        assert!(
+            error
+                .to_string()
+                .starts_with("OpenAI refused to exchange the workload identity token for an access token (HTTP 307 Temporary Redirect)"),
+            "{error}"
+        );
+        assert!(
+            mock.exchanges.lock().expect("lock").is_empty(),
+            "the identity token must not be re-sent to the redirect's target"
+        );
+    }
+
     #[test]
     fn github_actions_needs_the_request_url_and_token() {
         for (url, token) in [
@@ -982,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn a_token_is_refreshed_a_minute_early_or_after_three_quarters_of_its_life() {
+    fn a_token_is_refreshed_a_minute_early_or_after_three_quarters_of_its_life_and_never_at_once() {
         assert_eq!(
             [3600, 600, 299, 4, 0].map(|secs| refresh_after(Duration::from_secs(secs))),
             [
@@ -990,7 +1017,7 @@ mod tests {
                 Duration::from_mins(9),
                 Duration::from_secs(239),
                 Duration::from_secs(3),
-                Duration::ZERO,
+                MIN_REFRESH_WAIT,
             ]
         );
     }

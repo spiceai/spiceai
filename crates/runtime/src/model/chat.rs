@@ -19,6 +19,8 @@ use evaluate_chat::ChatEvaluator;
 use llms::bedrock::chat::{BedrockConverse, guardrail::GuardRail};
 #[cfg(feature = "models")]
 use llms::chat::DistributedBackendSetting;
+
+use super::workload_identity;
 use llms::evaluate::Evaluate;
 use llms::{
     HealthCheck,
@@ -253,7 +255,7 @@ pub async fn construct_model(
             let p =
                 typed_params::<AnthropicModelParams>(component, params, source.clone(), secrets)
                     .await?;
-            anthropic(model_id.as_deref(), &p)
+            anthropic(model_id.as_deref(), &p).await
         }
         ModelSource::Google => {
             let p = typed_params::<GoogleModelParams>(component, params, source.clone(), secrets)
@@ -273,7 +275,7 @@ pub async fn construct_model(
         ModelSource::OpenAi => {
             let p = typed_params::<OpenAiModelParams>(component, params, source.clone(), secrets)
                 .await?;
-            openai(model_id, params, &p)
+            openai(model_id, params, &p).await
         }
         ModelSource::Databricks => {
             let p =
@@ -364,16 +366,16 @@ fn xai(model_id: Option<&str>, params: &XaiModelParams) -> Result<Arc<dyn Chat>,
     Ok(Arc::new(Xai::new(model_id, api_key)) as Arc<dyn Chat>)
 }
 
-fn anthropic(
+async fn anthropic(
     model_id: Option<&str>,
     params: &AnthropicModelParams,
 ) -> Result<Arc<dyn Chat>, LlmError> {
-    Ok(Arc::new(anthropic_client(model_id, params)?) as Arc<dyn Chat>)
+    Ok(Arc::new(anthropic_client(model_id, params).await?) as Arc<dyn Chat>)
 }
 
 /// The Anthropic client of a `from: anthropic` model, which serves both its chat completions
 /// and, natively, the Messages API.
-pub(crate) fn anthropic_client(
+pub(crate) async fn anthropic_client(
     model_id: Option<&str>,
     params: &AnthropicModelParams,
 ) -> Result<Anthropic, LlmError> {
@@ -381,13 +383,23 @@ pub(crate) fn anthropic_client(
     let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
     let auth_token = params.auth_token.as_ref().map(ExposeSecret::expose_secret);
 
-    let auth = match (api_key, auth_token) {
-        (Some(s), None) => GenericAuthMechanism::from_api_key(s),
-        (None, Some(s)) => GenericAuthMechanism::from_bearer_token(s),
-        (None, None) => return Err(LlmError::FailedToLoadModel {
-            source: "One of following `model.params` is required: `anthropic_api_key` or `anthropic_auth_token`.".into(),
+    let key_param = match (api_key, auth_token) {
+        (Some(_), _) => Some("anthropic_api_key"),
+        (None, Some(_)) => Some("anthropic_auth_token"),
+        (None, None) => None,
+    };
+    let federated = workload_identity::anthropic_token_provider(&params.federation(), key_param)
+        .await
+        .map_err(workload_identity::FederationError::into_llm_error)?;
+
+    let auth = match (federated, api_key, auth_token) {
+        (Some(token), _, _) => GenericAuthMechanism::from_bearer_token_provider(token),
+        (None, Some(s), None) => GenericAuthMechanism::from_api_key(s),
+        (None, None, Some(s)) => GenericAuthMechanism::from_bearer_token(s),
+        (None, None, None) => return Err(LlmError::FailedToLoadModel {
+            source: "One of following `model.params` is required: `anthropic_api_key`, `anthropic_auth_token`, or workload identity federation (`anthropic_federation_rule_id`).".into(),
         }),
-        (Some(_), Some(_)) => return Err(LlmError::FailedToLoadModel {
+        (None, Some(_), Some(_)) => return Err(LlmError::FailedToLoadModel {
             source: "Only one of following `model.params` is allowed: `anthropic_api_key` or `anthropic_auth_token`.".into(),
         }),
     };
@@ -710,7 +722,7 @@ fn spiceai(
     )) as Arc<dyn Chat>)
 }
 
-fn openai(
+async fn openai(
     model_id: Option<String>,
     raw_params: &HashMap<String, SecretString>,
     params: &OpenAiModelParams,
@@ -724,8 +736,21 @@ fn openai(
 
     validate_temperature(raw_params, "openai")?;
 
+    let model = model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string());
+    if let Some(client) = workload_identity::openai_federated_client(
+        &model,
+        &params.federation(),
+        workload_identity::openai_api_key_in_spicepod(raw_params),
+        chat_backend,
+    )
+    .await
+    .map_err(workload_identity::FederationError::into_llm_error)?
+    {
+        return Ok(Arc::new(client) as Arc<dyn Chat>);
+    }
+
     Ok(Arc::new(llms::openai::new_openai_client_with_chat_backend(
-        model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
+        model,
         api_base,
         api_key,
         org_id,

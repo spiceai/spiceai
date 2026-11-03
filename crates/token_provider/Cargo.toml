@@ -10,6 +10,7 @@ version.workspace = true
 
 [dependencies]
 chrono.workspace = true
+http-body-limit = { path = "../http-body-limit" }
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 reqwest = { workspace = true, features = ["form"] }
 secrecy = { workspace = true, features = ["serde"] }
