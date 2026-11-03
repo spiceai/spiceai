@@ -14,15 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Workload identity federation for `from: openai` and `from: anthropic` models and embeddings:
-//! the params that configure it, validated, and the refreshing token provider they build.
+//! Workload identity federation for `OpenAI` and Anthropic models and embeddings: the params that
+//! configure it, validated, and the refreshing token provider and client they build.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use llms::config::HostedModelConfig;
-use llms::openai::{ChatBackend, Openai, UsageTier};
+use crate::config::HostedModelConfig;
+use crate::openai::{ChatBackend, Openai, UsageTier};
 use secrecy::SecretString;
 use token_provider::TokenProvider;
 use token_provider::workload_identity::{
@@ -35,7 +35,7 @@ const ANTHROPIC_DOCS: &str = "https://spiceai.org/docs/components/models/anthrop
 
 /// Why a model's workload identity federation could not be set up.
 #[derive(Debug)]
-pub(crate) enum FederationError {
+pub enum FederationError {
     /// A mistake in the model's params: `param` is the one to change.
     Config {
         param: &'static str,
@@ -48,23 +48,27 @@ pub(crate) enum FederationError {
 }
 
 impl FederationError {
-    pub(crate) fn into_llm_error(self) -> llms::chat::Error {
+    /// The model loading error this is: a configuration error for a mistake in the params.
+    #[must_use]
+    pub fn into_llm_error(self) -> crate::chat::Error {
         match self {
-            Self::Config { param, message } => llms::chat::Error::InvalidParamValueError {
+            Self::Config { param, message } => crate::chat::Error::InvalidParamValueError {
                 param: param.to_string(),
                 message,
             },
-            Self::Exchange(source) => llms::chat::Error::FailedToAuthenticate {
+            Self::Exchange(source) => crate::chat::Error::FailedToAuthenticate {
                 source: Box::new(source),
             },
-            Self::Client(source) => llms::chat::Error::FailedToLoadModel {
+            Self::Client(source) => crate::chat::Error::FailedToLoadModel {
                 source: Box::new(source),
             },
         }
     }
 
-    pub(crate) fn into_embed_error(self) -> llms::embeddings::Error {
-        llms::embeddings::Error::FailedToInstantiateEmbeddingModel {
+    /// The embedding loading error this is, reading as the model error.
+    #[must_use]
+    pub fn into_embed_error(self) -> crate::embeddings::Error {
+        crate::embeddings::Error::FailedToInstantiateEmbeddingModel {
             source: Box::new(self.into_llm_error()),
         }
     }
@@ -72,31 +76,32 @@ impl FederationError {
 
 /// The `openai_*` federation params of a model or embedding, and the settings of the client
 /// built with them.
-pub(crate) struct OpenAiFederation<'a> {
-    pub(crate) identity_provider_id: Option<&'a str>,
-    pub(crate) service_account_id: Option<&'a str>,
-    pub(crate) identity_token_audience: Option<&'a str>,
-    pub(crate) identity_token_file: Option<&'a str>,
-    pub(crate) endpoint: &'a str,
-    pub(crate) org_id: Option<&'a str>,
-    pub(crate) project_id: Option<&'a str>,
-    pub(crate) usage_tier: UsageTier,
+pub struct OpenAiFederation<'a> {
+    pub identity_provider_id: Option<&'a str>,
+    pub service_account_id: Option<&'a str>,
+    pub identity_token_audience: Option<&'a str>,
+    pub identity_token_file: Option<&'a str>,
+    pub endpoint: &'a str,
+    pub org_id: Option<&'a str>,
+    pub project_id: Option<&'a str>,
+    pub usage_tier: UsageTier,
 }
 
 /// The `anthropic_*` federation params of a model.
-pub(crate) struct AnthropicFederation<'a> {
-    pub(crate) federation_rule_id: Option<&'a str>,
-    pub(crate) organization_id: Option<&'a str>,
-    pub(crate) service_account_id: Option<&'a str>,
-    pub(crate) workspace_id: Option<&'a str>,
-    pub(crate) identity_token_audience: Option<&'a str>,
-    pub(crate) identity_token_file: Option<&'a str>,
+pub struct AnthropicFederation<'a> {
+    pub federation_rule_id: Option<&'a str>,
+    pub organization_id: Option<&'a str>,
+    pub service_account_id: Option<&'a str>,
+    pub workspace_id: Option<&'a str>,
+    pub identity_token_audience: Option<&'a str>,
+    pub identity_token_file: Option<&'a str>,
 }
 
 /// `openai_api_key` when the Spicepod itself sets it, as opposed to a key autoloaded from a secret
 /// store: federation params win over an autoloaded key, but not over one the user wrote.
-pub(crate) fn openai_api_key_in_spicepod(
-    raw_params: &HashMap<String, SecretString>,
+#[must_use]
+pub fn openai_api_key_in_spicepod<S: std::hash::BuildHasher>(
+    raw_params: &HashMap<String, SecretString, S>,
 ) -> Option<&'static str> {
     raw_params
         .contains_key("openai_api_key")
@@ -166,10 +171,11 @@ fn subject_token_source(
 }
 
 async fn token_provider(
+    component: &str,
     source: SubjectTokenSource,
     exchange: Exchange,
 ) -> Result<Arc<dyn TokenProvider>, FederationError> {
-    let provider = WorkloadIdentityTokenProvider::try_new(source, exchange)
+    let provider = WorkloadIdentityTokenProvider::try_new(component, source, exchange)
         .await
         .map_err(FederationError::Exchange)?;
     Ok(Arc::new(provider))
@@ -178,6 +184,7 @@ async fn token_provider(
 /// The token provider of an `OpenAI` model configured for workload identity federation, or `None`
 /// when no federation param is set.
 async fn openai_token_provider(
+    component: &str,
     federation: &OpenAiFederation<'_>,
     key_param: Option<&'static str>,
 ) -> Result<Option<Arc<dyn TokenProvider>>, FederationError> {
@@ -206,24 +213,35 @@ async fn openai_token_provider(
         "openai_identity_token_file",
         OPENAI_DOCS,
     )?;
-    token_provider(source, Exchange::openai(provider_id, service_account_id))
-        .await
-        .map(Some)
+    token_provider(
+        component,
+        source,
+        Exchange::openai(provider_id, service_account_id),
+    )
+    .await
+    .map(Some)
 }
 
 /// The client of an `OpenAI` model or embedding configured for workload identity federation,
 /// which sends the current token of a refreshing provider, or `None` when no federation param is
-/// set.
-pub(crate) async fn openai_federated_client(
+/// set. `component` names the model or embedding in the provider's logs, such as
+/// `model 'gpt' (openai)`.
+///
+/// # Errors
+///
+/// A [`FederationError`] for a conflicting or missing param, a refused first exchange, or a
+/// client the other params cannot build.
+pub async fn openai_federated_client(
+    component: &str,
     model: &str,
     federation: &OpenAiFederation<'_>,
     key_param: Option<&'static str>,
     chat_backend: ChatBackend,
 ) -> Result<Option<Openai<HostedModelConfig>>, FederationError> {
-    let Some(token) = openai_token_provider(federation, key_param).await? else {
+    let Some(token) = openai_token_provider(component, federation, key_param).await? else {
         return Ok(None);
     };
-    llms::openai::new_openai_client_with_token_provider(
+    crate::openai::new_openai_client_with_token_provider(
         model.to_string(),
         federation.endpoint,
         token,
@@ -237,8 +255,14 @@ pub(crate) async fn openai_federated_client(
 }
 
 /// The token provider of an Anthropic model configured for workload identity federation, or
-/// `None` when no federation param is set.
-pub(crate) async fn anthropic_token_provider(
+/// `None` when no federation param is set. `component` names the model in the provider's logs,
+/// such as `model 'claude' (anthropic)`.
+///
+/// # Errors
+///
+/// A [`FederationError`] for a conflicting or missing param, or a refused first exchange.
+pub async fn anthropic_token_provider(
+    component: &str,
     federation: &AnthropicFederation<'_>,
     key_param: Option<&'static str>,
 ) -> Result<Option<Arc<dyn TokenProvider>>, FederationError> {
@@ -279,6 +303,7 @@ pub(crate) async fn anthropic_token_provider(
         .filter(|id| !id.is_empty())
         .map(str::to_string);
     token_provider(
+        component,
         source,
         Exchange::anthropic(rule_id, organization_id, service_account_id, workspace_id),
     )
@@ -324,15 +349,20 @@ mod tests {
 
     #[tokio::test]
     async fn a_model_without_federation_params_has_no_token_provider() {
-        let none = openai_token_provider(&openai(None, None, None), Some("openai_api_key"))
-            .await
-            .expect("no federation");
+        let none = openai_token_provider(
+            "model 'gpt' (openai)",
+            &openai(None, None, None),
+            Some("openai_api_key"),
+        )
+        .await
+        .expect("no federation");
         assert!(none.is_none(), "an API key model stays an API key model");
     }
 
     #[tokio::test]
     async fn federation_and_an_api_key_in_the_spicepod_conflict() {
         let error = openai_token_provider(
+            "model 'gpt' (openai)",
             &openai(Some("idp_1"), Some("user-1"), Some("aud")),
             Some("openai_api_key"),
         )
@@ -346,17 +376,22 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_federation_param_is_named() {
-        let error = openai_token_provider(&openai(Some("idp_1"), None, Some("aud")), None)
-            .await
-            .expect_err("a missing service account");
+        let error = openai_token_provider(
+            "model 'gpt' (openai)",
+            &openai(Some("idp_1"), None, Some("aud")),
+            None,
+        )
+        .await
+        .expect_err("a missing service account");
         assert_eq!(
             message(error),
             "Invalid value for parameter openai_service_account_id. Workload identity federation needs `openai_identity_provider_id`, `openai_service_account_id`, `openai_identity_token_audience`, and `openai_service_account_id` is not set. See: https://spiceai.org/docs/components/models/openai"
         );
 
-        let error = anthropic_token_provider(&anthropic(Some("")), None)
-            .await
-            .expect_err("an empty organization");
+        let error =
+            anthropic_token_provider("model 'claude' (anthropic)", &anthropic(Some("")), None)
+                .await
+                .expect_err("an empty organization");
         assert_eq!(
             message(error),
             "Invalid value for parameter anthropic_organization_id. Workload identity federation needs `anthropic_federation_rule_id`, `anthropic_organization_id`, `anthropic_service_account_id`, and `anthropic_organization_id` is not set. See: https://spiceai.org/docs/components/models/anthropic"
@@ -365,9 +400,13 @@ mod tests {
 
     #[tokio::test]
     async fn an_anthropic_key_and_federation_conflict() {
-        let error = anthropic_token_provider(&anthropic(Some("org")), Some("anthropic_auth_token"))
-            .await
-            .expect_err("a conflict");
+        let error = anthropic_token_provider(
+            "model 'claude' (anthropic)",
+            &anthropic(Some("org")),
+            Some("anthropic_auth_token"),
+        )
+        .await
+        .expect_err("a conflict");
         assert_eq!(
             message(error),
             "Invalid value for parameter anthropic_auth_token. A model authenticates with either `anthropic_auth_token` or workload identity federation (`anthropic_federation_rule_id`), and both are set. Remove one of them. See: https://spiceai.org/docs/components/models/anthropic"

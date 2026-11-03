@@ -145,7 +145,7 @@ async fn construct_model(
         ModelSource::OpenAi => {
             let p = typed_params::<OpenAiModelParams>(component, params, source.clone(), secrets)
                 .await?;
-            openai(model_id, params, &p).await
+            openai(&component.name, model_id, params, &p).await
         }
         ModelSource::Azure => {
             let p = typed_params::<AzureModelParams>(component, params, source.clone(), secrets)
@@ -193,6 +193,7 @@ pub fn get_openai_responses_request_overrides(model: &Model, prefix: &str) -> Ve
 }
 
 async fn openai(
+    model_name: &str,
     model_id: Option<String>,
     raw_params: &HashMap<String, SecretString>,
     params: &OpenAiModelParams,
@@ -221,14 +222,15 @@ async fn openai(
     }
 
     let model = model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string());
-    if let Some(client) = crate::model::workload_identity::openai_federated_client(
+    if let Some(client) = llms::workload_identity::openai_federated_client(
+        &format!("model '{model_name}' (openai)"),
         &model,
         &params.federation(),
-        crate::model::workload_identity::openai_api_key_in_spicepod(raw_params),
+        llms::workload_identity::openai_api_key_in_spicepod(raw_params),
         llms::openai::ChatBackend::ChatCompletions,
     )
     .await
-    .map_err(crate::model::workload_identity::FederationError::into_llm_error)?
+    .map_err(llms::workload_identity::FederationError::into_llm_error)?
     {
         return Ok(Arc::new(client) as Arc<dyn Responses>);
     }

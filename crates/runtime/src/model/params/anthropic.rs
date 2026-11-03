@@ -55,8 +55,8 @@ pub struct AnthropicModelParams {
 
 impl AnthropicModelParams {
     /// The workload identity federation params, borrowed.
-    pub(crate) fn federation(&self) -> crate::model::workload_identity::AnthropicFederation<'_> {
-        crate::model::workload_identity::AnthropicFederation {
+    pub(crate) fn federation(&self) -> llms::workload_identity::AnthropicFederation<'_> {
+        llms::workload_identity::AnthropicFederation {
             federation_rule_id: self.federation_rule_id.as_deref(),
             organization_id: self.organization_id.as_deref(),
             service_account_id: self.service_account_id.as_deref(),

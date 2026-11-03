@@ -53,8 +53,8 @@ pub struct OpenAiEmbeddingParams {
 
 impl OpenAiEmbeddingParams {
     /// The workload identity federation params, and the client settings, borrowed.
-    pub(crate) fn federation(&self) -> crate::model::workload_identity::OpenAiFederation<'_> {
-        crate::model::workload_identity::OpenAiFederation {
+    pub(crate) fn federation(&self) -> llms::workload_identity::OpenAiFederation<'_> {
+        llms::workload_identity::OpenAiFederation {
             identity_provider_id: self.identity_provider_id.as_deref(),
             service_account_id: self.service_account_id.as_deref(),
             identity_token_audience: self.identity_token_audience.as_deref(),

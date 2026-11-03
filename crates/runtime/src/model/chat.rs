@@ -20,8 +20,8 @@ use llms::bedrock::chat::{BedrockConverse, guardrail::GuardRail};
 #[cfg(feature = "models")]
 use llms::chat::DistributedBackendSetting;
 
-use super::workload_identity;
 use llms::evaluate::Evaluate;
+use llms::workload_identity;
 use llms::{
     HealthCheck,
     anthropic::Anthropic,
@@ -255,7 +255,7 @@ pub async fn construct_model(
             let p =
                 typed_params::<AnthropicModelParams>(component, params, source.clone(), secrets)
                     .await?;
-            anthropic(model_id.as_deref(), &p).await
+            anthropic(&component.name, model_id.as_deref(), &p).await
         }
         ModelSource::Google => {
             let p = typed_params::<GoogleModelParams>(component, params, source.clone(), secrets)
@@ -275,7 +275,7 @@ pub async fn construct_model(
         ModelSource::OpenAi => {
             let p = typed_params::<OpenAiModelParams>(component, params, source.clone(), secrets)
                 .await?;
-            openai(model_id, params, &p).await
+            openai(&component.name, model_id, params, &p).await
         }
         ModelSource::Databricks => {
             let p =
@@ -367,15 +367,17 @@ fn xai(model_id: Option<&str>, params: &XaiModelParams) -> Result<Arc<dyn Chat>,
 }
 
 async fn anthropic(
+    model_name: &str,
     model_id: Option<&str>,
     params: &AnthropicModelParams,
 ) -> Result<Arc<dyn Chat>, LlmError> {
-    Ok(Arc::new(anthropic_client(model_id, params).await?) as Arc<dyn Chat>)
+    Ok(Arc::new(anthropic_client(model_name, model_id, params).await?) as Arc<dyn Chat>)
 }
 
 /// The Anthropic client of a `from: anthropic` model, which serves both its chat completions
 /// and, natively, the Messages API.
 pub(crate) async fn anthropic_client(
+    model_name: &str,
     model_id: Option<&str>,
     params: &AnthropicModelParams,
 ) -> Result<Anthropic, LlmError> {
@@ -388,9 +390,13 @@ pub(crate) async fn anthropic_client(
         (None, Some(_)) => Some("anthropic_auth_token"),
         (None, None) => None,
     };
-    let federated = workload_identity::anthropic_token_provider(&params.federation(), key_param)
-        .await
-        .map_err(workload_identity::FederationError::into_llm_error)?;
+    let federated = workload_identity::anthropic_token_provider(
+        &format!("model '{model_name}' (anthropic)"),
+        &params.federation(),
+        key_param,
+    )
+    .await
+    .map_err(workload_identity::FederationError::into_llm_error)?;
 
     let auth = match (federated, api_key, auth_token) {
         (Some(token), _, _) => GenericAuthMechanism::from_bearer_token_provider(token),
@@ -723,6 +729,7 @@ fn spiceai(
 }
 
 async fn openai(
+    model_name: &str,
     model_id: Option<String>,
     raw_params: &HashMap<String, SecretString>,
     params: &OpenAiModelParams,
@@ -738,6 +745,7 @@ async fn openai(
 
     let model = model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string());
     if let Some(client) = workload_identity::openai_federated_client(
+        &format!("model '{model_name}' (openai)"),
         &model,
         &params.federation(),
         workload_identity::openai_api_key_in_spicepod(raw_params),

@@ -504,14 +504,29 @@ async fn exchange(
 /// exchange, so a misconfigured identity fails there; a background task then exchanges again
 /// before each token expires, and stops when the provider is dropped.
 pub struct WorkloadIdentityTokenProvider {
+    component: Arc<str>,
     source: Arc<SubjectTokenSource>,
     exchange: Arc<Exchange>,
     rx: watch::Receiver<SecretString>,
 }
 
+/// The warning logged when a refresh of `component`'s access token fails: it names the
+/// component, because several models can authenticate with the same provider.
+fn refresh_failure_message(
+    component: &str,
+    retry_in: Duration,
+    error: &WorkloadIdentityError,
+) -> String {
+    format!(
+        "Failed to refresh the access token of {component}, so requests keep the current one until it expires. Retrying in {}s. Cause: {error}",
+        retry_in.as_secs()
+    )
+}
+
 impl fmt::Debug for WorkloadIdentityTokenProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WorkloadIdentityTokenProvider")
+            .field("component", &self.component)
             .field("source", &self.source)
             .field("exchange", &self.exchange)
             .finish_non_exhaustive()
@@ -565,13 +580,19 @@ impl TokenProvider for WorkloadIdentityTokenProvider {
 
 impl WorkloadIdentityTokenProvider {
     /// Exchanges an identity token from `source` with `exchange`'s provider, and keeps
-    /// exchanging before each access token expires.
+    /// exchanging before each access token expires. `component` names what the token
+    /// authenticates, as the logs show it, such as `model 'gpt' (openai)`.
     ///
     /// # Errors
     ///
     /// When the first identity token cannot be read, or the provider refuses or cannot be
     /// reached for the first exchange.
-    pub async fn try_new(source: SubjectTokenSource, exchange: Exchange) -> Result<Self> {
+    pub async fn try_new(
+        component: impl Into<Arc<str>>,
+        source: SubjectTokenSource,
+        exchange: Exchange,
+    ) -> Result<Self> {
+        let component: Arc<str> = component.into();
         let http = reqwest::Client::builder()
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(Duration::from_secs(10))
@@ -586,7 +607,7 @@ impl WorkloadIdentityTokenProvider {
 
         let first = self::exchange(&http, &source, &exchange).await?;
         tracing::debug!(
-            "Exchanged a workload identity token from {} for an {} access token that expires in {}s",
+            "Exchanged a workload identity token from {} for the {} access token of {component}; it expires in {}s",
             source.describe(),
             exchange.provider(),
             first.expires_in.as_secs()
@@ -594,6 +615,7 @@ impl WorkloadIdentityTokenProvider {
         let first_expires_in = first.expires_in;
         let (tx, rx) = watch::channel(first.token);
 
+        let task_component = Arc::clone(&component);
         let task_source = Arc::clone(&source);
         let task_exchange = Arc::clone(&exchange);
         tokio::spawn(async move {
@@ -611,7 +633,7 @@ impl WorkloadIdentityTokenProvider {
                     Ok(token) => {
                         backoff.reset();
                         tracing::debug!(
-                            "Refreshed the {} access token; it expires in {}s",
+                            "Refreshed the {} access token of {task_component}; it expires in {}s",
                             task_exchange.provider(),
                             token.expires_in.as_secs()
                         );
@@ -623,9 +645,8 @@ impl WorkloadIdentityTokenProvider {
                     Err(error) => {
                         next_wait = backoff.next_duration().unwrap_or(MAX_RETRY_WAIT);
                         tracing::warn!(
-                            "Failed to refresh the {} access token, so requests keep the current one until it expires. Retrying in {}s. Cause: {error}",
-                            task_exchange.provider(),
-                            next_wait.as_secs()
+                            "{}",
+                            refresh_failure_message(&task_component, next_wait, &error)
                         );
                     }
                 }
@@ -633,6 +654,7 @@ impl WorkloadIdentityTokenProvider {
         });
 
         Ok(Self {
+            component,
             source,
             exchange,
             rx,
@@ -801,6 +823,7 @@ mod tests {
     async fn an_openai_token_is_exchanged_again_with_a_new_identity_token_before_it_expires() {
         let (base, mock) = start(4).await;
         let provider = WorkloadIdentityTokenProvider::try_new(
+            "model 'test' (openai)",
             github_actions(&base, "https://api.openai.com"),
             openai_at(format!("{base}/token")),
         )
@@ -855,12 +878,14 @@ mod tests {
     async fn anthropic_receives_the_jwt_bearer_grant_with_its_identifiers() {
         let (base, mock) = start(3600).await;
         let with_workspace = WorkloadIdentityTokenProvider::try_new(
+            "model 'test' (openai)",
             github_actions(&base, ANTHROPIC_AUDIENCE),
             anthropic_at(format!("{base}/token"), Some("wrkspc_1")),
         )
         .await
         .expect("an exchange naming the workspace");
         let without_workspace = WorkloadIdentityTokenProvider::try_new(
+            "model 'test' (openai)",
             github_actions(&base, ANTHROPIC_AUDIENCE),
             anthropic_at(format!("{base}/token"), None),
         )
@@ -903,6 +928,7 @@ mod tests {
             .expect("write the token file");
 
         let provider = WorkloadIdentityTokenProvider::try_new(
+            "model 'test' (openai)",
             SubjectTokenSource::File(path.clone()),
             openai_at(format!("{base}/token")),
         )
@@ -932,6 +958,7 @@ mod tests {
         let (base, mock) = start(4).await;
         mock.refuse_exchange.store(2, Ordering::SeqCst);
         let provider = WorkloadIdentityTokenProvider::try_new(
+            "model 'test' (openai)",
             github_actions(&base, "https://api.openai.com"),
             openai_at(format!("{base}/token")),
         )
@@ -947,6 +974,7 @@ mod tests {
     async fn a_refused_exchange_names_the_provider_its_reason_and_where_to_look() {
         let (base, _mock) = start(3600).await;
         let anthropic = WorkloadIdentityTokenProvider::try_new(
+            "model 'test' (openai)",
             github_actions(&base, ANTHROPIC_AUDIENCE),
             anthropic_at(format!("{base}/refuse/anthropic"), None),
         )
@@ -958,6 +986,7 @@ mod tests {
         );
 
         let openai = WorkloadIdentityTokenProvider::try_new(
+            "model 'test' (openai)",
             github_actions(&base, "https://api.openai.com"),
             openai_at(format!("{base}/refuse/openai")),
         )
@@ -973,6 +1002,7 @@ mod tests {
     async fn a_redirect_from_the_token_endpoint_is_not_followed() {
         let (base, mock) = start(3600).await;
         let error = WorkloadIdentityTokenProvider::try_new(
+            "model 'test' (openai)",
             github_actions(&base, "https://api.openai.com"),
             openai_at(format!("{base}/redirect")),
         )
@@ -987,6 +1017,23 @@ mod tests {
         assert!(
             mock.exchanges.lock().expect("lock").is_empty(),
             "the identity token must not be re-sent to the redirect's target"
+        );
+    }
+
+    #[test]
+    fn a_refresh_failure_names_the_component_whose_token_it_is() {
+        let error = WorkloadIdentityError::EmptySubjectToken {
+            origin: "GitHub Actions".to_string(),
+        };
+        assert_eq!(
+            [
+                refresh_failure_message("model 'gpt-a' (openai)", Duration::from_secs(2), &error),
+                refresh_failure_message("embedding 'embed' (openai)", Duration::from_secs(2), &error),
+            ],
+            [
+                "Failed to refresh the access token of model 'gpt-a' (openai), so requests keep the current one until it expires. Retrying in 2s. Cause: The workload identity token from GitHub Actions is empty.".to_string(),
+                "Failed to refresh the access token of embedding 'embed' (openai), so requests keep the current one until it expires. Retrying in 2s. Cause: The workload identity token from GitHub Actions is empty.".to_string(),
+            ]
         );
     }
 

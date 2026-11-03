@@ -104,7 +104,7 @@ async fn native(
                 &rt.secrets(),
             )
             .await?;
-            let native = anthropic_client(component.get_model_id().as_deref(), &p)
+            let native = anthropic_client(&component.name, component.get_model_id().as_deref(), &p)
                 .await?
                 .messages();
             let provider_model = native.model().to_string();

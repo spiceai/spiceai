@@ -37,7 +37,6 @@ mod tool_use;
 mod tool_use_messages;
 mod tool_use_responses;
 mod util;
-pub(crate) mod workload_identity;
 mod wrapper;
 
 pub use chat::{LLMChatCompletionsModelStore, LoadedChatModel, try_to_chat_model};

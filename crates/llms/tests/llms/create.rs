@@ -114,6 +114,7 @@ async fn openai_token() -> Result<Arc<dyn TokenProvider>, anyhow::Error> {
         env_nonempty("OPENAI_WIF_AUDIENCE").unwrap_or_else(|| "https://api.openai.com".to_string());
     let source = SubjectTokenSource::github_actions_from_env(audience)?;
     let provider = WorkloadIdentityTokenProvider::try_new(
+        "test model (openai)",
         source,
         Exchange::openai(provider_id, service_account),
     )
@@ -151,6 +152,7 @@ pub(crate) async fn create_anthropic(
     let auth = if let Some(rule_id) = env_nonempty("ANTHROPIC_FEDERATION_RULE_ID") {
         let source = SubjectTokenSource::github_actions_from_env(ANTHROPIC_AUDIENCE)?;
         let provider = WorkloadIdentityTokenProvider::try_new(
+            "test model (anthropic)",
             source,
             Exchange::anthropic(
                 rule_id,

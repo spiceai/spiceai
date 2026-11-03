@@ -674,6 +674,7 @@ async fn openai_bearer() -> Result<String, String> {
     let source = SubjectTokenSource::github_actions_from_env(openai_audience())
         .map_err(|e| e.to_string())?;
     let provider = WorkloadIdentityTokenProvider::try_new(
+        "the tests' OpenAI availability check",
         source,
         Exchange::openai(
             env_value("OPENAI_IDENTITY_PROVIDER_ID")?,
@@ -787,6 +788,7 @@ async fn anthropic_credential_value() -> Result<(String, bool), String> {
             let source = SubjectTokenSource::github_actions_from_env(ANTHROPIC_AUDIENCE)
                 .map_err(|e| e.to_string())?;
             let provider = WorkloadIdentityTokenProvider::try_new(
+                "the tests' Anthropic availability check",
                 source,
                 Exchange::anthropic(
                     env_value("ANTHROPIC_FEDERATION_RULE_ID")?,
