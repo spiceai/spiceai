@@ -38,6 +38,7 @@ use serde_json::{Value, json};
 mod ai_udf;
 mod anthropic;
 mod bedrock;
+mod decisions;
 mod embedding;
 mod embedding_filter_limit;
 #[cfg(feature = "duckdb")]
