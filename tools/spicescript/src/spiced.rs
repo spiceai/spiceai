@@ -111,9 +111,12 @@ fn http_listen(every_interface: bool, port: impl std::fmt::Display) -> String {
 /// Whether `command_line` is a `spiced` this tool started serving HTTP on
 /// `port`, on either address [`Spiced::start`] passes.
 pub fn serves_http_on(command_line: &str, port: impl std::fmt::Display + Copy) -> bool {
-    [false, true]
-        .into_iter()
-        .any(|every| command_line.contains(&format!("--http {}", http_listen(every, port))))
+    let args: Vec<&str> = command_line.split_whitespace().collect();
+    [false, true].into_iter().any(|every| {
+        let address = http_listen(every, port);
+        args.windows(2)
+            .any(|pair| pair[0] == "--http" && pair[1] == address)
+    })
 }
 
 impl Spiced {
@@ -1106,6 +1109,8 @@ mod http_listen_tests {
         assert!(serves_http_on(every, "29141"));
         // Another port, another host, or the port given to another flag.
         assert!(!serves_http_on(loopback, 29143));
+        // A port that is only a prefix of the one served.
+        assert!(!serves_http_on(loopback, 2914));
         assert!(!serves_http_on("spiced --http 10.0.0.5:29141", 29141));
         assert!(!serves_http_on(
             "spiced --http 127.0.0.1:1 --flight 127.0.0.1:29142",
