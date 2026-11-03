@@ -94,27 +94,12 @@ pub(crate) fn request_labels(req: &CreateChatCompletionRequest) -> Vec<KeyValue>
         ));
     }
 
-    #[expect(deprecated)]
-    if let Some(ref user) = req.user {
-        labels.push(KeyValue::new(
-            Key::new("user"),
-            Value::String(user.clone().into()),
-        ));
-    }
-
-    if let Some(ref metadata) = req.metadata {
-        labels.push(KeyValue::new(
-            Key::new("metadata"),
-            Value::String(format!("{metadata:?}").into()),
-        ));
-    }
-
     labels
 }
 
 pub(crate) fn request_labels_responses(req: &CreateResponse) -> Vec<KeyValue> {
     #[expect(clippy::cast_possible_wrap)]
-    let mut labels = vec![
+    let labels = vec![
         KeyValue::new(
             Key::new("stream"),
             Value::Bool(req.stream.unwrap_or_default()),
@@ -129,21 +114,6 @@ pub(crate) fn request_labels_responses(req: &CreateResponse) -> Vec<KeyValue> {
         ),
         KeyValue::new(Key::new("responses_api"), Value::Bool(true)),
     ];
-
-    if let Some(ref metadata) = req.metadata {
-        labels.push(KeyValue::new(
-            Key::new("metadata"),
-            Value::String(format!("{metadata:?}").into()),
-        ));
-    }
-
-    if let Some(ref instructions) = req.instructions {
-        labels.push(KeyValue::new(
-            Key::new("instructions"),
-            Value::String(instructions.clone().into()),
-        ));
-    }
-
     labels
 }
 

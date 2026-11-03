@@ -62,13 +62,6 @@ pub(crate) fn request_labels(req: &CreateEmbeddingRequest) -> Vec<KeyValue> {
         KeyValue::new(Key::new("model"), Value::String(req.model.clone().into())),
         KeyValue::new(Key::new("encoding_format"), Value::String(encoding.into())),
     ];
-    if let Some(ref user) = req.user {
-        labels.push(KeyValue::new(
-            Key::new("user"),
-            Value::String(user.clone().into()),
-        ));
-    }
-
     if let Some(ref dim) = req.dimensions {
         labels.push(KeyValue::new(
             Key::new("dimensions"),
