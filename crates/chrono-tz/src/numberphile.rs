@@ -23,7 +23,7 @@ limitations under the License.
 //!
 //! [video]: https://www.youtube.com/watch?v=-5wpm-gesOY
 
-use chrono::{DateTime, NaiveDate, TimeZone};
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone};
 
 use crate::Africa::Tripoli;
 use crate::America::New_York;
@@ -154,8 +154,7 @@ fn leapsecond() {
     let from = UTC.with_ymd_and_hms(2016, 6, 30, 23, 59, 59).unwrap();
     let leap = NaiveDate::from_ymd_opt(2016, 6, 30)
         .unwrap()
-        .and_hms_milli_opt(23, 59, 59, 1000)
-        .unwrap();
+        .and_time(NaiveTime::from_hms_milli_opt(23, 59, 59, 1000).unwrap());
     let to = UTC.from_local_datetime(&leap).unwrap();
     assert_eq!(seconds(from, to), 1);
 }
@@ -175,8 +174,7 @@ fn leapsecond_2() {
 fn leapsecond_3() {
     let leap = NaiveDate::from_ymd_opt(2016, 6, 30)
         .unwrap()
-        .and_hms_milli_opt(23, 59, 59, 1000)
-        .unwrap();
+        .and_time(NaiveTime::from_hms_milli_opt(23, 59, 59, 1000).unwrap());
     let from = UTC.from_local_datetime(&leap).unwrap();
     let to = UTC.with_ymd_and_hms(2016, 7, 1, 0, 0, 0).unwrap();
     assert_eq!(seconds(from, to), 1);
