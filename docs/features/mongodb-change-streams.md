@@ -88,4 +88,4 @@ If MongoDB does not include `fullDocument` for an update or replacement event, S
 - Unit tests cover Change Stream event conversion, truncate handling, required `fullDocument`/`documentKey` validation, primary-key/upsert validation, and Change Stream parameter parsing.
 - Live runtime integration coverage is available in the MongoDB runtime tests. It starts MongoDB as a single-node replica set, loads an accelerated dataset with `refresh_mode: changes`, then verifies insert, update, and delete propagation.
 - The `mongodb_change_stream` Criterion microbenchmark measures BSON Change Stream event conversion into Spice CDC batches.
-- Testoperator TPCH benchmark, throughput, and load coverage is configured by `test/spicepods/tpch/sf1/accelerated/mongodb-duckdb[file]-changes.yaml` and `tools/testoperator/dispatch/tpch/sf1/accelerated/mongodb-duckdb[file]-changes.yaml`.
+- Testoperator TPCH benchmark, throughput, and load coverage is configured by `test/spicepods/tpch/sf1/accelerated/mongodb-cayenne[file]-changes.yaml` and `tools/testoperator/dispatch/tpch/sf1/accelerated/mongodb-cayenne[file]-changes.yaml`.

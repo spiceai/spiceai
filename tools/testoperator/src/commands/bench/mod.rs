@@ -602,7 +602,7 @@ mod tests {
         for scenario in [
             "dynamodb-arrow",
             "dynamodb-federated",
-            "dynamodb-duckdb[file]",
+            "dynamodb-cayenne[file]",
             "dynamodb-scylladb-alternator-federated",
             "glue[csv]-federated",
             "iceberg[hadoop]-federated",
@@ -629,8 +629,8 @@ mod tests {
             "glue[parquet]-federated",
             "glue[catalog]-federated",
             "iceberg[catalog]-federated",
-            "iceberg-duckdb[file]",
-            "s3[parquet]-duckdb[file]",
+            "iceberg-cayenne[file]",
+            "s3[parquet]-cayenne[file]",
         ] {
             assert_eq!(
                 snapshot_predicate(scenario, "tpch_q1"),

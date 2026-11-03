@@ -369,9 +369,9 @@ pub fn warm_session_with_runtime(
 
 /// A clean `DuckDB` file-mode database with the same schema.
 ///
-/// File-backed (not in-memory) for parity with Cayenne, which only supports
-/// `mode: file`. Comparing Cayenne-file vs `DuckDB`-memory would not be fair
-/// (see `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/README.md`).
+/// File-backed (not in-memory) so it does the same disk work as the Cayenne
+/// side: comparing Cayenne on disk against an in-memory `DuckDB` would not be
+/// fair.
 pub struct DuckDbFixture {
     pub temp_dir: TempDir,
     pub conn: Connection,

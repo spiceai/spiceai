@@ -1198,7 +1198,7 @@ tests:
         let yaml = "
 tests:
   search:
-    spicepod_path: test/spicepods/search/mteb/quora/full_text_search-duckdb[file].yaml
+    spicepod_path: test/spicepods/search/mteb/quora/full_text_search-cayenne[file].yaml
     runner_type: spiceai-dev-runners
     ready_wait: 1800
 ";
@@ -1208,7 +1208,7 @@ tests:
         assert_eq!(test_file.tests.search.len(), 1);
         assert_eq!(
             test_file.tests.search[0].spicepod_path.to_string_lossy(),
-            "test/spicepods/search/mteb/quora/full_text_search-duckdb[file].yaml"
+            "test/spicepods/search/mteb/quora/full_text_search-cayenne[file].yaml"
         );
         assert!(matches!(
             test_file.tests.search[0].runner_type,
@@ -1235,7 +1235,7 @@ tests:
         let yaml = "
 tests:
   search:
-    spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-duckdb[file].yaml
+    spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-cayenne[file].yaml
     runner_type: spiceai-dev-runners
     sql_pipeline: test/spicepods/search/pipelines/text_search.sql
 ";
@@ -1259,7 +1259,7 @@ tests:
         let yaml = "
 tests:
   search:
-    spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-duckdb[file].yaml
+    spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-cayenne[file].yaml
     runner_type: spiceai-dev-runners
     sql_pipeline: |
       SELECT _id, _score FROM text_search(corpus, :query)
@@ -1280,7 +1280,7 @@ tests:
         // The spicepod names its own dataset now. A stale `benchmark_dataset` must fail here,
         // because the workflow no longer has that input and GitHub rejects unknown inputs.
         let args = "
-spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-duckdb[file].yaml
+spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-cayenne[file].yaml
 runner_type: spiceai-dev-runners
 benchmark_dataset: fiqa_retrieval
 ";

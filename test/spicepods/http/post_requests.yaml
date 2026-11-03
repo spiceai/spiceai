@@ -11,7 +11,7 @@ datasets:
       file_format: auto
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       refresh_mode: full
       refresh_sql: |
         SELECT request_path, request_query, request_body, content
@@ -27,7 +27,7 @@ datasets:
       file_format: auto
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       refresh_mode: full
       refresh_sql: |
         SELECT request_path, request_body, content
@@ -42,7 +42,7 @@ datasets:
       file_format: auto
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       refresh_mode: full
       refresh_sql: |
         SELECT request_path, request_body, content
@@ -58,7 +58,7 @@ datasets:
       http_post_content_type: application/json
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       refresh_mode: full
       refresh_sql: |
         SELECT request_path, request_body, content

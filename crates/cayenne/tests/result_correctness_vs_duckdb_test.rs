@@ -14,10 +14,10 @@
 
 //! # Result correctness (not performance)
 //!
-//! Asserts **Spice Cayenne** and **standalone DuckDB** (out-of-Spice `duckdb`
-//! crate) return **equivalent query results** for the same SQL on identical data.
-//! Separate from Criterion `vs_duckdb_*` benches and from
-//! `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/` (latency/throughput).
+//! Asserts **Spice Cayenne** and **standalone DuckDB** (an installed DuckDB over
+//! ADBC, through `duckdb-oracle`) return **equivalent query results** for the
+//! same SQL on identical data.
+//! Separate from the Criterion `vs_duckdb_*` benches (latency/throughput).
 //!
 //! Requires `--features result-correctness-duckdb` (not `duckdb-bench`).
 //! See `tests/correctness/README.md`.

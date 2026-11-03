@@ -40,10 +40,9 @@ limitations under the License.
 //! ~72M at SF100, `catalog_sales` ~14M at SF10, `inventory` ~117M at SF10),
 //! so the rewriter fires on most fact-side inner joins at production scale
 //! factors. End-to-end TPC-DS-on-Cayenne shows substantial query-time and
-//! memory regressions as a result. The `pairs.yaml` testoperator manifest
-//! at `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/` carries the
-//! end-to-end benchmark; this Criterion bench is the focused per-rule
-//! reproducer.
+//! memory regressions as a result. The TPC-DS Cayenne Spicepods under
+//! `test/spicepods/tpcds/` carry the end-to-end benchmark; this Criterion
+//! bench is the focused per-rule reproducer.
 //!
 //! ## What this bench measures
 //!

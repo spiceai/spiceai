@@ -14,7 +14,7 @@ Test spicepod names should be formatted according to the following template:
 * `file[csv]` - a File connector using CSV data
 * `odbc[athena]` - an ODBC connector using AWS Athena
 * `spark[databricks]` - a Spark connector using databricks
-* `duckdb[file]` - a DuckDB accelerator using file-mode acceleration.
+* `cayenne[file]` - a Cayenne accelerator using file-mode acceleration.
 
 Variants can be nested, up to 2 levels. For example, `odbc[s3[parquet]]` is an ODBC connector using an S3 source with Parquet data.
 
@@ -29,8 +29,8 @@ Examples of full spicepod names:
 * `s3[parquet]-federated` - a non-accelerator S3 connector using Parquet.
 * `duckdb-federated` - a DuckDB connector using no acceleration.
 * `spicecloud-arrow` - a Spicecloud connector using Arrow acceleration.
-* `mysql-duckdb[file]-on_zero_results` - a MySQL connector using file-mode DuckDB acceleration, testing the behavior of on-zero-results action.
-* `file[parquet]-duckdb[file]-on_zero_results` - a File connector using Parquet data with DuckDB file-mode acceleration, testing the behavior of on-zero-results action.
-* `file[parquet]-duckdb[memory]-on_zero_results` - a File connector using Parquet data with DuckDB memory-mode acceleration, testing the behavior of on-zero-results action.
-* `s3[parquet]-duckdb[memory]-on_zero_results` - an S3 connector using Parquet data with DuckDB memory-mode acceleration, testing on-zero-results action.
-* `s3[parquet]-duckdb[file]-on_zero_results` - an S3 connector using Parquet data with DuckDB file-mode acceleration, testing on-zero-results action.
+* `mysql-cayenne[file]-on_zero_results` - a MySQL connector using file-mode Cayenne acceleration, testing the behavior of on-zero-results action.
+* `file[parquet]-cayenne[file]-on_zero_results` - a File connector using Parquet data with Cayenne file-mode acceleration, testing the behavior of on-zero-results action.
+* `file[parquet]-cayenne[memory]-on_zero_results` - a File connector using Parquet data with Cayenne memory-mode acceleration, testing the behavior of on-zero-results action.
+* `s3[parquet]-cayenne[memory]-on_zero_results` - an S3 connector using Parquet data with Cayenne memory-mode acceleration, testing on-zero-results action.
+* `s3[parquet]-cayenne[file]-on_zero_results` - an S3 connector using Parquet data with Cayenne file-mode acceleration, testing on-zero-results action.

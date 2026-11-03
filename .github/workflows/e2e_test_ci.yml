@@ -1042,7 +1042,6 @@ jobs:
           [
             {},
             { engine: arrow, mode: memory },
-            { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
             { engine: cayenne, mode: file },
           ]
@@ -1203,7 +1202,6 @@ jobs:
           [
             {},
             { engine: arrow, mode: memory },
-            { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
             { engine: cayenne, mode: file },
           ]
@@ -1636,8 +1634,6 @@ jobs:
             { engine: arrow, mode: memory },
             { engine: cayenne, mode: memory },
             { engine: cayenne, mode: file },
-            { engine: duckdb, mode: memory },
-            { engine: duckdb, mode: file },
             { engine: sqlite, mode: memory },
             { engine: sqlite, mode: file },
           ]
@@ -2500,9 +2496,9 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
         spicepod:
           [
-            duckdb_append_with_pk_and_indexes.yaml,
-            duckdb_append_with_pk.yaml,
-            duckdb_append_with_indexes.yaml,
+            cayenne_append_with_pk_and_indexes.yaml,
+            cayenne_append_with_pk.yaml,
+            cayenne_append_with_indexes.yaml,
           ]
         # run only on "Linux x64"
         exclude:
@@ -2723,9 +2719,9 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
         spicepod:
           [
-            duckdb_full_with_pk_and_indexes.yaml,
-            duckdb_full_with_pk.yaml,
-            duckdb_full_with_indexes.yaml,
+            cayenne_full_with_pk_and_indexes.yaml,
+            cayenne_full_with_pk.yaml,
+            cayenne_full_with_indexes.yaml,
           ]
         # run only on "Linux x64"
         exclude:
