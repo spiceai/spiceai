@@ -1716,6 +1716,13 @@ mod coding_agents {
     /// (`PROJECT_TIMEOUT` in `commands/coding_agent/orca.rs`).
     const ORCA_PROJECT_BUDGET: Duration = Duration::from_mins(1);
 
+    /// How long a session waits for the runtime it started to answer `/health`
+    /// before it starts its agent (`HEALTH_BUDGET` in
+    /// `commands/coding_agent/runtime.rs`). The stub runtime is a Python
+    /// process, which on a loaded machine can take longer than [`BUDGET`] to
+    /// start serving.
+    const RUNTIME_HEALTH_BUDGET: Duration = Duration::from_mins(2);
+
     /// A runtime the user started, answering `/health` and `/v1/models` from a
     /// thread of this process. Returns its endpoint.
     fn user_runtime() -> String {
@@ -2127,6 +2134,14 @@ Server((host, int(port)), Handler).serve_forever()
         wait_within(BUDGET, what, done);
     }
 
+    /// Waits for the first session's agent, which starts only once the runtime
+    /// that session launched answers `/health`.
+    fn wait_for_first_agent(lab: &Lab) {
+        wait_within(RUNTIME_HEALTH_BUDGET + BUDGET, "the first agent", || {
+            lab.agent_started("first")
+        });
+    }
+
     fn wait_within(budget: Duration, what: &str, mut done: impl FnMut() -> bool) {
         let deadline = Instant::now() + budget;
         while !done() {
@@ -2290,7 +2305,7 @@ Server((host, int(port)), Handler).serve_forever()
         let endpoint = format!("http://{address}");
 
         let mut first = lab.session("first", &endpoint);
-        wait_for("the first agent", || lab.agent_started("first"));
+        wait_for_first_agent(&lab);
         assert!(serving(&address), "the first session started the runtime");
         let mut second = lab.session("second", &endpoint);
         wait_for("the second agent", || lab.agent_started("second"));
@@ -2325,7 +2340,7 @@ Server((host, int(port)), Handler).serve_forever()
         let port = address.rsplit(':').next().expect("a port");
 
         let mut first = lab.session("first", &format!("http://{address}"));
-        wait_for("the first agent", || lab.agent_started("first"));
+        wait_for_first_agent(&lab);
         let mut second = lab.session("second", &format!("http://localhost:{port}"));
         wait_for("the second agent", || lab.agent_started("second"));
 
@@ -2357,7 +2372,7 @@ Server((host, int(port)), Handler).serve_forever()
         let endpoint = format!("http://{address}");
 
         let mut first = lab.session("first", &endpoint);
-        wait_for("the first agent", || lab.agent_started("first"));
+        wait_for_first_agent(&lab);
         let mut second = lab.session("second", &format!("http://[::1]:{port}"));
         let status = second.wait();
         let output = lab.output("second");
