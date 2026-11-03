@@ -666,13 +666,13 @@ jobs:
 
       - name: Init spice app
         run: |
-          cp ./test/cli/spicepod_openai.yml ./spicepod.yaml
+          cp ./test/cli/spicepod_xai.yml ./spicepod.yaml
           cat ./spicepod.yaml
 
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
           spice run &> spice.log &
 
