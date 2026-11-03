@@ -826,7 +826,7 @@ fn runner_label() -> HashMap<&'static str, String> {
 }
 
 /// Whether the Docker daemon runs rootless. Its `host` network is then
-/// RootlessKit's namespace, not this machine's: a container there still
+/// `RootlessKit`'s namespace, not this machine's: a container there still
 /// reaches other containers' published ports at 127.0.0.1, because the daemon
 /// listens for them inside that namespace too, but nothing that listens only
 /// on this machine's loopback, such as `spiced`.
