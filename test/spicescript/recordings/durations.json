@@ -147,6 +147,7 @@
   "text-search-stale-after-refresh": 18,
   "time-columns": 21,
   "time-columns-retention": 11,
+  "timezone-rules": 1,
   "tlp": 384,
   "tls": 3,
   "tpch-coverage": 89,

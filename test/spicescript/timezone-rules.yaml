@@ -1,0 +1,53 @@
+name: timezone-rules
+description: >
+  Named time zone conversions follow the IANA tz database Spice bundles. Each
+  zone changed its rules after tzdata 2025b; the expected local times are the
+  ones the IANA release notes for 2026b through 2026f announce, before and
+  after the change, with zones whose rules did not change as controls.
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: timezone-rules
+  runtime:
+    cpu: { cores: 2 }
+steps:
+  - start: {}
+  # One UTC instant before the 2026 changes and one after, shown in each zone.
+  - query: >-
+      WITH instants(utc) AS (
+        VALUES (arrow_cast(TIMESTAMP '2026-01-15 12:00:00', 'Timestamp(Second, Some("UTC"))')),
+               (arrow_cast(TIMESTAMP '2026-12-01 12:00:00', 'Timestamp(Second, Some("UTC"))'))
+      )
+      SELECT 'America/Vancouver' AS zone, arrow_cast(arrow_cast(utc, 'Timestamp(Second, Some("America/Vancouver"))'), 'Utf8') AS local_time FROM instants
+      UNION ALL SELECT 'America/Edmonton', arrow_cast(arrow_cast(utc, 'Timestamp(Second, Some("America/Edmonton"))'), 'Utf8') FROM instants
+      UNION ALL SELECT 'Africa/Casablanca', arrow_cast(arrow_cast(utc, 'Timestamp(Second, Some("Africa/Casablanca"))'), 'Utf8') FROM instants
+      UNION ALL SELECT 'America/Inuvik', arrow_cast(arrow_cast(utc, 'Timestamp(Second, Some("America/Inuvik"))'), 'Utf8') FROM instants
+      UNION ALL SELECT 'America/Winnipeg', arrow_cast(arrow_cast(utc, 'Timestamp(Second, Some("America/Winnipeg"))'), 'Utf8') FROM instants
+      UNION ALL SELECT 'America/Havana', arrow_cast(arrow_cast(utc, 'Timestamp(Second, Some("America/Havana"))'), 'Utf8') FROM instants
+      UNION ALL SELECT 'Europe/Berlin', arrow_cast(arrow_cast(utc, 'Timestamp(Second, Some("Europe/Berlin"))'), 'Utf8') FROM instants
+      UNION ALL SELECT 'America/New_York', arrow_cast(arrow_cast(utc, 'Timestamp(Second, Some("America/New_York"))'), 'Utf8') FROM instants
+    expect:
+      rows:
+        # 2026b: British Columbia on permanent -07.
+        - [America/Vancouver, "2026-01-15T04:00:00-08:00"]
+        - [America/Vancouver, "2026-12-01T05:00:00-07:00"]
+        # 2026c: Alberta on permanent -06.
+        - [America/Edmonton, "2026-01-15T05:00:00-07:00"]
+        - [America/Edmonton, "2026-12-01T06:00:00-06:00"]
+        # 2026c: Morocco on permanent +00 from 2026-09-20.
+        - [Africa/Casablanca, "2026-01-15T13:00:00+01:00"]
+        - [Africa/Casablanca, "2026-12-01T12:00:00+00:00"]
+        # 2026d: the Northwest Territories on permanent -06.
+        - [America/Inuvik, "2026-01-15T05:00:00-07:00"]
+        - [America/Inuvik, "2026-12-01T06:00:00-06:00"]
+        # 2026e: Manitoba on permanent -05.
+        - [America/Winnipeg, "2026-01-15T06:00:00-06:00"]
+        - [America/Winnipeg, "2026-12-01T07:00:00-05:00"]
+        # 2026f: Cuba stays on -04 through 2027-11-07.
+        - [America/Havana, "2026-01-15T07:00:00-05:00"]
+        - [America/Havana, "2026-12-01T08:00:00-04:00"]
+        # Controls: no rule change.
+        - [Europe/Berlin, "2026-01-15T13:00:00+01:00"]
+        - [Europe/Berlin, "2026-12-01T13:00:00+01:00"]
+        - [America/New_York, "2026-01-15T07:00:00-05:00"]
+        - [America/New_York, "2026-12-01T07:00:00-05:00"]

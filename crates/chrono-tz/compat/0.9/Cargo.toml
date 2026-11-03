@@ -1,0 +1,14 @@
+[package]
+name = "chrono-tz"
+# Serves dependents that ask for crates.io `chrono-tz` 0.9 (tera) from the
+# workspace crate, through the root `[patch.crates-io]` entry `chrono-tz-0_9`.
+# It is not a workspace member: a workspace cannot hold two packages of one name.
+version = "0.9.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/chronotope/chrono-tz"
+description = "chrono-tz 0.9 for Spice.ai: re-exports the workspace chrono-tz 0.10"
+publish = false
+
+[dependencies]
+chrono-tz = { version = "0.10", path = "../.." }

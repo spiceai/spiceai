@@ -28,6 +28,8 @@ arrow.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+# The `Tz` clickhouse-rs uses, which is still crates.io 0.8; move both to 0.10
+# together (crates/chrono-tz/README.md).
 chrono-tz = "0.8.6"
 clickhouse-rs.workspace = true
 data-connector-api = { path = "../../data-connector-api" }
