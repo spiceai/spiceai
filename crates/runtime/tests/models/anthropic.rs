@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Chat completions through Spice's tool loop against a real Anthropic model. Needs
-//! `SPICE_ANTHROPIC_AUTH_TOKEN` (a short-lived access token, as CI sets) or
+//! Chat completions through Spice's tool loop against a real Anthropic model. Needs the
+//! `ANTHROPIC_*` workload identity federation IDs (as CI sets), `SPICE_ANTHROPIC_AUTH_TOKEN`, or
 //! `SPICE_ANTHROPIC_API_KEY`.
 
 use std::fmt::Write as _;

@@ -320,7 +320,7 @@ async fn messages_on_an_openai_model_are_translated_to_chat_completions()
     let _tracing = init_tracing(None);
     test_request_context()
         .scope(async {
-            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            verify_env_secret_exists(crate::utils::openai_credential_secret())
                 .await
                 .map_err(anyhow::Error::msg)?;
             let base_url = start(

@@ -22187,8 +22187,10 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 name = "token_provider"
 version = "2.5.0-unstable"
 dependencies = [
+ "axum",
  "base64 0.22.1",
  "chrono",
+ "http-body-limit",
  "jsonwebtoken",
  "reqwest 0.13.4",
  "secrecy",
@@ -22196,6 +22198,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "snafu",
+ "tempfile",
  "tokio",
  "tracing",
  "util",
