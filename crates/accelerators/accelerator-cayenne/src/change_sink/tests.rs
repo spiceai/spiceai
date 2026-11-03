@@ -814,7 +814,10 @@ async fn an_object_native_durable_cdc_write_commits_its_position_with_its_data()
         "the position must commit with the data it covers, records: {records:?}"
     );
     assert_eq!(
-        catalog.sidecar_value("spice_sys_applied_lsn/positions").await.expect("read"),
+        catalog
+            .sidecar_value("spice_sys_applied_lsn/positions")
+            .await
+            .expect("read"),
         Some(b"lsn 7".to_vec())
     );
 }

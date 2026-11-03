@@ -22,8 +22,6 @@ use super::{
     Domain, HeldReservation, NativeCatalogConfig, OpenSummary, ValueChange, invalid, position,
     replay_state,
 };
-use cayenne_metastore_actions::proto;
-use prost::Message;
 use crate::{
     catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit},
     metadata::{
@@ -34,9 +32,11 @@ use crate::{
 };
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use cayenne_metastore_actions::proto;
 use futures::{StreamExt, TryStreamExt};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload, path::Path};
 use parking_lot::RwLock;
+use prost::Message;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -89,8 +89,10 @@ struct Routes {
 impl Routes {
     /// Route every table of `domain` to it, replacing what was routed there.
     fn refresh(&mut self, domain: &Arc<Domain>, tables: Vec<(String, String, bool)>) {
-        self.by_name.retain(|_, routed| !Arc::ptr_eq(routed, domain));
-        self.by_table.retain(|_, routed| !Arc::ptr_eq(routed, domain));
+        self.by_name
+            .retain(|_, routed| !Arc::ptr_eq(routed, domain));
+        self.by_table
+            .retain(|_, routed| !Arc::ptr_eq(routed, domain));
         for (id, name, partitioned) in tables {
             if partitioned {
                 self.partitioned.insert(name.clone());
@@ -123,7 +125,11 @@ fn slug(name: &str) -> String {
         })
         .take(40)
         .collect();
-    if slug.is_empty() { "dataset".to_string() } else { slug }
+    if slug.is_empty() {
+        "dataset".to_string()
+    } else {
+        slug
+    }
 }
 
 /// When the `UUIDv7` that ends `name` (a transaction id or a dataset folder) was
@@ -136,7 +142,10 @@ fn created_at(name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
 /// Delete every object under `prefix`.
 async fn delete_under(store: &Arc<dyn ObjectStore>, prefix: &Path) -> CatalogResult<()> {
-    let locations = store.list(Some(prefix)).map_ok(|meta| meta.location).boxed();
+    let locations = store
+        .list(Some(prefix))
+        .map_ok(|meta| meta.location)
+        .boxed();
     store
         .delete_stream(locations)
         .try_collect::<Vec<_>>()
@@ -223,7 +232,11 @@ async fn decide(
             tokio::time::sleep(std::time::Duration::from_millis(50 << attempt.min(6))).await;
         }
         match store
-            .put_opts(&path, PutPayload::from(body.clone()), PutMode::Create.into())
+            .put_opts(
+                &path,
+                PutPayload::from(body.clone()),
+                PutMode::Create.into(),
+            )
             .await
         {
             Ok(_) => return Ok(commit),
@@ -253,7 +266,10 @@ async fn intent_exists(
     transactions: &Path,
     txn: &str,
 ) -> CatalogResult<bool> {
-    match store.head(&transactions.clone().join(txn).join(INTENT)).await {
+    match store
+        .head(&transactions.clone().join(txn).join(INTENT))
+        .await
+    {
         Ok(_) => Ok(true),
         Err(object_store::Error::NotFound { .. }) => Ok(false),
         Err(error) => Err(invalid(error)),
@@ -428,7 +444,9 @@ async fn finish_in_background(
         if commit { "committed" } else { "aborted" }
     );
     if let Err(error) = forget_records(&store, &transactions, &txn).await {
-        tracing::debug!("Cayenne object-native metastore left the records of resolved transaction {txn} for the next open to remove: {error}");
+        tracing::debug!(
+            "Cayenne object-native metastore left the records of resolved transaction {txn} for the next open to remove: {error}"
+        );
     }
 }
 
@@ -440,7 +458,10 @@ async fn forget_records(
     txn: &str,
 ) -> CatalogResult<()> {
     for name in [INTENT, DECISION] {
-        match store.delete(&transactions.clone().join(txn).join(name)).await {
+        match store
+            .delete(&transactions.clone().join(txn).join(name))
+            .await
+        {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
             Err(error) => return Err(invalid(error)),
         }
@@ -464,7 +485,10 @@ async fn participant_state(
         .await
         .map_err(invalid)?;
     let lease = reader.state().head.lease;
-    Ok((lease, replay_state(opened)?.state.prepared.contains_key(txn)))
+    Ok((
+        lease,
+        replay_state(opened)?.state.prepared.contains_key(txn),
+    ))
 }
 
 /// Whether every participant of `intent` is past the coordinator's lease, from
@@ -502,7 +526,9 @@ async fn remove_if_finished(
     txn: &str,
 ) -> CatalogResult<bool> {
     let Some(intent) = read_intent(store, transactions, txn).await? else {
-        let stray = read_record(store, transactions, txn, DECISION).await?.is_some();
+        let stray = read_record(store, transactions, txn, DECISION)
+            .await?
+            .is_some();
         if stray {
             forget_records(store, transactions, txn).await?;
         }
@@ -833,7 +859,11 @@ impl ObjectNativeCatalog {
             // refers to either has this marker or was never named.
             self.store
                 .put(
-                    &self.datasets.clone().join(domain.folder.as_str()).join(DROPPED),
+                    &self
+                        .datasets
+                        .clone()
+                        .join(domain.folder.as_str())
+                        .join(DROPPED),
                     PutPayload::new(),
                 )
                 .await
@@ -882,8 +912,7 @@ impl ObjectNativeCatalog {
                 })
                 .collect(),
             deadline_unix_millis: (chrono::Utc::now()
-                + chrono::Duration::from_std(self.config.transaction_deadline)
-                    .map_err(invalid)?)
+                + chrono::Duration::from_std(self.config.transaction_deadline).map_err(invalid)?)
             .timestamp_millis(),
         };
         self.store
@@ -913,8 +942,14 @@ impl ObjectNativeCatalog {
                 }
             })
             .collect();
-        let commit = match decide_by(&self.store, &self.transactions, &txn, all_prepared, deadline)
-            .await
+        let commit = match decide_by(
+            &self.store,
+            &self.transactions,
+            &txn,
+            all_prepared,
+            deadline,
+        )
+        .await
         {
             Decided::Recorded(commit) => commit,
             Decided::Finished => {
@@ -985,7 +1020,9 @@ impl ObjectNativeCatalog {
     /// participant. One that fails is removed when a catalog next opens.
     async fn forget(&self, txn: &str) {
         if let Err(error) = forget_records(&self.store, &self.transactions, txn).await {
-            tracing::debug!("Cayenne object-native metastore left the records of resolved transaction {txn} for the next open to remove: {error}");
+            tracing::debug!(
+                "Cayenne object-native metastore left the records of resolved transaction {txn} for the next open to remove: {error}"
+            );
         }
     }
 
@@ -1296,14 +1333,29 @@ impl MetadataCatalog for ObjectNativeCatalog {
     async fn commit_pending_for(&self, table_id: &str) -> CatalogResult<()> {
         self.for_table(table_id).commit_pending_for(table_id).await
     }
-    async fn list_pending_write_back(&self, table_id: &str, limit: usize, after: Option<&(i64, Vec<u8>)>) -> CatalogResult<Vec<(Vec<u8>, i64)>> {
-        self.for_table(table_id).list_pending_write_back(table_id, limit, after).await
+    async fn list_pending_write_back(
+        &self,
+        table_id: &str,
+        limit: usize,
+        after: Option<&(i64, Vec<u8>)>,
+    ) -> CatalogResult<Vec<(Vec<u8>, i64)>> {
+        self.for_table(table_id)
+            .list_pending_write_back(table_id, limit, after)
+            .await
     }
-    async fn clear_pending_write_back(&self, table_id: &str, keys: &[(Vec<u8>, i64)]) -> CatalogResult<()> {
-        self.for_table(table_id).clear_pending_write_back(table_id, keys).await
+    async fn clear_pending_write_back(
+        &self,
+        table_id: &str,
+        keys: &[(Vec<u8>, i64)],
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .clear_pending_write_back(table_id, keys)
+            .await
     }
     async fn pending_write_back_count(&self, table_id: &str) -> CatalogResult<i64> {
-        self.for_table(table_id).pending_write_back_count(table_id).await
+        self.for_table(table_id)
+            .pending_write_back_count(table_id)
+            .await
     }
     async fn get_table(&self, table_name: &str) -> CatalogResult<TableMetadata> {
         self.for_name(table_name).get_table(table_name).await
@@ -1312,37 +1364,76 @@ impl MetadataCatalog for ObjectNativeCatalog {
         self.for_table(table_id).get_sequence_number(table_id).await
     }
     async fn get_table_delete_files(&self, table_id: &str) -> CatalogResult<Vec<DeleteFile>> {
-        self.for_table(table_id).get_table_delete_files(table_id).await
+        self.for_table(table_id)
+            .get_table_delete_files(table_id)
+            .await
     }
-    async fn get_orphan_eligible_delete_files(&self, table_id: &str, max_sequence: i64, limit: usize) -> CatalogResult<Vec<DeleteFile>> {
-        self.for_table(table_id).get_orphan_eligible_delete_files(table_id, max_sequence, limit).await
+    async fn get_orphan_eligible_delete_files(
+        &self,
+        table_id: &str,
+        max_sequence: i64,
+        limit: usize,
+    ) -> CatalogResult<Vec<DeleteFile>> {
+        self.for_table(table_id)
+            .get_orphan_eligible_delete_files(table_id, max_sequence, limit)
+            .await
     }
     async fn get_insert_records(&self, table_id: &str) -> CatalogResult<HashMap<Box<[u8]>, i64>> {
         self.for_table(table_id).get_insert_records(table_id).await
     }
-    async fn get_snapshot_sequence(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<Option<i64>> {
-        self.for_table(table_id).get_snapshot_sequence(table_id, snapshot_id).await
+    async fn get_snapshot_sequence(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<Option<i64>> {
+        self.for_table(table_id)
+            .get_snapshot_sequence(table_id, snapshot_id)
+            .await
     }
-    async fn get_all_snapshot_sequences(&self, table_id: &str) -> CatalogResult<HashMap<String, i64>> {
-        self.for_table(table_id).get_all_snapshot_sequences(table_id).await
+    async fn get_all_snapshot_sequences(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<HashMap<String, i64>> {
+        self.for_table(table_id)
+            .get_all_snapshot_sequences(table_id)
+            .await
     }
     async fn get_partitions(&self, table_id: &str) -> CatalogResult<Vec<PartitionMetadata>> {
         self.for_table(table_id).get_partitions(table_id).await
     }
     async fn get_table_statistics(&self, table_id: &str) -> CatalogResult<Option<TableStatistics>> {
-        self.for_table(table_id).get_table_statistics(table_id).await
+        self.for_table(table_id)
+            .get_table_statistics(table_id)
+            .await
     }
-    async fn get_snapshot_file_statistics(&self, table_id: &str, snapshot_id: &str, file_path: &str) -> CatalogResult<Option<SnapshotFileStatistics>> {
-        self.for_table(table_id).get_snapshot_file_statistics(table_id, snapshot_id, file_path).await
+    async fn get_snapshot_file_statistics(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        file_path: &str,
+    ) -> CatalogResult<Option<SnapshotFileStatistics>> {
+        self.for_table(table_id)
+            .get_snapshot_file_statistics(table_id, snapshot_id, file_path)
+            .await
     }
     async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>> {
-        self.for_table(table_id).get_all_snapshot_files(table_id).await
+        self.for_table(table_id)
+            .get_all_snapshot_files(table_id)
+            .await
     }
-    async fn get_snapshot_files(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<Vec<SnapshotFile>> {
-        self.for_table(table_id).get_snapshot_files(table_id, snapshot_id).await
+    async fn get_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<Vec<SnapshotFile>> {
+        self.for_table(table_id)
+            .get_snapshot_files(table_id, snapshot_id)
+            .await
     }
     async fn list_cold_tier_files(&self, table_id: &str) -> CatalogResult<Vec<ColdTierFile>> {
-        self.for_table(table_id).list_cold_tier_files(table_id).await
+        self.for_table(table_id)
+            .list_cold_tier_files(table_id)
+            .await
     }
     async fn get_pk_index(&self, table_id: &str) -> CatalogResult<Option<(String, Vec<u8>)>> {
         self.for_table(table_id).get_pk_index(table_id).await
@@ -1353,125 +1444,349 @@ impl MetadataCatalog for ObjectNativeCatalog {
     async fn get_inlined_data(&self, table_id: &str) -> CatalogResult<Vec<InlinedData>> {
         self.for_table(table_id).get_inlined_data(table_id).await
     }
-    async fn get_inlined_data_for_partition(&self, table_id: &str, partition_key: &str) -> CatalogResult<Vec<InlinedData>> {
-        self.for_table(table_id).get_inlined_data_for_partition(table_id, partition_key).await
+    async fn get_inlined_data_for_partition(
+        &self,
+        table_id: &str,
+        partition_key: &str,
+    ) -> CatalogResult<Vec<InlinedData>> {
+        self.for_table(table_id)
+            .get_inlined_data_for_partition(table_id, partition_key)
+            .await
     }
     async fn get_inlined_data_count(&self, table_id: &str) -> CatalogResult<i64> {
-        self.for_table(table_id).get_inlined_data_count(table_id).await
+        self.for_table(table_id)
+            .get_inlined_data_count(table_id)
+            .await
     }
     async fn get_inlined_data_stats(&self, table_id: &str) -> CatalogResult<InlinedDataStats> {
-        self.for_table(table_id).get_inlined_data_stats(table_id).await
+        self.for_table(table_id)
+            .get_inlined_data_stats(table_id)
+            .await
     }
     async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>> {
         self.for_table(table_id).get_inlined_deletes(table_id).await
     }
-    async fn get_published_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>> {
-        self.for_table(table_id).get_published_inlined_deletes(table_id).await
+    async fn get_published_inlined_deletes(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Vec<InlinedDelete>> {
+        self.for_table(table_id)
+            .get_published_inlined_deletes(table_id)
+            .await
     }
-    async fn get_unpublished_inlined_delete_ids(&self, table_id: &str) -> CatalogResult<Vec<String>> {
-        self.for_table(table_id).get_unpublished_inlined_delete_ids(table_id).await
+    async fn get_unpublished_inlined_delete_ids(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Vec<String>> {
+        self.for_table(table_id)
+            .get_unpublished_inlined_delete_ids(table_id)
+            .await
     }
     async fn table_storage_stats(&self, table_id: &str) -> CatalogResult<TableStorageStats> {
         self.for_table(table_id).table_storage_stats(table_id).await
     }
     async fn update_table_schema(&self, table_id: &str, schema: &SchemaRef) -> CatalogResult<()> {
-        self.for_table(table_id).update_table_schema(table_id, schema).await
+        self.for_table(table_id)
+            .update_table_schema(table_id, schema)
+            .await
     }
-    async fn update_table_schema_dropping_statistics(&self, table_id: &str, schema: &SchemaRef) -> CatalogResult<()> {
-        self.for_table(table_id).update_table_schema_dropping_statistics(table_id, schema).await
+    async fn update_table_schema_dropping_statistics(
+        &self,
+        table_id: &str,
+        schema: &SchemaRef,
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .update_table_schema_dropping_statistics(table_id, schema)
+            .await
     }
-    async fn set_current_snapshot(&self, table_id: &str, replaced_snapshot_id: &str, new_snapshot_id: &str) -> CatalogResult<()> {
-        self.for_table(table_id).set_current_snapshot(table_id, replaced_snapshot_id, new_snapshot_id).await
+    async fn set_current_snapshot(
+        &self,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .set_current_snapshot(table_id, replaced_snapshot_id, new_snapshot_id)
+            .await
     }
     async fn increment_sequence_number(&self, table_id: &str) -> CatalogResult<i64> {
-        self.for_table(table_id).increment_sequence_number(table_id).await
+        self.for_table(table_id)
+            .increment_sequence_number(table_id)
+            .await
     }
     async fn reserve_sequence_numbers(&self, table_id: &str, count: u32) -> CatalogResult<i64> {
-        self.for_table(table_id).reserve_sequence_numbers(table_id, count).await
+        self.for_table(table_id)
+            .reserve_sequence_numbers(table_id, count)
+            .await
     }
     async fn add_delete_file(&self, delete_file: DeleteFile) -> CatalogResult<String> {
-        self.for_table(&delete_file.table_id).add_delete_file(delete_file).await
+        self.for_table(&delete_file.table_id)
+            .add_delete_file(delete_file)
+            .await
     }
-    async fn commit_delete_files_with_inlined_rewrite(&self, delete_files: Vec<DeleteFile>, table_id: &str, updated_data: Vec<InlinedData>, deleted_inlined_ids: Vec<String>, replaced_delete_file_ids: Vec<String>) -> CatalogResult<()> {
-        self.for_table(table_id).commit_delete_files_with_inlined_rewrite(delete_files, table_id, updated_data, deleted_inlined_ids, replaced_delete_file_ids).await
+    async fn commit_delete_files_with_inlined_rewrite(
+        &self,
+        delete_files: Vec<DeleteFile>,
+        table_id: &str,
+        updated_data: Vec<InlinedData>,
+        deleted_inlined_ids: Vec<String>,
+        replaced_delete_file_ids: Vec<String>,
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .commit_delete_files_with_inlined_rewrite(
+                delete_files,
+                table_id,
+                updated_data,
+                deleted_inlined_ids,
+                replaced_delete_file_ids,
+            )
+            .await
     }
-    async fn remove_delete_files(&self, table_id: &str, delete_file_ids: &[String]) -> CatalogResult<()> {
-        self.for_table(table_id).remove_delete_files(table_id, delete_file_ids).await
+    async fn remove_delete_files(
+        &self,
+        table_id: &str,
+        delete_file_ids: &[String],
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .remove_delete_files(table_id, delete_file_ids)
+            .await
     }
     async fn clear_delete_files(&self, table_id: &str) -> CatalogResult<()> {
         self.for_table(table_id).clear_delete_files(table_id).await
     }
-    async fn add_insert_record(&self, table_id: &str, pk_bytes: Vec<u8>, sequence_number: i64) -> CatalogResult<()> {
-        self.for_table(table_id).add_insert_record(table_id, pk_bytes, sequence_number).await
+    async fn add_insert_record(
+        &self,
+        table_id: &str,
+        pk_bytes: Vec<u8>,
+        sequence_number: i64,
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .add_insert_record(table_id, pk_bytes, sequence_number)
+            .await
     }
-    async fn add_insert_records_batch(&self, table_id: &str, pk_bytes_list: Vec<Vec<u8>>, sequence_number: i64) -> CatalogResult<()> {
-        self.for_table(table_id).add_insert_records_batch(table_id, pk_bytes_list, sequence_number).await
+    async fn add_insert_records_batch(
+        &self,
+        table_id: &str,
+        pk_bytes_list: Vec<Vec<u8>>,
+        sequence_number: i64,
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .add_insert_records_batch(table_id, pk_bytes_list, sequence_number)
+            .await
     }
-    async fn commit_on_conflict_deletions(&self, delete_files: Vec<DeleteFile>, table_id: &str, insert_pk_bytes_list: Vec<Vec<u8>>, insert_sequence: i64, snapshot_sequence: Option<SnapshotSequenceCommit>) -> CatalogResult<()> {
-        self.for_table(table_id).commit_on_conflict_deletions(delete_files, table_id, insert_pk_bytes_list, insert_sequence, snapshot_sequence).await
+    async fn commit_on_conflict_deletions(
+        &self,
+        delete_files: Vec<DeleteFile>,
+        table_id: &str,
+        insert_pk_bytes_list: Vec<Vec<u8>>,
+        insert_sequence: i64,
+        snapshot_sequence: Option<SnapshotSequenceCommit>,
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .commit_on_conflict_deletions(
+                delete_files,
+                table_id,
+                insert_pk_bytes_list,
+                insert_sequence,
+                snapshot_sequence,
+            )
+            .await
     }
-    async fn commit_on_conflict_deletions_with_tombstone(&self, delete_files: Vec<DeleteFile>, table_id: &str, insert_pk_bytes_list: Vec<Vec<u8>>, insert_sequence: i64, snapshot_sequence: Option<SnapshotSequenceCommit>, inline_tombstone: Option<InlinedDelete>, pending_durable_flips: &[String]) -> CatalogResult<Option<String>> {
-        self.for_table(table_id).commit_on_conflict_deletions_with_tombstone(delete_files, table_id, insert_pk_bytes_list, insert_sequence, snapshot_sequence, inline_tombstone, pending_durable_flips).await
+    async fn commit_on_conflict_deletions_with_tombstone(
+        &self,
+        delete_files: Vec<DeleteFile>,
+        table_id: &str,
+        insert_pk_bytes_list: Vec<Vec<u8>>,
+        insert_sequence: i64,
+        snapshot_sequence: Option<SnapshotSequenceCommit>,
+        inline_tombstone: Option<InlinedDelete>,
+        pending_durable_flips: &[String],
+    ) -> CatalogResult<Option<String>> {
+        self.for_table(table_id)
+            .commit_on_conflict_deletions_with_tombstone(
+                delete_files,
+                table_id,
+                insert_pk_bytes_list,
+                insert_sequence,
+                snapshot_sequence,
+                inline_tombstone,
+                pending_durable_flips,
+            )
+            .await
     }
     async fn clear_insert_records(&self, table_id: &str) -> CatalogResult<()> {
-        self.for_table(table_id).clear_insert_records(table_id).await
+        self.for_table(table_id)
+            .clear_insert_records(table_id)
+            .await
     }
-    async fn set_snapshot_sequence(&self, table_id: &str, snapshot_id: &str, sequence_number: i64) -> CatalogResult<()> {
-        self.for_table(table_id).set_snapshot_sequence(table_id, snapshot_id, sequence_number).await
+    async fn set_snapshot_sequence(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        sequence_number: i64,
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .set_snapshot_sequence(table_id, snapshot_id, sequence_number)
+            .await
     }
-    async fn clear_snapshot_sequence(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()> {
-        self.for_table(table_id).clear_snapshot_sequence(table_id, snapshot_id).await
+    async fn clear_snapshot_sequence(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .clear_snapshot_sequence(table_id, snapshot_id)
+            .await
     }
-    async fn commit_compaction(&self, table_id: &str, replaced_snapshot_id: &str, new_snapshot_id: &str) -> CatalogResult<()> {
-        self.for_table(table_id).commit_compaction(table_id, replaced_snapshot_id, new_snapshot_id).await
+    async fn commit_compaction(
+        &self,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .commit_compaction(table_id, replaced_snapshot_id, new_snapshot_id)
+            .await
     }
-    async fn commit_compaction_fenced(&self, table_id: &str, replaced_snapshot_id: &str, new_snapshot_id: &str, cutoff: i64, protected_snapshot_ids_to_clear: &[String]) -> CatalogResult<()> {
-        self.for_table(table_id).commit_compaction_fenced(table_id, replaced_snapshot_id, new_snapshot_id, cutoff, protected_snapshot_ids_to_clear).await
+    async fn commit_compaction_fenced(
+        &self,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+        cutoff: i64,
+        protected_snapshot_ids_to_clear: &[String],
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .commit_compaction_fenced(
+                table_id,
+                replaced_snapshot_id,
+                new_snapshot_id,
+                cutoff,
+                protected_snapshot_ids_to_clear,
+            )
+            .await
     }
-    async fn swap_protected_snapshots(&self, table_id: &str, old_snapshot_ids: &[String], new_snapshot_id: &str, new_sequence_number: i64) -> CatalogResult<bool> {
-        self.for_table(table_id).swap_protected_snapshots(table_id, old_snapshot_ids, new_snapshot_id, new_sequence_number).await
+    async fn swap_protected_snapshots(
+        &self,
+        table_id: &str,
+        old_snapshot_ids: &[String],
+        new_snapshot_id: &str,
+        new_sequence_number: i64,
+    ) -> CatalogResult<bool> {
+        self.for_table(table_id)
+            .swap_protected_snapshots(
+                table_id,
+                old_snapshot_ids,
+                new_snapshot_id,
+                new_sequence_number,
+            )
+            .await
     }
-    async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str, inlined: Option<&InlinedData>, delete_files: &[crate::metadata::DeleteFile]) -> CatalogResult<()> {
-        self.for_table(table_id).commit_overwrite(table_id, new_snapshot_id, inlined, delete_files).await
+    async fn commit_overwrite(
+        &self,
+        table_id: &str,
+        new_snapshot_id: &str,
+        inlined: Option<&InlinedData>,
+        delete_files: &[crate::metadata::DeleteFile],
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .commit_overwrite(table_id, new_snapshot_id, inlined, delete_files)
+            .await
     }
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<String> {
-        self.for_table(&partition.table_id).add_partition(partition).await
+        self.for_table(&partition.table_id)
+            .add_partition(partition)
+            .await
     }
     async fn upsert_table_statistics(&self, stats: &TableStatistics) -> CatalogResult<()> {
-        self.for_table(&stats.table_id).upsert_table_statistics(stats).await
+        self.for_table(&stats.table_id)
+            .upsert_table_statistics(stats)
+            .await
     }
     async fn clear_table_statistics(&self, table_id: &str) -> CatalogResult<()> {
-        self.for_table(table_id).clear_table_statistics(table_id).await
+        self.for_table(table_id)
+            .clear_table_statistics(table_id)
+            .await
     }
-    async fn upsert_snapshot_file_statistics(&self, stats: &SnapshotFileStatistics) -> CatalogResult<()> {
-        self.for_table(&stats.table_id).upsert_snapshot_file_statistics(stats).await
+    async fn upsert_snapshot_file_statistics(
+        &self,
+        stats: &SnapshotFileStatistics,
+    ) -> CatalogResult<()> {
+        self.for_table(&stats.table_id)
+            .upsert_snapshot_file_statistics(stats)
+            .await
     }
-    async fn clear_snapshot_file_statistics_except(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()> {
-        self.for_table(table_id).clear_snapshot_file_statistics_except(table_id, snapshot_id).await
+    async fn clear_snapshot_file_statistics_except(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .clear_snapshot_file_statistics_except(table_id, snapshot_id)
+            .await
     }
     async fn clear_snapshot_file_statistics(&self, table_id: &str) -> CatalogResult<()> {
-        self.for_table(table_id).clear_snapshot_file_statistics(table_id).await
+        self.for_table(table_id)
+            .clear_snapshot_file_statistics(table_id)
+            .await
     }
     async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()> {
-        self.for_table(&file.table_id).upsert_snapshot_file(file).await
+        self.for_table(&file.table_id)
+            .upsert_snapshot_file(file)
+            .await
     }
-    async fn replace_snapshot_files(&self, table_id: &str, snapshot_id: &str, files: &[SnapshotFile]) -> CatalogResult<()> {
-        self.for_table(table_id).replace_snapshot_files(table_id, snapshot_id, files).await
+    async fn replace_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        files: &[SnapshotFile],
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .replace_snapshot_files(table_id, snapshot_id, files)
+            .await
     }
-    async fn clear_snapshot_cached_metadata(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()> {
-        self.for_table(table_id).clear_snapshot_cached_metadata(table_id, snapshot_id).await
+    async fn clear_snapshot_cached_metadata(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .clear_snapshot_cached_metadata(table_id, snapshot_id)
+            .await
     }
-    async fn clear_snapshot_files_except(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()> {
-        self.for_table(table_id).clear_snapshot_files_except(table_id, snapshot_id).await
+    async fn clear_snapshot_files_except(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .clear_snapshot_files_except(table_id, snapshot_id)
+            .await
     }
     async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()> {
-        self.for_table(table_id).clear_snapshot_files(table_id).await
+        self.for_table(table_id)
+            .clear_snapshot_files(table_id)
+            .await
     }
-    async fn commit_overwrite_to_cold(&self, table_id: &str, new_snapshot_id: &str, cold_files: &[ColdTierFile]) -> CatalogResult<()> {
-        self.for_table(table_id).commit_overwrite_to_cold(table_id, new_snapshot_id, cold_files).await
+    async fn commit_overwrite_to_cold(
+        &self,
+        table_id: &str,
+        new_snapshot_id: &str,
+        cold_files: &[ColdTierFile],
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .commit_overwrite_to_cold(table_id, new_snapshot_id, cold_files)
+            .await
     }
-    async fn upsert_pk_index(&self, table_id: &str, snapshot_id: &str, index_blob: &[u8]) -> CatalogResult<()> {
-        self.for_table(table_id).upsert_pk_index(table_id, snapshot_id, index_blob).await
+    async fn upsert_pk_index(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        index_blob: &[u8],
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .upsert_pk_index(table_id, snapshot_id, index_blob)
+            .await
     }
     async fn clear_pk_index(&self, table_id: &str) -> CatalogResult<()> {
         self.for_table(table_id).clear_pk_index(table_id).await
@@ -1479,40 +1794,103 @@ impl MetadataCatalog for ObjectNativeCatalog {
     async fn register_index_run(&self, run: &IndexRunRecord) -> CatalogResult<()> {
         self.for_table(&run.table_id).register_index_run(run).await
     }
-    async fn remove_index_run(&self, table_id: &str, index_key: &str, run_name: &str) -> CatalogResult<()> {
-        self.for_table(table_id).remove_index_run(table_id, index_key, run_name).await
+    async fn remove_index_run(
+        &self,
+        table_id: &str,
+        index_key: &str,
+        run_name: &str,
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .remove_index_run(table_id, index_key, run_name)
+            .await
     }
     async fn add_inlined_data(&self, data: InlinedData) -> CatalogResult<String> {
         self.for_table(&data.table_id).add_inlined_data(data).await
     }
-    async fn get_inlined_data_above_sequence(&self, table_id: &str, after_sequence: i64) -> CatalogResult<Vec<InlinedData>> {
-        self.for_table(table_id).get_inlined_data_above_sequence(table_id, after_sequence).await
+    async fn get_inlined_data_above_sequence(
+        &self,
+        table_id: &str,
+        after_sequence: i64,
+    ) -> CatalogResult<Vec<InlinedData>> {
+        self.for_table(table_id)
+            .get_inlined_data_above_sequence(table_id, after_sequence)
+            .await
     }
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()> {
         self.for_table(table_id).clear_inlined_data(table_id).await
     }
     async fn clear_inlined_data_and_deletes(&self, table_id: &str) -> CatalogResult<()> {
-        self.for_table(table_id).clear_inlined_data_and_deletes(table_id).await
+        self.for_table(table_id)
+            .clear_inlined_data_and_deletes(table_id)
+            .await
     }
-    async fn commit_on_conflict_deletions_and_clear_inlined(&self, delete_files: Vec<DeleteFile>, table_id: &str, insert_pk_bytes_list: Vec<Vec<u8>>, insert_sequence: i64, snapshot_sequence: Option<SnapshotSequenceCommit>) -> CatalogResult<()> {
-        self.for_table(table_id).commit_on_conflict_deletions_and_clear_inlined(delete_files, table_id, insert_pk_bytes_list, insert_sequence, snapshot_sequence).await
+    async fn commit_on_conflict_deletions_and_clear_inlined(
+        &self,
+        delete_files: Vec<DeleteFile>,
+        table_id: &str,
+        insert_pk_bytes_list: Vec<Vec<u8>>,
+        insert_sequence: i64,
+        snapshot_sequence: Option<SnapshotSequenceCommit>,
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .commit_on_conflict_deletions_and_clear_inlined(
+                delete_files,
+                table_id,
+                insert_pk_bytes_list,
+                insert_sequence,
+                snapshot_sequence,
+            )
+            .await
     }
     async fn add_inlined_delete(&self, delete: InlinedDelete) -> CatalogResult<String> {
-        self.for_table(&delete.table_id).add_inlined_delete(delete).await
+        self.for_table(&delete.table_id)
+            .add_inlined_delete(delete)
+            .await
     }
-    async fn mark_inlined_delete_published(&self, table_id: &str, inlined_id: &str) -> CatalogResult<()> {
-        self.for_table(table_id).mark_inlined_delete_published(table_id, inlined_id).await
+    async fn mark_inlined_delete_published(
+        &self,
+        table_id: &str,
+        inlined_id: &str,
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .mark_inlined_delete_published(table_id, inlined_id)
+            .await
     }
-    async fn mark_inlined_delete_unpublished(&self, table_id: &str, inlined_id: &str) -> CatalogResult<()> {
-        self.for_table(table_id).mark_inlined_delete_unpublished(table_id, inlined_id).await
+    async fn mark_inlined_delete_unpublished(
+        &self,
+        table_id: &str,
+        inlined_id: &str,
+    ) -> CatalogResult<()> {
+        self.for_table(table_id)
+            .mark_inlined_delete_unpublished(table_id, inlined_id)
+            .await
     }
     async fn publish_orphan_inlined_deletes(&self, table_id: &str) -> CatalogResult<u64> {
-        self.for_table(table_id).publish_orphan_inlined_deletes(table_id).await
+        self.for_table(table_id)
+            .publish_orphan_inlined_deletes(table_id)
+            .await
     }
-    async fn commit_inlined_mutation(&self, table_id: &str, updated_data: Vec<InlinedData>, deleted_inlined_ids: Vec<String>, data: Vec<InlinedData>, assigned_sequence: i64) -> CatalogResult<Option<i64>> {
-        self.for_table(table_id).commit_inlined_mutation(table_id, updated_data, deleted_inlined_ids, data, assigned_sequence).await
+    async fn commit_inlined_mutation(
+        &self,
+        table_id: &str,
+        updated_data: Vec<InlinedData>,
+        deleted_inlined_ids: Vec<String>,
+        data: Vec<InlinedData>,
+        assigned_sequence: i64,
+    ) -> CatalogResult<Option<i64>> {
+        self.for_table(table_id)
+            .commit_inlined_mutation(
+                table_id,
+                updated_data,
+                deleted_inlined_ids,
+                data,
+                assigned_sequence,
+            )
+            .await
     }
     async fn clear_inlined_deletes(&self, table_id: &str) -> CatalogResult<()> {
-        self.for_table(table_id).clear_inlined_deletes(table_id).await
+        self.for_table(table_id)
+            .clear_inlined_deletes(table_id)
+            .await
     }
 }

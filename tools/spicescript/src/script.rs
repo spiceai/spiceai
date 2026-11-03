@@ -2009,8 +2009,10 @@ fn parse_step(index: usize, step: Value) -> Result<Step> {
             })
         }
         "assert-objects" => {
-            let mut inner =
-                Opts::of_mapping(arg, "`assert-objects` takes `source`, `prefix`, `contains`, `min` and `max`")?;
+            let mut inner = Opts::of_mapping(
+                arg,
+                "`assert-objects` takes `source`, `prefix`, `contains`, `min` and `max`",
+            )?;
             let source = inner
                 .string("source")?
                 .context("`assert-objects` needs a `source`")?;

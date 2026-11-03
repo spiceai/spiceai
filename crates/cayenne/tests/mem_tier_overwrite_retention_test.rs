@@ -644,9 +644,11 @@ async fn records_after(
     after: u64,
 ) -> TestResult<Vec<Vec<&'static str>>> {
     use prost::Message;
-    let (_, opened) =
-        object_store_occ::headlog::Reader::open(Arc::clone(store), dataset_log(store, dataset).await?)
-            .await?;
+    let (_, opened) = object_store_occ::headlog::Reader::open(
+        Arc::clone(store),
+        dataset_log(store, dataset).await?,
+    )
+    .await?;
     let mut records = Vec::new();
     for entry in opened
         .records
@@ -698,9 +700,11 @@ async fn an_object_native_checkpoint_commits_its_position_with_its_data() -> Tes
         durable: std::sync::atomic::AtomicU64::new(0),
     });
     table.install_slot_advancer(Arc::clone(&advancer) as Arc<dyn SlotAdvancer>);
-    let (reader, _) =
-        object_store_occ::headlog::Reader::open(Arc::clone(&store), dataset_log(&store, NAME).await?)
-            .await?;
+    let (reader, _) = object_store_occ::headlog::Reader::open(
+        Arc::clone(&store),
+        dataset_log(&store, NAME).await?,
+    )
+    .await?;
     let before = reader.state().head.commit;
 
     cdc_apply(&table, id_value_batch(&[(1, 10), (2, 20)])?).await?;
@@ -762,9 +766,11 @@ async fn an_object_native_seal_commits_its_position_with_its_data() -> TestResul
         durable: std::sync::atomic::AtomicU64::new(0),
     });
     table.install_slot_advancer(Arc::clone(&advancer) as Arc<dyn SlotAdvancer>);
-    let (reader, _) =
-        object_store_occ::headlog::Reader::open(Arc::clone(&store), dataset_log(&store, NAME).await?)
-            .await?;
+    let (reader, _) = object_store_occ::headlog::Reader::open(
+        Arc::clone(&store),
+        dataset_log(&store, NAME).await?,
+    )
+    .await?;
     let before = reader.state().head.commit;
 
     cdc_apply(&table, id_value_batch(&[(1, 10), (2, 20)])?).await?;

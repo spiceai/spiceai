@@ -218,13 +218,10 @@ impl Protocol {
         }
         state.recorded != 0
             && (self.has("no-fence-check") || Self::all_fenced(state))
-            && state
-                .ds
-                .iter()
-                .all(|dataset| {
-                    self.has("no-prepared-check")
-                        || Self::decode(dataset).is_some_and(|log| !fold(&log).pending)
-                })
+            && state.ds.iter().all(|dataset| {
+                self.has("no-prepared-check")
+                    || Self::decode(dataset).is_some_and(|log| !fold(&log).pending)
+            })
     }
     fn head(dataset: &Local) -> Head {
         Head {
@@ -846,7 +843,11 @@ pub fn steps(mode: &str, bound: usize, actions: &[String]) -> Option<Vec<Step>> 
                 let request = state.ds[i].req.as_ref()?;
                 (
                     None,
-                    Some((i, request.kind, request.base.lease != usize::from(state.ds[i].lease))),
+                    Some((
+                        i,
+                        request.kind,
+                        request.base.lease != usize::from(state.ds[i].lease),
+                    )),
                 )
             }
             _ => (None, None),

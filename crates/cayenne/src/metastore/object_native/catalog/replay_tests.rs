@@ -57,19 +57,17 @@ limitations under the License.
 //! - report: the coordinator reports the first recorded decision or nothing;
 //! - records: a transaction's records survive while a log holds it prepared.
 
-use super::{
-    INTENT, confirmed_outcome, decide, forget_records, read_decision, remove_if_finished,
-};
+use super::{INTENT, confirmed_outcome, decide, forget_records, read_decision, remove_if_finished};
 use crate::{
     catalog::{CatalogPublication, MetadataCatalog},
     metadata::{CreateTableOptions, VortexConfig},
     metastore::object_native::{Domain, NativeCatalogConfig, position, replay_state},
 };
 use cayenne_metastore_actions::{DatasetState, proto};
-use prost::Message;
 use cayenne_metastore_model::TransactionStep;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload, path::Path};
 use object_store_occ::headlog::{HeadLogConfig, Reader};
+use prost::Message;
 use std::{
     collections::{BTreeMap, HashSet},
     sync::Arc,
@@ -216,25 +214,25 @@ impl Replay {
         let mut participants = Vec::with_capacity(count);
         for i in 0..count {
             let prefix = Path::from(format!("datasets/p{i}"));
-            let domain = Domain::create_with_config(Arc::clone(&store), prefix.clone(), config(), false)
-                .await
-                .expect("create a participant's log");
-            let table = domain
-                .create_table(CreateTableOptions {
-                    table_name: format!("t{i}"),
-                    schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-                        "id",
-                        arrow_schema::DataType::Int64,
-                        false,
-                    )])),
-                    primary_key: vec!["id".to_string()],
-                    on_conflict: None,
-                    base_path: format!("/tmp/unused/t{i}"),
-                    partition_column: None,
-                    vortex_config: VortexConfig::default(),
-                })
-                .await
-                .expect("create a participant's table");
+            let domain =
+                Domain::create_with_config(Arc::clone(&store), prefix.clone(), config(), false)
+                    .await
+                    .expect("create a participant's log");
+            let table =
+                domain
+                    .create_table(CreateTableOptions {
+                        table_name: format!("t{i}"),
+                        schema: Arc::new(arrow_schema::Schema::new(vec![
+                            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+                        ])),
+                        primary_key: vec!["id".to_string()],
+                        on_conflict: None,
+                        base_path: format!("/tmp/unused/t{i}"),
+                        partition_column: None,
+                        vortex_config: VortexConfig::default(),
+                    })
+                    .await
+                    .expect("create a participant's table");
             participants.push(Participant {
                 prefix,
                 table,
@@ -273,10 +271,13 @@ impl Replay {
     }
 
     async fn read(&self, i: usize) -> DatasetState {
-        let (_, opened) = Reader::open(Arc::clone(&self.store), self.participants[i].prefix.clone())
-            .await
-            .expect("open a participant's log from storage");
-        replay_state(opened).expect("replay a participant's log").state
+        let (_, opened) =
+            Reader::open(Arc::clone(&self.store), self.participants[i].prefix.clone())
+                .await
+                .expect("open a participant's log from storage");
+        replay_state(opened)
+            .expect("replay a participant's log")
+            .state
     }
 
     async fn view(&self, i: usize) -> View {
@@ -304,7 +305,12 @@ impl Replay {
     }
 
     /// Run a record of `kind` on participant `i` through the handle of `lease`.
-    async fn write(&mut self, i: usize, lease: usize, kind: u8) -> crate::catalog::CatalogResult<()> {
+    async fn write(
+        &mut self,
+        i: usize,
+        lease: usize,
+        kind: u8,
+    ) -> crate::catalog::CatalogResult<()> {
         self.sequence += 1;
         let sequence = self.sequence;
         let decision = self.decision().await;
@@ -314,7 +320,11 @@ impl Replay {
         match kind {
             0 => {
                 handle
-                    .commit_actions(vec![position("other", &sequence.to_string(), Some(vec![1]))])
+                    .commit_actions(vec![position(
+                        "other",
+                        &sequence.to_string(),
+                        Some(vec![1]),
+                    )])
                     .await
             }
             1 => {
@@ -365,7 +375,11 @@ impl Replay {
                 outcomes.insert(commit);
             }
         }
-        if outcomes.len() > 1 || self.decided.is_some_and(|d| outcomes.iter().any(|&o| o != d)) {
+        if outcomes.len() > 1
+            || self
+                .decided
+                .is_some_and(|d| outcomes.iter().any(|&o| o != d))
+        {
             return Some(format!(
                 "agreement: participants resolved {outcomes:?} with decision {:?}",
                 self.decided
@@ -404,15 +418,18 @@ impl Replay {
                 }
                 let before = self.view(i).await;
                 if let Err(error) = self.write(i, lease, kind).await {
-                    outcome.divergence = Some(at(format!("refused a record the model lands: {error}")));
+                    outcome.divergence =
+                        Some(at(format!("refused a record the model lands: {error}")));
                     return outcome;
                 }
                 if kind == 2 && before.prepared {
-                    outcome.violation = Some(at("reservation: a write landed on a prepared table".into()));
+                    outcome.violation =
+                        Some(at("reservation: a write landed on a prepared table".into()));
                     return outcome;
                 }
                 if kind == 3 && !before.prepared {
-                    outcome.violation = Some(at("matching: a Resolve landed without its Prepare".into()));
+                    outcome.violation =
+                        Some(at("matching: a Resolve landed without its Prepare".into()));
                     return outcome;
                 }
                 if kind == 3 && self.participants[i].resolved != Some(model_outcome == 1) {
@@ -436,7 +453,10 @@ impl Replay {
                 }
                 *outcome.replayed.entry("fenced").or_default() += 1;
             } else if refused.is_some() {
-                *outcome.counted.entry("Deliver after another record".into()).or_default() += 1;
+                *outcome
+                    .counted
+                    .entry("Deliver after another record".into())
+                    .or_default() += 1;
             } else if let Some(i) = *fenced {
                 let participant = &mut self.participants[i];
                 let domain = Domain::open_with_config(
@@ -448,7 +468,9 @@ impl Replay {
                 .await
                 .expect("take a participant's log over");
                 participant.lease += 1;
-                participant.handles.insert(participant.lease, Arc::new(domain));
+                participant
+                    .handles
+                    .insert(participant.lease, Arc::new(domain));
                 *outcome.replayed.entry("fence").or_default() += 1;
             } else if name == "Decide" {
                 let commit = text == "Decide(1)";
@@ -559,7 +581,11 @@ impl Replay {
 }
 
 async fn replay(trace: &Trace) -> Vec<(&'static str, Outcome)> {
-    let participants = if trace.run.contains("three-participants") { 3 } else { 2 };
+    let participants = if trace.run.contains("three-participants") {
+        3
+    } else {
+        2
+    };
     let directory = tempfile::tempdir().expect("temporary directory");
     let stores: [(&'static str, Arc<dyn ObjectStore>); 2] = [
         ("memory", Arc::new(object_store::memory::InMemory::new())),
@@ -615,9 +641,7 @@ async fn positive(text: &str) {
             count += 1;
         }
     }
-    eprintln!(
-        "REPLAYED traces×backends={count} replayed={replayed:?} counted={counted:?}"
-    );
+    eprintln!("REPLAYED traces×backends={count} replayed={replayed:?} counted={counted:?}");
 }
 
 /// Each witness that breaks `property` in the model: every guarantee holds on
@@ -644,9 +668,10 @@ async fn negative(text: &str, property: &str, refuses: bool) {
             eprintln!(
                 "CONTROL {backend} {}: {}",
                 describe(&trace),
-                outcome
-                    .divergence
-                    .unwrap_or_else(|| format!("followed, guarantees hold; replayed {:?}", outcome.replayed))
+                outcome.divergence.unwrap_or_else(|| format!(
+                    "followed, guarantees hold; replayed {:?}",
+                    outcome.replayed
+                ))
             );
             checked += 1;
         }

@@ -3643,13 +3643,9 @@ impl DataFusion {
                 // place, a full refresh finds the checkpoint and skips the initial load,
                 // and the dataset serves no rows. A snapshot it bootstrapped from carries
                 // its own state, so that is kept.
-                if dataset
-                    .acceleration
-                    .as_ref()
-                    .is_some_and(|acceleration| {
-                        acceleration.mode == crate::component::dataset::acceleration::Mode::FileCreate
-                    })
-                    && matches!(status, BootstrapStatus::None)
+                if dataset.acceleration.as_ref().is_some_and(|acceleration| {
+                    acceleration.mode == crate::component::dataset::acceleration::Mode::FileCreate
+                }) && matches!(status, BootstrapStatus::None)
                 {
                     clear_recreated_acceleration_state(dataset.as_ref(), registry)
                         .await
@@ -7950,7 +7946,6 @@ async fn build_snapshot_refresh_state(
 mod installation_tests;
 #[cfg(test)]
 mod integer_overflow;
-
 
 /// Clears `source`'s dataset checkpoint and append cursor after its acceleration was
 /// recreated empty, as [`DataFusion::rebuild_acceleration`] does for a settings

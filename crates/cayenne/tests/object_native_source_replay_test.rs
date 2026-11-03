@@ -101,7 +101,10 @@ struct Replay {
 }
 
 /// The logged rows and position, from storage alone.
-async fn logged(store: &Arc<dyn ObjectStore>, table_id: &str) -> Result<(Vec<usize>, usize), String> {
+async fn logged(
+    store: &Arc<dyn ObjectStore>,
+    table_id: &str,
+) -> Result<(Vec<usize>, usize), String> {
     let log = cayenne::metastore::object_native::dataset_log_at(
         Arc::clone(store),
         &Path::from("catalog"),
@@ -277,7 +280,11 @@ impl Replay {
             }
             "Deliver" => {
                 let wires = &self.attempts[args[0]].wires;
-                let wire = if args[1] == 0 { wires.first() } else { wires.last() };
+                let wire = if args[1] == 0 {
+                    wires.first()
+                } else {
+                    wires.last()
+                };
                 let wire = *wire.ok_or("missing delivery")?;
                 let _ = self.faults.deliver(wire).await;
             }

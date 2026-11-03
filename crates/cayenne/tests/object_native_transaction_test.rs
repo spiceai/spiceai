@@ -219,7 +219,10 @@ async fn a_transaction_across_two_datasets_commits_on_both_logs() {
         .commit_publications(&across(&orders, &audit))
         .await
         .expect("commit across both datasets");
-    assert_eq!(published(&catalog, &orders, &audit).await, [Some(5), Some(6)]);
+    assert_eq!(
+        published(&catalog, &orders, &audit).await,
+        [Some(5), Some(6)]
+    );
     for dataset in ["orders", "audit"] {
         let names = actions(&store, dataset).await;
         assert_eq!(
@@ -229,12 +232,18 @@ async fn a_transaction_across_two_datasets_commits_on_both_logs() {
         );
     }
     // Both participants resolved it, so the coordinator removed its records.
-    assert_eq!(objects_under(&store, "transactions").await, Vec::<String>::new());
+    assert_eq!(
+        objects_under(&store, "transactions").await,
+        Vec::<String>::new()
+    );
     drop(catalog);
     let reopened = ObjectNativeCatalog::open(Arc::clone(&store), Path::from("catalog"))
         .await
         .expect("reopen");
-    assert_eq!(published(&reopened, &orders, &audit).await, [Some(5), Some(6)]);
+    assert_eq!(
+        published(&reopened, &orders, &audit).await,
+        [Some(5), Some(6)]
+    );
 }
 
 /// The coordinator stops before recording its decision: the process that opens
@@ -259,7 +268,10 @@ async fn a_transaction_stopped_before_its_decision_aborts_when_the_catalog_reope
         .await
         .expect("reopen resolves the prepared transaction");
     assert_eq!(published(&reopened, &orders, &audit).await, [None, None]);
-    assert_eq!(objects_under(&store, "transactions").await, Vec::<String>::new());
+    assert_eq!(
+        objects_under(&store, "transactions").await,
+        Vec::<String>::new()
+    );
     reopened
         .commit_publications(&[publication(&orders, "orders-later", 7)])
         .await
@@ -291,8 +303,14 @@ async fn a_transaction_stopped_after_its_commit_decision_commits_when_the_catalo
     let reopened = ObjectNativeCatalog::open(Arc::clone(&store), Path::from("catalog"))
         .await
         .expect("reopen resolves the prepared transaction");
-    assert_eq!(published(&reopened, &orders, &audit).await, [Some(5), Some(6)]);
-    assert_eq!(objects_under(&store, "transactions").await, Vec::<String>::new());
+    assert_eq!(
+        published(&reopened, &orders, &audit).await,
+        [Some(5), Some(6)]
+    );
+    assert_eq!(
+        objects_under(&store, "transactions").await,
+        Vec::<String>::new()
+    );
 }
 
 /// Between a transaction's `Prepare` and `Resolve`, another change to one of its
@@ -320,10 +338,15 @@ async fn a_change_to_a_reserved_dataset_waits_for_the_transaction() {
     // A bounded wait for something that must not happen: the change is blocked
     // for as long as the decision is held.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(!change.is_finished(), "the change did not wait for the transaction");
+    assert!(
+        !change.is_finished(),
+        "the change did not wait for the transaction"
+    );
     faults.clear_rules();
     faults.deliver(held).await.expect("the decision lands");
-    faults.respond(held).expect("release the decision's response");
+    faults
+        .respond(held)
+        .expect("release the decision's response");
     coordinator
         .await
         .expect("coordinator task")
@@ -332,7 +355,10 @@ async fn a_change_to_a_reserved_dataset_waits_for_the_transaction() {
         .await
         .expect("change task")
         .expect("the change commits after the transaction");
-    assert_eq!(published(&catalog, &orders, &audit).await, [Some(5), Some(6)]);
+    assert_eq!(
+        published(&catalog, &orders, &audit).await,
+        [Some(5), Some(6)]
+    );
     assert_eq!(
         catalog
             .get_snapshot_sequence(&orders, "orders-later")
@@ -360,7 +386,8 @@ async fn an_open_removes_the_logs_no_dataset_uses_and_keeps_the_others() {
     faults.clear_rules();
     let kept = objects_under(&store, "datasets").await;
     assert!(
-        kept.iter().any(|path| path.starts_with("datasets/unnamed-")),
+        kept.iter()
+            .any(|path| path.starts_with("datasets/unnamed-")),
         "the stopped create wrote its log: {kept:?}"
     );
     drop(catalog);
@@ -383,11 +410,18 @@ async fn an_open_removes_the_logs_no_dataset_uses_and_keeps_the_others() {
         .filter(|path| path.starts_with(&orders_log))
         .cloned()
         .collect();
-    assert!(!orders_objects.is_empty(), "orders' log has objects: {kept:?}");
+    assert!(
+        !orders_objects.is_empty(),
+        "orders' log has objects: {kept:?}"
+    );
     drop(open_reclaiming(&store).await);
     // Exactly orders' log is left, every object of it, and the dropped one is gone.
     assert_eq!(objects_under(&store, "datasets").await, orders_objects);
-    assert!(!orders_objects.iter().any(|path| path.starts_with(&format!("{dropped_log}/"))));
+    assert!(
+        !orders_objects
+            .iter()
+            .any(|path| path.starts_with(&format!("{dropped_log}/")))
+    );
     // Read back from storage alone.
     let reopened = ObjectNativeCatalog::open(Arc::clone(&store), Path::from("catalog"))
         .await
@@ -423,7 +457,10 @@ async fn create_fails(catalog: &ObjectNativeCatalog, name: &str) {
             vortex_config: VortexConfig::default(),
         })
         .await;
-    assert!(created.is_err(), "the create succeeded although the registry could not commit");
+    assert!(
+        created.is_err(),
+        "the create succeeded although the registry could not commit"
+    );
 }
 
 /// The decision's create lands but its response is lost: the coordinator's
@@ -437,8 +474,14 @@ async fn a_commit_whose_response_is_lost_is_reported_committed() {
         .commit_publications(&across(&orders, &audit))
         .await
         .expect("the coordinator reads back the commit it recorded");
-    assert_eq!(published(&catalog, &orders, &audit).await, [Some(5), Some(6)]);
-    assert_eq!(objects_under(&store, "transactions").await, Vec::<String>::new());
+    assert_eq!(
+        published(&catalog, &orders, &audit).await,
+        [Some(5), Some(6)]
+    );
+    assert_eq!(
+        objects_under(&store, "transactions").await,
+        Vec::<String>::new()
+    );
 }
 
 /// Storage refuses every decision until the deadline and after it, so the
@@ -468,7 +511,10 @@ async fn a_decision_storage_refuses_is_reported_unknown_and_finished_once_storag
     // A bounded wait for something that must not happen: the change waits for
     // as long as storage refuses the decision.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(!change.is_finished(), "the change did not wait for the transaction");
+    assert!(
+        !change.is_finished(),
+        "the change did not wait for the transaction"
+    );
     faults.clear_rules();
     change
         .await
@@ -499,7 +545,10 @@ async fn a_commit_that_cannot_be_read_back_is_reported_unknown_and_applied() {
     assert!(error.contains("is unknown"), "{error}");
     faults.clear_rules();
     records_removed(&store, std::time::Duration::from_secs(10)).await;
-    assert_eq!(published(&catalog, &orders, &audit).await, [Some(5), Some(6)]);
+    assert_eq!(
+        published(&catalog, &orders, &audit).await,
+        [Some(5), Some(6)]
+    );
 }
 
 /// The commit's create is still in flight at the deadline: the coordinator
@@ -514,7 +563,10 @@ async fn a_commit_still_in_flight_at_the_deadline_is_aborted() {
     faults.arm(Op::Create, is_decision, Fault::Hold);
     let error = failed_across(&catalog, &orders, &audit).await;
     assert!(error.contains("was aborted"), "{error}");
-    assert_eq!(objects_under(&store, "transactions").await, Vec::<String>::new());
+    assert_eq!(
+        objects_under(&store, "transactions").await,
+        Vec::<String>::new()
+    );
     let held = faults.held_ids();
     assert_eq!(held.len(), 1, "the commit's create is held");
     faults
@@ -532,5 +584,8 @@ async fn a_commit_still_in_flight_at_the_deadline_is_aborted() {
         .await
         .expect("reopen");
     assert_eq!(published(&reopened, &orders, &audit).await, [None, None]);
-    assert_eq!(objects_under(&store, "transactions").await, Vec::<String>::new());
+    assert_eq!(
+        objects_under(&store, "transactions").await,
+        Vec::<String>::new()
+    );
 }

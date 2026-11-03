@@ -888,7 +888,11 @@ async fn replay(
         let expected_sizes: Vec<_> = symbolic.iter().map(|b| b * 10_000).collect();
         let head = &replay.reader.state().head;
         let sizes: Vec<_> = head.window.iter().map(|r| r.encoded.len()).collect();
-        let batches: Vec<_> = head.batches.iter().map(|&end| usize::try_from(end).expect("bounded trace")).collect();
+        let batches: Vec<_> = head
+            .batches
+            .iter()
+            .map(|&end| usize::try_from(end).expect("bounded trace"))
+            .collect();
         require(batches == ends && sizes == expected_sizes, || {
             format!(
                 "trace={} {:?} expected batch ends {ends:?}, window bytes {expected_sizes:?}; actual {batches:?}, {sizes:?}",

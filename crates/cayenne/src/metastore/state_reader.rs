@@ -36,10 +36,7 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use cayenne_metastore_actions::{DatasetState, ObjRef, TableState};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
-use std::{
-    collections::HashMap,
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 /// A read-only [`MetadataCatalog`] over one replayed [`DatasetState`].
 /// Data files remain in the locations recorded by the writer.

@@ -721,10 +721,13 @@ impl DatasetState {
             .map_err(|error| guard(format!("prepared actions decode: {error}")))?;
         let mut scratch = DatasetState::default();
         for table_id in &footprint {
-            let table = self.tables.get(table_id).ok_or_else(|| ApplyError::NoTable {
-                action: "Prepare",
-                table_id: table_id.clone(),
-            })?;
+            let table = self
+                .tables
+                .get(table_id)
+                .ok_or_else(|| ApplyError::NoTable {
+                    action: "Prepare",
+                    table_id: table_id.clone(),
+                })?;
             scratch.tables.insert(table_id.clone(), table.clone());
             if self.unknown.contains(table_id) {
                 scratch.unknown.insert(table_id.clone());
@@ -939,7 +942,9 @@ mod tests {
                 guard: "no unresolved transaction 'x' shares a table with it".into(),
             })
         );
-        state.apply(&one(advance("b", 2))).expect("b is not reserved");
+        state
+            .apply(&one(advance("b", 2)))
+            .expect("b is not reserved");
         assert_eq!(
             state.apply(&one(resolve("x", &["a", "b"], true))),
             Err(ApplyError::Guard {
@@ -974,8 +979,7 @@ mod tests {
             Err(ApplyError::Guard {
                 action: "Prepare",
                 table_id: "y".into(),
-                guard: "AdvanceSeq changes a table of its footprint and no table's identity"
-                    .into(),
+                guard: "AdvanceSeq changes a table of its footprint and no table's identity".into(),
             })
         );
         assert!(state.prepared.is_empty());
@@ -994,7 +998,10 @@ mod tests {
             .apply(&crate::checkpoint::state_as_root(&state))
             .expect("root");
         assert_eq!(rebuilt, state);
-        assert!(rebuilt.apply(&one(advance("a", 1))).is_err(), "still reserved");
+        assert!(
+            rebuilt.apply(&one(advance("a", 1))).is_err(),
+            "still reserved"
+        );
         rebuilt
             .apply(&one(resolve("x", &["a"], true)))
             .expect("resolve after the checkpoint");

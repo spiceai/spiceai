@@ -157,7 +157,11 @@ impl Model for Protocol {
 /// `None` when an action does not parse or is not enabled, so a replay can take
 /// its expected cuts from the model rather than from the code it checks.
 #[must_use]
-pub fn head_after(mode: &str, bound: usize, actions: &[String]) -> Option<(Vec<usize>, Vec<usize>)> {
+pub fn head_after(
+    mode: &str,
+    bound: usize,
+    actions: &[String],
+) -> Option<(Vec<usize>, Vec<usize>)> {
     let protocol = Protocol::new(mode, bound);
     let mut state = protocol.init_states().pop()?;
     for action in actions {
@@ -183,6 +187,11 @@ pub fn head_after(mode: &str, bound: usize, actions: &[String]) -> Option<(Vec<u
     }
     Some((
         state.store.index.iter().map(|&(_, end)| end).collect(),
-        state.store.window.iter().map(|r| crate::core::size(*r)).collect(),
+        state
+            .store
+            .window
+            .iter()
+            .map(|r| crate::core::size(*r))
+            .collect(),
     ))
 }

@@ -3047,7 +3047,9 @@ pub fn run(name: &str) -> Result<(), String> {
 /// not enable at that point.
 #[must_use]
 pub fn window_head_after(run: &str, actions: &[String]) -> Option<(Vec<usize>, Vec<usize>)> {
-    let run = runs().into_iter().find(|r| r.name == run && r.family == "window")?;
+    let run = runs()
+        .into_iter()
+        .find(|r| r.name == run && r.family == "window")?;
     window::head_after(run.mode, run.bound, actions)
 }
 
