@@ -47,7 +47,6 @@ connector-oracle = { path = "../../crates/data-connectors/connector-oracle", opt
 accelerator-postgres = { path = "../../crates/accelerators/accelerator-postgres", optional = true }
 accelerator-sqlite = { path = "../../crates/accelerators/accelerator-sqlite", optional = true }
 llms-llamacpp = { path = "../../crates/llms-llamacpp", optional = true }
-accelerator-turso = { path = "../../crates/accelerators/accelerator-turso", optional = true }
 accelerator-duckdb = { path = "../../crates/accelerators/accelerator-duckdb", optional = true }
 accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
@@ -188,7 +187,6 @@ default = [
     "runtime/s3_vectors",
     "mongodb",
     "iceberg-write",
-    "turso",
     "smb",
     "models",
     "aws-secrets-manager",
@@ -241,7 +239,6 @@ spark = ["connector-spark", "runtime/spark", "connector-databricks/spark"]
 spicebench = ["runtime/spicebench"]
 sqlite = ["accelerator-sqlite", "runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
-turso = ["accelerator-turso", "runtime/turso"]
 vortex = ["runtime/vortex"]
 
 [lints]

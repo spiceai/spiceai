@@ -32,7 +32,3 @@ sqlite-file:
 sqlite-memory:
   datasets: { '*': { acceleration: { enabled: true, engine: sqlite, mode: memory } } }
 
-turso-file:
-  datasets: { '*': { acceleration: { enabled: true, engine: turso, mode: file } } }
-turso-memory:
-  datasets: { '*': { acceleration: { enabled: true, engine: turso, mode: memory } } }

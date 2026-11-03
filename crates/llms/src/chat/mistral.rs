@@ -14,7 +14,9 @@ limitations under the License.
 #![allow(clippy::borrowed_box)]
 #![allow(clippy::needless_pass_by_value)]
 
-use crate::chat::{LocalModelOptions, PagedAttentionMode, ReasoningDefault, message_to_mistral};
+use crate::chat::{
+    ContentSupport, LocalModelOptions, PagedAttentionMode, ReasoningDefault, message_to_mistral,
+};
 use crate::streaming_utils::create_stream_response_with_timestamp;
 
 use super::{
@@ -47,8 +49,8 @@ use mistralrs::core::{
 };
 use mistralrs::{
     ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice, Constraint, Device, Function,
-    ModelDType, NormalRequest, Request as MistralRequest, Response as MistralResponse,
-    SamplingParams, Tool, ToolCallResponse, ToolChoice, ToolType,
+    MessageContent, ModelDType, NormalRequest, Request as MistralRequest,
+    Response as MistralResponse, SamplingParams, Tool, ToolCallResponse, ToolChoice, ToolType,
 };
 
 use serde::Deserialize;
@@ -77,6 +79,8 @@ pub struct MistralLlama {
     model_name: String,
     /// What the chat template does with each `reasoning_effort` value.
     reasoning_support: ReasoningSupport,
+    /// Which shapes of a message's content the chat template reads.
+    content_support: ContentSupport,
     /// RAII drop guard that keeps the per-node `RING_CONFIG` temp file alive for
     /// the model's lifetime (its `Drop` deletes the file on model teardown).
     /// `None` for single-node models. Never read directly.
@@ -563,6 +567,7 @@ impl MistralLlama {
         reasoning: ReasoningDefault<'_>,
     ) -> Result<Self> {
         let reasoning_support = Self::reasoning_support(&pipeline).await;
+        let content_support = Self::content_support(&pipeline).await;
         if let Some(effort) = reasoning.effort {
             reasoning_controls(Some(effort), &reasoning_support, reasoning.model_name).map_err(
                 |message| ChatError::InvalidParamValueError {
@@ -580,6 +585,7 @@ impl MistralLlama {
             counter: AtomicUsize::new(0),
             model_name: reasoning.model_name.to_string(),
             reasoning_support,
+            content_support,
             ring_config,
         })
     }
@@ -625,6 +631,67 @@ impl MistralLlama {
             );
             ReasoningSupport::default()
         })
+    }
+
+    /// Renders a conversation for each role with markers in each shape of a message's content,
+    /// to learn which the chat template reads ([`ContentSupport`]), off the async runtime as
+    /// [`Self::reasoning_support`] renders. Named templates are probed apart, the `tool_use`
+    /// one by rendering with a tool; a single template renders alike with or without tools.
+    async fn content_support(
+        pipeline: &Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>,
+    ) -> ContentSupport {
+        let pipeline = Arc::clone(pipeline);
+        tokio::task::spawn_blocking(move || {
+            let pipeline = pipeline.blocking_lock();
+            let processor = pipeline.get_processor();
+            let named = pipeline
+                .get_chat_template()
+                .is_some_and(|t| t.chat_template.as_ref().is_some_and(|t| t.0.is_right()));
+            ContentSupport::from_renders(|messages, with_tools| {
+                let tools = if with_tools && named {
+                    vec![Tool {
+                        tp: ToolType::Function,
+                        function: Function {
+                            description: None,
+                            name: "probe".to_string(),
+                            parameters: None,
+                            strict: None,
+                        },
+                    }]
+                } else {
+                    Vec::new()
+                };
+                processor
+                    .process(&*pipeline, messages, true, false, None, None, tools)
+                    .map(|(_, prompt)| prompt)
+                    .ok()
+            })
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::debug!(
+                "Checking which message content the chat template reads stopped, so a message's text parts reach it joined: {e}"
+            );
+            ContentSupport::default()
+        })
+    }
+
+    /// `req`'s messages as the chat template reads them: [`message_to_mistral`]'s, fitted to
+    /// the template by [`ContentSupport::rewrite`]. Public for tests.
+    #[doc(hidden)]
+    pub fn template_messages(
+        &self,
+        req: &CreateChatCompletionRequest,
+    ) -> Result<Vec<IndexMap<String, MessageContent>>, OpenAIError> {
+        let mut messages = req
+            .messages
+            .iter()
+            .map(message_to_mistral)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|part| OpenAIError::InvalidArgument(part.refusal(&self.model_name)))?;
+        let with_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+        self.content_support.rewrite(&mut messages, with_tools);
+        Ok(messages)
     }
 
     // TODO: handle passing in [`SamplingParams`] from request.
@@ -705,16 +772,13 @@ impl MistralLlama {
     async fn send_message(
         &self,
         req: CreateChatCompletionRequest,
+        messages: Vec<IndexMap<String, MessageContent>>,
         tool_choice: Option<ToolChoice>,
         reasoning: ReasoningControls,
     ) -> Result<Receiver<MistralResponse>> {
         let max_len = Self::completion_limit(&req);
         let message = RequestMessage::Chat {
-            messages: req
-                .messages
-                .iter()
-                .map(message_to_mistral)
-                .collect::<Vec<_>>(),
+            messages,
             enable_thinking: reasoning.enable_thinking,
             reasoning_effort: reasoning.reasoning_effort,
         };
@@ -897,8 +961,9 @@ impl Chat for MistralLlama {
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let tool_choice = request_tool_choice(&req)?;
         let reasoning = self.request_reasoning(&req)?;
+        let messages = self.template_messages(&req)?;
         let recver = self
-            .send_message(req, tool_choice, reasoning)
+            .send_message(req, messages, tool_choice, reasoning)
             .await
             .map_err(|e| {
                 OpenAIError::ApiError(ApiError {
@@ -917,8 +982,9 @@ impl Chat for MistralLlama {
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let tool_choice = request_tool_choice(&req)?;
         let reasoning = self.request_reasoning(&req)?;
+        let messages = self.template_messages(&req)?;
         let mut recver = self
-            .send_message(req, tool_choice, reasoning)
+            .send_message(req, messages, tool_choice, reasoning)
             .await
             .map_err(|e| {
                 OpenAIError::ApiError(ApiError {

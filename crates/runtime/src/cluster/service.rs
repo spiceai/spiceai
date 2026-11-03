@@ -440,12 +440,19 @@ impl ClusterService for ClusterServiceImpl {
         );
 
         let secrets = Secrets::snapshot(&self.secrets).await;
-        // A reference through the `secrets:` sentinel keeps its normal
-        // "search every configured store in precedence order" resolution; a
-        // reference scoped to a specific store (e.g. `${ env:KEY }`) is
-        // restricted to that store, so a same-named key in an unrelated
-        // store can't answer in its place.
-        let lookup = if allowed_stores.contains(SECRETS) {
+        // A reference to a specific store (e.g. `${ aws:KEY }`) that the app
+        // makes is answered by that store alone, so a same-named key in an
+        // unrelated store can't answer in its place. Otherwise a key the app
+        // references through the `secrets:` sentinel keeps its normal "search
+        // every configured store in precedence order" resolution, and any
+        // other request is limited to the stores the app references the key
+        // through.
+        let store = request.store.as_str();
+        let lookup = if store != SECRETS && allowed_stores.contains(store) {
+            secrets
+                .get_secret_from_stores(&request.key, &HashSet::from([store.to_string()]))
+                .await
+        } else if allowed_stores.contains(SECRETS) {
             secrets.get_secret(&request.key).await
         } else {
             secrets
@@ -2090,6 +2097,7 @@ mod tests {
             .expand_secret(Request::new(ExpandSecretRequest {
                 executor_id: "executor-1".to_string(),
                 key: "PG_PASS".to_string(),
+                store: String::new(),
             }))
             .await
             .expect("referenced secret should expand");
@@ -2112,6 +2120,7 @@ mod tests {
             .expand_secret(Request::new(ExpandSecretRequest {
                 executor_id: "executor-1".to_string(),
                 key: "AWS_SECRET_ACCESS_KEY".to_string(),
+                store: String::new(),
             }))
             .await
             .expect_err("unreferenced secret must be denied");
@@ -2156,6 +2165,7 @@ mod tests {
             .expand_secret(Request::new(ExpandSecretRequest {
                 executor_id: "executor-1".to_string(),
                 key: "API_KEY".to_string(),
+                store: String::new(),
             }))
             .await
             .expect("store-scoped key referenced by the app should expand");
@@ -2188,6 +2198,7 @@ mod tests {
                     .expand_secret(ExpandSecretRequest {
                         executor_id: "executor-1".to_string(),
                         key: "PG_PASS".to_string(),
+                        store: String::new(),
                     })
                     .await
                     .map(drop),
@@ -2286,6 +2297,7 @@ mod tests {
             .expand_secret(Request::new(ExpandSecretRequest {
                 executor_id: "executor-1".to_string(),
                 key: "API_KEY".to_string(),
+                store: String::new(),
             }))
             .await
             .expect_err("a key only runtime.auth references must not expand");
@@ -2303,6 +2315,7 @@ mod tests {
             .expand_secret(Request::new(ExpandSecretRequest {
                 executor_id: "executor-1".to_string(),
                 key: "PG_PASS".to_string(),
+                store: String::new(),
             }))
             .await
             .expect_err("ExpandSecret without app must be denied");
@@ -2320,6 +2333,7 @@ mod tests {
             .expand_secret(Request::new(ExpandSecretRequest {
                 executor_id: "executor-1".to_string(),
                 key: String::new(),
+                store: String::new(),
             }))
             .await
             .expect_err("empty key must be denied");
@@ -2338,6 +2352,7 @@ mod tests {
             .expand_secret(Request::new(ExpandSecretRequest {
                 executor_id: "executor-1".to_string(),
                 key: "PG_PASS".to_string(),
+                store: String::new(),
             }))
             .await
             .expect_err("missing allowlisted secret must fail");
@@ -2371,6 +2386,7 @@ mod tests {
         let executor_secrets = Secrets::new_for_cluster_executor(
             Box::new(crate::cluster::ClusterSecretExpanderImpl::new(client)),
             "executor-1".to_string(),
+            Vec::new(),
         );
 
         // Not referenced by the app, so the scheduler declines it even though
@@ -2400,6 +2416,53 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// A reference to a store the spicepod names resolves on an executor from
+    /// that store on the scheduler, even when another store holds the same key.
+    #[tokio::test]
+    async fn executor_secrets_resolve_references_to_named_stores() {
+        let mut ds = Dataset::new("memory:data", "orders");
+        ds.params = Some(Params::from_string_map(HashMap::from([
+            ("pg_pass".to_string(), "${ aws:PG_PASS }".to_string()),
+            ("api_key".to_string(), "${ vault:PG_PASS }".to_string()),
+            ("token".to_string(), "${ secrets:TOKEN }".to_string()),
+        ])));
+        let app = Arc::new(AppBuilder::new("test").with_dataset(ds).build());
+        let lookups = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut secrets = Secrets::new();
+        for (store, value) in [("aws", "from-aws"), ("vault", "from-vault")] {
+            secrets.register_store(
+                store,
+                Arc::new(RecordingSecretStore {
+                    values: HashMap::from([
+                        ("PG_PASS".to_string(), value.to_string()),
+                        ("TOKEN".to_string(), format!("token-{value}")),
+                    ]),
+                    lookups: Arc::clone(&lookups),
+                }),
+            );
+        }
+        let service = make_test_service_with(Some(app), secrets).await;
+        let (client, shutdown) = serve_test_service(service).await;
+        let executor_secrets = Secrets::new_for_cluster_executor(
+            Box::new(crate::cluster::ClusterSecretExpanderImpl::new(client)),
+            "executor-1".to_string(),
+            vec!["aws".to_string(), "vault".to_string()],
+        );
+
+        let expanded = executor_secrets
+            .inject_secrets(
+                "params",
+                runtime_secrets::ParamStr("${ aws:PG_PASS } ${ vault:PG_PASS } ${ secrets:TOKEN }"),
+            )
+            .await;
+        assert_eq!(
+            expanded.expose_secret(),
+            "from-aws from-vault token-from-aws"
+        );
+
+        shutdown.cancel();
+    }
+
     #[tokio::test]
     async fn executor_secrets_report_unreachable_scheduler_as_error() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -2417,6 +2480,7 @@ mod tests {
                 ClusterServiceClient::new(channel),
             )),
             "executor-1".to_string(),
+            Vec::new(),
         );
 
         let err = executor_secrets

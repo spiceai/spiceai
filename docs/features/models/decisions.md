@@ -72,6 +72,15 @@ Arguments:
 
 Constants are checked when the query is planned, before any model is called.
 
+A required constant (`condition`, `instructions` of `ai_score`, `labels`, `levels`) can also be an uncorrelated scalar subquery. The query runs the subquery one time and checks its value by the same rules before any model is called. A subquery for `labels` can return one label per row, or one list:
+
+```sql
+SELECT id, ai_classify(body, (SELECT DISTINCT team_name FROM teams)) AS team
+FROM tickets;
+```
+
+A subquery for `levels` must return one list, lowest first, because a subquery does not keep the order of its rows: `(SELECT array_agg(level ORDER BY rank) FROM levels)`. A call with a subquery argument does not share its request with other calls, because its question is known only when the query runs. `questions`, `model`, `on_error` and `ai_classify`'s `instructions` must be literals.
+
 How the engine runs them:
 
 - In one `SELECT` list or `WHERE` clause, `ai_if`, `ai_probability`, `ai_classify` and `ai_score` calls on the same `input`, `model` and `on_error` share one request per row, and identical `ai_decide` calls share one request and one answer. Each distinct `ai_decide` call is its own request, asking all of its questions at once. Identical inputs are asked once within each slice of up to 1,024 rows.

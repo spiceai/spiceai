@@ -6,12 +6,12 @@
 //
 //     https://www.apache.org/licenses/LICENSE-2.0
 
-//! PK equality lookups: Cayenne vs DuckDB.
+//! PK equality lookups: Cayenne vs `DuckDB`.
 //!
 //! Models the "interactive query" workload — many small queries that
 //! resolve a single row by primary key. The PK is `id BIGINT` for both
-//! engines (DuckDB declares it as `PRIMARY KEY`, Cayenne tracks it via
-//! its `primary_key` table option which routes through the Int64Pk
+//! engines (`DuckDB` declares it as `PRIMARY KEY`, Cayenne tracks it via
+//! its `primary_key` table option which routes through the `Int64Pk`
 //! deletion strategy).
 //!
 //! Three lookup patterns:

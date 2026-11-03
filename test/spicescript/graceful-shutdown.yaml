@@ -5,8 +5,7 @@ description: >
   SIGTERM, leaves a file acceleration it can reopen, and after a restart
   serves one row per key: the newest version (upsert, and Cayenne, which keeps
   the newest by time column whatever `on_conflict` says) or the first (DuckDB's
-  drop). Every query during the load succeeds. (Turso, an accelerator being retired,
-  is not covered.)
+  drop). Every query during the load succeeds.
 
 sources:
   src: { kind: postgres }
