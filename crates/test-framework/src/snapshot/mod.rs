@@ -831,7 +831,7 @@ mod tests {
         let replacement = super::ENDPOINT_CONTEXT_FILTER_REPLACEMENT;
 
         // Dremio: grpc URL plus a username, comma-separated.
-        let input = "VirtualExecutionPlan name=dremio compute_context=url=grpc://dremio-client.example.internal:32010,username=bench base_sql=SELECT \"l_orderkey\" FROM \"lineitem\"";
+        let input = "VirtualExecutionPlan name=dremio compute_context=url=grpc://dremio.example.internal:32010,username=bench base_sql=SELECT \"l_orderkey\" FROM \"lineitem\"";
         let expected = "VirtualExecutionPlan name=dremio compute_context=<CONNECTION> base_sql=SELECT \"l_orderkey\" FROM \"lineitem\"";
         assert_eq!(regex.replace_all(input, replacement), expected);
 

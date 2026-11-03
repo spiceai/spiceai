@@ -102,11 +102,30 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
         let acceleration = if snapshot_source.is_some() {
             None
         } else {
+            let name = &dataset.name;
             dataset
                 .acceleration
                 .map(acceleration::Acceleration::try_from)
-                .transpose()?
+                .transpose()
+                .map_err(|err| match err {
+                    runtime_acceleration::AccelerationParseError::AcceleratorEngineRemoved {
+                        name: engine,
+                    } => crate::Error::AcceleratedDatasetEngineRemoved {
+                        dataset: name.clone(),
+                        engine,
+                    },
+                    err => err.into(),
+                })?
         };
+
+        if runtime_component::vector_engine::uses_removed_vector_engine(
+            dataset.vectors.as_ref(),
+            &dataset.columns,
+        ) {
+            return Err(crate::Error::DatasetVectorEngineRemoved {
+                dataset: dataset.name,
+            });
+        }
 
         validate_identifier(&dataset.name).context(crate::ComponentSnafu)?;
 

@@ -60,8 +60,7 @@ use data_accelerator_api::snapshots::{
 };
 use data_accelerator_api::spice_data_base_path;
 use data_accelerator_api::{
-    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator,
-    get_primary_keys_from_constraints,
+    AccelerationSource, BootstrapStatus, DataAccelerator, get_primary_keys_from_constraints,
 };
 use runtime_acceleration::Engine;
 use runtime_acceleration::OnSchemaChange;
@@ -258,6 +257,21 @@ pub enum Error {
         table_name: String,
         data_dir: String,
         source: std::io::Error,
+    },
+
+    /// The Cayenne metastore on disk was written by the Turso metastore. The metastore
+    /// is shared by every file-mode Cayenne dataset in the instance, so recovering means
+    /// rebuilding all of them.
+    #[snafu(display(
+        "Failed to load dataset '{dataset}' (cayenne): the Cayenne metastore '{metastore_path}' was written by the Turso metastore, which is no longer supported, so it cannot be opened. \
+        Stop Spice, remove `cayenne_metastore` from every dataset that sets it, delete the Cayenne metastore directory '{metadata_dir}', then start Spice to reload the datasets from their sources. \
+        Every Cayenne dataset that uses this metastore also reloads from its source. \
+        See: {CAYENNE_MIGRATION_DOCS}"
+    ))]
+    TursoMetastoreOnDisk {
+        dataset: Arc<str>,
+        metastore_path: String,
+        metadata_dir: String,
     },
 
     #[snafu(display(
@@ -901,6 +915,29 @@ fn auto_tuned_config_is_newly_resolved(table_name: &str, fingerprint: u64) -> bo
     true
 }
 
+/// The warning for a dataset that still sets `cayenne_metastore: turso` over a metastore
+/// Turso did not write. The param has no effect, so the dataset loads and the warning says
+/// to remove it.
+fn turso_metastore_param_warning(dataset: &str) -> String {
+    format!(
+        "Dataset '{dataset}' sets `cayenne_metastore: turso`, which is no longer supported and has no effect: \
+        the dataset uses the built-in metastore. Remove `cayenne_metastore` from this dataset. \
+        See: {CAYENNE_MIGRATION_DOCS}"
+    )
+}
+
+/// Whether the `cayenne_metastore: turso` warning for `dataset` has yet to be emitted: once
+/// per dataset, however often its load is retried or the Spicepod reloaded.
+fn turso_metastore_param_unreported(dataset: &str) -> bool {
+    static REPORTED: LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+    REPORTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(dataset.to_string())
+}
+
 /// The retired-parameter warnings for `table_name` that have not been emitted yet: once per
 /// table per retired key, however often the table is re-resolved by an init retry or a hot
 /// reload, and again for a key a reload newly adds.
@@ -1367,9 +1404,52 @@ fn rebuild_held(acceleration: Option<&Acceleration>) -> bool {
     })
 }
 
-/// The `SQLite`/Turso database a Cayenne metastore lives in, inside its metadata
+/// The `SQLite` database a Cayenne metastore lives in, inside its metadata
 /// directory. Every metastore connection string in this file ends in this name.
 const METASTORE_DB_FILE: &str = "cayenne.db";
+
+/// The `cayenne_metastore` value that selected the retired Turso metastore.
+const TURSO_METASTORE: &str = "turso";
+
+/// Where a user with a Turso-written Cayenne metastore learns how to move off it.
+const CAYENNE_MIGRATION_DOCS: &str =
+    "https://spiceai.org/docs/components/data-accelerators/cayenne/migration";
+
+/// Whether the metastore at `db_path` was written by the retired Turso metastore.
+///
+/// Turso's MVCC journal mode stamps `0xFF` into both file-format version bytes of the
+/// database header (offsets 18 and 19), where `SQLite` writes 1 (rollback journal) or
+/// 2 (WAL), and keeps its commit log beside the database in `cayenne.db-log`. Either
+/// one marks the catalog as Turso's.
+///
+/// `SQLite` refuses to open such a file ("file is not a database"), so this check is
+/// not what keeps the catalog from being misread. It turns that refusal into an error
+/// that says what to do, and it runs before anything opens or creates the database, so
+/// the Turso files are left exactly as they were.
+///
+/// A header that cannot be read is reported as not Turso: opening the database
+/// reports that failure itself.
+async fn is_turso_metastore(db_path: &Path) -> bool {
+    use tokio::io::AsyncReadExt;
+
+    const FILE_FORMAT_VERSION_OFFSET: usize = 18;
+    const MVCC_FILE_FORMAT_VERSION: [u8; 2] = [0xFF, 0xFF];
+
+    let mut log_path = db_path.as_os_str().to_owned();
+    log_path.push("-log");
+    if tokio::fs::try_exists(&log_path).await.unwrap_or(false) {
+        return true;
+    }
+
+    let Ok(mut file) = tokio::fs::File::open(db_path).await else {
+        return false;
+    };
+    let mut header = [0_u8; FILE_FORMAT_VERSION_OFFSET + MVCC_FILE_FORMAT_VERSION.len()];
+    if file.read_exact(&mut header).await.is_err() {
+        return false;
+    }
+    header[FILE_FORMAT_VERSION_OFFSET..] == MVCC_FILE_FORMAT_VERSION
+}
 
 /// True for the metastore database or one of the sidecars `SQLite` keeps beside it
 /// (`-wal`, `-shm`, `-journal`). Any of them means a catalog lives in this directory:
@@ -2843,16 +2923,64 @@ impl CayenneAccelerator {
         .map(Arc::clone)
     }
 
+    /// The shared file-mode catalog at `metadata_dir`. Callers with a source go through
+    /// [`Self::catalog_for_source`], which first refuses a retired Turso metastore.
     async fn get_or_create_catalog(
         &self,
         metadata_dir: &str,
-        metastore_type: &str,
     ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
-        let connection_string = match metastore_type {
-            "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
-            _ => format!("sqlite://{metadata_dir}/cayenne.db"), // Default to SQLite
-        };
-        Self::init_cayenne_catalog(&self.catalog, connection_string).await
+        Self::init_cayenne_catalog(
+            &self.catalog,
+            format!("sqlite://{metadata_dir}/{METASTORE_DB_FILE}"),
+        )
+        .await
+    }
+
+    /// The shared file-mode catalog for `source`, once [`Self::ensure_supported_metastore`]
+    /// has ruled out a retired Turso metastore.
+    async fn catalog_for_source(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
+        Self::ensure_supported_metastore(source).await?;
+        self.get_or_create_catalog(&Self::resolve_metadata_dir(source.acceleration()))
+            .await
+    }
+
+    /// Refuses a dataset whose metastore on disk the retired Turso metastore wrote, and
+    /// warns, once per dataset, about one that still sets `cayenne_metastore: turso`.
+    ///
+    /// A Turso catalog has to be deleted and every dataset in it reloaded, so it fails
+    /// the dataset before anything opens, creates, or changes a file. Otherwise the param
+    /// has no effect: the dataset runs on the `SQLite` metastore and loads, including in
+    /// `mode: memory`, which never had a Turso metastore to select.
+    async fn ensure_supported_metastore(source: &dyn AccelerationSource) -> Result<()> {
+        let acceleration = source.acceleration();
+        if source.is_file_accelerated() {
+            let metadata_dir = Self::resolve_metadata_dir(acceleration);
+            let metastore_path = Path::new(&metadata_dir).join(METASTORE_DB_FILE);
+            if is_turso_metastore(&metastore_path).await {
+                return TursoMetastoreOnDiskSnafu {
+                    dataset: Arc::from(source.name().to_string()),
+                    metastore_path: metastore_path.to_string_lossy().into_owned(),
+                    metadata_dir,
+                }
+                .fail();
+            }
+        }
+
+        let configured_turso = acceleration
+            .and_then(|acceleration| acceleration.params.get("cayenne_metastore"))
+            .is_some_and(|metastore| metastore.trim().eq_ignore_ascii_case(TURSO_METASTORE));
+        let dataset = source.name().to_string();
+        if configured_turso && turso_metastore_param_unreported(&dataset) {
+            tracing::warn!(
+                target: "spiced::acceleration::cayenne",
+                "{}",
+                turso_metastore_param_warning(&dataset)
+            );
+        }
+        Ok(())
     }
 
     /// Get or create the shared in-memory (`memdb`) catalog for `mode: memory`
@@ -2974,29 +3102,26 @@ impl CayenneAccelerator {
 
         tracing::debug!("create_cayenne_table_provider: starting for table {table_name}");
 
-        // Get metastore type and metadata directory
         let acceleration = source.acceleration();
         let metadata_dir = Self::resolve_metadata_dir(acceleration);
-        let metastore_type = acceleration
-            .and_then(|a| a.params.get("cayenne_metastore"))
-            .map_or("sqlite", String::as_str)
-            .to_string();
 
         // Memory mode (`mode: memory`): fully in-RAM — an in-memory `memdb`
         // metastore (nothing on disk) and no metadata directory. File mode creates
         // the metadata dir and uses the shared on-disk catalog as before.
         let memory_mode = !source.is_file_accelerated();
         let catalog = if memory_mode {
+            Self::ensure_supported_metastore(source).await?;
             self.get_or_create_memory_catalog().await?
         } else {
-            // Ensure metadata directory exists
+            // Refuse a Turso metastore before the directory is created, so a dataset
+            // that fails here leaves nothing behind.
+            Self::ensure_supported_metastore(source).await?;
             tokio::fs::create_dir_all(&metadata_dir)
                 .await
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?;
             // Get or create the shared catalog (lazy initialization)
-            self.get_or_create_catalog(&metadata_dir, &metastore_type)
-                .await?
+            self.get_or_create_catalog(&metadata_dir).await?
         };
 
         // Maintained aggregates hold for the primary key the table has once it opens: a
@@ -3525,7 +3650,10 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("metadata_dir")
             .description("Path for storing Cayenne metadata (SQLite catalog). If not specified, defaults to '{cayenne_file_path}/metadata'."),
         ParameterSpec::component("metastore")
-            .description("Metastore backend for Cayenne catalog. Options: 'sqlite' (default), 'turso' (requires 'turso' feature enabled at build time)")
+            .description("Metastore backend for the Cayenne catalog. 'sqlite' is the only supported value and the default. 'turso' is no longer supported and has no effect: a dataset that sets it loads on 'sqlite' and logs a warning to remove it.")
+            // 'turso' stays accepted here so a leftover value reaches the specific
+            // warning in `ensure_supported_metastore` rather than a generic
+            // invalid-value error.
             .one_of(&["sqlite", "turso"])
             .default("sqlite"),
         ParameterSpec::runtime("file_watcher"),
@@ -3835,16 +3963,9 @@ impl DataAccelerator for CayenneAccelerator {
     /// Creates the data directory if it doesn't exist
     /// Cayenne keeps its sidecar tables in the metastore database beside the dataset's
     /// Cayenne directory, not in the dataset's own store.
-    ///
-    /// When that metastore is Turso, the pool comes from the **Turso accelerator's**
-    /// path-keyed cache rather than one built here: `cayenne.db` is opened by every
-    /// sidecar of every Cayenne dataset in the pod, and the lock that serializes their
-    /// DDL against each other's `BEGIN CONCURRENT` writes lives on the pool instance —
-    /// a pool of our own would hold a lock no other sidecar observes.
     async fn sidecar(
         &self,
         source: &dyn AccelerationSource,
-        registry: Arc<AcceleratorEngineRegistry>,
         open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
         {
@@ -3857,8 +3978,16 @@ impl DataAccelerator for CayenneAccelerator {
                     source: Box::new(source),
                 })?;
 
+            // The sidecar opens `cayenne.db` itself, so it refuses a Turso metastore
+            // here as well as through the catalog.
+            Self::ensure_supported_metastore(source)
+                .await
+                .map_err(|source| CheckpointError::Store {
+                    source: Box::new(source),
+                })?;
+
             let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
-            let metadata_db_path = format!("{metadata_dir}/cayenne.db");
+            let metadata_db_path = format!("{metadata_dir}/{METASTORE_DB_FILE}");
 
             if open_option == OpenOption::OpenExisting && !path_exists(&metadata_db_path).await {
                 return Err(CheckpointError::Store {
@@ -3875,27 +4004,6 @@ impl DataAccelerator for CayenneAccelerator {
                         source: Box::new(source),
                     }
                 })?;
-            }
-
-            {
-                let metastore_type = source
-                    .acceleration()
-                    .and_then(|a| a.params.get("cayenne_metastore"))
-                    .map_or("sqlite", String::as_str);
-                if metastore_type == "turso" {
-                    let turso_engine = registry
-                        .get_accelerator_engine(Engine::Turso)
-                        .await
-                        .ok_or_else(|| CheckpointError::Store {
-                            source: "Turso accelerator engine not available".into(),
-                        })?;
-                    // Through the contract, not a downcast: the Turso engine owns the
-                    // path-keyed pool whose lock serializes this sidecar's DDL, and asking
-                    // it for the sidecar is what keeps this engine from naming that one.
-                    return turso_engine
-                        .sidecar_for_path(&metadata_db_path, &source.name().to_string())
-                        .await;
-                }
             }
 
             let sqlite_factory = SqliteTableProviderFactory::new();
@@ -3921,6 +4029,11 @@ impl DataAccelerator for CayenneAccelerator {
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // First, and in every mode: `init` follows this with a snapshot bootstrap and,
+        // for `mode: file_create`, a delete of the data directory, neither of which may
+        // run over a Turso metastore.
+        Self::ensure_supported_metastore(source).await?;
+
         if !source.is_file_accelerated() {
             return Ok(());
         }
@@ -4124,16 +4237,9 @@ impl DataAccelerator for CayenneAccelerator {
             // table leaves the per-partition children whose stale schemas this
             // rebuild exists to discard. Failing first leaves an acceleration
             // the operator can retry.
-            let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
-
-            let metastore_type = acceleration
-                .params
-                .get("cayenne_metastore")
-                .map_or("sqlite", String::as_str);
-
             let table_name = source.name().to_string();
             let catalog = self
-                .get_or_create_catalog(&metadata_dir, metastore_type)
+                .catalog_for_source(source)
                 .await
                 .boxed()
                 .context(AccelerationInitializationFailedSnafu)?;
@@ -4178,13 +4284,7 @@ impl DataAccelerator for CayenneAccelerator {
             );
             let refresh_mode = resolved_refresh_mode(source, acceleration);
 
-            let metastore_type = acceleration
-                .params
-                .get("cayenne_metastore")
-                .map_or("sqlite", String::as_str);
-            let catalog = self
-                .get_or_create_catalog(&metadata_dir.to_string_lossy(), metastore_type)
-                .await?;
+            let catalog = self.catalog_for_source(source).await?;
 
             if !snapshot_bootstrap_enabled(acceleration, source, refresh_mode) {
                 return Ok(BootstrapStatus::none());
@@ -4399,7 +4499,9 @@ impl DataAccelerator for CayenneAccelerator {
             // Get metadata catalog for partition tracking
             let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
 
-            // Ensure metadata directory exists
+            // Refuse a Turso metastore before the directory is created, so a dataset
+            // that fails here leaves nothing behind.
+            Self::ensure_supported_metastore(source).await?;
             tokio::fs::create_dir_all(&metadata_dir)
                 .await
                 .boxed()
@@ -4411,19 +4513,7 @@ impl DataAccelerator for CayenneAccelerator {
             // the MetadataCatalog API), while the concrete handle is needed by
             // `CayennePartitionedInsertStrategy` to open a shared
             // MetastoreTransaction across all partitions (issue #10125).
-            // Honor the configured `cayenne_metastore` backend (Turso uses the
-            // `libsql://` scheme) rather than hardcoding SQLite. The unpartitioned
-            // path (`get_or_create_catalog`) already selects the scheme from this
-            // param; without the same logic here, partitioned tables silently
-            // ignore `cayenne_metastore: turso` and fall back to SQLite.
-            let metastore_type = source
-                .acceleration()
-                .and_then(|a| a.params.get("cayenne_metastore"))
-                .map_or("sqlite", String::as_str);
-            let catalog_connection_string = match metastore_type {
-                "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
-                _ => format!("sqlite://{metadata_dir}/cayenne.db"),
-            };
+            let catalog_connection_string = format!("sqlite://{metadata_dir}/{METASTORE_DB_FILE}");
             let catalog_concrete: Arc<cayenne::CayenneCatalog> = Arc::new(
                 cayenne::CayenneCatalog::new(catalog_connection_string)
                     .boxed()
@@ -4614,6 +4704,7 @@ impl DataAccelerator for CayenneAccelerator {
                     | Error::UnsupportedDataTypes { .. }
                     | Error::PartitionByChanged { .. }
                     | Error::PartitionByChangeHeld { .. }
+                    | Error::TursoMetastoreOnDisk { .. }
             )
         ) || rejects_stored_table(error)
     }
@@ -4645,17 +4736,8 @@ impl DataAccelerator for CayenneAccelerator {
         &self,
         source: &dyn AccelerationSource,
     ) -> Option<Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>> {
-        let acceleration = source.acceleration()?;
-        let metadata_dir = PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
-        let metastore_type = acceleration
-            .params
-            .get("cayenne_metastore")
-            .map_or("sqlite", String::as_str)
-            .to_string();
-        let catalog = match self
-            .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
-            .await
-        {
+        source.acceleration()?;
+        let catalog = match self.catalog_for_source(source).await {
             Ok(catalog) => catalog,
             Err(err) => {
                 tracing::warn!(
@@ -4798,15 +4880,8 @@ impl DataAccelerator for CayenneAccelerator {
         let mut removed_dirs = vec![dir_path.clone()];
         let mut left_in_place = None;
         let mut stored_elsewhere = false;
-        if let Some(acceleration) = source.acceleration() {
-            let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
-            let metastore_type = acceleration
-                .params
-                .get("cayenne_metastore")
-                .map_or("sqlite", String::as_str);
-            let catalog = self
-                .get_or_create_catalog(&metadata_dir, metastore_type)
-                .await?;
+        if source.acceleration().is_some() {
+            let catalog = self.catalog_for_source(source).await?;
             // A failed lookup must not fall back to the configured directory: that is
             // where the dataset now puts its data, which may already hold files. Only a
             // table that is not there leaves the configured directory to clear.
@@ -4916,14 +4991,7 @@ impl DataAccelerator for CayenneAccelerator {
             }));
         }
 
-        let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
-        let metastore_type = acceleration
-            .params
-            .get("cayenne_metastore")
-            .map_or("sqlite", String::as_str);
-        let catalog = self
-            .get_or_create_catalog(&metadata_dir, metastore_type)
-            .await?;
+        let catalog = self.catalog_for_source(source).await?;
         let table = catalog.get_table(table_name).await.boxed()?;
 
         // The metastore stores the Vortex-transformed schema (unsupported
@@ -5805,6 +5873,89 @@ mod tests {
     }
 
     #[test]
+    fn turso_metastore_messages_name_the_dataset_the_fix_and_the_docs() {
+        assert_eq!(
+            turso_metastore_param_warning("orders"),
+            "Dataset 'orders' sets `cayenne_metastore: turso`, which is no longer supported and has no effect: \
+             the dataset uses the built-in metastore. Remove `cayenne_metastore` from this dataset. \
+             See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration"
+        );
+        // Once per dataset: an init retry or a reload that keeps the param stays quiet.
+        assert!(turso_metastore_param_unreported("turso_param_dedupe"));
+        assert!(!turso_metastore_param_unreported("turso_param_dedupe"));
+        assert!(turso_metastore_param_unreported("turso_param_dedupe_other"));
+
+        let on_disk = Error::TursoMetastoreOnDisk {
+            dataset: Arc::from("orders"),
+            metastore_path: "/data/metadata/cayenne.db".to_string(),
+            metadata_dir: "/data/metadata".to_string(),
+        }
+        .to_string();
+        assert_eq!(
+            on_disk,
+            "Failed to load dataset 'orders' (cayenne): the Cayenne metastore '/data/metadata/cayenne.db' was written by the Turso metastore, which is no longer supported, so it cannot be opened. \
+             Stop Spice, remove `cayenne_metastore` from every dataset that sets it, delete the Cayenne metastore directory '/data/metadata', then start Spice to reload the datasets from their sources. \
+             Every Cayenne dataset that uses this metastore also reloads from its source. \
+             See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration"
+        );
+    }
+
+    /// The detection reads only the header and the `-log` sidecar. A real Turso
+    /// catalog is exercised end to end; these pin the byte-level rule against a
+    /// database `SQLite` itself wrote, which must never read as Turso.
+    #[tokio::test]
+    async fn turso_metastore_detection_reads_the_header_and_the_mvcc_log() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let missing = dir.path().join("missing").join(METASTORE_DB_FILE);
+        assert!(
+            !is_turso_metastore(&missing).await,
+            "no metastore is not Turso"
+        );
+
+        let sqlite = dir.path().join("sqlite").join(METASTORE_DB_FILE);
+        std::fs::create_dir_all(sqlite.parent().expect("parent")).expect("sqlite dir");
+        {
+            let conn = rusqlite::Connection::open(&sqlite).expect("open sqlite");
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .expect("wal mode");
+            conn.execute("CREATE TABLE t (a INTEGER)", [])
+                .expect("create table");
+        }
+        assert!(
+            !is_turso_metastore(&sqlite).await,
+            "a WAL-mode SQLite metastore is not Turso"
+        );
+
+        let mvcc = dir.path().join("mvcc").join(METASTORE_DB_FILE);
+        std::fs::create_dir_all(mvcc.parent().expect("parent")).expect("mvcc dir");
+        let mut header = std::fs::read(&sqlite).expect("read sqlite header");
+        header[18] = 0xFF;
+        header[19] = 0xFF;
+        std::fs::write(&mvcc, &header).expect("write mvcc header");
+        assert!(
+            is_turso_metastore(&mvcc).await,
+            "0xFF file-format versions are Turso's MVCC journal mode"
+        );
+
+        let log_only = dir.path().join("log").join(METASTORE_DB_FILE);
+        std::fs::create_dir_all(log_only.parent().expect("parent")).expect("log dir");
+        std::fs::write(log_only.with_file_name("cayenne.db-log"), b"").expect("write log");
+        assert!(
+            is_turso_metastore(&log_only).await,
+            "a Turso MVCC log beside the database marks the catalog as Turso's"
+        );
+
+        let short = dir.path().join("short").join(METASTORE_DB_FILE);
+        std::fs::create_dir_all(short.parent().expect("parent")).expect("short dir");
+        std::fs::write(&short, b"SQLite").expect("write short file");
+        assert!(
+            !is_turso_metastore(&short).await,
+            "a truncated header is left for SQLite to report"
+        );
+    }
+
+    #[test]
     fn native_vector_indexes_skips_non_vector_schemas() {
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -6457,7 +6608,7 @@ mod tests {
         );
     }
 
-    /// Object-store data paths cannot contain the metastore — `SQLite`/Turso only run
+    /// Object-store data paths cannot contain the metastore — `SQLite` only runs
     /// on a local filesystem — so the guard must not reject an S3 configuration.
     #[tokio::test]
     async fn overlap_never_fires_for_an_object_store_data_path() {
@@ -6553,7 +6704,7 @@ mod tests {
         std::fs::create_dir_all(&snapshots_dir).expect("snapshot directory");
         let accelerator = CayenneAccelerator::new();
         let catalog = accelerator
-            .get_or_create_catalog(&metadata_dir.to_string_lossy(), "sqlite")
+            .get_or_create_catalog(&metadata_dir.to_string_lossy())
             .await
             .expect("shared catalog");
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));

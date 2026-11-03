@@ -36,6 +36,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
 - [ ] Communicate the feature freeze date to contributors.
 - [ ] **Patch Release (vX.Y.Z)**: Verify no backward-incompatible changes and cherry-pick relevant commits.
 - [ ] **Minor Release (vX.Y)**: Plan to merge `trunk` into the release branch.
+- [ ] **Minor Release (vX.Y)**: Review and update [threat model](https://github.com/spiceai/spiceai/tree/trunk/docs/threat_models).
 
 ## Release Branch Creation
 
@@ -275,7 +276,7 @@ Testing focus DRIs are responsible for:
 - [ ] If this is a **minor** release, update the scheduled benchmark job `dispatch-scheduled` in [`testoperator_dispatch.yml`](https://github.com/spiceai/spiceai/blob/trunk/.github/workflows/testoperator_dispatch.yml) to use the new release branch.
 - [ ] Update [brew taps](https://github.com/spiceai/homebrew-spiceai/actions/workflows/update-formula.yml) after the final build completes.
 - [ ] Remove or mark the released version in the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md).
-- [ ] Update the supported version in `SECURITY.md` if necessary.
+- [ ] Update `SECURITY.md`: the latest open-source release, and the versions Spice.ai Enterprise currently supports (pre-release, latest, previous minor release line, LTS).
 - [ ] Confirm docs/install refs for Skills point at the matching release (or trunk if intentional).
 
 ## Announcement Checklist

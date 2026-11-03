@@ -465,7 +465,6 @@ mod tests {
             Engine::PartitionedArrow,
             Engine::DuckDB,
             Engine::Sqlite,
-            Engine::Turso,
             Engine::PostgreSQL,
         ] {
             assert!(

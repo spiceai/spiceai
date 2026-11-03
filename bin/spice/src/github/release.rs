@@ -289,6 +289,9 @@ fn format_size(bytes: u64) -> String {
 
 pub struct Arch(pub String);
 
+/// The runtime asset prefix. There is no Windows runtime asset.
+const RUNTIME_ASSET_PREFIX: &str = "spiced";
+
 pub enum SystemType {
     Linux(Arch),
     Darwin(Arch),
@@ -335,14 +338,6 @@ impl SystemType {
         }
     }
 
-    /// Get the runtime asset prefix for the current platform.
-    fn runtime_asset_prefix(&self) -> &str {
-        match self {
-            SystemType::Windows(_) => "spiced.exe",
-            _ => "spiced",
-        }
-    }
-
     /// Get the runtime asset names for the current platform.
     ///
     /// Returns a list of possible asset names to try, in order of preference.
@@ -354,8 +349,14 @@ impl SystemType {
     /// # Arguments
     /// * `flavor` - The flavor to install: "default" (auto-detect), or "cuda" (explicit CUDA)
     /// * `target_version` - The release tag (e.g. "v2.0.0-rc.1") to determine naming strategy
+    ///
+    /// Empty on Windows: no release publishes a native Windows runtime, which runs
+    /// under WSL or in Docker instead.
     pub fn runtime_asset_names(&self, flavor: &str, target_version: &str) -> Vec<String> {
         let mut names = Vec::new();
+        if matches!(self, SystemType::Windows(_)) {
+            return names;
+        }
 
         // Determine the accelerator based on flavor
         let accelerator = match flavor {
@@ -381,7 +382,7 @@ impl SystemType {
             // New naming (v1.11+/trunk): accelerator without "models_" prefix
             names.push(format!(
                 "{prefix}_{accel}_{os}_{arch}.tar.gz",
-                prefix = self.runtime_asset_prefix(),
+                prefix = RUNTIME_ASSET_PREFIX,
                 os = self.os_type_name(),
                 arch = self.arch()
             ));
@@ -391,7 +392,7 @@ impl SystemType {
             if !is_v2_or_later(target_version) {
                 names.push(format!(
                     "{prefix}_models_{accel}_{os}_{arch}.tar.gz",
-                    prefix = self.runtime_asset_prefix(),
+                    prefix = RUNTIME_ASSET_PREFIX,
                     os = self.os_type_name(),
                     arch = self.arch()
                 ));
@@ -401,7 +402,7 @@ impl SystemType {
         // Fallback: base runtime without accelerator
         names.push(format!(
             "{prefix}_{os}_{arch}.tar.gz",
-            prefix = self.runtime_asset_prefix(),
+            prefix = RUNTIME_ASSET_PREFIX,
             os = self.os_type_name(),
             arch = self.arch()
         ));
@@ -730,27 +731,12 @@ mod tests {
     // default flavor on x86 - auto-detects accelerator, but in tests no accelerator is present
     #[case(SystemType::linux_x86(), "default", "spiced_linux_x86_64.tar.gz")]
     #[case(SystemType::darwin_x86(), "default", "spiced_darwin_x86_64.tar.gz")]
-    #[case(
-        SystemType::windows_x86(),
-        "default",
-        "spiced.exe_windows_x86_64.tar.gz"
-    )]
     // default flavor on arm
     #[case(SystemType::linux_arm(), "default", "spiced_linux_aarch64.tar.gz")]
     #[case(SystemType::darwin_arm(), "default", "spiced_darwin_aarch64.tar.gz")]
-    #[case(
-        SystemType::windows_arm(),
-        "default",
-        "spiced.exe_windows_aarch64.tar.gz"
-    )]
     // unknown flavor falls back to default behavior
     #[case(SystemType::linux_x86(), "unknown", "spiced_linux_x86_64.tar.gz")]
     #[case(SystemType::darwin_x86(), "unknown", "spiced_darwin_x86_64.tar.gz")]
-    #[case(
-        SystemType::windows_x86(),
-        "unknown",
-        "spiced.exe_windows_x86_64.tar.gz"
-    )]
     fn test_runtime_asset_names(
         #[case] os_type: SystemType,
         #[case] flavor: &str,
@@ -760,6 +746,17 @@ mod tests {
         let names = os_type.runtime_asset_names(flavor, "v1.0.0");
         // The last entry should always be the fallback base name
         assert!(names.last().is_some_and(|n| n == expected));
+    }
+
+    #[rstest]
+    #[case(SystemType::windows_x86(), "default")]
+    #[case(SystemType::windows_arm(), "default")]
+    #[case(SystemType::windows_x86(), "cuda")]
+    fn windows_has_no_runtime_asset(#[case] os_type: SystemType, #[case] flavor: &str) {
+        assert_eq!(
+            os_type.runtime_asset_names(flavor, "v2.0.0"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

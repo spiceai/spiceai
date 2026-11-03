@@ -1,0 +1,103 @@
+name: snapshots-reader-removed-engine
+description: >
+  A `file_format: snapshot` dataset whose snapshots a release published with
+  the `turso` engine fails to load on a build that no longer has it, with the
+  fix and the migration guide in its status and one error line, while the rest
+  of the Spicepod serves. Spice never rebuilds those snapshots into another
+  engine on its own.
+
+# No OSS release can publish snapshots (it has only the `release` and `models`
+# features), so run this with `--from` a build from before Turso's removal that
+# has `postgres`, `snapshots` and `turso`, as this directory's README shows.
+from: 2.4.x
+
+sources:
+  src: { kind: postgres }
+  lake: { kind: rustfs }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: snapshots-reader-removed-engine
+  runtime:
+    state:
+      location: s3://${sources.lake.shared_bucket}/state/
+      params:
+        s3_endpoint: ${sources.lake.endpoint}
+        s3_region: us-east-1
+        s3_auth: key
+        s3_key: ${sources.lake.key}
+        s3_secret: ${sources.lake.secret}
+        allow_http: 'true'
+  datasets:
+    - { from: 'postgres:public.t', name: healthy, params: '${sources.src.params}' }
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: turso
+        mode: file
+        refresh_mode: full
+        refresh_check_interval: 1h
+        snapshots: create_only
+        primary_key: id
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text);
+        INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 1000) i;
+
+  # The release accelerates `t` with Turso and publishes its snapshot.
+  - start: {}
+  - query: SELECT * FROM t
+    expect: { oracle: src }
+  - assert-log: { contains: 'Snapshot created dataset=t\b' }
+    eventually: 30s
+  - stop: {}
+
+  # The build under test reads those snapshots, with no source and no engine
+  # named: a snapshot dataset takes its engine from the snapshots.
+  - upgrade:
+      ready: false
+      patch:
+        spicepod:
+          runtime: { state: null }
+          datasets:
+            - { from: 'postgres:public.t', name: healthy, params: '${sources.src.params}' }
+            - from: s3://${sources.lake.shared_bucket}/state/snapshots/
+              name: t
+              params:
+                file_format: snapshot
+                s3_endpoint: ${sources.lake.endpoint}
+                s3_region: us-east-1
+                s3_auth: key
+                s3_key: ${sources.lake.key}
+                s3_secret: ${sources.lake.secret}
+                allow_http: 'true'
+              acceleration:
+                refresh_check_interval: 1s
+  - query: SELECT count(*) AS n FROM healthy
+    expect: { rows: [['1000']] }
+    eventually: 30s
+  # Neither `message-contains` nor a log pattern takes placeholders, so the
+  # status is checked in two parts around the bucket name.
+  - assert-status:
+      dataset: t
+      status: Error
+      message-contains: "Failed to load dataset 't' from its snapshots, so it cannot be queried: the snapshots at 's3://"
+    eventually: 30s
+  - assert-status:
+      dataset: t
+      status: Error
+      message-contains: "/state/snapshots/' were created with the 'turso' engine, and the acceleration engine `turso` is no longer supported as of v2.5 and cannot be used. Set `acceleration.engine: cayenne`, or remove `engine` to use the default, which is `cayenne`, then delete the old engine's acceleration files and snapshots. See: https://spiceai.org/docs/components/data-accelerators/cayenne/migration"
+    eventually: 30s
+  - query: SELECT * FROM t
+    expect-error: "table 'spice.public.t' not found"
+  # The refusal is permanent: one error line, not a retry loop, and not the
+  # advice for an engine a different build could load.
+  - assert-log:
+      count:
+        "ERROR .*Failed to load dataset 't' from its snapshots, so it cannot be queried: the snapshots at 's3://[^/']+/state/snapshots/' were created with the 'turso' engine, and the acceleration engine `turso` is no longer supported as of v2.5 .*cayenne/migration$": 1
+      lacks: ["a build that includes 'turso'", "loads the turso snapshots"]

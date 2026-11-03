@@ -2995,8 +2995,7 @@ mod served_from_acceleration {
 }
 
 /// `append` datasets with a `time_column` and acceleration snapshots enabled.
-// Cayenne does not build on Windows.
-#[cfg(all(feature = "snapshots", not(windows)))]
+#[cfg(feature = "snapshots")]
 mod served_with_snapshots_enabled {
     use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 

@@ -44,7 +44,7 @@ pub trait TypeRewriteRule: std::fmt::Debug + Send + Sync {
 
 /// Rewrites `DataType::Dictionary(_, value_type)` → `value_type` (recursively).
 ///
-/// Used by accelerators (`DuckDB`, `SQLite`, Turso) that do not support Arrow Dictionary encoding.
+/// Used by accelerators (`DuckDB`, `SQLite`) that do not support Arrow Dictionary encoding.
 #[derive(Debug)]
 pub struct DictionaryUnwrap;
 impl TypeRewriteRule for DictionaryUnwrap {

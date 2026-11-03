@@ -172,7 +172,17 @@ pub(crate) async fn post(
                                 }
                                 tracing::info!(target: "task_history", parent: &span_clone,  id = %response.id, "labels");
 
-                            Json(response).into_response()
+                            match llms::chat::wire::chat_completion_json(&response) {
+                                Ok(response) => Json(response).into_response(),
+                                Err(e) => {
+                                    tracing::error!("Failed to serialize chat completion: {e}");
+                                    (
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        format!("Failed to serialize the chat completion: {e}"),
+                                    )
+                                        .into_response()
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::error!(target: "task_history", parent: &span_clone, "{e}");
@@ -336,10 +346,17 @@ fn create_sse_response(
                             chat_output.push_str(intermediate_chat_output);
                         }
 
-                    yield Ok::<Event, Infallible>(Event::default().json_data(resp).unwrap_or_else(|e| {
-                        tracing::error!("Failed to serialize chat completion message: {e}");
-                        to_openai_error_event(e.to_string())
-                    }));
+                    let event = match llms::chat::wire::stream_chunk_json(&resp) {
+                        Ok(chunk) => Event::default().json_data(chunk).unwrap_or_else(|e| {
+                            tracing::error!("Failed to serialize chat completion message: {e}");
+                            to_openai_error_event(e.to_string())
+                        }),
+                        Err(e) => {
+                            tracing::error!("Failed to serialize chat completion message: {e}");
+                            to_openai_error_event(e.to_string())
+                        }
+                    };
+                    yield Ok::<Event, Infallible>(event);
                 },
                 Err(e) => {
                     tracing::error!("Error encountered in chat completion stream: {e}");
@@ -409,6 +426,20 @@ fn evaluate_only_chat_response(model_id: &str) -> Response {
     }))
 }
 
+/// The HTTP status an `OpenAI` API error answers with.
+#[must_use]
+pub(crate) fn api_error_status(api_error: &async_openai::error::ApiError) -> StatusCode {
+    match ApiErrorKind::of(api_error) {
+        Some(ApiErrorKind::InvalidRequest) => StatusCode::BAD_REQUEST,
+        Some(ApiErrorKind::Authentication) => StatusCode::UNAUTHORIZED,
+        Some(ApiErrorKind::PermissionDenied) => StatusCode::FORBIDDEN,
+        Some(ApiErrorKind::NotFound) => StatusCode::NOT_FOUND,
+        Some(ApiErrorKind::InsufficientQuota) => StatusCode::PAYMENT_REQUIRED,
+        Some(ApiErrorKind::RateLimited) => StatusCode::TOO_MANY_REQUESTS,
+        None => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 /// Converts `OpenAI` errors to HTTP responses
 /// Preserve the original `OpenAI` error structure to maintain compatibility with `OpenAI` documentation
 #[must_use]
@@ -423,15 +454,7 @@ pub fn openai_error_to_response(e: OpenAIError) -> Response {
                 "code": api_error.code
             });
 
-            let status_code = match ApiErrorKind::of(&api_error) {
-                Some(ApiErrorKind::InvalidRequest) => StatusCode::BAD_REQUEST,
-                Some(ApiErrorKind::Authentication) => StatusCode::UNAUTHORIZED,
-                Some(ApiErrorKind::PermissionDenied) => StatusCode::FORBIDDEN,
-                Some(ApiErrorKind::NotFound) => StatusCode::NOT_FOUND,
-                Some(ApiErrorKind::InsufficientQuota) => StatusCode::PAYMENT_REQUIRED,
-                Some(ApiErrorKind::RateLimited) => StatusCode::TOO_MANY_REQUESTS,
-                None => StatusCode::INTERNAL_SERVER_ERROR,
-            };
+            let status_code = api_error_status(&api_error);
 
             (status_code, Json(error_response)).into_response()
         }

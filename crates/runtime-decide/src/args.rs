@@ -23,14 +23,38 @@ limitations under the License.
 //! named literal keeps its parameter name in `spice.parameter_name` field metadata,
 //! which is what tells the two apart. The planner rule and the function both read
 //! arguments through [`positions`], so neither has to guess.
+//!
+//! A required constant may also be any expression with one value for the whole query,
+//! such as an uncorrelated scalar subquery. `DataFusion` computes it once when the
+//! query runs, so it is a [`ConstArg::Deferred`] while the query is planned, and the
+//! function checks it by the same rules when it runs:
+//!
+//! ```text
+//! ai_classify(body, <labels>)
+//!                      |
+//!       +--------------+----------------------+
+//!       |                                     |
+//!  ['a', 'b']                      (SELECT team FROM teams)
+//!       |                                     |
+//!  ConstArg::Known                  ConstArg::Deferred
+//!  checked while planning           checked when the function runs
+//! ```
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use arrow::array::{Array, AsArray};
-use datafusion::common::{DataFusionError, Result, ScalarValue, plan_datafusion_err, plan_err};
-use datafusion::logical_expr::{ColumnarValue, Expr, ScalarFunctionArgs};
+use arrow::datatypes::DataType;
+use datafusion::common::tree_node::TreeNode;
+use datafusion::common::{
+    Column, DataFusionError, Result, ScalarValue, plan_datafusion_err, plan_err,
+};
+use datafusion::functions_aggregate::expr_fn::array_agg;
+use datafusion::logical_expr::{
+    ColumnarValue, Expr, ExprFunctionExt, LogicalPlanBuilder, ScalarFunctionArgs,
+};
 use evaluate_api::{EntryType, NonNullEntry, NullableEntry, Question};
 use serde::Deserialize;
 use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
@@ -56,6 +80,61 @@ const MAX_CHOICE_OPTIONS: usize = 255;
 pub(crate) struct Layout {
     pub params: &'static [&'static str],
     pub required: usize,
+}
+
+impl Layout {
+    /// When the constant in `position` must be known. Required parameters come first and
+    /// a call cannot skip them, so an argument in a required position fills that
+    /// parameter whatever expression it is.
+    pub(crate) fn resolution(&self, position: usize) -> Resolution {
+        match self.params.get(position) {
+            Some(&"questions") => Resolution::Literal(LiteralOnly::ResultType),
+            _ if position < self.required => Resolution::PerQuery,
+            _ => Resolution::Literal(LiteralOnly::Optional),
+        }
+    }
+}
+
+/// When the value of a constant parameter must be known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Resolution {
+    /// A literal is read while the query is planned. Any other expression with one value
+    /// for the whole query, such as an uncorrelated scalar subquery, is read when the
+    /// function runs. The same rules check both.
+    PerQuery,
+    /// Only a literal is accepted.
+    Literal(LiteralOnly),
+}
+
+/// Why a parameter accepts only a literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiteralOnly {
+    /// It sets the type of the result (`ai_decide`'s `questions`), which `DataFusion`
+    /// needs while it plans the query.
+    ResultType,
+    /// It is optional. `DataFusion` drops the optional parameters a call skips, and only
+    /// a literal keeps the name it was passed by, so for any other expression the
+    /// parameter it fills is not certain.
+    Optional,
+}
+
+/// A constant argument of a decision call.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ConstArg {
+    /// A literal, checked and normalized while the query is planned. `None` for NULL or
+    /// an omitted optional argument.
+    Known(Option<String>),
+    /// An expression with one value for the whole query, such as an uncorrelated scalar
+    /// subquery. Its value is known, and checked, only when the function runs.
+    Deferred(Expr),
+}
+
+/// How a constant argument is written.
+enum Written<'a> {
+    /// A literal, or a list of literals: its text, `None` for NULL.
+    Literal(Option<String>),
+    /// Any other expression.
+    Expression(&'a Expr),
 }
 
 /// What happens to a row the model cannot answer.
@@ -149,7 +228,8 @@ fn literal_parameter_name(expr: &Expr) -> Option<String> {
     }
 }
 
-/// A call's arguments in every position, with constants normalized.
+/// A call's arguments in every position, with literal constants normalized and
+/// deferred ones in the form the function reads them.
 ///
 /// Returns `None` when `args` is already in that form, so the rule can report that it
 /// changed nothing.
@@ -157,26 +237,27 @@ pub(crate) fn canonical_args(kind: Kind, args: &[Expr]) -> Result<Option<Vec<Exp
     let layout = kind.layout();
     let names: Vec<Option<String>> = args.iter().map(literal_parameter_name).collect();
     let positions = positions(kind, &names)?;
-    let mut slots: Vec<Option<&Expr>> = vec![None; layout.params.len()];
-    for (arg, position) in args.iter().zip(positions) {
-        slots[position] = Some(arg);
+    let mut slots: Vec<Option<(usize, &Expr)>> = vec![None; layout.params.len()];
+    for (index, (arg, position)) in args.iter().zip(positions).enumerate() {
+        slots[position] = Some((index, arg));
     }
 
     let mut canonical = Vec::with_capacity(slots.len());
     for (position, slot) in slots.into_iter().enumerate() {
-        let param = layout.params[position];
         let value = if position == 0 {
             // The input is per row; it is used as written.
             match slot {
-                Some(expr) => expr.clone(),
+                Some((_, expr)) => expr.clone(),
                 None => return plan_err!("{}: missing `input`", kind.name()),
             }
         } else {
-            let text = match slot {
-                Some(expr) => expr_constant(kind, param, expr)?,
-                None => None,
-            };
-            string_literal(normalize_constant(kind, param, text)?)
+            match slot {
+                Some((index, expr)) => match const_arg(kind, position, index, expr)? {
+                    ConstArg::Known(text) => string_literal(text),
+                    ConstArg::Deferred(expr) => expr,
+                },
+                None => string_literal(normalize_constant(kind, layout.params[position], None)?),
+            }
         };
         canonical.push(value);
     }
@@ -192,44 +273,113 @@ fn string_literal(value: Option<String>) -> Expr {
     Expr::Literal(ScalarValue::Utf8(value), None)
 }
 
-/// The text of a constant argument: a string, or — for `labels` and `levels` — a list
-/// of strings, given as its JSON. `None` for NULL.
-fn expr_constant(kind: Kind, param: &str, expr: &Expr) -> Result<Option<String>> {
+/// Reads `expr`, passed as argument `index`, as the constant in `position`.
+fn const_arg(kind: Kind, position: usize, index: usize, expr: &Expr) -> Result<ConstArg> {
+    let layout = kind.layout();
+    let param = layout.params[position];
+    match written(kind, param, expr)? {
+        Written::Literal(text) => normalize_constant(kind, param, text).map(ConstArg::Known),
+        Written::Expression(expr) => match layout.resolution(position) {
+            Resolution::PerQuery if is_query_constant(expr) => {
+                per_query_value(param, expr).map(ConstArg::Deferred)
+            }
+            Resolution::PerQuery => Err(varies_by_row(kind, param)),
+            Resolution::Literal(reason) => Err(literal_only(kind, param, index, reason)),
+        },
+    }
+}
+
+/// The text of a literal constant: a string, or — for `labels` and `levels` — a list of
+/// strings, given as its JSON.
+fn written<'a>(kind: Kind, param: &str, expr: &'a Expr) -> Result<Written<'a>> {
     match expr {
-        Expr::Literal(scalar, _) => scalar_constant(kind, param, scalar),
+        Expr::Literal(scalar, _) => scalar_constant(kind, param, scalar).map(Written::Literal),
         // `['a', 'b']` is planned as `make_array('a', 'b')` until constants are folded.
         Expr::ScalarFunction(function)
             if function.func.name() == "make_array" && is_list_param(param) =>
         {
             let mut items = Vec::with_capacity(function.args.len());
             for item in &function.args {
-                match expr_constant(kind, param, item)? {
+                let Expr::Literal(scalar, _) = item else {
+                    return Ok(Written::Expression(expr));
+                };
+                match scalar_constant(kind, param, scalar)? {
                     Some(text) => items.push(Value::String(text)),
-                    None => {
-                        return plan_err!(
-                            "{}: `{param}` cannot contain NULL. Usage: {}",
-                            kind.name(),
-                            kind.usage()
-                        );
-                    }
+                    None => return Err(contains_null(kind, param)),
                 }
             }
-            Ok(Some(Value::Array(items).to_string()))
+            Ok(Written::Literal(Some(Value::Array(items).to_string())))
         }
-        _ => not_constant(kind, param),
+        _ => Ok(Written::Expression(expr)),
     }
+}
+
+/// Whether `expr` has one value for the whole query: it reads no column, calls no
+/// volatile or async function, and every subquery in it is uncorrelated.
+pub(crate) fn is_query_constant(expr: &Expr) -> bool {
+    let varies = expr.exists(|e| {
+        Ok(match e {
+            Expr::Literal(..)
+            | Expr::Alias(_)
+            | Expr::Cast(_)
+            | Expr::TryCast(_)
+            | Expr::BinaryExpr(_)
+            | Expr::Case(_)
+            | Expr::Not(_)
+            | Expr::Negative(_)
+            | Expr::IsNull(_)
+            | Expr::IsNotNull(_) => false,
+            Expr::ScalarSubquery(subquery) => !subquery.outer_ref_columns.is_empty(),
+            Expr::ScalarFunction(function) => {
+                e.is_volatile_node() || function.func.as_async().is_some()
+            }
+            _ => true,
+        })
+    });
+    matches!(varies, Ok(false))
+}
+
+/// A deferred constant in the form the function reads it. A subquery for `labels` that
+/// returns one label per row (`SELECT DISTINCT team FROM teams`) is collected into one
+/// sorted list, since a scalar subquery must return at most one row. `levels` are
+/// ordered, and a subquery does not keep the order of its rows, so a subquery for
+/// `levels` must return one list itself, such as `array_agg(level ORDER BY rank)`.
+fn per_query_value(param: &str, expr: &Expr) -> Result<Expr> {
+    let Expr::ScalarSubquery(subquery) = expr else {
+        return Ok(expr.clone());
+    };
+    let schema = subquery.subquery.schema();
+    if param != "labels" || schema.fields().len() != 1 || is_list(schema.field(0).data_type()) {
+        return Ok(expr.clone());
+    }
+    let rows = Expr::Column(Column::from(schema.qualified_field(0)));
+    let collected = array_agg(rows.clone())
+        .order_by(vec![rows.sort(true, false)])
+        .build()?;
+    let plan = LogicalPlanBuilder::new_from_arc(Arc::clone(&subquery.subquery))
+        .aggregate(Vec::<Expr>::new(), vec![collected])?
+        .build()?;
+    Ok(Expr::ScalarSubquery(subquery.with_plan(Arc::new(plan))))
+}
+
+fn is_list(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::ListView(_)
+            | DataType::LargeListView(_)
+    )
 }
 
 fn is_list_param(param: &str) -> bool {
     matches!(param, "labels" | "levels")
 }
 
-fn not_constant<T>(kind: Kind, param: &str) -> Result<T> {
-    Err(not_constant_error(kind, param))
-}
-
-fn not_constant_error(kind: Kind, param: &str) -> DataFusionError {
-    let example = match param {
+/// A literal that fits `param`, for its error messages.
+fn example(param: &str) -> &'static str {
+    match param {
         "labels" => " such as ['billing', 'technical']",
         "levels" => " such as ['low', 'medium', 'high']",
         "questions" => {
@@ -237,15 +387,62 @@ fn not_constant_error(kind: Kind, param: &str) -> DataFusionError {
         }
         "on_error" => " ('fail' or 'null')",
         _ => " string",
+    }
+}
+
+/// A per-query parameter got an expression that can change from row to row.
+fn varies_by_row(kind: Kind, param: &str) -> DataFusionError {
+    plan_datafusion_err!(
+        "{}: `{param}` must have one value for the whole query: a literal{}, or a subquery that does not refer to the outer query. This argument can change from row to row, because it reads a column or refers to the outer query. Usage: {}",
+        kind.name(),
+        example(param),
+        kind.usage()
+    )
+}
+
+/// A literal-only parameter got another expression.
+fn literal_only(kind: Kind, param: &str, index: usize, reason: LiteralOnly) -> DataFusionError {
+    match reason {
+        LiteralOnly::ResultType => plan_datafusion_err!(
+            "{}: `{param}` must be a literal{}, because it sets the type of the result. Usage: {}",
+            kind.name(),
+            example(param),
+            kind.usage()
+        ),
+        LiteralOnly::Optional => plan_datafusion_err!(
+            "{}: argument {} is not a literal. Optional arguments such as `model` and `on_error` must be literals, because only for a literal can Spice tell which parameter it fills. Usage: {}",
+            kind.name(),
+            index + 1,
+            kind.usage()
+        ),
+    }
+}
+
+/// A constant has a value of the wrong type.
+fn wrong_type(kind: Kind, param: &str, found: impl fmt::Display) -> DataFusionError {
+    let expected = match param {
+        "labels" => "a list of strings, or a string that holds a JSON list or object",
+        "levels" => "a list of strings, or a string that holds a JSON list",
+        "questions" => "a string that holds a JSON object",
+        _ => "a string",
     };
     plan_datafusion_err!(
-        "{}: `{param}` must be a constant{example}; it cannot vary by row. Usage: {}",
+        "{}: `{param}` must be {expected}, not {found}. Usage: {}",
         kind.name(),
         kind.usage()
     )
 }
 
-/// The text of a constant scalar, as [`expr_constant`] describes.
+fn contains_null(kind: Kind, param: &str) -> DataFusionError {
+    plan_datafusion_err!(
+        "{}: `{param}` cannot contain NULL. Usage: {}",
+        kind.name(),
+        kind.usage()
+    )
+}
+
+/// The text of a constant value: a string, or — for `labels` and `levels` — a list of
+/// strings, given as its JSON. `None` for NULL.
 fn scalar_constant(kind: Kind, param: &str, scalar: &ScalarValue) -> Result<Option<String>> {
     if scalar.is_null() {
         return Ok(None);
@@ -254,6 +451,7 @@ fn scalar_constant(kind: Kind, param: &str, scalar: &ScalarValue) -> Result<Opti
         ScalarValue::Utf8(Some(text))
         | ScalarValue::LargeUtf8(Some(text))
         | ScalarValue::Utf8View(Some(text)) => Ok(Some(text.clone())),
+        ScalarValue::Dictionary(_, value) => scalar_constant(kind, param, value),
         ScalarValue::List(list) if is_list_param(param) => {
             list_constant(kind, param, &list.value(0))
         }
@@ -263,7 +461,7 @@ fn scalar_constant(kind: Kind, param: &str, scalar: &ScalarValue) -> Result<Opti
         ScalarValue::FixedSizeList(list) if is_list_param(param) => {
             list_constant(kind, param, &list.value(0))
         }
-        _ => not_constant(kind, param),
+        other => Err(wrong_type(kind, param, other.data_type())),
     }
 }
 
@@ -272,20 +470,14 @@ fn list_constant(
     param: &str,
     values: &arrow::array::ArrayRef,
 ) -> Result<Option<String>> {
-    let values = arrow::compute::cast(values, &arrow::datatypes::DataType::Utf8)
-        .map_err(|_| not_constant_error(kind, param))?;
+    let values = arrow::compute::cast(values, &DataType::Utf8)
+        .map_err(|_| wrong_type(kind, param, format!("a list of {}", values.data_type())))?;
     let strings = values.as_string::<i32>();
     let mut items = Vec::with_capacity(strings.len());
     for item in strings {
         match item {
             Some(text) => items.push(Value::String(text.to_string())),
-            None => {
-                return plan_err!(
-                    "{}: `{param}` cannot contain NULL. Usage: {}",
-                    kind.name(),
-                    kind.usage()
-                );
-            }
+            None => return Err(contains_null(kind, param)),
         }
     }
     Ok(Some(Value::Array(items).to_string()))
@@ -543,10 +735,12 @@ pub(crate) fn questions_from_scalar(
     kind: Kind,
     scalar: Option<&ScalarValue>,
 ) -> Result<BTreeMap<String, Question>> {
-    match scalar.map(|s| scalar_constant(kind, "questions", s)) {
-        Some(Ok(Some(text))) => parse_questions(kind, &text),
-        Some(Err(e)) => Err(e),
-        None | Some(Ok(None)) => not_constant(kind, "questions"),
+    match scalar
+        .map(|s| scalar_constant(kind, "questions", s))
+        .transpose()?
+    {
+        Some(text) => parse_questions(kind, &required_text(kind, "questions", text)?),
+        None => Err(literal_only(kind, "questions", 1, LiteralOnly::ResultType)),
     }
 }
 
@@ -612,8 +806,9 @@ pub(crate) fn typed_question(kind: Kind, constants: &[Option<String>]) -> Result
 }
 
 /// Checks a call's arguments while its query is planned, so a mistake is reported
-/// before anything runs. A `labels` or `levels` list written as `['a', 'b']` is not a
-/// literal yet at this point; the planner rule checks it.
+/// before anything runs. Only literals have a value at this point. A list written as
+/// `['a', 'b']` is not a literal yet, and a per-query parameter can also be a subquery,
+/// so the planner rule checks every other argument of a per-query parameter.
 pub(crate) fn check_planning_args(
     kind: Kind,
     arg_fields: &[arrow::datatypes::FieldRef],
@@ -634,8 +829,12 @@ pub(crate) fn check_planning_args(
                 let text = scalar_constant(kind, param, scalar)?;
                 normalize_constant(kind, param, text)?;
             }
-            None if is_list_param(param) => {}
-            None => return not_constant(kind, param),
+            None => match layout.resolution(position) {
+                Resolution::PerQuery => {}
+                Resolution::Literal(reason) => {
+                    return Err(literal_only(kind, param, index, reason));
+                }
+            },
         }
     }
     Ok(())
@@ -673,31 +872,51 @@ pub(crate) struct CallArgs {
 }
 
 impl CallArgs {
-    /// Reads the constants of an invocation. A call the planner rule built has every
-    /// argument in its position; any other is placed by the parameter names recorded on
-    /// its argument fields.
+    /// Reads the constants of an invocation.
     pub(crate) fn from_invocation(kind: Kind, args: &ScalarFunctionArgs) -> Result<Self> {
+        let names: Vec<Option<String>> = args
+            .arg_fields
+            .iter()
+            .map(|field| field.metadata().get(PARAMETER_NAME_KEY).cloned())
+            .collect();
+        Self::from_values(kind, &args.args, &names)
+    }
+
+    /// Reads constants from their values. A call the planner rule built has every
+    /// argument in its position; any other is placed by `names`, the parameter names
+    /// recorded on its argument fields.
+    ///
+    /// A deferred constant is checked here for the first time, by the rules that check a
+    /// literal while the query is planned, so its errors have the same text. They are
+    /// execution errors, as the query is running.
+    pub(crate) fn from_values(
+        kind: Kind,
+        values: &[ColumnarValue],
+        names: &[Option<String>],
+    ) -> Result<Self> {
+        Self::read_values(kind, values, names).map_err(|e| match e {
+            DataFusionError::Plan(message) => DataFusionError::Execution(message),
+            other => other,
+        })
+    }
+
+    fn read_values(kind: Kind, values: &[ColumnarValue], names: &[Option<String>]) -> Result<Self> {
         let layout = kind.layout();
-        let positions: Vec<usize> = if args.args.len() == layout.params.len() {
+        let positions: Vec<usize> = if values.len() == layout.params.len() {
             (0..layout.params.len()).collect()
         } else {
-            let names: Vec<Option<String>> = args
-                .arg_fields
-                .iter()
-                .map(|field| field.metadata().get(PARAMETER_NAME_KEY).cloned())
-                .collect();
-            positions(kind, &names)?
+            positions(kind, names)?
         };
 
         let mut constants: Vec<Option<String>> = vec![None; layout.params.len()];
-        for (value, position) in args.args.iter().zip(positions) {
+        for (value, position) in values.iter().zip(positions) {
             if position == 0 {
                 continue;
             }
             let param = layout.params[position];
             let text = match value {
                 ColumnarValue::Scalar(scalar) => scalar_constant(kind, param, scalar)?,
-                ColumnarValue::Array(_) => return not_constant(kind, param),
+                ColumnarValue::Array(_) => return Err(varies_by_row(kind, param)),
             };
             constants[position] = normalize_constant(kind, param, text)?;
         }
@@ -709,7 +928,7 @@ impl CallArgs {
                 kind,
                 constants[1]
                     .as_deref()
-                    .ok_or_else(|| not_constant_error(kind, "questions"))?,
+                    .ok_or_else(|| literal_only(kind, "questions", 1, LiteralOnly::ResultType))?,
             )?,
             _ => BTreeMap::from([(
                 TYPED_QUESTION_ID.to_string(),
@@ -724,9 +943,9 @@ impl CallArgs {
     }
 }
 
-/// The normalized constants of a call whose arguments are already in every position,
-/// as [`canonical_args`] leaves them.
-pub(crate) fn canonical_constants(kind: Kind, args: &[Expr]) -> Result<Vec<Option<String>>> {
+/// The constants of a call whose arguments are already in every position, as
+/// [`canonical_args`] leaves them. The input, in position 0, is `Known(None)`.
+pub(crate) fn canonical_constants(kind: Kind, args: &[Expr]) -> Result<Vec<ConstArg>> {
     let layout = kind.layout();
     if args.len() != layout.params.len() {
         return plan_err!(
@@ -740,18 +959,39 @@ pub(crate) fn canonical_constants(kind: Kind, args: &[Expr]) -> Result<Vec<Optio
         .enumerate()
         .map(|(position, arg)| {
             if position == 0 {
-                Ok(None)
+                Ok(ConstArg::Known(None))
             } else {
-                expr_constant(kind, layout.params[position], arg)
+                const_arg(kind, position, position, arg)
             }
         })
         .collect()
 }
 
+/// The text of every constant, when all are known while the query is planned.
+pub(crate) fn known_constants(constants: Vec<ConstArg>) -> Option<Vec<Option<String>>> {
+    constants
+        .into_iter()
+        .map(|constant| match constant {
+            ConstArg::Known(text) => Some(text),
+            ConstArg::Deferred(_) => None,
+        })
+        .collect()
+}
+
+/// Whether `args` are a typed call as the planner rule leaves it to run on its own: in
+/// every position, with a constant known only when the query runs.
+pub(crate) fn runs_with_deferred_constants(kind: Kind, args: &[Expr]) -> bool {
+    kind != Kind::Decide
+        && matches!(canonical_args(kind, args), Ok(None))
+        && canonical_constants(kind, args).is_ok_and(|c| known_constants(c).is_none())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::logical_expr::{col, lit};
+    use arrow::array::{ArrayRef, StringArray};
+    use datafusion::common::Spans;
+    use datafusion::logical_expr::{LogicalPlan, Subquery, col, lit, out_ref_col, scalar_subquery};
     use datafusion::scalar::ScalarValue;
     use std::collections::BTreeMap as Map2;
 
@@ -853,7 +1093,7 @@ mod tests {
             (
                 Kind::If,
                 vec![col("x"), col("question")],
-                "Error during planning: ai_if: `condition` must be a constant string; it cannot vary by row. Usage: ai_if(input, condition[, model => 'name'][, on_error => 'fail' | 'null'])",
+                "Error during planning: ai_if: `condition` must have one value for the whole query: a literal string, or a subquery that does not refer to the outer query. This argument can change from row to row, because it reads a column or refers to the outer query. Usage: ai_if(input, condition[, model => 'name'][, on_error => 'fail' | 'null'])",
             ),
             (
                 Kind::If,
@@ -957,5 +1197,198 @@ mod tests {
             canonical[1],
             lit(r#"{"u":{"type":"noul","instructions":"Urgent?"}}"#)
         );
+    }
+
+    /// A plan returning one `team` row per name, for subqueries.
+    fn teams(names: &[&str]) -> Arc<LogicalPlan> {
+        let rows = names.iter().map(|name| vec![lit(*name)]).collect();
+        Arc::new(
+            LogicalPlanBuilder::values(rows)
+                .expect("values")
+                .build()
+                .expect("plan"),
+        )
+    }
+
+    /// `labels` from a subquery are deferred to when the function runs. One label per
+    /// row is collected into one list, so the subquery can return many rows.
+    #[test]
+    fn labels_from_a_subquery_are_deferred_and_collected() {
+        let canonical = canonical_args(
+            Kind::Classify,
+            &[col("x"), scalar_subquery(teams(&["billing", "technical"]))],
+        )
+        .expect("valid")
+        .expect("rewritten");
+        assert!(
+            matches!(
+                &canonical[1],
+                Expr::ScalarSubquery(subquery)
+                    if matches!(subquery.subquery.as_ref(), LogicalPlan::Aggregate(_))
+                        && is_list(subquery.subquery.schema().field(0).data_type())
+            ),
+            "labels are collected into one list: {}",
+            canonical[1]
+        );
+        assert_eq!(canonical[2], null(), "no instructions");
+
+        let constants = canonical_constants(Kind::Classify, &canonical).expect("valid");
+        assert!(matches!(constants[1], ConstArg::Deferred(_)));
+        assert_eq!(known_constants(constants), None);
+        // The rule leaves the call as it is on the next optimizer pass.
+        assert_eq!(
+            canonical_args(Kind::Classify, &canonical).expect("valid"),
+            None
+        );
+        assert!(runs_with_deferred_constants(Kind::Classify, &canonical));
+    }
+
+    /// Levels are ordered and a subquery's rows are not, so a `levels` subquery is used
+    /// as written; it must return one list.
+    #[test]
+    fn levels_from_a_subquery_are_not_collected() {
+        let levels = scalar_subquery(teams(&["calm", "furious"]));
+        let canonical = canonical_args(Kind::Score, &[col("x"), lit("How upset?"), levels.clone()])
+            .expect("valid")
+            .expect("rewritten");
+        assert_eq!(canonical[2], levels);
+        assert!(runs_with_deferred_constants(Kind::Score, &canonical));
+    }
+
+    #[test]
+    fn literal_constants_are_known_while_planning() {
+        let canonical = canonical_args(Kind::If, &[col("x"), lit("refund")])
+            .expect("valid")
+            .expect("rewritten");
+        let constants = canonical_constants(Kind::If, &canonical).expect("valid");
+        assert_eq!(
+            known_constants(constants),
+            Some(vec![
+                None,
+                Some("refund".to_string()),
+                None,
+                Some("fail".to_string())
+            ])
+        );
+        assert!(!runs_with_deferred_constants(Kind::If, &canonical));
+    }
+
+    #[test]
+    fn constants_that_are_not_one_value_per_query_are_refused() {
+        let correlated = Expr::ScalarSubquery(Subquery {
+            subquery: teams(&["billing", "technical"]),
+            outer_ref_columns: vec![out_ref_col(DataType::Utf8, "tickets.team")],
+            spans: Spans::new(),
+        });
+        let labels_vary = "Error during planning: ai_classify: `labels` must have one value for the whole query: a literal such as ['billing', 'technical'], or a subquery that does not refer to the outer query. This argument can change from row to row, because it reads a column or refers to the outer query. Usage: ai_classify(input, labels[, instructions => '...'][, model => 'name'][, on_error => 'fail' | 'null'])";
+        let cases: Vec<(Kind, Vec<Expr>, &str)> = vec![
+            (Kind::Classify, vec![col("x"), col("labels")], labels_vary),
+            (Kind::Classify, vec![col("x"), correlated], labels_vary),
+            (
+                Kind::If,
+                vec![col("x"), lit("refund"), scalar_subquery(teams(&["jev"]))],
+                "Error during planning: ai_if: argument 3 is not a literal. Optional arguments such as `model` and `on_error` must be literals, because only for a literal can Spice tell which parameter it fills. Usage: ai_if(input, condition[, model => 'name'][, on_error => 'fail' | 'null'])",
+            ),
+            (
+                Kind::If,
+                vec![col("x"), lit(42_i64)],
+                "Error during planning: ai_if: `condition` must be a string, not Int64. Usage: ai_if(input, condition[, model => 'name'][, on_error => 'fail' | 'null'])",
+            ),
+            (
+                Kind::Decide,
+                vec![col("x"), scalar_subquery(teams(&["{}"]))],
+                r#"Error during planning: ai_decide: `questions` must be a literal such as '{"urgent": {"type": "noul", "instructions": "Is this urgent?"}}', because it sets the type of the result. Usage: ai_decide(input, questions[, model => 'name'][, on_error => 'fail' | 'null'])"#,
+            ),
+        ];
+        for (kind, args, expected) in cases {
+            let err = canonical_args(kind, &args).expect_err("invalid");
+            assert_eq!(err.strip_backtrace(), expected);
+        }
+    }
+
+    fn text_input() -> ColumnarValue {
+        ColumnarValue::Array(Arc::new(StringArray::from(vec!["refund please"])) as ArrayRef)
+    }
+
+    fn label_list(labels: &[Option<&str>]) -> ColumnarValue {
+        let items: Vec<ScalarValue> = labels
+            .iter()
+            .map(|label| ScalarValue::Utf8(label.map(ToString::to_string)))
+            .collect();
+        ColumnarValue::Scalar(ScalarValue::List(ScalarValue::new_list_nullable(
+            &items,
+            &DataType::Utf8,
+        )))
+    }
+
+    /// A deferred constant reaches the function as a value, which is checked by the
+    /// rules a literal is checked by while planning, with the same text.
+    #[test]
+    fn deferred_constants_are_checked_when_the_function_runs() {
+        let call = CallArgs::from_values(
+            Kind::Classify,
+            &[
+                text_input(),
+                label_list(&[Some("billing"), Some("technical")]),
+            ],
+            &[None, None],
+        )
+        .expect("valid labels");
+        assert!(matches!(
+            call.questions.get(TYPED_QUESTION_ID),
+            Some(Question::Choice { criteria, .. }) if criteria.len() == 2
+        ));
+
+        let too_many: Vec<String> = (0..256).map(|i| format!("label {i}")).collect();
+        let too_many: Vec<Option<&str>> = too_many.iter().map(|l| Some(l.as_str())).collect();
+        let usage = "Usage: ai_classify(input, labels[, instructions => '...'][, model => 'name'][, on_error => 'fail' | 'null'])";
+        let cases: Vec<(Kind, ColumnarValue, String)> = vec![
+            (
+                Kind::Classify,
+                label_list(&[Some("billing")]),
+                "Execution error: ai_classify: `labels` must list between 2 and 255 labels; it lists 1. Include a fallback such as 'other' when no label may fit.".to_string(),
+            ),
+            (
+                Kind::Classify,
+                label_list(&too_many),
+                "Execution error: ai_classify: `labels` must list between 2 and 255 labels; it lists 256. Include a fallback such as 'other' when no label may fit.".to_string(),
+            ),
+            (
+                Kind::Classify,
+                label_list(&[Some("billing"), Some("billing")]),
+                "Execution error: ai_classify: label 'billing' is listed more than once. List each label once.".to_string(),
+            ),
+            (
+                Kind::Classify,
+                label_list(&[Some("billing"), None]),
+                format!("Execution error: ai_classify: `labels` cannot contain NULL. {usage}"),
+            ),
+            // A subquery that returns no row is NULL.
+            (
+                Kind::Classify,
+                ColumnarValue::Scalar(ScalarValue::Utf8(None)),
+                format!("Execution error: ai_classify: `labels` is required and cannot be empty or NULL. {usage}"),
+            ),
+            (
+                Kind::Classify,
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(7))),
+                format!("Execution error: ai_classify: `labels` must be a list of strings, or a string that holds a JSON list or object, not Int64. {usage}"),
+            ),
+            (
+                Kind::Classify,
+                ColumnarValue::Array(Arc::new(StringArray::from(vec!["billing"])) as ArrayRef),
+                format!("Execution error: ai_classify: `labels` must have one value for the whole query: a literal such as ['billing', 'technical'], or a subquery that does not refer to the outer query. This argument can change from row to row, because it reads a column or refers to the outer query. {usage}"),
+            ),
+            (
+                Kind::If,
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(7))),
+                "Execution error: ai_if: `condition` must be a string, not Int64. Usage: ai_if(input, condition[, model => 'name'][, on_error => 'fail' | 'null'])".to_string(),
+            ),
+        ];
+        for (kind, value, expected) in cases {
+            let err = CallArgs::from_values(kind, &[text_input(), value], &[None, None])
+                .expect_err("invalid");
+            assert_eq!(err.strip_backtrace(), expected);
+        }
     }
 }

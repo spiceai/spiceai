@@ -157,6 +157,7 @@ static TEST_MODELS: LazyLock<Vec<TestModel>> = LazyLock::new(|| {
             create: Box::new(|| {
                 Box::pin(async {
                     create::create_anthropic(None)
+                        .await
                         .map_err(|e| anyhow::anyhow!("failed to create anthropic model: {e}"))
                 })
             }),
@@ -175,7 +176,7 @@ static TEST_MODELS: LazyLock<Vec<TestModel>> = LazyLock::new(|| {
         TestModel {
             name: "openai",
             fetch_repo: None,
-            create: Box::new(|| Box::pin(async { Ok(create::create_openai(OPENAI_MODEL)) })),
+            create: Box::new(|| Box::pin(async { create::create_openai(OPENAI_MODEL).await })),
         },
         TestModel {
             name: "xai",
@@ -1214,6 +1215,7 @@ async fn default_anthropic_model_accepts_forwarded_sampling_controls() {
     }
 
     let model = create::create_anthropic(None)
+        .await
         .unwrap_or_else(|e| panic!("failed to build the default Anthropic model: {e}"));
 
     // Every control `crates/llms/src/anthropic/chat.rs` forwards to Anthropic. `top_logprobs` is
