@@ -2429,6 +2429,7 @@ impl Runtime {
                 data_connector,
                 Arc::clone(&self.embeds),
                 self.secrets(),
+                Arc::clone(&self.status),
             ));
         }
 
@@ -2728,9 +2729,11 @@ impl Runtime {
 
         // Only the datasets this diff loads or updates are initialized: `mode: file_create`
         // deletes the acceleration state on init, and an unchanged dataset keeps serving from
-        // the `AcceleratedTable` it already has. The one exception is a `localpod` dataset
-        // whose parent this diff reloads: it reads through the table the parent is about to
-        // replace, so it reloads too, after its parent.
+        // the `AcceleratedTable` it already has. The exceptions read through something this
+        // diff replaces, so they reload too: a dataset that embeds with a changed embedding
+        // model, which fixed its vector size and chunker when it loaded, and a `localpod`
+        // dataset whose parent this diff reloads, after its parent.
+        let changed_embeddings = crate::init::embedding::changed_embeddings(current_app, new_app);
         let changed_datasets: Vec<Arc<Dataset>> = valid_datasets
             .iter()
             .filter(|ds| {
@@ -2738,6 +2741,7 @@ impl Runtime {
                     .iter()
                     .find(|current| current.name == ds.name)
                     .is_none_or(|current| current != *ds)
+                    || uses_embedding_model(ds, &changed_embeddings)
             })
             .map(Arc::clone)
             .collect();
@@ -3979,6 +3983,19 @@ fn is_queued_localpod(
         .values()
         .flatten()
         .any(|(ds, _)| resolve_table_reference(ds.name.clone()) == *name)
+}
+
+/// Whether `ds` embeds a column with one of `models`.
+fn uses_embedding_model(ds: &Dataset, models: &HashSet<String>) -> bool {
+    ds.embeddings
+        .iter()
+        .map(|e| &e.model)
+        .chain(
+            ds.columns
+                .iter()
+                .flat_map(|c| c.embeddings.iter().map(|e| &e.model)),
+        )
+        .any(|model| models.contains(model))
 }
 
 /// Extends the datasets a spicepod apply reloads with every `localpod` dataset that reads
@@ -7084,6 +7101,53 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             reload.contains("is updating") && reload.contains("previous contents"),
             "the reload wording is unchanged, so an operator's existing alert keeps matching: {reload}"
         );
+    }
+
+    /// A dataset fixes its embedding model's vector size and chunker when it loads, so a change
+    /// to the model reloads every dataset that embeds with it, and no other dataset.
+    #[tokio::test]
+    async fn a_change_to_an_embedding_model_reloads_the_datasets_that_use_it() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let app = |endpoint: &str| {
+            let embedded = |name: &str| {
+                serde_json::from_value::<spicepod::component::dataset::Dataset>(serde_json::json!({
+                    "from": "file:docs.csv",
+                    "name": name,
+                    "columns": [{"name": "body", "embeddings": [{"from": "e"}]}],
+                }))
+                .expect("a valid dataset")
+            };
+            Arc::new(
+                app::AppBuilder::new("embedding_dependents")
+                    .with_embedding(
+                        serde_json::from_value(serde_json::json!({
+                            "name": "e",
+                            "from": "openai:text-embedding-3-small",
+                            "params": {"endpoint": endpoint},
+                        }))
+                        .expect("a valid embedding model"),
+                    )
+                    .with_dataset(embedded("docs"))
+                    .with_dataset(embedded("notes"))
+                    .with_dataset(spicepod_dataset("file:plain.csv", "plain"))
+                    .build(),
+            )
+        };
+        let reloaded = |set: HashSet<ResolvedTableReference>| {
+            let mut names: Vec<String> = set.iter().map(|t| t.table.to_string()).collect();
+            names.sort();
+            names
+        };
+
+        let unchanged = Arc::clone(&runtime)
+            .apply_dataset_diff(&app("http://a"), &app("http://a"))
+            .await;
+        assert!(reloaded(unchanged).is_empty());
+
+        let changed = Arc::clone(&runtime)
+            .apply_dataset_diff(&app("http://a"), &app("http://b"))
+            .await;
+        assert_eq!(reloaded(changed), ["docs", "notes"]);
     }
 
     /// An app declaring `names` as `file:` datasets. The `from` never has to resolve: the

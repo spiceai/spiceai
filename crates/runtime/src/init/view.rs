@@ -962,8 +962,10 @@ impl Runtime {
 
         // A view's plan holds the tables it read when it registered, so a view that
         // reads a dataset this change loads, reloads or removes registers again to read
-        // the dataset the Spicepod now declares, or to fail when it is gone. The views
-        // that read it follow through the dependency order below.
+        // the dataset the Spicepod now declares, or to fail when it is gone. A view that
+        // embeds with a changed embedding model registers again with the new model. The
+        // views that read it follow through the dependency order below.
+        let changed_embeddings = crate::init::embedding::changed_embeddings(current_app, new_app);
         let reads: HashMap<ResolvedTableReference, TablesRead> = {
             let state = self.df.ctx.state();
             validated_views
@@ -978,11 +980,17 @@ impl Runtime {
         };
         for vv in &validated_views {
             if !views_that_changed.contains(&vv.view.name)
-                && reads
+                && (reads
                     .get(&resolve_table_reference(vv.view.name.clone()))
                     .is_some_and(|tables| {
                         tables.keys().any(|table| reloaded_datasets.contains(table))
                     })
+                    || vv
+                        .view
+                        .columns
+                        .iter()
+                        .flat_map(|c| &c.embeddings)
+                        .any(|e| changed_embeddings.contains(&e.model)))
             {
                 views_that_changed.push(vv.view.name.clone());
             }

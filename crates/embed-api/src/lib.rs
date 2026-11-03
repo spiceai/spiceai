@@ -148,6 +148,26 @@ pub enum Error {
     UnsupportedEmbeddingInput { model: String, message: String },
 }
 
+impl Error {
+    /// Returns `true` when the error is a mistake in the model's Spicepod configuration, which no
+    /// retry can clear. A refusal or failure of the provider is not one.
+    #[must_use]
+    pub fn is_configuration_error(&self) -> bool {
+        matches!(
+            self,
+            Self::UnknownModelSource { .. }
+                | Self::ModelNotProvided { .. }
+                | Self::MissingParamError { .. }
+                | Self::InvalidParamError { .. }
+                | Self::InvalidPoolingMode { .. }
+                | Self::InvalidOpenAITier { .. }
+                | Self::LocalModelPathDoesNotExist { .. }
+                | Self::UnsupportedTaskForModel { .. }
+                | Self::RevisionPinningUnsupported { .. }
+        )
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Convert the float-vector representation to the desired format.
