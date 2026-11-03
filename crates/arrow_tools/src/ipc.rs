@@ -173,6 +173,11 @@ pub const FLIGHT_TARGET_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 ///
 /// Dictionary values are not sliced: every slice of a dictionary-encoded column shares the
 /// column's whole dictionary, which is sent once.
+///
+/// Slices share the batch's buffers, except that a slice's string and binary view columns
+/// (at any nesting depth) are copied into buffers holding only its own values when the
+/// column's buffers are over `max_bytes`, because the IPC writer sends view data buffers
+/// whole.
 #[must_use]
 pub fn split_batch_for_flight(
     batch: arrow::record_batch::RecordBatch,
@@ -180,7 +185,153 @@ pub fn split_batch_for_flight(
 ) -> Vec<arrow::record_batch::RecordBatch> {
     let mut slices = Vec::new();
     split_into(batch, max_bytes, &mut slices);
+    if max_bytes > 0 {
+        for slice in &mut slices {
+            compact_view_columns(slice, max_bytes);
+        }
+    }
     slices
+}
+
+/// Rewrites, in place, each column of `slice` that holds string or binary views and whose
+/// buffers add up to more than `max_bytes`, so it keeps only the view data its own rows use.
+///
+/// The IPC writer sends a view array's data buffers whole, so a slice of a view column, or
+/// of a struct or list holding one, would otherwise carry every value the parent batch
+/// held. Columns without views, and view columns whose buffers already fit, are left as
+/// they are, so batches without views pay nothing.
+fn compact_view_columns(slice: &mut arrow::record_batch::RecordBatch, max_bytes: usize) {
+    use arrow::array::Array;
+
+    let needs_compaction = |column: &arrow::array::ArrayRef| {
+        contains_view(column.data_type()) && column.get_array_memory_size() > max_bytes
+    };
+    if !slice.columns().iter().any(needs_compaction) {
+        return;
+    }
+    let columns = slice
+        .columns()
+        .iter()
+        .map(|column| {
+            if needs_compaction(column) {
+                compact_views(column)
+            } else {
+                std::sync::Arc::clone(column)
+            }
+        })
+        .collect();
+    if let Ok(compacted) = arrow::record_batch::RecordBatch::try_new(slice.schema(), columns) {
+        *slice = compacted;
+    }
+}
+
+fn contains_view(data_type: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType;
+
+    match data_type {
+        DataType::Utf8View | DataType::BinaryView => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => contains_view(field.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|f| contains_view(f.data_type())),
+        _ => false,
+    }
+}
+
+/// `array` with its string and binary views, at any depth of struct, list, large list,
+/// fixed-size list and map nesting, copied into buffers that hold only the values `array`
+/// references. Any part it cannot rebuild is returned as it was.
+fn compact_views(array: &arrow::array::ArrayRef) -> arrow::array::ArrayRef {
+    use arrow::array::{Array, AsArray, FixedSizeListArray, MapArray, StructArray};
+    use arrow_schema::DataType;
+    use std::sync::Arc;
+
+    if !contains_view(array.data_type()) {
+        return Arc::clone(array);
+    }
+    let rebuilt: Option<arrow::array::ArrayRef> = match array.data_type() {
+        DataType::Utf8View => Some(Arc::new(array.as_string_view().gc())),
+        DataType::BinaryView => Some(Arc::new(array.as_binary_view().gc())),
+        DataType::Struct(fields) => {
+            let parent = array.as_struct();
+            let children = parent.columns().iter().map(compact_views).collect();
+            StructArray::try_new(fields.clone(), children, parent.nulls().cloned())
+                .ok()
+                .map(|a| Arc::new(a) as _)
+        }
+        DataType::List(field) => compact_list::<i32>(array, field),
+        DataType::LargeList(field) => compact_list::<i64>(array, field),
+        DataType::FixedSizeList(field, size) => {
+            let list = array.as_fixed_size_list();
+            FixedSizeListArray::try_new(
+                Arc::clone(field),
+                *size,
+                compact_views(list.values()),
+                list.nulls().cloned(),
+            )
+            .ok()
+            .map(|a| Arc::new(a) as _)
+        }
+        DataType::Map(field, ordered) => {
+            let map = array.as_map();
+            let (offsets, entries) =
+                referenced_values(map.value_offsets(), &(Arc::new(map.entries().clone()) as _));
+            entries.and_then(|entries| {
+                let entries = compact_views(&entries);
+                MapArray::try_new(
+                    Arc::clone(field),
+                    offsets,
+                    entries.as_struct().clone(),
+                    map.nulls().cloned(),
+                    *ordered,
+                )
+                .ok()
+                .map(|a| Arc::new(a) as _)
+            })
+        }
+        _ => None,
+    };
+    rebuilt.unwrap_or_else(|| Arc::clone(array))
+}
+
+fn compact_list<O: arrow::array::OffsetSizeTrait>(
+    array: &arrow::array::ArrayRef,
+    field: &arrow_schema::FieldRef,
+) -> Option<arrow::array::ArrayRef> {
+    use arrow::array::{Array, AsArray, GenericListArray};
+    use std::sync::Arc;
+
+    let list = array.as_list::<O>();
+    let (offsets, values) = referenced_values(list.value_offsets(), list.values());
+    let values = compact_views(&values?);
+    GenericListArray::<O>::try_new(Arc::clone(field), offsets, values, list.nulls().cloned())
+        .ok()
+        .map(|a| Arc::new(a) as _)
+}
+
+/// The part of `values` that `offsets` points at, and `offsets` rebased to start at zero.
+fn referenced_values<O: arrow::array::OffsetSizeTrait>(
+    offsets: &[O],
+    values: &arrow::array::ArrayRef,
+) -> (
+    arrow::buffer::OffsetBuffer<O>,
+    Option<arrow::array::ArrayRef>,
+) {
+    let start = offsets.first().copied().unwrap_or_else(O::zero);
+    let end = offsets.last().copied().unwrap_or_else(O::zero);
+    let rebased: Vec<O> = offsets.iter().map(|&o| o - start).collect();
+    let rebased = if rebased.is_empty() {
+        arrow::buffer::OffsetBuffer::new_empty()
+    } else {
+        arrow::buffer::OffsetBuffer::new(rebased.into())
+    };
+    let values = start
+        .to_usize()
+        .zip(end.to_usize())
+        .filter(|(start, end)| start <= end && *end <= values.len())
+        .map(|(start, end)| values.slice(start, end - start));
+    (rebased, values)
 }
 
 fn split_into(
@@ -262,6 +413,31 @@ fn referenced_bytes(data: &arrow::array::ArrayData) -> usize {
         DataType::Struct(_) => data.child_data().iter().fold(validity, |total, child| {
             total.saturating_add(referenced_bytes(child))
         }),
+        // The IPC writer sends a view column's data buffers whole; `split_batch_for_flight`
+        // compacts each slice's views, so count only the values this slice references.
+        DataType::Utf8View | DataType::BinaryView => {
+            let views = data
+                .buffers()
+                .first()
+                .map(|b| b.typed_data::<u128>())
+                .and_then(|views| views.get(data.offset()..data.offset().saturating_add(len)));
+            match views {
+                Some(views) => views.iter().fold(
+                    validity.saturating_add(len.saturating_mul(16)),
+                    |total, &view| {
+                        // The low 32 bits of a view are its value's length; values of up to
+                        // 12 bytes are stored inline in the view itself.
+                        let value_len = (view as u32) as usize;
+                        if value_len > 12 {
+                            total.saturating_add(value_len)
+                        } else {
+                            total
+                        }
+                    },
+                ),
+                None => unnarrowed_bytes(data),
+            }
+        }
         DataType::Dictionary(key, _) => {
             validity.saturating_add(len.saturating_mul(key.primitive_width().unwrap_or(8)))
         }
@@ -752,6 +928,87 @@ mod split_batch_for_flight_tests {
         assert!(
             (2..=3).contains(&slices.len()),
             "expected 2 or 3 slices, got {}",
+            slices.len()
+        );
+        for slice in &slices {
+            assert!(encoded_message_bytes(slice) <= CLIENT_DEFAULT_DECODE_LIMIT);
+        }
+        let rejoined = concat_batches(&batch.schema(), &slices).expect("concat");
+        assert_eq!(rejoined, batch);
+    }
+
+    /// A struct column of string views is split, and each slice's views are compacted so
+    /// it does not carry every value the parent batch held: the IPC writer sends a view
+    /// array's data buffers whole.
+    #[test]
+    fn nested_string_views_are_split_and_compacted() {
+        use arrow::array::{StringViewArray, StructArray};
+
+        let value = "x".repeat(1_024);
+        let views: ArrayRef = Arc::new(StringViewArray::from_iter_values(
+            (0..8_192).map(|_| value.as_str()),
+        ));
+        let field = Arc::new(Field::new("s", DataType::Utf8View, true));
+        let structs: ArrayRef = Arc::new(StructArray::from(vec![(field, views)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "st",
+            structs.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![structs]).expect("batch");
+        assert!(
+            encoded_message_bytes(&batch) > CLIENT_DEFAULT_DECODE_LIMIT,
+            "fixture must be over the client limit"
+        );
+
+        let slices = split_batch_for_flight(batch.clone(), FLIGHT_TARGET_MESSAGE_BYTES);
+
+        assert!(
+            (4..=6).contains(&slices.len()),
+            "expected 4 to 6 slices, got {}",
+            slices.len()
+        );
+        for slice in &slices {
+            let bytes = encoded_message_bytes(slice);
+            assert!(
+                bytes <= CLIENT_DEFAULT_DECODE_LIMIT,
+                "a {}-row slice encodes to {bytes} bytes",
+                slice.num_rows()
+            );
+        }
+        let rejoined = concat_batches(&batch.schema(), &slices).expect("concat");
+        assert_eq!(rejoined, batch);
+    }
+
+    /// Slicing a list column of string views keeps only the referenced values.
+    #[test]
+    fn list_of_string_views_is_compacted() {
+        use arrow::array::{GenericListArray, StringViewArray};
+        use arrow::buffer::OffsetBuffer;
+
+        let value = "y".repeat(512);
+        let values: ArrayRef = Arc::new(StringViewArray::from_iter_values(
+            (0..16_384).map(|_| value.as_str()),
+        ));
+        let item = Arc::new(Field::new("item", DataType::Utf8View, true));
+        let lists: ArrayRef = Arc::new(GenericListArray::<i32>::new(
+            Arc::clone(&item),
+            OffsetBuffer::from_lengths(std::iter::repeat_n(2, 8_192)),
+            values,
+            None,
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "l",
+            lists.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![lists]).expect("batch");
+
+        let slices = split_batch_for_flight(batch.clone(), FLIGHT_TARGET_MESSAGE_BYTES);
+
+        assert!(
+            slices.len() > 1 && slices.len() <= 8,
+            "got {} slices",
             slices.len()
         );
         for slice in &slices {
