@@ -233,6 +233,18 @@ impl GtidSet {
             })
         })
     }
+
+    /// Whether the set holds the transaction `uuid:gno`.
+    #[must_use]
+    pub fn contains(&self, uuid: Uuid, gno: u64) -> bool {
+        let Some(ranges) = self.intervals.get(&uuid) else {
+            return false;
+        };
+        // Sorted, disjoint, inclusive ranges: the candidate is the last one
+        // starting at or below `gno`.
+        let idx = ranges.partition_point(|&(start, _)| start <= gno);
+        idx > 0 && gno <= ranges[idx - 1].1
+    }
 }
 
 impl std::fmt::Display for GtidSet {
@@ -323,6 +335,19 @@ mod tests {
         let s = format!("{U1}:1-5:8-10,{U2}:1-3");
         let set = GtidSet::parse(&s).expect("parse");
         assert_eq!(set.to_string(), s);
+    }
+
+    #[test]
+    fn contains_checks_every_range_boundary() {
+        let set = GtidSet::parse(&format!("{U1}:1-5:8-10,{U2}:3")).expect("parse");
+        let u1 = Uuid::parse_str(U1).expect("uuid");
+        let u2 = Uuid::parse_str(U2).expect("uuid");
+        let held: Vec<u64> = (0..=12).filter(|&gno| set.contains(u1, gno)).collect();
+        assert_eq!(held, vec![1, 2, 3, 4, 5, 8, 9, 10]);
+        let held: Vec<u64> = (0..=5).filter(|&gno| set.contains(u2, gno)).collect();
+        assert_eq!(held, vec![3]);
+        let other = Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("uuid");
+        assert!(!set.contains(other, 1), "a UUID absent from the set holds nothing");
     }
 
     #[test]
