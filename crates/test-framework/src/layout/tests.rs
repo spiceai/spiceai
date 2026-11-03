@@ -293,7 +293,7 @@ fn every_benchmark_table_has_one_entry_and_a_key() {
 /// The columns a partition expression reads. Covers the forms the catalogs
 /// use; any other form fails the test rather than going unchecked.
 fn partition_columns(expression: &str) -> BTreeSet<String> {
-    use datafusion::sql::sqlparser::{
+    use sqlparser::{
         ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments},
         dialect::GenericDialect,
         parser::Parser,

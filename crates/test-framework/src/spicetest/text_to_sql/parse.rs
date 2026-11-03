@@ -14,13 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use arrow::datatypes::{DataType, Field, Schema};
-use datafusion::{
-    common::Column,
-    common::{ResolvedTableReference, TableReference},
-    sql::sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser},
-};
+use datafusion_common::{Column, ResolvedTableReference, TableReference};
 use reqwest::Client;
 use serde_json::Value;
+use sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser};
 use std::{collections::HashSet, str::FromStr, sync::Arc};
 
 // Fetches the logical plan by running `EXPLAIN FORMAT PGJSON <sql>` against `v1/sql`.
@@ -62,7 +59,7 @@ pub async fn logical_plan(
 pub fn attempt_parse_table_and_projection(
     sql: &str,
 ) -> Result<(HashSet<ResolvedTableReference>, HashSet<Column>), anyhow::Error> {
-    use datafusion::sql::sqlparser::ast::With;
+    use sqlparser::ast::With;
 
     let mut tables = HashSet::new();
     let mut projections = HashSet::new();
@@ -95,11 +92,11 @@ pub fn attempt_parse_table_and_projection(
 }
 
 fn extract_tables_from_set_expr(
-    expr: &datafusion::sql::sqlparser::ast::SetExpr,
+    expr: &sqlparser::ast::SetExpr,
     cte_names: &HashSet<String>,
     tables: &mut HashSet<ResolvedTableReference>,
 ) {
-    use datafusion::sql::sqlparser::ast::SetExpr;
+    use sqlparser::ast::SetExpr;
 
     match expr {
         SetExpr::Select(select) => {
@@ -127,11 +124,11 @@ fn extract_tables_from_set_expr(
 }
 
 fn extract_table_from_factor(
-    factor: &datafusion::sql::sqlparser::ast::TableFactor,
+    factor: &sqlparser::ast::TableFactor,
     cte_names: &HashSet<String>,
     tables: &mut HashSet<ResolvedTableReference>,
 ) {
-    use datafusion::sql::sqlparser::ast::{ObjectNamePart, TableFactor};
+    use sqlparser::ast::{ObjectNamePart, TableFactor};
 
     match factor {
         TableFactor::Table { name, .. } => {
@@ -181,10 +178,10 @@ fn extract_table_from_factor(
 }
 
 fn extract_projections_from_set_expr(
-    expr: &datafusion::sql::sqlparser::ast::SetExpr,
+    expr: &sqlparser::ast::SetExpr,
     projections: &mut HashSet<Column>,
 ) {
-    use datafusion::sql::sqlparser::ast::{ObjectNamePart, SelectItem, SetExpr, TableFactor};
+    use sqlparser::ast::{ObjectNamePart, SelectItem, SetExpr, TableFactor};
     use std::collections::HashMap;
 
     match expr {
@@ -287,10 +284,10 @@ fn extract_projections_from_set_expr(
 
 /// Extracts alias-to-table mappings from a table factor.
 fn extract_alias_from_table_factor(
-    factor: &datafusion::sql::sqlparser::ast::TableFactor,
+    factor: &sqlparser::ast::TableFactor,
     alias_map: &mut std::collections::HashMap<String, ResolvedTableReference>,
 ) {
-    use datafusion::sql::sqlparser::ast::{ObjectNamePart, TableFactor};
+    use sqlparser::ast::{ObjectNamePart, TableFactor};
 
     if let TableFactor::Table { name, alias, .. } = factor {
         let parts: Vec<&str> = name
@@ -321,12 +318,12 @@ fn extract_alias_from_table_factor(
 }
 
 fn extract_columns_from_expr(
-    expr: &datafusion::sql::sqlparser::ast::Expr,
+    expr: &sqlparser::ast::Expr,
     projections: &mut HashSet<Column>,
     default_table: Option<&ResolvedTableReference>,
     alias_map: &std::collections::HashMap<String, ResolvedTableReference>,
 ) {
-    use datafusion::sql::sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
 
     match expr {
         Expr::Identifier(ident) => {
@@ -796,8 +793,8 @@ mod tests {
         // sqlparser's own parse error rather than some other failure.
         assert!(
             matches!(
-                err.downcast_ref::<datafusion::sql::sqlparser::parser::ParserError>(),
-                Some(datafusion::sql::sqlparser::parser::ParserError::ParserError(message))
+                err.downcast_ref::<sqlparser::parser::ParserError>(),
+                Some(sqlparser::parser::ParserError::ParserError(message))
                     if message == "Expected: an SQL statement, found: Looking at Line: 1, Column: 1"
             ),
             "expected sqlparser to reject the leading prose, got: {err}"

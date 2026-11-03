@@ -27,12 +27,8 @@ use super::compare;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use chbench_driver::ChBenchDriver;
-use datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
-use datafusion::logical_expr::{
-    Expr, LogicalPlanBuilder, TableSource, builder::LogicalTableSource,
-};
-use datafusion::prelude::{col, lit};
-use datafusion::sql::unparser::Unparser;
+use datafusion_common::{Column, TableReference};
+use sqlparser::keywords::ALL_KEYWORDS;
 use test_framework::anyhow;
 use test_framework::opentelemetry::KeyValue;
 use tokio::time::sleep;
@@ -696,25 +692,45 @@ fn first_non_empty(batches: &[RecordBatch]) -> Option<&RecordBatch> {
 }
 
 /// Build the engine-agnostic fingerprint aggregate SQL for `table` from its
-/// Arrow `schema`, via [`LogicalPlanBuilder`] + the unparser so the generated
-/// SQL is well-formed on both the source and Spice.
+/// Arrow `schema`, well-formed on both the source and Spice.
 ///
 /// A `COUNT(*)`, a non-null `COUNT` for every column (catches column swaps /
 /// nulled values), `MIN`/`MAX` for numeric columns, and `SUM` for exact
 /// (integer/decimal) numeric columns. Each aggregate is aliased
 /// (`count_<col>`, `min_<col>`, `max_<col>`, `sum_<col>`) so a divergence
 /// reported by [`compare::numeric_delta`] names the offending column.
+///
+/// The text is what `DataFusion`'s default unparser writes for the same
+/// aggregate plan: identifiers are quoted only when [`quote_ident`] says so,
+/// and columns are qualified by the bare table name.
 fn build_fingerprint_sql(table: &str, schema: &SchemaRef) -> anyhow::Result<String> {
-    // The table source only carries the schema — the plan is unparsed, never run.
-    let source = Arc::new(LogicalTableSource::new(Arc::clone(schema))) as Arc<dyn TableSource>;
+    let table = TableReference::parse_str(table);
+    let qualifier = quote_ident(table.table());
 
-    let mut aggs = vec![count(lit(1_i64)).alias("count_star")];
+    let mut aggs = vec!["count(1) AS count_star".to_string()];
     for field in schema.fields() {
         let name = field.name();
-        aggs.push(count(col(name.as_str())).alias(format!("count_{name}")));
+        // An unquoted column name is normalized to lower case, and `a.b` names
+        // column `b` of relation `a`, so a field whose name doesn't resolve to
+        // itself can't be referenced this way.
+        let resolved = Column::from_qualified_name(name.as_str());
+        anyhow::ensure!(
+            resolved.relation.is_none() && resolved.name == *name,
+            "Schema error: No field named {}. Column {name:?} of {table} can't be referenced unquoted",
+            resolved.flat_name()
+        );
+        let column = format!("{qualifier}.{}", quote_ident(name));
+        let aggregate = |func: &str| {
+            format!(
+                "{func}({column}) AS {}",
+                quote_ident(&format!("{func}_{name}"))
+            )
+        };
+
+        aggs.push(aggregate("count"));
         if compare::is_numeric(field.data_type()) {
-            aggs.push(min(col(name.as_str())).alias(format!("min_{name}")));
-            aggs.push(max(col(name.as_str())).alias(format!("max_{name}")));
+            aggs.push(aggregate("min"));
+            aggs.push(aggregate("max"));
             // SUM only for exact (integer/decimal) columns. It catches interior
             // value corruption — a wrong upsert value, a stale/missed update —
             // that COUNT/MIN/MAX miss (the wrong value need not be a new
@@ -724,16 +740,48 @@ fn build_fingerprint_sql(table: &str, schema: &SchemaRef) -> anyhow::Result<Stri
             // sum relies on the f64-exactness bound documented in `compare`
             // (magnitudes below 2^53), which holds at the scale factors we run.
             if compare::is_exact_numeric(field.data_type()) {
-                aggs.push(sum(col(name.as_str())).alias(format!("sum_{name}")));
+                aggs.push(aggregate("sum"));
             }
         }
     }
 
-    let plan = LogicalPlanBuilder::scan(table, source, None)?
-        .aggregate(Vec::<Expr>::new(), aggs)?
-        .build()?;
-    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
-    Ok(sql)
+    let from = match &table {
+        TableReference::Bare { table } => quote_ident(table),
+        TableReference::Partial { schema, table } => {
+            format!("{}.{}", quote_ident(schema), quote_ident(table))
+        }
+        TableReference::Full {
+            catalog,
+            schema,
+            table,
+        } => format!(
+            "{}.{}.{}",
+            quote_ident(catalog),
+            quote_ident(schema),
+            quote_ident(table)
+        ),
+    };
+    Ok(format!("SELECT {} FROM {from}", aggs.join(", ")))
+}
+
+/// `ident` as `DataFusion`'s default unparser writes it: double-quoted (with
+/// embedded quotes doubled) when it is a SQL keyword other than `ID`, isn't a
+/// plain `[A-Za-z_][A-Za-z0-9_]*` name, or holds an upper-case letter.
+fn quote_ident(ident: &str) -> String {
+    let upper = ident.to_uppercase();
+    let plain = ident
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let needs_quote = (upper != "ID" && ALL_KEYWORDS.contains(&upper.as_str()))
+        || !plain
+        || ident.chars().any(|c| c.is_ascii_uppercase());
+    if needs_quote {
+        format!("\"{}\"", ident.replace('"', "\"\""))
+    } else {
+        ident.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -901,4 +949,91 @@ mod tests {
         // The source table is referenced.
         assert!(sql.contains("order_line"), "{sql}");
     }
+
+    /// The fingerprint SQL is byte-for-byte what `DataFusion`'s default
+    /// unparser wrote for the same aggregate plan (these strings were captured
+    /// from it), so the source and Spice keep receiving the same text.
+    #[test]
+    fn fingerprint_sql_matches_the_unparser_text() {
+        let cases: Vec<(&str, Vec<Field>, &str)> = vec![
+            (
+                "order_line",
+                vec![
+                    Field::new("ol_amount", DataType::Decimal128(38, 2), true),
+                    Field::new("ol_quantity", DataType::Int32, true),
+                    Field::new("ol_ratio", DataType::Float64, true),
+                    Field::new("ol_dist_info", DataType::Utf8, true),
+                    Field::new(
+                        "ol_delivery_d",
+                        DataType::Timestamp(TimeUnit::Microsecond, None),
+                        true,
+                    ),
+                ],
+                ORDER_LINE,
+            ),
+            (
+                "order",
+                vec![Field::new("select", DataType::Int64, true)],
+                ORDER,
+            ),
+            (
+                "t2",
+                vec![Field::new("has space", DataType::UInt64, true)],
+                T2,
+            ),
+            (
+                "t3",
+                vec![Field::new("q\"uote", DataType::Float32, true)],
+                T3,
+            ),
+            ("t5", vec![Field::new("1col", DataType::Int8, true)], T5),
+            (
+                "t6",
+                vec![
+                    Field::new("user", DataType::Utf8, true),
+                    Field::new("order", DataType::Date32, true),
+                ],
+                T6,
+            ),
+            (
+                "Warehouse",
+                vec![Field::new("w_id", DataType::Int64, false)],
+                WAREHOUSE,
+            ),
+            (
+                "public.customer",
+                vec![Field::new("c_id", DataType::Int64, false)],
+                CUSTOMER,
+            ),
+            ("empty_cols", vec![], EMPTY),
+        ];
+        for (table, fields, expected) in cases {
+            let schema: SchemaRef = Arc::new(Schema::new(fields));
+            let sql = build_fingerprint_sql(table, &schema).expect("builds fingerprint SQL");
+            assert_eq!(sql, expected, "fingerprint SQL for {table}");
+        }
+
+        // The unparser path refused a column an unquoted reference can't name
+        // (it lower-cases `MixedCase` and reads `a.b` as relation `a`), which
+        // skips the table's fingerprint; so does this.
+        for (table, column) in [("t1", "MixedCase"), ("t4", "a.b")] {
+            let schema: SchemaRef =
+                Arc::new(Schema::new(vec![Field::new(column, DataType::Int16, true)]));
+            let err = build_fingerprint_sql(table, &schema).expect_err("unreferenceable column");
+            assert!(
+                err.to_string().starts_with("Schema error: No field named "),
+                "{err}"
+            );
+        }
+    }
+
+    const ORDER_LINE: &str = "SELECT count(1) AS count_star, count(order_line.ol_amount) AS count_ol_amount, min(order_line.ol_amount) AS min_ol_amount, max(order_line.ol_amount) AS max_ol_amount, sum(order_line.ol_amount) AS sum_ol_amount, count(order_line.ol_quantity) AS count_ol_quantity, min(order_line.ol_quantity) AS min_ol_quantity, max(order_line.ol_quantity) AS max_ol_quantity, sum(order_line.ol_quantity) AS sum_ol_quantity, count(order_line.ol_ratio) AS count_ol_ratio, min(order_line.ol_ratio) AS min_ol_ratio, max(order_line.ol_ratio) AS max_ol_ratio, count(order_line.ol_dist_info) AS count_ol_dist_info, count(order_line.ol_delivery_d) AS count_ol_delivery_d FROM order_line";
+    const ORDER: &str = r#"SELECT count(1) AS count_star, count("order"."select") AS count_select, min("order"."select") AS min_select, max("order"."select") AS max_select, sum("order"."select") AS sum_select FROM "order""#;
+    const T2: &str = r#"SELECT count(1) AS count_star, count(t2."has space") AS "count_has space", min(t2."has space") AS "min_has space", max(t2."has space") AS "max_has space", sum(t2."has space") AS "sum_has space" FROM t2"#;
+    const T3: &str = r#"SELECT count(1) AS count_star, count(t3."q""uote") AS "count_q""uote", min(t3."q""uote") AS "min_q""uote", max(t3."q""uote") AS "max_q""uote" FROM t3"#;
+    const T5: &str = r#"SELECT count(1) AS count_star, count(t5."1col") AS count_1col, min(t5."1col") AS min_1col, max(t5."1col") AS max_1col, sum(t5."1col") AS sum_1col FROM t5"#;
+    const T6: &str = r#"SELECT count(1) AS count_star, count(t6."user") AS count_user, count(t6."order") AS count_order FROM t6"#;
+    const WAREHOUSE: &str = r#"SELECT count(1) AS count_star, count("warehouse".w_id) AS count_w_id, min("warehouse".w_id) AS min_w_id, max("warehouse".w_id) AS max_w_id, sum("warehouse".w_id) AS sum_w_id FROM "warehouse""#;
+    const CUSTOMER: &str = r#"SELECT count(1) AS count_star, count(customer.c_id) AS count_c_id, min(customer.c_id) AS min_c_id, max(customer.c_id) AS max_c_id, sum(customer.c_id) AS sum_c_id FROM "public".customer"#;
+    const EMPTY: &str = "SELECT count(1) AS count_star FROM empty_cols";
 }
