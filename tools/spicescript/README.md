@@ -38,10 +38,15 @@ The scripts live in `test/spicescript/`; see its README for their layout.
 
 ## Running
 
+`testoperator script` takes the same arguments and runs the same code: this crate is
+a library that both binaries call.
+
 ```bash
 cargo build -p spicescript
 # Every script in a directory, against the installed spiced (~/.spice/bin/spiced):
 target/debug/spicescript test/spicescript
+# The same, through testoperator:
+target/debug/testoperator script test/spicescript
 # The whole suite, eight spiced processes at a time:
 target/debug/spicescript --jobs 8 --spiced trunk=target/release/spiced test/spicescript
 # One script, against two builds; they must agree:

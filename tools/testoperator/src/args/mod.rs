@@ -60,6 +60,10 @@ pub enum Commands {
     Export(TestCommands),
     /// Dispatch a number of tests in GitHub Actions
     Dispatch(DispatchArgs),
+    /// Run scenario scripts: YAML files that start their sources and spiced,
+    /// change things while it runs, and check every answer against an oracle
+    /// (see tools/spicescript/README.md)
+    Script(spicescript::Args),
 }
 
 #[derive(Subcommand)]

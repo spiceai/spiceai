@@ -21986,6 +21986,7 @@ dependencies = [
  "serde_json",
  "spiceai",
  "spicepod",
+ "spicescript",
  "system-adapter-protocol",
  "test-framework",
  "tokio",
