@@ -4,9 +4,14 @@ on:
   schedule:
     # htap-sf1000-adaptive, every 8 hours (0000, 0800, 1600) — the high-value SF1000 adaptive
     # configs (mysql + postgres, which also run the Cayenne datalake tier) for frequent adaptive
-    # trend data (spiceai-dev-xlarge-runners). That is 6 runs/day on the serialized SF1000
-    # xlarge queue at a 30-minute HTAP window, leaving slack for slow arms.
+    # trend data (spiceai-dev-xlarge-runners). With the daily batch below that is 7 runs/day on
+    # the serialized SF1000 xlarge queue at a 30-minute HTAP window, leaving slack for slow arms.
     - cron: '0 */8 * * *'
+    # htap-sf1000-vnext, once daily (0400) on the xlarge pool: the postgres adaptive config with
+    # `runtime.params.cayenne_vnext: enabled` (the object-native Cayenne metastore), on the same
+    # trunk commit as the 0000 sf1000-adaptive batch, whose postgres arm is its SQLite baseline.
+    # 0400 sits after the 0000 batch so it usually starts on an idle slot.
+    - cron: '0 4 * * *'
     # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners).
     # SF1 uses a different runner pool and a unique concurrency group, so it does not serialize
     # with the SF1000 xlarge queue.
@@ -34,6 +39,7 @@ on:
           - 'sf10'
           - 'sf100'
           - 'sf1000-adaptive'
+          - 'sf1000-vnext'
           - 'sf1-source-versions'
           - 'sf1-layouts'
 
@@ -111,6 +117,7 @@ jobs:
           if [ -z "$SF" ]; then
             case "${{ github.event.schedule }}" in
               '0 */8 * * *')                  SF=sf1000-adaptive ;;
+              '0 4 * * *')                    SF=sf1000-vnext ;;
               '0 6,18 * * *')                 SF=sf1 ;;
               '0 2 * * 0')                    SF=sf1-source-versions ;;
               '0 3 * * 0')                    SF=sf1-layouts ;;
