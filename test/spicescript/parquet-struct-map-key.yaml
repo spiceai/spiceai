@@ -29,8 +29,9 @@ spicepod:
     - from: 'file:${instance.dir}/som.parquet'
       name: t
       params: { file_format: parquet }
-    # Files whose `som` structs differ: `b.parquet` lacks `n`, so the
-    # scan casts its struct to the table's before the lookup.
+    # Files whose `som` structs differ: `data_0.parquet` lacks `n`. The
+    # table schema comes from `z.parquet`, written last, so it keeps `n` and
+    # the scan casts `data_0.parquet`'s struct to it before the lookup.
     - from: 'file:${instance.dir}/evo/'
       name: evo
       params: { file_format: parquet }
@@ -50,18 +51,18 @@ steps:
       src: |
         COPY (
           SELECT * FROM (VALUES
-            (0, {'mm': MAP {'k': 1}, 'n': 5}),
-            (1, {'mm': MAP {'j': 2}, 'n': 6})
+            (2, {'mm': MAP {'k': 1}}),
+            (3, {'mm': MAP {'k': 3}})
           ) AS v(id, som)
         ) TO '${instance.dir}/evo' (FORMAT parquet, PER_THREAD_OUTPUT true);
   - source-exec:
       src: |
         COPY (
           SELECT * FROM (VALUES
-            (2, {'mm': MAP {'k': 1}}),
-            (3, {'mm': MAP {'k': 3}})
+            (0, {'mm': MAP {'k': 1}, 'n': 5}),
+            (1, {'mm': MAP {'j': 2}, 'n': 6})
           ) AS v(id, som)
-        ) TO '${instance.dir}/evo/b.parquet' (FORMAT parquet);
+        ) TO '${instance.dir}/evo/z.parquet' (FORMAT parquet);
   - start: {}
 
   # Pin the lookup inside the Parquet scan's projection: a lookup evaluated
