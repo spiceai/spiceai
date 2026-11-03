@@ -1,4 +1,22 @@
 {
+  "postgres-upgrade": [
+    {
+      "run": "postgres-upgrade[from=2.3.x]",
+      "who": "default",
+      "key": "query: SELECT sum(balance) AS total FROM accounts #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"total\", row_number: 1, expected: \"\\\"17750.00\\\"\", actual: \"\\\"12750.00\\\"\" }",
+      "group": "write-back"
+    },
+    {
+      "run": "postgres-upgrade[from=2.3.x]",
+      "who": "default",
+      "key": "source-query: {\"src\":\"SELECT sum(balance) FROM accounts\"} #2",
+      "kind": "other",
+      "signature": "the source answered [[Some(\"12750.00\")]], expected [[Some(\"17750.00\")]]",
+      "group": "write-back"
+    }
+  ],
   "postgres-write-back-pending-across-rebuild": [
     {
       "run": "postgres-write-back-pending-across-rebuild",

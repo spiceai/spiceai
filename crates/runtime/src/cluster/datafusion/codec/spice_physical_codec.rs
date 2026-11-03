@@ -18,7 +18,6 @@ use crate::Runtime;
 use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
 use arrow_schema::Schema;
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
-#[cfg(not(windows))]
 use cayenne::provider::CayenneAccelerationExec;
 use data_components::http::provider::{HttpExec, HttpTableProvider};
 use data_connector_api::listing::{
@@ -35,10 +34,8 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_expr::ScalarUDF;
 use datafusion_proto::bytes::Serializeable;
 use datafusion_proto::generated::datafusion_common;
-#[cfg(not(windows))]
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::physical_plan::{PhysicalExtensionCodec, PhysicalProtoConverterExtension};
-#[cfg(not(windows))]
 use datafusion_proto::protobuf::PhysicalPlanNode;
 use iceberg_datafusion::IcebergTableProvider;
 use prost::Message;
@@ -133,18 +130,9 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                 )
                 .fallback_to_new_context(),
             )),
-            Some(spice_physical_plan_node::Node::CayenneAcceleration(_)) => {
-                #[cfg(not(windows))]
-                {
-                    Ok(Arc::new(CayenneAccelerationExec::new(Arc::clone(
-                        &inputs[0],
-                    ))))
-                }
-                #[cfg(windows)]
-                {
-                    exec_err!("CayenneAccelerationExec is not supported on Windows")
-                }
-            }
+            Some(spice_physical_plan_node::Node::CayenneAcceleration(_)) => Ok(Arc::new(
+                CayenneAccelerationExec::new(Arc::clone(&inputs[0])),
+            )),
             Some(spice_physical_plan_node::Node::Udtf(node)) => {
                 // Decode the UdtfExec by re-invoking the UDTF
                 let runtime = self.runtime()?;
@@ -334,7 +322,6 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                 )))
             }
             None => {
-                #[cfg(not(windows))]
                 if let Ok(plan) = Self::try_decode_nested_physical_plan(buf, ctx) {
                     return Ok(plan);
                 }
@@ -485,21 +472,14 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                     },
                 )),
             }
+        } else if node.is::<CayenneAccelerationExec>() {
+            SpicePhysicalPlanNode {
+                node: Some(spice_physical_plan_node::Node::CayenneAcceleration(
+                    CayenneAccelerationExecNode {},
+                )),
+            }
         } else {
-            #[cfg(not(windows))]
-            if node.is::<CayenneAccelerationExec>() {
-                SpicePhysicalPlanNode {
-                    node: Some(spice_physical_plan_node::Node::CayenneAcceleration(
-                        CayenneAccelerationExecNode {},
-                    )),
-                }
-            } else {
-                return self.inner.try_encode(node, buf, proto_converter);
-            }
-            #[cfg(windows)]
-            {
-                return self.inner.try_encode(node, buf, proto_converter);
-            }
+            return self.inner.try_encode(node, buf, proto_converter);
         };
 
         wrapper
@@ -649,7 +629,6 @@ fn decode_partitioning(partitioning: Option<&IcebergPartitioning>) -> Result<Par
     })
 }
 
-#[cfg(not(windows))]
 impl SpicePhysicalCodec {
     fn try_decode_nested_physical_plan(
         buf: &[u8],
@@ -667,7 +646,6 @@ impl SpicePhysicalCodec {
 }
 
 #[cfg(test)]
-#[cfg(not(windows))]
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};

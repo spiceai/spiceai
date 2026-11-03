@@ -40,7 +40,6 @@ on:
           - 'sqlite'
           - 'postgresql'
           - 'mysql'
-          - 'dremio'
           - 'odbc-athena'
           - 'odbc-databricks'
           - 'oracle'
@@ -133,6 +132,10 @@ jobs:
         uses: ./.github/actions/setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
+
+      # testoperator generates and checks its data with the DuckDB library installed on the host.
+      - name: Set up libduckdb
+        uses: ./.github/actions/setup-libduckdb
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator

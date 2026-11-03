@@ -98,7 +98,6 @@ const CATEGORIES_CSV: &str = r"id,category,rating
 /// in-process executors for this test, using an isolated temporary directory
 /// per test run to avoid interference with other tests.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
@@ -192,7 +191,7 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
 #[tokio::test(flavor = "multi_thread")]
 // Builds a DuckDB file to federate over, so it needs the optional `duckdb`
 // dependency this crate only carries under its own feature.
-#[cfg(all(not(target_os = "windows"), feature = "duckdb"))]
+#[cfg(feature = "duckdb")]
 async fn cluster_distributes_accelerated_table_with_federated_source() -> Result<(), anyhow::Error>
 {
     let _ = tracing_subscriber::fmt()
@@ -300,7 +299,6 @@ async fn cluster_distributes_accelerated_table_with_federated_source() -> Result
 /// the source instead of distributing. This is identical to `bucket_partitioning_plan` EXCEPT
 /// the dataset has a column description.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn cluster_distributes_accelerated_table_with_column_metadata() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=info,warn"))
@@ -388,7 +386,6 @@ async fn cluster_distributes_accelerated_table_with_column_metadata() -> Result<
 /// A query on the table must fail: the scheduler holds none of the data, and an answer from
 /// the assigned partition alone would be wrong.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn query_fails_when_a_partition_has_no_ready_executor() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=info,warn"))
@@ -476,7 +473,6 @@ async fn query_fails_when_a_partition_has_no_ready_executor() -> Result<(), anyh
 /// - Full SELECT returns all 10 rows without duplicates
 /// - COUNT/AVG aggregations produce correct results
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
@@ -598,7 +594,6 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
 /// - `WHERE score > 85` appears in the `FlightSqlExec` sql string in the EXPLAIN plan
 /// - Only rows matching the predicate are returned (5 rows: ids 2,4,6,8,10)
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
@@ -668,7 +663,6 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
 /// Test that `ORDER BY col LIMIT N` is pushed down into each executor's `FlightSqlExec`
 /// so each partition returns at most N rows (`TopK`)
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_acceleration_order_by_limit_pushdown() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
@@ -769,7 +763,6 @@ async fn test_distributed_acceleration_order_by_limit_pushdown() -> Result<(), a
 ///    executor[1]
 /// 5. Verify queries still return all 10 rows
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Result<(), anyhow::Error>
 {
     let _ = tracing_subscriber::fmt()
@@ -863,7 +856,6 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
 /// - JOIN returns the expected 10 rows with correct column values from both tables
 /// - EXPLAIN plan reflects the distributed scatter-gather for both tables
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
@@ -987,7 +979,6 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
 /// - Executors receive the `RefreshDataset` command and trigger a local refresh
 /// - Data remains correct after the distributed refresh
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
@@ -1076,7 +1067,6 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
 /// 2. After refresh: partition store has 11 partition values (new city discovered + assigned)
 /// 3. All 11 rows are queryable
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
 async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=debug,info"))

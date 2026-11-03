@@ -1,0 +1,54 @@
+name: append-upsert-same-time
+description: >
+  Known failing (#15542): an append refresh into an acceleration that upserts on a
+  primary key alternates between two versions of a key that share one time. The
+  source holds both versions; each append refresh reads the rows at the stored
+  maximum time again and drops only the stored copy, so the version left over
+  overwrites it, and the next refresh with nothing new swaps them back. DuckDB and
+  SQLite show it; Cayenne keeps the latest version, ordering versions by time.
+sources:
+  src: { kind: postgres }
+variants:
+  duckdb: {}
+  sqlite: { datasets: { events: { acceleration: { engine: sqlite } } } }
+  cayenne: { datasets: { events: { acceleration: { engine: cayenne, mode: file } } } }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: append-upsert-same-time
+  datasets:
+    - from: postgres:public.events
+      name: events
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: iso8601
+      acceleration:
+        enabled: true
+        engine: duckdb
+        refresh_mode: append
+        refresh_check_interval: 1h
+        primary_key: id
+        on_conflict: { id: upsert }
+defaults:
+  # The engines differ by design here, so agreement between them proves nothing.
+  compare-variants: false
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE events (id int, ts text, v text);
+        INSERT INTO events VALUES (1, '2031-05-01T10:00:05Z', 'old'), (2, '2031-05-01T10:00:00Z', 'other');
+  - start: {}
+  - query: SELECT id, ts, v FROM events ORDER BY id
+    expect: { rows: [["1", "2031-05-01T10:00:05Z", "old"], ["2", "2031-05-01T10:00:00Z", "other"]] }
+  # A second version of key 1 at the same time as the stored one.
+  - source-exec: { src: "INSERT INTO events VALUES (1, '2031-05-01T10:00:05Z', 'new')" }
+  - refresh: events
+  - query: SELECT id, ts, v FROM events ORDER BY id
+    expect: { rows: [["1", "2031-05-01T10:00:05Z", "new"], ["2", "2031-05-01T10:00:00Z", "other"]] }
+  # Refreshes with nothing new keep it.
+  - refresh: events
+  - query: SELECT id, ts, v FROM events ORDER BY id
+    expect: { rows: [["1", "2031-05-01T10:00:05Z", "new"], ["2", "2031-05-01T10:00:00Z", "other"]] }
+  - refresh: events
+  - query: SELECT id, ts, v FROM events ORDER BY id
+    expect: { rows: [["1", "2031-05-01T10:00:05Z", "new"], ["2", "2031-05-01T10:00:00Z", "other"]] }

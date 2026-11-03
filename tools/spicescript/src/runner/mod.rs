@@ -313,9 +313,11 @@ pub struct Target {
 
 pub struct Options {
     pub targets: Vec<Target>,
-    /// The binary every instance starts on; an `upgrade` step moves it to
-    /// its target's.
-    pub from: Option<PathBuf>,
+    /// `--from`: the binary every instance starts on, in place of any
+    /// script's `from:`; an `upgrade` step moves it to its target's.
+    pub from_override: Option<PathBuf>,
+    /// Each rendered `from:` of the selected runs, with its release and binary.
+    pub releases: BTreeMap<String, crate::release::BaseRelease>,
     /// Run every instance as a cluster scheduler with one executor.
     pub cluster: bool,
     pub work_dir: PathBuf,
@@ -425,6 +427,7 @@ struct Instance {
     spiced: Spiced,
     /// The binary under test, which an `upgrade` step starts.
     target_binary: PathBuf,
+    base_release: Option<crate::release::BaseRelease>,
     /// The cluster executors started beside `spiced` (by `--cluster`,
     /// `defaults.cluster` or `defaults.executor-args`), spares last.
     executors: Vec<Spiced>,
@@ -627,6 +630,15 @@ async fn run_combination(
     run_label: &str,
     report: &mut Report,
 ) -> Result<()> {
+    if options.from_override.is_none()
+        && let Some(from) = script.render_from(combo)?
+    {
+        let release = options
+            .releases
+            .get(&from)
+            .context("base release was not fetched")?;
+        say!("   from   v{} ({from})", release.version);
+    }
     // The steps of this matrix combination.
     let steps: Vec<Step> = script
         .steps
@@ -654,6 +666,7 @@ async fn run_combination(
     };
     let result = async {
         let matrix_ctx = json!({ "matrix": combo });
+        let mut resolved = Vec::new();
         for (name, spec) in &script.sources {
             let kind = template::substitute_text(&spec.kind, &matrix_ctx)?;
             let version = spec
@@ -661,6 +674,17 @@ async fn run_combination(
                 .as_deref()
                 .map(|v| template::substitute_text(v, &matrix_ctx))
                 .transpose()?;
+            resolved.push((name, spec, kind, version));
+        }
+        let mut duckdb_releases = Vec::new();
+        for (name, _, kind, version) in &resolved {
+            if matches!(kind.as_str(), "duckdb" | "ducklake") {
+                let release = source::duckdb_cli::version(version.as_deref())?;
+                duckdb_releases.push(((*name).clone(), kind.clone(), release));
+            }
+        }
+        one_duckdb_release(&duckdb_releases)?;
+        for (name, spec, kind, version) in resolved {
             let src = source::start(
                 name,
                 run_id,
@@ -906,6 +930,20 @@ async fn create_instances(
     } else {
         &script.variants
     };
+    let base_release = if options.from_override.is_none() {
+        script
+            .render_from(combo)?
+            .map(|from| {
+                options
+                    .releases
+                    .get(&from)
+                    .context("base release was not fetched")
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let release_binary = base_release.map(|release| &release.binary);
     let mut instances = Vec::new();
     for target in &options.targets {
         for (variant_name, variant) in variants {
@@ -962,6 +1000,12 @@ async fn create_instances(
                     .as_ref()
                     .is_some_and(|c| c.containers);
             if cluster {
+                if spicepod.pointer("/runtime/mode").and_then(Value::as_str) == Some("sidecar") {
+                    say!(
+                        "   skip {label:<20} runtime.mode: sidecar does not run as a cluster node"
+                    );
+                    continue;
+                }
                 if let Some(engine) = undistributed_engine(&spicepod) {
                     // A cluster accelerates only into Cayenne and Arrow.
                     say!("   skip {label:<20} the '{engine}' engine does not run in a cluster");
@@ -983,12 +1027,46 @@ async fn create_instances(
             let spicepod_yaml = yaml::to_string(&spicepod)?;
             let spicepod = spicepod.clone();
             let mut env = variant.env.clone();
+            // DuckDB sources install the library matching the CLI. Make it
+            // discoverable by name without changing the harness environment.
+            for entry in context["sources"]
+                .as_object()
+                .into_iter()
+                .flat_map(|sources| sources.values())
+            {
+                if let Some(dir) = entry.get("library_dir").and_then(Value::as_str) {
+                    let key = if cfg!(target_os = "macos") {
+                        "DYLD_FALLBACK_LIBRARY_PATH"
+                    } else {
+                        "LD_LIBRARY_PATH"
+                    };
+                    let previous = env.get(key).cloned().or_else(|| std::env::var(key).ok());
+                    let mut paths = vec![PathBuf::from(dir)];
+                    if let Some(previous) = previous {
+                        paths.extend(std::env::split_paths(&previous));
+                    } else if cfg!(target_os = "macos") {
+                        // Setting DYLD_FALLBACK_LIBRARY_PATH replaces its defaults.
+                        if let Some(home) = std::env::var_os("HOME") {
+                            paths.push(PathBuf::from(home).join("lib"));
+                        }
+                        paths.extend([PathBuf::from("/usr/local/lib"), PathBuf::from("/usr/lib")]);
+                    }
+                    env.insert(
+                        key.into(),
+                        std::env::join_paths(paths)?.into_string().map_err(|_| {
+                            anyhow::anyhow!("DuckDB library search path is not UTF-8")
+                        })?,
+                    );
+                }
+            }
             // Spice derives replication slot names from this, so instances
             // sharing a source do not take each other's slots.
             env.insert("SPICE_INSTANCE_ID".into(), format!("{run_id}-{index}"));
             let first_binary = options
-                .from
-                .clone()
+                .from_override
+                .as_ref()
+                .or(release_binary)
+                .cloned()
                 .unwrap_or_else(|| target.binary.clone());
             let executor_count = script.defaults.cluster.as_ref().map_or(1, |c| c.executors);
             let spare_count = script.defaults.cluster.as_ref().map_or(0, |c| c.spare);
@@ -1067,6 +1145,7 @@ async fn create_instances(
                 variant: variant_name.clone(),
                 spiced,
                 target_binary: target.binary.clone(),
+                base_release: base_release.cloned(),
                 active_executors: executors.len().saturating_sub(spare_count),
                 executors,
                 spicepod_yaml,
@@ -1123,8 +1202,8 @@ async fn run_lockstep(
                 }),
         )
         .await;
-        for (instance, outcome) in outcomes {
-            note_broken(instance, step, &outcome);
+        for (instance, mut outcome) in outcomes {
+            note_broken(instance, step, &mut outcome).await;
             record(report, run_label, &instance.label, step, outcome);
         }
     }
@@ -1142,12 +1221,12 @@ async fn run_sequential(
         if instance.broken.is_some() || !applies(step, instance) {
             continue;
         }
-        let outcome = if is_source_step(&step.action) {
+        let mut outcome = if is_source_step(&step.action) {
             run_source_step(&step.action, sources).await
         } else {
             run_instance_step(script, instance, step, sources).await
         };
-        note_broken(instance, step, &outcome);
+        note_broken(instance, step, &mut outcome).await;
         record(report, run_label, &instance.label, step, outcome);
     }
 }
@@ -1194,14 +1273,14 @@ async fn run_independent(
                 if instance.broken.is_some() || !applies(step, instance) {
                     continue;
                 }
-                let outcome = match &step.action {
+                let mut outcome = match &step.action {
                     Action::Sleep(d) => {
                         tokio::time::sleep(*d).await;
                         Ok(String::new())
                     }
                     _ => run_instance_step(script, instance, step, sources).await,
                 };
-                note_broken(instance, step, &outcome);
+                note_broken(instance, step, &mut outcome).await;
                 record(&mut part, run_label, &instance.label, step, outcome);
             }
             stop_processes(instance).await;
@@ -1251,19 +1330,68 @@ fn applies(step: &Step, instance: &Instance) -> bool {
 /// A failed lifecycle step leaves `spiced` in an unknown state, so the
 /// instance's remaining steps are skipped. Any other failed step is a failed
 /// check, and the script goes on.
-fn note_broken(instance: &mut Instance, step: &Step, outcome: &Result<String>) {
-    if let Err(e) = outcome
-        && matches!(
-            step.action,
-            Action::Start { .. }
-                | Action::Stop
-                | Action::Kill { .. }
-                | Action::Restart { .. }
-                | Action::WaitReady { .. }
-        )
+async fn note_broken(instance: &mut Instance, step: &Step, outcome: &mut Result<String>) {
+    let lifecycle = matches!(
+        step.action,
+        Action::Start { .. }
+            | Action::Stop
+            | Action::Kill { .. }
+            | Action::Restart { .. }
+            | Action::WaitReady { .. }
+    );
+    if outcome.is_ok() && matches!(step.action, Action::Start { .. } | Action::Restart { .. }) {
+        if let Err(error) = check_base_release_features(instance).await {
+            *outcome = Err(error);
+        }
+    } else if lifecycle
+        && instance.spiced.binary != instance.target_binary
+        && let Some(release) = &instance.base_release
+        && let Some(error) = outcome.as_ref().err()
     {
-        instance.broken = Some(format!("step {}: {e:#}", step.index));
+        *outcome = Err(anyhow::anyhow!(
+            "{error:#} (on base release v{})",
+            release.version
+        ));
     }
+    if lifecycle && let Err(error) = outcome {
+        instance.broken = Some(format!("step {}: {error:#}", step.index));
+    }
+}
+
+async fn check_base_release_features(instance: &Instance) -> Result<()> {
+    if instance.spiced.binary == instance.target_binary {
+        return Ok(());
+    }
+    let Some(release) = &instance.base_release else {
+        return Ok(());
+    };
+    for spiced in std::iter::once(&instance.spiced)
+        .chain(instance.executors.iter().take(instance.active_executors))
+    {
+        let path = spiced.log_path();
+        let log = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        if let Some(message) = base_release_feature_gap(&log, &release.version, &release.spec) {
+            bail!("{message}");
+        }
+    }
+    Ok(())
+}
+
+fn base_release_feature_gap(log: &str, version: &str, spec: &str) -> Option<String> {
+    let text = checks::strip_ansi(log);
+    let line = text
+        .lines()
+        .find(|line| line.contains("included in the Enterprise distribution of Spice.ai"))?
+        .trim();
+    let line = line
+        .split_once(char::is_whitespace)
+        .filter(|(timestamp, _)| chrono::DateTime::parse_from_rfc3339(timestamp).is_ok())
+        .map_or(line, |(_, rest)| rest.trim_start());
+    Some(format!(
+        "base release v{version} (from: {spec}) lacks a feature this script uses; it logged: {line}. OSS release builds have only the `release` and `models` features, so a script that needs another (such as `snapshots`) cannot upgrade from a release; pass --from with a build that has it."
+    ))
 }
 
 fn record(report: &mut Report, run_label: &str, who: &str, step: &Step, outcome: Result<String>) {
@@ -1306,6 +1434,21 @@ fn record(report: &mut Report, run_label: &str, who: &str, step: &Step, outcome:
 /// How a dataset names table `t` of a source of this kind: `from:
 /// <prefix>t<suffix>`, plus whether it is a directory of files (which then
 /// needs a `file_format`), so one spicepod line serves a matrix over sources.
+/// `spiced` loads one `DuckDB` library, so the `duckdb` and `ducklake` sources of
+/// one run must use the same release. Each entry is a source's name, kind and
+/// resolved release.
+fn one_duckdb_release(sources: &[(String, String, String)]) -> Result<()> {
+    let Some((first, first_kind, release)) = sources.first() else {
+        return Ok(());
+    };
+    if let Some((name, kind, other)) = sources.iter().find(|(_, _, r)| r != release) {
+        anyhow::bail!(
+            "Sources '{first}' ({first_kind}) and '{name}' ({kind}) use DuckDB {release} and {other}, but spiced loads one DuckDB library. Give them the same `version`, or remove both to use --duckdb-version or the newest release in test/duckdb_versions.json."
+        );
+    }
+    Ok(())
+}
+
 fn table_from(kind: &str, entry: &Map<String, Value>) -> (String, String, bool) {
     let field = |key: &str| entry.get(key).and_then(Value::as_str).unwrap_or_default();
     match kind {
@@ -1316,7 +1459,7 @@ fn table_from(kind: &str, entry: &Map<String, Value>) -> (String, String, bool) 
             false,
         ),
         "mongodb" => ("mongodb:".into(), String::new(), false),
-        "mysql" | "clickhouse" => (format!("{kind}:"), String::new(), false),
+        "mysql" | "clickhouse" | "duckdb" => (format!("{kind}:"), String::new(), false),
         "ducklake" => ("ducklake:main.".into(), String::new(), false),
         "iceberg" => (
             format!(
@@ -1602,6 +1745,7 @@ mod table_from_tests {
         assert_eq!(named("dynamodb"), ("dynamodb:i0_x_t".into(), false));
         assert_eq!(named("mysql"), ("mysql:t".into(), false));
         assert_eq!(named("clickhouse"), ("clickhouse:t".into(), false));
+        assert_eq!(named("duckdb"), ("duckdb:t".into(), false));
         assert_eq!(named("ducklake"), ("ducklake:main.t".into(), false));
         assert_eq!(
             named("iceberg"),
@@ -1612,5 +1756,45 @@ mod table_from_tests {
         );
         assert_eq!(named("rustfs"), ("s3://b/t/".into(), true));
         assert_eq!(named("files"), ("file:///d/t/".into(), true));
+    }
+
+    #[test]
+    fn duckdb_sources_of_one_run_use_one_release() {
+        let source = |name: &str, kind: &str, release: &str| {
+            (name.to_string(), kind.to_string(), release.to_string())
+        };
+        one_duckdb_release(&[]).expect("no DuckDB sources");
+        one_duckdb_release(&[
+            source("src", "duckdb", "2.0.0"),
+            source("lake", "ducklake", "2.0.0"),
+        ])
+        .expect("one release");
+        assert_eq!(
+            one_duckdb_release(&[
+                source("src", "duckdb", "2.0.0"),
+                source("lake", "ducklake", "1.5.6")
+            ])
+            .expect_err("two releases")
+            .to_string(),
+            "Sources 'src' (duckdb) and 'lake' (ducklake) use DuckDB 2.0.0 and 1.5.6, but spiced loads one DuckDB library. Give them the same `version`, or remove both to use --duckdb-version or the newest release in test/duckdb_versions.json."
+        );
+    }
+}
+
+#[cfg(test)]
+mod base_release_tests {
+    use super::base_release_feature_gap;
+
+    #[test]
+    fn enterprise_warning_names_the_release_feature_and_override() {
+        let log = "2026-10-27T12:34:56.123Z INFO runtime: Starting Spice.ai\n2026-10-27T12:34:56.456Z \x1b[33mWARN\x1b[0m runtime_acceleration::snapshot::behavior: Acceleration Snapshots are included in the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise\n2026-10-27T12:34:56.789Z WARN runtime: Other features are included in the Enterprise distribution of Spice.ai\n";
+        assert_eq!(
+            base_release_feature_gap(log, "2.4.0", "2.4.x"),
+            Some("base release v2.4.0 (from: 2.4.x) lacks a feature this script uses; it logged: WARN runtime_acceleration::snapshot::behavior: Acceleration Snapshots are included in the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise. OSS release builds have only the `release` and `models` features, so a script that needs another (such as `snapshots`) cannot upgrade from a release; pass --from with a build that has it.".to_string())
+        );
+        assert_eq!(
+            base_release_feature_gap("INFO runtime: ready", "2.4.0", "2.4.x"),
+            None
+        );
     }
 }

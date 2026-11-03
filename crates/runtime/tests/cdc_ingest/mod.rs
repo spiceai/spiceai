@@ -404,7 +404,6 @@ const CAYENNE_MEMORY_TABLE: &str = "orders_cayenne_memory";
 /// `crates/runtime/tests/acceleration/cayenne_memory.rs`, where the equivalent
 /// negative control does flip.
 #[tokio::test]
-#[cfg(not(target_os = "windows"))]
 async fn cdc_ingest_delete_removes_a_cayenne_memory_mode_row() -> anyhow::Result<()> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 

@@ -416,6 +416,21 @@ jobs:
       - build
       - setup-model-matrix
     if: ${{ needs.setup-model-matrix.outputs.matrix != '[]' }}
+    # Holds the OpenAI workload identity federation IDs (`OPENAI_*` secrets).
+    environment: ci
+    permissions:
+      contents: read
+      actions: read
+      # The Spicepod's `github:` dataset reads this repository's issues with `GITHUB_TOKEN`.
+      issues: read
+      pull-requests: read
+      # Exchanged for OpenAI access tokens: workload identity federation.
+      id-token: write
+    env:
+      # Workload identity federation: spiced and the tests exchange this job's GitHub OIDC token
+      # for provider access tokens with these IDs, and exchange again before each expires.
+      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
     strategy:
       fail-fast: false
       matrix:
@@ -451,7 +466,6 @@ jobs:
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
@@ -660,7 +674,6 @@ jobs:
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
@@ -1045,18 +1058,6 @@ jobs:
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
             { engine: cayenne, mode: file },
-            {
-              engine: postgres,
-              params:
-                {
-                  pg_host: localhost,
-                  pg_port: 5432,
-                  pg_db: testdb_acc,
-                  pg_user: postgres,
-                  pg_pass: postgres,
-                  pg_sslmode: disable,
-                },
-            },
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
@@ -1074,13 +1075,6 @@ jobs:
         run: |
           psql -h localhost -U postgres -d testdb < test/scripts/setup-data-postgresql.sql
           psql -h localhost -U postgres -d testdb -c 'SELECT * FROM test_postgresql_table;'
-
-      - name: Create Postgres Accelerator Test Database
-        if: matrix.acceleration.engine == 'postgres'
-        env:
-          PGPASSWORD: postgres
-        run: |
-          createdb -h localhost -U postgres testdb_acc
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -1225,29 +1219,11 @@ jobs:
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
             { engine: cayenne, mode: file },
-            {
-              engine: postgres,
-              params:
-                {
-                  pg_host: localhost,
-                  pg_port: 5432,
-                  pg_db: testdb,
-                  pg_user: postgres,
-                  pg_pass: postgres,
-                  pg_sslmode: disable,
-                },
-            },
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install PostgreSQL
-        if: matrix.acceleration.engine == 'postgres'
-        uses: ./.github/actions/install-postgres
-        with:
-          pg-db: testdb
 
       - name: Configure apt mirrors (Linux)
         if: matrix.target.target_os == 'linux'
@@ -1611,6 +1587,10 @@ jobs:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
+      # duckdb: datasets load the DuckDB library installed on the host.
+      - name: Set up libduckdb
+        uses: ./.github/actions/setup-libduckdb
+
       - name: Install Spice
         uses: ./.github/actions/install-spice
         with:
@@ -1667,14 +1647,12 @@ jobs:
       matrix:
         acceleration: [
             { engine: arrow, mode: memory },
+            { engine: cayenne, mode: memory },
             { engine: cayenne, mode: file },
             { engine: duckdb, mode: memory },
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: memory },
             { engine: sqlite, mode: file },
-            { engine: turso, mode: memory },
-            { engine: turso, mode: file },
-            # { engine: postgres},
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
@@ -2553,6 +2531,10 @@ jobs:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
+      # duckdb: datasets load the DuckDB library installed on the host.
+      - name: Set up libduckdb
+        uses: ./.github/actions/setup-libduckdb
+
       - name: Install spice
         uses: ./.github/actions/install-spice
         with:
@@ -2772,6 +2754,10 @@ jobs:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
+      # duckdb: datasets load the DuckDB library installed on the host.
+      - name: Set up libduckdb
+        uses: ./.github/actions/setup-libduckdb
+
       - name: Install spice
         uses: ./.github/actions/install-spice
         with:
@@ -2941,6 +2927,10 @@ jobs:
           # change in how a bug shows also fails the job.
           - { name: 'spicescript: known failing (1/2)', partition: 1/2, args: --max-wait 30s test/spicescript/known-failing }
           - { name: 'spicescript: known failing (2/2)', partition: 2/2, args: --max-wait 30s test/spicescript/known-failing }
+          # The shards above read DuckDB and DuckLake sources with the newest
+          # release test/duckdb_versions.json lists; this one runs the scripts
+          # with DuckDB sources again on each older listed release.
+          - { name: 'spicescript: older DuckDB releases', partition: 1/1, older_duckdb: true }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -2971,7 +2961,7 @@ jobs:
       # Sources run in containers; log in so image pulls are not rate limited.
       - name: Login to DockerHub
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -3003,7 +2993,14 @@ jobs:
             --spiced "$(command -v spiced)" \
             --work-dir "$RUNNER_TEMP/spicescript/harness-checks"
 
+      # Upgrade scripts start on the release their `from:` names and upgrade
+      # to this build: spicescript resolves `X.Y.x` against the GitHub releases
+      # and downloads each release it needs into ~/.cache/spicescript, so no
+      # `--from` is passed here. The token is for the releases API's rate limit.
       - name: Run scenario scripts
+        if: ${{ !matrix.older_duckdb }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           "${{ steps.spicescript.outputs.path }}" --jobs 4 \
             --partition ${{ matrix.partition }} \
@@ -3014,6 +3011,36 @@ jobs:
             --log-capture "$RUNNER_TEMP/spicescript-logs" \
             ${{ matrix.args }}
 
+      # The combinations whose source is DuckDB or DuckLake (matrix keys
+      # backend, src and source), then the DuckDB and DuckLake scripts without
+      # such a key, on each older listed release.
+      - name: Run DuckDB scripts on older DuckDB releases
+        if: ${{ matrix.older_duckdb }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          status=0
+          for version in $(jq -r '.versions[:-1][].version' test/duckdb_versions.json); do
+            for args in "--matrix backend=duckdb test/spicescript" \
+              "--matrix src=duckdb test/spicescript" \
+              "--matrix source=duckdb test/spicescript" \
+              "--matrix backend=ducklake test/spicescript" \
+              "--matrix src=ducklake test/spicescript" \
+              "--matrix source=ducklake test/spicescript" \
+              "test/spicescript/adbc-duckdb-catalog.yaml test/spicescript/ducklake-coverage.yaml test/spicescript/ducklake-refresh.yaml"; do
+              # shellcheck disable=SC2086 # args holds several words
+              "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+                --duckdb-version "$version" \
+                --spiced "$(command -v spiced)" \
+                --spice-cli "$(command -v spice)" \
+                --work-dir "$RUNNER_TEMP/spicescript" \
+                --results "$RUNNER_TEMP/spicescript-results-duckdb-$version-$((++run)).json" \
+                --log-capture "$RUNNER_TEMP/spicescript-logs" \
+                $args || status=1
+            done
+          done
+          exit $status
+
       # Every script's outcome, passes included, from every run: a script's
       # failure rate across runs is read off these rather than off job logs.
       - name: Upload script results
@@ -3021,7 +3048,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spicescript-results-${{ strategy.job-index }}
-          path: ${{ runner.temp }}/spicescript-results.json
+          path: ${{ runner.temp }}/spicescript-results*.json
           if-no-files-found: warn
           retention-days: 30
 

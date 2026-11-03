@@ -289,13 +289,6 @@ async fn sqlite_surfaces_vs_standalone_engines() {
     run("sqlite").await;
 }
 
-#[cfg(feature = "turso")]
-#[tokio::test(flavor = "multi_thread")]
-async fn turso_surfaces_vs_standalone_engines() {
-    run("turso").await;
-}
-
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn cayenne_surfaces_vs_standalone_engines() {
     run("cayenne").await;

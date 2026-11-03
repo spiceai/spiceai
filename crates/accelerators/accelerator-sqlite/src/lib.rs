@@ -54,8 +54,7 @@ use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 
 use data_accelerator_api::{
-    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator, keep_first,
-    pk_write_guard, upsert_dedup,
+    AccelerationSource, BootstrapStatus, DataAccelerator, keep_first, pk_write_guard, upsert_dedup,
 };
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_checkpoint_api::CheckpointError;
@@ -428,7 +427,6 @@ impl DataAccelerator for SqliteAccelerator {
     async fn sidecar(
         &self,
         source: &dyn AccelerationSource,
-        _registry: Arc<AcceleratorEngineRegistry>,
         open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
         let sqlite_file =
@@ -666,6 +664,10 @@ impl DataAccelerator for SqliteAccelerator {
             &cmd.constraints,
             keep_first::NanKey::Null,
         );
+
+        // SQLite evaluates the `UPDATE` and `DELETE` the writer renders.
+        let write_provider =
+            runtime_datafusion::checked_arithmetic::with_plain_arithmetic_writes(write_provider);
 
         let table_provider =
             Arc::new(PolyTableProvider::new(write_provider, read_provider)).into_table();

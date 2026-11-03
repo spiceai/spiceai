@@ -181,6 +181,14 @@ jobs:
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
       TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
+      # Workload identity federation: spiced and the tests exchange this job's GitHub OIDC token
+      # for provider access tokens with these IDs, and exchange again before each expires.
+      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+      ANTHROPIC_FEDERATION_RULE_ID: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
+      ANTHROPIC_ORGANIZATION_ID: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
+      ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+      ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
     strategy:
       # The two arms cover disjoint model sets — self-hosted local models and the hosted
       # providers — so one arm's result says nothing about the other's, and cancelling the
@@ -188,7 +196,14 @@ jobs:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
-    permissions: read-all
+    # Holds the OpenAI and Anthropic workload identity federation IDs (`OPENAI_*` and
+    # `ANTHROPIC_*` secrets).
+    environment: ci
+    permissions:
+      contents: read
+      actions: read
+      # Exchanged for OpenAI and Anthropic access tokens: workload identity federation.
+      id-token: write
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -235,8 +250,6 @@ jobs:
       - name: Run integration test
         env:
           MODEL_ALLOWLIST: ${{ matrix.target.model_allowlist }}
-          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-          SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
           # The spiceio setup action exports AWS_ENDPOINT_URL for sccache; the AWS SDK
@@ -244,12 +257,12 @@ jobs:
           # calls to the local build cache instead of AWS.
           unset AWS_ENDPOINT_URL
           if [ "${{ matrix.target.needs_env }}" == "true" ]; then
-            if [ -z "$SPICE_OPENAI_API_KEY" ]; then
-              echo "Error: 'SPICE_OPENAI_API_KEY' is not defined."
+            if [ -z "${OPENAI_IDENTITY_PROVIDER_ID:-}" ]; then
+              echo "Error: 'OPENAI_IDENTITY_PROVIDER_ID' is not defined."
               exit 1
             fi
-            if [ -z "$SPICE_ANTHROPIC_API_KEY" ]; then
-              echo "Error: 'SPICE_ANTHROPIC_API_KEY' is not defined."
+            if [ -z "${ANTHROPIC_FEDERATION_RULE_ID:-}" ]; then
+              echo "Error: 'ANTHROPIC_FEDERATION_RULE_ID' is not defined."
               exit 1
             fi
             if [ -z "$SPICE_XAI_API_KEY" ]; then
@@ -296,9 +309,9 @@ jobs:
 
   llama-cpp-engine:
     name: llama.cpp engine (Qwen3-0.6B GGUF)
-    # The engine's model and differential tests download Qwen3-0.6B (639 MB), and its MTP
-    # tests Qwen3.5-0.8B (550 MB), from Hugging Face and run them; its no-network tests run
-    # in `make nextest`.
+    # The engine's model, differential and greedy-pick tests download Qwen3-0.6B (639 MB), its
+    # MTP tests Qwen3.5-0.8B (550 MB), and its content-part tests both, from Hugging Face and run
+    # them; its no-network tests run in `make nextest`.
     if: github.event_name != 'workflow_dispatch' || inputs.run != 'hosted'
     runs-on: ${{ github.event_name == 'merge_group' && 'spiceai-macos-large' || 'spiceai-macos' }}
     # Sized like the build job above: a cold cache rebuilds llama.cpp and mistral.rs.
@@ -316,10 +329,10 @@ jobs:
       - name: Set up the C and C++ toolchain
         uses: ./.github/actions/setup-cc
 
-      - name: Run the llama.cpp engine's model, differential, MTP, prefix-reuse and unsupported-architecture tests
+      - name: Run the llama.cpp engine's model, content-part, differential, greedy-pick, Harmony, MTP, prefix-reuse, Hugging Face resolution and unsupported-architecture tests
         env:
           # Metal runners do not have `xcrun metal`
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
         run: |
-          cargo test -p llms-llamacpp --features metal --test integration -- model:: differential:: distributed:: mtp:: prefix_reuse:: unsupported::
+          cargo test -p llms-llamacpp --features metal --test integration -- model:: content_parts:: differential:: distributed:: greedy:: harmony:: mtp:: prefix_reuse:: hf_resolution:: unsupported::

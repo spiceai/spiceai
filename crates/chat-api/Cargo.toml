@@ -31,6 +31,7 @@ async-stream.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 rand.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
@@ -39,6 +40,11 @@ tracing-futures.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# Prints latency percentiles itself, so it needs no benchmark harness.
+[[bench]]
+name = "wire"
+harness = false
 
 [lints]
 workspace = true

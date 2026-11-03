@@ -18,8 +18,8 @@ limitations under the License.
 //!
 //! The `spice_sys_*` tables — CDC stream positions, the dataset schema checkpoint, the
 //! caching engine's fetch marker — live inside the dataset's own accelerator database.
-//! The per-engine SQL for them lives in the `runtime-checkpoint-{duckdb,sqlite,turso,
-//! postgres}` crates, behind [`AcceleratorSidecar`].
+//! The per-engine SQL for them lives in the `runtime-checkpoint-{duckdb,sqlite,postgres}`
+//! crates, behind [`AcceleratorSidecar`].
 //!
 //! What is left here is only the *resolution*: a dataset names an engine, the registry
 //! hands back that engine, and the engine hands back its sidecar. Nothing in this
@@ -65,9 +65,7 @@ pub async fn sidecar_for(
             source: format!("{engine} accelerator engine not available").into(),
         })?;
 
-    accelerator
-        .sidecar(source, Arc::clone(&registry), open_option)
-        .await
+    accelerator.sidecar(source, open_option).await
 }
 
 /// The dataset's sidecar, resolved from the runtime handle it carries.
