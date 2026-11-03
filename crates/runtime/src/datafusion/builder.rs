@@ -4280,7 +4280,7 @@ mod tests {
     /// Runs `NOT IN` queries whose subquery yields a NULL, then counts, over a
     /// parquet table in a session built with `eager_aggregation`. Returns whether
     /// the `count(id)` plan pre-aggregates below the join, that plan rendered, and
-    /// each query with its single formatted value (or the error it raised).
+    /// each query with every row it returned (or the error it raised).
     #[cfg(not(windows))]
     async fn count_over_a_null_aware_anti_join_on_parquet(
         eager_aggregation: bool,
@@ -4388,14 +4388,25 @@ mod tests {
             let value = match df.ctx.sql(query).await {
                 Ok(frame) => match frame.collect().await {
                     Ok(batches) => {
-                        let column = batches
-                            .iter()
-                            .find(|b| b.num_rows() > 0)
-                            .map(|b| Arc::clone(b.column(0)));
-                        match column {
-                            Some(column) => arrow::util::display::array_value_to_string(&column, 0)
-                                .expect("format the value"),
-                            None => "<no rows>".to_string(),
+                        // Every row, so a second row from an ungrouped aggregate
+                        // fails the comparison instead of passing unseen.
+                        let mut rows = Vec::new();
+                        for batch in &batches {
+                            assert_eq!(batch.num_columns(), 1, "{query} returns one column");
+                            let column = batch.column(0);
+                            for row in 0..batch.num_rows() {
+                                rows.push(if column.is_null(row) {
+                                    "NULL".to_string()
+                                } else {
+                                    arrow::util::display::array_value_to_string(column, row)
+                                        .expect("format the value")
+                                });
+                            }
+                        }
+                        if rows.is_empty() {
+                            "<no rows>".to_string()
+                        } else {
+                            rows.join(" | ")
                         }
                     }
                     Err(e) => format!("error: {e}"),
