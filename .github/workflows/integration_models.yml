@@ -615,6 +615,7 @@ jobs:
       # exchanges with STS itself. A GitHub OIDC token lives 5 minutes, which this one test
       # needs for a single exchange; STS's credentials then last the role's session.
       - name: Run a Bedrock test with web identity credentials
+        if: ${{ !cancelled() }}
         env:
           AWS_ROLE_ARN: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
           AWS_ROLE_SESSION_NAME: gha-bedrock-web-identity-${{ github.run_id }}
