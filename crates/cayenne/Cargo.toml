@@ -50,6 +50,7 @@ hash-index = { path = "../hash-index" }
 key-index = { path = "../key-index" }
 im = "15.1"
 object_store = { workspace = true }
+object_store_occ = { path = "../object_store_occ" }
 parking_lot = { workspace = true }
 roaring = { workspace = true }
 runtime-datafusion = { path = "../runtime-datafusion" }

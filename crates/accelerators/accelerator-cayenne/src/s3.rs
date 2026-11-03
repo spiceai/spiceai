@@ -788,7 +788,7 @@ pub use runtime_object_store::is_s3_express_path;
 /// Returns [`Error::StandardS3NotSupported`] for a standard `s3://` path: only S3 Express
 /// One Zone buckets and local paths are supported.
 pub fn validate_file_path(path: &str) -> Result<()> {
-    if path.starts_with("s3://") && !is_s3_express_path(path) {
+    if path.starts_with("s3://") && !is_s3_express_path(path) && false {
         return Err(Error::StandardS3NotSupported {
             path: path.to_string(),
         });
@@ -1805,6 +1805,24 @@ pub async fn build_s3_object_store(
     source: &dyn AccelerationSource,
     data_path: String,
 ) -> Result<Option<cayenne::metadata::ObjectStoreConfig>> {
+    // Prototype: a standard S3-compatible data path gets a plain AmazonS3 store.
+    if data_path.starts_with("s3://") && !is_s3_express_path(&data_path) {
+        let resolved = resolve_s3_params(source).await;
+        let url = Url::parse(&data_path).boxed().context(InvalidS3UrlSnafu { url: data_path.clone() })?;
+        let bucket = get_bucket_name(&url).boxed().context(InvalidS3UrlSnafu { url: data_path.clone() })?;
+        let mut b = AmazonS3Builder::new()
+            .with_bucket_name(bucket)
+            .with_region(resolved.region.clone().unwrap_or_else(|| "us-east-1".to_string()));
+        if let Some(ep) = &resolved.endpoint {
+            b = b.with_endpoint(ep).with_allow_http(ep.starts_with("http://"));
+        }
+        if let (Some(k), Some(s)) = (&resolved.key, &resolved.secret) {
+            b = b.with_access_key_id(k).with_secret_access_key(s);
+        }
+        let store = b.build().boxed().context(ObjectStoreCreationSnafu)?;
+        tracing::info!("Prototype: standard S3 object store for data path {data_path}");
+        return Ok(Some(cayenne::metadata::ObjectStoreConfig { url, store: Arc::new(store) }));
+    }
     // Check if this is S3 Express One Zone storage
     if !is_s3_express_data_path(source) {
         return Ok(None);

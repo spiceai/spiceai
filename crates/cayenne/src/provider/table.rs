@@ -10344,6 +10344,16 @@ impl CayenneTableProvider {
         // loading, deletion sinks) will automatically inherit the store.
         if let Some(ref config) = object_store_config {
             Self::register_object_store_if_needed(context.runtime_env(), config);
+        } else if !table_metadata.path.starts_with("s3://") {
+            // Prototype: a local table's files go through one durable object store.
+            static DURABLE_LOCAL: std::sync::LazyLock<Arc<dyn object_store::ObjectStore>> =
+                std::sync::LazyLock::new(|| Arc::new(object_store_occ::DurableLocalFileSystem::new()));
+            if let Ok(url) = url::Url::parse("file:///") {
+                Self::register_object_store_if_needed(
+                    context.runtime_env(),
+                    &crate::metadata::ObjectStoreConfig { url, store: Arc::clone(&DURABLE_LOCAL) },
+                );
+            }
         }
 
         let mut object_store_registered_runtime_envs = HashSet::new();
