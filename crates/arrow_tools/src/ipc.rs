@@ -160,9 +160,11 @@ pub const FLIGHT_TARGET_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 /// Split `batch` into zero-copy row slices of at most `max_bytes` of Arrow data each, so
 /// that each slice can be sent as its own Flight message.
 ///
-/// Sizes come from [`crate::record_batch::slice_memory_size`], which counts only the part of
-/// each buffer a (possibly already sliced) batch references, so a narrow slice of a large
-/// decoded chunk is not split further than its own rows need. Rows are first spread evenly
+/// Sizes count only the part of each buffer a (possibly already sliced) batch references,
+/// including the child values a list, large list, map or fixed-size list slice points at,
+/// so a narrow slice of a large decoded chunk, or of a column of lists, is not split further
+/// than its own rows need. Dictionary values are not counted, because they go out in their
+/// own message rather than with the batch. Rows are first spread evenly
 /// across as many slices as the batch's size calls for, and any slice still over `max_bytes`
 /// (because its rows are wider than the batch's average) is split again the same way. A
 /// batch at or under `max_bytes`, a batch with at most one row, and a `max_bytes` of zero
@@ -191,7 +193,9 @@ fn split_into(
         slices.push(batch);
         return;
     }
-    let size = crate::record_batch::slice_memory_size(&batch);
+    let size = batch.columns().iter().fold(0usize, |total, column| {
+        total.saturating_add(referenced_bytes(&column.to_data()))
+    });
     if size <= max_bytes {
         slices.push(batch);
         return;
@@ -207,6 +211,94 @@ fn split_into(
         split_into(batch.slice(offset, length), max_bytes, slices);
         offset += length;
     }
+}
+
+/// Bytes of Arrow data `data` references, as the body of an IPC record-batch message for it
+/// carries them.
+///
+/// [`ArrayData::get_slice_memory_size`](arrow::array::ArrayData::get_slice_memory_size)
+/// narrows a slice's own buffers but counts a list's whole child array, so every slice of a
+/// list column would measure as large as the column. This narrows list, large list, map and
+/// fixed-size list children to the range the slice's offsets point at, and counts only the
+/// keys of a dictionary-encoded column. Anything it cannot narrow is measured the way
+/// `get_slice_memory_size` measures it, which can only overstate the size.
+fn referenced_bytes(data: &arrow::array::ArrayData) -> usize {
+    use arrow_schema::DataType;
+
+    let len = data.len();
+    let validity = data.nulls().map_or(0, |_| len.div_ceil(8));
+    match data.data_type() {
+        DataType::List(_) | DataType::Map(_, _) => {
+            list_referenced_bytes(data, validity, 4, |buffer, i| {
+                buffer
+                    .typed_data::<i32>()
+                    .get(i)
+                    .and_then(|&o| usize::try_from(o).ok())
+            })
+        }
+        DataType::LargeList(_) => list_referenced_bytes(data, validity, 8, |buffer, i| {
+            buffer
+                .typed_data::<i64>()
+                .get(i)
+                .and_then(|&o| usize::try_from(o).ok())
+        }),
+        DataType::FixedSizeList(_, size) => {
+            let size = usize::try_from(*size).unwrap_or(0);
+            match data.child_data().first() {
+                Some(child) => {
+                    let start = data.offset().saturating_mul(size);
+                    let count = len.saturating_mul(size);
+                    let values = if start.saturating_add(count) <= child.len() {
+                        referenced_bytes(&child.slice(start, count))
+                    } else {
+                        referenced_bytes(child)
+                    };
+                    validity.saturating_add(values)
+                }
+                None => unnarrowed_bytes(data),
+            }
+        }
+        // `ArrayData::slice` and `StructArray::slice` both slice a struct's children.
+        DataType::Struct(_) => data.child_data().iter().fold(validity, |total, child| {
+            total.saturating_add(referenced_bytes(child))
+        }),
+        DataType::Dictionary(key, _) => {
+            validity.saturating_add(len.saturating_mul(key.primitive_width().unwrap_or(8)))
+        }
+        _ => unnarrowed_bytes(data),
+    }
+}
+
+/// Bytes of a list-like `data` with `offset_width`-byte offsets: its offsets and validity,
+/// plus the child values between its first and last offset.
+fn list_referenced_bytes(
+    data: &arrow::array::ArrayData,
+    validity: usize,
+    offset_width: usize,
+    offset_at: impl Fn(&arrow::buffer::Buffer, usize) -> Option<usize>,
+) -> usize {
+    let len = data.len();
+    let (Some(buffer), Some(child)) = (data.buffers().first(), data.child_data().first()) else {
+        return unnarrowed_bytes(data);
+    };
+    let start = offset_at(buffer, data.offset());
+    let end = offset_at(buffer, data.offset().saturating_add(len));
+    match (start, end) {
+        (Some(start), Some(end)) if start <= end && end <= child.len() => {
+            let offsets = len.saturating_add(1).saturating_mul(offset_width);
+            validity
+                .saturating_add(offsets)
+                .saturating_add(referenced_bytes(&child.slice(start, end - start)))
+        }
+        _ => unnarrowed_bytes(data),
+    }
+}
+
+fn unnarrowed_bytes(data: &arrow::array::ArrayData) -> usize {
+    use arrow::array::Array;
+
+    data.get_slice_memory_size()
+        .unwrap_or_else(|_| arrow::array::make_array(data.clone()).get_array_memory_size())
 }
 
 #[cfg(test)]
@@ -631,6 +723,40 @@ mod split_batch_for_flight_tests {
             assert!(encoded_message_bytes(slice) <= CLIENT_DEFAULT_DECODE_LIMIT);
         }
         assert_eq!(slices.iter().map(RecordBatch::num_rows).sum::<usize>(), 100);
+        let rejoined = concat_batches(&batch.schema(), &slices).expect("concat");
+        assert_eq!(rejoined, batch);
+    }
+
+    /// A column of lists is sized by the child values each slice points at, not by the
+    /// whole child array every slice shares: a batch just over the target splits into a
+    /// couple of slices, not one per row.
+    #[test]
+    fn list_column_is_split_by_the_values_each_slice_references() {
+        let rows: i64 = 8_192;
+        let lists: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
+            (0..rows).map(|row| Some((0..40).map(move |i| Some(row * 40 + i)))),
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "l",
+            lists.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![lists]).expect("batch");
+        assert!(
+            encoded_message_bytes(&batch) > FLIGHT_TARGET_MESSAGE_BYTES,
+            "fixture must be over the target"
+        );
+
+        let slices = split_batch_for_flight(batch.clone(), FLIGHT_TARGET_MESSAGE_BYTES);
+
+        assert!(
+            (2..=3).contains(&slices.len()),
+            "expected 2 or 3 slices, got {}",
+            slices.len()
+        );
+        for slice in &slices {
+            assert!(encoded_message_bytes(slice) <= CLIENT_DEFAULT_DECODE_LIMIT);
+        }
         let rejoined = concat_batches(&batch.schema(), &slices).expect("concat");
         assert_eq!(rejoined, batch);
     }
