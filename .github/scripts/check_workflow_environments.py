@@ -14,7 +14,11 @@
 #    job that calls a reusable workflow (`uses:`) is the exception: GitHub does
 #    not allow `environment:` there, and the callee's own jobs select theirs.
 #
-# 2. A job in the `secret-free` environment references no secret other than the
+# 2. The environment is one this repository has configured. GitHub creates any
+#    environment a job names that does not exist yet, with no protection rules,
+#    so a misspelled or new name silently gets an unprotected environment.
+#
+# 3. A job in the `secret-free` environment references no secret other than the
 #    GitHub-managed `GITHUB_TOKEN`. `secret-free` carries no protection rules, so
 #    it is what fork and Dependabot PR runs execute under; a `secrets.X` reference
 #    there either reads a repository/organization fallback the migration is meant
@@ -33,6 +37,18 @@ from pathlib import Path
 import yaml
 
 SECRET_FREE = "secret-free"
+
+# The environments configured in this repository's settings, with the protection
+# rules listed in docs/dev/github_actions_environments.md. Adding one here means
+# creating and configuring it first.
+ALLOWED_ENVIRONMENTS = frozenset(
+    {
+        "ci",
+        "github-publish",
+        "github-publish-autoapprove",
+        SECRET_FREE,
+    }
+)
 
 # The token GitHub mints for every run. It is not stored in any environment and
 # its permissions come from the job's `permissions:` block, so it is not a
@@ -134,6 +150,15 @@ def check_workflow(document: dict) -> list[str]:
             problems.append(
                 f"job '{job_id}' selects no `environment:`; add the environment whose secrets it uses, "
                 f"or `environment: {SECRET_FREE}` if it uses none "
+                "(see docs/dev/github_actions_environments.md)"
+            )
+            continue
+        # An expression is resolved at run time and cannot be checked here.
+        if "${{" not in name and name not in ALLOWED_ENVIRONMENTS:
+            problems.append(
+                f"job '{job_id}' selects environment '{name}', which is not one of "
+                f"{', '.join(f'`{e}`' for e in sorted(ALLOWED_ENVIRONMENTS))}; "
+                "GitHub would create it with no protection rules "
                 "(see docs/dev/github_actions_environments.md)"
             )
             continue

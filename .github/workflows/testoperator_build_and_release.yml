@@ -24,7 +24,7 @@ permissions:
   packages: write
 jobs:
   build-binary:
-    environment: ci-build
+    environment: ci
     name: Build testoperator
     runs-on: spiceai-dev-runners
     env:
@@ -57,7 +57,7 @@ jobs:
         run: ./target/release/testoperator --version
 
   build-docker:
-    environment: publish
+    environment: github-publish-autoapprove
     name: Build Docker image
     needs: build-binary
     runs-on: ubuntu-24.04

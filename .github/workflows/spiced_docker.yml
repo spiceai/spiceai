@@ -281,7 +281,7 @@ jobs:
           echo "run_cuda=${run_cuda}" >> "$GITHUB_OUTPUT"
 
   build-amd64:
-    environment: ci-build
+    environment: ci
     needs: setup
     runs-on: spiceai-dev-runners
     steps:
@@ -342,7 +342,7 @@ jobs:
           path: /tmp/image-amd64-*.tar
 
   build-arm64:
-    environment: ci-build
+    environment: ci
     needs: setup
     runs-on: hosted-linux-arm-runner
     steps:
@@ -426,7 +426,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
   build-cuda:
-    environment: ci-build
+    environment: ci
     needs: setup
     runs-on: 'spiceai-dev-runners'
     env:
@@ -490,7 +490,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
   publish:
-    environment: publish
+    environment: github-publish
     if: ${{ needs.setup.outputs.run_amd64 == 'true' || needs.setup.outputs.run_arm64 == 'true' }}
     needs: [setup, build-amd64, build-arm64]
     runs-on: ubuntu-24.04
@@ -617,7 +617,7 @@ jobs:
           fi
 
   publish-cuda:
-    environment: publish
+    environment: github-publish
     needs: [setup, build-cuda]
     if: ${{ needs.setup.outputs.run_cuda == 'true' }}
     runs-on: ubuntu-24.04

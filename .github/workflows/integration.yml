@@ -146,7 +146,7 @@ jobs:
           echo "Source versions beyond each default: ${matrix}"
 
   build:
-    environment: ci-build
+    environment: ci
     name: Build Test Binary
     needs: check_changes
     if: ${{ github.event_name != 'pull_request' }}
@@ -335,7 +335,7 @@ jobs:
           key: ${{ steps.cargo-registry.outputs.cache-primary-key }}
 
   test-partitions:
-    environment: ci-integration
+    environment: ci
     name: Run Integration Tests (part ${{ matrix.label }})
     needs: [build, check_changes]
     if: ${{ github.event_name != 'pull_request' }}
@@ -563,7 +563,7 @@ jobs:
   # archive with `SPICE_TEST_<SOURCE>_VERSION` set, so nothing is rebuilt. When it
   # runs is `source_changes` in `check_changes`.
   source-versions:
-    environment: ci-integration
+    environment: ci
     name: Integration Tests (${{ matrix.source }} ${{ matrix.version }})
     needs: [build, check_changes]
     if: ${{ github.event_name != 'pull_request' && needs.check_changes.outputs.relevant_changes == 'true' && needs.check_changes.outputs.source_changes == 'true' && needs.check_changes.outputs.source_versions_matrix != '[]' }}
@@ -907,7 +907,7 @@ jobs:
         run: echo "No snapshot artifacts were uploaded; skipping snapshot update."
 
   test-github:
-    environment: ci-integration
+    environment: ci
     name: GitHub Connector Integration Tests
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -1034,7 +1034,7 @@ jobs:
           retention-days: 1
 
   test-aws-sdk:
-    environment: ci-integration
+    environment: ci
     name: AWS SDK Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 12.4 min (run 34213792762).
@@ -1100,7 +1100,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration_aws_sdk)'
 
   test-aws-sdk-credential-bridge:
-    environment: ci-integration
+    environment: ci
     name: AWS SDK Credential Bridge Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 9.0 min (run 34213792762).
@@ -1170,7 +1170,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=aws-sdk-credential-bridge::credential_provider)'
 
   test-snapshot-refresh:
-    environment: ci-integration
+    environment: ci
     name: Snapshot Refresh Mode Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 10.9 min (run 34213792762).
@@ -1234,7 +1234,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration_snapshot_refresh)'
 
   test-data-components:
-    environment: ci-integration
+    environment: ci
     name: Data Components Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 7.5 min (run 33859377810).
@@ -1291,7 +1291,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=data_components::integration) & test(/^hadoop_catalog_test::/)'
 
   test-runtime-partition:
-    environment: ci-integration
+    environment: ci
     name: Partition Table Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 7.7 min (run 34213792762).

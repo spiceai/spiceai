@@ -129,7 +129,7 @@ jobs:
             return isPrEvent ? matrix.slice(0, 1) : matrix;
 
   build:
-    environment: ci-build
+    environment: ci
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.builder }}
     needs: [setup-matrix, check_changes]
@@ -273,7 +273,7 @@ jobs:
           if-no-files-found: ignore
 
   test-bigquery:
-    environment: ci-integration
+    environment: ci
     name: BigQuery Regression Tests
     needs: build
     if: ${{ inputs.run_all_tests }}
@@ -410,7 +410,7 @@ jobs:
             return isPrEvent ? matrix.slice(0, 1) : matrix;
 
   test_openai_model:
-    environment: ci-ai
+    environment: ci
     name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     # A backstop for the whole job, so it has to clear this job's own setup — artifact
     # download and CLI install on the self-hosted pool — before the steps' bounded waits
@@ -503,7 +503,7 @@ jobs:
         uses: ./.github/actions/stop-spice
 
   test_hf_model:
-    environment: ci-ai
+    environment: ci
     name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     timeout-minutes: 10
     runs-on: ${{ matrix.target.runner }}
@@ -805,7 +805,7 @@ jobs:
           working-directory: test_app
 
   test_quickstart_spiceai:
-    environment: ci-integration
+    environment: ci
     name: 'Test Spice.ai quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     # run quickstart with external service dependency only on manual trigger
@@ -871,7 +871,7 @@ jobs:
           working-directory: test_app
 
   test_quickstart_s3:
-    environment: ci-integration
+    environment: ci
     name: 'Test S3 quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
     # run quickstart with external service dependency only on manual trigger
@@ -966,7 +966,7 @@ jobs:
           working-directory: test_app
 
   test_cold_start_unkeyed_append:
-    environment: ci-integration
+    environment: ci
     name: 'Cold start: unkeyed Cayenne append loads without rewriting itself'
     # The nightly `testoperator run cold-start` workflow times every acceleration shape
     # against the previous release; this is its timing-free bound, cheap enough for the
@@ -2236,7 +2236,7 @@ jobs:
           working-directory: test_app
 
   hf_connector_live:
-    environment: ci-ai
+    environment: ci
     name: 'Test Hugging Face connector against the live Hub'
     # Reads pinned commits of public datasets through the Hub and compares every answer
     # with one recorded from DuckDB's own `hf://` reader (test/huggingface/check_live.py).
@@ -2401,7 +2401,7 @@ jobs:
           working-directory: test_app
 
   databricks_delta_catalog_connector_quickstart:
-    environment: ci-integration
+    environment: ci
     name: 'Test Databricks catalog connector (mode: delta_lake) on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -2891,7 +2891,7 @@ jobs:
   # The runner for the scenario scripts in test/spicescript. Built beside spiced
   # rather than after it, so it adds nothing to the run's critical path.
   build_spicescript:
-    environment: ci-build
+    environment: ci
     name: Build spicescript
     needs: check_changes
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
@@ -2919,7 +2919,7 @@ jobs:
 
   # Runs the scenario scripts against this run's spiced and spice CLI.
   test_spicescript:
-    environment: ci-integration
+    environment: ci
     name: ${{ matrix.name }}
     needs: [build, build_spicescript]
     runs-on: spiceai-dev-runners

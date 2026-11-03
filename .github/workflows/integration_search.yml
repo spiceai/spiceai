@@ -37,7 +37,7 @@ env:
 
 jobs:
   test-search:
-    environment: ci-ai
+    environment: ci
     name: Test Search Integration
     runs-on: spiceai-macos-large
     steps:

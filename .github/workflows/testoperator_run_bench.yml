@@ -127,7 +127,7 @@ on:
 
 jobs:
   run-bench:
-    environment: ci-integration
+    environment: ci
     name: Run benchmark e2e tests
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600

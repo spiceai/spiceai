@@ -42,7 +42,7 @@ jobs:
         uses: ./.github/actions/check-code-changes
 
   check:
-    environment: ci-build
+    environment: ci
     name: Rust Lint
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -124,7 +124,7 @@ jobs:
           if-no-files-found: ignore
 
   build-and-test:
-    environment: ci-build
+    environment: ci
     name: Build and Test
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'

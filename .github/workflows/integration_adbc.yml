@@ -58,7 +58,7 @@ jobs:
         uses: ./.github/actions/check-code-changes
 
   test:
-    environment: ci-integration
+    environment: ci
     name: ADBC Integration Tests
     needs: check_changes
     # Slowest observed success in the 2026-07-25..08-08 window: 50 min.

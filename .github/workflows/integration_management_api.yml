@@ -34,7 +34,7 @@ env:
 
 jobs:
   test-management-api:
-    environment: ci-cloud
+    environment: ci
     name: Test Management API Integration
     runs-on: 'spiceai-macos'
     steps:

@@ -44,7 +44,7 @@ env:
 # ready. Every step below that runs the test binary drops it first.
 jobs:
   build:
-    environment: ci-build
+    environment: ci
     name: Build Test Binary (macOS)
     runs-on: spiceai-macos-large
     env:
@@ -179,7 +179,7 @@ jobs:
     # test code runs, while the same archive starts cleanly on the MacBook Pros.
     runs-on: spiceai-macos-large
     # Holds the Anthropic workload identity federation IDs (`ANTHROPIC_*` secrets).
-    environment: ci-ai
+    environment: ci
     permissions:
       contents: write
       pull-requests: write
@@ -481,7 +481,7 @@ jobs:
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
   test-hf:
-    environment: ci-ai
+    environment: ci
     name: Test Hugging Face Models
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
@@ -575,7 +575,7 @@ jobs:
   # wait. This asks AWS once, before the build finishes, and names the cause. STS
   # GetCallerIdentity needs no IAM permission, so only an invalid key pair fails it.
   check-bedrock-credentials:
-    environment: ci-ai
+    environment: ci
     name: Check Bedrock credentials
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
     runs-on: spiceai-dev-runners
@@ -618,7 +618,7 @@ jobs:
           fi
 
   test-bedrock:
-    environment: ci-ai
+    environment: ci
     name: Test Bedrock Models
     needs: [build, check-bedrock-credentials]
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
@@ -693,7 +693,7 @@ jobs:
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
   build-extended:
-    environment: ci-build
+    environment: ci
     name: Build Test Binary (Extended)
     runs-on: spiceai-macos-large
     env:

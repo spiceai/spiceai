@@ -637,7 +637,7 @@ jobs:
           spice upgrade
 
   test_spice_chat:
-    environment: ci-ai
+    environment: ci
     name: 'Test spice chat'
     if: github.event.inputs.build_cli == 'true'
     runs-on: ${{ matrix.target.runner }}

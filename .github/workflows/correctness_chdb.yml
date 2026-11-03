@@ -56,7 +56,7 @@ jobs:
         uses: ./.github/actions/check-code-changes
 
   test:
-    environment: ci-build
+    environment: ci
     name: chDB Result Correctness
     needs: check_changes
     timeout-minutes: 90

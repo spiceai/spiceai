@@ -68,7 +68,7 @@ jobs:
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
     # Holds the Anthropic workload identity federation IDs (`ANTHROPIC_*` secrets).
-    environment: ci-ai
+    environment: ci
     permissions:
       contents: read
       actions: read

@@ -104,7 +104,7 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   dispatch-scheduled:
-    environment: ci-build
+    environment: ci
     name: Dispatch tests - Scheduled (${{ matrix.branch }})
     needs: plan-scheduled
     if: ${{ needs.plan-scheduled.outputs.matrix != '[]' }}
@@ -510,7 +510,7 @@ jobs:
           retention-days: 60
 
   dispatch-input:
-    environment: ci-build
+    environment: ci
     name: Dispatch tests - Input
     runs-on: spiceai-dev-runners
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.schedule != 'daily' && github.event.inputs.schedule != 'weekly' }}

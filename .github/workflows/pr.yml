@@ -655,7 +655,7 @@ jobs:
 
   # Run Rust linting
   lint-rust:
-    environment: ci-build
+    environment: ci
     name: Rust Lint
     runs-on: spiceai-macos-large
     # Slowest observed success in the 2026-07-25..08-08 window: 126 min.
@@ -758,7 +758,7 @@ jobs:
 
   # Build and test
   build-test:
-    environment: ci-integration
+    environment: ci
     name: Build and Test
     runs-on: spiceai-macos-large
     # Slowest observed success in the 2026-07-25..08-08 window: 117 min.
@@ -956,7 +956,7 @@ jobs:
 
   # Release-profile installs (make install, install-cli, install-spiced)
   build-install-release:
-    environment: ci-build
+    environment: ci
     name: Build (release profile)
     runs-on: spiceai-macos-large
     # Slowest observed success in the 2026-07-25..08-08 window: 106 min.

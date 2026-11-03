@@ -53,13 +53,13 @@ jobs:
                 """\
 jobs:
   a:
-    environment: ci-build
+    environment: ci
     runs-on: ubuntu-24.04
     steps:
       - run: echo ${{ secrets.MINIO_ACCESS_KEY }}
   b:
     environment:
-      name: publish
+      name: github-publish
       url: https://example.com
     runs-on: ubuntu-24.04
     steps:
@@ -72,6 +72,32 @@ jobs:
 """
             ),
             [],
+        )
+
+    def test_unknown_environment_fails(self):
+        self.assertEqual(
+            problems(
+                """\
+jobs:
+  a:
+    environment: ci-build
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo hi
+  b:
+    environment:
+      name: publsh
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo hi
+"""
+            ),
+            [
+                f"job '{job}' selects environment '{env}', which is not one of "
+                "`ci`, `github-publish`, `github-publish-autoapprove`, `secret-free`; "
+                "GitHub would create it with no protection rules (see docs/dev/github_actions_environments.md)"
+                for job, env in (("a", "ci-build"), ("b", "publsh"))
+            ],
         )
 
     def test_reusable_workflow_caller_needs_no_environment(self):
@@ -94,7 +120,7 @@ jobs:
 jobs:
   call:
     uses: ./.github/workflows/other.yml
-    environment: ci-build
+    environment: ci
 """
             ),
             [
@@ -186,7 +212,7 @@ jobs:
     steps:
       - run: echo hi
   ai:
-    environment: ci-ai
+    environment: ci
     runs-on: ubuntu-24.04
     steps:
       - run: echo hi
@@ -226,7 +252,7 @@ jobs:
                 """\
 jobs:
   test:
-    environment: ci-integration
+    environment: ci
     runs-on: ubuntu-24.04
     steps:
       - run: echo ${{ secrets.TEST_MYSQL_PASSWORD }}

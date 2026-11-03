@@ -187,7 +187,7 @@ jobs:
           rust-profile: ${{ env.RUST_PROFILE }}
 
   publish-minio:
-    environment: ci-build
+    environment: ci
     name: Publish linux-x86_64 CUDA binaries to Minio
     runs-on: spiceai-dev-runners
     needs: build
@@ -231,7 +231,7 @@ jobs:
           done
 
   publish:
-    environment: publish
+    environment: github-publish
     name: Publish CUDA binaries
     needs: build
     if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'

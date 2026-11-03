@@ -103,7 +103,7 @@ jobs:
             return matrix;
 
   build:
-    environment: ci-build
+    environment: ci
     name: Build Test Binary
     # `spiceai-macos-large` in the merge queue: on the `spiceai-macos` minis
     # this build queued 68 min at p90 for a runner (merge_group,
@@ -191,7 +191,7 @@ jobs:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     # Holds the Anthropic workload identity federation IDs (`ANTHROPIC_*` secrets).
-    environment: ci-ai
+    environment: ci
     permissions:
       contents: read
       actions: read

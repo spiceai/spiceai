@@ -5,7 +5,7 @@ on:
 
 jobs:
   build:
-    environment: publish
+    environment: github-publish-autoapprove
     runs-on: ubuntu-24.04
 
     steps:

@@ -242,7 +242,7 @@ jobs:
           echo "Targeted pre-lint base: trunk (fixed)"
 
   sign-off:
-    environment: ci-build
+    environment: ci
     name: "Sign off on ${{ inputs.pr_number && format('PR #{0}', inputs.pr_number) || github.event.inputs.branch }}"
     needs: resolve
     # The authoritative one-run-per-commit guard. Both dispatch forms reduce to
