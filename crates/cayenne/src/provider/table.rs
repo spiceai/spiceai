@@ -6182,12 +6182,6 @@ impl PkKeysetBytesPublisher {
 }
 
 impl CayenneTableProvider {
-    fn is_shadow_reader(&self) -> bool {
-        self.catalog
-            .as_any()
-            .is::<crate::metastore_tap::reader::ShadowCatalog>()
-    }
-
     pub(crate) fn metadata_catalog(&self) -> &Arc<dyn MetadataCatalog> {
         &self.catalog
     }
@@ -10664,12 +10658,6 @@ impl CayenneTableProvider {
         };
 
         provider.refresh_deletion_memory_accounting();
-
-        // The prototype reader never repairs or maintains writer-owned files
-        // or catalog rows during open. Data directories must be quiescent.
-        if provider.is_shadow_reader() {
-            return Ok(provider);
-        }
 
         // Fail construction if a staging WAL exists — the table may contain
         // partial data from an interrupted append and must be resolved first.
@@ -41091,9 +41079,6 @@ impl CayenneTableProvider {
         generation: u64,
         collected_under: SchemaRef,
     ) {
-        if self.is_shadow_reader() {
-            return;
-        }
         let pending = self.scan_statistics_persistence.start();
         let catalog = Arc::clone(&self.catalog);
         let lock = Arc::clone(&self.table_statistics_persistence_lock);

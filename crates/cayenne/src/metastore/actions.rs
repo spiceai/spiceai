@@ -54,14 +54,6 @@ pub(crate) fn add_files(
     }))
 }
 
-/// One action per file, for upserts that name their snapshot per file.
-pub(crate) fn upsert_files(files: &[SnapshotFile]) -> Vec<Action> {
-    files
-        .iter()
-        .map(|f| add_files(&f.table_id, &f.snapshot_id, std::slice::from_ref(f), true))
-        .collect()
-}
-
 pub(crate) fn remove_files(table_id: &str, select: Select, snapshot_ids: &[String]) -> Action {
     Action::new(Kind::RemoveFiles(proto::RemoveBySnapshot {
         table_id: table_id.to_string(),

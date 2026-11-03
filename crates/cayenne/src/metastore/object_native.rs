@@ -15,7 +15,7 @@ limitations under the License.
 
 //! SQL-free catalog backed by a catalog-wide conditional-write head log.
 
-use super::{actions, state_reader::ShadowCatalog};
+use super::{actions, state_reader::DatasetStateReader};
 use crate::{
     catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit},
     metadata::{
@@ -53,7 +53,7 @@ struct OpenSummary {
     lease: u64,
 }
 struct Inner {
-    reader: ShadowCatalog,
+    reader: DatasetStateReader,
     writer: Writer,
     poisoned: bool,
     config: NativeCatalogConfig,
@@ -441,7 +441,7 @@ impl Domain {
                 available: Notify::new(),
                 reserved: std::sync::atomic::AtomicBool::new(false),
                 inner: Mutex::new(Some(Inner {
-                    reader: ShadowCatalog::from_state(state, store, prefix),
+                    reader: DatasetStateReader::from_state(state, store, prefix),
                     writer,
                     poisoned: false,
                     config,

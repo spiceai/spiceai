@@ -71,7 +71,6 @@ pub mod maintained_aggregate;
 pub mod metadata;
 pub mod metastore;
 pub mod metastore_layout;
-pub mod metastore_tap;
 
 /// Cold-tier clustering kernel, re-exported for benchmarks only. Not a stable API.
 #[doc(hidden)]

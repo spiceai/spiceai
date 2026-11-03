@@ -13,14 +13,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Immutable, storage-only view of the prototype's per-table shadow logs.
+//! Immutable, storage-only view of object-native dataset logs.
 //!
-//! Each head is opened independently; this is not a cross-table snapshot.
-//! Data and deletion-vector files must remain available at their recorded paths.
-//! Provider scans retain Cayenne's file discovery: manifests are best-effort
-//! caches, so the writer's data directories must be quiescent. This prototype
-//! does not pin files against a live writer's reclamation. SQL-metastore slice
-//! export is unsupported.
+//! [`DatasetStateReader`] answers the object-native catalog's metadata reads
+//! from a [`DatasetState`] replayed out of object storage, loading the
+//! immutable blobs that state references (schemas, statistics, indexes, inline
+//! payloads) from the store and checking each against its recorded digest. It
+//! holds no database and writes nothing: every mutating [`MetadataCatalog`]
+//! method returns an error, and the object-native catalog applies committed
+//! records to its state instead. Data and deletion-vector files must remain
+//! available at the paths the state records.
 
 use crate::{
     catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit},
@@ -35,13 +37,13 @@ use async_trait::async_trait;
 use cayenne_metastore_actions::{DatasetState, ObjRef, TableState};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     sync::Arc,
 };
 
-/// A frozen catalog reconstructed exclusively from shadow storage.
+/// A read-only [`MetadataCatalog`] over one replayed [`DatasetState`].
 /// Data files remain in the locations recorded by the writer.
-pub struct ShadowCatalog {
+pub(crate) struct DatasetStateReader {
     pub(crate) state: DatasetState,
     empty: TableState,
     pub(crate) store: Arc<dyn ObjectStore>,
@@ -54,37 +56,8 @@ fn invalid(error: impl std::fmt::Display) -> CatalogError {
     }
 }
 
-impl ShadowCatalog {
-    /// Open every table log under `prefix`, without a SQL metastore or tap state.
-    ///
-    /// # Errors
-    /// Returns an error on unreadable logs, invalid actions, or duplicate table identities.
-    pub async fn open(store: Arc<dyn ObjectStore>, prefix: Path) -> CatalogResult<Self> {
-        let datasets = prefix.clone().join("datasets");
-        let entries = store
-            .list_with_delimiter(Some(&datasets))
-            .await
-            .map_err(invalid)?;
-        let mut state = DatasetState::default();
-        let mut names = BTreeSet::new();
-        for table_prefix in entries.common_prefixes {
-            let rebuilt = crate::metastore_tap::shadow::replay(Arc::clone(&store), table_prefix)
-                .await
-                .map_err(invalid)?;
-            for (id, table) in rebuilt.tables {
-                if !names.insert(table.name.clone()) || state.tables.insert(id, table).is_some() {
-                    return Err(invalid("duplicate shadow table identity"));
-                }
-            }
-        }
-        Ok(Self {
-            empty: TableState::default(),
-            state,
-            store,
-            prefix,
-        })
-    }
-
+impl DatasetStateReader {
+    /// A reader over `state`, whose blobs are stored under `prefix` in `store`.
     pub(crate) fn from_state(
         state: DatasetState,
         store: Arc<dyn ObjectStore>,
@@ -135,7 +108,7 @@ impl ShadowCatalog {
             .map_err(invalid)?;
         if &ObjRef::of(&bytes) != reference {
             return Err(invalid(format!(
-                "shadow blob {path} failed integrity validation"
+                "metastore blob {path} failed integrity validation"
             )));
         }
         Ok(bytes.to_vec())
@@ -143,7 +116,7 @@ impl ShadowCatalog {
 }
 
 #[async_trait]
-impl MetadataCatalog for ShadowCatalog {
+impl MetadataCatalog for DatasetStateReader {
     async fn commit_pending(&self) -> CatalogResult<()> {
         // Read-only: there is never anything pending.
         Ok(())
@@ -162,7 +135,7 @@ impl MetadataCatalog for ShadowCatalog {
         &self,
         _publications: &[crate::catalog::CatalogPublication],
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn list_pending_write_back(
         &self,
@@ -186,7 +159,7 @@ impl MetadataCatalog for ShadowCatalog {
         _table_id: &str,
         _keys: &[(Vec<u8>, i64)],
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn pending_write_back_count(&self, table_id: &str) -> CatalogResult<i64> {
         count(self.rows(table_id).pending_write_back.len())
@@ -215,7 +188,7 @@ impl MetadataCatalog for ShadowCatalog {
             .blob(
                 t.schema
                     .as_ref()
-                    .ok_or_else(|| invalid("shadow table has no schema"))?,
+                    .ok_or_else(|| invalid("the stored table has no schema"))?,
             )
             .await?;
         Ok(TableMetadata {
@@ -575,17 +548,17 @@ impl MetadataCatalog for ShadowCatalog {
         Ok(s)
     }
     async fn create_table(&self, _options: CreateTableOptions) -> CatalogResult<String> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn update_table_schema(&self, _table_id: &str, _schema: &SchemaRef) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn update_table_schema_dropping_statistics(
         &self,
         _table_id: &str,
         _schema: &SchemaRef,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn set_current_snapshot(
         &self,
@@ -593,19 +566,19 @@ impl MetadataCatalog for ShadowCatalog {
         _replaced_snapshot_id: &str,
         _new_snapshot_id: &str,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn increment_sequence_number(&self, _table_id: &str) -> CatalogResult<i64> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn reserve_sequence_numbers(&self, _table_id: &str, _count: u32) -> CatalogResult<i64> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn add_delete_file(&self, _delete_file: DeleteFile) -> CatalogResult<String> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn add_delete_files(&self, _delete_files: Vec<DeleteFile>) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn commit_delete_files_with_inlined_rewrite(
         &self,
@@ -615,17 +588,17 @@ impl MetadataCatalog for ShadowCatalog {
         _deleted_inlined_ids: Vec<String>,
         _replaced_delete_file_ids: Vec<String>,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn remove_delete_files(
         &self,
         _table_id: &str,
         _delete_file_ids: &[String],
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn clear_delete_files(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn add_insert_record(
         &self,
@@ -633,7 +606,7 @@ impl MetadataCatalog for ShadowCatalog {
         _pk_bytes: Vec<u8>,
         _sequence_number: i64,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn add_insert_records_batch(
         &self,
@@ -641,7 +614,7 @@ impl MetadataCatalog for ShadowCatalog {
         _pk_bytes_list: Vec<Vec<u8>>,
         _sequence_number: i64,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn commit_on_conflict_deletions(
         &self,
@@ -651,7 +624,7 @@ impl MetadataCatalog for ShadowCatalog {
         _insert_sequence: i64,
         _snapshot_sequence: Option<SnapshotSequenceCommit>,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn commit_on_conflict_deletions_with_tombstone(
         &self,
@@ -663,10 +636,10 @@ impl MetadataCatalog for ShadowCatalog {
         _inline_tombstone: Option<InlinedDelete>,
         _pending_durable_flips: &[String],
     ) -> CatalogResult<Option<String>> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn clear_insert_records(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn set_snapshot_sequence(
         &self,
@@ -674,14 +647,14 @@ impl MetadataCatalog for ShadowCatalog {
         _snapshot_id: &str,
         _sequence_number: i64,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn clear_snapshot_sequence(
         &self,
         _table_id: &str,
         _snapshot_id: &str,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn commit_compaction(
         &self,
@@ -689,7 +662,7 @@ impl MetadataCatalog for ShadowCatalog {
         _replaced_snapshot_id: &str,
         _new_snapshot_id: &str,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn commit_compaction_fenced(
         &self,
@@ -699,7 +672,7 @@ impl MetadataCatalog for ShadowCatalog {
         _cutoff: i64,
         _protected_snapshot_ids_to_clear: &[String],
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn swap_protected_snapshots(
         &self,
@@ -708,7 +681,7 @@ impl MetadataCatalog for ShadowCatalog {
         _new_snapshot_id: &str,
         _new_sequence_number: i64,
     ) -> CatalogResult<bool> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn commit_overwrite(
         &self,
@@ -717,35 +690,35 @@ impl MetadataCatalog for ShadowCatalog {
         _inlined: Option<&InlinedData>,
         _delete_files: &[crate::metadata::DeleteFile],
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn add_partition(&self, _partition: PartitionMetadata) -> CatalogResult<String> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn upsert_table_statistics(&self, _stats: &TableStatistics) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn clear_table_statistics(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn upsert_snapshot_file_statistics(
         &self,
         _stats: &SnapshotFileStatistics,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn clear_snapshot_file_statistics_except(
         &self,
         _table_id: &str,
         _snapshot_id: &str,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn clear_snapshot_file_statistics(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn upsert_snapshot_file(&self, _file: &SnapshotFile) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn replace_snapshot_files(
         &self,
@@ -753,24 +726,24 @@ impl MetadataCatalog for ShadowCatalog {
         _snapshot_id: &str,
         _files: &[SnapshotFile],
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn clear_snapshot_cached_metadata(
         &self,
         _table_id: &str,
         _snapshot_id: &str,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn clear_snapshot_files_except(
         &self,
         _table_id: &str,
         _snapshot_id: &str,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn clear_snapshot_files(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn commit_overwrite_to_cold(
         &self,
@@ -778,7 +751,7 @@ impl MetadataCatalog for ShadowCatalog {
         _new_snapshot_id: &str,
         _cold_files: &[ColdTierFile],
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn upsert_pk_index(
         &self,
@@ -786,13 +759,13 @@ impl MetadataCatalog for ShadowCatalog {
         _snapshot_id: &str,
         _index_blob: &[u8],
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn clear_pk_index(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn register_index_run(&self, _run: &IndexRunRecord) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn remove_index_run(
         &self,
@@ -800,10 +773,10 @@ impl MetadataCatalog for ShadowCatalog {
         _index_key: &str,
         _run_name: &str,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn add_inlined_data(&self, _data: InlinedData) -> CatalogResult<String> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn get_inlined_data_above_sequence(
         &self,
@@ -818,10 +791,10 @@ impl MetadataCatalog for ShadowCatalog {
             .collect())
     }
     async fn clear_inlined_data(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn clear_inlined_data_and_deletes(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn commit_on_conflict_deletions_and_clear_inlined(
         &self,
@@ -831,27 +804,27 @@ impl MetadataCatalog for ShadowCatalog {
         _insert_sequence: i64,
         _snapshot_sequence: Option<SnapshotSequenceCommit>,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn add_inlined_delete(&self, _delete: InlinedDelete) -> CatalogResult<String> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn mark_inlined_delete_published(
         &self,
         _table_id: &str,
         _inlined_id: &str,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn mark_inlined_delete_unpublished(
         &self,
         _table_id: &str,
         _inlined_id: &str,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn publish_orphan_inlined_deletes(&self, _table_id: &str) -> CatalogResult<u64> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn commit_inlined_mutation(
         &self,
@@ -861,26 +834,26 @@ impl MetadataCatalog for ShadowCatalog {
         _data: Vec<InlinedData>,
         _assigned_sequence: i64,
     ) -> CatalogResult<Option<i64>> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn clear_inlined_deletes(&self, _table_id: &str) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn checkpoint_wal(&self) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn incremental_vacuum(&self) -> CatalogResult<u64> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn drop_table(&self, _table_name: &str) -> CatalogResult<bool> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
     async fn import_dataset_slice(
         &self,
         _slice: &crate::metastore::snapshot::DatasetMetastoreSlice,
         _data_dir_anchor: &std::path::Path,
     ) -> CatalogResult<()> {
-        Err(invalid("the shadow catalog is read-only"))
+        Err(invalid("the dataset state reader is read-only"))
     }
 }
 
@@ -889,7 +862,7 @@ fn count(value: usize) -> CatalogResult<i64> {
 }
 fn add(a: i64, b: i64) -> CatalogResult<i64> {
     a.checked_add(b)
-        .ok_or_else(|| invalid("shadow aggregate overflow"))
+        .ok_or_else(|| invalid("table storage statistics overflowed"))
 }
 fn sum(values: impl IntoIterator<Item = i64>) -> CatalogResult<i64> {
     values.into_iter().try_fold(0, add)
