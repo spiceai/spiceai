@@ -4,7 +4,7 @@ description: >-
   Anthropic workload identity federation, and exports it, masked, as SPICE_ANTHROPIC_AUTH_TOKEN
   for the steps that follow. The token lives only as long as the federation rule allows
   (`expires_in` is logged) and nothing refreshes it, so run this right before each step that
-  calls Anthropic. The job needs `permissions: id-token: write` and `environment: ci`, whose
+  calls Anthropic. The job needs `permissions: id-token: write` and `environment: ci-ai`, whose
   secrets hold the identifiers. Anthropic accepts the token only as a bearer token, so a model
   sends it as `anthropic_auth_token`, never `anthropic_api_key`.
 inputs:
@@ -44,7 +44,7 @@ runs:
           };
           const missing = Object.entries(ids).filter(([, value]) => !value).map(([name]) => name);
           if (missing.length > 0) {
-            core.setFailed(`Failed to mint an Anthropic access token: no ${missing.join(', ')} was given, so no step in this job can call Anthropic. Pass them from the 'ci' environment's ANTHROPIC_* secrets and give the job 'environment: ci'.`);
+            core.setFailed(`Failed to mint an Anthropic access token: no ${missing.join(', ')} was given, so no step in this job can call Anthropic. Pass them from the 'ci-ai' environment's ANTHROPIC_* secrets and give the job 'environment: ci-ai'.`);
             return;
           }
           if (process.env.WORKSPACE_ID) {
