@@ -233,7 +233,6 @@ tracing.workspace = true
 tracing-futures.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
-turso-shared = { workspace = true }
 twox-hash.workspace = true
 typetag = "0.2.22"
 url.workspace = true
@@ -306,10 +305,8 @@ connector-oracle = { path = "../data-connectors/connector-oracle" }
 accelerator-postgres = { path = "../accelerators/accelerator-postgres" }
 runtime-checkpoint-postgres = { path = "../runtime-checkpoint-postgres" }
 accelerator-sqlite = { path = "../accelerators/accelerator-sqlite" }
-accelerator-turso = { path = "../accelerators/accelerator-turso" }
 accelerator-duckdb = { path = "../accelerators/accelerator-duckdb" }
 accelerator-cayenne = { path = "../accelerators/accelerator-cayenne" }
-turso.workspace = true
 connector-postgres = { path = "../data-connectors/connector-postgres" }
 connector-scylladb = { path = "../data-connectors/connector-scylladb" }
 tokio-postgres = { workspace = true }
@@ -460,14 +457,6 @@ sqlite = [
     "data_components/sqlite",
     "dep:rusqlite",
     "runtime-acceleration/sqlite",
-]
-turso = [
-    "dep:tokio-rusqlite",
-    "db_connection_pool/sqlite",
-    "data_components/sqlite",
-    "data_components/turso",
-    "dep:rusqlite",
-    "runtime-acceleration/turso",
 ]
 vortex = []
 

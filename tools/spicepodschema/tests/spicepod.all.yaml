@@ -539,25 +539,6 @@ datasets:
         connection_pool_size: '15'
 
   # ---------------------------------------------------------------------------
-  # Turso accelerator test
-  # ---------------------------------------------------------------------------
-  - name: turso_accel
-    from: postgres:public.data
-    params:
-      pg_host: localhost
-      pg_port: '5432'
-      pg_db: db
-      pg_user: user
-      pg_pass: pass
-    acceleration:
-      enabled: true
-      engine: turso
-      mode: file
-      params:
-        turso_turso_file: ./data/accel.turso
-        turso_internal_timestamp_format: integer_millis # rfc3339, integer_millis
-
-  # ---------------------------------------------------------------------------
   # Cayenne accelerator test
   # ---------------------------------------------------------------------------
   - name: cayenne_accel

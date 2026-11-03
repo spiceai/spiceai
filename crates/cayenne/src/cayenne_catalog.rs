@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use turso_shared::{
+use write_retry::{
     DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, is_retryable_write_conflict_message, retry_backoff_delay,
 };
 

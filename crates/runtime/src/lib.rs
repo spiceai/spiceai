@@ -332,6 +332,27 @@ pub enum Error {
     #[snafu(display("Unable to create view: {reason}"))]
     UnableToCreateView { reason: String },
 
+    /// A dataset's acceleration sets an engine removed in v2.5. Only that dataset fails to
+    /// load: Spice never switches it to Cayenne on its own.
+    #[snafu(display(
+        "Failed to load dataset '{dataset}': {}",
+        runtime_acceleration::removed_engine_message(engine)
+    ))]
+    AcceleratedDatasetEngineRemoved {
+        dataset: String,
+        engine: &'static str,
+    },
+
+    /// A view's acceleration sets an engine removed in v2.5.
+    #[snafu(display(
+        "Failed to load view '{view_name}': {}",
+        runtime_acceleration::removed_engine_message(engine)
+    ))]
+    AcceleratedViewEngineRemoved {
+        view_name: String,
+        engine: &'static str,
+    },
+
     #[snafu(display(
         "Specify the SQL string for view {name} using either `sql: SELECT * FROM...` inline or as a file reference with `sql_ref: my_view.sql`"
     ))]
