@@ -184,6 +184,32 @@ impl<'m> Mtp<'m> {
         Ok(out)
     }
 
+    /// The head's state that truncating its cache does not restore: the target's hidden state at
+    /// the last position it read, which it pairs with the next token. Saved with a prompt
+    /// checkpoint and restored with [`Mtp::restore_state`] when the cache is cut back to it, so
+    /// the read that follows pairs its first token as a read of the whole prompt does. `None`
+    /// when the head holds none.
+    pub fn state(&mut self) -> Result<Option<Vec<u8>>> {
+        let mut data: *const u8 = std::ptr::null();
+        let mut n: usize = 0;
+        // SAFETY: the state is live; the shim points `data` at `n` bytes it keeps until its next
+        // call, which are copied before then.
+        let status = unsafe { sys::spice_mtp_get_state(self.raw.as_ptr(), &raw mut data, &raw mut n) };
+        self.check(status)?;
+        if n == 0 || data.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: as above, `data` holds `n` readable bytes.
+        Ok(Some(unsafe { std::slice::from_raw_parts(data, n) }.to_vec()))
+    }
+
+    /// Restores a state [`Mtp::state`] returned.
+    pub fn restore_state(&mut self, state: &[u8]) -> Result<()> {
+        // SAFETY: `state` holds `state.len()` readable bytes for the call; the shim copies them.
+        let status = unsafe { sys::spice_mtp_set_state(self.raw.as_ptr(), state.as_ptr(), state.len()) };
+        self.check(status)
+    }
+
     /// Reports how many drafted tokens the target accepted.
     pub fn accept(&mut self, accepted: u16) -> Result<()> {
         // SAFETY: the state is live.

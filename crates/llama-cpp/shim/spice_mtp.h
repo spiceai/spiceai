@@ -76,6 +76,14 @@ spice_mtp_status spice_mtp_draft(spice_mtp * mtp, llama_pos n_past, llama_token 
 // Reports how many drafted tokens the target accepted; owed after every non-empty draft.
 spice_mtp_status spice_mtp_accept(spice_mtp * mtp, uint16_t n_accepted);
 
+// The draft head's state that a cache truncation does not restore: the target's hidden state at
+// the last position the head read, which it pairs with the token after it. `*data` and `*n`
+// describe it until the next call; `*n` is 0 when the head holds none.
+spice_mtp_status spice_mtp_get_state(spice_mtp * mtp, const uint8_t ** data, size_t * n);
+
+// Restores a state spice_mtp_get_state returned, for a cache cut back to the position after it.
+spice_mtp_status spice_mtp_set_state(spice_mtp * mtp, const uint8_t * data, size_t n);
+
 #ifdef __cplusplus
 }
 #endif
