@@ -425,7 +425,7 @@ fn referenced_bytes(data: &arrow::array::ArrayData) -> usize {
             let views = data
                 .buffers()
                 .first()
-                .map(|b| b.typed_data::<u128>())
+                .map(arrow::buffer::Buffer::typed_data::<u128>)
                 .and_then(|views| views.get(data.offset()..data.offset().saturating_add(len)));
             match views {
                 Some(views) => views.iter().fold(
@@ -433,7 +433,8 @@ fn referenced_bytes(data: &arrow::array::ArrayData) -> usize {
                     |total, &view| {
                         // The low 32 bits of a view are its value's length; values of up to
                         // 12 bytes are stored inline in the view itself.
-                        let value_len = (view as u32) as usize;
+                        let value_len =
+                            u32::try_from(view & u128::from(u32::MAX)).unwrap_or(u32::MAX) as usize;
                         if value_len > 12 {
                             total.saturating_add(value_len)
                         } else {
