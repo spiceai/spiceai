@@ -64,7 +64,9 @@ fn create_sql_worker(name: &str, sql: &str, cron: &str) -> Worker {
 
 fn get_openai_model(model: impl Into<String>, name: impl Into<String>) -> Model {
     let mut model = Model::new(format!("openai:{}", model.into()), name);
-    model.params.extend(crate::utils::openai_credential_params());
+    model
+        .params
+        .extend(crate::utils::openai_credential_params());
     model.params.insert("tools".into(), "auto".into());
     model
 }

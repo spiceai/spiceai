@@ -129,7 +129,10 @@ fn validate<'a, const N: usize>(
     let mut values = [""; N];
     for (slot, (name, value)) in values.iter_mut().zip(required) {
         let Some(value) = value.filter(|value| !value.is_empty()) else {
-            let names: Vec<String> = required.iter().map(|(name, _)| format!("`{name}`")).collect();
+            let names: Vec<String> = required
+                .iter()
+                .map(|(name, _)| format!("`{name}`"))
+                .collect();
             return Err(FederationError::Config {
                 param: name,
                 message: format!(
@@ -180,7 +183,10 @@ async fn openai_token_provider(
 ) -> Result<Option<Arc<dyn TokenProvider>>, FederationError> {
     let Some([provider_id, service_account_id, audience]) = validate(
         [
-            ("openai_identity_provider_id", federation.identity_provider_id),
+            (
+                "openai_identity_provider_id",
+                federation.identity_provider_id,
+            ),
             ("openai_service_account_id", federation.service_account_id),
             (
                 "openai_identity_token_audience",
@@ -238,9 +244,15 @@ pub(crate) async fn anthropic_token_provider(
 ) -> Result<Option<Arc<dyn TokenProvider>>, FederationError> {
     let Some([rule_id, organization_id, service_account_id]) = validate(
         [
-            ("anthropic_federation_rule_id", federation.federation_rule_id),
+            (
+                "anthropic_federation_rule_id",
+                federation.federation_rule_id,
+            ),
             ("anthropic_organization_id", federation.organization_id),
-            ("anthropic_service_account_id", federation.service_account_id),
+            (
+                "anthropic_service_account_id",
+                federation.service_account_id,
+            ),
         ],
         &[
             federation.identity_token_audience,

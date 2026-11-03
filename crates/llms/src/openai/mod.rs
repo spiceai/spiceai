@@ -271,15 +271,16 @@ pub fn new_openai_client_with_token_provider(
     usage_tier: Option<UsageTier>,
     chat_backend: ChatBackend,
 ) -> Result<Openai<crate::config::HostedModelConfig>, async_openai::error::OpenAIError> {
-    let mut cfg = crate::config::HostedModelConfig::from_url(api_base).with_auth(
-        crate::config::GenericAuthMechanism::from_bearer_token_provider(token),
-    );
-    for (header, value) in [("openai-organization", org_id), ("openai-project", project_id)] {
+    let mut cfg = crate::config::HostedModelConfig::from_url(api_base)
+        .with_auth(crate::config::GenericAuthMechanism::from_bearer_token_provider(token));
+    for (header, value) in [
+        ("openai-organization", org_id),
+        ("openai-project", project_id),
+    ] {
         if let Some(value) = value {
-            let value = reqwest::header::HeaderValue::from_str(value)
-                .map_err(|e| {
-                    async_openai::error::OpenAIError::InvalidArgument(format!("{header}: {e}"))
-                })?;
+            let value = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
+                async_openai::error::OpenAIError::InvalidArgument(format!("{header}: {e}"))
+            })?;
             cfg = cfg.with_header_value(header, value);
         }
     }

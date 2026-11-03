@@ -234,12 +234,7 @@ async fn openai(
     }
 
     Ok(Arc::new(llms::openai::new_openai_client(
-        model,
-        api_base,
-        api_key,
-        org_id,
-        project_id,
-        usage_tier,
+        model, api_base, api_key, org_id, project_id, usage_tier,
     )) as Arc<dyn Responses>)
 }
 

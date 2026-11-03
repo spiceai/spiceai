@@ -673,8 +673,8 @@ async fn openai_bearer() -> Result<String, String> {
     if !openai_uses_workload_identity() {
         return env_value("SPICE_OPENAI_API_KEY");
     }
-    let source =
-        SubjectTokenSource::github_actions_from_env(openai_audience()).map_err(|e| e.to_string())?;
+    let source = SubjectTokenSource::github_actions_from_env(openai_audience())
+        .map_err(|e| e.to_string())?;
     let provider = WorkloadIdentityTokenProvider::try_new(
         source,
         Exchange::openai(
@@ -755,7 +755,10 @@ pub(crate) fn anthropic_credential_params() -> Vec<(String, serde_json::Value)> 
                     "anthropic_federation_rule_id",
                     secret("ANTHROPIC_FEDERATION_RULE_ID"),
                 ),
-                ("anthropic_organization_id", secret("ANTHROPIC_ORGANIZATION_ID")),
+                (
+                    "anthropic_organization_id",
+                    secret("ANTHROPIC_ORGANIZATION_ID"),
+                ),
                 (
                     "anthropic_service_account_id",
                     secret("ANTHROPIC_SERVICE_ACCOUNT_ID"),

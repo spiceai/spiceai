@@ -1720,7 +1720,9 @@ async fn verify_similarity_search_chat_completion(rt: Arc<Runtime>) -> Result<()
 
 pub(crate) fn get_openai_model(model: impl Into<String>, name: impl Into<String>) -> Model {
     let mut model = Model::new(format!("openai:{}", model.into()), name);
-    model.params.extend(crate::utils::openai_credential_params());
+    model
+        .params
+        .extend(crate::utils::openai_credential_params());
     model.params.insert("system_prompt".to_string(), r#"
     When writing SQL queries, do not put double quotes around schema-qualified table names. For example:
 

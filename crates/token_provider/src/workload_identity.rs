@@ -921,7 +921,10 @@ mod tests {
             .iter()
             .map(|body| body["subject_token"].clone())
             .collect();
-        assert_eq!(subject_tokens, vec![json!("file-jwt-1"), json!("file-jwt-2")]);
+        assert_eq!(
+            subject_tokens,
+            vec![json!("file-jwt-1"), json!("file-jwt-2")]
+        );
     }
 
     #[tokio::test]

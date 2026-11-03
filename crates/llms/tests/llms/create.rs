@@ -30,14 +30,14 @@ use llms::{
     xai::Xai,
 };
 use secrecy::SecretString;
-use token_provider::{StaticTokenProvider, TokenProvider};
-use token_provider::workload_identity::{
-    ANTHROPIC_AUDIENCE, Exchange, SubjectTokenSource, WorkloadIdentityTokenProvider,
-};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use token_provider::workload_identity::{
+    ANTHROPIC_AUDIENCE, Exchange, SubjectTokenSource, WorkloadIdentityTokenProvider,
+};
+use token_provider::{StaticTokenProvider, TokenProvider};
 
 pub(crate) async fn create_bedrock(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
     let mut config_builder = default_aws_config();
@@ -104,12 +104,14 @@ fn env_nonempty(name: &str) -> Option<String> {
 async fn openai_token() -> Result<Arc<dyn TokenProvider>, anyhow::Error> {
     let Some(provider_id) = env_nonempty("OPENAI_IDENTITY_PROVIDER_ID") else {
         let api_key = std::env::var("SPICE_OPENAI_API_KEY").unwrap_or_default();
-        return Ok(Arc::new(StaticTokenProvider::new(SecretString::from(api_key))));
+        return Ok(Arc::new(StaticTokenProvider::new(SecretString::from(
+            api_key,
+        ))));
     };
-    let service_account =
-        env_nonempty("OPENAI_SERVICE_ACCOUNT_ID").context("OPENAI_SERVICE_ACCOUNT_ID is not set")?;
-    let audience = env_nonempty("OPENAI_WIF_AUDIENCE")
-        .unwrap_or_else(|| "https://api.openai.com".to_string());
+    let service_account = env_nonempty("OPENAI_SERVICE_ACCOUNT_ID")
+        .context("OPENAI_SERVICE_ACCOUNT_ID is not set")?;
+    let audience =
+        env_nonempty("OPENAI_WIF_AUDIENCE").unwrap_or_else(|| "https://api.openai.com".to_string());
     let source = SubjectTokenSource::github_actions_from_env(audience)?;
     let provider = WorkloadIdentityTokenProvider::try_new(
         source,

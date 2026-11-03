@@ -68,10 +68,9 @@ async fn run_test(
     }
 
     let label = format!("{test_name}/{model_name} (stream: {as_stream})");
-    let model =
-        create_model(model_name)
-            .await
-            .unwrap_or_else(|e| panic!("{label}: failed to create model: {e}"));
+    let model = create_model(model_name)
+        .await
+        .unwrap_or_else(|e| panic!("{label}: failed to create model: {e}"));
     let mut req: CreateResponse =
         serde_json::from_value(req).unwrap_or_else(|e| panic!("{label}: invalid request: {e}"));
     tracing::info!("Running test {label} with {req:?}");
