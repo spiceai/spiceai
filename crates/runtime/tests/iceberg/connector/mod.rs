@@ -60,7 +60,7 @@ async fn iceberg_integration_test_dataset() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-async fn iceberg_integration_test_duckdb_acceleration() -> Result<(), anyhow::Error> {
+async fn iceberg_integration_test_cayenne_acceleration() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );
@@ -70,12 +70,12 @@ async fn iceberg_integration_test_duckdb_acceleration() -> Result<(), anyhow::Er
             let mut dataset = make_iceberg_dataset("tpch_sf1", "customer", "customer")?;
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::File,
                 params: get_params(
                     &Mode::File,
                     Some("./iceberg_duckdb_simple.db".to_string()),
-                    "duckdb",
+                    "cayenne",
                 ),
                 ..Acceleration::default()
             });
@@ -95,7 +95,7 @@ async fn iceberg_integration_test_duckdb_acceleration() -> Result<(), anyhow::Er
 }
 
 #[tokio::test]
-async fn iceberg_integration_test_duckdb_acceleration_restart() -> Result<(), anyhow::Error> {
+async fn iceberg_integration_test_cayenne_acceleration_restart() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );
@@ -105,12 +105,12 @@ async fn iceberg_integration_test_duckdb_acceleration_restart() -> Result<(), an
             let mut dataset = make_iceberg_dataset("tpch_sf1", "customer", "customer")?;
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::File,
                 params: get_params(
                     &Mode::File,
                     Some("./iceberg_duckdb_restart.db".to_string()),
-                    "duckdb",
+                    "cayenne",
                 ),
                 ..Acceleration::default()
             });

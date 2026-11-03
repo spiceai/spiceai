@@ -19,7 +19,7 @@ limitations under the License.
 //!
 //! Default replace-on-key is unchanged. These cases cover the unambiguous bugs:
 //! `SQLite` must reject a NULL primary key; an in-batch duplicate must name the
-//! uniqueness constraint rather than `Query is not read-only`; `DuckDB` must not
+//! uniqueness constraint rather than `Query is not read-only`; `Cayenne` must not
 //! leak `__data_<dataset>_<n>`.
 
 use std::collections::HashMap;
@@ -77,9 +77,9 @@ async fn pk_runtime(
 
     let mut params = HashMap::new();
     match engine {
-        "duckdb" => {
+        "cayenne" => {
             params.insert(
-                "duckdb_file".to_string(),
+                "cayenne_file_path".to_string(),
                 temp_dir.path().join("acc.db").display().to_string(),
             );
         }
@@ -185,13 +185,12 @@ async fn sqlite_reports_uniqueness_for_an_in_batch_duplicate_key() -> Result<(),
         .await
 }
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn duckdb_constraint_errors_name_the_user_dataset() -> Result<(), anyhow::Error> {
+async fn cayenne_constraint_errors_name_the_user_dataset() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
     test_request_context()
         .scope(async {
-            let (_dir, rt) = pk_runtime("duckdb", "o_duckdb").await?;
+            let (_dir, rt) = pk_runtime("cayenne", "o_duckdb").await?;
             let message = execute_sql_err(
                 &rt,
                 "INSERT INTO o_duckdb (id, customer, amount, status) VALUES (NULL, 'nullpk', 1.0, 'new')",

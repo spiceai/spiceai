@@ -34,7 +34,7 @@ pub mod aggregate_clause_pushdown;
 pub mod catalog;
 #[cfg(feature = "postgres")]
 pub mod catalog_changes;
-#[cfg(all(feature = "postgres", feature = "duckdb"))]
+#[cfg(feature = "postgres")]
 pub mod comments;
 pub mod common;
 #[cfg(feature = "postgres")]
@@ -45,11 +45,11 @@ pub mod numeric_scale;
 pub mod replication;
 #[cfg(feature = "postgres")]
 pub mod replication_shared;
-#[cfg(all(feature = "postgres", feature = "duckdb"))]
+#[cfg(feature = "postgres")]
 pub mod replication_tpch;
 #[cfg(all(feature = "postgres", feature = "duckdb"))]
 pub mod replication_type_change;
-#[cfg(all(feature = "postgres", feature = "duckdb"))]
+#[cfg(feature = "postgres")]
 pub mod schema_inference;
 #[cfg(all(feature = "postgres", feature = "sqlite"))]
 pub mod write_back;

@@ -816,16 +816,6 @@ async fn run_replication_e2e(engine: EngineConfig) -> Result<(), anyhow::Error> 
         .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn mysql_binlog_replication_end_to_end() -> Result<(), anyhow::Error> {
-    run_replication_e2e(EngineConfig {
-        engine: "duckdb",
-        mode: spicepod::acceleration::Mode::Memory,
-        accel_params: HashMap::new(),
-    })
-    .await
-}
-
 /// Same lifecycle against the Cayenne accelerator — the file-backed engine
 /// additionally exercises the `spice_sys_mysql_binlog` position sidecar.
 #[tokio::test(flavor = "multi_thread")]

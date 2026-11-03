@@ -1020,26 +1020,39 @@ async fn test_acceleration_refresh_arrow_full_variant() -> Result<(), anyhow::Er
     test_refresh_full_for_engine("arrow").await
 }
 
-// DuckDB (feature-gated)
-#[cfg(feature = "duckdb")]
+// Cayenne memory-mode refreshes
 #[tokio::test]
-async fn test_acceleration_refresh_duckdb_append_variant() -> Result<(), anyhow::Error> {
+async fn test_acceleration_refresh_cayenne_memory_append_variant() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_append_for_engine("duckdb").await
+    test_refresh_append_for_engine("cayenne").await
 }
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn test_acceleration_refresh_duckdb_append_upsert_history() -> Result<(), anyhow::Error> {
+async fn test_acceleration_refresh_cayenne_memory_append_upsert_history()
+-> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    test_upsert_history_for_engine("duckdb").await
+    test_upsert_history_for_engine("cayenne").await
 }
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn test_acceleration_refresh_duckdb_full_variant() -> Result<(), anyhow::Error> {
+async fn test_acceleration_refresh_cayenne_memory_full_variant() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_full_for_engine("duckdb").await
+    test_refresh_full_for_engine("cayenne").await
+}
+
+/// Append refresh with Unix-seconds timestamps in a memory acceleration.
+#[tokio::test]
+async fn test_acceleration_refresh_cayenne_memory_append_unix_seconds() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    super::common::test_append_unix_seconds_for_engine("cayenne", None, None).await
+}
+
+/// Append refresh with ISO8601 timestamps in a memory acceleration.
+#[tokio::test]
+async fn test_acceleration_refresh_cayenne_memory_append_iso8601() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    super::common::test_append_iso8601_for_engine("cayenne", None, None).await
 }
 
 // SQLite (feature-gated)

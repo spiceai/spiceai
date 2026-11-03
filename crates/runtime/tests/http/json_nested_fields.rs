@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Integration test for HTTP datasets with nested JSON fields extracted via
 //! `json_get_str` / `json_get_int` / `json_get_bool` in views, accelerated
-//! with `DuckDB`. Validates:
+//! with `Cayenne`. Validates:
 //!
 //! 1. Initial load of the view returns correct data.
 //! 2. Hot-reload (adding new `json_get_*` columns to the view, including
@@ -148,7 +148,7 @@ datasets:
       allowed_request_paths: /audit-logs
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: memory
       refresh_mode: full
       refresh_sql: |
@@ -187,7 +187,7 @@ datasets:
       allowed_request_paths: /audit-logs
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: memory
       refresh_mode: full
       refresh_sql: |
@@ -235,11 +235,11 @@ async fn run_query(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, String> 
         .map_err(|e| format!("Failed to collect results: {e}"))
 }
 
-/// Validates that an HTTP dataset with `DuckDB` acceleration works with
+/// Validates that an HTTP dataset with `Cayenne` acceleration works with
 /// `json_get_str`/`json_get_int`/`json_get_bool` in views, including
 /// hot-reload of the view definition with additional nested JSON columns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn http_json_nested_fields_duckdb_hot_reload() -> Result<(), String> {
+async fn http_json_nested_fields_cayenne_hot_reload() -> Result<(), String> {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );

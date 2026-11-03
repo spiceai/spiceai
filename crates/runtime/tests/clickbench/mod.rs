@@ -36,7 +36,7 @@ fn get_hits_small_accelerated_dataset() -> Dataset {
     );
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some("cayenne".to_string()),
         ..Acceleration::default()
     });
     dataset

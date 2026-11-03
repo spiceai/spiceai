@@ -34,31 +34,27 @@ use crate::{
     utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
-#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
-    use datafusion_table_providers::sql::db_connection_pool::{
-        DbConnectionPool, duckdbpool::DuckDbConnectionPool,
-    };
-    use duckdb::AccessMode;
-
+async fn accelerated_view_cayenne() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
     test_request_context()
         .scope(async {
+            let temp_dir = tempfile::tempdir()?;
+            let db_path = temp_dir.path().join("cayenne");
             // Clean up any existing acceleration file
             if std::path::Path::new("./taxi_trips_vw.db").exists() {
-                std::fs::remove_file("./taxi_trips_vw.db").expect("to remove file");
+                std::fs::remove_dir_all(&db_path).expect("to remove Cayenne directory");
             }
 
             let dataset = Dataset::new("s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet", "taxi_trips");
             let mut view = View::new("taxi_trips_vw".to_string());
             view.sql = Some("SELECT VendorID, AVG(trip_distance) AS avg_trip_distance, AVG(fare_amount) AS avg_fare_amount FROM taxi_trips GROUP BY VendorID".to_string());
             view.acceleration = Some(Acceleration {
-                params: get_params(&Mode::File, Some("./taxi_trips_vw.db".to_string()), "duckdb"),
+                params: get_params(&Mode::File, Some(db_path.display().to_string()), "cayenne"),
                 enabled: true,
-                engine: Some("duckdb".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: Mode::File,
                 refresh_mode: Some(RefreshMode::Full),
                 ..Acceleration::default()
@@ -120,7 +116,7 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
                 .expect("Failed to get last checkpoint time");
             assert!(last_checkpoint_time.is_some(), "Last checkpoint time is not set");
 
-            // Test explain to ensure duckdb is used
+            // Test the accelerated view plan
             let query_result = rt
                 .datafusion()
                 .query_builder("EXPLAIN SELECT * FROM taxi_trips_vw ORDER BY avg_trip_distance;")
@@ -135,7 +131,7 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
 
             let pretty = arrow::util::pretty::pretty_format_batches(&query_result)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-            insta::assert_snapshot!("duckdb_query_explain", pretty);
+            insta::assert_snapshot!("cayenne_query_explain", pretty);
 
             // Test query output
             let query_result = rt
@@ -152,46 +148,39 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
 
             let pretty = arrow::util::pretty::pretty_format_batches(&query_result)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-            insta::assert_snapshot!("duckdb_query_result", pretty);
+            insta::assert_snapshot!("cayenne_query_result", pretty);
 
             rt.shutdown().await;
             drop(rt);
 
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-            let pool = DuckDbConnectionPool::new_file("./taxi_trips_vw.db", &AccessMode::ReadWrite)
-                .expect("valid path");
-            let conn_dyn = pool.connect().await.expect("valid connection");
-            let conn = conn_dyn.as_sync().expect("sync connection");
-            let result: Vec<RecordBatch> = conn
-                .query_arrow(
-                    "SELECT dataset_name FROM spice_sys_dataset_checkpoint",
-                    &[],
-                    None,
-                )
-                .expect("query executes")
-                .try_collect::<Vec<RecordBatch>>()
-                .await
-                .expect("collects results");
+            let metadata_path = db_path.join("metadata/cayenne.db");
+            let names = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+                let conn = rusqlite::Connection::open(metadata_path)?;
+                let mut statement = conn.prepare("SELECT dataset_name FROM spice_sys_dataset_checkpoint")?;
+                Ok(statement.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?)
+            }).await??;
+            let result = vec![RecordBatch::try_from_iter(vec![(
+                "dataset_name",
+                Arc::new(arrow::array::StringArray::from(names)) as arrow::array::ArrayRef,
+            )])?];
 
             let pretty = arrow::util::pretty::pretty_format_batches(&result)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-            insta::assert_snapshot!("duckdb_spice_sys_dataset_checkpoint", pretty);
+            insta::assert_snapshot!("cayenne_spice_sys_dataset_checkpoint", pretty);
 
-            let persisted_records: Vec<RecordBatch> = conn
-                .query_arrow("SELECT * FROM taxi_trips_vw ORDER BY avg_trip_distance", &[], None)
-                .expect("query executes")
-                .try_collect::<Vec<RecordBatch>>()
-                .await
-                .expect("collects results");
+            let persisted_records = crate::acceleration::query_cayenne_file(
+                &db_path,
+                "taxi_trips_vw",
+                "SELECT * FROM taxi_trips_vw ORDER BY avg_trip_distance",
+            ).await?;
 
             let persisted_records_pretty =
                 arrow::util::pretty::pretty_format_batches(&persisted_records)
                     .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-            insta::assert_snapshot!("duckdb_persisted_records", persisted_records_pretty);
+            insta::assert_snapshot!("cayenne_persisted_records", persisted_records_pretty);
 
             // Remove the file
-            std::fs::remove_file("./taxi_trips_vw.db").expect("to remove file");
+            std::fs::remove_dir_all(&db_path).expect("to remove Cayenne directory");
 
             Ok(())
         })

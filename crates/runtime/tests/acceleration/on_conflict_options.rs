@@ -104,6 +104,7 @@ impl TestCsvDataBuilder {
 
 /// Test the behavior of the vanilla `upsert` when there are duplicates in the incoming batch.
 /// The behavior will be to error out, preventing the runtime from becoming ready because the acceleration isn't loaded.
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn test_acceleration_on_conflict_same_batch_upsert() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -176,7 +177,7 @@ async fn test_acceleration_on_conflict_same_batch_upsert_with_dedup() -> Result<
             data_builder.flush_to_file();
 
             let dataset = data_builder.dataset("test");
-            let dataset = set_duckdb_acceleration(dataset);
+            let dataset = set_cayenne_acceleration(dataset);
             let dataset = set_primary_key(dataset, "foo");
             let dataset = set_on_conflict_behavior(dataset, OnConflictBehavior::UpsertDedup);
             let app = AppBuilder::new("test_acceleration_on_conflict_same_batch_upsert_with_dedup")
@@ -209,6 +210,7 @@ async fn test_acceleration_on_conflict_same_batch_upsert_with_dedup() -> Result<
 
 /// Test the behavior of `upsert_dedup` when there are conflicts in the incoming batch, but not exact duplicates.
 /// The runtime should error since the de-duplication isn't sufficient.
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn test_acceleration_on_conflict_same_batch_upsert_with_dedup_not_exact_duplicates()
 -> Result<(), anyhow::Error> {
@@ -284,7 +286,7 @@ async fn test_acceleration_on_conflict_same_batch_upsert_with_dedup_by_row_id_no
             data_builder.flush_to_file();
 
             let dataset = data_builder.dataset("test");
-            let dataset = set_duckdb_acceleration(dataset);
+            let dataset = set_cayenne_acceleration(dataset);
             let dataset = set_primary_key(dataset, "foo");
             let dataset = set_on_conflict_behavior(dataset, OnConflictBehavior::UpsertDedupByRowId);
             let app = AppBuilder::new("test_acceleration_on_conflict_same_batch_upsert_with_dedup_by_row_id_not_exact_duplicates")
@@ -360,6 +362,22 @@ async fn assert_value(
     assert_eq!(value, target_col_expected_value);
 }
 
+#[expect(clippy::expect_used)]
+fn set_cayenne_acceleration(mut dataset: Dataset) -> Dataset {
+    let yaml = r"
+                enabled: true
+                engine: cayenne
+                mode: memory
+            ";
+    let acceleration: Acceleration = yaml::from_str(yaml).expect("Failed to parse Acceleration");
+    dataset.acceleration = Some(acceleration);
+    dataset
+}
+
+/// `DuckDB` refuses a batch whose rows repeat a key under `upsert` without exact
+/// duplicates; Cayenne keeps the last copy instead (`test/spicescript/duplicate-keys.yaml`).
+/// Only the tests of that `DuckDB` behavior use this, and they go with the engine.
+#[cfg(feature = "duckdb")]
 #[expect(clippy::expect_used)]
 fn set_duckdb_acceleration(mut dataset: Dataset) -> Dataset {
     let yaml = r"

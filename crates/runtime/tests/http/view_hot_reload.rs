@@ -18,7 +18,7 @@ limitations under the License.
 //! accelerated HTTP connector dataset.
 //!
 //! The scenario being tested:
-//! 1. An HTTP dataset is accelerated (`DuckDB` or Arrow).
+//! 1. An HTTP dataset is accelerated (`Cayenne` or Arrow).
 //! 2. A view is created using `json_get` to extract columns from the JSON content.
 //! 3. While the runtime is running, the spicepod is updated with a new view SQL
 //!    that adds an extra column.
@@ -192,7 +192,7 @@ async fn query_batches(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, Stri
 
 /// Core logic for the hot-reload regression test, parameterized by acceleration engine.
 ///
-/// `engine` should be `"duckdb"`, `"arrow"`, `""` (the default engine), etc.
+/// `engine` should be `"cayenne"`, `"arrow"`, `""` (the default engine), etc.
 async fn run_view_hot_reload_test(engine: &str) -> Result<(), String> {
     let test_dir = get_test_dir(if engine.is_empty() { "arrow" } else { engine });
     // Clean up any leftovers from a previous run.
@@ -332,10 +332,10 @@ async fn run_view_hot_reload_test(engine: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Regression test: hot-reloading a view with `json_get` on a DuckDB-accelerated
+/// Regression test: hot-reloading a view with `json_get` on a Cayenne-accelerated
 /// HTTP dataset must update both `DESCRIBE` and `SELECT` results.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_http_json_view_hot_reload_duckdb() -> Result<(), String> {
+async fn test_http_json_view_hot_reload_cayenne() -> Result<(), String> {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );
@@ -343,12 +343,12 @@ async fn test_http_json_view_hot_reload_duckdb() -> Result<(), String> {
     register_test_connectors().await;
 
     test_request_context()
-        .scope(async { run_view_hot_reload_test("duckdb").await })
+        .scope(async { run_view_hot_reload_test("cayenne").await })
         .await
 }
 
 /// Same regression test with the Arrow accelerator to determine
-/// whether the bug is DuckDB-specific or affects all acceleration engines.
+/// whether the bug is Cayenne-specific or affects all acceleration engines.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_http_json_view_hot_reload_arrow() -> Result<(), String> {
     let _ = rustls::crypto::CryptoProvider::install_default(
