@@ -547,6 +547,15 @@ jobs:
       # `repo:spiceai/spiceai:environment:ci`), so CI holds no AWS access key. The credentials
       # go to the test step alone, not the job's environment. Assumed before spiceio starts, so
       # no build-cache endpoint can reach the STS call.
+      - name: Check for the Bedrock role
+        env:
+          AWS_BEDROCK_ROLE_ARN: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+        run: |
+          if [ -z "$AWS_BEDROCK_ROLE_ARN" ]; then
+            echo "::error::AWS_BEDROCK_ROLE_ARN is not set in the ci environment, so the Bedrock tests cannot authenticate. Create the IAM role that trusts this repository's GitHub OIDC tokens and set the secret to its ARN."
+            exit 1
+          fi
+
       - name: Assume the Bedrock role
         id: bedrock-role
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0

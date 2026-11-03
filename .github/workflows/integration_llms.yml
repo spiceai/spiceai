@@ -214,6 +214,7 @@ jobs:
       AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
       AZURE_OPENAI_TENANT_ID: ${{ secrets.AZURE_OPENAI_TENANT_ID }}
       AZURE_OPENAI_CLIENT_ID: ${{ secrets.AZURE_OPENAI_CLIENT_ID }}
+      HAS_BEDROCK_ROLE: ${{ secrets.AWS_BEDROCK_ROLE_ARN != '' }}
     strategy:
       # The two arms cover disjoint model sets — self-hosted local models and the hosted
       # providers — so one arm's result says nothing about the other's, and cancelling the
@@ -241,7 +242,7 @@ jobs:
       # to the test step alone, and are assumed before spiceio starts, so no build-cache endpoint
       # can reach the STS call.
       - name: Assume the Bedrock role
-        if: matrix.target.needs_env && contains(format(',{0},', matrix.target.model_allowlist), ',bedrock,')
+        if: matrix.target.needs_env && env.HAS_BEDROCK_ROLE == 'true' && contains(format(',{0},', matrix.target.model_allowlist), ',bedrock,')
         id: bedrock-role
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
@@ -301,6 +302,17 @@ jobs:
           # honours it for every service, so leaving it set sends this suite's Bedrock
           # calls to the local build cache instead of AWS.
           unset AWS_ENDPOINT_URL
+          # Bedrock runs as the CI role (`AWS_BEDROCK_ROLE_ARN`): until the `ci` environment has
+          # one, the other providers still run, and the run says Bedrock did not.
+          if [[ ",${MODEL_ALLOWLIST}," == *",bedrock,"* && "${HAS_BEDROCK_ROLE}" != "true" ]]; then
+            echo "::warning::AWS_BEDROCK_ROLE_ARN is not set in the ci environment, so this run does not test Bedrock. Create the Bedrock CI role and set the secret."
+            MODEL_ALLOWLIST=$(printf '%s' "$MODEL_ALLOWLIST" | tr ',' '\n' | grep -vx bedrock | paste -sd, - || true)
+            if [ -z "$MODEL_ALLOWLIST" ]; then
+              echo "::error::This run tests only Bedrock, which needs AWS_BEDROCK_ROLE_ARN."
+              exit 1
+            fi
+            export MODEL_ALLOWLIST
+          fi
           if [ "${{ matrix.target.needs_env }}" == "true" ]; then
             if [ -z "${OPENAI_IDENTITY_PROVIDER_ID:-}" ]; then
               echo "Error: 'OPENAI_IDENTITY_PROVIDER_ID' is not defined."
