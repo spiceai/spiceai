@@ -22,11 +22,8 @@ the next accepted commit publishes the floor, as in the model.
 - ../headlog_replay.rs: three positive replay tests, five negative-control tests,
   and listed-but-missing batch checks for cold open and lagging poll.
 - *.jsonl: eight driver-generated trace sets; positive sets include walks.
-- evidence/: the driver's verbatim output per trace set (model-*.txt), the replay
-  output (replay-and-controls.txt), and the checkpoint-root control
-  (replay-control-checkpoint-root.txt). Temporary directories are shown as <tmp>.
 
-This prototype is not wired into Spice or a Spicepod; these tests exercise the
+These tests exercise the
 real head-log API and real stores directly. The replay cancels tasks, drops
 Writer handles, clears volatile receipts and deserializes only persisted bytes
 for Writer::resume. This is a storage-boundary restart simulation, not an OS
@@ -145,13 +142,12 @@ and walks), the head's listed batch ends and inline record sizes must equal
 those of the model stepped through the same actions
 (`cayenne_metastore_model::window_head_after`, with the trace's own run), at
 10,000 bytes per symbolic byte. The expectation comes from the model, never from
-the head log. 23 traces × 2 backends compare; the `CUTS` lines in
-evidence/replay-and-controls.txt show each. Controls:
+the head log. 23 traces × 2 backends compare; the replay prints a `CUTS` line for each
+(`--no-capture`). Controls:
 
 - `spill_above_bytes` 15,000 instead of 20,000 (records spill, no append is
   refused, every reader check still holds) fails only this check:
-  `expected batch ends [2, 5], window bytes [10000]; actual [3], [10000, 10000, 10000]`
-  (evidence/replay-control-spill-threshold.txt).
+  `expected batch ends [2, 5], window bytes [10000]; actual [3], [10000, 10000, 10000]`.
 - `batch_max_records` 2 and `batch_budget_bytes` 25,000 are caught earlier, as a
   refused positive append.
 - Gap: `head_budget_bytes` 75,000 instead of 55,000 passes every check. No
@@ -164,8 +160,7 @@ the serial reference).
 
 **Checkpoint control.** With the root written one record short
 (`serial[..c - 1]`), window_storage fails at the commit that publishes the floor:
-`trace=window-storage-6-exhaust "delayed seal after GC" step=8 action=Append(0) expected invariants hold; actual=I1/I6 expected [...]`
-(evidence/replay-control-checkpoint-root.txt).
+`trace=window-storage-6-exhaust "delayed seal after GC" step=8 action=Append(0) expected invariants hold; actual=I1/I6 expected [...]`.
 
 ## Trace-generation commands
 
@@ -203,5 +198,4 @@ Each walk run printed `WALKS <run> seed=42 count=20 max_steps=40 good=true`.
 
     cargo nextest run -p object_store_occ --test headlog_replay --no-capture --retries 0
 
-`9 tests run: 9 passed`; the replay and control lines are in
-evidence/replay-and-controls.txt.
+Each test prints its replay and control lines with `--no-capture`.
