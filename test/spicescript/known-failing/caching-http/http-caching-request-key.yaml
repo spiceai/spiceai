@@ -5,14 +5,13 @@ description: >
   The write should be refused, leaving nothing cached, so the next lookup
   asks the origin again and answers all three rows. On Cayenne one of the
   three rows is cached, and every later lookup answers that one row from the
-  cache without asking the origin. DuckDB is the comparison.
+  cache without asking the origin.
 
 sources:
   api: { kind: mock-http }
 
 variants:
   cayenne: {}
-  duckdb: { datasets: { t: { acceleration: { engine: duckdb } } } }
 
 spicepod:
   version: v1

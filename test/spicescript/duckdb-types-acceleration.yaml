@@ -16,8 +16,6 @@ sources:
 variants:
   federated: {}
   arrow: arrow-memory
-  duckdb: duckdb-file
-  duckdb-memory: duckdb-memory
   sqlite: sqlite-file
   cayenne: cayenne-file
   cayenne-memory: cayenne-memory

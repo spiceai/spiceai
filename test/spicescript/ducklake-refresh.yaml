@@ -1,7 +1,7 @@
 name: ducklake-refresh
 description: >
   A DuckLake table answers through Spice like DuckDB reading the same lake:
-  federated and accelerated by full refresh into Cayenne and DuckDB, after a
+  federated and accelerated by full refresh into Cayenne, after a
   bulk load and after small inserts, deletes and updates (which DuckLake may
   keep in its catalog rather than in data files). Rows inserted through Spice
   reach the lake, and the accelerations keep serving while the lake's catalog
@@ -15,8 +15,6 @@ variants:
     datasets: { orders: { access: read_write } }
   cayenne:
     datasets: { orders: { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }
-  duckdb:
-    datasets: { orders: { acceleration: { enabled: true, engine: duckdb, mode: file, refresh_mode: full } } }
 
 spicepod:
   version: v1
@@ -53,7 +51,7 @@ steps:
         - DELETE FROM orders WHERE id IN (5, 6, 60001)
         - UPDATE orders SET total = total + 100, note = 'updated' WHERE id IN (7, 60002)
   - refresh: orders
-    only: [cayenne, duckdb]
+    only: cayenne
   - query: SELECT * FROM orders
     eventually: 30s
   - query: SELECT * FROM orders WHERE id IN (5, 6, 7, 60001, 60002)
@@ -66,7 +64,7 @@ steps:
         - DELETE FROM orders WHERE id % 7 = 0
         - UPDATE orders SET total = total + 1 WHERE id % 11 = 0
   - refresh: orders
-    only: [cayenne, duckdb]
+    only: cayenne
   - query: SELECT * FROM orders
     eventually: 30s
   - query: SELECT status, count(*), sum(total), min(placed), max(placed) FROM orders GROUP BY status
@@ -78,9 +76,9 @@ steps:
     only: federated
   - source-exec:
       lake: "INSERT INTO orders VALUES (90001, 9, 'S', 9.99, TIMESTAMP '2025-03-01 12:00:00', 'via spice'), (90002, 9, 'S', NULL, NULL, NULL)"
-    only: [cayenne, duckdb]
+    only: cayenne
   - refresh: orders
-    only: [cayenne, duckdb]
+    only: cayenne
   - query: SELECT * FROM orders WHERE id > 90000
     eventually: 30s
   - query: SELECT count(*) FROM orders WHERE id > 90000
@@ -88,13 +86,13 @@ steps:
 
   # The catalog goes away: the accelerations keep serving what they hold.
   - query: SELECT * FROM orders
-    only: [cayenne, duckdb]
+    only: cayenne
     id: before-outage
   - stop-source: lake
   - query: SELECT * FROM orders
     expect: { same-as: before-outage }
     consistently: 5s
-    only: [cayenne, duckdb]
+    only: cayenne
   - query: SELECT count(*) FROM orders
     expect-error: true
     only: federated

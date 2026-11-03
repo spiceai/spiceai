@@ -11,7 +11,7 @@ sources:
   src: { kind: mysql }
 
 matrix:
-  engine: [cayenne, duckdb]
+  engine: [cayenne]
 
 variants:
   fail-loud: {}

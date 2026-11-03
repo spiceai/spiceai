@@ -11,7 +11,7 @@ sources:
   src: { kind: postgres }
 
 matrix:
-  engine: [duckdb, cayenne]
+  engine: [cayenne]
 
 variants:
   on-load: {}

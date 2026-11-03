@@ -13,10 +13,8 @@ sources:
 variants:
   federated: {}
   arrow: arrow-memory
-  duckdb: duckdb-file
   sqlite: sqlite-file
   cayenne: cayenne-file
-  duckdb-memory: duckdb-memory
   sqlite-memory: sqlite-memory
   cayenne-memory: cayenne-memory
 

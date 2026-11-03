@@ -8,7 +8,6 @@ sources:
 
 variants:
   federated: {}
-  duckdb: duckdb
   arrow: arrow
 
 spicepod:
