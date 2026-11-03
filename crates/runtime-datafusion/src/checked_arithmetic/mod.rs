@@ -26,6 +26,7 @@ mod analyzer;
 mod decomposability;
 mod eager;
 mod op;
+mod plain_writes;
 mod single_distinct;
 mod sum;
 
@@ -36,6 +37,7 @@ pub use eager::{
     install_checked_eager_aggregation_for_distributed,
 };
 pub use op::{CHECKED_ADD_UDF_NAME, CHECKED_MUL_UDF_NAME, CHECKED_SUB_UDF_NAME};
+pub use plain_writes::{PlainArithmeticWrites, plain_arithmetic, with_plain_arithmetic_writes};
 pub use single_distinct::{CheckedSingleDistinctToGroupBy, install_checked_single_distinct};
 pub use sum::CheckedSum;
 
