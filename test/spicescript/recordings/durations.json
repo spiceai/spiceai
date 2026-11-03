@@ -6,6 +6,7 @@
   "append-time-column": 8,
   "append-time-partition": 4,
   "auth": 3,
+  "azure-model-credentials": 1,
   "builtins": 4,
   "case-mixed-widths": 5,
   "cayenne-upgrade": 8,

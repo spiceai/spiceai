@@ -851,7 +851,9 @@ pub(crate) async fn azure_client(
     }
 
     if api_key.is_none() && entra_token.is_none() {
-        return Err(LlmError::FailedToLoadModel {
+        // Not `FailedToLoadModel`, which presents the cause as a bug to report: this is a
+        // credential the configuration does not give.
+        return Err(LlmError::FailedToAuthenticate {
             source: format!(
                 "Azure model '{component_name}' requires `azure_api_key`, `azure_entra_token`, or a Microsoft Entra workload identity: `azure_tenant_id` and `azure_client_id`, or on AKS a pod labeled `azure.workload.identity/use: \"true\"`. See https://spiceai.org/docs/components/models/azure for details."
             )
