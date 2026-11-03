@@ -20,6 +20,9 @@ limitations under the License.
 //! it, and the body length does not answer that question — see [`declared_message_header`].
 //! The predicates live here rather than beside one receiver so that the scheduler's
 //! write-through path and the runtime's `DoPut` handler share one answer.
+//!
+//! On the sending side, [`split_batch_for_flight`] bounds how much one Flight record-batch
+//! message carries, so every Flight encoder splits a large batch the same way.
 
 /// What an IPC message's header declares, or `None` when the message carries no header bytes.
 ///
@@ -141,6 +144,51 @@ fn exceeds_decompression_bound(declared: u64, body_len: usize) -> bool {
     let body_len = u64::try_from(body_len).unwrap_or(u64::MAX);
     declared > DECOMPRESSED_SIZE_FLOOR
         && declared > body_len.saturating_mul(MAX_DECOMPRESSION_RATIO)
+}
+
+/// Largest Arrow data, in bytes, that one Flight record-batch message should carry.
+///
+/// gRPC clients reject a message over their receive limit, and most default it to 4 MiB
+/// (tonic, grpc-go, grpc-java). Encoding each [`RecordBatch`] as a single message means a
+/// large batch — an accelerator scan that yields tens of thousands of rows, a sort that
+/// coalesces its output, an engine that hands back its whole result at once — becomes one
+/// message the client cannot decode. This matches `arrow-flight`'s own
+/// `GRPC_TARGET_MAX_FLIGHT_SIZE_BYTES`, the target `FlightDataEncoderBuilder` splits to, which
+/// leaves room for the IPC header and padding below the 4 MiB default.
+pub const FLIGHT_TARGET_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Split `batch` into zero-copy row slices of about `max_bytes` of Arrow data each, so that
+/// each slice can be sent as its own Flight message.
+///
+/// Sizes come from [`crate::record_batch::slice_memory_size`], which counts only the part of
+/// each buffer a (possibly already sliced) batch references, so a narrow slice of a large
+/// decoded chunk is not split further than its own rows need. Rows are spread evenly across
+/// the slices. A batch at or under `max_bytes`, a batch with at most one row, and a
+/// `max_bytes` of zero are returned unchanged: a single row is the smallest unit Flight can
+/// send, so a row larger than the target still goes out as one message.
+#[must_use]
+pub fn split_batch_for_flight(
+    batch: arrow::record_batch::RecordBatch,
+    max_bytes: usize,
+) -> Vec<arrow::record_batch::RecordBatch> {
+    let num_rows = batch.num_rows();
+    if max_bytes == 0 || num_rows <= 1 {
+        return vec![batch];
+    }
+    let size = crate::record_batch::slice_memory_size(&batch);
+    if size <= max_bytes {
+        return vec![batch];
+    }
+    let pieces = size.div_ceil(max_bytes).min(num_rows);
+    let rows_per_piece = num_rows.div_ceil(pieces).max(1);
+    let mut slices = Vec::with_capacity(pieces);
+    let mut offset = 0;
+    while offset < num_rows {
+        let length = rows_per_piece.min(num_rows - offset);
+        slices.push(batch.slice(offset, length));
+        offset += length;
+    }
+    slices
 }
 
 #[cfg(test)]
@@ -398,5 +446,140 @@ mod tests {
         assert!(exceeds_decompression_bound(at_ratio + 1, body_len));
         assert!(!exceeds_decompression_bound(DECOMPRESSED_SIZE_FLOOR, 0));
         assert!(exceeds_decompression_bound(DECOMPRESSED_SIZE_FLOOR + 1, 0));
+    }
+}
+
+#[cfg(test)]
+mod split_batch_for_flight_tests {
+    use std::sync::Arc;
+
+    use arrow::array::{Array, ArrayRef, Int64Array, LargeStringArray, ListArray, RecordBatch};
+    use arrow::compute::concat_batches;
+    use arrow::datatypes::Int64Type;
+    use arrow_ipc::writer::{
+        DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions,
+    };
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::{FLIGHT_TARGET_MESSAGE_BYTES, split_batch_for_flight};
+
+    /// The 4 MiB receive limit tonic, grpc-go and grpc-java clients apply by default.
+    const CLIENT_DEFAULT_DECODE_LIMIT: usize = 4 * 1024 * 1024;
+
+    /// `rows` rows of an id, a `row_bytes`-wide string and a 4-element list, about
+    /// `rows * row_bytes` bytes in all.
+    fn wide_batch(rows: usize, row_bytes: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("s", DataType::LargeUtf8, false),
+            Field::new(
+                "l",
+                DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true))),
+                true,
+            ),
+        ]));
+        let ids: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            (0..rows).map(|i| i64::try_from(i).unwrap_or(i64::MAX)),
+        ));
+        let pad = "x".repeat(row_bytes.saturating_sub(9));
+        let strings: ArrayRef = Arc::new(LargeStringArray::from_iter_values(
+            (0..rows).map(|i| format!("{i:09}{pad}")),
+        ));
+        let lists: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
+            (0..rows).map(|i| {
+                let i = i64::try_from(i).unwrap_or(i64::MAX);
+                Some(vec![Some(i), Some(i + 1), None, Some(i + 3)])
+            }),
+        ));
+        RecordBatch::try_new(schema, vec![ids, strings, lists]).expect("valid test batch")
+    }
+
+    /// Bytes of the Flight message `batch` encodes to: IPC header plus body.
+    fn encoded_message_bytes(batch: &RecordBatch) -> usize {
+        let (_, encoded) = IpcDataGenerator::default()
+            .encode(
+                batch,
+                &mut DictionaryTracker::new(false),
+                &IpcWriteOptions::default(),
+                &mut IpcWriteContext::default(),
+            )
+            .expect("encode test batch");
+        encoded.ipc_message.len() + encoded.arrow_data.len()
+    }
+
+    /// A batch whose single message would exceed the client default (the reported
+    /// 7.6 MB `SELECT *` message) is split into messages under it, every row kept in
+    /// order.
+    #[test]
+    fn large_batch_splits_into_messages_under_the_client_limit() {
+        let batch = wide_batch(32_768, 240);
+        assert!(
+            encoded_message_bytes(&batch) > CLIENT_DEFAULT_DECODE_LIMIT,
+            "fixture must reproduce an over-limit message"
+        );
+
+        let slices = split_batch_for_flight(batch.clone(), FLIGHT_TARGET_MESSAGE_BYTES);
+
+        assert!(slices.len() > 1);
+        for slice in &slices {
+            let bytes = encoded_message_bytes(slice);
+            assert!(
+                bytes <= CLIENT_DEFAULT_DECODE_LIMIT,
+                "slice of {} rows encodes to {bytes} bytes",
+                slice.num_rows()
+            );
+        }
+        let rejoined = concat_batches(&batch.schema(), &slices).expect("concat slices");
+        assert_eq!(rejoined, batch);
+    }
+
+    /// A narrow slice of a large parent is sized by the rows it covers, not by the
+    /// parent buffers it shares, so it is not split needlessly.
+    #[test]
+    fn narrow_slice_of_large_parent_is_not_split() {
+        let parent = wide_batch(32_768, 240);
+        let slice = parent.slice(100, 1_000);
+        assert!(slice.get_array_memory_size() > FLIGHT_TARGET_MESSAGE_BYTES);
+
+        let slices = split_batch_for_flight(slice.clone(), FLIGHT_TARGET_MESSAGE_BYTES);
+
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0], slice);
+    }
+
+    /// Small batches, empty batches, single rows and a zero target pass through as-is.
+    #[test]
+    fn batches_that_cannot_or_need_not_split_are_unchanged() {
+        let small = wide_batch(100, 64);
+        assert_eq!(
+            split_batch_for_flight(small.clone(), FLIGHT_TARGET_MESSAGE_BYTES),
+            vec![small.clone()]
+        );
+        assert_eq!(split_batch_for_flight(small.clone(), 0), vec![small]);
+
+        let empty = wide_batch(0, 64);
+        assert_eq!(
+            split_batch_for_flight(empty.clone(), FLIGHT_TARGET_MESSAGE_BYTES),
+            vec![empty]
+        );
+
+        // One row wider than the target still goes out — as one message.
+        let one_huge_row = wide_batch(1, FLIGHT_TARGET_MESSAGE_BYTES * 2);
+        let slices = split_batch_for_flight(one_huge_row.clone(), FLIGHT_TARGET_MESSAGE_BYTES);
+        assert_eq!(slices, vec![one_huge_row]);
+    }
+
+    /// Rows spread evenly: no slice is more than one row longer than another, and
+    /// there is no tiny trailing slice.
+    #[test]
+    fn rows_spread_evenly_across_slices() {
+        let batch = wide_batch(10_001, 1_024);
+        let slices = split_batch_for_flight(batch, FLIGHT_TARGET_MESSAGE_BYTES);
+        let lengths: Vec<usize> = slices.iter().map(RecordBatch::num_rows).collect();
+        let max = lengths.iter().copied().max().unwrap_or_default();
+        let min = lengths.iter().copied().min().unwrap_or_default();
+        assert_eq!(lengths.iter().sum::<usize>(), 10_001);
+        assert!(max - min < slices.len(), "uneven slices: {lengths:?}");
+        assert!(slices.iter().all(|s| s.column(0).len() == s.num_rows()));
     }
 }

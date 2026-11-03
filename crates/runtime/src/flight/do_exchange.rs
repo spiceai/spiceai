@@ -142,18 +142,25 @@ impl ChangeFlightEncoder {
             self.tracker = DictionaryTracker::new(false);
         }
 
-        let (flight_dictionaries, flight_batch) = self
-            .encoder
-            .encode(
-                record_batch,
-                &mut self.tracker,
-                &self.write_options,
-                &mut self.compression_context,
-            )
-            .map_err(|source| Status::internal(format!("Unable to encode batch: {source}")))?;
+        // A large change batch goes out as several messages, each under a
+        // client's default gRPC receive limit.
+        for slice in arrow_tools::ipc::split_batch_for_flight(
+            record_batch.clone(),
+            arrow_tools::ipc::FLIGHT_TARGET_MESSAGE_BYTES,
+        ) {
+            let (flight_dictionaries, flight_batch) = self
+                .encoder
+                .encode(
+                    &slice,
+                    &mut self.tracker,
+                    &self.write_options,
+                    &mut self.compression_context,
+                )
+                .map_err(|source| Status::internal(format!("Unable to encode batch: {source}")))?;
 
-        flights.extend(flight_dictionaries.into_iter().map(Into::into));
-        flights.push(flight_batch.into());
+            flights.extend(flight_dictionaries.into_iter().map(Into::into));
+            flights.push(flight_batch.into());
+        }
 
         Ok(flights)
     }
