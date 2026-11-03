@@ -79,8 +79,7 @@ jobs:
                 name: 'hosted',
                 needs_env: true,
                 runner,
-                // Bedrock is left out until CI has credentials that can invoke it (#13558).
-                model_allowlist: 'anthropic,openai,xai'
+                model_allowlist: 'anthropic,openai,azure,xai,bedrock'
               }
             ];
 
@@ -189,6 +188,11 @@ jobs:
       ANTHROPIC_ORGANIZATION_ID: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
       ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
       ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+      # Azure OpenAI authenticates as a managed identity whose federated credential trusts this
+      # job's GitHub OIDC token (subject `repo:spiceai/spiceai:environment:ci`).
+      AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+      AZURE_OPENAI_TENANT_ID: ${{ secrets.AZURE_OPENAI_TENANT_ID }}
+      AZURE_OPENAI_CLIENT_ID: ${{ secrets.AZURE_OPENAI_CLIENT_ID }}
     strategy:
       # The two arms cover disjoint model sets — self-hosted local models and the hosted
       # providers — so one arm's result says nothing about the other's, and cancelling the
@@ -196,19 +200,35 @@ jobs:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
-    # Holds the OpenAI and Anthropic workload identity federation IDs (`OPENAI_*` and
-    # `ANTHROPIC_*` secrets).
+    # Holds the OpenAI, Anthropic and Azure OpenAI workload identity federation IDs
+    # (`OPENAI_*`, `ANTHROPIC_*` and `AZURE_OPENAI_*` secrets).
     environment: ci
     permissions:
       contents: read
       actions: read
-      # Exchanged for OpenAI and Anthropic access tokens: workload identity federation.
+      # Exchanged for OpenAI, Anthropic and Microsoft Entra access tokens: workload identity
+      # federation.
       id-token: write
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # Bedrock: an IAM role that trusts this job's GitHub OIDC token (subject
+      # `repo:spiceai/spiceai:environment:ci`), so CI holds no AWS access key. The credentials go
+      # to the test step alone, and are assumed before spiceio starts, so no build-cache endpoint
+      # can reach the STS call.
+      - name: Assume the Bedrock role
+        if: matrix.target.needs_env
+        id: bedrock-role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          role-session-name: gha-llms-bedrock-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
 
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
@@ -251,6 +271,10 @@ jobs:
         env:
           MODEL_ALLOWLIST: ${{ matrix.target.model_allowlist }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+          SPICE_BEDROCK_REGION: us-east-1
+          SPICE_BEDROCK_ACCESS_KEY: ${{ steps.bedrock-role.outputs.aws-access-key-id }}
+          SPICE_BEDROCK_SECRET_KEY: ${{ steps.bedrock-role.outputs.aws-secret-access-key }}
+          SPICE_BEDROCK_SESSION_TOKEN: ${{ steps.bedrock-role.outputs.aws-session-token }}
         run: |
           # The spiceio setup action exports AWS_ENDPOINT_URL for sccache; the AWS SDK
           # honours it for every service, so leaving it set sends this suite's Bedrock
@@ -263,6 +287,10 @@ jobs:
             fi
             if [ -z "${ANTHROPIC_FEDERATION_RULE_ID:-}" ]; then
               echo "Error: 'ANTHROPIC_FEDERATION_RULE_ID' is not defined."
+              exit 1
+            fi
+            if [ -z "${AZURE_OPENAI_CLIENT_ID:-}" ]; then
+              echo "Error: 'AZURE_OPENAI_CLIENT_ID' is not defined."
               exit 1
             fi
             if [ -z "$SPICE_XAI_API_KEY" ]; then
