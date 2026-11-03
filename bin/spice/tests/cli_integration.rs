@@ -1706,6 +1706,16 @@ mod coding_agents {
     /// bound on something that normally takes milliseconds.
     const BUDGET: Duration = Duration::from_secs(30);
 
+    /// How long `spice orca` waits for Orca to answer before it checks Orca's
+    /// agent commands (`ANSWER_BUDGET` in `commands/coding_agent/orca.rs`). The
+    /// stub Orca starts two Python processes before it answers, which on a
+    /// loaded machine takes longer than [`BUDGET`].
+    const ORCA_ANSWER_BUDGET: Duration = Duration::from_mins(3);
+
+    /// How long `spice orca` gives `orca repo add` once Orca has answered
+    /// (`PROJECT_TIMEOUT` in `commands/coding_agent/orca.rs`).
+    const ORCA_PROJECT_BUDGET: Duration = Duration::from_mins(1);
+
     /// A runtime the user started, answering `/health` and `/v1/models` from a
     /// thread of this process. Returns its endpoint.
     fn user_runtime() -> String {
@@ -2113,10 +2123,18 @@ Server((host, int(port)), Handler).serve_forever()
         );
     }
 
-    fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-        let deadline = Instant::now() + BUDGET;
+    fn wait_for(what: &str, done: impl FnMut() -> bool) {
+        wait_within(BUDGET, what, done);
+    }
+
+    fn wait_within(budget: Duration, what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + budget;
         while !done() {
-            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting {}s for {what}",
+                budget.as_secs()
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -2586,11 +2604,13 @@ if args[:1] == ["status"]:
             "Orca runs Codex CLI with the command 'codex', so Codex CLI sessions in Orca do not use Spice. Set Codex CLI's command in Orca's Settings, under Agents, to `'{}/.spice/orca/bin/spice-agent' codex`.",
             lab.home.display()
         );
-        wait_for("the warning about Codex CLI's command", || {
-            output().contains(&codex_warning)
-        });
+        wait_within(
+            ORCA_ANSWER_BUDGET,
+            "the warning about Codex CLI's command",
+            || output().contains(&codex_warning),
+        );
         let project = fs::canonicalize(&lab.app).expect("resolve the project");
-        wait_for("the project to be added", || {
+        wait_within(ORCA_PROJECT_BUDGET, "the project to be added", || {
             orca_calls(root).iter().any(|call| {
                 call["args"]
                     == serde_json::json!([
