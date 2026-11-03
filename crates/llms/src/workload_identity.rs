@@ -14,24 +14,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Workload identity federation for `OpenAI` and Anthropic models and embeddings: the params that
-//! configure it, validated, and the refreshing token provider and client they build.
+//! Workload identity federation for `OpenAI`, Anthropic and Azure `OpenAI` models and embeddings:
+//! the params that configure it, validated, and the refreshing token provider and client they
+//! build.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::HostedModelConfig;
-use crate::openai::{ChatBackend, Openai, UsageTier};
+use crate::openai::{AzureTokenConfig, ChatBackend, Openai, UsageTier};
 use secrecy::SecretString;
 use token_provider::TokenProvider;
 use token_provider::workload_identity::{
-    ANTHROPIC_AUDIENCE, Exchange, SubjectTokenSource, WorkloadIdentityError,
+    ANTHROPIC_AUDIENCE, ENTRA_AUDIENCE, Exchange, SubjectTokenSource, WorkloadIdentityError,
     WorkloadIdentityTokenProvider,
 };
 
 const OPENAI_DOCS: &str = "https://spiceai.org/docs/components/models/openai";
 const ANTHROPIC_DOCS: &str = "https://spiceai.org/docs/components/models/anthropic";
+const AZURE_DOCS: &str = "https://spiceai.org/docs/components/models/azure";
+
+/// The Microsoft Entra scope of Azure `OpenAI`.
+const AZURE_OPENAI_SCOPE: &str = "https://cognitiveservices.azure.com/.default";
 
 /// Why a model's workload identity federation could not be set up.
 #[derive(Debug)]
@@ -97,15 +102,73 @@ pub struct AnthropicFederation<'a> {
     pub identity_token_file: Option<&'a str>,
 }
 
-/// `openai_api_key` when the Spicepod itself sets it, as opposed to a key autoloaded from a secret
-/// store: federation params win over an autoloaded key, but not over one the user wrote.
+/// The `azure_*` federation params of a model or embedding, and the settings of the client
+/// built with them.
+pub struct AzureFederation<'a> {
+    pub tenant_id: Option<&'a str>,
+    pub client_id: Option<&'a str>,
+    pub identity_token_audience: Option<&'a str>,
+    pub identity_token_file: Option<&'a str>,
+    pub endpoint: Option<&'a str>,
+    pub api_version: Option<&'a str>,
+    pub deployment_name: Option<&'a str>,
+}
+
+/// The workload identity the platform gives the process in the environment variables the Azure
+/// SDKs read. The AKS workload identity webhook sets all of them in a pod that uses it.
+#[derive(Clone, Debug, Default)]
+pub struct AzureEnvironment {
+    /// `AZURE_TENANT_ID`.
+    pub tenant_id: Option<String>,
+    /// `AZURE_CLIENT_ID`.
+    pub client_id: Option<String>,
+    /// `AZURE_FEDERATED_TOKEN_FILE`.
+    pub federated_token_file: Option<String>,
+    /// `AZURE_AUTHORITY_HOST`, the Microsoft Entra authority of a sovereign cloud.
+    pub authority_host: Option<String>,
+}
+
+impl AzureEnvironment {
+    /// The variables of this process. An empty variable counts as unset.
+    #[must_use]
+    pub fn from_process() -> Self {
+        let var = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        };
+        Self {
+            tenant_id: var("AZURE_TENANT_ID"),
+            client_id: var("AZURE_CLIENT_ID"),
+            federated_token_file: var("AZURE_FEDERATED_TOKEN_FILE"),
+            authority_host: var("AZURE_AUTHORITY_HOST"),
+        }
+    }
+}
+
+/// The first of `names` that the Spicepod itself sets, as opposed to a key autoloaded from a
+/// secret store: federation params win over an autoloaded key, but not over one the user wrote.
+#[must_use]
+pub fn key_in_spicepod<S: std::hash::BuildHasher>(
+    raw_params: &HashMap<String, SecretString, S>,
+    names: &[&'static str],
+) -> Option<&'static str> {
+    names
+        .iter()
+        .copied()
+        .find(|name| raw_params.contains_key(*name))
+}
+
+/// `openai_api_key` when the Spicepod itself sets it; see [`key_in_spicepod`].
 #[must_use]
 pub fn openai_api_key_in_spicepod<S: std::hash::BuildHasher>(
     raw_params: &HashMap<String, SecretString, S>,
 ) -> Option<&'static str> {
-    raw_params
-        .contains_key("openai_api_key")
-        .then_some("openai_api_key")
+    key_in_spicepod(raw_params, &["openai_api_key"])
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty())
 }
 
 /// Checks a provider's federation params. `None` when none of `required` or `optional` is set;
@@ -311,6 +374,113 @@ pub async fn anthropic_token_provider(
     .map(Some)
 }
 
+/// Where an Azure model's identity token comes from and the exchange it goes to, or `None` when
+/// the model is not configured for workload identity federation.
+///
+/// - The `azure_*` federation params configure it, and conflict with an `azure_api_key` or
+///   `azure_entra_token` that the Spicepod sets (`key_param`).
+/// - A model with no credential at all (`has_key` is false, counting keys autoloaded from a
+///   secret store) uses the workload identity of the environment, as the Azure SDKs do: the
+///   tenant and client from `AZURE_TENANT_ID` and `AZURE_CLIENT_ID`, and the identity token from
+///   `AZURE_FEDERATED_TOKEN_FILE` or the GitHub Actions job.
+fn azure_exchange(
+    federation: &AzureFederation<'_>,
+    key_param: Option<&'static str>,
+    has_key: bool,
+    environment: &AzureEnvironment,
+) -> Result<Option<(SubjectTokenSource, Exchange)>, FederationError> {
+    let explicit = [
+        federation.tenant_id,
+        federation.client_id,
+        federation.identity_token_audience,
+        federation.identity_token_file,
+    ]
+    .into_iter()
+    .any(|value| non_empty(value).is_some());
+    if !explicit && has_key {
+        return Ok(None);
+    }
+    let tenant = non_empty(federation.tenant_id).or(environment.tenant_id.as_deref());
+    let client = non_empty(federation.client_id).or(environment.client_id.as_deref());
+    let file =
+        non_empty(federation.identity_token_file).or(environment.federated_token_file.as_deref());
+    let audience = non_empty(federation.identity_token_audience).unwrap_or(ENTRA_AUDIENCE);
+    if !explicit {
+        // Only an environment that provides a whole workload identity configures a model that
+        // sets no federation param; anything less leaves it a model without a credential.
+        let identity_token =
+            file.is_some() || SubjectTokenSource::github_actions_from_env(audience).is_ok();
+        if tenant.is_none() || client.is_none() || !identity_token {
+            return Ok(None);
+        }
+    }
+    let Some([tenant, client]) = validate(
+        [("azure_tenant_id", tenant), ("azure_client_id", client)],
+        &[
+            federation.identity_token_audience,
+            federation.identity_token_file,
+        ],
+        key_param,
+        AZURE_DOCS,
+    )?
+    else {
+        return Ok(None);
+    };
+    let exchange = Exchange::entra(
+        environment.authority_host.as_deref(),
+        tenant,
+        client,
+        AZURE_OPENAI_SCOPE,
+    )
+    .map_err(|error| FederationError::Config {
+        param: "azure_tenant_id",
+        message: format!("{error} See: {AZURE_DOCS}"),
+    })?;
+    let source = subject_token_source(file, audience, "azure_identity_token_file", AZURE_DOCS)?;
+    Ok(Some((source, exchange)))
+}
+
+/// The client of an Azure `OpenAI` model or embedding configured for workload identity
+/// federation (see [`azure_exchange`]), which sends the current Microsoft Entra token of a
+/// refreshing provider, or `None` when the model is not configured for it. `component` names the
+/// model or embedding in the provider's logs, such as `model 'gpt' (azure)`.
+///
+/// # Errors
+///
+/// A [`FederationError`] for a conflicting, missing or invalid param, or a refused first
+/// exchange.
+pub async fn azure_federated_client(
+    component: &str,
+    model: &str,
+    federation: &AzureFederation<'_>,
+    key_param: Option<&'static str>,
+    has_key: bool,
+    environment: &AzureEnvironment,
+    chat_backend: ChatBackend,
+) -> Result<Option<Openai<AzureTokenConfig>>, FederationError> {
+    let Some((source, exchange)) = azure_exchange(federation, key_param, has_key, environment)?
+    else {
+        return Ok(None);
+    };
+    let Some(endpoint) = non_empty(federation.endpoint) else {
+        return Err(FederationError::Config {
+            param: "endpoint",
+            message: format!(
+                "An Azure model needs `endpoint`, the endpoint of its Azure OpenAI resource, such as https://my-resource.openai.azure.com. See: {AZURE_DOCS}"
+            ),
+        });
+    };
+    let token = token_provider(component, source, exchange).await?;
+    Ok(Some(crate::openai::new_azure_client_with_token_provider(
+        model.to_string(),
+        endpoint,
+        federation.api_version,
+        federation.deployment_name,
+        token,
+        chat_backend,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,6 +592,170 @@ mod tests {
         assert_eq!(
             error.into_embed_error().to_string(),
             "Failed to load embedding model: Invalid value for parameter openai_service_account_id. It is not set."
+        );
+    }
+
+    fn azure<'a>(
+        tenant_id: Option<&'a str>,
+        client_id: Option<&'a str>,
+        identity_token_file: Option<&'a str>,
+    ) -> AzureFederation<'a> {
+        AzureFederation {
+            tenant_id,
+            client_id,
+            identity_token_audience: None,
+            identity_token_file,
+            endpoint: Some("https://my-resource.openai.azure.com"),
+            api_version: None,
+            deployment_name: None,
+        }
+    }
+
+    fn aks() -> AzureEnvironment {
+        AzureEnvironment {
+            tenant_id: Some("aks-tenant".to_string()),
+            client_id: Some("aks-client".to_string()),
+            federated_token_file: Some(
+                "/var/run/secrets/azure/tokens/azure-identity-token".to_string(),
+            ),
+            authority_host: Some("https://login.microsoftonline.com/".to_string()),
+        }
+    }
+
+    /// The identity token source and the token endpoint and client of the exchange an Azure
+    /// model resolves to, or the message of the error it resolves to.
+    fn azure_plan(
+        federation: &AzureFederation<'_>,
+        key_param: Option<&'static str>,
+        has_key: bool,
+        environment: &AzureEnvironment,
+    ) -> Result<Option<(String, String, String)>, String> {
+        match azure_exchange(federation, key_param, has_key, environment) {
+            Ok(None) => Ok(None),
+            Ok(Some((
+                source,
+                Exchange::Entra {
+                    token_url,
+                    client_id,
+                    scope,
+                },
+            ))) => {
+                assert_eq!(scope, "https://cognitiveservices.azure.com/.default");
+                Ok(Some((format!("{source:?}"), token_url, client_id)))
+            }
+            Ok(Some((_, exchange))) => panic!("not an Entra exchange: {exchange:?}"),
+            Err(error) => Err(message(error)),
+        }
+    }
+
+    #[test]
+    fn an_azure_model_with_a_key_ignores_the_environments_workload_identity() {
+        assert_eq!(
+            azure_plan(
+                &azure(None, None, None),
+                Some("azure_api_key"),
+                true,
+                &aks()
+            ),
+            Ok(None)
+        );
+        // A key autoloaded from a secret store is a credential too.
+        assert_eq!(
+            azure_plan(&azure(None, None, None), None, true, &aks()),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn an_azure_model_without_a_credential_uses_the_aks_workload_identity() {
+        assert_eq!(
+            azure_plan(&azure(None, None, None), None, false, &aks()),
+            Ok(Some((
+                r#"File("/var/run/secrets/azure/tokens/azure-identity-token")"#.to_string(),
+                "https://login.microsoftonline.com/aks-tenant/oauth2/v2.0/token".to_string(),
+                "aks-client".to_string()
+            )))
+        );
+        // Without a tenant the environment holds no whole identity, so the model has no
+        // credential.
+        let no_tenant = AzureEnvironment {
+            tenant_id: None,
+            ..aks()
+        };
+        assert_eq!(
+            azure_plan(&azure(None, None, None), None, false, &no_tenant),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn azure_federation_params_override_the_environment_and_an_autoloaded_key() {
+        let federation = azure(
+            Some("contoso.onmicrosoft.com"),
+            Some("spicepod-client"),
+            Some("/token"),
+        );
+        let sovereign = AzureEnvironment {
+            authority_host: Some("https://login.microsoftonline.us".to_string()),
+            ..aks()
+        };
+        assert_eq!(
+            azure_plan(&federation, None, true, &sovereign),
+            Ok(Some((
+                r#"File("/token")"#.to_string(),
+                "https://login.microsoftonline.us/contoso.onmicrosoft.com/oauth2/v2.0/token"
+                    .to_string(),
+                "spicepod-client".to_string()
+            )))
+        );
+        // A param the Spicepod does not set comes from the environment.
+        assert_eq!(
+            azure_plan(
+                &azure(None, Some("spicepod-client"), None),
+                None,
+                false,
+                &aks()
+            ),
+            Ok(Some((
+                r#"File("/var/run/secrets/azure/tokens/azure-identity-token")"#.to_string(),
+                "https://login.microsoftonline.com/aks-tenant/oauth2/v2.0/token".to_string(),
+                "spicepod-client".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn azure_federation_params_and_a_key_in_the_spicepod_conflict() {
+        assert_eq!(
+            azure_plan(
+                &azure(Some("tenant"), Some("client"), None),
+                Some("azure_entra_token"),
+                true,
+                &AzureEnvironment::default()
+            ),
+            Err("Invalid value for parameter azure_entra_token. A model authenticates with either `azure_entra_token` or workload identity federation (`azure_tenant_id`), and both are set. Remove one of them. See: https://spiceai.org/docs/components/models/azure".to_string())
+        );
+    }
+
+    #[test]
+    fn a_missing_or_invalid_azure_tenant_is_named() {
+        assert_eq!(
+            azure_plan(
+                &azure(None, Some("client"), Some("/token")),
+                None,
+                false,
+                &AzureEnvironment::default()
+            ),
+            Err("Invalid value for parameter azure_tenant_id. Workload identity federation needs `azure_tenant_id`, `azure_client_id`, and `azure_tenant_id` is not set. See: https://spiceai.org/docs/components/models/azure".to_string())
+        );
+        assert_eq!(
+            azure_plan(
+                &azure(Some("contoso/../common"), Some("client"), Some("/token")),
+                None,
+                false,
+                &AzureEnvironment::default()
+            ),
+            Err("Invalid value for parameter azure_tenant_id. The Microsoft Entra tenant must be a directory (tenant) ID, which is a GUID, or a domain name such as 'contoso.onmicrosoft.com'. See: https://spiceai.org/docs/components/models/azure".to_string())
         );
     }
 
