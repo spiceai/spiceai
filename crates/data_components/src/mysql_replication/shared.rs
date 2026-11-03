@@ -273,8 +273,12 @@ struct AckSlot {
     /// `delivered`, and always a superset of `gtid`. Under GTID positioning it
     /// is what decides routing, because binlog coordinates are local to one
     /// server and a failover leaves `delivered` and `committed` holding the
-    /// previous server's. Lock order: `delivered_gtid` before `gtid`.
+    /// previous server's.
     delivered_gtid: Mutex<GtidSet>,
+    /// GTID of the last transaction delivered into this member's channel,
+    /// `None` until one is. The consumer commits in delivery order, so the
+    /// member is idle exactly when its executed set holds this one.
+    last_delivered_gtid: Mutex<Option<Gtid>>,
     state: AtomicU8,
 }
 
@@ -284,6 +288,7 @@ impl AckSlot {
             committed: Mutex::new(at.clone()),
             delivered: Mutex::new(at),
             delivered_gtid: Mutex::new(gtid_seed.clone()),
+            last_delivered_gtid: Mutex::new(None),
             gtid: Mutex::new(gtid_seed),
             state: AtomicU8::new(LIVE | if snapshotting { SNAPSHOTTING } else { 0 }),
         }
@@ -316,14 +321,30 @@ impl AckSlot {
         advance_position(&self.delivered, to);
         if let Some((uuid, gno)) = gtid {
             lock(&self.delivered_gtid).add(uuid, gno);
+            *lock(&self.last_delivered_gtid) = Some((uuid, gno));
+        }
+    }
+
+    /// Credit a transaction the member needs nothing from, or already holds:
+    /// it counts as delivered and committed, without being in flight.
+    fn credit(&self, upto: &BinlogPosition, gtid: Option<Gtid>) {
+        self.commit(upto);
+        advance_position(&self.delivered, upto);
+        if let Some((uuid, gno)) = gtid {
+            lock(&self.delivered_gtid).add(uuid, gno);
+            self.fold_gtid(uuid, gno);
         }
     }
 
     /// Whether every envelope delivered to this member has been committed.
+    ///
+    /// Under GTID positioning, positions cannot tell: after a failover the
+    /// `delivered` and `committed` recorded on the previous server stay above
+    /// every new one, and compare equal while an envelope is in flight.
     fn is_idle(&self, gtid_positioned: bool) -> bool {
         if gtid_positioned {
-            let delivered = lock(&self.delivered_gtid);
-            *delivered == *lock(&self.gtid)
+            let last = *lock(&self.last_delivered_gtid);
+            last.is_none_or(|(uuid, gno)| lock(&self.gtid).contains(uuid, gno))
         } else {
             self.delivered() == self.committed()
         }
@@ -406,6 +427,7 @@ impl AckTable {
                 *lock(&slot.committed) = at.clone();
                 *lock(&slot.delivered) = at;
                 *lock(&slot.delivered_gtid) = gtid_seed.clone();
+                *lock(&slot.last_delivered_gtid) = None;
                 *lock(&slot.gtid) = gtid_seed;
                 slot.state.store(held, Ordering::Release);
             }
@@ -462,14 +484,10 @@ impl AckTable {
         for slot in read_lock(&self.members).values() {
             let s = slot.state.load(Ordering::Acquire);
             if s & (LIVE | STREAMING) == (LIVE | STREAMING) && slot.is_idle(gtid_positioned) {
-                slot.commit(upto);
-                slot.deliver(upto, gtid);
                 // An idle member's committed advances past this transaction, so
                 // its executed set gains the transaction's GTID too (idempotent
                 // — re-folding an already-present GTID is a no-op).
-                if let Some((uuid, gno)) = gtid {
-                    slot.fold_gtid(uuid, gno);
-                }
+                slot.credit(upto, gtid);
             }
         }
     }
