@@ -419,6 +419,21 @@ jobs:
       - build
       - setup-model-matrix
     if: ${{ needs.setup-model-matrix.outputs.matrix != '[]' }}
+    # Holds the OpenAI workload identity federation IDs (`OPENAI_*` secrets).
+    environment: ci
+    permissions:
+      contents: read
+      actions: read
+      # The Spicepod's `github:` dataset reads this repository's issues with `GITHUB_TOKEN`.
+      issues: read
+      pull-requests: read
+      # Exchanged for OpenAI access tokens: workload identity federation.
+      id-token: write
+    env:
+      # Workload identity federation: spiced and the tests exchange this job's GitHub OIDC token
+      # for provider access tokens with these IDs, and exchange again before each expires.
+      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
     strategy:
       fail-fast: false
       matrix:
@@ -454,7 +469,6 @@ jobs:
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
@@ -663,7 +677,6 @@ jobs:
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
