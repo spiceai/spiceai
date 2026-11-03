@@ -61,7 +61,8 @@ pub enum FederationError {
     Exchange(WorkloadIdentityError),
     /// The client could not be built from the model's other params.
     Client(async_openai::error::OpenAIError),
-    /// The environment holds part of a workload identity, but not enough to authenticate with.
+    /// The environment's workload identity cannot be used: it lacks a part, or names an
+    /// authority the identity token must not be sent to.
     IncompleteIdentity(String),
 }
 
@@ -539,9 +540,14 @@ fn azure_exchange(
         client,
         scope,
     )
-    .map_err(|error| FederationError::Config {
-        param: "azure_tenant_id",
-        message: format!("{error} See: {AZURE_DOCS}"),
+    .map_err(|error| match error {
+        WorkloadIdentityError::InsecureEntraAuthority => FederationError::IncompleteIdentity(
+            format!("`AZURE_AUTHORITY_HOST` is not usable: {error} See: {AZURE_DOCS}"),
+        ),
+        error => FederationError::Config {
+            param: "azure_tenant_id",
+            message: format!("{error} See: {AZURE_DOCS}"),
+        },
     })?;
     let (source, token_from) = match (file, github) {
         (Some(file), _) => (SubjectTokenSource::File(PathBuf::from(file)), file_from),
@@ -950,6 +956,18 @@ mod tests {
                     "https://cognitiveservices.azure.us/.default".to_string()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn an_http_authority_from_the_environment_is_refused() {
+        let environment = AzureEnvironment {
+            authority_host: Some("http://login.microsoftonline.com".to_string()),
+            ..aks()
+        };
+        assert_eq!(
+            azure_plan(&azure(None, None, None), None, false, &environment, false),
+            Err("`AZURE_AUTHORITY_HOST` is not usable: The Microsoft Entra authority must be an https:// URL, such as https://login.microsoftonline.us, because the workload identity token is sent to it. See: https://spiceai.org/docs/components/models/azure".to_string())
         );
     }
 

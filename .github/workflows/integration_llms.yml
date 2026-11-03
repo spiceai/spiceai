@@ -313,24 +313,17 @@ jobs:
             fi
             export MODEL_ALLOWLIST
           fi
-          if [ "${{ matrix.target.needs_env }}" == "true" ]; then
-            if [ -z "${OPENAI_IDENTITY_PROVIDER_ID:-}" ]; then
-              echo "Error: 'OPENAI_IDENTITY_PROVIDER_ID' is not defined."
+          # Each provider's credential is required only when the run tests that provider.
+          runs() { [[ ",${MODEL_ALLOWLIST}," == *",$1,"* ]]; }
+          for check in openai:OPENAI_IDENTITY_PROVIDER_ID anthropic:ANTHROPIC_FEDERATION_RULE_ID \
+            azure:AZURE_OPENAI_CLIENT_ID xai:SPICE_XAI_API_KEY; do
+            model="${check%%:*}"
+            variable="${check#*:}"
+            if runs "$model" && [ -z "${!variable:-}" ]; then
+              echo "Error: '${variable}' is not defined, so the ${model} tests cannot authenticate."
               exit 1
             fi
-            if [ -z "${ANTHROPIC_FEDERATION_RULE_ID:-}" ]; then
-              echo "Error: 'ANTHROPIC_FEDERATION_RULE_ID' is not defined."
-              exit 1
-            fi
-            if [ -z "${AZURE_OPENAI_CLIENT_ID:-}" ]; then
-              echo "Error: 'AZURE_OPENAI_CLIENT_ID' is not defined."
-              exit 1
-            fi
-            if [ -z "$SPICE_XAI_API_KEY" ]; then
-              echo "Error: 'SPICE_XAI_API_KEY' is not defined."
-              exit 1
-            fi
-          fi
+          done
           test_binary=./integration_test/llms_integration_test
           # The live-provider tests live under `integration.rs`'s `llms` module; the
           # binary's other modules are credential-free and run in `make nextest`.

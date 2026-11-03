@@ -175,6 +175,11 @@ pub enum WorkloadIdentityError {
         "The Microsoft Entra tenant must be a directory (tenant) ID, which is a GUID, or a domain name such as 'contoso.onmicrosoft.com'."
     ))]
     InvalidEntraTenant,
+
+    #[snafu(display(
+        "The Microsoft Entra authority must be an https:// URL, such as https://login.microsoftonline.us, because the workload identity token is sent to it."
+    ))]
+    InsecureEntraAuthority,
 }
 
 pub type Result<T, E = WorkloadIdentityError> = std::result::Result<T, E>;
@@ -366,7 +371,9 @@ impl Exchange {
     /// # Errors
     ///
     /// [`WorkloadIdentityError::InvalidEntraTenant`] when `tenant_id` is neither a GUID nor a
-    /// domain name, so that it cannot change the path of the token endpoint.
+    /// domain name, so that it cannot change the path of the token endpoint, and
+    /// [`WorkloadIdentityError::InsecureEntraAuthority`] when `authority_host` names a scheme
+    /// other than `https`, which would send the identity token unencrypted.
     pub fn entra(
         authority_host: Option<&str>,
         tenant_id: &str,
@@ -379,10 +386,15 @@ impl Exchange {
             .filter(|host| !host.is_empty())
             .unwrap_or(ENTRA_AUTHORITY_HOST)
             .trim_end_matches('/');
-        let authority = if authority.contains("://") {
-            authority.to_string()
-        } else {
-            format!("https://{authority}")
+        let authority = match authority.split_once("://") {
+            Some((scheme, _)) => {
+                ensure!(
+                    scheme.eq_ignore_ascii_case("https"),
+                    InsecureEntraAuthoritySnafu
+                );
+                authority.to_string()
+            }
+            None => format!("https://{authority}"),
         };
         Ok(Self::Entra {
             token_url: format!("{authority}/{tenant_id}/oauth2/v2.0/token"),
@@ -1128,6 +1140,34 @@ mod tests {
                 Ok("https://login.chinacloudapi.cn/contoso/oauth2/v2.0/token".to_string()),
                 Ok("https://login.microsoftonline.com/contoso/oauth2/v2.0/token".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn an_entra_authority_must_be_https() {
+        for authority in [
+            "http://login.microsoftonline.com",
+            "HTTP://login.microsoftonline.us/",
+            "ftp://login.example.test",
+        ] {
+            assert_eq!(
+                Exchange::entra(Some(authority), "contoso", "client-1", "scope")
+                    .map(|exchange| exchange.token_url().to_string())
+                    .map_err(|error| error.to_string()),
+                Err("The Microsoft Entra authority must be an https:// URL, such as https://login.microsoftonline.us, because the workload identity token is sent to it.".to_string()),
+                "{authority:?}"
+            );
+        }
+        assert_eq!(
+            Exchange::entra(
+                Some("HTTPS://login.microsoftonline.us"),
+                "contoso",
+                "c",
+                "s"
+            )
+            .map(|exchange| exchange.token_url().to_string())
+            .map_err(|error| error.to_string()),
+            Ok("HTTPS://login.microsoftonline.us/contoso/oauth2/v2.0/token".to_string())
         );
     }
 
