@@ -67,7 +67,7 @@ pub(super) struct ReasoningRequest {
     /// `maxTokens` to send in place of the request's own value.
     pub(super) max_tokens: Option<u32>,
     /// Whether the model rejects Converse inference parameters while reasoning at high effort.
-    pub(super) omit_inference_parameters: bool,
+    pub(super) reject_inference_parameters: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -204,7 +204,7 @@ impl ReasoningControl {
         };
 
         let nearest_effort = Effort::nearest(effort);
-        let omit_inference_parameters =
+        let reject_inference_parameters =
             matches!((self, nearest_effort), (Self::Nova, Some(Effort::High)));
         let (fields, max_tokens) = match (self, nearest_effort) {
             // Thinking is off by default on these models.
@@ -241,7 +241,7 @@ impl ReasoningControl {
                         max_reasoning_effort: effort,
                     },
                 },
-                if omit_inference_parameters {
+                if reject_inference_parameters {
                     None
                 } else {
                     max_tokens
@@ -273,7 +273,7 @@ impl ReasoningControl {
         Ok(Some(ReasoningRequest {
             additional_model_request_fields: value_to_document(fields),
             max_tokens,
-            omit_inference_parameters,
+            reject_inference_parameters,
         }))
     }
 }
@@ -340,12 +340,12 @@ mod tests {
     fn expected_with_inference_parameters(
         value: Value,
         max_tokens: Option<u32>,
-        omit_inference_parameters: bool,
+        reject_inference_parameters: bool,
     ) -> ReasoningRequest {
         ReasoningRequest {
             additional_model_request_fields: value_to_document(value),
             max_tokens,
-            omit_inference_parameters,
+            reject_inference_parameters,
         }
     }
 
