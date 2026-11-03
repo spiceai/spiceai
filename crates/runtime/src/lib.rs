@@ -332,6 +332,24 @@ pub enum Error {
     #[snafu(display("Unable to create view: {reason}"))]
     UnableToCreateView { reason: String },
 
+    /// A dataset selects the `duckdb` vector engine, removed in v2.5. Only that dataset
+    /// fails to load.
+    #[snafu(display(
+        "Failed to load dataset '{}': {}",
+        dataset.escape_debug(),
+        runtime_component::vector_engine::removed_vector_engine_message()
+    ))]
+    DatasetVectorEngineRemoved { dataset: String },
+
+    /// A view selects the `duckdb` vector engine, removed in v2.5. Only that view fails
+    /// to load.
+    #[snafu(display(
+        "Failed to load view '{}': {}",
+        view_name.escape_debug(),
+        runtime_component::vector_engine::removed_vector_engine_message()
+    ))]
+    ViewVectorEngineRemoved { view_name: String },
+
     /// A dataset's acceleration sets an engine removed in v2.5. Only that dataset fails to
     /// load: Spice never switches it to Cayenne on its own.
     #[snafu(display(
