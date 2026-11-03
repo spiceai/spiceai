@@ -1,0 +1,58 @@
+name: parquet-struct-map-key
+description: >
+  A key lookup into a map that sits inside a struct column of a Parquet file
+  (`som['mm']['k']`, which DataFusion folds into one
+  `get_field(som, 'mm', 'k')`) answers the same as it does from an
+  accelerated copy: in the projection, through `get_field(som, 'mm')['k']`,
+  and in a `WHERE` clause that is pushed into the Parquet row filter, rather
+  than failing with an internal error because the scan pruned the struct
+  column away. The federated plan shows the lookup pushed into the Parquet
+  scan, so the path that used to fail is the one under test.
+
+sources:
+  src: { kind: duckdb }
+
+variants:
+  arrow: arrow-memory
+  cayenne: cayenne-file
+  federated: {}
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: parquet-struct-map-key
+  runtime:
+    caching: { sql_results: { enabled: false } }
+  datasets:
+    - from: 'file:${instance.dir}/som.parquet'
+      name: t
+      params: { file_format: parquet }
+
+steps:
+  # Row 0 holds the key, row 1 a NULL map, row 2 a map without the key.
+  - source-exec:
+      src: |
+        COPY (
+          SELECT * FROM (VALUES
+            (0, {'mm': MAP {'k': 1}, 'n': 5}),
+            (1, {'mm': NULL::MAP(VARCHAR, BIGINT), 'n': 6}),
+            (2, {'mm': MAP {'j': 2}, 'n': 7})
+          ) AS v(id, som)
+        ) TO '${instance.dir}/som.parquet' (FORMAT parquet);
+  - start: {}
+
+  - explain: SELECT id, som['mm']['k'] AS v FROM t
+    only: federated
+    contains: ['get_field(som@1, mm, k)']
+  - query: SELECT id, som['mm']['k'] AS v FROM t ORDER BY id
+    expect: { rows: [['0', '1'], ['1', null], ['2', null]] }
+  - query: SELECT som['mm']['k'] AS v FROM t
+    expect: { rows: [['1'], [null], [null]] }
+  - query: SELECT id, get_field(som, 'mm')['k'] AS v FROM t ORDER BY id
+    expect: { rows: [['0', '1'], ['1', null], ['2', null]] }
+  - query: SELECT id FROM t WHERE som['mm']['k'] = 1
+    expect: { rows: [['0']] }
+  - query: SELECT id, som['n'] AS n FROM t WHERE som['mm']['k'] IS NULL ORDER BY id
+    expect: { rows: [['1', '6'], ['2', '7']] }
+  - query: SELECT id, map_extract(som['mm'], 'k') AS v FROM t ORDER BY id
+    expect: {}
