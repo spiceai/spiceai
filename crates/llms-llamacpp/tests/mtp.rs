@@ -19,7 +19,9 @@ limitations under the License.
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
-use llama_cpp::{Backend, Batch, ContextParams, DraftKind, Model, ModelParams, Mtp, MtpParams, Sampler, Token};
+use llama_cpp::{
+    Backend, Batch, ContextParams, DraftKind, Model, ModelParams, Mtp, MtpParams, Sampler, Token,
+};
 use llms::chat::{LocalModelOptions, ReasoningDefault};
 use llms::hf::HubParams;
 use serde_json::json;
@@ -133,39 +135,69 @@ async fn a_second_request_drafts_as_on_a_fresh_context() {
             .expect("the prompt tokenizes")
     };
     let first = chat("Name the planets of the solar system in order, one per line.");
-    let second = chat("Write a short paragraph about the history of the bicycle.");
+    // A stale pairing changes one entry of the head's cache, which moves its logits a little, so
+    // whether a draft flips within a request depends on the backend's numerics; across these
+    // requests, one does on every backend this has run on when the state outlives the request.
+    let seconds = [
+        "Write a short paragraph about the history of the bicycle.",
+        "List five prime numbers and say why each one is prime.",
+        "Translate 'good morning, how are you?' into French, Spanish and German.",
+        "Describe how a refrigerator keeps food cold.",
+        "Explain what a hash table is to a new programmer.",
+        "Give three tips for keeping a houseplant alive.",
+        "Summarize the plot of a heist story in four sentences.",
+        "Why is the sky blue? Answer in two sentences.",
+    ];
 
-    let after_another = {
-        let mut spec = drafting(&model, backend);
-        let (_, served) = generate(&mut spec, &first, 24);
-        // the finished request leaves the cache as a new request finds it: empty
-        assert!(
-            spec.target_mut().truncate(0) && spec.draft_mut().truncate(0),
-            "the cache empties after {} tokens",
-            served.len()
+    let mut differing = Vec::new();
+    for text in seconds {
+        let second = chat(text);
+        let after_another = {
+            let mut spec = drafting(&model, backend);
+            let (_, served) = generate(&mut spec, &first, 24);
+            // the finished request leaves the cache as a new request finds it: empty
+            assert!(
+                spec.target_mut().truncate(0) && spec.draft_mut().truncate(0),
+                "the cache empties after {} tokens",
+                served.len()
+            );
+            generate(&mut spec, &second, 64)
+        };
+        let fresh = generate(&mut drafting(&model, backend), &second, 64);
+
+        // the reply is the target's greedy tokens either way, as far as both runs got in their
+        // steps
+        let shared = after_another.1.len().min(fresh.1.len());
+        assert_eq!(
+            after_another.1[..shared],
+            fresh.1[..shared],
+            "the reply to {text:?}"
         );
-        generate(&mut spec, &second, 48)
-    };
-    let fresh = generate(&mut drafting(&model, backend), &second, 48);
-
-    // the reply is the target's greedy tokens either way, as far as both runs got in their steps
-    let shared = after_another.1.len().min(fresh.1.len());
-    assert_eq!(after_another.1[..shared], fresh.1[..shared], "the second request's reply");
-    // and the drafts, so the steps, must be the same too
-    let first_difference = after_another.0.iter().zip(&fresh.0).position(|(a, b)| a != b);
-    eprintln!(
-        "after another request: {} reply tokens in {} steps; fresh: {} in {}; first draft that differs: {first_difference:?}",
-        after_another.1.len(),
-        after_another.0.len(),
-        fresh.1.len(),
-        fresh.0.len()
-    );
-    assert_eq!(
-        first_difference,
-        None,
-        "drafts after another request {:?}\nthe same request's drafts on a fresh context {:?}",
-        after_another.0,
-        fresh.0
+        // and the drafts, so the steps, must be the same too
+        let first_difference = after_another
+            .0
+            .iter()
+            .zip(&fresh.0)
+            .position(|(a, b)| a != b);
+        eprintln!(
+            "{text:?} after another request: {} reply tokens in {} steps; fresh: {} in {}; first draft that differs: {first_difference:?}",
+            after_another.1.len(),
+            after_another.0.len(),
+            fresh.1.len(),
+            fresh.0.len()
+        );
+        if let Some(step) = first_difference {
+            differing.push((
+                text,
+                step,
+                after_another.0[step].clone(),
+                fresh.0[step].clone(),
+            ));
+        }
+    }
+    assert!(
+        differing.is_empty(),
+        "requests whose drafts after another request differ from a fresh context's (request, step, after another, fresh): {differing:?}"
     );
 }
 
@@ -176,11 +208,15 @@ fn drafting<'m>(model: &'m Model, backend: &Backend) -> Mtp<'m> {
         .with_n_ctx(NonZeroU32::new(2048))
         .with_n_batch(512)
         .with_n_rs_seq(3);
-    let target = model.new_context(backend, &params).expect("a target context");
+    let target = model
+        .new_context(backend, &params)
+        .expect("a target context");
     Mtp::new(
         target,
         model,
-        &ContextParams::default().with_n_ctx(NonZeroU32::new(2048)).with_n_batch(512),
+        &ContextParams::default()
+            .with_n_ctx(NonZeroU32::new(2048))
+            .with_n_batch(512),
         MtpParams {
             kind: DraftKind::Mtp,
             n_max: 3,
@@ -198,9 +234,13 @@ fn generate(spec: &mut Mtp<'_>, prompt: &[Token], steps: usize) -> (Vec<Vec<Toke
     let position = |n: usize| i32::try_from(n).expect("a position");
     let mut batch = Batch::new(512);
     for (pos, &token) in prompt.iter().enumerate() {
-        batch.add(token, position(pos), pos + 1 == prompt.len()).expect("the prompt fits a batch");
+        batch
+            .add(token, position(pos), pos + 1 == prompt.len())
+            .expect("the prompt fits a batch");
     }
-    spec.target_mut().decode(&batch).expect("the prompt decodes");
+    spec.target_mut()
+        .decode(&batch)
+        .expect("the prompt decodes");
     spec.process(&batch).expect("the head reads the prompt");
     spec.begin(prompt).expect("drafting begins");
     let mut sampler = Sampler::greedy();
@@ -212,14 +252,22 @@ fn generate(spec: &mut Mtp<'_>, prompt: &[Token], steps: usize) -> (Vec<Vec<Toke
         let n_past = position(history.len());
         let draft = spec.draft(n_past, id, &history).expect("a draft");
         // drafting wrote its positions into the head's cache, and the verify batch writes them again
-        assert!(spec.draft_mut().truncate(n_past), "the head's cache rolls back");
+        assert!(
+            spec.draft_mut().truncate(n_past),
+            "the head's cache rolls back"
+        );
         batch.clear();
         batch.add(id, n_past, true).expect("fits");
         for (i, &token) in draft.iter().enumerate() {
-            batch.add(token, n_past + 1 + position(i), true).expect("fits");
+            batch
+                .add(token, n_past + 1 + position(i), true)
+                .expect("fits");
         }
-        spec.target_mut().decode(&batch).expect("the verify batch decodes");
-        spec.process(&batch).expect("the head reads the verify batch");
+        spec.target_mut()
+            .decode(&batch)
+            .expect("the verify batch decodes");
+        spec.process(&batch)
+            .expect("the head reads the verify batch");
         history.push(id);
         reply.push(id);
         let mut accepted = 0;
@@ -234,7 +282,8 @@ fn generate(spec: &mut Mtp<'_>, prompt: &[Token], steps: usize) -> (Vec<Vec<Toke
             }
         };
         if !draft.is_empty() {
-            spec.accept(u16::try_from(accepted).expect("a draft length")).expect("the draft is accepted");
+            spec.accept(u16::try_from(accepted).expect("a draft length"))
+                .expect("the draft is accepted");
         }
         let kept = position(history.len());
         assert!(
@@ -261,7 +310,12 @@ async fn a_reused_prefix_drafts_as_on_a_fresh_context() {
     let backend = Backend::get();
     let model = Model::load(backend, &gguf, &ModelParams::default().with_load_mtp(true))
         .expect("Qwen3.5-0.8B loads with its MTP layer");
-    let tokens = |text: &str| model.vocab().tokenize(text, false, true).expect("the prompt tokenizes");
+    let tokens = |text: &str| {
+        model
+            .vocab()
+            .tokenize(text, false, true)
+            .expect("the prompt tokenizes")
+    };
     let question = "Name the planets of the solar system in order, one per line.";
     let answer = "Mercury\nVenus\nEarth\nMars\nJupiter\nSaturn\nUranus\nNeptune";
     let turn1 = tokens(&format!(
@@ -273,17 +327,27 @@ async fn a_reused_prefix_drafts_as_on_a_fresh_context() {
     // spiced's split: the checkpoint four tokens before the prompt's end, before its generation
     // prompt's empty think block, which the next turn's prompt does not repeat
     let at = turn1.len() - 4;
-    assert_eq!(turn1[..at], turn2[..at], "turn 2 repeats turn 1 up to the split");
+    assert_eq!(
+        turn1[..at],
+        turn2[..at],
+        "turn 2 repeats turn 1 up to the split"
+    );
 
     let reused = {
         let mut spec = drafting(&model, backend);
         read(&mut spec, &turn1, 0..at);
-        let checkpoint = spec.target().partial_state().expect("the recurrent state saves");
+        let checkpoint = spec
+            .target()
+            .partial_state()
+            .expect("the recurrent state saves");
         let head = spec.state().expect("the head's state");
         read(&mut spec, &turn1, at..turn1.len());
         let _ = generate_after_read(&mut spec, &turn1, 24);
         // turn 2: restore the states saved at the split, then cut both caches back to it
-        assert!(spec.target_mut().restore_partial_state(&checkpoint), "the checkpoint restores");
+        assert!(
+            spec.target_mut().restore_partial_state(&checkpoint),
+            "the checkpoint restores"
+        );
         if let Some(head) = &head {
             spec.restore_state(head).expect("the head's state restores");
         }
@@ -312,11 +376,9 @@ async fn a_reused_prefix_drafts_as_on_a_fresh_context() {
         fresh.0.len()
     );
     assert_eq!(
-        first_difference,
-        None,
+        first_difference, None,
         "turn 2's drafts after turn 1 {:?}\nread whole on a fresh context {:?}",
-        reused.0,
-        fresh.0
+        reused.0, fresh.0
     );
 }
 
@@ -329,14 +391,20 @@ fn position(n: usize) -> i32 {
 fn read(spec: &mut Mtp<'_>, prompt: &[Token], span: std::ops::Range<usize>) {
     let mut batch = Batch::new(512);
     for pos in span {
-        batch.add(prompt[pos], position(pos), pos + 1 == prompt.len()).expect("the span fits a batch");
+        batch
+            .add(prompt[pos], position(pos), pos + 1 == prompt.len())
+            .expect("the span fits a batch");
     }
     spec.target_mut().decode(&batch).expect("the span decodes");
     spec.process(&batch).expect("the head reads the span");
 }
 
 /// After `prompt` is read whole: `steps` verify steps, as `generate`'s loop.
-fn generate_after_read(spec: &mut Mtp<'_>, prompt: &[Token], steps: usize) -> (Vec<Vec<Token>>, Vec<Token>) {
+fn generate_after_read(
+    spec: &mut Mtp<'_>,
+    prompt: &[Token],
+    steps: usize,
+) -> (Vec<Vec<Token>>, Vec<Token>) {
     spec.begin(prompt).expect("drafting begins");
     let mut sampler = Sampler::greedy();
     let mut history = prompt.to_vec();
@@ -348,14 +416,22 @@ fn generate_after_read(spec: &mut Mtp<'_>, prompt: &[Token], steps: usize) -> (V
     for _ in 0..steps {
         let n_past = position(history.len());
         let draft = spec.draft(n_past, id, &history).expect("a draft");
-        assert!(spec.draft_mut().truncate(n_past), "the head's cache rolls back");
+        assert!(
+            spec.draft_mut().truncate(n_past),
+            "the head's cache rolls back"
+        );
         batch.clear();
         batch.add(id, n_past, true).expect("fits");
         for (i, &token) in draft.iter().enumerate() {
-            batch.add(token, n_past + 1 + position(i), true).expect("fits");
+            batch
+                .add(token, n_past + 1 + position(i), true)
+                .expect("fits");
         }
-        spec.target_mut().decode(&batch).expect("the verify batch decodes");
-        spec.process(&batch).expect("the head reads the verify batch");
+        spec.target_mut()
+            .decode(&batch)
+            .expect("the verify batch decodes");
+        spec.process(&batch)
+            .expect("the head reads the verify batch");
         history.push(id);
         reply.push(id);
         let mut accepted = 0;
@@ -370,7 +446,8 @@ fn generate_after_read(spec: &mut Mtp<'_>, prompt: &[Token], steps: usize) -> (V
             }
         };
         if !draft.is_empty() {
-            spec.accept(u16::try_from(accepted).expect("a draft length")).expect("the draft is accepted");
+            spec.accept(u16::try_from(accepted).expect("a draft length"))
+                .expect("the draft is accepted");
         }
         let kept = position(history.len());
         assert!(
