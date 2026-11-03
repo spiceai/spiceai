@@ -14,7 +14,7 @@ datasets:
     acceleration: &acceleration
       enabled: true
       engine: cayenne
-      mode: file
+      mode: memory
       params:
         connection_pool_size: 25
   - from: postgres:catalog_returns
