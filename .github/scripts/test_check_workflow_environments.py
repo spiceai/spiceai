@@ -2,6 +2,7 @@
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -138,6 +139,23 @@ jobs:
             [],
         )
 
+    def test_external_reusable_workflow_fails(self):
+        self.assertEqual(
+            problems(
+                """\
+jobs:
+  call:
+    uses: other-org/repo/.github/workflows/x.yml@v1
+    secrets: inherit
+"""
+            ),
+            [
+                "job 'call' calls reusable workflow 'other-org/repo/.github/workflows/x.yml@v1', which is not "
+                "a local `./.github/workflows/` file, so its jobs' environments and secret use cannot be checked; "
+                "copy it into this repository (see docs/dev/github_actions_environments.md)"
+            ],
+        )
+
     def test_reusable_workflow_caller_with_environment_fails(self):
         self.assertEqual(
             problems(
@@ -255,6 +273,32 @@ jobs:
         )
         self.assertEqual(len(result), 1)
         self.assertIn("reads secrets.X, secrets.Y;", result[0])
+
+    def test_unterminated_expression_does_not_hide_a_later_one(self):
+        result = problems(
+            """\
+jobs:
+  test:
+    environment: secret-free
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo ${{ 'never closed ${{ secrets.X }}
+"""
+        )
+        self.assertEqual(len(result), 1)
+        self.assertIn("reads secrets.X;", result[0])
+
+    def test_runs_of_quotes_scan_in_linear_time(self):
+        # A backtracking pattern for this grammar takes seconds at ~55 characters
+        # of this unterminated shape and doubles with every added pair of quotes.
+        noise = "${{{{''" + "''''" * 5000
+        job = {"environment": "secret-free", "steps": [{"run": noise}, {"run": "${{ secrets.X }}"}]}
+        started = time.perf_counter()
+        result = check_workflow_environments.check_workflow({"jobs": {"test": job}})
+        elapsed = time.perf_counter() - started
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(len(result), 1)
+        self.assertIn("reads secrets.X;", result[0])
 
     def test_bare_if_condition_is_scanned(self):
         result = problems(

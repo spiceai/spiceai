@@ -5,7 +5,7 @@
 #
 # Every credential a workflow uses lives in a GitHub environment, not in the
 # repository or organization (see `docs/dev/github_actions_environments.md`).
-# That boundary only holds while two rules hold for every job under
+# That boundary only holds while these rules hold for every job under
 # `.github/workflows/`:
 #
 # 1. A job that runs steps selects an `environment:`. A job without one still
@@ -13,6 +13,9 @@
 #    key silently bypasses the environment's ref restrictions and reviewers. A
 #    job that calls a reusable workflow (`uses:`) is the exception: GitHub does
 #    not allow `environment:` there, and the callee's own jobs select theirs.
+#    The callee must be a local `./.github/workflows/` file, so this check also
+#    sees its jobs; a workflow in another repository is never scanned, yet
+#    `secrets: inherit` would hand it every repository and organization secret.
 #
 # 2. The environment is one this repository has configured. GitHub creates any
 #    environment a job names that does not exist yet, with no protection rules,
@@ -56,9 +59,7 @@ ALLOWED_ENVIRONMENTS = frozenset(
 # custom credential and `secret-free` jobs may use it.
 ALLOWED_SECRETS = frozenset({"GITHUB_TOKEN"})
 
-# `${{ ... }}`, ending at the first `}}` outside a string literal, so a literal
-# such as `format('{{"a":"{0}"}}', secrets.X)` does not end the expression early.
-EXPRESSION = re.compile(r"\$\{\{((?:[^'}]|'(?:[^']|'')*'|\}(?!\}))*)\}\}")
+LOCAL_WORKFLOW_PREFIX = "./.github/workflows/"
 
 # GitHub expressions quote string literals with `'`, doubling it to escape. They
 # are blanked first so `contains(github.ref, 'secrets.X')` is not a secret use,
@@ -90,14 +91,49 @@ def environment_name(environment: object) -> str | None:
     return None
 
 
+def _embedded_expressions(text: str):
+    """The body of each `${{ ... }}` in a string.
+
+    An expression ends at the first `}}` outside a string literal, so a literal such
+    as `format('{{"a":"{0}"}}', secrets.X)` does not end it early. Literals quote
+    with `'` and escape it by doubling. One forward pass per expression keeps this
+    linear; a backtracking regex for the same grammar is exponential on runs of `'`.
+    An unterminated expression is skipped and the scan resumes just after its `${{`,
+    so a later expression in the same string is still found.
+    """
+    start = text.find("${{")
+    while start != -1:
+        i = start + 3
+        in_literal = False
+        end = -1
+        while i < len(text):
+            if in_literal:
+                if text[i] == "'":
+                    if text.startswith("''", i):
+                        i += 2
+                        continue
+                    in_literal = False
+            elif text[i] == "'":
+                in_literal = True
+            elif text.startswith("}}", i):
+                end = i
+                break
+            i += 1
+        if end == -1:
+            start = text.find("${{", start + 3)
+            continue
+        yield text[start + 3 : end]
+        start = text.find("${{", end + 2)
+
+
 def _expressions(node: object):
     """The text of every expression in a node: each `${{ }}`, plus bare `if:` conditions."""
     if isinstance(node, str):
-        yield from EXPRESSION.findall(node)
+        yield from _embedded_expressions(node)
     elif isinstance(node, dict):
         for key, value in node.items():
             if isinstance(key, str):
-                yield from EXPRESSION.findall(key)
+                yield from _embedded_expressions(key)
             # An `if:` is an expression whether or not it is wrapped in `${{ }}`.
             if key == "if" and isinstance(value, str) and "${{" not in value:
                 yield value
@@ -148,6 +184,14 @@ def check_workflow(document: dict) -> list[str]:
                 problems.append(
                     f"job '{job_id}' calls a reusable workflow and sets `environment:`, "
                     "which GitHub rejects; select the environment in the called workflow's jobs instead"
+                )
+            uses = job["uses"]
+            if not (isinstance(uses, str) and uses.startswith(LOCAL_WORKFLOW_PREFIX)):
+                problems.append(
+                    f"job '{job_id}' calls reusable workflow '{uses}', which is not a local "
+                    f"`{LOCAL_WORKFLOW_PREFIX}` file, so its jobs' environments and secret use cannot be "
+                    "checked; copy it into this repository "
+                    "(see docs/dev/github_actions_environments.md)"
                 )
             continue
         name = environment_name(environment)
