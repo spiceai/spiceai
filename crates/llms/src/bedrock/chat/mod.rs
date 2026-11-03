@@ -435,9 +435,28 @@ impl BedrockConverse {
         req: &CreateChatCompletionRequest,
         reasoning: Option<&ReasoningRequest>,
     ) -> InferenceConfiguration {
-        let max_tokens = match reasoning {
+        let requested_max_tokens = match reasoning {
             Some(r) => r.max_tokens,
             None => Self::max_tokens(req),
+        };
+        let omit_inference_parameters = reasoning.is_some_and(|r| r.omit_inference_parameters);
+        if omit_inference_parameters
+            && (Self::max_tokens(req).is_some() || req.temperature.is_some() || req.top_p.is_some())
+        {
+            tracing::warn!(
+                "Model '{}' uses high reasoning effort; Amazon Nova 2 Lite rejects `max_completion_tokens`, `max_tokens`, `temperature` and `top_p`, so those parameters are omitted for this request. Use `reasoning_effort: low` or `medium` to retain them. See: https://spiceai.org/docs/components/models/aws-bedrock",
+                req.model
+            );
+        }
+        let max_tokens = if omit_inference_parameters {
+            None
+        } else {
+            requested_max_tokens
+        };
+        let (temperature, top_p) = if omit_inference_parameters {
+            (None, None)
+        } else {
+            (req.temperature, req.top_p)
         };
         InferenceConfiguration::builder()
             .set_max_tokens(max_tokens.map(|u| u as i32))
@@ -445,8 +464,8 @@ impl BedrockConverse {
                 StopConfiguration::String(s) => vec![s.clone()],
                 StopConfiguration::StringArray(arr) => arr.clone(),
             }))
-            .set_temperature(req.temperature)
-            .set_top_p(req.top_p)
+            .set_temperature(temperature)
+            .set_top_p(top_p)
             .build()
     }
 
@@ -1031,6 +1050,51 @@ mod tests {
             Some(SystemContentBlock::CachePoint(cache_point))
                 if cache_point.r#type == CachePointType::Default
         ));
+    }
+
+    #[test]
+    fn nova_high_reasoning_omits_incompatible_inference_parameters() {
+        // Regression test for #15665: Nova 2 Lite rejects these fields with high reasoning.
+        let chat = converse("us.amazon.nova-2-lite-v1:0");
+        let mut req = CreateChatCompletionRequest::default();
+        req.model = "us.amazon.nova-2-lite-v1:0".to_string();
+        req.reasoning_effort = Some(async_openai::types::chat::ReasoningEffort::High);
+        req.max_completion_tokens = Some(1024);
+        req.temperature = Some(0.5);
+        req.top_p = Some(0.9);
+        req.stop = Some(StopConfiguration::String("done".to_string()));
+
+        let reasoning = chat
+            .reasoning_request(&req)
+            .expect("reasoning request should build")
+            .expect("Nova high should enable reasoning");
+        let config = BedrockConverse::inference_cfg(&req, Some(&reasoning));
+
+        assert_eq!(config.max_tokens(), None);
+        assert_eq!(config.temperature(), None);
+        assert_eq!(config.top_p(), None);
+        assert_eq!(config.stop_sequences(), &["done".to_string()][..]);
+    }
+
+    #[test]
+    fn nova_medium_reasoning_keeps_inference_parameters() {
+        let chat = converse("us.amazon.nova-2-lite-v1:0");
+        let mut req = CreateChatCompletionRequest::default();
+        req.model = "us.amazon.nova-2-lite-v1:0".to_string();
+        req.reasoning_effort = Some(async_openai::types::chat::ReasoningEffort::Medium);
+        req.max_completion_tokens = Some(1024);
+        req.temperature = Some(0.5);
+        req.top_p = Some(0.9);
+
+        let reasoning = chat
+            .reasoning_request(&req)
+            .expect("reasoning request should build")
+            .expect("Nova medium should enable reasoning");
+        let config = BedrockConverse::inference_cfg(&req, Some(&reasoning));
+
+        assert_eq!(config.max_tokens(), Some(1024));
+        assert_eq!(config.temperature(), Some(0.5));
+        assert_eq!(config.top_p(), Some(0.9));
     }
 }
 
