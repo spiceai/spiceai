@@ -237,6 +237,8 @@ yaml = { path = "../yaml" }
 
 [dev-dependencies]
 anyhow.workspace = true
+# Gzip-encodes response bodies in the HTTP connector decompression tests.
+flate2 = "1.1"
 async-graphql = "7.0.17"
 async-graphql-axum = "7.0.16"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }

@@ -3,7 +3,7 @@ description: >
   A MySQL dataset's connection pool takes its size and connection lifetime from
   the Spicepod whether the server is given as individual parameters or as a
   connection string: a connection string without pool settings gets the
-  documented defaults (at most 5 connections, 1 kept idle), not 10 and 100,
+  documented defaults (at most 5 connections, 1 kept once idle), not 10 and 100,
   and one whose query sets only a maximum below 10 is accepted.
   Connections are replaced once `connection_max_lifetime` passes, and kept
   when it is `0s`. An invalid pool value, or one the connection string sets
@@ -136,13 +136,14 @@ steps:
   - stop-background: { id: burst_default }
   - stop-background: { id: burst_sized }
   - stop-background: { id: burst_max_only }
-  # Once idle, each pool keeps its minimum: 1 by default, 2 as set.
+  # Once idle, each pool keeps its minimum: 1 by default, 2 as set. Connections above
+  # it are kept for 30s after their last use and closed at the next check, every 10s.
   - source-query: { src: "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER = 'ud_${sources.src.namespace}'" }
     expect: { rows: [['1']] }
-    eventually: 30s
+    eventually: 60s
   - source-query: { src: "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER = 'us_${sources.src.namespace}'" }
     expect: { rows: [['2']] }
-    eventually: 30s
+    eventually: 60s
 
   # One reader at a time on each lifetime dataset. With a 2s lifetime the
   # pooled connection keeps being replaced; with `0s` the one connection the
