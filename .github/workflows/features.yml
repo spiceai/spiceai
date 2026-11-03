@@ -85,7 +85,7 @@ jobs:
 
       - name: Check if sccache can be set up
         run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
+          if [ -z "${{ vars.TEST_MINIO_ENDPOINT }}" ]; then
             echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
             echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
           else
@@ -97,7 +97,7 @@ jobs:
         if: runner.os == 'macOS' && env.SCCACHE_SETUP == 'true' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}

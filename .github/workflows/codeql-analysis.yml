@@ -55,7 +55,7 @@ jobs:
     # through to those credentials.
     runs-on: spiceai-macos-large
     env:
-      HAS_TEST_MINIO_SECRET: ${{ github.event_name == 'push' && secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
+      HAS_TEST_MINIO_SECRET: ${{ github.event_name == 'push' && vars.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
     # Extraction takes 10-18 minutes on most runs and up to 75 on a loaded
     # host. The query suite took 8 minutes with the same 10 threads and
@@ -105,7 +105,7 @@ jobs:
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_ENDPOINT || '' }}
+          minio_endpoint: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && vars.TEST_MINIO_ENDPOINT || '' }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
           minio_access_key: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_ACCESS_KEY || '' }}
           minio_secret_key: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_SECRET_KEY || '' }}

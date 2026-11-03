@@ -69,7 +69,7 @@ jobs:
       # MinIO is only the fallback cache, and only on push: merge_group checks
       # out the queue merge commit, which contains the queued pull request, and
       # a spiceio miss must not fall through to those credentials.
-      HAS_TEST_MINIO_SECRET: ${{ github.event_name == 'push' && secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
+      HAS_TEST_MINIO_SECRET: ${{ github.event_name == 'push' && vars.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
     steps:
       - name: Checkout spiceai
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -113,7 +113,7 @@ jobs:
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_ENDPOINT || '' }}
+          minio_endpoint: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && vars.TEST_MINIO_ENDPOINT || '' }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
           minio_access_key: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_ACCESS_KEY || '' }}
           minio_secret_key: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_SECRET_KEY || '' }}
@@ -245,14 +245,14 @@ jobs:
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 

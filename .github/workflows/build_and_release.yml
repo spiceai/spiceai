@@ -360,7 +360,7 @@ jobs:
         if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default')
         uses: ./.github/actions/upload-to-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           source_path: spiced_linux_x86_64.tar.gz
@@ -394,7 +394,7 @@ jobs:
         if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'odbc')
         uses: ./.github/actions/upload-to-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           source_path: spiced_odbc_linux_x86_64.tar.gz
@@ -475,7 +475,7 @@ jobs:
         if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default')
         uses: ./.github/actions/upload-to-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           source_path: spice_linux_x86_64.tar.gz
