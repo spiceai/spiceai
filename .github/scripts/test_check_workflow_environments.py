@@ -65,13 +65,38 @@ jobs:
     steps:
       - run: echo ${{ secrets.DOCKERHUB_TOKEN }}
   c:
-    environment: ${{ inputs.environment }}
+    environment: CI
     runs-on: ubuntu-24.04
     steps:
       - run: echo hi
 """
             ),
             [],
+        )
+
+    def test_expression_environment_fails(self):
+        self.assertEqual(
+            problems(
+                """\
+jobs:
+  a:
+    environment: ${{ inputs.environment }}
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo ${{ secrets.X }}
+  b:
+    environment: "${{ 'secret-free' }}"
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo ${{ secrets.X }}
+"""
+            ),
+            [
+                "job 'a' selects its environment with an expression ('${{ inputs.environment }}'), which this check "
+                "cannot verify; name the environment literally (see docs/dev/github_actions_environments.md)",
+                "job 'b' selects its environment with an expression ('${{ 'secret-free' }}'), which this check "
+                "cannot verify; name the environment literally (see docs/dev/github_actions_environments.md)",
+            ],
         )
 
     def test_unknown_environment_fails(self):
@@ -183,6 +208,53 @@ jobs:
         )
         self.assertEqual(len(result), 1)
         self.assertIn("reads secrets, secrets[...];", result[0])
+
+    def test_secret_free_is_matched_case_insensitively(self):
+        self.assertEqual(
+            problems(
+                """\
+jobs:
+  test:
+    environment: Secret-Free
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo ${{ secrets.X }}
+"""
+            ),
+            [
+                "job 'test' is in the `secret-free` environment but reads secrets.X; "
+                "move it to the environment that holds those secrets, or remove the references"
+            ],
+        )
+
+    def test_uppercase_secrets_context_fails(self):
+        result = problems(
+            """\
+jobs:
+  test:
+    environment: secret-free
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo ${{ SECRETS.X }} ${{ Secrets['Y'] }} ${{ SECRETS.github_token }} ${{ Secrets['GITHUB_TOKEN'] }}
+"""
+        )
+        self.assertEqual(len(result), 1)
+        self.assertIn("reads secrets.X, secrets.Y;", result[0])
+
+    def test_closing_braces_inside_string_literal(self):
+        result = problems(
+            """\
+jobs:
+  test:
+    environment: secret-free
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo '${{ format('{{"t":"{0}"}}', secrets.X) }}'
+      - run: echo "${{ format('it''s }}', secrets.Y) }}"
+"""
+        )
+        self.assertEqual(len(result), 1)
+        self.assertIn("reads secrets.X, secrets.Y;", result[0])
 
     def test_bare_if_condition_is_scanned(self):
         result = problems(

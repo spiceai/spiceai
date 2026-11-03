@@ -40,7 +40,8 @@ SECRET_FREE = "secret-free"
 
 # The environments configured in this repository's settings, with the protection
 # rules listed in docs/dev/github_actions_environments.md. Adding one here means
-# creating and configuring it first.
+# creating and configuring it first. GitHub matches environment names
+# case-insensitively, so these are compared in lowercase.
 ALLOWED_ENVIRONMENTS = frozenset(
     {
         "ci",
@@ -55,19 +56,23 @@ ALLOWED_ENVIRONMENTS = frozenset(
 # custom credential and `secret-free` jobs may use it.
 ALLOWED_SECRETS = frozenset({"GITHUB_TOKEN"})
 
-EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+# `${{ ... }}`, ending at the first `}}` outside a string literal, so a literal
+# such as `format('{{"a":"{0}"}}', secrets.X)` does not end the expression early.
+EXPRESSION = re.compile(r"\$\{\{((?:[^'}]|'(?:[^']|'')*'|\}(?!\}))*)\}\}")
 
 # GitHub expressions quote string literals with `'`, doubling it to escape. They
 # are blanked first so `contains(github.ref, 'secrets.X')` is not a secret use,
 # except where the literal is the index of `secrets['NAME']`.
 STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
-SECRETS_INDEX_OPEN = re.compile(r"(?<![\w.-])secrets\s*\[\s*$")
+SECRETS_INDEX_OPEN = re.compile(r"(?<![\w.-])secrets\s*\[\s*$", re.IGNORECASE)
 
 # `secrets.NAME`, `secrets['NAME']`, or the bare context (`toJSON(secrets)`),
 # matched only where `secrets` starts the token so `inputs.secrets.x` or
-# `steps.secrets.outputs.y` are not mistaken for the context.
+# `steps.secrets.outputs.y` are not mistaken for the context. Context names are
+# case-insensitive in GitHub expressions, so `SECRETS.NAME` matches too.
 SECRET_REFERENCE = re.compile(
-    r"(?<![\w.-])secrets\b\s*(?:\.\s*([A-Za-z_][\w-]*)|\[\s*'([^']*)'\s*\]|(\[)|)"
+    r"(?<![\w.-])secrets\b\s*(?:\.\s*([A-Za-z_][\w-]*)|\[\s*'([^']*)'\s*\]|(\[)|)",
+    re.IGNORECASE,
 )
 
 
@@ -153,8 +158,16 @@ def check_workflow(document: dict) -> list[str]:
                 "(see docs/dev/github_actions_environments.md)"
             )
             continue
-        # An expression is resolved at run time and cannot be checked here.
-        if "${{" not in name and name not in ALLOWED_ENVIRONMENTS:
+        # An expression is resolved at run time, so the environment it selects, and
+        # whether that is `secret-free`, cannot be checked here.
+        if "${{" in name:
+            problems.append(
+                f"job '{job_id}' selects its environment with an expression ('{name}'), which this check "
+                "cannot verify; name the environment literally "
+                "(see docs/dev/github_actions_environments.md)"
+            )
+            continue
+        if name.lower() not in ALLOWED_ENVIRONMENTS:
             problems.append(
                 f"job '{job_id}' selects environment '{name}', which is not one of "
                 f"{', '.join(f'`{e}`' for e in sorted(ALLOWED_ENVIRONMENTS))}; "
@@ -162,7 +175,7 @@ def check_workflow(document: dict) -> list[str]:
                 "(see docs/dev/github_actions_environments.md)"
             )
             continue
-        if name != SECRET_FREE:
+        if name.lower() != SECRET_FREE:
             continue
         secrets = secret_references(job)
         if secrets:
