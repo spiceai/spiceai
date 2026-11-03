@@ -43,12 +43,13 @@ pub struct AzureEmbeddingParams {
     /// model has no other credential.
     pub client_id: Option<String>,
     /// The audience a GitHub Actions identity token is requested for. It must match the federated
-    /// credential's audience. Defaults to `api://AzureADTokenExchange`.
-    pub identity_token_audience: Option<String>,
+    /// credential's audience. Defaults to `api://AzureADTokenExchange`. It cannot be set when the
+    /// identity token comes from a file, whose audience is set where it is issued.
+    pub federated_token_audience: Option<String>,
     /// A file that holds the workload's identity token, read again for every exchange, such as a
     /// Kubernetes projected service account token. Defaults to `AZURE_FEDERATED_TOKEN_FILE`; in a
     /// GitHub Actions job, Spice requests the token from GitHub instead.
-    pub identity_token_file: Option<String>,
+    pub federated_token_file: Option<String>,
 }
 
 impl AzureEmbeddingParams {
@@ -57,8 +58,8 @@ impl AzureEmbeddingParams {
         llms::workload_identity::AzureFederation {
             tenant_id: self.tenant_id.as_deref(),
             client_id: self.client_id.as_deref(),
-            identity_token_audience: self.identity_token_audience.as_deref(),
-            identity_token_file: self.identity_token_file.as_deref(),
+            federated_token_audience: self.federated_token_audience.as_deref(),
+            federated_token_file: self.federated_token_file.as_deref(),
             endpoint: self.endpoint.as_deref(),
             api_version: self.api_version.as_deref(),
             deployment_name: self.deployment_name.as_deref(),

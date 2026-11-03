@@ -689,7 +689,7 @@ async fn azure(
     if api_key.is_none() && entra_token.is_none() {
         return Err(EmbedError::FailedToInstantiateEmbeddingModel {
             source: format!(
-                "Azure embedding model '{component_name}' requires `azure_api_key`, `azure_entra_token`, or workload identity federation (`azure_tenant_id` and `azure_client_id`). See https://spiceai.org/docs/components/embeddings/azure for details."
+                "Azure embedding model '{component_name}' requires `azure_api_key`, `azure_entra_token`, or a Microsoft Entra workload identity: `azure_tenant_id` and `azure_client_id`, or on AKS a pod labeled `azure.workload.identity/use: \"true\"`. See https://spiceai.org/docs/components/embeddings/azure for details."
             )
             .into(),
         });

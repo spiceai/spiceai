@@ -869,7 +869,7 @@ mod tests {
             Json(json!({
                 "error": "invalid_client",
                 "error_description": "AADSTS700213: No matching federated identity record found for presented assertion subject 'repo:org/repo:environment:prod'. Check your federated identity credential Subject, Audience and Issuer against the presented assertion. Trace ID: 0b1c Correlation ID: 5e6f Timestamp: 2026-11-03 10:00:00Z",
-                "error_codes": [700213],
+                "error_codes": [700_213],
             })),
         )
             .into_response()

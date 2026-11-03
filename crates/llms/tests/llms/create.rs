@@ -193,8 +193,8 @@ pub(crate) async fn create_azure() -> Result<Arc<dyn Chat>, anyhow::Error> {
         let federation = llms::workload_identity::AzureFederation {
             tenant_id: Some(&tenant_id),
             client_id: Some(&client_id),
-            identity_token_audience: None,
-            identity_token_file: None,
+            federated_token_audience: None,
+            federated_token_file: None,
             endpoint: Some(&endpoint),
             api_version: Some(&api_version),
             deployment_name: Some(&deployment),
