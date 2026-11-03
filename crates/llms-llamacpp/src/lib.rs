@@ -1512,7 +1512,9 @@ impl PromptCache {
         let reused = if cut > 0
             && truncates
             && truncate_to(target, cut)
-            && head.as_ref().is_none_or(|state| target.restore_head_state(state))
+            && head
+                .as_ref()
+                .is_none_or(|state| target.restore_head_state(state))
         {
             cut
         } else if let Some(at) = self
@@ -1555,7 +1557,12 @@ impl PromptCache {
     /// Where reading a prompt of `len` tokens from `start` on stashes the draft head's state, for
     /// a cache that can be cut anywhere and so keeps no checkpoints: where a checkpoint would be,
     /// before the generation prompt the next turn's prompt does not repeat.
-    fn head_stash_at<'m>(&self, target: &impl Target<'m>, start: usize, len: usize) -> Option<usize> {
+    fn head_stash_at<'m>(
+        &self,
+        target: &impl Target<'m>,
+        start: usize,
+        len: usize,
+    ) -> Option<usize> {
         if self.checkpoints.is_some() || !target.has_head() {
             return None;
         }
@@ -1617,7 +1624,11 @@ impl Checkpoints {
             self.0.remove(0);
         }
         let bytes = state.len() + head.as_ref().map_or(0, Vec::len);
-        self.0.push(Checkpoint { n_tokens, state, head });
+        self.0.push(Checkpoint {
+            n_tokens,
+            state,
+            head,
+        });
         Some(bytes)
     }
 
@@ -1632,7 +1643,10 @@ impl Checkpoints {
     fn restore<'m>(&self, target: &mut impl Target<'m>) -> Option<usize> {
         let latest = self.0.last()?;
         let restored = target.context_mut().restore_partial_state(&latest.state)
-            && latest.head.as_ref().is_none_or(|head| target.restore_head_state(head));
+            && latest
+                .head
+                .as_ref()
+                .is_none_or(|head| target.restore_head_state(head));
         restored.then_some(latest.n_tokens)
     }
 
