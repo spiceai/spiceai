@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `76fab6507ec44635951aff0e662a628f36cc63a0` | `lukim/count-distinct-compact-nested-on-cf084aa` (TEMPORARY: spiceai/datafusion#287) |
+| [datafusion](#datafusion) | `bcc3c58969d55c462199578d43c85cb086f3fc32` | `lukim/count-distinct-compact-nested-on-cf084aa` (TEMPORARY: spiceai/datafusion#287) |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `f0af9b628dc48f0227ce6daf3d323b2ead3cc8a5` | `spiceai-55-release-2.4` |
