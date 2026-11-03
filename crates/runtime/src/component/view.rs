@@ -44,6 +44,9 @@ impl From<Error> for crate::Error {
             Error::VectorEngineRemoved { view_name } => {
                 crate::Error::ViewVectorEngineRemoved { view_name }
             }
+            Error::AccelerationEngineRemoved { view_name, engine } => {
+                crate::Error::AcceleratedViewEngineRemoved { view_name, engine }
+            }
             Error::AcceleratedViewInvalidConfiguration { view_name, reason } => {
                 crate::Error::AcceleratedViewInvalidConfiguration { view_name, reason }
             }

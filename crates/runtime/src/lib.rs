@@ -350,6 +350,27 @@ pub enum Error {
     ))]
     ViewVectorEngineRemoved { view_name: String },
 
+    /// A dataset's acceleration sets an engine removed in v2.5. Only that dataset fails to
+    /// load: Spice never switches it to Cayenne on its own.
+    #[snafu(display(
+        "Failed to load dataset '{dataset}': {}",
+        runtime_acceleration::removed_engine_message(engine)
+    ))]
+    AcceleratedDatasetEngineRemoved {
+        dataset: String,
+        engine: &'static str,
+    },
+
+    /// A view's acceleration sets an engine removed in v2.5.
+    #[snafu(display(
+        "Failed to load view '{view_name}': {}",
+        runtime_acceleration::removed_engine_message(engine)
+    ))]
+    AcceleratedViewEngineRemoved {
+        view_name: String,
+        engine: &'static str,
+    },
+
     #[snafu(display(
         "Specify the SQL string for view {name} using either `sql: SELECT * FROM...` inline or as a file reference with `sql_ref: my_view.sql`"
     ))]
@@ -779,7 +800,12 @@ pub struct Runtime {
     dataset_loads: Arc<init::dataset_loads::DatasetLoads>,
     /// The model loads in progress, so a Spicepod change can stop the load of a
     /// configuration it replaces or removes.
-    model_loads: Arc<init::model::ModelLoads>,
+    model_loads: Arc<init::model::LoadTasks>,
+    /// The Spicepod tool loads in progress, so a Spicepod change can stop the load of a
+    /// configuration it replaces or removes.
+    tool_loads: Arc<init::model::LoadTasks>,
+    /// Names of the SQL functions registered for `as_sql` tools.
+    tool_udfs: Arc<parking_lot::Mutex<HashSet<String>>>,
     /// Startup view registrations still waiting, cancelled when a Spicepod change replaces or removes the view.
     view_loads: Arc<init::view_loads::ViewLoads>,
 

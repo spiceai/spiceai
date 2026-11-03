@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 //! Chat completions through Spice's tool loop against a real Anthropic model. Needs
+//! `SPICE_ANTHROPIC_AUTH_TOKEN` (a short-lived access token, as CI sets) or
 //! `SPICE_ANTHROPIC_API_KEY`.
 
 use std::fmt::Write as _;
@@ -263,7 +264,7 @@ async fn anthropic_prompt_caching_through_tool_calls() -> Result<(), anyhow::Err
 
     test_request_context()
         .scope(async {
-            verify_env_secret_exists("SPICE_ANTHROPIC_API_KEY")
+            verify_env_secret_exists(crate::utils::anthropic_credential_secret())
                 .await
                 .map_err(anyhow::Error::msg)?;
 

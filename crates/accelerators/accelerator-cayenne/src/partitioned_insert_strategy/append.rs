@@ -751,7 +751,7 @@ impl CayennePartitionedAppendSink {
             cayenne::provider::PreparedOnConflictDeletionPublish,
         >],
     ) -> datafusion::common::Result<()> {
-        let max_attempts = turso_shared::DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+        let max_attempts = write_retry::DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
         // An overlay moves no pointer: its recorded sequence, written by its
         // on-conflict payload below, publishes it.
         let snapshots: Vec<(&str, &str)> = prepared
@@ -794,7 +794,7 @@ impl CayennePartitionedAppendSink {
                     );
                 }
                 if attempt < max_attempts && cayenne::is_retryable_write_conflict(&error) {
-                    tokio::time::sleep(turso_shared::retry_backoff_delay(attempt)).await;
+                    tokio::time::sleep(write_retry::retry_backoff_delay(attempt)).await;
                     continue;
                 }
                 return Err(DataFusionError::External(Box::new(error)));
@@ -816,7 +816,7 @@ impl CayennePartitionedAppendSink {
                         );
                     }
                     if attempt < max_attempts && cayenne::is_retryable_write_conflict(&error) {
-                        tokio::time::sleep(turso_shared::retry_backoff_delay(attempt)).await;
+                        tokio::time::sleep(write_retry::retry_backoff_delay(attempt)).await;
                         continue 'attempts;
                     }
                     return Err(DataFusionError::External(Box::new(error)));
@@ -854,7 +854,7 @@ impl CayennePartitionedAppendSink {
                         );
                     }
                     if attempt < max_attempts && cayenne::is_retryable_write_conflict(&error) {
-                        tokio::time::sleep(turso_shared::retry_backoff_delay(attempt)).await;
+                        tokio::time::sleep(write_retry::retry_backoff_delay(attempt)).await;
                         continue 'attempts;
                     }
                     return Err(DataFusionError::External(Box::new(error)));
@@ -870,7 +870,7 @@ impl CayennePartitionedAppendSink {
                 Err(error)
                     if attempt < max_attempts && cayenne::is_retryable_write_conflict(&error) =>
                 {
-                    tokio::time::sleep(turso_shared::retry_backoff_delay(attempt)).await;
+                    tokio::time::sleep(write_retry::retry_backoff_delay(attempt)).await;
                 }
                 Err(error) => return Err(DataFusionError::External(Box::new(error))),
             }

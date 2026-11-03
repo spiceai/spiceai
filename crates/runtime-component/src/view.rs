@@ -61,6 +61,16 @@ pub enum Error {
     ))]
     VectorEngineRemoved { view_name: String },
 
+    /// The view's acceleration sets an engine removed in v2.5.
+    #[snafu(display(
+        "Failed to load view '{view_name}': {}",
+        runtime_acceleration::removed_engine_message(engine)
+    ))]
+    AccelerationEngineRemoved {
+        view_name: String,
+        engine: &'static str,
+    },
+
     #[snafu(display(
         "Configuration of '{view_name}' view is invalid: {reason}. Update the configuration and retry. For details, visit: https://spiceai.org/docs/components/views"
     ))]
@@ -267,7 +277,15 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
             .acceleration
             .map(acceleration::Acceleration::try_from)
             .transpose()
-            .context(InvalidAccelerationConfigurationSnafu)?;
+            .map_err(|source| match source {
+                acceleration::ParseError::AcceleratorEngineRemoved { name } => {
+                    Error::AccelerationEngineRemoved {
+                        view_name: view.name.clone(),
+                        engine: name,
+                    }
+                }
+                source => Error::InvalidAccelerationConfiguration { source },
+            })?;
 
         if crate::vector_engine::uses_removed_vector_engine(view.vectors.as_ref(), &view.columns) {
             return VectorEngineRemovedSnafu {

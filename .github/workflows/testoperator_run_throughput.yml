@@ -55,7 +55,6 @@ on:
           - 'mssql-catalog'
           - 'oracle-catalog'
           - 'ducklake-catalog'
-          - 'turso'
           - 'bigquery'
           - 'scylladb'
       ready_wait:
