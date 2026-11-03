@@ -26,6 +26,7 @@ steps:
       UNION ALL SELECT 'America/Havana', arrow_cast(arrow_cast(utc, 'Timestamp(Second, Some("America/Havana"))'), 'Utf8') FROM instants
       UNION ALL SELECT 'Europe/Berlin', arrow_cast(arrow_cast(utc, 'Timestamp(Second, Some("Europe/Berlin"))'), 'Utf8') FROM instants
       UNION ALL SELECT 'America/New_York', arrow_cast(arrow_cast(utc, 'Timestamp(Second, Some("America/New_York"))'), 'Utf8') FROM instants
+      UNION ALL SELECT 'Europe/London', arrow_cast(arrow_cast(utc, 'Timestamp(Second, Some("Europe/London"))'), 'Utf8') FROM instants
     expect:
       rows:
         # 2026b: British Columbia on permanent -07.
@@ -34,9 +35,10 @@ steps:
         # 2026c: Alberta on permanent -06.
         - [America/Edmonton, "2026-01-15T05:00:00-07:00"]
         - [America/Edmonton, "2026-12-01T06:00:00-06:00"]
-        # 2026c: Morocco on permanent +00 from 2026-09-20.
+        # 2026c: Morocco on permanent +00 from 2026-09-20 (a zero offset is written `Z`,
+        # as for London in winter below).
         - [Africa/Casablanca, "2026-01-15T13:00:00+01:00"]
-        - [Africa/Casablanca, "2026-12-01T12:00:00+00:00"]
+        - [Africa/Casablanca, "2026-12-01T12:00:00Z"]
         # 2026d: the Northwest Territories on permanent -06.
         - [America/Inuvik, "2026-01-15T05:00:00-07:00"]
         - [America/Inuvik, "2026-12-01T06:00:00-06:00"]
@@ -51,3 +53,5 @@ steps:
         - [Europe/Berlin, "2026-12-01T13:00:00+01:00"]
         - [America/New_York, "2026-01-15T07:00:00-05:00"]
         - [America/New_York, "2026-12-01T07:00:00-05:00"]
+        - [Europe/London, "2026-01-15T12:00:00Z"]
+        - [Europe/London, "2026-12-01T12:00:00Z"]
