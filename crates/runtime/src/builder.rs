@@ -918,6 +918,7 @@ impl RuntimeBuilder {
             dataset_loads: Arc::default(),
             model_loads: Arc::default(),
             tool_loads: Arc::default(),
+            tool_udfs: Arc::default(),
             view_loads: Arc::default(),
             telemetry_config: self.telemetry_config,
             snapshot_sources: Arc::default(),

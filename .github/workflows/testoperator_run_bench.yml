@@ -48,7 +48,6 @@ on:
           - 'sqlite'
           - 'postgresql'
           - 'mysql'
-          - 'dremio'
           - 'odbc-athena'
           - 'odbc-databricks'
           - 'oracle'
@@ -71,7 +70,6 @@ on:
           - 'mssql-catalog'
           - 'oracle-catalog'
           - 'ducklake-catalog'
-          - 'turso'
           - 'bigquery'
           - 'scylladb'
       ready_wait:
@@ -697,9 +695,6 @@ jobs:
           SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
           SQL_WAREHOUSE_DATABRICKS_HOST: ${{ vars.SQL_WAREHOUSE_DATABRICKS_HOST }}
           SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
-          DREMIO_ENDPOINT: ${{ vars.TEST_DREMIO_ENDPOINT}}
-          DREMIO_USERNAME: ${{ secrets.TEST_DREMIO_USERNAME}}
-          DREMIO_PASSWORD: ${{ secrets.TEST_DREMIO_PASSWORD}}
           INSTA_UPDATE: ${{ steps.determine_update_snapshots.outputs.update_snapshots}}
           MSSQL_HOST: localhost
           MSSQL_USER: sa

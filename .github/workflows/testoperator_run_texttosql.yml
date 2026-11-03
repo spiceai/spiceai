@@ -67,6 +67,23 @@ jobs:
     name: Run Text-to-SQL tests
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
+    # Holds the OpenAI and Anthropic workload identity federation IDs (`OPENAI_*` and
+    # `ANTHROPIC_*` secrets).
+    environment: ci
+    permissions:
+      contents: read
+      actions: read
+      # Exchanged for OpenAI and Anthropic access tokens: workload identity federation.
+      id-token: write
+    env:
+      # Workload identity federation: spiced and the tests exchange this job's GitHub OIDC token
+      # for provider access tokens with these IDs, and exchange again before each expires.
+      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+      ANTHROPIC_FEDERATION_RULE_ID: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
+      ANTHROPIC_ORGANIZATION_ID: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
+      ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+      ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -197,8 +214,6 @@ jobs:
           MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           MINIO_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           MINIO_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-          SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
           SPICE_BEDROCK_ACCESS_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
           SPICE_BEDROCK_SECRET_KEY: ${{ secrets.AWS_BEDROCK_SECRET }}

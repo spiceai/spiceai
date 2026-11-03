@@ -60,7 +60,6 @@ tracing.workspace = true
 
 [features]
 default = []
-duckdb = ["search/duckdb"]
 elasticsearch = ["search/elasticsearch", "dep:elasticsearch", "dep:duration-parse"]
 models = ["runtime-datafusion-udfs/models"]
 openapi = ["dep:utoipa"]
