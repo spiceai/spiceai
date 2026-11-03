@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 //! Runs statements through the `duckdb` CLI, for sources whose writer and
-//! oracle is `DuckDB` (Iceberg, `DuckLake`).
+//! oracle is `DuckDB` (Iceberg, `DuckLake`, `DuckDB` files).
 
 use std::process::Stdio;
 
@@ -24,73 +24,124 @@ use tokio::io::AsyncWriteExt;
 
 use super::{Source, TextResult};
 
-/// The `duckdb` CLI of the release Spice embeds, for writers whose format
-/// Spice must read (a newer release writes a `DuckLake` format Spice cannot
-/// attach). The release is the `duckdb` crate's version in the workspace
-/// `Cargo.lock` above `near`; its CLI is downloaded once into
+/// The run-wide `DuckDB` release for `duckdb` and `ducklake` sources that do
+/// not name one (`--duckdb-version`).
+static DEFAULT_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Sets the release `duckdb` and `ducklake` sources use when their spec has
+/// no `version`, in place of the newest one `test/duckdb_versions.json` lists.
+pub fn set_default_version(version: String) {
+    let _ = DEFAULT_VERSION.set(version);
+}
+
+/// The `DuckDB` release a `duckdb` or `ducklake` source writes, checks
+/// answers and lends `spiced` its library with: `requested` (the source's
+/// `version`), else `--duckdb-version`, else the newest release
+/// `test/duckdb_versions.json` lists. Spice loads the installed `DuckDB`, so
+/// the CLI writing a file and the library reading it are the same release.
+pub fn version(requested: Option<&str>) -> Result<String> {
+    if let Some(version) = requested.or(DEFAULT_VERSION.get().map(String::as_str)) {
+        return Ok(version.trim_start_matches('v').to_string());
+    }
+    let path = super::repo_file("test/duckdb_versions.json")?;
+    let listed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    listed
+        .get("versions")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|versions| versions.last())
+        .and_then(|newest| newest.get("version"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .with_context(|| format!("{} lists no versions", path.display()))
+}
+
+/// The `duckdb` CLI of `version`, downloaded once into
 /// `~/.cache/spicescript/duckdb-<version>/`. `override_var`, when set, names a
 /// binary to use instead.
-pub async fn embedded(near: &std::path::Path, override_var: &str) -> Result<String> {
+pub async fn cli(version: &str, override_var: &str) -> Result<String> {
     if let Ok(binary) = std::env::var(override_var) {
         return Ok(binary);
     }
-    let lock = near
-        .ancestors()
-        .map(|dir| dir.join("Cargo.lock"))
-        .find(|path| path.is_file())
-        .with_context(|| {
-            format!(
-                "no Cargo.lock above {} to read Spice's DuckDB release from; set {override_var}",
-                near.display()
-            )
-        })?;
-    let text = tokio::fs::read_to_string(&lock).await?;
-    let version = text
-        .split("[[package]]")
-        .find(|package| package.contains("name = \"duckdb\"\n"))
-        .and_then(|package| package.lines().find_map(|l| l.strip_prefix("version = \"")))
-        .map(|v| v.trim_end_matches('"').to_string())
-        .with_context(|| {
-            format!(
-                "no duckdb package in {}; set {override_var}",
-                lock.display()
-            )
-        })?;
+    let asset = release_asset(version, "cli", override_var)?;
+    download(version, &asset, "duckdb", override_var).await
+}
+
+/// The shared library of `version`, which also exports the `DuckDB` ADBC
+/// driver. `SPICESCRIPT_DUCKDB_LIBRARY` names a library to use instead.
+pub async fn library(version: &str) -> Result<String> {
+    let override_var = "SPICESCRIPT_DUCKDB_LIBRARY";
+    if let Ok(library) = std::env::var(override_var) {
+        return Ok(std::fs::canonicalize(library)?.display().to_string());
+    }
+    let asset = release_asset(version, "lib", override_var)?;
+    let file = if cfg!(target_os = "macos") {
+        "libduckdb.dylib"
+    } else {
+        "libduckdb.so"
+    };
+    download(version, &asset, file, override_var).await
+}
+
+/// The release asset holding the CLI (`cli`) or the shared library (`lib`)
+/// for this platform. Releases from 2.0 name them
+/// `duckdb-{cli,shared-libs}-<os>-<arch>.tar.gz`; earlier ones
+/// `duckdb_cli-<os>-<arch>.zip` and `libduckdb-<os>-<arch>.zip`.
+fn release_asset(version: &str, what: &str, override_var: &str) -> Result<String> {
+    let platform = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", _) => "osx-universal",
+        ("linux", "aarch64") => "linux-arm64",
+        ("linux", "x86_64") => "linux-amd64",
+        (os, arch) => bail!("no DuckDB download for {os}/{arch}; set {override_var}"),
+    };
+    let major: u32 = version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse().ok())
+        .with_context(|| format!("DuckDB version '{version}' does not start with a number"))?;
+    Ok(match (what, major >= 2) {
+        ("cli", true) => format!("duckdb-cli-{platform}.tar.gz"),
+        ("cli", false) => format!("duckdb_cli-{platform}.zip"),
+        (_, true) => format!("duckdb-shared-libs-{platform}.tar.gz"),
+        (_, false) => format!("libduckdb-{platform}.zip"),
+    })
+}
+
+async fn download(version: &str, asset: &str, file: &str, override_var: &str) -> Result<String> {
+    // Matrix combinations can resolve the same release concurrently.
+    static DOWNLOAD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _download = DOWNLOAD.lock().await;
     let home = std::env::var("HOME").context("HOME is not set")?;
     let dir = std::path::PathBuf::from(home).join(format!(".cache/spicescript/duckdb-{version}"));
-    let binary = dir.join("duckdb");
+    let binary = dir.join(file);
     if !binary.is_file() {
-        let asset = match (std::env::consts::OS, std::env::consts::ARCH) {
-            ("macos", _) => "duckdb_cli-osx-universal.zip",
-            ("linux", "aarch64") => "duckdb_cli-linux-arm64.zip",
-            ("linux", _) => "duckdb_cli-linux-amd64.zip",
-            (os, arch) => bail!("no DuckDB CLI download for {os}/{arch}; set {override_var}"),
-        };
         tokio::fs::create_dir_all(&dir).await?;
-        let zip = dir.join(asset);
+        let archive = dir.join(asset);
         let url = format!("https://github.com/duckdb/duckdb/releases/download/v{version}/{asset}");
         let status = tokio::process::Command::new("curl")
             .args(["-fsSL", "-o"])
-            .arg(&zip)
+            .arg(&archive)
             .arg(&url)
             .status()
             .await
             .context("Failed to run curl")?;
         if !status.success() {
-            bail!("Failed to download the DuckDB {version} CLI from {url}; set {override_var}");
+            bail!("Failed to download the DuckDB {version} {file} from {url}; set {override_var}");
         }
-        let status = tokio::process::Command::new("unzip")
-            .args(["-o", "-q"])
-            .arg(&zip)
-            .arg("-d")
-            .arg(&dir)
-            .status()
-            .await
-            .context("Failed to run unzip")?;
+        let mut unpack = if asset.ends_with(".tar.gz") {
+            let mut tar = tokio::process::Command::new("tar");
+            tar.arg("-xzf").arg(&archive).arg("-C").arg(&dir);
+            tar
+        } else {
+            let mut unzip = tokio::process::Command::new("unzip");
+            unzip.args(["-o", "-q"]).arg(&archive).arg("-d").arg(&dir);
+            unzip
+        };
+        let status = unpack.status().await.context("Failed to unpack")?;
         if !status.success() || !binary.is_file() {
             bail!(
-                "Failed to unpack the DuckDB {version} CLI from {}",
-                zip.display()
+                "Failed to unpack the DuckDB {version} {file} from {}",
+                archive.display()
             );
         }
     }

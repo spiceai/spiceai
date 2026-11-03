@@ -313,8 +313,6 @@ pub enum QueryOverridesArg {
     Arrow,
     #[serde(rename = "cayenne")]
     Cayenne,
-    #[serde(rename = "turso")]
-    Turso,
     #[serde(rename = "bigquery")]
     #[value(name = "bigquery")]
     BigQuery,
@@ -499,7 +497,6 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::OracleCatalog => QueryOverrides::OracleCatalog,
             QueryOverridesArg::SnowflakeCatalog => QueryOverrides::SnowflakeCatalog,
             QueryOverridesArg::DucklakeCatalog => QueryOverrides::DucklakeCatalog,
-            QueryOverridesArg::Turso => QueryOverrides::Turso,
             QueryOverridesArg::BigQuery => QueryOverrides::BigQuery,
             QueryOverridesArg::ScyllaDB => QueryOverrides::ScyllaDB,
             QueryOverridesArg::ChbenchSkipSlow => QueryOverrides::ChbenchSkipSlow,

@@ -41,6 +41,9 @@ impl From<Error> for crate::Error {
             }
             Error::NeedToSpecifySQLView { name } => crate::Error::NeedToSpecifySQLView { name },
             Error::InvalidAccelerationConfiguration { source } => source.into(),
+            Error::AccelerationEngineRemoved { view_name, engine } => {
+                crate::Error::AcceleratedViewEngineRemoved { view_name, engine }
+            }
             Error::AcceleratedViewInvalidConfiguration { view_name, reason } => {
                 crate::Error::AcceleratedViewInvalidConfiguration { view_name, reason }
             }
