@@ -88,3 +88,23 @@ pub(crate) fn handle_metrics(duration: Duration, is_failure: bool, labels: &[Key
         FAILURES.add(1, labels);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_labels_omit_user() -> Result<(), serde_json::Error> {
+        let req: CreateEmbeddingRequest = serde_json::from_value(serde_json::json!({
+            "model": "embed",
+            "input": "hi",
+            "user": "alice@example.com",
+            "dimensions": 256,
+        }))?;
+
+        let labels = request_labels(&req);
+        let keys: Vec<&str> = labels.iter().map(|kv| kv.key.as_str()).collect();
+        assert_eq!(keys, ["model", "encoding_format", "dimensions"]);
+        Ok(())
+    }
+}

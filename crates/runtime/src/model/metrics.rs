@@ -184,3 +184,44 @@ pub(crate) fn handle_token_metrics(
     LLM_PROMPT_TOKENS.add(u64::from(prompt_tokens), labels);
     LLM_COMPLETION_TOKENS.add(u64::from(completion_tokens), labels);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn label_keys(labels: &[KeyValue]) -> Vec<&str> {
+        labels.iter().map(|kv| kv.key.as_str()).collect()
+    }
+
+    #[test]
+    fn chat_labels_omit_request_content() -> Result<(), serde_json::Error> {
+        let req: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt",
+            "messages": [{"role": "user", "content": "hi"}],
+            "user": "alice@example.com",
+            "metadata": {"ticket": "4711"},
+        }))?;
+
+        assert_eq!(
+            label_keys(&request_labels(&req)),
+            ["stream", "request_level_tools", "model"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn responses_labels_omit_request_content() -> Result<(), serde_json::Error> {
+        let req: CreateResponse = serde_json::from_value(serde_json::json!({
+            "model": "gpt",
+            "input": "hi",
+            "instructions": "You are the support agent for account 4711.",
+            "metadata": {"ticket": "4711"},
+        }))?;
+
+        assert_eq!(
+            label_keys(&request_labels_responses(&req)),
+            ["stream", "request_level_tools", "model", "responses_api"]
+        );
+        Ok(())
+    }
+}
