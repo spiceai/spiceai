@@ -120,20 +120,6 @@ pub(crate) async fn initialize_postgres_time_format(
     Ok(db_conn)
 }
 
-/// Get dataset with Unix timestamp column (INT) to work around Vortex v0.52.1 timestamp metadata bug
-pub(crate) fn get_dataset_unix_time(port: usize) -> Dataset {
-    let mut ds = Dataset::new("postgres:test_table", "test_table");
-    ds.params = Some(Params::from_string_map(
-        get_pg_params(port)
-            .into_iter()
-            .map(|(k, v)| (k, v.expose_secret().to_string()))
-            .collect::<HashMap<String, String>>(),
-    ));
-    ds.time_column = Some("created_at".to_string());
-    ds.time_format = Some(TimeFormat::UnixSeconds);
-    ds
-}
-
 pub(crate) async fn execute_ps_sql(
     db_conn: &PostgresConnection,
     sql: &str,
@@ -293,20 +279,6 @@ pub(crate) async fn initialize_postgres_with_value_column(
     Ok(db_conn)
 }
 
-/// Get dataset configured for ISO8601 string timestamps.
-pub(crate) fn get_dataset_iso8601(port: usize) -> Dataset {
-    let mut ds = Dataset::new("postgres:test_table", "test_table");
-    ds.params = Some(Params::from_string_map(
-        get_pg_params(port)
-            .into_iter()
-            .map(|(k, v)| (k, v.expose_secret().to_string()))
-            .collect::<HashMap<String, String>>(),
-    ));
-    ds.time_column = Some("created_at".to_string());
-    ds.time_format = Some(TimeFormat::ISO8601);
-    ds
-}
-
 pub(crate) async fn start_test_runtime(
     port: usize,
     acceleration: Acceleration,
@@ -321,21 +293,7 @@ pub(crate) async fn start_test_runtime_no_time_column(
     start_test_runtime_with_dataset(port, acceleration, get_dataset_no_time_column(port)).await
 }
 
-pub(crate) async fn start_test_runtime_unix_time(
-    port: usize,
-    acceleration: Acceleration,
-) -> Result<Arc<Runtime>, anyhow::Error> {
-    start_test_runtime_with_dataset(port, acceleration, get_dataset_unix_time(port)).await
-}
-
-pub(crate) async fn start_test_runtime_iso8601(
-    port: usize,
-    acceleration: Acceleration,
-) -> Result<Arc<Runtime>, anyhow::Error> {
-    start_test_runtime_with_dataset(port, acceleration, get_dataset_iso8601(port)).await
-}
-
-async fn start_test_runtime_with_dataset(
+pub(crate) async fn start_test_runtime_with_dataset(
     _port: usize,
     acceleration: Acceleration,
     mut dataset: Dataset,

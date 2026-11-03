@@ -31,9 +31,9 @@ limitations under the License.
 
 use crate::acceleration::refresh::common::{
     execute_ps_sql, execute_rt_sql, get_acceleration_config_append, get_acceleration_config_full,
-    initialize_postgres_labeled, initialize_postgres_time_format,
+    get_dataset, initialize_postgres_labeled, initialize_postgres_time_format,
     initialize_postgres_with_value_column, refresh_table, start_test_runtime,
-    start_test_runtime_iso8601, start_test_runtime_unix_time,
+    start_test_runtime_with_dataset,
 };
 use crate::postgres::common;
 use crate::{init_tracing, utils::test_request_context};
@@ -45,6 +45,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection;
 use runtime::Runtime;
 use spicepod::acceleration::Acceleration;
+use spicepod::component::dataset::TimeFormat;
 use spicepod::param::Params;
 use std::sync::Arc;
 use tokio_postgres::types::Type;
@@ -339,20 +340,42 @@ async fn compare_upsert_stage(
     rt: &Arc<Runtime>,
     expected_pairs: &[(i64, Option<&str>)],
 ) -> Result<Answer, anyhow::Error> {
-    let postgres_projection = answer_from_postgres(db_conn, UPSERT_PROJECTION_SQL).await?;
-    let spice_projection = answer_from_spice(rt, UPSERT_PROJECTION_SQL).await?;
-    assert_inserted_pairs(stage, &postgres_projection, ("id", "value"), expected_pairs)?;
+    compare_history_stage(
+        stage,
+        db_conn,
+        rt,
+        [UPSERT_PROJECTION_SQL, UPSERT_AGG_SQL, UPSERT_GROUP_SQL],
+        |postgres_projection| {
+            assert_inserted_pairs(stage, postgres_projection, ("id", "value"), expected_pairs)
+        },
+    )
+    .await
+}
+
+/// Compares the projection, aggregation and group statements in `sqls`, in that order, after
+/// `pin_oracle` checks `PostgreSQL`'s projection holds what the history wrote. Returns Spice's
+/// projection.
+async fn compare_history_stage(
+    stage: &Stage<'_>,
+    db_conn: &PostgresConnection,
+    rt: &Arc<Runtime>,
+    [projection_sql, agg_sql, group_sql]: [&str; 3],
+    pin_oracle: impl FnOnce(&Answer) -> Result<(), anyhow::Error>,
+) -> Result<Answer, anyhow::Error> {
+    let postgres_projection = answer_from_postgres(db_conn, projection_sql).await?;
+    let spice_projection = answer_from_spice(rt, projection_sql).await?;
+    pin_oracle(&postgres_projection)?;
     assert_same_multiset(
         stage.engine,
         stage.mode,
         stage.name,
         "projection",
-        UPSERT_PROJECTION_SQL,
+        projection_sql,
         &spice_projection,
         &postgres_projection,
     );
 
-    for (query_name, sql) in [("aggregation", UPSERT_AGG_SQL), ("group", UPSERT_GROUP_SQL)] {
+    for (query_name, sql) in [("aggregation", agg_sql), ("group", group_sql)] {
         let postgres = answer_from_postgres(db_conn, sql).await?;
         let spice = answer_from_spice(rt, sql).await?;
         assert_same_multiset(
@@ -368,6 +391,9 @@ async fn compare_upsert_stage(
 
     Ok(spice_projection)
 }
+
+/// A `(created_at, n, label)` row a time-format history wrote to `PostgreSQL`.
+type WrittenRow<'a> = (chrono::DateTime<chrono::Utc>, i64, Option<&'a str>);
 
 /// How an append history's `created_at` is stored in `PostgreSQL` and declared to Spice.
 #[derive(Clone, Copy)]
@@ -417,15 +443,11 @@ impl TimeFormatCase {
         acceleration.indexes = std::collections::HashMap::new();
     }
 
-    async fn start_runtime(
-        self,
-        port: usize,
-        acceleration: Acceleration,
-    ) -> Result<Arc<Runtime>, anyhow::Error> {
+    fn time_format(self) -> TimeFormat {
         match self {
-            TimeFormatCase::Timestamp => start_test_runtime(port, acceleration).await,
-            TimeFormatCase::UnixSeconds => start_test_runtime_unix_time(port, acceleration).await,
-            TimeFormatCase::Iso8601 => start_test_runtime_iso8601(port, acceleration).await,
+            TimeFormatCase::Timestamp => TimeFormat::Timestamp,
+            TimeFormatCase::UnixSeconds => TimeFormat::UnixSeconds,
+            TimeFormatCase::Iso8601 => TimeFormat::ISO8601,
         }
     }
 
@@ -449,23 +471,19 @@ impl TimeFormatCase {
         n: i32,
         label: Option<&str>,
     ) -> Result<(), anyhow::Error> {
-        let sql = "INSERT INTO test_table (created_at, n, label) VALUES ($1, $2, $3)";
-        let inserted = match self {
-            TimeFormatCase::Timestamp => db_conn.conn.execute(sql, &[&at, &n, &label]).await,
-            TimeFormatCase::UnixSeconds => {
-                db_conn
-                    .conn
-                    .execute(sql, &[&at.timestamp(), &n, &label])
-                    .await
-            }
-            TimeFormatCase::Iso8601 => {
-                db_conn
-                    .conn
-                    .execute(sql, &[&Self::iso8601(at), &n, &label])
-                    .await
-            }
-        }
-        .map_err(|e| anyhow::anyhow!("Error inserting into test_table: {e}"))?;
+        let created_at: Box<dyn tokio_postgres::types::ToSql + Sync> = match self {
+            TimeFormatCase::Timestamp => Box::new(at),
+            TimeFormatCase::UnixSeconds => Box::new(at.timestamp()),
+            TimeFormatCase::Iso8601 => Box::new(Self::iso8601(at)),
+        };
+        let inserted = db_conn
+            .conn
+            .execute(
+                "INSERT INTO test_table (created_at, n, label) VALUES ($1, $2, $3)",
+                &[created_at.as_ref(), &n, &label],
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Error inserting into test_table: {e}"))?;
         anyhow::ensure!(
             inserted == 1,
             "expected to insert 1 row into test_table, inserted {inserted}"
@@ -507,7 +525,9 @@ pub(crate) async fn append_time_format_matches_postgres_source(
 
             let mut acceleration = configure(port);
             format.configure(&mut acceleration);
-            let rt = format.start_runtime(port, acceleration).await?;
+            let mut dataset = get_dataset(port);
+            dataset.time_format = Some(format.time_format());
+            let rt = start_test_runtime_with_dataset(port, acceleration, dataset).await?;
             let stage = |name| Stage {
                 engine,
                 mode: format.label(),
@@ -568,39 +588,22 @@ async fn compare_time_format_stage(
     format: TimeFormatCase,
     db_conn: &PostgresConnection,
     rt: &Arc<Runtime>,
-    written: &[(chrono::DateTime<chrono::Utc>, i64, Option<&str>)],
+    written: &[WrittenRow<'_>],
 ) -> Result<Answer, anyhow::Error> {
-    let postgres_projection = answer_from_postgres(db_conn, TIME_FORMAT_PROJECTION_SQL).await?;
-    let spice_projection = answer_from_spice(rt, TIME_FORMAT_PROJECTION_SQL).await?;
-    assert_written_time_format_rows(stage, format, &postgres_projection, written)?;
-    assert_same_multiset(
-        stage.engine,
-        stage.mode,
-        stage.name,
-        "projection",
-        TIME_FORMAT_PROJECTION_SQL,
-        &spice_projection,
-        &postgres_projection,
-    );
-
-    for (query_name, sql) in [
-        ("aggregation", TIME_FORMAT_AGG_SQL),
-        ("group", TIME_FORMAT_GROUP_SQL),
-    ] {
-        let postgres = answer_from_postgres(db_conn, sql).await?;
-        let spice = answer_from_spice(rt, sql).await?;
-        assert_same_multiset(
-            stage.engine,
-            stage.mode,
-            stage.name,
-            query_name,
-            sql,
-            &spice,
-            &postgres,
-        );
-    }
-
-    Ok(spice_projection)
+    compare_history_stage(
+        stage,
+        db_conn,
+        rt,
+        [
+            TIME_FORMAT_PROJECTION_SQL,
+            TIME_FORMAT_AGG_SQL,
+            TIME_FORMAT_GROUP_SQL,
+        ],
+        |postgres_projection| {
+            assert_written_time_format_rows(stage, format, postgres_projection, written)
+        },
+    )
+    .await
 }
 
 /// Pins the oracle: `PostgreSQL` holds exactly the `(created_at, n, label)` rows written.
@@ -608,7 +611,7 @@ fn assert_written_time_format_rows(
     stage: &Stage<'_>,
     format: TimeFormatCase,
     postgres: &Answer,
-    written: &[(chrono::DateTime<chrono::Utc>, i64, Option<&str>)],
+    written: &[WrittenRow<'_>],
 ) -> Result<(), anyhow::Error> {
     let indexes = [
         column_index(postgres, "created_at")?,
