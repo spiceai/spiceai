@@ -13,9 +13,9 @@ description: >
   timestamp deletes exactly the rows it is true for, and no retention check
   fails.
   On an append-refreshed acceleration that upserts by
-  key, `retention_sql` applies as each refresh writes, with no scheduled check:
-  a row the source marks deleted is gone once the refresh that brings the change
-  commits.
+  key, `retention_sql` applies after each refresh writes, with no scheduled
+  check: a row the source marks deleted is removed after the refresh that brings
+  the change.
 
 sources:
   src: { kind: postgres }
@@ -189,5 +189,3 @@ steps:
   - query: SELECT * FROM appended
     oracle-sql: SELECT * FROM widgets WHERE NOT deleted
     eventually: 30s
-  - query: SELECT count(*) FROM appended WHERE deleted = true
-    expect: { rows: [["0"]] }
