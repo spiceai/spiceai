@@ -25,7 +25,7 @@ const PASSWORD: &str = "spicescript";
 
 pub struct Mysql {
     container: Container,
-    /// The container's name on the run's MySQL network.
+    /// The source's name on the run's MySQL network.
     peer_host: String,
 }
 
@@ -35,12 +35,13 @@ impl Mysql {
     /// the connector can checkpoint by GTID.
     ///
     /// Every MySQL source of one run joins one Docker network, where each is
-    /// reachable by its container name (no `_`, which a host name may not
-    /// hold): a replica reaches its primary without a route to the host.
+    /// reachable by the source's name (`_` made `-`, which a host name may
+    /// hold): a replica reaches its primary without a route to the host. The
+    /// container's own name can be longer than a host name label allows.
     pub async fn start(name: &str, run_id: &str, version: Option<&str>) -> Result<Self> {
-        let peer_host = format!("spicescript-{run_id}-{name}").replace('_', "-");
+        let peer_host = name.replace('_', "-");
         let container = Container::start(ContainerSpec {
-            name: peer_host.clone(),
+            name: format!("spicescript-{run_id}-{name}"),
             image: super::image("mysql", version)?,
             env: vec![("MYSQL_ROOT_PASSWORD".into(), PASSWORD.into())],
             command: Some(
@@ -57,6 +58,7 @@ impl Mysql {
                 "mysqladmin ping -h127.0.0.1 -uroot --password={PASSWORD} --silent"
             ))),
             network: Some(format!("spicescript-{run_id}-mysql")),
+            alias: Some(peer_host.clone()),
         })
         .await?;
         Ok(Self {
