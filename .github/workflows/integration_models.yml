@@ -517,7 +517,6 @@ jobs:
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
   test-bedrock:
-    environment: ci
     name: Test Bedrock Models
     needs: [build]
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}

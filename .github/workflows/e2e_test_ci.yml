@@ -410,7 +410,6 @@ jobs:
             return isPrEvent ? matrix.slice(0, 1) : matrix;
 
   test_openai_model:
-    environment: ci
     name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     # A backstop for the whole job, so it has to clear this job's own setup — artifact
     # download and CLI install on the self-hosted pool — before the steps' bounded waits

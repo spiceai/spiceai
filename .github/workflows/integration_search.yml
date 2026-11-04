@@ -39,7 +39,6 @@ env:
 
 jobs:
   test-search:
-    environment: ci
     name: Test Search Integration
     runs-on: spiceai-macos-large
     # Holds the OpenAI workload identity federation IDs (`OPENAI_*` secrets).
