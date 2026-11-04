@@ -49,7 +49,7 @@ class CodeQlWorkflowTest(unittest.TestCase):
         self.assertEqual(analyze["runs-on"], "spiceai-macos-large")
         self.assertEqual(
             analyze["env"]["HAS_SPICEIO_SECRET"],
-            "${{ secrets.UNAS_SMB_PASS != '' }}",
+            "${{ secrets.SMB_PASSWORD != '' }}",
         )
         spiceio = next(step for step in analyze["steps"] if step["name"] == "Set up spiceio")
         self.assertIn("runner.os == 'macOS'", spiceio["if"])

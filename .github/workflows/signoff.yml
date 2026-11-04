@@ -269,6 +269,7 @@ jobs:
     # Standard pool, not `spiceai-macos-large`. A dispatched sign-off takes a
     # `spiceai-macos` runner instead of waiting on the large pool.
     runs-on: spiceai-macos
+    environment: ci-build
     # This pool terminates a job at ~360 minutes, and that arrives
     # as `cancelled` with no failed step — the same shape as the
     # cancel-in-progress eviction above, and with no chance for the steps below
@@ -291,7 +292,7 @@ jobs:
       # Needed so scripts/signoff can find the PR and its Attestation run.
       pull-requests: read
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Drive remote-specific behavior in scripts/signoff (pending status,
       # "via remote" description, GitHub compare fallback, step summary).
@@ -454,7 +455,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1

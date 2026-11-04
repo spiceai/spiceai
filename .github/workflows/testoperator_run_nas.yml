@@ -27,6 +27,7 @@ jobs:
   run-nas-bench:
     name: Run network-attached storage benchmark tests
     runs-on: spiceai-macos
+    environment: ci-build
     permissions:
       contents: read
       id-token: write  # RustFS credentials
@@ -110,6 +111,6 @@ jobs:
           S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
           S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
           S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
-          UNAS_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          UNAS_SMB_PASS: ${{ secrets.SMB_PASSWORD }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
