@@ -25,13 +25,21 @@ const PASSWORD: &str = "spicescript";
 
 pub struct Mysql {
     container: Container,
+    /// The source's name on the run's MySQL network.
+    peer_host: String,
 }
 
 impl Mysql {
     /// Starts MySQL. Row-based binary logging is on by default from 8.0, so
     /// the same source serves full, append and CDC refresh; GTIDs are on so
     /// the connector can checkpoint by GTID.
+    ///
+    /// Every MySQL source of one run joins one Docker network, where each is
+    /// reachable by the source's name (`_` made `-`, which a host name may
+    /// hold): a replica reaches its primary without a route to the host. The
+    /// container's own name can be longer than a host name label allows.
     pub async fn start(name: &str, run_id: &str, version: Option<&str>) -> Result<Self> {
+        let peer_host = name.replace('_', "-");
         let container = Container::start(ContainerSpec {
             name: format!("spicescript-{run_id}-{name}"),
             image: super::image("mysql", version)?,
@@ -49,10 +57,14 @@ impl Mysql {
             healthcheck: Some(healthcheck(&format!(
                 "mysqladmin ping -h127.0.0.1 -uroot --password={PASSWORD} --silent"
             ))),
-            network: None,
+            network: Some(format!("spicescript-{run_id}-mysql")),
+            alias: Some(peer_host.clone()),
         })
         .await?;
-        Ok(Self { container })
+        Ok(Self {
+            container,
+            peer_host,
+        })
     }
 
     /// Runs the `mysql` client inside the container as root, against
@@ -79,18 +91,34 @@ impl Source for Mysql {
         Some(&self.container)
     }
 
+    async fn remove(&self) -> Result<()> {
+        self.container.remove().await?;
+        // The run's other MySQL sources may still be on the network; the
+        // last one out removes it, and the runner's final sweep removes it
+        // whichever does not.
+        let _ = self.container.remove_network().await;
+        Ok(())
+    }
+
     async fn create_namespace(&self, namespace: &str) -> Result<super::Namespace> {
         self.mysql(None, &["-e", &format!("CREATE DATABASE `{namespace}`")])
             .await
             .with_context(|| format!("Failed to create database '{namespace}'"))?;
-        Ok(super::Namespace::params(json!({
-            "mysql_host": "127.0.0.1",
-            "mysql_tcp_port": self.container.host_port(3306)?.to_string(),
-            "mysql_user": "root",
-            "mysql_pass": PASSWORD,
-            "mysql_db": namespace,
-            "mysql_sslmode": "disabled",
-        })))
+        let mut extra = serde_json::Map::new();
+        // How another MySQL source of the run (a replica) reaches this one.
+        extra.insert("peer_host".into(), json!(self.peer_host));
+        extra.insert("peer_port".into(), json!(3306));
+        Ok(super::Namespace {
+            params: json!({
+                "mysql_host": "127.0.0.1",
+                "mysql_tcp_port": self.container.host_port(3306)?.to_string(),
+                "mysql_user": "root",
+                "mysql_pass": PASSWORD,
+                "mysql_db": namespace,
+                "mysql_sslmode": "disabled",
+            }),
+            extra,
+        })
     }
 
     /// `mysql -e` runs the statements in order in one session, so session

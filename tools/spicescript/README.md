@@ -152,7 +152,7 @@ steps:
 
 | Kind | What it is |
 | --- | --- |
-| `postgres`, `mysql`, `clickhouse` | A database in Docker. Each instance gets its own database inside it. `${sources.<name>.params}` holds the connector parameters. |
+| `postgres`, `mysql`, `clickhouse` | A database in Docker. Each instance gets its own database inside it. `${sources.<name>.params}` holds the connector parameters. A run's `mysql` sources share a Docker network, where `${sources.<name>.peer_host}` and `${sources.<name>.peer_port}` reach one from another, so one can replicate from another. |
 | `kafka` | Redpanda (`v26.1.6`), with a topic prefix per instance. Tables are `<namespace>_<table>`, created with three partitions on first write. Connector params include bootstrap servers and PLAINTEXT security. |
 | `mongodb` | MongoDB (`9.0`) single-node replica set, with a database per instance. Connector params include its connection string. |
 | `dynamodb` | LocalStack (`4.9`), with a table-name prefix per instance. Tables are `<namespace>_<table>`, created on first write with a numeric or string HASH key and `NEW_AND_OLD_IMAGES` streams. Connector params include endpoint, region and test credentials. |
