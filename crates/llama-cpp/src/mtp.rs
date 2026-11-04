@@ -194,19 +194,23 @@ impl<'m> Mtp<'m> {
         let mut n: usize = 0;
         // SAFETY: the state is live; the shim points `data` at `n` bytes it keeps until its next
         // call, which are copied before then.
-        let status = unsafe { sys::spice_mtp_get_state(self.raw.as_ptr(), &raw mut data, &raw mut n) };
+        let status =
+            unsafe { sys::spice_mtp_get_state(self.raw.as_ptr(), &raw mut data, &raw mut n) };
         self.check(status)?;
         if n == 0 || data.is_null() {
             return Ok(None);
         }
         // SAFETY: as above, `data` holds `n` readable bytes.
-        Ok(Some(unsafe { std::slice::from_raw_parts(data, n) }.to_vec()))
+        Ok(Some(
+            unsafe { std::slice::from_raw_parts(data, n) }.to_vec(),
+        ))
     }
 
     /// Restores a state [`Mtp::state`] returned.
     pub fn restore_state(&mut self, state: &[u8]) -> Result<()> {
         // SAFETY: `state` holds `state.len()` readable bytes for the call; the shim copies them.
-        let status = unsafe { sys::spice_mtp_set_state(self.raw.as_ptr(), state.as_ptr(), state.len()) };
+        let status =
+            unsafe { sys::spice_mtp_set_state(self.raw.as_ptr(), state.as_ptr(), state.len()) };
         self.check(status)
     }
 
