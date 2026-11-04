@@ -28,7 +28,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use aws_config::Region;
 use aws_config::timeout::TimeoutConfig;
-use aws_sdk_kms::error::{DisplayErrorContext, ProvideErrorMetadata};
+use aws_sdk_kms::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_kms::primitives::Blob;
 use aws_sdk_kms::types::{MessageType, SigningAlgorithmSpec};
 use snafu::prelude::*;
@@ -147,6 +147,51 @@ fn refusal_hint(code: Option<&str>, message: &str) -> &'static str {
     }
 }
 
+/// Bounds the reason quoted from KMS or the SDK.
+const MAX_REASON_LEN: usize = 300;
+
+/// `text` as a clause of a longer message: on one line, without a trailing period, and bounded.
+fn clause(text: &str) -> String {
+    let text: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let text = text.trim().trim_end_matches('.');
+    match text.char_indices().nth(MAX_REASON_LEN) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
+/// The deepest cause of `error`: what an error that wraps it adds is context, such as the
+/// request it failed, which the SDK prints in full.
+fn root_cause(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut cause = error;
+    while let Some(source) = cause.source() {
+        cause = source;
+    }
+    cause.to_string()
+}
+
+/// Why a request KMS never answered failed: what went wrong, and its deepest cause.
+fn unanswered_reason<E, R>(error: &SdkError<E, R>) -> String
+where
+    E: std::error::Error + 'static,
+    R: fmt::Debug,
+{
+    let what = match error {
+        SdkError::ConstructionFailure(_) => "the request could not be built",
+        SdkError::TimeoutError(_) => "the request timed out",
+        SdkError::DispatchFailure(_) => "the request was not sent",
+        SdkError::ResponseError(_) => "the response could not be read",
+        _ => "the request failed",
+    };
+    match std::error::Error::source(error) {
+        Some(source) => format!("{what}: {}", root_cause(source)),
+        None => what.to_string(),
+    }
+}
+
 /// A [`JwtSigner`] that has AWS KMS sign with a key it holds, as
 /// `RSASSA_PKCS1_V1_5_SHA_256` over a SHA-256 digest: RS256.
 pub struct AwsKmsSigner {
@@ -202,12 +247,13 @@ impl AwsKmsSigner {
                             service.message().unwrap_or("no message")
                         ),
                     ),
-                    None => (None, DisplayErrorContext(&error).to_string()),
+                    None => (None, unanswered_reason(&error)),
                 };
-                let reason = reason.trim().trim_end_matches('.').to_string();
+                // The hint looks at the whole chain, which names a missing credential deep down.
+                let chain = DisplayErrorContext(&error).to_string();
                 Error::SignFailed {
-                    hint: refusal_hint(code, &reason),
-                    reason,
+                    hint: refusal_hint(code, if code.is_some() { &reason } else { &chain }),
+                    reason: clause(&reason),
                 }
             })?;
         output
@@ -275,6 +321,38 @@ mod tests {
                 "{value:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_request_kms_never_answered_is_named_by_its_deepest_cause_on_one_bounded_line() {
+        #[derive(Debug)]
+        struct Wrapping(&'static str, Option<Box<Wrapping>>);
+        impl fmt::Display for Wrapping {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Wrapping {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|cause| cause as _)
+            }
+        }
+        let error = Wrapping(
+            "failed to apply endpoint to request `Request { body: SdkBody { … } }`",
+            Some(Box::new(Wrapping(
+                "invalid URL\nrelative URL without a base.",
+                None,
+            ))),
+        );
+        assert_eq!(
+            root_cause(&error),
+            "invalid URL\nrelative URL without a base."
+        );
+        assert_eq!(
+            clause(&root_cause(&error)),
+            "invalid URL relative URL without a base"
+        );
+        assert_eq!(clause(&"x".repeat(400)), format!("{}…", "x".repeat(300)));
     }
 
     #[test]

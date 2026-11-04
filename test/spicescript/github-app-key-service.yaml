@@ -84,6 +84,7 @@ steps:
         --query KeyMetadata.KeyId --output text)
         && awslocal kms create-alias --alias-name alias/github-app-${sources.kms.namespace}
         --target-key-id "$id"
+  - source-exec:
       api:
         - |
           path: /app/installations/42/access_tokens
@@ -91,6 +92,13 @@ steps:
           status: 201
           headers: { content-type: application/json }
           body: '{"token": "ghs-from-kms", "expires_at": "2099-01-01T00:00:00Z"}'
+        # The connector checks the installation's access before it loads the dataset.
+        - |
+          path: /repos/acme/widgets/stargazers
+          method: GET
+          headers-match: { authorization: Bearer ghs-from-kms }
+          headers: { content-type: application/json }
+          body: '[]'
         # One answer serves the load's health check and the stargazers query.
         - |
           path: /graphql

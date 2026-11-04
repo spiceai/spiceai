@@ -145,7 +145,7 @@ const TOKEN_REFRESH_BUFFER_SECS: u64 = 60;
 struct Installation {
     app_client_id: Arc<str>,
     key: AppKey,
-    installation_id: Arc<str>,
+    id: Arc<str>,
     /// The GitHub API the installation token is requested from: `https://api.github.com`, or a
     /// GitHub Enterprise Server's `https://<host>/api/v3`.
     api_base: Arc<str>,
@@ -228,7 +228,7 @@ impl GitHubAppTokenProvider {
         let installation = Arc::new(Installation {
             app_client_id: Arc::clone(&app_client_id),
             key: key.clone(),
-            installation_id: Arc::clone(&installation_id),
+            id: Arc::clone(&installation_id),
             api_base,
         });
         let init_token = generate_token(&installation).await?;
@@ -412,7 +412,7 @@ async fn generate_token(installation: &Installation) -> Result<GitHubToken, GitH
         .post(format!(
             "{}/app/installations/{}/access_tokens",
             installation.api_base.trim_end_matches('/'),
-            installation.installation_id,
+            installation.id,
         ))
         .header("Accept", "application/vnd.github+json")
         .header("Authorization", format!("Bearer {jwt_token}"))
@@ -424,7 +424,7 @@ async fn generate_token(installation: &Installation) -> Result<GitHubToken, GitH
     if !status.is_success() {
         let body = http_body_limit::read_prefix(response, MAX_ERROR_BODY_BYTES).await;
         return GitHubRefusedAppJwtSnafu {
-            installation_id: installation.installation_id.to_string(),
+            installation_id: installation.id.to_string(),
             status,
             reason: refusal_reason(&body),
         }
@@ -531,7 +531,7 @@ pub(crate) mod tests {
             Ok(sign_digest(&self.key_pair, digest))
         }
 
-        fn key_id(&self) -> &str {
+        fn key_id(&self) -> &'static str {
             "local-test-key"
         }
     }
@@ -548,7 +548,7 @@ pub(crate) mod tests {
             Err("AccessDeniedException: not authorized to perform kms:Sign".into())
         }
 
-        fn key_id(&self) -> &str {
+        fn key_id(&self) -> &'static str {
             "arn:aws:kms:us-east-1:111122223333:alias/github-app"
         }
     }

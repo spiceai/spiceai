@@ -32,8 +32,7 @@ use std::{fmt, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use azure_core::credentials::TokenCredential;
 use azure_identity::{
-    AzureCliCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions,
-    UserAssignedId,
+    AzureCliCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions, UserAssignedId,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -214,10 +213,7 @@ impl KeyVaultKey {
         let host = url.host_str().ok_or_else(invalid)?;
         let cloud = CLOUDS
             .iter()
-            .find(|cloud| {
-                host.strip_suffix(cloud.suffix)
-                    .is_some_and(is_key_segment)
-            })
+            .find(|cloud| host.strip_suffix(cloud.suffix).is_some_and(is_key_segment))
             .ok_or_else(invalid)?;
         let segments: Vec<&str> = url.path().trim_matches('/').split('/').collect();
         let path = match segments.as_slice() {
@@ -350,14 +346,17 @@ fn clause(text: &str) -> String {
     }
 }
 
+/// An Azure SDK credential to try, as a message names it, and how long it has to answer.
+type Candidate = (
+    &'static str,
+    azure_core::Result<Arc<dyn TokenCredential>>,
+    Duration,
+);
+
 /// The first of `candidates` that gets an access token for `scope` within its budget, and its
 /// name; or, when none does, what each said, as a message lists them.
 async fn first_answering(
-    candidates: Vec<(
-        &'static str,
-        azure_core::Result<Arc<dyn TokenCredential>>,
-        Duration,
-    )>,
+    candidates: Vec<Candidate>,
     scope: &str,
 ) -> Result<(Arc<dyn TokenCredential>, &'static str), String> {
     let mut tried = Vec::new();
@@ -372,10 +371,7 @@ async fn first_answering(
         match tokio::time::timeout(budget, credential.get_token(&[scope], None)).await {
             Ok(Ok(_)) => return Ok((credential, name)),
             Ok(Err(error)) => tried.push(format!("{name} ({})", clause(&error.to_string()))),
-            Err(_) => tried.push(format!(
-                "{name} (no answer within {}s)",
-                budget.as_secs()
-            )),
+            Err(_) => tried.push(format!("{name} (no answer within {}s)", budget.as_secs())),
         }
     }
     Err(match tried.as_slice() {
@@ -462,15 +458,20 @@ impl KeyVaultSigner {
             ));
         }
 
-        let managed_identity = ManagedIdentityCredential::new(Some(ManagedIdentityCredentialOptions {
-            user_assigned_id: env.client_id.clone().map(UserAssignedId::ClientId),
-            ..ManagedIdentityCredentialOptions::default()
-        }))
-        .map(|credential| credential as Arc<dyn TokenCredential>);
+        let managed_identity =
+            ManagedIdentityCredential::new(Some(ManagedIdentityCredentialOptions {
+                user_assigned_id: env.client_id.clone().map(UserAssignedId::ClientId),
+                ..ManagedIdentityCredentialOptions::default()
+            }))
+            .map(|credential| credential as Arc<dyn TokenCredential>);
         let azure_cli =
             AzureCliCredential::new(None).map(|credential| credential as Arc<dyn TokenCredential>);
         let candidates = vec![
-            ("a managed identity", managed_identity, MANAGED_IDENTITY_BUDGET),
+            (
+                "a managed identity",
+                managed_identity,
+                MANAGED_IDENTITY_BUDGET,
+            ),
             ("the Azure CLI", azure_cli, AZURE_CLI_BUDGET),
         ];
         match first_answering(candidates, key.scope).await {
@@ -547,7 +548,9 @@ impl KeyVaultSigner {
 #[async_trait]
 impl JwtSigner for KeyVaultSigner {
     async fn sign_sha256_digest(&self, digest: &[u8; 32]) -> Result<Vec<u8>, SignError> {
-        self.sign(digest).await.map_err(|error| Box::new(error) as _)
+        self.sign(digest)
+            .await
+            .map_err(|error| Box::new(error) as _)
     }
 
     fn key_id(&self) -> &str {
@@ -586,8 +589,6 @@ mod tests {
     use aws_lc_rs::digest::{Digest as LcDigest, SHA256};
     use aws_lc_rs::rsa::{KeyPair, KeySize};
     use aws_lc_rs::signature::RSA_PKCS1_SHA256;
-    use azure_core::credentials::{AccessToken, TokenRequestOptions};
-    use azure_core::time::OffsetDateTime;
     use axum::{
         Json, Router,
         extract::{Query, State},
@@ -595,6 +596,8 @@ mod tests {
         response::{IntoResponse, Response},
         routing::post,
     };
+    use azure_core::credentials::{AccessToken, TokenRequestOptions};
+    use azure_core::time::OffsetDateTime;
     use token_provider::StaticTokenProvider;
 
     use super::*;
@@ -745,7 +748,7 @@ mod tests {
         assert_eq!(
             describe(AzureIdentityEnvironment {
                 github_actions_request_url: None,
-                ..actions.clone()
+                ..actions
             }),
             Ok(None)
         );
@@ -827,11 +830,7 @@ mod tests {
         );
         let answering = FakeCredential::new(Ok("vault-token"), Duration::ZERO);
         let candidates = |answering: Option<Arc<FakeCredential>>| {
-            let mut candidates: Vec<(
-                &'static str,
-                azure_core::Result<Arc<dyn TokenCredential>>,
-                Duration,
-            )> = vec![
+            let mut candidates: Vec<Candidate> = vec![
                 (
                     "a managed identity",
                     Ok(Arc::clone(&hanging) as Arc<dyn TokenCredential>),
@@ -889,10 +888,13 @@ mod tests {
         );
     }
 
+    /// A sign request as the mock vault received it: its query, `Authorization` and body.
+    type VaultRequest = (HashMap<String, String>, Option<String>, Value);
+
     /// What the mock vault received, and the key it signs with.
     struct Vault {
         key_pair: KeyPair,
-        requests: Mutex<Vec<(HashMap<String, String>, Option<String>, Value)>>,
+        requests: Mutex<Vec<VaultRequest>>,
         refuse: bool,
     }
 

@@ -175,7 +175,7 @@ pub(crate) async fn signer(
 mod tests {
     use super::*;
 
-    fn app<'a>(private_key_kms: &'a str) -> AppKeyParams<'a> {
+    fn app(private_key_kms: &str) -> AppKeyParams<'_> {
         AppKeyParams {
             private_key_kms: Some(private_key_kms),
             client_id: Some("Iv23liTest"),
