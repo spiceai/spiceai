@@ -217,6 +217,10 @@ mod tests {
     #[case::milliseconds(datafusion::arrow::datatypes::TimeUnit::Millisecond, &[-377_705_116_800_000, -62_135_596_800_000, 253_402_214_400_000, 253_402_300_799_999])]
     #[case::microseconds(datafusion::arrow::datatypes::TimeUnit::Microsecond, &[-377_705_116_800_000_000, -62_135_596_800_000_000, 253_402_214_400_000_000, 253_402_300_799_999_999])]
     #[case::nanoseconds(datafusion::arrow::datatypes::TimeUnit::Nanosecond, &[i64::MIN, -1, 0, i64::MAX])]
+    // Day counts past `i32` (2^32 days is the first that datetime parts would truncate to 0),
+    // so the write's compression has to keep these out of datetime parts.
+    #[case::seconds_past_i32_days(datafusion::arrow::datatypes::TimeUnit::Second, &[i64::MIN, -371_085_174_374_400, 371_085_174_374_400, i64::MAX])]
+    #[case::milliseconds_past_i32_days(datafusion::arrow::datatypes::TimeUnit::Millisecond, &[i64::MIN, -371_085_174_374_400_000, 371_085_174_374_400_000, i64::MAX])]
     #[tokio::test]
     async fn timestamps_at_the_type_limits_roundtrip_through_a_vortex_file(
         #[case] unit: datafusion::arrow::datatypes::TimeUnit,
