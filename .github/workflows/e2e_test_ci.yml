@@ -813,6 +813,7 @@ jobs:
   test_quickstart_spiceai:
     name: 'Test Spice.ai quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
+    environment: ci
     # run quickstart with external service dependency only on manual trigger
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs:
@@ -878,6 +879,7 @@ jobs:
   test_quickstart_s3:
     name: 'Test S3 quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
+    environment: ci
     # run quickstart with external service dependency only on manual trigger
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs:
