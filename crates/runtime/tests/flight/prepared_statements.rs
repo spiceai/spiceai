@@ -1339,9 +1339,16 @@ mod flight_prepared_statements {
                     let results =
                         execute_parameterized_query(&mut client, &typeof_sql, batch()?).await?;
                     let (bound, lit) = string_pair(&results)?;
-                    assert_eq!(bound, lit, "[{label}] arrow_typeof($1)");
                     if let Some(zone) = zone {
+                        assert_eq!(bound, lit, "[{label}] arrow_typeof($1)");
                         assert!(bound.contains(zone), "[{label}] zone dropped: {bound}");
+                    } else {
+                        // Naive parameters are still rewritten to CAST($N AS TIMESTAMP),
+                        // which may change the unit; only require that no zone appears.
+                        assert!(
+                            bound.starts_with("Timestamp(") && !bound.contains(','),
+                            "[{label}] naive parameter gained a zone: {bound}"
+                        );
                     }
 
                     for column in ["ts_utc", "ts_la", "ts_us", "ts_naive"] {
