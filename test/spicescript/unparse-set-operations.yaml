@@ -9,6 +9,8 @@ sources:
 variants:
   federated: {}
   arrow: arrow
+  cayenne: cayenne-file
+  cayenne-memory: cayenne-memory
 
 spicepod:
   version: v1

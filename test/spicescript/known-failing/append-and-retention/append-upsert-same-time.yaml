@@ -10,6 +10,7 @@ sources:
   src: { kind: postgres }
 variants:
   cayenne: {}
+  cayenne-memory: { datasets: { events: { acceleration: { mode: memory } } } }
   sqlite: { datasets: { events: { acceleration: { engine: sqlite, mode: memory } } } }
 spicepod:
   version: v1

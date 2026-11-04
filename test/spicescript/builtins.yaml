@@ -13,6 +13,7 @@ variants:
   arrow: arrow
   sqlite: sqlite
   cayenne: cayenne-file
+  cayenne-memory: cayenne-memory
   federated: {}
 
 spicepod:

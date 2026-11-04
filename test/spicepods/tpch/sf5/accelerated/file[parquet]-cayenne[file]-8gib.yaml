@@ -1,6 +1,13 @@
 version: v1
 kind: Spicepod
 name: file[parquet]-cayenne[file]-8gib
+
+# Every TPC-H query must answer within an 8 GiB query memory limit, spilling
+# to disk where it needs more.
+runtime:
+  query:
+    memory_limit: 8GiB
+
 datasets:
   - from: s3://benchmarks/tpch_sf5/customer/
     name: customer

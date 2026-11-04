@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 //! End-to-end integration test for the `MySQL` binlog-replication path, driven
-//! through the full Spice Runtime (Spicepod datasets + `DuckDB` accelerator).
+//! through the full Spice Runtime (Spicepod datasets + Cayenne accelerator).
 //!
 //! What this test validates that the pure-library test at `replication.rs`
 //! does not:
@@ -814,6 +814,17 @@ async fn run_replication_e2e(engine: EngineConfig) -> Result<(), anyhow::Error> 
             Ok(())
         })
         .await
+}
+
+/// The binlog replication lifecycle on an in-memory Cayenne acceleration.
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_binlog_replication_end_to_end_cayenne_memory() -> Result<(), anyhow::Error> {
+    run_replication_e2e(EngineConfig {
+        engine: "cayenne",
+        mode: spicepod::acceleration::Mode::Memory,
+        accel_params: HashMap::new(),
+    })
+    .await
 }
 
 /// Same lifecycle against the Cayenne accelerator — the file-backed engine

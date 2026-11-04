@@ -1,9 +1,9 @@
 version: v1
 kind: Spicepod
-name: file[parquet]-cayenne[file]-64gib
+name: file[parquet]-cayenne[file]-8gib
 
-# DuckDB and the query pool share the runner's 72 GiB. Their limits must fit
-# below it with headroom, or the runtime shrinks the query pool to what is left.
+# Every TPC-H query must answer within an 8 GiB query memory limit, spilling
+# to disk where it needs more.
 runtime:
   query:
     memory_limit: 8GiB

@@ -1,6 +1,13 @@
 version: v1
 kind: Spicepod
 name: file[parquet]-cayenne[memory]-2gib
+
+# Every TPC-H query must answer within a 2 GiB query memory limit, spilling
+# to disk where it needs more.
+runtime:
+  query:
+    memory_limit: 2GiB
+
 datasets:
   - from: file:data/customer.parquet
     name: customer

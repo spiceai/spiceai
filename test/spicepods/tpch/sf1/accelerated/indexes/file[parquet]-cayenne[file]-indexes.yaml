@@ -9,6 +9,9 @@ datasets:
       engine: cayenne
       mode: file
       primary_key: c_custkey
+      indexes:
+        c_phone: enabled
+        c_acctbal: enabled
   - from: file:data/lineitem.parquet
     name: lineitem
     acceleration:
@@ -16,6 +19,14 @@ datasets:
       engine: cayenne
       mode: file
       primary_key: (l_orderkey, l_linenumber)
+      indexes:
+        l_orderkey: enabled
+        l_suppkey: enabled
+        l_discount: enabled
+        l_shipdate: enabled
+        l_partkey: enabled
+        l_quantity: enabled
+        (l_shipdate, l_receiptdate): enabled
   - from: file:data/nation.parquet
     name: nation
     acceleration:
@@ -23,6 +34,8 @@ datasets:
       engine: cayenne
       mode: file
       primary_key: n_nationkey
+      indexes:
+        (n_nationkey, n_regionkey): enabled
   - from: file:data/orders.parquet
     name: orders
     acceleration:
@@ -30,6 +43,10 @@ datasets:
       engine: cayenne
       mode: file
       primary_key: o_orderkey
+      indexes:
+        o_orderdate: enabled
+        o_custkey: enabled
+        (o_orderdate, o_custkey): enabled
   - from: file:data/part.parquet
     name: part
     acceleration:
@@ -37,6 +54,10 @@ datasets:
       engine: cayenne
       mode: file
       primary_key: p_partkey
+      indexes:
+        p_brand: enabled
+        p_container: enabled
+        (p_brand, p_container): enabled
   - from: file:data/partsupp.parquet
     name: partsupp
     acceleration:
@@ -58,3 +79,5 @@ datasets:
       engine: cayenne
       mode: file
       primary_key: s_suppkey
+      indexes:
+        s_nationkey: enabled
