@@ -129,7 +129,7 @@ jobs:
     name: Run benchmark e2e tests
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
-    # Holds the BigQuery workload identity federation IDs (`BIGQUERY_*` secrets).
+    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
     environment: ci
     permissions:
       contents: write
@@ -138,8 +138,7 @@ jobs:
       issues: write
       # Approves the snapshot PR's held pull_request runs.
       actions: write
-      # Exchanged for a Google Cloud token that creates the run's BigQuery key: workload identity
-      # federation.
+      # Exchanged for Google Cloud access tokens for the BigQuery tests: workload identity federation.
       id-token: write
     services:
       mssql_tpch:
@@ -457,13 +456,11 @@ jobs:
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
         uses: ./.github/actions/setup-adbc-bigquery
 
-      - name: Create the run's BigQuery service account key
+      - name: Set up BigQuery credentials (workload identity federation)
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
-        uses: ./.github/actions/bigquery-service-account-key
+        uses: ./.github/actions/bigquery-credentials
         with:
-          mode: create
           workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
-          minter-service-account: ${{ secrets.BIGQUERY_KEY_MINTER_SERVICE_ACCOUNT }}
           service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
 
       # duckdb: and ducklake: datasets load the installed DuckDB through ADBC.
@@ -730,15 +727,6 @@ jobs:
           SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
           SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
           CHBENCH_PG_HOST: 127.0.0.1
-
-      - name: Delete the run's BigQuery service account key
-        if: ${{ always() && contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
-        uses: ./.github/actions/bigquery-service-account-key
-        with:
-          mode: delete
-          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
-          minter-service-account: ${{ secrets.BIGQUERY_KEY_MINTER_SERVICE_ACCOUNT }}
-          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
 
       - name: Install GH CLI
         if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'

@@ -275,12 +275,11 @@ jobs:
     if: ${{ inputs.run_all_tests }}
     runs-on: spiceai-dev-runners
     timeout-minutes: 90
-    # Holds the BigQuery workload identity federation IDs (`BIGQUERY_*` secrets).
+    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
     environment: ci
     permissions:
       contents: read
-      # Exchanged for a Google Cloud token that creates the run's BigQuery key: workload identity
-      # federation.
+      # Exchanged for Google Cloud access tokens for the BigQuery tests: workload identity federation.
       id-token: write
     env:
       SPICED_BIN: ${{ github.workspace }}/build/spiced
@@ -303,12 +302,10 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Create the run's BigQuery service account key
-        uses: ./.github/actions/bigquery-service-account-key
+      - name: Set up BigQuery credentials (workload identity federation)
+        uses: ./.github/actions/bigquery-credentials
         with:
-          mode: create
           workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
-          minter-service-account: ${{ secrets.BIGQUERY_KEY_MINTER_SERVICE_ACCOUNT }}
           service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
 
       - name: Download Linux runtime artifact
@@ -354,15 +351,6 @@ jobs:
             fi
           done
           exit "$failed"
-
-      - name: Delete the run's BigQuery service account key
-        if: ${{ always() }}
-        uses: ./.github/actions/bigquery-service-account-key
-        with:
-          mode: delete
-          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
-          minter-service-account: ${{ secrets.BIGQUERY_KEY_MINTER_SERVICE_ACCOUNT }}
-          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
 
       - name: Upload BigQuery test evidence
         if: ${{ always() && steps.test_env.outcome == 'success' }}

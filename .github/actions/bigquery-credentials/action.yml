@@ -1,0 +1,31 @@
+name: BigQuery credentials
+description: >-
+  Exports BIGQUERY_SERVICE_ACCOUNT_JSON as a workload identity federation credential
+  (`external_account`) for the BigQuery tests. The ADBC BigQuery driver and the Python tests use
+  it to exchange the job's GitHub OIDC token for short-lived Google Cloud access tokens, and
+  exchange again before each expires, so CI stores no BigQuery key. It stops working when the
+  job ends. The job needs `environment: ci` and `permissions: id-token: write`; pull requests
+  from forks get no OIDC token.
+
+inputs:
+  workload-identity-provider:
+    description: Full resource name of the Google Cloud workload identity provider that trusts the job.
+    required: true
+  service-account:
+    description: Service account the BigQuery tests act as.
+    required: true
+  token-lifetime-seconds:
+    description: Lifetime of each Google Cloud access token, from 600 to 3600.
+    required: false
+    default: '1800'
+
+runs:
+  using: composite
+  steps:
+    - name: Create the BigQuery workload identity federation credential
+      shell: bash
+      env:
+        WIF_PROVIDER: ${{ inputs.workload-identity-provider }}
+        SERVICE_ACCOUNT: ${{ inputs.service-account }}
+        TOKEN_LIFETIME_SECONDS: ${{ inputs.token-lifetime-seconds }}
+      run: '"${GITHUB_ACTION_PATH}/credentials.sh"'
