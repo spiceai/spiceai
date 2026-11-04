@@ -47,7 +47,9 @@ env:
   CARGO_HTTP_TIMEOUT: 60
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
-  HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
+  # RustFS credentials come from the job's OIDC token, which pull requests from forks
+  # and Dependabot never get; those runs pass test archives as artifacts instead.
+  HAS_RUSTFS_ACCESS: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
   INTEGRATION_TESTS_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-tests-archive/integration_tests.tar.zst
 
 jobs:
@@ -150,6 +152,9 @@ jobs:
     needs: check_changes
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     # Slowest successful run from 2026-08-20 to 2026-09-25 (UTC), after the archive
     # step was consolidated to one `nextest archive` invocation: 151.4 min
     # (run 34988348747, merge_group, 2026-09-15), p99 115 min over 880 `push`
@@ -196,13 +201,23 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/install-protoc
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '12000'
+          export-env: 'false'
+
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -291,25 +306,25 @@ jobs:
           if command -v sccache >/dev/null 2>&1; then sccache --show-stats || true; fi
 
       - name: Set up MinIO client
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Upload test archives to local MinIO
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to upload integration test archives}"
-          mc mb --ignore-existing spice-minio/build
           mc cp ./integration_tests.tar.zst "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}"
 
       - name: Upload test archive (artifact fallback)
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: integration-tests-archive
@@ -336,8 +351,8 @@ jobs:
     needs: [build, check_changes]
     if: ${{ github.event_name != 'pull_request' }}
     permissions:
-      contents: write
       id-token: write
+      contents: write
     runs-on: spiceai-dev-runners
     environment: ci
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 30.7 min (run
@@ -371,18 +386,28 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-oracle-odpi
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '5400'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download test archive from local MinIO
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
@@ -390,7 +415,7 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
@@ -451,9 +476,10 @@ jobs:
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
           # MinIO/S3-compatible storage for TPC-DS and other S3 tests
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY_ID: ${{ steps.rustfs.outputs.access-key-id }}
+          MINIO_SECRET_ACCESS_KEY: ${{ steps.rustfs.outputs.secret-access-key }}
+          MINIO_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
           NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
@@ -556,7 +582,7 @@ jobs:
     environment: ci
     permissions:
       contents: read
-      id-token: write
+      id-token: write  # RustFS credentials
     # The largest leg, PostgreSQL, ran its 85 tests in 4.3 minutes locally (six
     # threads, PostgreSQL 14, 2026-10-08), against 13.1 minutes at most for a
     # whole partition in CI; the bound leaves a cold runner room for the archive
@@ -579,18 +605,28 @@ jobs:
       - name: Install Oracle ODPI-C
         uses: ./.github/actions/setup-oracle-odpi
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
@@ -598,7 +634,7 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        if: env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
@@ -904,11 +940,11 @@ jobs:
     # The Entra app that signs the organization App token trusts this environment.
     environment: ci-integration
     permissions:
+      id-token: write
       # GitHub's GraphQL stargazers connection rejects contents: read, including
       # read-all. The read query requires contents: write on GITHUB_TOKEN.
       # Reproduction: https://github.com/spiceai/spiceai/actions/runs/34186688336
       contents: write
-      id-token: write
     # Shared with the live E2E smoke test: API quotas span processes and runs.
     concurrency:
       group: github-connector-live-api
@@ -931,18 +967,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '2400'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download GitHub test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download GitHub test archive}"
@@ -950,7 +996,7 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download GitHub test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        if: env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
@@ -1028,6 +1074,7 @@ jobs:
     environment: ci
     permissions:
       contents: read
+      id-token: write  # RustFS credentials
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1038,18 +1085,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download AWS SDK test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK test archive}"
@@ -1057,7 +1114,7 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download AWS SDK test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        if: env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
@@ -1084,7 +1141,7 @@ jobs:
     environment: ci
     permissions:
       contents: read
-      id-token: write
+      id-token: write  # RustFS credentials
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1095,18 +1152,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download AWS SDK credential bridge test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK credential bridge test archive}"
@@ -1114,7 +1181,7 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download AWS SDK credential bridge test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        if: env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
@@ -1149,7 +1216,9 @@ jobs:
     # 60 is kept deliberately as a stuck-runner backstop, 5.5x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    permissions: read-all
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1159,18 +1228,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download snapshot refresh test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download snapshot refresh test archive}"
@@ -1178,7 +1257,7 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download snapshot refresh test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        if: env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
@@ -1202,7 +1281,9 @@ jobs:
     # 60 is kept deliberately as a stuck-runner backstop, 8.0x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    permissions: read-all
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1213,18 +1294,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download data components test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download data components test archive}"
@@ -1232,7 +1323,7 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download data components test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        if: env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
@@ -1243,9 +1334,10 @@ jobs:
 
       - name: Run data components integration test
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY_ID: ${{ steps.rustfs.outputs.access-key-id }}
+          MINIO_SECRET_ACCESS_KEY: ${{ steps.rustfs.outputs.secret-access-key }}
+          MINIO_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=data_components::integration) & test(/^hadoop_catalog_test::/)'
 
@@ -1257,6 +1349,11 @@ jobs:
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-dev-runners
+    permissions:
+      actions: write  # approves the held runs of its snapshot PR
+      contents: write  # push-snap-changes pushes a snapshot branch
+      pull-requests: write  # and opens, auto-merges or closes its PR
+      id-token: write  # RustFS credentials
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1265,18 +1362,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download partition table test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download partition table test archive}"
@@ -1284,7 +1391,7 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download partition table test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        if: env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive

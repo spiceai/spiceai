@@ -706,10 +706,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -728,8 +725,6 @@ jobs:
         run: make lint-rust
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
       - name: Show sccache stats
@@ -848,10 +843,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -876,8 +868,6 @@ jobs:
         run: make nextest verify-cli
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
           AWS_REGION: ${{ vars.AWS_REGION }}
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots || 'no' }}
@@ -891,8 +881,6 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: cargo build -p testoperator --all-features --locked
 
       - name: Show sccache stats
@@ -989,10 +977,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -1011,8 +996,6 @@ jobs:
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           RUST_PROFILE: release
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: make install
 
       - name: make install-cli
@@ -1020,8 +1003,6 @@ jobs:
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           RUST_PROFILE: release
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: make install-cli
 
       - name: make install-spiced
@@ -1029,8 +1010,6 @@ jobs:
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           RUST_PROFILE: release
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: make install-spiced
 
       - name: Show sccache stats

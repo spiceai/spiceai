@@ -187,12 +187,12 @@ jobs:
   publish-minio:
     name: Publish linux-x86_64 CUDA binaries to Minio
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     needs: build
     env:
       ARTIFACT_DIR: ./release
-      MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
-      MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
-      MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
       COMMIT_SHA: ${{ github.sha }}
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
@@ -211,14 +211,24 @@ jobs:
           path: ${{ env.ARTIFACT_DIR }}
           merge-multiple: true
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '21600'
+          export-env: 'false'
+
+      - name: Set up MinIO client
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
+
       - name: Upload artifacts to Minio
         run: |
-          sudo apt-get update
-          sudo apt-get install wget -y
-          sudo wget https://public-data.spiceai.org/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z -O /usr/local/bin/mc
-          sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-minio ${{ env.MINIO_ENDPOINT }} ${{ env.MINIO_ACCESS_KEY }} ${{ env.MINIO_SECRET_KEY }}
-
           # Upload any CUDA artifacts that were successfully built
           for file in ${{ env.ARTIFACT_DIR }}/spiced_cuda_*_linux_x86_64.tar.gz; do
             if [ -f "$file" ]; then

@@ -64,12 +64,10 @@ jobs:
     name: Run data consistency tests
     # The service principal's federation policy trusts this environment's subject.
     environment: ci
+    runs-on: ${{ github.event.inputs.runner_type }}
     permissions:
       contents: read
-      actions: read
-      # Exchanged for Databricks access tokens: workload identity federation.
-      id-token: write
-    runs-on: ${{ github.event.inputs.runner_type }}
+      id-token: write  # RustFS credentials and Databricks access tokens
     timeout-minutes: 600
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -90,19 +88,29 @@ jobs:
           fi
           echo "Compare spicepod file found at ${{ github.event.inputs.compare_spicepod_path }}"
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '36000'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
         uses: ./.github/actions/build-spicepod-validator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepods
         run: |
@@ -117,9 +125,10 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup Testoperator
         uses: ./.github/actions/setup-testoperator-data
@@ -139,9 +148,10 @@ jobs:
             --disable-progress-bars \
             --compare-spicepod-path ${{ github.event.inputs.compare_spicepod_path }}
         env:
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY}}
+          S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT}}
+          S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
+          S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
+          S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
           DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
           DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
           DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
