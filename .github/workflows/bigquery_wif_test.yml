@@ -124,20 +124,33 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Try to get BigQuery credentials without the ci environment
-        id: creds
-        continue-on-error: true
+      - name: Get BigQuery credentials without the ci environment
         uses: ./.github/actions/bigquery-credentials
         with:
           workload-identity-provider: projects/198677639031/locations/global/workloadIdentityPools/spiceai-ci-github-actions/providers/github
           service-account: spiceai-testing-bq@spiceai-testing.iam.gserviceaccount.com
 
-      - name: Require the refusal
-        env:
-          OUTCOME: ${{ steps.creds.outcome }}
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Require Google to refuse the credential
         run: |
-          echo "credentials outcome: ${OUTCOME}; credential exported: ${BIGQUERY_SERVICE_ACCOUNT_JSON:+yes}"
-          if [ "${OUTCOME}" != failure ] || [ -n "${BIGQUERY_SERVICE_ACCOUNT_JSON:-}" ]; then
-            echo "::error::a job outside the ci environment got BigQuery credentials"
-            exit 1
-          fi
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet google-auth==2.62.1 requests
+          "$RUNNER_TEMP/venv/bin/python" - <<'PYEOF'
+          import json, os, sys
+          import google.auth, google.auth.transport.requests
+          from google.auth import exceptions
+          info = json.loads(os.environ["BIGQUERY_SERVICE_ACCOUNT_JSON"])
+          from google.auth import identity_pool
+          creds = identity_pool.Credentials.from_info(info, scopes=["https://www.googleapis.com/auth/cloud-platform"])
+          try:
+              creds.refresh(google.auth.transport.requests.Request())
+          except exceptions.RefreshError as error:
+              print(f"refused as expected: {error}")
+              sys.exit(0)
+          print("::error::a job outside the ci environment got a Google Cloud token")
+          sys.exit(1)
+          PYEOF
