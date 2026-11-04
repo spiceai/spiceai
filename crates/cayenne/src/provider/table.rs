@@ -8282,7 +8282,7 @@ impl CayenneTableProvider {
     pub(crate) fn sweep_retired_snapshot_dirs(&self) {
         // A closed instance's ledger and scan pins do not cover the scans of the
         // instance that replaced it, so it must not judge any directory unused.
-        if self.is_maintenance_closed() || crate::is_object_store_path(&self.table_metadata.path) {
+        if self.is_maintenance_closed() {
             return;
         }
         // Lock order everywhere in this file: ledger, then last-listed.
@@ -8358,6 +8358,16 @@ impl CayenneTableProvider {
         // spawned task ref-counts against a coherent set.
         let mut live_snapshot_ids: HashSet<String> = protected.keys().cloned().collect();
         live_snapshot_ids.insert(current);
+        if crate::is_object_store_path(&self.table_metadata.path) {
+            let table = self.clone_for_write();
+            tokio::spawn(async move {
+                let _deleting = deleting;
+                table
+                    .sweep_retired_snapshot_prefixes(due, &live_snapshot_ids)
+                    .await;
+            });
+            return;
+        }
         let table_path = self.table_metadata.path.clone();
         let table_id = self.table_metadata.table_id.clone();
         let runtime_env = Arc::clone(self.context.runtime_env());
@@ -8847,6 +8857,84 @@ impl CayenneTableProvider {
     /// left untouched. The S3 mirror of
     /// [`Self::delete_retired_snapshot_dir_refcounted`]; there is no empty-prefix
     /// "directory" to remove afterwards on object storage.
+    /// `{table path}/{table_id}/` as an object key prefix (with the trailing `/`).
+    fn snapshot_root_key_prefix(&self) -> Result<String> {
+        let base_url =
+            url::Url::parse(&self.table_metadata.path).map_err(|source| Error::UrlParse {
+                url: self.table_metadata.path.clone(),
+                source,
+            })?;
+        let mut base_prefix = base_url.path().trim_start_matches('/').to_string();
+        if !base_prefix.ends_with('/') {
+            base_prefix.push('/');
+        }
+        Ok(format!("{base_prefix}{}/", self.table_metadata.table_id))
+    }
+
+    /// Object-store mirror of the detached deletion in
+    /// [`Self::sweep_retired_snapshot_dirs`]: delete each due retired snapshot
+    /// prefix, keeping files a live snapshot references in place, and drop the
+    /// ledger entry once nothing is left under it.
+    async fn sweep_retired_snapshot_prefixes(
+        &self,
+        due: Vec<String>,
+        live_snapshot_ids: &HashSet<String>,
+    ) {
+        let table_name = self.table_metadata.table_name.as_str();
+        let all_rows = match self
+            .catalog
+            .get_all_snapshot_files(&self.table_metadata.table_id)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(target: "cayenne::compaction", table = table_name, %error, "Retired-prefix sweep skipped: failed to read snapshot manifest (will retry)");
+                maintenance_metrics::track_maintenance(
+                    table_name,
+                    MaintenanceOp::RetiredDirSweep,
+                    MaintenanceOutcome::Failed,
+                );
+                return;
+            }
+        };
+        let live_referenced = (!all_rows.is_empty())
+            .then(|| Self::live_referenced_relative_paths(&all_rows, live_snapshot_ids));
+        let (root, store) = match (self.snapshot_root_key_prefix(), self.require_object_store()) {
+            (Ok(root), Ok(config)) => (root, Arc::clone(&config.store)),
+            (Err(error), _) | (_, Err(error)) => {
+                tracing::warn!(target: "cayenne::compaction", table = table_name, %error, "Retired-prefix sweep skipped");
+                return;
+            }
+        };
+        let (mut reclaimed_dirs, mut failed_dirs) = (0_u64, 0_u64);
+        for id in due {
+            let prefix = ObjectStorePath::from(format!("{root}{id}/"));
+            let deleted = match &live_referenced {
+                Some(live) => self.delete_prefix_refcounted(&prefix, &id, live).await,
+                None => self.delete_prefix_with_object_store(&prefix).await,
+            };
+            if let Err(error) = deleted {
+                failed_dirs = failed_dirs.saturating_add(1);
+                tracing::warn!(target: "cayenne::compaction", table = table_name, snapshot_id = %id, %error, "Failed to delete retired snapshot prefix (will retry)");
+                continue;
+            }
+            let remaining: Vec<_> = match store.list(Some(&prefix)).try_collect().await {
+                Ok(remaining) => remaining,
+                Err(_) => continue,
+            };
+            if remaining.is_empty() {
+                self.retired_snapshot_dirs.lock().remove(&id);
+                self.snapshot_last_listed.lock().remove(&id);
+                reclaimed_dirs = reclaimed_dirs.saturating_add(1);
+            }
+        }
+        maintenance_metrics::track_maintenance(
+            table_name,
+            MaintenanceOp::RetiredDirSweep,
+            retired_dir_sweep_outcome(reclaimed_dirs, reclaimed_dirs, failed_dirs),
+        );
+    }
+
     async fn delete_prefix_refcounted(
         &self,
         prefix: &ObjectStorePath,
@@ -23214,7 +23302,17 @@ impl CayenneTableProvider {
                 record_row_removed(df);
                 continue;
             }
-            match tokio::fs::remove_file(&df.path).await {
+            let unlinked = match crate::resolve_object_url(&df.path) {
+                Some((store, location)) => match store.delete(&location).await {
+                    Ok(()) => Ok(()),
+                    Err(object_store::Error::NotFound { .. }) => {
+                        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                    }
+                    Err(error) => Err(std::io::Error::other(error)),
+                },
+                None => tokio::fs::remove_file(&df.path).await,
+            };
+            match unlinked {
                 Ok(()) => {
                     removed_ids.push(df.delete_file_id.clone());
                     record_unlinked(df);
