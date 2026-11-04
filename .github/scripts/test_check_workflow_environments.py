@@ -315,6 +315,44 @@ jobs:
         self.assertEqual(len(result), 1)
         self.assertIn("reads secrets.X;", result[0])
 
+    def test_bare_job_if_condition_is_scanned(self):
+        self.assertEqual(
+            problems(
+                """\
+jobs:
+  test:
+    environment: secret-free
+    if: secrets.X != ''
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo hi
+"""
+            ),
+            [
+                "job 'test' is in the `secret-free` environment but reads secrets.X; "
+                "move it to the environment that holds those secrets, or remove the references"
+            ],
+        )
+
+    def test_env_and_input_named_if_are_literal_text(self):
+        self.assertEqual(
+            problems(
+                """\
+jobs:
+  test:
+    environment: secret-free
+    runs-on: ubuntu-24.04
+    env:
+      if: no secrets here
+    steps:
+      - uses: some/action@v1
+        with:
+          if: secrets.txt
+"""
+            ),
+            [],
+        )
+
     def test_workflow_level_env_secret_fails(self):
         self.assertEqual(
             problems(

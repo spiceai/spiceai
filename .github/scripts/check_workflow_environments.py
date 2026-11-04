@@ -112,17 +112,25 @@ def _embedded_expressions(text: str):
         start = text.find("${{", end + 2)
 
 
-def _expressions(node: object):
-    """The text of every expression in a node: each `${{ }}`, plus bare `if:` conditions."""
+def _expressions(node: object, *, conditional: bool = False):
+    """The text of every expression in a node: each `${{ }}`, plus bare `if:` conditions.
+
+    `conditional` marks a job or step mapping, the only places where `if:` is a
+    condition. Elsewhere `if` is an ordinary key, such as an `env:` variable or a
+    `with:` input named `if`, and its value is literal text.
+    """
     if isinstance(node, str):
         yield from _embedded_expressions(node)
     elif isinstance(node, dict):
         for key, value in node.items():
             if isinstance(key, str):
                 yield from _embedded_expressions(key)
-            # An `if:` is an expression whether or not it is wrapped in `${{ }}`.
-            if key == "if" and isinstance(value, str) and "${{" not in value:
+            # A condition is an expression whether or not it is wrapped in `${{ }}`.
+            if conditional and key == "if" and isinstance(value, str) and "${{" not in value:
                 yield value
+            elif conditional and key == "steps" and isinstance(value, list):
+                for step in value:
+                    yield from _expressions(step, conditional=True)
             else:
                 yield from _expressions(value)
     elif isinstance(node, list):
@@ -130,14 +138,15 @@ def _expressions(node: object):
             yield from _expressions(item)
 
 
-def secret_references(node: object) -> list[str]:
+def secret_references(node: object, *, job: bool = False) -> list[str]:
     """Every secret a node's expressions read, other than `ALLOWED_SECRETS`.
 
     Only expressions are scanned: a `run:` script that mentions `secrets.txt`, or a
-    comment (which the YAML loader has already dropped), reads no secret.
+    comment (which the YAML loader has already dropped), reads no secret. `job`
+    marks a job mapping, so its `if:` and its steps' `if:` are read as conditions.
     """
     found: set[str] = set()
-    for expression in _expressions(node):
+    for expression in _expressions(node, conditional=job):
         expression = STRING_LITERAL.sub(
             lambda m, e=expression: m.group(0) if SECRETS_INDEX_OPEN.search(e, 0, m.start()) else "''",
             expression,
@@ -207,7 +216,7 @@ def check_workflow(document: dict) -> list[str]:
             continue
         if name.lower() != SECRET_FREE:
             continue
-        secrets = secret_references(job)
+        secrets = secret_references(job, job=True)
         if secrets:
             problems.append(
                 f"job '{job_id}' is in the `{SECRET_FREE}` environment but reads {', '.join(secrets)}; "
