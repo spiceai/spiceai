@@ -181,8 +181,8 @@ jobs:
           test_binary_url="${SPICEIO_ENDPOINT%/}/build/${TEST_BINARY_OBJECT_KEY}"
           curl --fail --silent --show-error --upload-file ./llms_integration_test "$test_binary_url"
 
+      # The `test` legs run in `ci`, which has no NAS password, so they read this copy.
       - name: Upload test binary
-        if: env.HAS_SPICEIO_SECRET != 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: llms-integration-test-binary
