@@ -2619,13 +2619,19 @@ if args[:1] == ["status"]:
             "Orca runs Codex CLI with the command 'codex', so Codex CLI sessions in Orca do not use Spice. Set Codex CLI's command in Orca's Settings, under Agents, to `'{}/.spice/orca/bin/spice-agent' codex`.",
             lab.home.display()
         );
+        // `spice orca` starts Orca, and with it `ANSWER_BUDGET`, only once the
+        // runtime it launched answers `/health` and its models are ready, so
+        // the warning can come as late as both waits together, plus `BUDGET`
+        // for the steps between them.
         wait_within(
-            ORCA_ANSWER_BUDGET,
+            RUNTIME_HEALTH_BUDGET + ORCA_ANSWER_BUDGET + BUDGET,
             "the warning about Codex CLI's command",
             || output().contains(&codex_warning),
         );
         let project = fs::canonicalize(&lab.app).expect("resolve the project");
-        wait_within(ORCA_PROJECT_BUDGET, "the project to be added", || {
+        // `PROJECT_TIMEOUT` starts after `git rev-parse` finds the project, and
+        // `BUDGET` covers that lookup.
+        wait_within(ORCA_PROJECT_BUDGET + BUDGET, "the project to be added", || {
             orca_calls(root).iter().any(|call| {
                 call["args"]
                     == serde_json::json!([
