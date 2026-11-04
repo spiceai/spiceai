@@ -183,7 +183,7 @@ impl KeyUse {
             | (CacheControl::Revalidate(CacheKeyType::Raw), CacheKey::Query(_, _))
             | (
                 CacheControl::Revalidate(CacheKeyType::ClientSupplied),
-                CacheKey::ClientSupplied(_),
+                CacheKey::ClientSupplied(_, _),
             ) => Self::Revalidate,
             (CacheControl::NoCache, _) => Self::Bypass,
             _ => Self::WrongKeyType,
