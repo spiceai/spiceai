@@ -3686,6 +3686,7 @@ impl CayenneTableProviderBuilder {
     /// while metadata remains on local disk.
     #[must_use]
     pub fn with_object_store(mut self, config: crate::metadata::ObjectStoreConfig) -> Self {
+        crate::register_object_store(&config.url, Arc::clone(&config.store));
         self.object_store_config = Some(config);
         self
     }

@@ -31,6 +31,7 @@ limitations under the License.
 //!   - `row_key: Binary` - Primary key bytes (via Arrow's `RowConverter`)
 //!   - `deleted_at: Int64` - Deletion timestamp (microseconds)
 
+use object_store::ObjectStoreExt as _;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
@@ -406,7 +407,11 @@ impl<'a> DeletionVectorWriter<'a> {
         //
         // The sync is one-time per snapshot (first deletion vector
         // written to it). Subsequent deletions reuse the directory.
-        let sync_snapshot_parent = match tokio::fs::create_dir(&deletion_dir).await {
+        let object_store_table = crate::is_object_store_path(&self.table.path);
+        let sync_snapshot_parent = if object_store_table {
+            false
+        } else {
+            match tokio::fs::create_dir(&deletion_dir).await {
             Ok(()) => true,
             Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => false,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -414,6 +419,7 @@ impl<'a> DeletionVectorWriter<'a> {
                 true
             }
             Err(source) => return Err(Error::IoError { source }),
+            }
         };
         if sync_snapshot_parent {
             let table = self.table.path.clone();
@@ -566,7 +572,7 @@ impl<'a> DeletionVectorWriter<'a> {
         // flushes ALL of its pending entries, so syncing once after every file
         // exists provides the same dirent durability at 1/N the barrier count.
         // Must complete before the catalog records any of the paths.
-        {
+        if !object_store_table {
             let table = self.table.path.clone();
             let deletion_dir_for_sync = deletion_dir.clone();
             tokio::task::spawn_blocking(move || {
@@ -653,6 +659,9 @@ impl<'a> DeletionVectorWriter<'a> {
 /// # Errors
 ///
 /// Returns an error if any deletion vector file cannot be read or parsed.
+trait ReadSeek: std::io::Read + std::io::Seek + Send {}
+impl<T: std::io::Read + std::io::Seek + Send> ReadSeek for T {}
+
 #[expect(clippy::type_complexity)]
 pub fn detect_deletion_type_and_read(
     delete_files: Vec<DeleteFile>,
@@ -682,7 +691,21 @@ pub fn detect_deletion_type_and_read(
         let path = std::path::Path::new(&delete_file.path);
         tracing::debug!("detect_deletion_type_and_read: reading file {:?}", path);
 
-        let file = match std::fs::File::open(path) {
+        let opened: std::io::Result<Box<dyn ReadSeek>> =
+            if let Some((store, location)) = crate::resolve_object_url(&delete_file.path) {
+                match tokio::runtime::Handle::current()
+                    .block_on(async { store.get(&location).await?.bytes().await })
+                {
+                    Ok(bytes) => Ok(Box::new(std::io::Cursor::new(bytes))),
+                    Err(object_store::Error::NotFound { .. }) => {
+                        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                    }
+                    Err(error) => Err(std::io::Error::other(error)),
+                }
+            } else {
+                std::fs::File::open(path).map(|f| Box::new(f) as Box<dyn ReadSeek>)
+            };
+        let file = match opened {
             Ok(file) => file,
             // A missing KEY-based DV file is tolerated and reported: the file-first
             // orphaned-DV sweep unlinks the file before removing its catalog row, so
@@ -881,6 +904,20 @@ async fn write_deletion_file(
     let output_path = file_path.to_path_buf();
     let table_name = table_name.to_string();
 
+    if let Some((store, location)) = output_path.to_str().and_then(crate::resolve_object_url) {
+        let _completion = completion;
+        let mut writer = FileWriter::try_new(Vec::new(), &schema)?;
+        writer.write(&batch)?;
+        writer.finish()?;
+        let bytes = writer.into_inner()?;
+        let len = bytes.len() as u64;
+        store
+            .put(&location, bytes.into())
+            .await
+            .map_err(|source| Error::IoError { source: std::io::Error::other(source) })?;
+        return Ok(len);
+    }
+
     tokio::task::spawn_blocking(move || -> Result<u64> {
         let _completion = completion;
         #[cfg(test)]
@@ -946,6 +983,13 @@ async fn write_deletion_file(
 /// never committed to the catalog.
 pub(crate) async fn cleanup_uncommitted_delete_paths(paths: &[PathBuf]) {
     for path in paths {
+        if let Some((store, location)) = path.to_str().and_then(crate::resolve_object_url) {
+            match store.delete(&location).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => tracing::warn!(path = %path.display(), %error, "Failed to remove an uncommitted deletion-vector object"),
+            }
+            continue;
+        }
         if let Err(error) = tokio::fs::remove_file(path).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -983,6 +1027,14 @@ pub(crate) fn remove_dropped_deletion_vector_files(
     crate::provider::compaction::spawn_compaction(async move {
         let _deleting = file_deletion_fence.write().await;
         for path in paths {
+            if let Some((store, location)) = path.to_str().and_then(crate::resolve_object_url) {
+                if let Err(error) = store.delete(&location).await
+                    && !matches!(error, object_store::Error::NotFound { .. })
+                {
+                    tracing::debug!(path = %path.display(), %error, "Failed to remove a deletion-vector object no catalog row references");
+                }
+                continue;
+            }
             if let Err(error) = tokio::fs::remove_file(&path).await
                 && error.kind() != std::io::ErrorKind::NotFound
             {

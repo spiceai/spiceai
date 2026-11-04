@@ -197,6 +197,40 @@ pub(crate) fn object_relative<'a>(
     location.as_ref().strip_prefix(prefix)?.strip_prefix('/')
 }
 
+/// Prototype: object stores by `scheme://host`, so code that holds only a file's
+/// URL (deletion vectors) reaches the store its table was given.
+static OBJECT_STORES: std::sync::LazyLock<
+    parking_lot::RwLock<std::collections::HashMap<String, std::sync::Arc<dyn object_store::ObjectStore>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn object_store_key(url: &url::Url) -> String {
+    format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default())
+}
+
+/// Prototype: record the store a table's files live in, keyed by its URL's scheme and host.
+pub fn register_object_store(url: &url::Url, store: std::sync::Arc<dyn object_store::ObjectStore>) {
+    OBJECT_STORES.write().insert(object_store_key(url), store);
+}
+
+/// The store and object path of a file addressed by URL (`s3://…`, `file://…`);
+/// `None` for a plain local path.
+#[must_use]
+pub(crate) fn resolve_object_url(
+    location: &str,
+) -> Option<(std::sync::Arc<dyn object_store::ObjectStore>, object_store::path::Path)> {
+    if !is_object_store_path(location) {
+        return None;
+    }
+    let url = url::Url::parse(location).ok()?;
+    let store = OBJECT_STORES
+        .read()
+        .get(&object_store_key(&url))
+        .cloned()
+        .or_else(|| (url.scheme() == "file").then(durable_local_object_store))?;
+    let path = object_store::path::Path::from_url_path(url.path()).ok()?;
+    Some((store, path))
+}
+
 /// Prototype: the durable local-directory store that every local file-mode table
 /// writes and reads through, registered for `file:///` in the table's `RuntimeEnv`.
 #[must_use]
