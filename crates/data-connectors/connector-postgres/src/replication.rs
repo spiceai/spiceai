@@ -524,7 +524,7 @@ pub async fn build_changes_stream(
     // UPDATE events must replace the row stored under the dataset's primary
     // key — otherwise the accelerator's write path falls through to append and
     // silently inserts duplicate rows on every UPDATE. Cayenne keeps one row per
-    // declared `primary_key` on its own; DuckDB / SQLite / Postgres / Turso
+    // declared `primary_key` on its own; DuckDB / SQLite / Postgres
     // also need an `on_conflict: upsert` (or upsert-dedup) entry keyed on it.
     // The Arrow engine genuinely can't support upsert and is documented as
     // append-only for UPDATEs — skip the check there.
@@ -1138,7 +1138,7 @@ fn accelerator_is_ephemeral(
         // `memory_mode` branch), so nothing about it survives a restart. Only its
         // file modes (local disk or S3 Express One Zone, both of which require a
         // file mode) persist independently of this process.
-        Engine::DuckDB | Engine::Sqlite | Engine::Turso | Engine::Cayenne => {
+        Engine::DuckDB | Engine::Sqlite | Engine::Cayenne => {
             matches!(acceleration.mode, Mode::Memory | Mode::FileCreate)
         }
         // External storage (another Postgres) persists independently of this
@@ -1614,7 +1614,7 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
         assert!(!ephemeral(Engine::Cayenne, Mode::File));
         assert!(!ephemeral(Engine::Cayenne, Mode::FileUpdate));
 
-        for engine in [Engine::DuckDB, Engine::Sqlite, Engine::Turso] {
+        for engine in [Engine::DuckDB, Engine::Sqlite] {
             assert!(ephemeral(engine, Mode::Memory), "{engine} memory");
             assert!(ephemeral(engine, Mode::FileCreate), "{engine} file_create");
             assert!(!ephemeral(engine, Mode::File), "{engine} file");

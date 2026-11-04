@@ -24,6 +24,23 @@ use snafu::ensure;
 use crate::mtp::DraftKind;
 use crate::{BatchFullSnafu, Error, Result, Token, sys};
 
+/// The parts of a sequence's state a truncation cannot restore: recurrent states and
+/// sliding-window caches, not the full-attention cache.
+const PARTIAL_ONLY: sys::llama_state_seq_flags = sys::LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+
+/// How far a context's cache can be cut back from its end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Truncation {
+    /// To any position: an attention cache, or a sliding-window cache kept at full size, as
+    /// llama.cpp keeps one by default.
+    Anywhere,
+    /// Only over the last few positions its rollback snapshots keep: a recurrent state with
+    /// snapshots for drafted tokens.
+    Bounded,
+    /// Not short of clearing it: a recurrent state without snapshots, or a compressed cache.
+    Never,
+}
+
 /// How a context is created.
 #[expect(
     clippy::struct_field_names,
@@ -85,6 +102,10 @@ impl ContextParams {
 }
 
 /// A llama.cpp context: the KV cache and compute state of the model's sequences.
+///
+/// `raw` is the context `llama_init_from_model` created for this value, which owns it: nothing
+/// else frees it, and `Drop` frees it once. So `raw` points to a live context for as long as
+/// `self` exists, which every `unsafe` call below relies on.
 #[derive(Debug)]
 pub struct Context<'m> {
     raw: NonNull<sys::llama_context>,
@@ -135,6 +156,42 @@ impl Context<'_> {
         }
     }
 
+    /// The logits of output row `index` of the last decoded batch, one per token of the
+    /// model's vocabulary, by token id. `None` when the last decode did not output that row,
+    /// or when a backend sampler, which leaves only its own candidates, sampled it.
+    pub(crate) fn logits(&self, index: i32) -> Option<&[f32]> {
+        let ctx = self.raw.as_ptr();
+        // SAFETY: `raw` is live while `self` is (see `Context`). Each call waits for the last
+        // decode to finish, then reads where it left row `index`.
+        let backend_sampled = unsafe {
+            sys::llama_get_sampled_token_ith(ctx, index) != sys::LLAMA_TOKEN_NULL
+                || !sys::llama_get_sampled_logits_ith(ctx, index).is_null()
+                || !sys::llama_get_sampled_probs_ith(ctx, index).is_null()
+        };
+        if backend_sampled {
+            return None;
+        }
+        // SAFETY: as above; null when the decode did not output row `index`.
+        let row = NonNull::new(unsafe { sys::llama_get_logits_ith(ctx, index) })?;
+        // SAFETY: as above; the model outlives the context, and its vocabulary the model.
+        let n_vocab = unsafe {
+            sys::llama_vocab_n_tokens(sys::llama_model_get_vocab(sys::llama_get_model(ctx)))
+        };
+        let n_vocab = usize::try_from(n_vocab).ok()?;
+        // SAFETY: llama.cpp keeps a row of logits per output, one per vocabulary token. It
+        // writes them while it decodes, and when the first read after a decode puts the rows in
+        // batch order, which the calls above have done. Only another decode queues writes again,
+        // and it takes `&mut self`, so it cannot start while the returned row borrows `self`.
+        Some(unsafe { std::slice::from_raw_parts(row.as_ptr(), n_vocab) })
+    }
+
+    /// Waits for the computation queued by earlier decodes to finish: a decode returns once
+    /// its computation is queued, and a time taken without waiting would leave it out.
+    pub fn synchronize(&mut self) {
+        // SAFETY: the context is live.
+        unsafe { sys::llama_synchronize(self.raw.as_ptr()) };
+    }
+
     /// Empties the KV cache of every sequence.
     pub fn clear(&mut self) {
         // SAFETY: the context is live; a context always has memory.
@@ -146,6 +203,70 @@ impl Context<'_> {
     pub fn truncate(&mut self, from: i32) -> bool {
         // SAFETY: as above; -1 means "to the end".
         unsafe { sys::llama_memory_seq_rm(sys::llama_get_memory(self.raw.as_ptr()), 0, from, -1) }
+    }
+
+    /// How far this context's cache can be cut back, found as llama.cpp's server finds it: a
+    /// context that keeps rollback snapshots rolls back only over them; otherwise two tokens are
+    /// decoded into the emptied cache, and the second removed. Leaves the cache empty.
+    pub fn truncation(&mut self) -> Truncation {
+        // SAFETY: `raw` is live while `self` is (see `Context`), and `llama_n_rs_seq` only reads
+        // the context's parameters.
+        if unsafe { sys::llama_n_rs_seq(self.raw.as_ptr()) } > 0 {
+            return Truncation::Bounded;
+        }
+        self.clear();
+        let mut batch = Batch::new(2);
+        let truncated = batch.add(Token(0), 0, false).is_ok()
+            && batch.add(Token(0), 1, true).is_ok()
+            && self.decode(&batch).is_ok()
+            && self.truncate(1);
+        self.clear();
+        if truncated {
+            Truncation::Anywhere
+        } else {
+            Truncation::Never
+        }
+    }
+
+    /// Sequence 0's state that a truncation cannot restore, as llama.cpp's server saves a
+    /// context checkpoint: a recurrent layer's state or a sliding-window cache, never the
+    /// full-attention cache. `None` when llama.cpp writes less than it sized.
+    #[must_use]
+    pub fn partial_state(&self) -> Option<Vec<u8>> {
+        // SAFETY: `raw` is live while `self` is (see `Context`), and sizing a sequence's state
+        // reads the context without changing it.
+        let size = unsafe { sys::llama_state_seq_get_size_ext(self.raw.as_ptr(), 0, PARTIAL_ONLY) };
+        let mut state = vec![0u8; size];
+        // SAFETY: `raw` is live (see `Context`), and llama.cpp writes at most `size` bytes into
+        // `state`, which holds `size` writable bytes.
+        let written = unsafe {
+            sys::llama_state_seq_get_data_ext(
+                self.raw.as_ptr(),
+                state.as_mut_ptr(),
+                size,
+                0,
+                PARTIAL_ONLY,
+            )
+        };
+        (size > 0 && written == size).then_some(state)
+    }
+
+    /// Restores a state `partial_state` saved, leaving the full-attention cache as it is.
+    /// Returns false when llama.cpp does not read all of it.
+    pub fn restore_partial_state(&mut self, state: &[u8]) -> bool {
+        // SAFETY: `raw` is live (see `Context`), `&mut self` keeps every other call off the
+        // context while its state is replaced, and llama.cpp reads at most `state.len()` bytes
+        // from `state`, which holds that many.
+        let read = unsafe {
+            sys::llama_state_seq_set_data_ext(
+                self.raw.as_ptr(),
+                state.as_ptr(),
+                state.len(),
+                0,
+                PARTIAL_ONLY,
+            )
+        };
+        !state.is_empty() && read == state.len()
     }
 }
 

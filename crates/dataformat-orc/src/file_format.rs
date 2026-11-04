@@ -585,6 +585,92 @@ mod tests {
         );
     }
 
+    /// An uncompressed ORC tail whose footer holds only `types`, each given as
+    /// `(kind, subtypes, field names)`.
+    fn orc_tail_with_types(types: &[(u8, Vec<u8>, Vec<&str>)]) -> Vec<u8> {
+        let mut footer = Vec::new();
+        for (kind, subtypes, names) in types {
+            // Type: kind = 1, subtypes = 2, fieldNames = 3; every value here fits one varint byte.
+            let mut ty = vec![0x08, *kind];
+            for subtype in subtypes {
+                ty.extend_from_slice(&[0x10, *subtype]);
+            }
+            for name in names {
+                ty.extend_from_slice(&[0x1a, u8::try_from(name.len()).expect("name length")]);
+                ty.extend_from_slice(name.as_bytes());
+            }
+            // Footer: types = 4.
+            footer.extend_from_slice(&[0x22, u8::try_from(ty.len()).expect("type length")]);
+            footer.extend_from_slice(&ty);
+        }
+
+        // PostScript: footerLength, compression = NONE, metadataLength = 0.
+        let mut postscript = vec![0x08];
+        let mut footer_length = footer.len();
+        while footer_length >= 0x80 {
+            postscript.push(0x80 | u8::try_from(footer_length & 0x7f).expect("varint"));
+            footer_length >>= 7;
+        }
+        postscript.push(u8::try_from(footer_length).expect("varint"));
+        postscript.extend_from_slice(&[0x10, 0x00, 0x28, 0x00]);
+
+        let mut bytes = footer;
+        bytes.extend_from_slice(&postscript);
+        bytes.push(u8::try_from(postscript.len()).expect("postscript length"));
+        bytes
+    }
+
+    /// A root struct with one column that is `depth - 1` nested lists around an int.
+    fn nested_list_types(depth: u8) -> Vec<(u8, Vec<u8>, Vec<&'static str>)> {
+        const STRUCT: u8 = 12;
+        const LIST: u8 = 10;
+        const INT: u8 = 3;
+        let mut types = vec![(STRUCT, vec![1], vec!["c"])];
+        types.extend((1..depth).map(|index| (LIST, vec![index + 1], vec![])));
+        types.push((INT, vec![], vec![]));
+        types
+    }
+
+    async fn infer_tail_schema(bytes: Vec<u8>) -> datafusion::error::Result<SchemaRef> {
+        let memory = Arc::new(InMemory::new());
+        let meta = put_orc(memory.as_ref(), "data/types.orc", bytes).await;
+        let store: Arc<dyn ObjectStore> = memory;
+        let ctx = SessionContext::new();
+        OrcFormat::new()
+            .infer_schema(&ctx.state(), &store, &[meta])
+            .await
+    }
+
+    #[tokio::test]
+    async fn infer_schema_bounds_the_footer_type_tree() {
+        infer_tail_schema(orc_tail_with_types(&nested_list_types(100)))
+            .await
+            .expect("a type tree 100 levels deep loads");
+
+        let err = infer_tail_schema(orc_tail_with_types(&nested_list_types(101)))
+            .await
+            .expect_err("a type tree 101 levels deep must be refused");
+        assert!(
+            err.to_string()
+                .contains("type tree nests more than 100 levels"),
+            "expected the depth bound, got: {err}"
+        );
+
+        let shared_child = [
+            (12, vec![1, 1], vec!["a", "b"]),
+            (3, vec![], vec![]),
+            (3, vec![], vec![]),
+        ];
+        let err = infer_tail_schema(orc_tail_with_types(&shared_child))
+            .await
+            .expect_err("a type used twice must be refused");
+        assert!(
+            err.to_string()
+                .contains("type 1 appears more than once in the type tree"),
+            "expected the repeated-type bound, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn infer_stats_reports_exact_row_count() {
         let memory = Arc::new(InMemory::new());

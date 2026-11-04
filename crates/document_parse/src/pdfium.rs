@@ -91,18 +91,6 @@ const PDFIUM_ASSETS: &[(&str, &str)] = &[
         "pdfium-linux-arm",
         "7ec4661139fffe72f76e58ef2deb364527f19e38565cfd32fdfb19655e81252d",
     ),
-    (
-        "pdfium-win-x64",
-        "fde13b38344b4db1df270737ceb15adb94ce3e31c6de4f1b56f02bfdb4e6b533",
-    ),
-    (
-        "pdfium-win-arm64",
-        "4c7d3f54a5bf1f41302e256b6d930c53839a52bda963f73f744d80dbfe9f4613",
-    ),
-    (
-        "pdfium-win-x86",
-        "b0ae78024c684d5b19083c1efb53a2f9fe1233d421c72753355a9982394bef58",
-    ),
 ];
 
 /// Maximum time to establish the connection to the release host.
@@ -188,7 +176,7 @@ fn provision_pdfium() -> Result<PathBuf, String> {
     let sha256 = expected_sha256(asset)
         .ok_or_else(|| format!("no pinned SHA-256 for PDFium asset '{asset}'"))?;
     let dir = pdfium_cache_dir(asset)?;
-    let lib_path = dir.join(lib_subdir()).join(dylib_file_name());
+    let lib_path = dir.join(LIB_SUBDIR).join(dylib_file_name());
 
     if lib_path.exists() {
         return Ok(lib_path);
@@ -322,17 +310,6 @@ fn base_cache_dir() -> Result<PathBuf, String> {
         return Ok(PathBuf::from(xdg));
     }
 
-    if cfg!(target_os = "windows") {
-        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA")
-            && !local_app_data.is_empty()
-        {
-            return Ok(PathBuf::from(local_app_data));
-        }
-        let profile = std::env::var("USERPROFILE")
-            .map_err(|_| "neither LOCALAPPDATA nor USERPROFILE is set".to_string())?;
-        return Ok(PathBuf::from(profile).join("AppData").join("Local"));
-    }
-
     let home =
         std::env::var("HOME").map_err(|_| "HOME environment variable is not set".to_string())?;
     if cfg!(target_os = "macos") {
@@ -343,21 +320,11 @@ fn base_cache_dir() -> Result<PathBuf, String> {
 }
 
 /// Subdirectory inside the extracted archive that holds the shared library.
-/// `pdfium-binaries` ships the Windows DLL under `bin/` and the Unix library
-/// under `lib/`.
-fn lib_subdir() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "bin"
-    } else {
-        "lib"
-    }
-}
+const LIB_SUBDIR: &str = "lib";
 
 /// The `PDFium` shared library file name for this target.
 fn dylib_file_name() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "pdfium.dll"
-    } else if cfg!(target_os = "macos") {
+    if cfg!(target_os = "macos") {
         "libpdfium.dylib"
     } else {
         "libpdfium.so"
@@ -388,16 +355,6 @@ fn pdfium_asset_stem() -> Result<&'static str, String> {
             "pdfium-linux-arm64"
         } else if cfg!(target_arch = "arm") {
             "pdfium-linux-arm"
-        } else {
-            return Err(unsupported_platform());
-        }
-    } else if cfg!(target_os = "windows") {
-        if cfg!(target_arch = "x86_64") {
-            "pdfium-win-x64"
-        } else if cfg!(target_arch = "aarch64") {
-            "pdfium-win-arm64"
-        } else if cfg!(target_arch = "x86") {
-            "pdfium-win-x86"
         } else {
             return Err(unsupported_platform());
         }
@@ -452,9 +409,7 @@ mod tests {
     #[test]
     fn dylib_name_matches_platform() {
         let name = dylib_file_name();
-        if cfg!(target_os = "windows") {
-            assert_eq!(name, "pdfium.dll");
-        } else if cfg!(target_os = "macos") {
+        if cfg!(target_os = "macos") {
             assert_eq!(name, "libpdfium.dylib");
         } else {
             assert_eq!(name, "libpdfium.so");

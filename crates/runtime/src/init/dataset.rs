@@ -2015,7 +2015,9 @@ impl Runtime {
                             // but a query that started after it and read the
                             // previous registration finishes with a `read_started_at`
                             // the clock would accept, so its result must be rejected by
-                            // a mark at the replacement itself.
+                            // a mark at the replacement itself. A plan built in between
+                            // holds the previous table, so the plans are cleared again too.
+                            self.df.clear_cached_plans().await;
                             self.invalidate_cached_results_for(&ds.name).await;
                             self.status
                                 .update_dataset(&ds.name, status::ComponentStatus::Ready);
@@ -2584,13 +2586,6 @@ impl Runtime {
             .context(AcceleratorEngineNotAvailableSnafu {
                 name: accelerator_engine.to_string(),
             })?;
-
-        // Warn if Turso engine is being used
-        if accelerator_engine == crate::component::dataset::acceleration::Engine::Turso {
-            tracing::warn!(
-                "Turso data accelerator (Alpha) is in preview and should not be used in production."
-            );
-        }
 
         // The accelerated refresh task will set the dataset status to `Ready` once it finishes loading.
         self.status
@@ -6319,7 +6314,6 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         async fn sidecar(
             &self,
             _source: &dyn AccelerationSource,
-            _registry: Arc<data_accelerator_api::AcceleratorEngineRegistry>,
             _open_option: runtime_acceleration::sidecar::OpenOption,
         ) -> std::result::Result<
             Arc<dyn runtime_acceleration::sidecar::AcceleratorSidecar>,

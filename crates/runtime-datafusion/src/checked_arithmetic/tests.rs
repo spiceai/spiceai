@@ -34,7 +34,7 @@ use crate::analyzer_rule::AnalyzerRulesBuilder;
 use crate::checked_arithmetic::op::checked_op_udf;
 use crate::checked_arithmetic::{
     CHECKED_ADD_UDF_NAME, CHECKED_MUL_UDF_NAME, CHECKED_SUB_UDF_NAME, CheckedIntegerOverflow,
-    install_checked_eager_aggregation, install_checked_single_distinct,
+    install_checked_eager_aggregation, install_checked_single_distinct, plain_arithmetic,
     register_checked_arithmetic,
 };
 use crate::session_config::get_df_default_config;
@@ -280,6 +280,70 @@ async fn projection_name_for_integer_add_is_preserved() {
     assert!(
         name.contains("big") && (name.contains('+') || name.contains("plus")),
         "rewritten add must keep a recognizable column name, got {name}"
+    );
+}
+
+/// The checked kernels must report the nullability `DataFusion`'s operators
+/// do: a Flight SQL client compares the schema a plan advertises with the one
+/// it streams, and the two disagreed on `id + id` once the rewrite reported
+/// every result nullable.
+#[tokio::test]
+async fn checked_ops_keep_the_operators_nullability() {
+    let sql = "SELECT id + id AS a, id - 1 AS s, id * 2 AS m, big - 1 AS nullable_sub FROM t";
+    let nullability = |schema: &Schema| {
+        schema
+            .fields()
+            .iter()
+            .map(|field| (field.name().clone(), field.is_nullable()))
+            .collect::<Vec<_>>()
+    };
+
+    let vanilla = vanilla_session()
+        .sql(sql)
+        .await
+        .expect("plan vanilla arithmetic")
+        .collect()
+        .await
+        .expect("run vanilla arithmetic");
+    let expected = nullability(
+        vanilla
+            .first()
+            .expect("one vanilla batch")
+            .schema()
+            .as_ref(),
+    );
+    assert_eq!(
+        expected,
+        vec![
+            ("a".to_string(), false),
+            ("s".to_string(), false),
+            ("m".to_string(), false),
+            ("nullable_sub".to_string(), true),
+        ],
+        "DataFusion's own operators are the reference"
+    );
+
+    let ctx = checked_session();
+    let df = ctx.sql(sql).await.expect("plan checked arithmetic");
+    let plan = df
+        .clone()
+        .into_optimized_plan()
+        .expect("optimize checked arithmetic");
+    assert!(
+        format!("{}", plan.display_indent()).contains(CHECKED_SUB_UDF_NAME),
+        "the analyzer must have rewritten the operators:\n{}",
+        plan.display_indent()
+    );
+    assert_eq!(
+        nullability(plan.schema().as_arrow()),
+        expected,
+        "optimized plan schema"
+    );
+    let batches = df.collect().await.expect("run checked arithmetic");
+    assert_eq!(
+        nullability(batches.first().expect("one batch").schema().as_ref()),
+        expected,
+        "streamed schema"
     );
 }
 
@@ -1373,4 +1437,56 @@ fn next_sql(first: &str, lines: &mut std::iter::Peekable<std::str::Lines<'_>>) -
         }
     }
     sql.trim_end_matches(';').to_string()
+}
+
+/// The plan `sql` optimizes to on `ctx`, as `EXPLAIN` indents it.
+async fn optimized_plan(ctx: &SessionContext, sql: &str) -> datafusion::logical_expr::LogicalPlan {
+    let state = ctx.state();
+    let plan = state
+        .create_logical_plan(sql)
+        .await
+        .unwrap_or_else(|error| panic!("`{sql}` plans: {error}"));
+    state
+        .optimize(&plan)
+        .unwrap_or_else(|error| panic!("`{sql}` optimizes: {error}"))
+}
+
+/// A write a provider renders for another engine carries the operators
+/// `DataFusion` itself plans, not Spice's checked kernels: restoring them in
+/// the checked session's plan gives exactly the plan of a session that never
+/// rewrote them.
+#[tokio::test]
+async fn plain_arithmetic_restores_the_operators_of_an_update_and_a_delete() {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+
+    for sql in [
+        "UPDATE t SET big = big + 1, i = i * 2 WHERE big - id > 0",
+        "DELETE FROM t WHERE big * 2 = id + 1",
+    ] {
+        let checked = optimized_plan(&checked_session(), sql).await;
+        let rendered = checked.display_indent().to_string();
+        assert!(
+            [
+                CHECKED_ADD_UDF_NAME,
+                CHECKED_SUB_UDF_NAME,
+                CHECKED_MUL_UDF_NAME
+            ]
+            .iter()
+            .any(|name| rendered.contains(name)),
+            "the checked session rewrites `{sql}`:\n{rendered}"
+        );
+
+        let restored = checked
+            .transform_up(|plan| {
+                plan.map_expressions(|expr| plain_arithmetic(expr).map(Transformed::yes))
+            })
+            .expect("restore the operators")
+            .data;
+        let vanilla = optimized_plan(&vanilla_session(), sql).await;
+        assert_eq!(
+            restored.display_indent().to_string(),
+            vanilla.display_indent().to_string(),
+            "`{sql}`"
+        );
+    }
 }

@@ -19,6 +19,7 @@ use crate::parameters::ConnectorContext;
 use data_components::cdc::{AccelerationContents, ChangesStream};
 use data_components::csv_header_projection::HeaderProjectedCsvFormat;
 use data_components::file_schema_drift::{FileSchemaDriftGuard, FileSchemaDriftLayer};
+use data_components::fresh_file_listing::FreshFileListingLayer;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -60,7 +61,6 @@ use object_store::client::{HttpError, HttpErrorKind};
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
 use snafu::prelude::*;
 use url::Url;
-#[cfg(not(windows))]
 use {
     datafusion_datasource::file_format::FileFormatFactory, vortex_datafusion::VortexFormatFactory,
 };
@@ -266,13 +266,16 @@ impl ListingTableTemplate {
             Arc::new(LocationPruningListingTable::new(
                 table,
                 Arc::clone(&self.object_store),
-                table_path,
+                table_path.clone(),
                 Arc::clone(&self.schema),
                 self.extension.as_str(),
             ))
         } else {
             table
         };
+        // A file dataset is read as its files are at query time, not as they were
+        // listed at its first scan.
+        let table = FreshFileListingLayer::over(table, vec![table_path]);
         match self.schema_drift_guard() {
             Some(guard) => FileSchemaDriftLayer::over(table, guard),
             None => table,
@@ -1047,7 +1050,7 @@ pub trait ListingTableConnector: DataConnector {
     /// unstructured formats. It supports the following tabular formats:
     ///  - parquet
     ///  - orc
-    ///  - vortex (not available on Windows)
+    ///  - vortex
     ///  - csv
     ///
     /// For tabular formats, file options can also be specified in the [`Dataset`]'s `param`s.
@@ -1177,7 +1180,6 @@ pub trait ListingTableConnector: DataConnector {
                     file_compression_type,
                 ),
             )),
-            #[cfg(not(windows))]
             (Some("vortex"), _) | (None, Some("vortex")) => Ok((
                 Some(
                     VortexFormatFactory::new()
@@ -1286,7 +1288,6 @@ pub trait ListingTableConnector: DataConnector {
                             FileCompressionType::UNCOMPRESSED,
                         ),
                     )),
-                    #[cfg(not(windows))]
                     Some("vortex") => Ok((
                         Some(
                             VortexFormatFactory::new()
@@ -2449,7 +2450,6 @@ fn structured_file_formats() -> Vec<&'static str> {
         "auto", "csv", "json", "jsonl", "ldjson", "ndjson", "orc", "parquet", "soda", "socrata",
         "tsv",
     ];
-    #[cfg(not(windows))]
     formats.push("vortex");
     formats
 }
@@ -4253,7 +4253,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_get_file_format_and_extension_detect_vortex_extension() {
         let (connector, dataset) = setup_connector("test:test.vortex".to_string(), HashMap::new());
@@ -4267,7 +4266,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_get_file_format_and_extension_auto_detects_vortex() {
         let mut params = HashMap::new();
@@ -8597,6 +8595,70 @@ mod tests {
             message.contains("Thrift list declares 2147483647 elements"),
             "the error has to name the declared count, or an oversized footer is \
              indistinguishable from a truncated one: {message}"
+        );
+    }
+
+    /// A Parquet footer whose schema nests deeper than 100 levels is refused, and one
+    /// at exactly 100 levels still opens.
+    ///
+    /// The footer's schema is a flat element list that the reader rebuilds into a tree by
+    /// recursing once per nesting level, so a file of a few KiB can declare enough levels to
+    /// exhaust the stack during schema inference at dataset initialization. A Spice patch to
+    /// the `spiceai/arrow-rs` fork bounds that depth.
+    #[test]
+    fn a_footer_schema_nested_past_the_depth_limit_is_a_parquet_error() {
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::arrow::arrow_writer::ArrowWriterOptions;
+        use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+
+        const MAX_DEPTH: usize = 100;
+
+        // A column whose leaf sits `depth` levels below the schema root.
+        fn file_with_leaf_at(depth: usize) -> bytes::Bytes {
+            let mut field =
+                arrow::datatypes::Field::new("leaf", arrow::datatypes::DataType::Int64, true);
+            for _ in 1..depth {
+                field = arrow::datatypes::Field::new_struct("s", vec![field], true);
+            }
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+            let mut buffer = Vec::new();
+            ArrowWriter::try_new_with_options(
+                &mut buffer,
+                schema,
+                ArrowWriterOptions::new().with_skip_arrow_metadata(true),
+            )
+            .expect("parquet writer")
+            .close()
+            .expect("writes the footer");
+            bytes::Bytes::from(buffer)
+        }
+
+        let reader =
+            SerializedFileReader::new(file_with_leaf_at(MAX_DEPTH)).expect("reads the footer");
+        assert_eq!(
+            reader
+                .metadata()
+                .file_metadata()
+                .schema_descr()
+                .column(0)
+                .path()
+                .parts()
+                .len(),
+            MAX_DEPTH,
+            "the accepted file has to sit exactly at the limit"
+        );
+
+        let Err(error) = SerializedFileReader::new(file_with_leaf_at(MAX_DEPTH + 1)) else {
+            panic!(
+                "a footer schema nested {} levels deep was accepted",
+                MAX_DEPTH + 1
+            );
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("Parquet schema nesting depth exceeds the maximum of 100"),
+            "the footer was refused, but not on the depth limit: {error}"
         );
     }
 

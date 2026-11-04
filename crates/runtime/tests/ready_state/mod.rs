@@ -628,18 +628,20 @@ async fn run_ready_state_test(
         // This is the core behavior being tested: the reported readiness should reflect the
         // configured `ReadyState` before the initial acceleration refresh completes.
         let dataset_status_key = format!("dataset:{dataset_name}");
+        // Readiness is whether the dataset has reported `Ready`, as `/v1/ready` counts it,
+        // not its current status: the initial refresh reports `Refreshing` over `Ready` as
+        // soon as it starts, which can be before `load_components` returns.
+        let dataset_ref = datafusion::common::TableReference::from(dataset_name);
         match ready_state {
             ReadyState::OnRegistration => {
                 // `on_registration` marks the dataset ready immediately, regardless of the
                 // federated source. Poll briefly to account for scheduling races.
+                // Well inside the slow source's 5s load, so readiness that waits for it fails.
                 let ready_within = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(2),
                     async {
                         loop {
-                            if matches!(
-                                rt.status().get_component_status(&dataset_status_key),
-                                Some(runtime::status::ComponentStatus::Ready)
-                            ) {
+                            if rt.status().has_dataset_ever_been_ready(&dataset_ref) {
                                 return;
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -649,7 +651,7 @@ async fn run_ready_state_test(
                 .await;
                 assert!(
                     ready_within.is_ok(),
-                    "Dataset {dataset_name} with ready_state=on_registration should be Ready before initial load completes, but status was {:?}",
+                    "Dataset {dataset_name} with ready_state=on_registration should report Ready before initial load completes, but status was {:?}",
                     rt.status().get_component_status(&dataset_status_key)
                 );
             }
@@ -659,14 +661,12 @@ async fn run_ready_state_test(
                 // here, the federated provider is `Immediate` (schema is available
                 // synchronously before the builder runs), so readiness should transition to
                 // Ready before the initial refresh completes.
+                // Well inside the slow source's 5s load, so readiness that waits for it fails.
                 let ready_within = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(2),
                     async {
                         loop {
-                            if matches!(
-                                rt.status().get_component_status(&dataset_status_key),
-                                Some(runtime::status::ComponentStatus::Ready)
-                            ) {
+                            if rt.status().has_dataset_ever_been_ready(&dataset_ref) {
                                 return;
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -676,7 +676,7 @@ async fn run_ready_state_test(
                 .await;
                 assert!(
                     ready_within.is_ok(),
-                    "Dataset {dataset_name} with ready_state=on_schema_resolved should be Ready after schema resolution and before initial load completes, but status was {:?}",
+                    "Dataset {dataset_name} with ready_state=on_schema_resolved should report Ready after schema resolution and before initial load completes, but status was {:?}",
                     rt.status().get_component_status(&dataset_status_key)
                 );
             }
@@ -814,7 +814,6 @@ async fn run_ready_state_test(
 }
 
 // Test that the runtime is ready immediately with ready_state = on_registration for native provider
-#[cfg(not(windows))]
 #[tokio::test]
 async fn test_ready_state_on_registration_native_cayenne_acceleration() -> Result<(), anyhow::Error>
 {
@@ -846,7 +845,6 @@ async fn test_ready_state_on_registration_native_duckdb_acceleration() -> Result
 }
 
 // Test that the runtime is ready immediately with ready_state = on_registration for federated provider
-#[cfg(not(windows))]
 #[tokio::test]
 async fn test_ready_state_on_registration_federated_cayenne_acceleration()
 -> Result<(), anyhow::Error> {
@@ -878,7 +876,6 @@ async fn test_ready_state_on_registration_federated_duckdb_acceleration()
 }
 
 // Test that the runtime is ready immediately with ready_state = on_schema_resolved for native provider
-#[cfg(not(windows))]
 #[tokio::test]
 async fn test_ready_state_on_schema_resolved_native_cayenne_acceleration()
 -> Result<(), anyhow::Error> {
@@ -910,7 +907,6 @@ async fn test_ready_state_on_schema_resolved_native_duckdb_acceleration()
 }
 
 // Test that the runtime is ready immediately with ready_state = on_schema_resolved for federated provider
-#[cfg(not(windows))]
 #[tokio::test]
 async fn test_ready_state_on_schema_resolved_federated_cayenne_acceleration()
 -> Result<(), anyhow::Error> {
@@ -940,7 +936,6 @@ async fn test_ready_state_on_schema_resolved_federated_duckdb_acceleration()
 }
 
 // Test that the runtime is NOT ready until data loads with ready_state = on_load for native provider
-#[cfg(not(windows))]
 #[tokio::test]
 async fn test_ready_state_on_load_native_cayenne_acceleration() -> Result<(), anyhow::Error> {
     // Native provider, OnLoad, Cayenne engine, should error initially
@@ -970,7 +965,6 @@ async fn test_ready_state_on_load_native_duckdb_acceleration() -> Result<(), any
 }
 
 // Test that the runtime is NOT ready until data loads with ready_state = on_load for federated provider
-#[cfg(not(windows))]
 #[tokio::test]
 async fn test_ready_state_on_load_federated_cayenne_acceleration() -> Result<(), anyhow::Error> {
     // Federated provider, OnLoad, Cayenne engine, should error initially
@@ -1000,7 +994,6 @@ async fn test_ready_state_on_load_federated_duckdb_acceleration() -> Result<(), 
 }
 
 // Test both native and federated providers together with different ready states
-#[cfg(not(windows))]
 #[tokio::test]
 async fn test_ready_state_mixed_cayenne_acceleration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));

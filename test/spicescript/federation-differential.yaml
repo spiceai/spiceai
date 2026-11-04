@@ -1,19 +1,22 @@
 name: federation-differential
 description: >
   A query corpus answers the same through Spice as on the source itself, for
-  PostgreSQL and MySQL, both federated (each query rewritten and pushed to the
-  source) and accelerated into Cayenne, and the two agree with each other.
+  PostgreSQL, MySQL, DuckDB and DuckLake, both federated (each query rewritten and pushed
+  to the source) and accelerated into Cayenne, and the variants agree with each
+  other. The duckdb connector uses ADBC read-only.
 
 sources:
   src: { kind: '${matrix.source}' }
 
 matrix:
-  source: [postgres, mysql]
+  source: [postgres, mysql, duckdb, ducklake]
 
 variants:
   federated: {}
   cayenne:
     datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }
+  # duckdb: now exercises ADBC read-only alongside oracle: src. Direct adbc:
+  # takes the write lock; PostgreSQL-mirror scripts retain that variant.
 
 spicepod:
   version: v1
@@ -79,6 +82,52 @@ steps:
           WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 150)
           SELECT n, 1 + (n * 13) % 220, ELT(1 + n % 3, 'red', 'blue', 'green') FROM seq;
     when: { source: mysql }
+
+  - source-exec:
+      src: |
+        CREATE TABLE t (
+          id integer PRIMARY KEY, i integer, big bigint, d numeric(10, 2), f double precision,
+          s varchar(32), dt date, ts timestamp, b boolean
+        );
+        CREATE TABLE u (id integer PRIMARY KEY, t_id integer, label varchar(16));
+        INSERT INTO t
+          SELECT n,
+                 CASE WHEN n % 11 = 0 THEN NULL ELSE (n * 37) % 101 - 50 END,
+                 n::bigint * 50000000,
+                 ((n * 7919) % 20001 - 10000) / 100.0,
+                 n * 0.25,
+                 ['apple', 'Apple', 'APPLE', 'banana', 'O''Brien', 'naïve', '', 'under_score', 'b', NULL][1 + n % 10],
+                 DATE '2024-01-01' + n::integer,
+                 TIMESTAMP '2024-01-01 00:00:00' + n * INTERVAL '90 minutes',
+                 n % 3 = 0
+          FROM generate_series(1, 200) AS seq(n);
+        INSERT INTO u
+          SELECT n, 1 + (n * 13) % 220, ['red', 'blue', 'green'][1 + n % 3]
+          FROM generate_series(1, 150) AS seq(n);
+    when: { source: duckdb }
+  # DuckLake tables have no primary keys.
+  - source-exec:
+      src: |
+        CREATE TABLE t (
+          id integer, i integer, big bigint, d numeric(10, 2), f double precision,
+          s varchar(32), dt date, ts timestamp, b boolean
+        );
+        CREATE TABLE u (id integer, t_id integer, label varchar(16));
+        INSERT INTO t
+          SELECT n,
+                 CASE WHEN n % 11 = 0 THEN NULL ELSE (n * 37) % 101 - 50 END,
+                 n::bigint * 50000000,
+                 ((n * 7919) % 20001 - 10000) / 100.0,
+                 n * 0.25,
+                 ['apple', 'Apple', 'APPLE', 'banana', 'O''Brien', 'naïve', '', 'under_score', 'b', NULL][1 + n % 10],
+                 DATE '2024-01-01' + n::integer,
+                 TIMESTAMP '2024-01-01 00:00:00' + n * INTERVAL '90 minutes',
+                 n % 3 = 0
+          FROM generate_series(1, 200) AS seq(n);
+        INSERT INTO u
+          SELECT n, 1 + (n * 13) % 220, ['red', 'blue', 'green'][1 + n % 3]
+          FROM generate_series(1, 150) AS seq(n);
+    when: { source: ducklake }
 
   - start: {}
   - corpus: corpus/pushdown.sql

@@ -49,6 +49,9 @@ pub struct LocalChatEngine {
     pub distributed: Option<fn(&str) -> bool>,
     /// Loads the model from local weight files.
     pub load: LoadLocalModel,
+    /// The memory, in bytes, free on this node for a model on the devices the engine places
+    /// it on, for choosing a quantization that fits; `None` when the engine cannot tell.
+    pub free_memory: fn() -> Option<u64>,
 }
 
 impl LocalChatEngine {
@@ -89,6 +92,14 @@ pub fn engine_for(weights: &[PathBuf]) -> Option<&'static LocalChatEngine> {
     LOCAL_CHAT_ENGINES
         .iter()
         .find(|engine| (engine.serves)(weights))
+}
+
+/// The free memory the first registered engine that can measure it reports.
+#[must_use]
+pub fn free_memory() -> Option<u64> {
+    LOCAL_CHAT_ENGINES
+        .iter()
+        .find_map(|engine| (engine.free_memory)())
 }
 
 /// The engine for a rank other than 0 of a distributed model whose weights it does not hold

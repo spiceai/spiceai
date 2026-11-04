@@ -64,26 +64,41 @@ impl TaskRequest {
     }
 }
 
+/// A task started by a schedule. Dropping it aborts the task, so removing or stopping the
+/// schedule also stops a run that is still in progress.
 #[derive(Debug)]
 pub(crate) struct RunningTask {
-    pub(crate) handle: JoinHandle<Result<()>>,
+    handle: Option<JoinHandle<Result<()>>>,
 }
 
 impl RunningTask {
     #[must_use]
     pub(crate) fn new(handle: JoinHandle<Result<()>>) -> Self {
-        Self { handle }
+        Self {
+            handle: Some(handle),
+        }
     }
 
     #[must_use]
     pub(crate) fn is_finished(&self) -> bool {
-        self.handle.is_finished()
+        self.handle.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    pub(crate) fn abort(&self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+
+    /// Takes the handle without aborting the task.
+    #[must_use]
+    pub fn consume_for_handle(mut self) -> Option<JoinHandle<Result<()>>> {
+        self.handle.take()
     }
 }
 
-impl RunningTask {
-    #[must_use]
-    pub fn consume_for_handle(self) -> JoinHandle<Result<()>> {
-        self.handle
+impl Drop for RunningTask {
+    fn drop(&mut self) {
+        self.abort();
     }
 }

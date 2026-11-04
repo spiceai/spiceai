@@ -28,15 +28,10 @@ mod caching_mode_per_principal;
 mod caching_mode_post_filter;
 mod caching_mode_request_method;
 mod caching_mode_stale_if_error;
-#[cfg(not(target_os = "windows"))]
 mod cayenne_append_overlap;
-#[cfg(not(target_os = "windows"))]
 mod cayenne_append_timestamptz;
-#[cfg(not(target_os = "windows"))]
 mod cayenne_maintained_aggregates;
-#[cfg(not(target_os = "windows"))]
 mod cayenne_memory;
-#[cfg(not(target_os = "windows"))]
 mod cayenne_on_conflict_batches;
 #[cfg(feature = "duckdb")]
 mod checkpoint_duckdb;
@@ -44,8 +39,6 @@ mod checkpoint_duckdb;
 mod checkpoint_postgres;
 #[cfg(feature = "sqlite")]
 mod checkpoint_sqlite;
-#[cfg(feature = "turso")]
-mod checkpoint_turso;
 #[cfg(feature = "duckdb")]
 mod cron;
 #[cfg(any(feature = "duckdb", feature = "sqlite"))]
@@ -68,14 +61,12 @@ mod on_conflict;
 mod pk_insert_semantics;
 #[cfg(feature = "sqlite")]
 mod sqlite_builtin_pushdown;
-#[cfg(any(feature = "sqlite", feature = "turso"))]
+#[cfg(feature = "sqlite")]
 mod sqlite_interval_arithmetic;
 #[cfg(feature = "sqlite")]
 mod sqlite_query_errors;
 
-#[cfg(not(target_os = "windows"))]
 mod newest_by_time;
-#[cfg(not(target_os = "windows"))]
 mod on_conflict_cayenne;
 #[cfg(feature = "duckdb")]
 mod on_conflict_options;
@@ -83,17 +74,14 @@ mod on_zero_results_retention;
 #[cfg(any(feature = "duckdb", feature = "sqlite"))]
 mod on_zero_results_subqueries;
 mod partition_by_arrow;
-#[cfg(not(target_os = "windows"))]
 mod partition_by_cayenne;
 #[cfg(feature = "postgres-accel")]
 mod query_push_down;
 mod refresh;
-#[cfg(any(feature = "duckdb", feature = "sqlite", feature = "turso"))]
+#[cfg(any(feature = "duckdb", feature = "sqlite"))]
 mod reload_file_accelerated;
 mod retention_arrow;
-#[cfg(not(target_os = "windows"))]
 mod retention_cayenne;
-#[cfg(not(target_os = "windows"))]
 mod settings_change_cayenne;
 #[cfg(feature = "duckdb")]
 mod single_instance_duckdb;
@@ -194,7 +182,7 @@ pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Opt
 
 /// A CSV file dataset, accelerated in memory by `engine` with full refreshes,
 /// or unaccelerated when `engine` is `None`.
-#[cfg(any(feature = "sqlite", feature = "turso"))]
+#[cfg(feature = "sqlite")]
 pub(crate) fn csv_dataset(
     from: &str,
     name: &str,
