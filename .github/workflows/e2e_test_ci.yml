@@ -129,6 +129,7 @@ jobs:
   build:
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.builder }}
+    environment: ci-build
     needs: [setup-matrix, check_changes]
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
     # A backstop above the longest step bound below, leaving room for the artifact upload
@@ -137,7 +138,7 @@ jobs:
     # compile is exactly when the sccache stats are worth having.
     timeout-minutes: 200
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
     strategy:
       matrix:
@@ -186,7 +187,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
@@ -814,6 +815,7 @@ jobs:
   test_quickstart_spiceai:
     name: 'Test Spice.ai quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
+    environment: ci
     # run quickstart with external service dependency only on manual trigger
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs:
@@ -879,6 +881,7 @@ jobs:
   test_quickstart_s3:
     name: 'Test S3 quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
+    environment: ci
     # run quickstart with external service dependency only on manual trigger
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs:
@@ -977,6 +980,9 @@ jobs:
     # merge queue. A load into an empty table must not trigger a full compaction.
     if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     needs:
       - build
     timeout-minutes: 20
@@ -994,12 +1000,21 @@ jobs:
         with:
           build-path: ./build
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '1200'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Check for the fixture
         run: |
@@ -1015,9 +1030,10 @@ jobs:
           cd cold_start_app
           spiced --cpu-cores 2 --metrics 127.0.0.1:9095 &> spice.log &
         env:
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
+          S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
+          S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Wait for the dataset to be ready
         uses: ./.github/actions/wait-for-spice-ready
@@ -2401,6 +2417,10 @@ jobs:
       - build
       - setup-matrix
     timeout-minutes: 5
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
 
     strategy:
       matrix:
@@ -2438,19 +2458,28 @@ jobs:
           echo "      mode: delta_lake" >> spicepod.yaml
           echo "      databricks_aws_access_key_id: \${ secrets:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }" >> spicepod.yaml
           echo "      databricks_aws_secret_access_key: \${ secrets:AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }" >> spicepod.yaml
+          echo "      databricks_aws_region: us-west-2" >> spicepod.yaml
           echo "      databricks_endpoint: \${ secrets:DATABRICKS_ENDPOINT }" >> spicepod.yaml
           echo "      databricks_token: \${ secrets:DATABRICKS_TOKEN }" >> spicepod.yaml
 
           cat spicepod.yaml
 
+      - name: Get Databricks token
+        id: databricks-token
+        uses: ./.github/actions/databricks-oidc-token
+        with:
+          host: ${{ vars.NEW_DATABRICKS_HOST }}
+          client-id: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          audience: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+
       - name: Start spice runtime
         working-directory: test_app
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          DATABRICKS_ENDPOINT: ${{ vars.NEW_DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ steps.databricks-token.outputs.token }}
         run: |
           spice run &> spice.log &
           # time to initialize added datasets
@@ -2886,16 +2915,28 @@ jobs:
     needs: check_changes
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '1800'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Check documented SQL cases
         run: |
@@ -2912,6 +2953,10 @@ jobs:
     name: ${{ matrix.name }}
     needs: [build, build_spicescript]
     runs-on: spiceai-dev-runners
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -2947,12 +2992,21 @@ jobs:
         with:
           build-path: ./build
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download spicescript
         id: spicescript
@@ -2960,13 +3014,16 @@ jobs:
         with:
           package: spicescript
 
-      # Sources run in containers; log in so image pulls are not rate limited.
+      # Sources run in containers; log in so image pulls are not rate limited. Scripts pull
+      # images as they start, so the login has to last the whole job.
       - name: Login to DockerHub
         if: github.repository == 'spiceai/spiceai'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       # Object-store sources (rustfs) are managed with the aws CLI.
       - name: Install the AWS CLI
