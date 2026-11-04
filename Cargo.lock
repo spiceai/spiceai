@@ -3488,6 +3488,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "camino"
+version = "1.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbad30e4b4c14a39e3cc8aed085a12a327257c316619c93581e017bc52be591"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "candle-core"
 version = "0.11.0"
 source = "git+https://github.com/spiceai/candle.git?rev=829b57522e601ea169b04e2d4a375c3abe3ed58c#829b57522e601ea169b04e2d4a375c3abe3ed58c"
@@ -3616,6 +3625,30 @@ dependencies = [
  "serde_json",
  "serde_plain",
  "tracing",
+]
+
+[[package]]
+name = "cargo-platform"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd0061da739915fae12ea00e16397555ed4371a6bb285431aab930f61b0aa4ba"
+dependencies = [
+ "serde",
+ "serde_core",
+]
+
+[[package]]
+name = "cargo_metadata"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef987d17b0a113becdd19d3d0022d04d7ef41f9efe4f3fb63ac44ba61df3ade9"
+dependencies = [
+ "camino",
+ "cargo-platform",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -10338,6 +10371,7 @@ dependencies = [
  "http 1.4.1",
  "hyper 1.10.1",
  "hyper-util",
+ "log",
  "rustls",
  "rustls-native-certs",
  "tokio",
@@ -14071,6 +14105,48 @@ dependencies = [
  "snafu",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "octocrab"
+version = "0.49.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ddbc3bb87e8c680febf16f56855bbd8b44a38e18c913334213ab34908e71a09"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "cargo_metadata",
+ "cfg-if",
+ "chrono",
+ "either",
+ "futures",
+ "futures-util",
+ "getrandom 0.2.17",
+ "http 1.4.1",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper 1.10.1",
+ "hyper-rustls",
+ "hyper-timeout",
+ "hyper-util",
+ "jsonwebtoken",
+ "once_cell",
+ "percent-encoding",
+ "pin-project",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
+ "snafu",
+ "tokio",
+ "tower 0.5.3",
+ "tower-http 0.6.11",
+ "tracing",
+ "url",
+ "web-time",
 ]
 
 [[package]]
@@ -21737,14 +21813,17 @@ dependencies = [
  "bytes",
  "chrono",
  "dashmap",
- "datafusion-common",
+ "datafusion",
  "duckdb-oracle",
  "flight_client",
  "futures",
+ "http 1.4.1",
+ "http-body-util",
  "indicatif 0.18.4",
  "insta",
  "nix 0.30.1",
  "object_store 0.13.2",
+ "octocrab",
  "opentelemetry 0.32.0",
  "opentelemetry-otlp",
  "opentelemetry_sdk 0.32.1",
@@ -21761,7 +21840,6 @@ dependencies = [
  "serde_json",
  "spiceai",
  "spicepod",
- "sqlparser",
  "sysinfo 0.38.4",
  "telemetry",
  "tempfile",
@@ -21820,7 +21898,7 @@ dependencies = [
  "bollard",
  "chbench-driver",
  "clap",
- "datafusion-common",
+ "datafusion",
  "duckdb-oracle",
  "flight_client",
  "futures",
@@ -21834,7 +21912,6 @@ dependencies = [
  "spiceai",
  "spicepod",
  "spicescript",
- "sqlparser",
  "system-adapter-protocol",
  "test-framework",
  "tokio",
@@ -22694,6 +22771,7 @@ dependencies = [
  "tower 0.5.3",
  "tower-layer",
  "tower-service",
+ "tracing",
  "url",
 ]
 
@@ -24864,6 +24942,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
+ "serde",
  "wasm-bindgen",
 ]
 

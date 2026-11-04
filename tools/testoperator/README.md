@@ -26,8 +26,7 @@ Phases are `starting`, `preparing_source`, `waiting_for_spiced`, `running` (the 
 
 `testoperator script` runs YAML scenario scripts against a prebuilt `spiced`: each
 script starts its own sources, starts `spiced` on a spicepod, changes things while it
-runs, and checks every answer against an oracle. It takes the same arguments as the
-`spicescript` binary and runs the same library; see
+runs, and checks every answer against an oracle. See
 [`tools/spicescript/README.md`](../spicescript/README.md) for the script format and
 options.
 

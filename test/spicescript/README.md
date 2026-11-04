@@ -1,12 +1,12 @@
 # Scenario scripts
 
-The YAML scenarios that `spicescript` runs against a prebuilt `spiced`. The
+The YAML scenarios that `testoperator script` runs against a prebuilt `spiced`. The
 harness, the script format, every step and how to run them are described in
 [`tools/spicescript/README.md`](../../tools/spicescript/README.md).
 
 ```bash
-cargo build -p spicescript
-target/debug/spicescript --jobs 8 --spiced trunk=target/release/spiced test/spicescript
+cargo build -p testoperator
+target/debug/testoperator script --jobs 8 --spiced trunk=target/release/spiced test/spicescript
 ```
 
 ## Layout

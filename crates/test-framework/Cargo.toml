@@ -21,7 +21,7 @@ async-trait.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 dashmap = "6.1.0"
-datafusion-common = { workspace = true, features = ["sql"] }
+datafusion.workspace = true
 duckdb-oracle = { optional = true, path = "../duckdb-oracle" }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
@@ -55,7 +55,6 @@ rustls.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sqlparser = { workspace = true, features = ["visitor"] }
 yaml = { path = "../yaml" }
 spiceai = { workspace = true }
 spicepod = { path = "../spicepod", default-features = false }

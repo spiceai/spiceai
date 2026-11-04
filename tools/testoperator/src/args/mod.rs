@@ -62,7 +62,8 @@ pub enum Commands {
     Dispatch(DispatchArgs),
     /// Run scenario scripts: YAML files that start their sources and spiced,
     /// change things while it runs, and check every answer against an oracle
-    /// (see tools/spicescript/README.md)
+    /// (see tools/spicescript/README.md). Unix only.
+    #[cfg(unix)]
     Script(spicescript::Args),
 }
 

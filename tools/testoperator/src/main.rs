@@ -53,6 +53,7 @@ async fn main() -> ExitCode {
     let subcommand = match Cli::parse().subcommand {
         // A script run has three outcomes (passed, a check failed, the run
         // could not finish), so it sets the exit code itself.
+        #[cfg(unix)]
         Commands::Script(args) => return spicescript::exit_code(&spicescript::run(args).await),
         subcommand => subcommand,
     };

@@ -46,6 +46,7 @@ pub use app;
 pub use arrow;
 pub use flight_client;
 pub use futures;
+pub use octocrab;
 pub use opentelemetry;
 pub use opentelemetry_sdk;
 pub use rustls;

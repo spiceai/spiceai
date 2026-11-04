@@ -265,7 +265,7 @@ impl Query {
     /// - The SQL query cannot be parsed
     /// - The query contains multiple statements (only single statements are supported)
     pub fn rewrite_with_reference_schema(&self, reference_schema: &str) -> anyhow::Result<Self> {
-        use sqlparser::ast::{
+        use datafusion::sql::sqlparser::ast::{
             Ident, ObjectNamePart, TableAlias, TableFactor, VisitMut, VisitorMut,
         };
         use std::ops::ControlFlow;
@@ -350,7 +350,7 @@ impl Query {
     /// # Errors
     /// Returns an error if the SQL query cannot be parsed, or if it contains multiple statements.
     pub fn unqualified_table_names(&self) -> anyhow::Result<BTreeSet<String>> {
-        use sqlparser::ast::{ObjectNamePart, visit_relations};
+        use datafusion::sql::sqlparser::ast::{ObjectNamePart, visit_relations};
         use std::ops::ControlFlow;
 
         let statement = self.parse_single_statement("table name extraction")?;
@@ -371,8 +371,11 @@ impl Query {
         Ok(table_names)
     }
 
-    fn parse_single_statement(&self, action: &str) -> anyhow::Result<sqlparser::ast::Statement> {
-        use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+    fn parse_single_statement(
+        &self,
+        action: &str,
+    ) -> anyhow::Result<datafusion::sql::sqlparser::ast::Statement> {
+        use datafusion::sql::sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
         let dialect = PostgreSqlDialect {};
         let mut statements = Parser::parse_sql(&dialect, &self.sql).map_err(|e| {
@@ -391,8 +394,8 @@ impl Query {
     }
 }
 
-fn collect_cte_names(statement: &sqlparser::ast::Statement) -> BTreeSet<String> {
-    use sqlparser::ast::{Query as SqlQuery, Visit, Visitor};
+fn collect_cte_names(statement: &datafusion::sql::sqlparser::ast::Statement) -> BTreeSet<String> {
+    use datafusion::sql::sqlparser::ast::{Query as SqlQuery, Visit, Visitor};
     use std::ops::ControlFlow;
 
     #[derive(Default)]

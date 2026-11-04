@@ -44,8 +44,7 @@ mod template;
 mod tlp;
 mod tpch;
 
-/// The command-line arguments of a run: the `spicescript` binary's, and
-/// `testoperator script`'s.
+/// The command-line arguments of a run (`testoperator script`).
 #[derive(clap::Args)]
 #[expect(
     clippy::struct_excessive_bools,

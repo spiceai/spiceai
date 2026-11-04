@@ -22,7 +22,7 @@ aws-sdk-dynamodb.workspace = true
 bollard = "0.18.1"
 chbench-driver = { path = "../chbench-driver" }
 clap.workspace = true
-datafusion-common = { workspace = true, features = ["sql"] }
+datafusion.workspace = true
 duckdb-oracle = { path = "../../crates/duckdb-oracle" }
 flight_client = { path = "../../crates/flight_client" }
 futures.workspace = true
@@ -35,8 +35,6 @@ serde_json.workspace = true
 yaml = { path = "../../crates/yaml" }
 spiceai.workspace = true
 spicepod = { path = "../../crates/spicepod", default-features = false }
-spicescript = { path = "../spicescript" }
-sqlparser.workspace = true
 system-adapter-protocol.workspace = true
 test-framework = { path = "../../crates/test-framework" }
 rand.workspace = true
@@ -47,6 +45,10 @@ tokio-postgres = { workspace = true }
 tokio-util.workspace = true
 url.workspace = true
 uuid.workspace = true
+
+# The scenario runner signals and inspects processes with Unix-only APIs.
+[target.'cfg(unix)'.dependencies]
+spicescript = { path = "../spicescript" }
 
 [features]
 default = ["append"]

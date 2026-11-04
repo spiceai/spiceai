@@ -32,7 +32,7 @@ use std::{
 };
 
 use arrow::array::{Array, Int64Array};
-use datafusion_common::TableReference;
+use datafusion::common::TableReference;
 use serde::Serialize;
 use test_framework::{
     anyhow,

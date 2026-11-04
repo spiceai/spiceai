@@ -1254,7 +1254,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "scalar.list_min.column": {
@@ -1263,7 +1263,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "scalar.list_min.empty": {
@@ -1272,7 +1272,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "schema.round.CAST(2 AS BIGINT)": {
@@ -1281,7 +1281,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "schema.round.1 + 1": {
@@ -1290,7 +1290,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "aggregate.grouping.column": {
@@ -1299,7 +1299,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "aggregate.grouping.empty": {
@@ -1308,7 +1308,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "syntax.select.exclude": {
@@ -1317,7 +1317,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "syntax.select.except": {
@@ -1326,7 +1326,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "syntax.select.replace": {
@@ -1335,7 +1335,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "syntax.select.ilike": {
@@ -1344,7 +1344,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "syntax.order.all": {
@@ -1353,7 +1353,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "syntax.group.sets": {
@@ -1362,7 +1362,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "syntax.subquery.correlated_range": {
@@ -1371,7 +1371,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "syntax.subquery.any": {
@@ -1380,7 +1380,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "syntax.subquery.all": {
@@ -1389,7 +1389,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "operator.IS TRUE": {
@@ -1398,7 +1398,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "operator.IS NOT TRUE": {
@@ -1407,7 +1407,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "operator.IS FALSE": {
@@ -1416,7 +1416,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "operator.IS UNKNOWN": {
@@ -1425,7 +1425,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     },
     "literal.float_special": {
@@ -1434,7 +1434,7 @@
       "observed_date": "2026-10-27",
       "runtime_sha256": "44d997b1e0c2f3dbd4fe95f0aaa127cfeef31535b9640df39b9f1232a6e448b6",
       "documentation_revision": "31f71082804b7a5f711d2370e413881ef68319c9",
-      "reproduce": "target/debug/spicescript --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
+      "reproduce": "target/debug/testoperator script --spiced target/release/spiced test/spicescript/known-failing/sql-protocols/sql-surface.yaml",
       "artifact": "target/sql-surface-current-corrected.log"
     }
   },

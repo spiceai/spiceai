@@ -11,10 +11,12 @@ import tempfile
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runner", type=Path, required=True)
+    parser.add_argument("--runner", nargs="+", required=True,
+                        help="the command that runs scripts, e.g. target/debug/testoperator script")
     parser.add_argument("--spiced", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     args = parser.parse_args()
+    runner = [str(Path(args.runner[0]).resolve()), *args.runner[1:]]
     fixtures = [
         ("nonempty", [{"query": "SELECT 1 AS value", "protocols": ["flightsql", "http"],
                         "expect-empty": True, "expect": {}}],
@@ -42,7 +44,7 @@ def main():
             fixture.write_text(json.dumps({"name": name,
                 "spicepod": {"version": "v1", "kind": "Spicepod", "name": name},
                 "steps": [{"start": {}}] + steps}))
-            result = subprocess.run([str(args.runner.resolve()), "--record-durations", "--spiced",
+            result = subprocess.run([*runner, "--record-durations", "--spiced",
                 str(args.spiced.resolve()), "--work-dir", str(args.work_dir.resolve() / name), str(fixture)],
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
             (args.work_dir / f"{name}.log").write_text(result.stdout)

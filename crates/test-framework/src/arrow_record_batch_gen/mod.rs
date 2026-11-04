@@ -1,5 +1,6 @@
-use arrow::array::RecordBatch;
-use arrow::{
+use chrono::NaiveDate;
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::{
     array::{
         Array, ArrayRef, ArrowPrimitiveType, BinaryArray, BinaryBuilder, BinaryViewArray,
         BooleanArray, BooleanBuilder, Date32Array, Date64Array, Decimal128Array, Decimal256Array,
@@ -18,7 +19,6 @@ use arrow::{
         IntervalUnit, Schema, SchemaRef, TimeUnit, i256,
     },
 };
-use chrono::NaiveDate;
 use std::sync::Arc;
 
 // Helper functions to create arrow record batches of different types
@@ -271,7 +271,7 @@ pub fn get_arrow_float_record_batch() -> (RecordBatch, SchemaRef) {
 // Float16 - half precision floating point
 #[must_use]
 pub fn get_arrow_float16_record_batch() -> (RecordBatch, SchemaRef) {
-    use arrow::datatypes::Float16Type;
+    use datafusion::arrow::datatypes::Float16Type;
     // Float16 with edge cases: normal values, zero, negative, max, min, infinity
     // Note: Using Float16Type::Native which is half::f16
     type F16 = <Float16Type as ArrowPrimitiveType>::Native;
