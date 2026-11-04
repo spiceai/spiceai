@@ -18,6 +18,9 @@ limitations under the License.
 //! the platform a workload runs on for a short-lived model provider access token, and exchanges
 //! again before that access token expires.
 //!
+//! The providers are Anthropic, `OpenAI` and Microsoft Entra ID, whose tokens authenticate Azure
+//! `OpenAI`.
+//!
 //! The access tokens are short-lived by design. An `OpenAI` token never outlives the identity
 //! token it was exchanged for, so one exchanged for a GitHub Actions OIDC token (which lives five
 //! minutes) lasts at most five minutes. A client that holds one token for its whole life loses the
@@ -51,6 +54,16 @@ pub const ANTHROPIC_AUDIENCE: &str = "https://api.anthropic.com";
 
 /// `OpenAI`'s token endpoint.
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+
+/// The audience Microsoft Entra ID suggests for the federated credential of an application or
+/// managed identity, which GitHub Actions is asked to issue an identity token for.
+pub const ENTRA_AUDIENCE: &str = "api://AzureADTokenExchange";
+
+/// The Microsoft Entra ID authority of the Azure public cloud.
+const ENTRA_AUTHORITY_HOST: &str = "https://login.microsoftonline.com";
+
+const ENTRA_WORKLOAD_IDENTITY_DOCS: &str =
+    "https://learn.microsoft.com/entra/workload-id/workload-identity-federation";
 
 const ANTHROPIC_AUTHENTICATION_HISTORY: &str =
     "https://platform.claude.com/settings/workload-identity-federation?tab=history";
@@ -157,6 +170,16 @@ pub enum WorkloadIdentityError {
         provider: &'static str,
         token_type: String,
     },
+
+    #[snafu(display(
+        "The Microsoft Entra tenant must be a directory (tenant) ID, which is a GUID, or a domain name such as 'contoso.onmicrosoft.com'."
+    ))]
+    InvalidEntraTenant,
+
+    #[snafu(display(
+        "The Microsoft Entra authority must be an https:// URL, such as https://login.microsoftonline.us, because the workload identity token is sent to it."
+    ))]
+    InsecureEntraAuthority,
 }
 
 pub type Result<T, E = WorkloadIdentityError> = std::result::Result<T, E>;
@@ -301,6 +324,14 @@ pub enum Exchange {
         identity_provider_id: String,
         service_account_id: String,
     },
+    /// Microsoft Entra ID's client credentials grant with a federated client assertion: the
+    /// identity token stands in for the secret of the application or managed identity
+    /// `client_id`, whose federated credentials must match its claims.
+    Entra {
+        token_url: String,
+        client_id: String,
+        scope: String,
+    },
 }
 
 impl Exchange {
@@ -332,20 +363,69 @@ impl Exchange {
         }
     }
 
+    /// An exchange with the Microsoft Entra ID tenant `tenant_id`, for a token of `scope`, such
+    /// as `https://cognitiveservices.azure.com/.default`. `authority_host` replaces the public
+    /// cloud's `https://login.microsoftonline.com`, as `AZURE_AUTHORITY_HOST` does for the Azure
+    /// SDKs.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkloadIdentityError::InvalidEntraTenant`] when `tenant_id` is neither a GUID nor a
+    /// domain name, so that it cannot change the path of the token endpoint, and
+    /// [`WorkloadIdentityError::InsecureEntraAuthority`] when `authority_host` names a scheme
+    /// other than `https`, which would send the identity token unencrypted.
+    pub fn entra(
+        authority_host: Option<&str>,
+        tenant_id: &str,
+        client_id: impl Into<String>,
+        scope: impl Into<String>,
+    ) -> Result<Self> {
+        ensure!(is_entra_tenant(tenant_id), InvalidEntraTenantSnafu);
+        let authority = authority_host
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .unwrap_or(ENTRA_AUTHORITY_HOST)
+            .trim_end_matches('/');
+        let authority = match authority.split_once("://") {
+            Some((scheme, _)) => {
+                ensure!(
+                    scheme.eq_ignore_ascii_case("https"),
+                    InsecureEntraAuthoritySnafu
+                );
+                authority.to_string()
+            }
+            None => format!("https://{authority}"),
+        };
+        Ok(Self::Entra {
+            token_url: format!("{authority}/{tenant_id}/oauth2/v2.0/token"),
+            client_id: client_id.into(),
+            scope: scope.into(),
+        })
+    }
+
     fn provider(&self) -> &'static str {
         match self {
             Self::Anthropic { .. } => "Anthropic",
             Self::OpenAi { .. } => "OpenAI",
+            Self::Entra { .. } => "Microsoft Entra ID",
         }
     }
 
     fn token_url(&self) -> &str {
         match self {
-            Self::Anthropic { token_url, .. } | Self::OpenAi { token_url, .. } => token_url,
+            Self::Anthropic { token_url, .. }
+            | Self::OpenAi { token_url, .. }
+            | Self::Entra { token_url, .. } => token_url,
         }
     }
 
-    fn body(&self, subject_token: &SecretString) -> Value {
+    /// The exchange request: JSON for Anthropic and `OpenAI`, a form for Microsoft Entra ID.
+    fn request(
+        &self,
+        http: &reqwest::Client,
+        subject_token: &SecretString,
+    ) -> reqwest::RequestBuilder {
+        let request = http.post(self.token_url());
         match self {
             Self::Anthropic {
                 federation_rule_id,
@@ -364,19 +444,31 @@ impl Exchange {
                 if let Some(workspace_id) = workspace_id {
                     body["workspace_id"] = Value::String(workspace_id.clone());
                 }
-                body
+                request.json(&body)
             }
             Self::OpenAi {
                 identity_provider_id,
                 service_account_id,
                 ..
-            } => json!({
+            } => request.json(&json!({
                 "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
                 "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
                 "subject_token": subject_token.expose_secret(),
                 "identity_provider_id": identity_provider_id,
                 "service_account_id": service_account_id,
-            }),
+            })),
+            Self::Entra {
+                client_id, scope, ..
+            } => request.form(&[
+                ("grant_type", "client_credentials"),
+                ("client_id", client_id.as_str()),
+                ("scope", scope.as_str()),
+                (
+                    "client_assertion_type",
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                ),
+                ("client_assertion", subject_token.expose_secret()),
+            ]),
         }
     }
 
@@ -389,8 +481,26 @@ impl Exchange {
             Self::OpenAi { .. } => format!(
                 "Verify the identity provider's issuer and audience, and that a service account mapping matches the token's claims: {OPENAI_WORKLOAD_IDENTITY_SETTINGS}"
             ),
+            Self::Entra { client_id, .. } => format!(
+                "Verify that the application or managed identity '{client_id}' has a federated credential whose issuer, subject and audience match the workload identity token: {ENTRA_WORKLOAD_IDENTITY_DOCS}"
+            ),
         }
     }
+}
+
+/// Whether `tenant` is a Microsoft Entra tenant as a token endpoint path names it: a directory ID
+/// (a GUID) or a domain name. Nothing else can appear in the path, so a tenant cannot point the
+/// exchange at another endpoint.
+fn is_entra_tenant(tenant: &str) -> bool {
+    !tenant.is_empty()
+        && tenant.len() <= 253
+        && tenant.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
 }
 
 struct AccessToken {
@@ -431,7 +541,9 @@ fn truncate(text: &str) -> String {
 }
 
 /// The reason in a provider's error response: Anthropic's `error.message`, an `OAuth`
-/// `error` with its `error_description`, or the body itself.
+/// `error` with its `error_description`, or the body itself. Microsoft Entra ID ends every
+/// description with request identifiers (`Trace ID: … Correlation ID: … Timestamp: …`), which
+/// are left out so the bounded reason keeps the part that names the cause.
 fn refusal_reason(body: &str) -> String {
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return truncate(body);
@@ -442,7 +554,12 @@ fn refusal_reason(body: &str) -> String {
             None => truncate(body),
         },
         Value::String(code) => match value["error_description"].as_str() {
-            Some(description) => truncate(&format!("{code}: {description}")),
+            Some(description) => {
+                let description = description
+                    .split_once(" Trace ID:")
+                    .map_or(description, |(cause, _)| cause);
+                truncate(&format!("{code}: {description}"))
+            }
             None => truncate(code),
         },
         _ => truncate(body),
@@ -456,9 +573,8 @@ async fn exchange(
 ) -> Result<AccessToken> {
     let subject_token = source.fetch(http).await?;
     let provider = exchange.provider();
-    let response = http
-        .post(exchange.token_url())
-        .json(&exchange.body(&subject_token))
+    let response = exchange
+        .request(http, &subject_token)
         .send()
         .await
         .context(ExchangeRequestSnafu {
@@ -494,8 +610,8 @@ async fn exchange(
     }
     Ok(AccessToken {
         token: token.access_token,
-        // Both providers report the lifetime. A response without one is treated as the shortest
-        // lifetime either issues, so the token is exchanged again in good time.
+        // Every provider reports the lifetime. A response without one is treated as the shortest
+        // lifetime any of them issues, so the token is exchanged again in good time.
         expires_in: Duration::from_secs(token.expires_in.unwrap_or(300)),
     })
 }
@@ -669,7 +785,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::{
-        Json, Router,
+        Form, Json, Router,
         extract::{Query, State},
         http::{HeaderMap, StatusCode},
         response::{IntoResponse, Response},
@@ -712,6 +828,24 @@ mod tests {
     }
 
     async fn token(State(mock): State<Arc<Mock>>, Json(body): Json<Value>) -> Response {
+        issue(&mock, body)
+    }
+
+    /// Microsoft Entra ID's token endpoint, which reads a form rather than JSON.
+    async fn entra_token(
+        State(mock): State<Arc<Mock>>,
+        Form(form): Form<HashMap<String, String>>,
+    ) -> Response {
+        let body = form
+            .into_iter()
+            .map(|(name, value)| (name, Value::String(value)))
+            .collect();
+        issue(&mock, Value::Object(body))
+    }
+
+    /// Records an exchange request and answers it: with an access token, or with the refusal
+    /// `refuse_exchange` asks for.
+    fn issue(mock: &Mock, body: Value) -> Response {
         let attempt = {
             let mut exchanges = mock.exchanges.lock().expect("lock");
             exchanges.push(body);
@@ -741,6 +875,18 @@ mod tests {
             .into_response()
     }
 
+    async fn refuse_entra() -> Response {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_client",
+                "error_description": "AADSTS700213: No matching federated identity record found for presented assertion subject 'repo:org/repo:environment:prod'. Check your federated identity credential Subject, Audience and Issuer against the presented assertion. Trace ID: 0b1c Correlation ID: 5e6f Timestamp: 2026-11-03 10:00:00Z",
+                "error_codes": [700_213],
+            })),
+        )
+            .into_response()
+    }
+
     async fn redirect_to_token() -> Response {
         (
             StatusCode::TEMPORARY_REDIRECT,
@@ -766,6 +912,8 @@ mod tests {
             .route("/token", post(token))
             .route("/refuse/anthropic", post(refuse_anthropic))
             .route("/refuse/openai", post(refuse_openai))
+            .route("/entra/token", post(entra_token))
+            .route("/refuse/entra", post(refuse_entra))
             .route("/redirect", post(redirect_to_token))
             .with_state(Arc::clone(&mock));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -800,6 +948,14 @@ mod tests {
             organization_id: "org-1".to_string(),
             service_account_id: "svac_1".to_string(),
             workspace_id: workspace_id.map(str::to_string),
+        }
+    }
+
+    fn entra_at(token_url: String) -> Exchange {
+        Exchange::Entra {
+            token_url,
+            client_id: "client-1".to_string(),
+            scope: "https://cognitiveservices.azure.com/.default".to_string(),
         }
     }
 
@@ -919,6 +1075,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn entra_receives_the_client_credentials_grant_with_a_new_identity_token_as_its_assertion()
+     {
+        let (base, mock) = start(4).await;
+        let provider = WorkloadIdentityTokenProvider::try_new(
+            "model 'gpt' (azure)",
+            github_actions(&base, ENTRA_AUDIENCE),
+            entra_at(format!("{base}/entra/token")),
+        )
+        .await
+        .expect("the first exchange");
+        assert_eq!(provider.get_token(), "tok-1");
+        wait_for_token(&provider, "tok-2").await;
+
+        let grant = |assertion: &str| {
+            json!({
+                "grant_type": "client_credentials",
+                "client_id": "client-1",
+                "scope": "https://cognitiveservices.azure.com/.default",
+                "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                "client_assertion": assertion,
+            })
+        };
+        assert_eq!(
+            mock.exchanges.lock().expect("lock").clone(),
+            vec![grant("jwt-1"), grant("jwt-2")],
+            "each exchange is a form carrying a new identity token"
+        );
+        let audiences: Vec<Option<String>> = mock
+            .id_token_requests
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(query, _)| query.get("audience").cloned())
+            .collect();
+        assert_eq!(
+            audiences,
+            vec![
+                Some("api://AzureADTokenExchange".to_string()),
+                Some("api://AzureADTokenExchange".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn an_entra_exchange_goes_to_the_tenant_of_the_authority() {
+        let url = |authority: Option<&str>, tenant: &str| {
+            Exchange::entra(authority, tenant, "client-1", "scope")
+                .map(|exchange| exchange.token_url().to_string())
+                .map_err(|error| error.to_string())
+        };
+        assert_eq!(
+            [
+                url(None, "72f988bf-86f1-41af-91ab-2d7cd011db47"),
+                url(None, "contoso.onmicrosoft.com"),
+                url(Some("https://login.microsoftonline.us/"), "contoso.onmicrosoft.us"),
+                url(Some("login.chinacloudapi.cn"), "contoso"),
+                url(Some(""), "contoso"),
+            ],
+            [
+                Ok("https://login.microsoftonline.com/72f988bf-86f1-41af-91ab-2d7cd011db47/oauth2/v2.0/token".to_string()),
+                Ok("https://login.microsoftonline.com/contoso.onmicrosoft.com/oauth2/v2.0/token".to_string()),
+                Ok("https://login.microsoftonline.us/contoso.onmicrosoft.us/oauth2/v2.0/token".to_string()),
+                Ok("https://login.chinacloudapi.cn/contoso/oauth2/v2.0/token".to_string()),
+                Ok("https://login.microsoftonline.com/contoso/oauth2/v2.0/token".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_entra_authority_must_be_https() {
+        for authority in [
+            "http://login.microsoftonline.com",
+            "HTTP://login.microsoftonline.us/",
+            "ftp://login.example.test",
+        ] {
+            assert_eq!(
+                Exchange::entra(Some(authority), "contoso", "client-1", "scope")
+                    .map(|exchange| exchange.token_url().to_string())
+                    .map_err(|error| error.to_string()),
+                Err("The Microsoft Entra authority must be an https:// URL, such as https://login.microsoftonline.us, because the workload identity token is sent to it.".to_string()),
+                "{authority:?}"
+            );
+        }
+        assert_eq!(
+            Exchange::entra(
+                Some("HTTPS://login.microsoftonline.us"),
+                "contoso",
+                "c",
+                "s"
+            )
+            .map(|exchange| exchange.token_url().to_string())
+            .map_err(|error| error.to_string()),
+            Ok("HTTPS://login.microsoftonline.us/contoso/oauth2/v2.0/token".to_string())
+        );
+    }
+
+    #[test]
+    fn an_entra_tenant_cannot_change_the_token_endpoint() {
+        for tenant in [
+            "",
+            "contoso/oauth2",
+            "../common",
+            "contoso?x=1",
+            "contoso#x",
+            "contoso..com",
+            "-contoso",
+            "contoso.com.",
+            "con toso",
+            "contoso@evil.com",
+        ] {
+            assert_eq!(
+                Exchange::entra(None, tenant, "client-1", "scope")
+                    .map(|exchange| exchange.token_url().to_string())
+                    .map_err(|error| error.to_string()),
+                Err("The Microsoft Entra tenant must be a directory (tenant) ID, which is a GUID, or a domain name such as 'contoso.onmicrosoft.com'.".to_string()),
+                "{tenant:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_token_file_is_read_again_for_every_exchange() {
         let (base, mock) = start(4).await;
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -995,6 +1272,18 @@ mod tests {
         assert_eq!(
             openai.to_string(),
             "OpenAI refused to exchange the workload identity token for an access token (HTTP 400 Bad Request): invalid_grant: No service account mapping matched the token. Verify the identity provider's issuer and audience, and that a service account mapping matches the token's claims: https://platform.openai.com/settings/organization/security/workload-identity-provider"
+        );
+
+        let entra = WorkloadIdentityTokenProvider::try_new(
+            "model 'gpt' (azure)",
+            github_actions(&base, ENTRA_AUDIENCE),
+            entra_at(format!("{base}/refuse/entra")),
+        )
+        .await
+        .expect_err("Microsoft Entra ID refuses the exchange");
+        assert_eq!(
+            entra.to_string(),
+            "Microsoft Entra ID refused to exchange the workload identity token for an access token (HTTP 400 Bad Request): invalid_client: AADSTS700213: No matching federated identity record found for presented assertion subject 'repo:org/repo:environment:prod'. Check your federated identity credential Subject, Audience and Issuer against the presented assertion. Verify that the application or managed identity 'client-1' has a federated credential whose issuer, subject and audience match the workload identity token: https://learn.microsoft.com/entra/workload-id/workload-identity-federation"
         );
     }
 
