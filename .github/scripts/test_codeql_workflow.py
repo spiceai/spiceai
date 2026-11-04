@@ -62,7 +62,9 @@ class CodeQlWorkflowTest(unittest.TestCase):
             sccache["with"]["spiceio_endpoint"],
             "${{ steps.setup-spiceio.outputs.endpoint }}",
         )
-        self.assertIn("HAS_TEST_MINIO_SECRET", sccache["with"]["minio_endpoint"])
+        # merge_group checks out the queued pull request, so the job gets no
+        # object-store endpoint or credentials.
+        self.assertFalse({"minio_endpoint", "minio_access_key", "minio_secret_key"} & set(sccache["with"]))
         kill = next(step for step in analyze["steps"] if step["name"] == "Kill spiceio")
         self.assertIn("always()", kill["if"])
 

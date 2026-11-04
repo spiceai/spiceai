@@ -128,6 +128,11 @@ jobs:
   run-bench:
     name: Run benchmark e2e tests
     runs-on: ${{ github.event.inputs.runner_type }}
+    permissions:
+      actions: write  # approves the held runs of its snapshot PR
+      contents: write  # pushes a snapshot branch
+      pull-requests: write  # and opens or auto-merges its PR
+      id-token: write  # RustFS credentials
     timeout-minutes: 600
     services:
       mssql_tpch:
@@ -230,19 +235,29 @@ jobs:
           fi
           echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '36000'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
         uses: ./.github/actions/build-spicepod-validator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepod
         run: |
@@ -287,9 +302,10 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup Testoperator
         uses: ./.github/actions/setup-testoperator-data
@@ -654,9 +670,10 @@ jobs:
             --scale-factor ${{ github.event.inputs.scale_factor }}
         env:
           LAYOUT: ${{ github.event.inputs.layout }}
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
+          S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
+          S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
           DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
           DATABRICKS_ODBC_PATH: ${{ vars.DATABRICKS_ODBC_PATH }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}

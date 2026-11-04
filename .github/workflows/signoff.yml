@@ -469,10 +469,8 @@ jobs:
       - name: Set up sccache
         uses: ./.trusted-ci/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Install Protoc
         uses: ./.trusted-ci/actions/install-protoc
@@ -495,8 +493,6 @@ jobs:
         timeout-minutes: ${{ fromJSON(env.SIGNOFF_STEP_BUDGET_MINUTES) }}
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           SIGNOFF_SKIP_TARGETED_LINT: "${{ inputs.run_targeted_prechecks && '' || '1' }}"
           SIGNOFF_SKIP_TARGETED_TESTS: "${{ inputs.run_targeted_prechecks && '' || '1' }}"
 
