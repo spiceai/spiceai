@@ -808,20 +808,6 @@ datasets:
       max_concurrent_requests: '6'
       include: '*.md'
 
-  - name: github_pulls_workload_identity
-    from: github:github.com/spiceai/spiceai/pulls
-    params:
-      github_sts_identity: spice-reader
-      github_sts_scope: spiceai
-      github_sts_endpoint: https://octo-sts.dev
-      github_identity_token_file: /var/run/secrets/tokens/octo-sts
-
-  - name: github_issues_workload_identity_actions
-    from: github:github.com/spiceai/spiceai/issues
-    params:
-      github_sts_identity: spice-reader
-      github_identity_token_audience: octo-sts.dev
-
   # ---------------------------------------------------------------------------
   # Git connector
   # ---------------------------------------------------------------------------

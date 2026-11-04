@@ -15,12 +15,11 @@ limitations under the License.
 */
 
 //! Workload identity federation: a [`TokenProvider`] that exchanges an identity token issued by
-//! the platform a workload runs on for a short-lived access token, and exchanges again before
-//! that access token expires.
+//! the platform a workload runs on for a short-lived model provider access token, and exchanges
+//! again before that access token expires.
 //!
-//! The providers are Anthropic, `OpenAI`, Microsoft Entra ID, whose tokens authenticate Azure
-//! `OpenAI`, and Octo STS, which issues GitHub installation tokens. GitHub itself accepts no
-//! external identity token, so a broker that implements Octo STS's exchange stands in for it.
+//! The providers are Anthropic, `OpenAI` and Microsoft Entra ID, whose tokens authenticate Azure
+//! `OpenAI`.
 //!
 //! The access tokens are short-lived by design. An `OpenAI` token never outlives the identity
 //! token it was exchanged for, so one exchanged for a GitHub Actions OIDC token (which lives five
@@ -65,19 +64,6 @@ const ENTRA_AUTHORITY_HOST: &str = "https://login.microsoftonline.com";
 
 const ENTRA_WORKLOAD_IDENTITY_DOCS: &str =
     "https://learn.microsoft.com/entra/workload-id/workload-identity-federation";
-
-/// The public Octo STS instance.
-pub const OCTO_STS_ENDPOINT: &str = "https://octo-sts.dev";
-
-/// The path of the exchange under an Octo STS instance, and under the brokers compatible with it.
-const OCTO_STS_EXCHANGE_PATH: &str = "sts/exchange";
-
-const OCTO_STS_TRUST_POLICY_DOCS: &str = "https://github.com/octo-sts/app#the-trust-policy";
-
-/// How long a GitHub token is kept when the broker does not report its lifetime, which Octo STS
-/// does not. GitHub installation tokens live an hour; keeping one for half of that leaves time to
-/// spare even when a broker hands out a token minted a while before.
-const UNREPORTED_GITHUB_TOKEN_LIFETIME: Duration = Duration::from_mins(30);
 
 const ANTHROPIC_AUTHENTICATION_HISTORY: &str =
     "https://platform.claude.com/settings/workload-identity-federation?tab=history";
@@ -172,12 +158,6 @@ pub enum WorkloadIdentityError {
     },
 
     #[snafu(display("Failed to read {provider}'s token exchange response: {source}"))]
-    ExchangeJson {
-        provider: &'static str,
-        source: serde_json::Error,
-    },
-
-    #[snafu(display("Failed to read {provider}'s token exchange response: {source}"))]
     ExchangeBody {
         provider: &'static str,
         source: http_body_limit::Error,
@@ -200,16 +180,6 @@ pub enum WorkloadIdentityError {
         "The Microsoft Entra authority must be an https:// URL, such as https://login.microsoftonline.us, because the workload identity token is sent to it."
     ))]
     InsecureEntraAuthority,
-
-    #[snafu(display(
-        "The Octo STS endpoint '{endpoint}' must be a URL such as https://octo-sts.dev, with no query or fragment."
-    ))]
-    InvalidOctoStsEndpoint { endpoint: String },
-
-    #[snafu(display(
-        "The Octo STS endpoint must be an https:// URL, such as https://octo-sts.dev, because the workload identity token is sent to it and the GitHub token comes back from it. http:// is accepted only for a broker on this host: localhost, 127.0.0.1 or [::1]."
-    ))]
-    InsecureOctoStsEndpoint,
 }
 
 pub type Result<T, E = WorkloadIdentityError> = std::result::Result<T, E>;
@@ -259,13 +229,7 @@ impl SubjectTokenSource {
         )
     }
 
-    /// The OIDC token endpoint of a GitHub Actions job, from the values of its
-    /// `ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` variables.
-    ///
-    /// # Errors
-    ///
-    /// [`WorkloadIdentityError::GitHubActionsEnvironmentMissing`] when either is absent or empty.
-    pub fn github_actions(
+    fn github_actions(
         request_url: Option<String>,
         request_token: Option<String>,
         audience: impl Into<String>,
@@ -368,18 +332,6 @@ pub enum Exchange {
         client_id: String,
         scope: String,
     },
-    /// The exchange of Octo STS, and of the brokers compatible with it, for a GitHub installation
-    /// token with the permissions of the trust policy `identity` in `scope`: a repository
-    /// (`owner/repo`) or an owner, whose trust policies live in its `.github` repository. The
-    /// identity token is the request's bearer credential.
-    OctoSts {
-        token_url: String,
-        /// The endpoint without its scheme, which Octo STS calls its domain and checks the
-        /// identity token's audience against unless the trust policy names another.
-        domain: String,
-        scope: String,
-        identity: String,
-    },
 }
 
 impl Exchange {
@@ -451,82 +403,23 @@ impl Exchange {
         })
     }
 
-    /// An exchange with the Octo STS instance at `endpoint`, such as [`OCTO_STS_ENDPOINT`], for a
-    /// GitHub token that the trust policy `identity` in `scope` grants.
-    ///
-    /// # Errors
-    ///
-    /// [`WorkloadIdentityError::InvalidOctoStsEndpoint`] when `endpoint` is not a URL or has a
-    /// query or fragment, and [`WorkloadIdentityError::InsecureOctoStsEndpoint`] when it is
-    /// neither `https` nor `http` to this host: the identity token goes to it, and the GitHub
-    /// token comes back from it.
-    pub fn octo_sts(
-        endpoint: &str,
-        scope: impl Into<String>,
-        identity: impl Into<String>,
-    ) -> Result<Self> {
-        let endpoint = endpoint.trim();
-        // A bare domain, as `octo-sts/action` takes it, is reached over https.
-        let url = if endpoint.contains("://") {
-            reqwest::Url::parse(endpoint)
-        } else {
-            reqwest::Url::parse(&format!("https://{endpoint}"))
-        };
-        let url = url
-            .ok()
-            .filter(|url| url.query().is_none() && url.fragment().is_none())
-            .context(InvalidOctoStsEndpointSnafu { endpoint })?;
-        let host = url.host_str().context(InvalidOctoStsEndpointSnafu { endpoint })?;
-        ensure!(
-            url.scheme() == "https" || (url.scheme() == "http" && is_loopback_host(host)),
-            InsecureOctoStsEndpointSnafu
-        );
-        let port = url.port().map(|port| format!(":{port}")).unwrap_or_default();
-        let domain = format!("{host}{port}{}", url.path().trim_end_matches('/'));
-        Ok(Self::OctoSts {
-            token_url: format!("{}://{domain}/{OCTO_STS_EXCHANGE_PATH}", url.scheme()),
-            domain,
-            scope: scope.into(),
-            identity: identity.into(),
-        })
-    }
-
-    /// The audience to request an identity token from GitHub Actions for when the configuration
-    /// names none: the domain of an Octo STS instance, as `octo-sts/action` requests it. `None`
-    /// for the other providers, whose audience the caller always names.
-    #[must_use]
-    pub fn default_audience(&self) -> Option<&str> {
-        match self {
-            Self::OctoSts { domain, .. } => Some(domain),
-            Self::Anthropic { .. } | Self::OpenAi { .. } | Self::Entra { .. } => None,
-        }
-    }
-
     fn provider(&self) -> &'static str {
         match self {
             Self::Anthropic { .. } => "Anthropic",
             Self::OpenAi { .. } => "OpenAI",
             Self::Entra { .. } => "Microsoft Entra ID",
-            Self::OctoSts { .. } => "Octo STS",
         }
     }
 
-    /// The URL the exchange is sent to, normalized: two spellings of one endpoint give the same
-    /// URL.
-    #[must_use]
-    pub fn token_url(&self) -> &str {
+    fn token_url(&self) -> &str {
         match self {
             Self::Anthropic { token_url, .. }
             | Self::OpenAi { token_url, .. }
-            | Self::Entra { token_url, .. }
-            | Self::OctoSts { token_url, .. } => token_url,
+            | Self::Entra { token_url, .. } => token_url,
         }
     }
 
-    /// The exchange request: JSON for Anthropic and `OpenAI`, a form for Microsoft Entra ID, and
-    /// for Octo STS a `GET` whose bearer credential is the identity token. Octo STS reads
-    /// `scopes` and falls back to `scope`, which the brokers compatible with it read, so both
-    /// are sent, as `octo-sts/action` sends them.
+    /// The exchange request: JSON for Anthropic and `OpenAI`, a form for Microsoft Entra ID.
     fn request(
         &self,
         http: &reqwest::Client,
@@ -576,50 +469,6 @@ impl Exchange {
                 ),
                 ("client_assertion", subject_token.expose_secret()),
             ]),
-            Self::OctoSts {
-                scope, identity, ..
-            } => http
-                .get(self.token_url())
-                .query(&[
-                    ("scope", scope.as_str()),
-                    ("scopes", scope.as_str()),
-                    ("identity", identity.as_str()),
-                ])
-                .bearer_auth(subject_token.expose_secret()),
-        }
-    }
-
-    /// The access token in a successful exchange response, with how long to keep it, and the
-    /// token type the response names, if any.
-    fn access_token(&self, body: &[u8]) -> serde_json::Result<(AccessToken, Option<String>)> {
-        match self {
-            Self::OctoSts { .. } => {
-                let token: OctoStsResponse = serde_json::from_slice(body)?;
-                let expires_in = token
-                    .expires_in
-                    .map_or(UNREPORTED_GITHUB_TOKEN_LIFETIME, Duration::from_secs);
-                Ok((
-                    AccessToken {
-                        token: token.token,
-                        expires_in,
-                    },
-                    None,
-                ))
-            }
-            Self::Anthropic { .. } | Self::OpenAi { .. } | Self::Entra { .. } => {
-                let token: TokenResponse = serde_json::from_slice(body)?;
-                // Every provider reports the lifetime. A response without one is treated as the
-                // shortest lifetime any of them issues, so the token is exchanged again in good
-                // time.
-                let expires_in = Duration::from_secs(token.expires_in.unwrap_or(300));
-                Ok((
-                    AccessToken {
-                        token: token.access_token,
-                        expires_in,
-                    },
-                    token.token_type,
-                ))
-            }
         }
     }
 
@@ -635,23 +484,8 @@ impl Exchange {
             Self::Entra { client_id, .. } => format!(
                 "Verify that the application or managed identity '{client_id}' has a federated credential whose issuer, subject and audience match the workload identity token: {ENTRA_WORKLOAD_IDENTITY_DOCS}"
             ),
-            Self::OctoSts {
-                scope, identity, ..
-            } => format!(
-                "Verify that the Octo STS GitHub App is installed on the owner of '{scope}', that '{scope}' has the trust policy `.github/chainguard/{identity}.sts.yaml` (an owner keeps its trust policies in its `.github` repository), and that the policy's issuer, subject and audience match the workload identity token. Octo STS records why it refused an exchange only in its own logs: {OCTO_STS_TRUST_POLICY_DOCS}"
-            ),
         }
     }
-}
-
-/// Whether `host`, as a URL names it, is this host: `localhost` or a loopback address.
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Whether `tenant` is a Microsoft Entra tenant as a token endpoint path names it: a directory ID
@@ -678,15 +512,6 @@ struct AccessToken {
 #[derive(Deserialize)]
 struct IdTokenResponse {
     value: SecretString,
-}
-
-/// Octo STS's answer to an exchange: only the token. Brokers compatible with it may also report
-/// its lifetime.
-#[derive(Deserialize)]
-struct OctoStsResponse {
-    token: SecretString,
-    #[serde(default)]
-    expires_in: Option<u64>,
 }
 
 /// A provider's answer to a token exchange (RFC 6749 section 5.1).
@@ -716,8 +541,7 @@ fn truncate(text: &str) -> String {
 }
 
 /// The reason in a provider's error response: Anthropic's `error.message`, an `OAuth`
-/// `error` with its `error_description`, the `message` of a gRPC status, as Octo STS answers,
-/// or the body itself. Microsoft Entra ID ends every
+/// `error` with its `error_description`, or the body itself. Microsoft Entra ID ends every
 /// description with request identifiers (`Trace ID: … Correlation ID: … Timestamp: …`), which
 /// are left out so the bounded reason keeps the part that names the cause.
 fn refusal_reason(body: &str) -> String {
@@ -738,10 +562,7 @@ fn refusal_reason(body: &str) -> String {
             }
             None => truncate(code),
         },
-        _ => match value["message"].as_str() {
-            Some(message) => truncate(message),
-            None => truncate(body),
-        },
+        _ => truncate(body),
     }
 }
 
@@ -772,16 +593,13 @@ async fn exchange(
         .fail();
     }
 
-    let body = http_body_limit::buffer(response, http_body_limit::Limit::METADATA)
+    let token: TokenResponse = http_body_limit::buffer(response, http_body_limit::Limit::METADATA)
         .await
         .context(ExchangeBodySnafu { provider })?
-        .bytes()
+        .json()
         .await
         .context(ExchangeResponseSnafu { provider })?;
-    let (token, token_type) = exchange
-        .access_token(&body)
-        .context(ExchangeJsonSnafu { provider })?;
-    if let Some(token_type) = token_type
+    if let Some(token_type) = token.token_type
         && !token_type.eq_ignore_ascii_case("bearer")
     {
         return UnsupportedTokenTypeSnafu {
@@ -790,7 +608,12 @@ async fn exchange(
         }
         .fail();
     }
-    Ok(token)
+    Ok(AccessToken {
+        token: token.access_token,
+        // Every provider reports the lifetime. A response without one is treated as the shortest
+        // lifetime any of them issues, so the token is exchanged again in good time.
+        expires_in: Duration::from_secs(token.expires_in.unwrap_or(300)),
+    })
 }
 
 /// A [`TokenProvider`] backed by workload identity federation. Construction performs the first
@@ -1072,45 +895,6 @@ mod tests {
             .into_response()
     }
 
-    /// Octo STS's exchange: records the query and the bearer credential, and answers with a
-    /// GitHub token, reporting its lifetime only when `expires_in` is not 0, since Octo STS
-    /// itself never does.
-    async fn octo_sts(
-        State(mock): State<Arc<Mock>>,
-        Query(query): Query<HashMap<String, String>>,
-        headers: HeaderMap,
-    ) -> Json<Value> {
-        let mut request: serde_json::Map<String, Value> = query
-            .into_iter()
-            .map(|(name, value)| (name, Value::String(value)))
-            .collect();
-        let authorization = headers
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .map_or(Value::Null, |value| Value::String(value.to_string()));
-        request.insert("authorization".to_string(), authorization);
-        mock.exchanges
-            .lock()
-            .expect("lock")
-            .push(Value::Object(request));
-        let n = mock.access_tokens_issued.fetch_add(1, Ordering::SeqCst) + 1;
-        let expires_in = mock.expires_in.load(Ordering::SeqCst);
-        if expires_in == 0 {
-            Json(json!({"token": format!("ghs-{n}")}))
-        } else {
-            Json(json!({"token": format!("ghs-{n}"), "expires_in": expires_in}))
-        }
-    }
-
-    /// Octo STS's refusal, a gRPC status in JSON: it never says which claim failed to match.
-    async fn refuse_octo_sts() -> Response {
-        (
-            StatusCode::FORBIDDEN,
-            Json(json!({"code": 7, "message": "token does not match trust policy", "details": []})),
-        )
-            .into_response()
-    }
-
     async fn refuse_openai() -> Response {
         (
             StatusCode::BAD_REQUEST,
@@ -1131,8 +915,6 @@ mod tests {
             .route("/entra/token", post(entra_token))
             .route("/refuse/entra", post(refuse_entra))
             .route("/redirect", post(redirect_to_token))
-            .route("/sts/exchange", get(octo_sts))
-            .route("/refuse/sts/exchange", get(refuse_octo_sts))
             .with_state(Arc::clone(&mock));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1414,144 +1196,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn octo_sts_receives_a_new_identity_token_as_the_bearer_with_the_scope_and_identity() {
-        let (base, mock) = start(4).await;
-        let exchange =
-            Exchange::octo_sts(&base, "acme/widgets", "spice-reader").expect("a loopback broker");
-        let audience = exchange
-            .default_audience()
-            .expect("Octo STS has a default audience")
-            .to_string();
-        let provider = WorkloadIdentityTokenProvider::try_new(
-            "dataset 'stars' (github)",
-            github_actions(&base, &audience),
-            exchange,
-        )
-        .await
-        .expect("the first exchange");
-        assert_eq!(provider.get_token(), "ghs-1");
-        // A token that reports a 4 s lifetime is exchanged again after 3 s.
-        wait_for_token(&provider, "ghs-2").await;
-
-        let request = |identity_token: &str| {
-            json!({
-                "scope": "acme/widgets",
-                "scopes": "acme/widgets",
-                "identity": "spice-reader",
-                "authorization": format!("Bearer {identity_token}"),
-            })
-        };
-        assert_eq!(
-            mock.exchanges.lock().expect("lock").clone(),
-            vec![request("jwt-1"), request("jwt-2")],
-        );
-        let audiences: Vec<Option<String>> = mock
-            .id_token_requests
-            .lock()
-            .expect("lock")
-            .iter()
-            .map(|(query, _)| query.get("audience").cloned())
-            .collect();
-        let domain = base.trim_start_matches("http://").to_string();
-        assert_eq!(audiences, vec![Some(domain.clone()), Some(domain)]);
-    }
-
-    #[test]
-    fn an_octo_sts_token_without_a_lifetime_is_kept_for_half_of_a_github_token_lifetime() {
-        let exchange = Exchange::octo_sts(OCTO_STS_ENDPOINT, "acme/widgets", "spice-reader")
-            .expect("the public instance");
-        let kept_for = |body: &str| {
-            exchange
-                .access_token(body.as_bytes())
-                .map(|(token, token_type)| {
-                    (
-                        token.token.expose_secret().to_string(),
-                        token.expires_in,
-                        token_type,
-                    )
-                })
-                .map_err(|error| error.to_string())
-        };
-        assert_eq!(
-            [
-                kept_for(r#"{"token": "ghs_a"}"#),
-                kept_for(r#"{"token": "ghs_b", "expires_in": 120}"#),
-                kept_for(r#"{"access_token": "ghs_c"}"#),
-            ],
-            [
-                Ok(("ghs_a".to_string(), Duration::from_mins(30), None)),
-                Ok(("ghs_b".to_string(), Duration::from_mins(2), None)),
-                Err("missing field `token` at line 1 column 25".to_string()),
-            ]
-        );
-        assert_eq!(
-            refresh_after(UNREPORTED_GITHUB_TOKEN_LIFETIME),
-            Duration::from_mins(29)
-        );
-    }
-
-    #[test]
-    fn an_octo_sts_endpoint_is_https_or_on_this_host() {
-        let exchange = |endpoint: &str| {
-            Exchange::octo_sts(endpoint, "acme", "reader")
-                .map(|exchange| {
-                    (
-                        exchange.token_url().to_string(),
-                        exchange.default_audience().map(str::to_string),
-                    )
-                })
-                .map_err(|error| error.to_string())
-        };
-        let ok = |token_url: &str, audience: &str| {
-            Ok((token_url.to_string(), Some(audience.to_string())))
-        };
-        assert_eq!(
-            [
-                "https://octo-sts.dev",
-                "https://octo-sts.dev/",
-                "octo-sts.dev",
-                " HTTPS://Octo-STS.dev ",
-                "https://sts.example.com:8443/octo/",
-                "http://127.0.0.1:8080",
-                "http://localhost:8080/ns",
-                "http://[::1]:9000",
-            ]
-            .map(exchange),
-            [
-                ok("https://octo-sts.dev/sts/exchange", "octo-sts.dev"),
-                ok("https://octo-sts.dev/sts/exchange", "octo-sts.dev"),
-                ok("https://octo-sts.dev/sts/exchange", "octo-sts.dev"),
-                ok("https://octo-sts.dev/sts/exchange", "octo-sts.dev"),
-                ok(
-                    "https://sts.example.com:8443/octo/sts/exchange",
-                    "sts.example.com:8443/octo"
-                ),
-                ok("http://127.0.0.1:8080/sts/exchange", "127.0.0.1:8080"),
-                ok("http://localhost:8080/ns/sts/exchange", "localhost:8080/ns"),
-                ok("http://[::1]:9000/sts/exchange", "[::1]:9000"),
-            ]
-        );
-
-        let insecure = Err("The Octo STS endpoint must be an https:// URL, such as https://octo-sts.dev, because the workload identity token is sent to it and the GitHub token comes back from it. http:// is accepted only for a broker on this host: localhost, 127.0.0.1 or [::1].".to_string());
-        for endpoint in [
-            "http://octo-sts.dev",
-            "http://10.0.0.5:8080",
-            "http://127.0.0.1.example.com",
-            "http://localhost.example.com",
-            "ftp://octo-sts.dev",
-        ] {
-            assert_eq!(exchange(endpoint), insecure, "{endpoint:?}");
-        }
-        for endpoint in ["", "https://", "https://octo-sts.dev?x=1", "https://octo-sts.dev#x"] {
-            assert_eq!(
-                exchange(endpoint),
-                Err(format!("The Octo STS endpoint '{}' must be a URL such as https://octo-sts.dev, with no query or fragment.", endpoint.trim())),
-                "{endpoint:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn a_token_file_is_read_again_for_every_exchange() {
         let (base, mock) = start(4).await;
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -1640,19 +1284,6 @@ mod tests {
         assert_eq!(
             entra.to_string(),
             "Microsoft Entra ID refused to exchange the workload identity token for an access token (HTTP 400 Bad Request): invalid_client: AADSTS700213: No matching federated identity record found for presented assertion subject 'repo:org/repo:environment:prod'. Check your federated identity credential Subject, Audience and Issuer against the presented assertion. Verify that the application or managed identity 'client-1' has a federated credential whose issuer, subject and audience match the workload identity token: https://learn.microsoft.com/entra/workload-id/workload-identity-federation"
-        );
-
-        let octo_sts = WorkloadIdentityTokenProvider::try_new(
-            "dataset 'stars' (github)",
-            github_actions(&base, "octo-sts.dev"),
-            Exchange::octo_sts(&format!("{base}/refuse"), "acme/widgets", "spice-reader")
-                .expect("a loopback broker"),
-        )
-        .await
-        .expect_err("Octo STS refuses the exchange");
-        assert_eq!(
-            octo_sts.to_string(),
-            "Octo STS refused to exchange the workload identity token for an access token (HTTP 403 Forbidden): token does not match trust policy. Verify that the Octo STS GitHub App is installed on the owner of 'acme/widgets', that 'acme/widgets' has the trust policy `.github/chainguard/spice-reader.sts.yaml` (an owner keeps its trust policies in its `.github` repository), and that the policy's issuer, subject and audience match the workload identity token. Octo STS records why it refused an exchange only in its own logs: https://github.com/octo-sts/app#the-trust-policy"
         );
     }
 
