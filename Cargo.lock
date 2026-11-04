@@ -1687,56 +1687,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-sdk-cognitoidentity"
-version = "1.104.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1485e816a2cbe6bda0d24d28b508ba19d601ab18274881eb59123d23a47f7f3"
-dependencies = [
- "arc-swap",
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http 0.63.6",
- "aws-smithy-json",
- "aws-smithy-observability 0.2.6",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
- "bytes",
- "fastrand",
- "http 0.2.12",
- "http 1.4.1",
- "regex-lite",
- "tracing",
-]
-
-[[package]]
-name = "aws-sdk-cognitoidentityprovider"
-version = "1.123.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5ad7e92dd962febc85a12e88571bdb23d8f5ad52d8b481c368d1e844c62262d"
-dependencies = [
- "arc-swap",
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http 0.63.6",
- "aws-smithy-json",
- "aws-smithy-observability 0.2.6",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
- "bytes",
- "fastrand",
- "http 0.2.12",
- "http 1.4.1",
- "regex-lite",
- "tracing",
-]
-
-[[package]]
 name = "aws-sdk-credential-bridge"
 version = "2.5.0-unstable"
 dependencies = [
@@ -1745,8 +1695,6 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-runtime",
- "aws-sdk-cognitoidentity",
- "aws-sdk-cognitoidentityprovider",
  "aws-sdk-s3",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",

@@ -54,9 +54,10 @@ jobs:
     # contains the queued pull request, and a spiceio miss must not fall
     # through to those credentials.
     runs-on: spiceai-macos-large
+    environment: ci-build
     env:
       HAS_TEST_MINIO_SECRET: ${{ github.event_name == 'push' && secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
     # Extraction takes 10-18 minutes on most runs and up to 75 on a loaded
     # host. The query suite took 8 minutes with the same 10 threads and
     # 30 GB outside CI, and runs slower on a loaded host. An unbounded job
@@ -89,7 +90,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
