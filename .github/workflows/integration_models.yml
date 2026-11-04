@@ -179,7 +179,7 @@ jobs:
     # `nextest --list` and every test process abort with SIGABRT before any
     # test code runs, while the same archive starts cleanly on the MacBook Pros.
     runs-on: spiceai-macos-large
-    # The provider credentials these tests read are in the `ci` environment, as on trunk.
+    # Selects `ci`, as this job does on trunk, so secrets bound to that environment reach it.
     environment: ci
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
@@ -465,7 +465,7 @@ jobs:
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
     runs-on: spiceai-dev-runners
     timeout-minutes: 5
-    # The provider credentials these tests read are in the `ci` environment, as on trunk.
+    # Selects `ci`, as this job does on trunk, so secrets bound to that environment reach it.
     environment: ci
     permissions: {}
     steps:
@@ -511,7 +511,7 @@ jobs:
     # The large pool for the same reason as `test-models`: a Mac mini cannot
     # reliably start this archive's test binary.
     runs-on: spiceai-macos-large
-    # The provider credentials these tests read are in the `ci` environment, as on trunk.
+    # Selects `ci`, as this job does on trunk, so secrets bound to that environment reach it.
     environment: ci
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
