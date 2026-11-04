@@ -30,24 +30,28 @@ runs:
         AUDIENCE: ${{ inputs.audience }}
       run: |
         set -euo pipefail
-        curl_args=(--silent --show-error --fail-with-body --max-time 30 --retry 3 --retry-all-errors)
+        # Each retry replaces this file, so it only ever holds the last response.
+        response="$(mktemp)"
+        trap 'rm -f "${response}"' EXIT
+        curl_args=(--silent --show-error --fail-with-body --max-time 30 --retry 3 --retry-all-errors --output "${response}")
 
-        oidc_token="$(curl "${curl_args[@]}" --get --data-urlencode "audience=${AUDIENCE}" \
+        curl "${curl_args[@]}" --get --data-urlencode "audience=${AUDIENCE}" \
           --header "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-          "${ACTIONS_ID_TOKEN_REQUEST_URL}" | jq -er .value)"
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}"
+        oidc_token="$(jq -er .value "${response}")"
         echo "::add-mask::${oidc_token}"
 
-        if ! response="$(curl "${curl_args[@]}" "https://${HOST}/oidc/v1/token" \
+        if ! curl "${curl_args[@]}" "https://${HOST}/oidc/v1/token" \
           --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
           --data-urlencode "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
           --data-urlencode "subject_token=${oidc_token}" \
           --data-urlencode "client_id=${CLIENT_ID}" \
-          --data-urlencode "scope=all-apis")"; then
-          echo "::error::Databricks refused the token exchange at ${HOST}: ${response}"
+          --data-urlencode "scope=all-apis"; then
+          echo "::error::Databricks refused the token exchange at ${HOST}: $(cat "${response}")"
           exit 1
         fi
 
-        token="$(jq -er .access_token <<<"${response}")"
+        token="$(jq -er .access_token "${response}")"
         echo "::add-mask::${token}"
-        echo "Databricks token expires in $(jq -r .expires_in <<<"${response}") seconds."
+        echo "Databricks token expires in $(jq -r .expires_in "${response}") seconds."
         echo "token=${token}" >> "${GITHUB_OUTPUT}"
