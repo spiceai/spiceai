@@ -32,6 +32,8 @@ SECRET_FREE = "secret-free"
 ALLOWED_ENVIRONMENTS = frozenset(
     {
         "ci",
+        "ci-build",
+        "ci-integration",
         "github-publish",
         "github-publish-autoapprove",
         SECRET_FREE,

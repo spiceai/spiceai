@@ -229,7 +229,13 @@ impl SubjectTokenSource {
         )
     }
 
-    fn github_actions(
+    /// The OIDC token endpoint of a GitHub Actions job, from the values of its
+    /// `ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` variables.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkloadIdentityError::GitHubActionsEnvironmentMissing`] when either is absent or empty.
+    pub fn github_actions(
         request_url: Option<String>,
         request_token: Option<String>,
         audience: impl Into<String>,

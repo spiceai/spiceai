@@ -106,7 +106,7 @@ jobs:
                 """\
 jobs:
   a:
-    environment: ci-build
+    environment: ci-staging
     runs-on: ubuntu-24.04
     steps:
       - run: echo hi
@@ -120,9 +120,9 @@ jobs:
             ),
             [
                 f"job '{job}' selects environment '{env}', which is not one of "
-                "`ci`, `github-publish`, `github-publish-autoapprove`, `secret-free`; "
+                "`ci`, `ci-build`, `ci-integration`, `github-publish`, `github-publish-autoapprove`, `secret-free`; "
                 "GitHub would create it with no protection rules (see docs/dev/github_actions_environments.md)"
-                for job, env in (("a", "ci-build"), ("b", "publsh"))
+                for job, env in (("a", "ci-staging"), ("b", "publsh"))
             ],
         )
 

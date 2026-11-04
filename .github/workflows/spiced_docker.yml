@@ -281,9 +281,12 @@ jobs:
           echo "run_cuda=${run_cuda}" >> "$GITHUB_OUTPUT"
 
   build-amd64:
-    environment: ci
     needs: setup
     runs-on: spiceai-dev-runners
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Skip AMD64 build
         if: ${{ needs.setup.outputs.run_amd64 != 'true' }}
@@ -301,9 +304,11 @@ jobs:
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: ${{ needs.setup.outputs.run_amd64 == 'true' && github.repository == 'spiceai/spiceai' }}
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: default
         run: |
@@ -342,9 +347,12 @@ jobs:
           path: /tmp/image-amd64-*.tar
 
   build-arm64:
-    environment: ci
     needs: setup
     runs-on: hosted-linux-arm-runner
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Skip ARM64 build
         if: ${{ needs.setup.outputs.run_arm64 != 'true' }}
@@ -384,9 +392,11 @@ jobs:
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: ${{ needs.setup.outputs.run_arm64 == 'true' && github.repository == 'spiceai/spiceai' }}
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: default
         run: |
@@ -426,9 +436,12 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
   build-cuda:
-    environment: ci
     needs: setup
     runs-on: 'spiceai-dev-runners'
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
     env:
       CUDA_COMPUTE_CAP: 80
     steps:
@@ -448,9 +461,11 @@ jobs:
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: ${{ needs.setup.outputs.run_cuda == 'true' && github.repository == 'spiceai/spiceai' }}
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Configure CUDA build
         run: |
@@ -490,10 +505,14 @@ jobs:
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
   publish:
-    environment: github-publish
     if: ${{ needs.setup.outputs.run_amd64 == 'true' || needs.setup.outputs.run_arm64 == 'true' }}
     needs: [setup, build-amd64, build-arm64]
     runs-on: ubuntu-24.04
+    environment: github-publish
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     env:
       REL_VERSION: ${{ needs.setup.outputs.rel_version }}
       PUBLISH: ${{ needs.setup.outputs.publish }}
@@ -528,9 +547,11 @@ jobs:
         # registry:2 below.
         if: github.repository == 'spiceai/spiceai'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '3600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Start local registry
         run: |
@@ -547,9 +568,11 @@ jobs:
       - name: Login to DockerHub
         if: needs.setup.outputs.publish == 'true'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '3600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Import images and create manifests
         run: |
@@ -617,10 +640,14 @@ jobs:
           fi
 
   publish-cuda:
-    environment: github-publish
     needs: [setup, build-cuda]
     if: ${{ needs.setup.outputs.run_cuda == 'true' }}
     runs-on: ubuntu-24.04
+    environment: github-publish
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     env:
       REL_VERSION: ${{ needs.setup.outputs.rel_version }}
       PUBLISH: ${{ needs.setup.outputs.publish }}
@@ -645,9 +672,11 @@ jobs:
         # registry:2 below.
         if: github.repository == 'spiceai/spiceai'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '3600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Start local registry
         run: |
@@ -664,9 +693,11 @@ jobs:
       - name: Login to DockerHub
         if: needs.setup.outputs.publish == 'true'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '3600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Import images and create manifests
         run: |
