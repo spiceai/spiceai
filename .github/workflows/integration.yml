@@ -1371,6 +1371,7 @@ jobs:
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-dev-runners
     permissions:
+      actions: write  # approves the held runs of its snapshot PR
       contents: write  # push-snap-changes pushes a snapshot branch
       pull-requests: write  # and opens, auto-merges or closes its PR
       id-token: write  # RustFS credentials

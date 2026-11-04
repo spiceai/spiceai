@@ -30,6 +30,7 @@ jobs:
     name: Run schema tests
     runs-on: ${{ github.event.inputs.runner_type }}
     permissions:
+      actions: write  # approves the held runs of its snapshot PR
       contents: write  # pushes a snapshot branch
       pull-requests: write  # and opens its PR
       id-token: write  # RustFS credentials
