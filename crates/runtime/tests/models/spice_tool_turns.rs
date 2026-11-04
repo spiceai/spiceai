@@ -116,11 +116,12 @@ impl Provider {
         }
     }
 
-    /// The secret that holds the provider's API key.
-    fn api_key_secret(self) -> &'static str {
+    /// The secret that holds the provider's credential: its API key, or for Anthropic the access
+    /// token CI authenticates with, when it is set.
+    fn credential_secret(self) -> &'static str {
         match self {
-            Self::OpenAi | Self::OpenAiReasoning => "SPICE_OPENAI_API_KEY",
-            Self::Anthropic => "SPICE_ANTHROPIC_API_KEY",
+            Self::OpenAi | Self::OpenAiReasoning => crate::utils::openai_credential_secret(),
+            Self::Anthropic => crate::utils::anthropic_credential_secret(),
             Self::Xai => "SPICE_XAI_API_KEY",
         }
     }
@@ -246,7 +247,7 @@ struct Conversation {
 impl Conversation {
     /// Starts Spice with `provider`'s model and has the conversation on `api`.
     async fn run(provider: Provider, api: Api, stream: bool) -> Result<Self, anyhow::Error> {
-        verify_env_secret_exists(provider.api_key_secret())
+        verify_env_secret_exists(provider.credential_secret())
             .await
             .map_err(anyhow::Error::msg)?;
 
