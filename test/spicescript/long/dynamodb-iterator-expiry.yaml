@@ -41,6 +41,10 @@ spicepod:
 
 defaults:
   expect: { oracle: ref }
+  # Every instance of a combination shares the one LocalStack container and its
+  # forwarder on port 4567, so instances run one after another: a second
+  # forwarder cannot bind the port, and one instance's outage stops it for all.
+  exclusive: true
 
 steps:
   - source-exec:
