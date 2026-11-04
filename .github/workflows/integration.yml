@@ -1107,6 +1107,30 @@ jobs:
             --archive-file ./integration_tests/integration_tests.tar.zst \
             -E 'binary_id(=runtime::integration) & (test(/^databricks_/) | test(/^spark::/))'
 
+      - name: Upload integration snapshots artifact
+        id: create_snapshot_archive
+        if: github.event.inputs.update_snapshots == 'always' && needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          git diff --name-only -- '*.snap' > snapshot-files
+          git ls-files -o --exclude-standard -- '*.snap' >> snapshot-files
+          if [ -s snapshot-files ]; then
+            tr '\n' '\0' < snapshot-files > snapshot-files-0
+            tar --null -czf integration-snapshots-part-databricks.tar.gz --files-from snapshot-files-0
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No snapshot files found"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          fi
+          rm -f snapshot-files snapshot-files-0
+        shell: bash
+      - name: Store integration snapshots artifact
+        if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true' && needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: integration-snapshots-part-databricks
+          path: integration-snapshots-part-databricks.tar.gz
+          retention-days: 1
+
   test-aws-sdk:
     name: AWS SDK Integration Tests
     needs: [build, check_changes]

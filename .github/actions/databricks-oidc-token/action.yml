@@ -35,18 +35,19 @@ runs:
         trap 'rm -f "${response}"' EXIT
         curl_args=(--silent --show-error --fail-with-body --max-time 30 --retry 3 --retry-all-errors --output "${response}")
 
-        curl "${curl_args[@]}" --get --data-urlencode "audience=${AUDIENCE}" \
-          --header "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-          "${ACTIONS_ID_TOKEN_REQUEST_URL}"
+        # Tokens reach curl on stdin, out of the process list.
+        printf 'header = "Authorization: bearer %s"\n' "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" |
+          curl "${curl_args[@]}" --config - --get --data-urlencode "audience=${AUDIENCE}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}"
         oidc_token="$(jq -er .value "${response}")"
         echo "::add-mask::${oidc_token}"
 
-        if ! curl "${curl_args[@]}" "https://${HOST}/oidc/v1/token" \
-          --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
-          --data-urlencode "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
-          --data-urlencode "subject_token=${oidc_token}" \
-          --data-urlencode "client_id=${CLIENT_ID}" \
-          --data-urlencode "scope=all-apis"; then
+        if ! printf 'data-urlencode = "subject_token=%s"\n' "${oidc_token}" |
+          curl "${curl_args[@]}" --config - "https://${HOST}/oidc/v1/token" \
+            --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+            --data-urlencode "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
+            --data-urlencode "client_id=${CLIENT_ID}" \
+            --data-urlencode "scope=all-apis"; then
           echo "::error::Databricks refused the token exchange at ${HOST}: $(cat "${response}")"
           exit 1
         fi
