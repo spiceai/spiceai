@@ -6035,22 +6035,6 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "curve25519-dalek"
-version = "4.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "curve25519-dalek-derive",
- "digest 0.10.7",
- "fiat-crypto 0.2.9",
- "rustc_version",
- "subtle",
- "zeroize",
-]
-
-[[package]]
-name = "curve25519-dalek"
 version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5eed333089e2e1c1ac8c6c0398e5e2497b4c9926ca6d0365ed1e099afa5bc23"
@@ -6058,7 +6042,7 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "curve25519-dalek-derive",
- "fiat-crypto 0.3.0",
+ "fiat-crypto",
  "rustc_version",
  "subtle",
 ]
@@ -8088,30 +8072,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ed25519"
-version = "2.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
-dependencies = [
- "pkcs8",
- "signature",
-]
-
-[[package]]
-name = "ed25519-dalek"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
-dependencies = [
- "curve25519-dalek 4.1.3",
- "ed25519",
- "serde",
- "sha2 0.10.9",
- "subtle",
- "zeroize",
-]
-
-[[package]]
 name = "educe"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8165,7 +8125,6 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
- "hkdf 0.12.4",
  "pem-rfc7468",
  "pkcs8",
  "rand_core 0.6.4",
@@ -8735,12 +8694,6 @@ dependencies = [
  "rand_core 0.6.4",
  "subtle",
 ]
-
-[[package]]
-name = "fiat-crypto"
-version = "0.2.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "fiat-crypto"
@@ -10083,15 +10036,6 @@ dependencies = [
 
 [[package]]
 name = "hkdf"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
-dependencies = [
- "hmac 0.12.1",
-]
-
-[[package]]
-name = "hkdf"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
@@ -10163,7 +10107,7 @@ dependencies = [
  "aead 0.6.1",
  "chacha20poly1305",
  "getrandom 0.4.2",
- "hkdf 0.13.0",
+ "hkdf",
  "hybrid-array",
  "rand_core 0.10.1",
  "sha2 0.11.0",
@@ -11394,18 +11338,11 @@ checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
- "ed25519-dalek",
  "getrandom 0.2.17",
- "hmac 0.12.1",
  "js-sys",
- "p256",
- "p384",
  "pem",
- "rand 0.8.6",
- "rsa",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "signature",
  "simple_asn1",
  "zeroize",
@@ -12735,7 +12672,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec#d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -12762,7 +12699,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-audio"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec#d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec"
 dependencies = [
  "anyhow",
  "apodize",
@@ -12773,7 +12710,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-code-exec"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec#d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -12792,7 +12729,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec#d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec"
 dependencies = [
  "ahash 0.8.12",
  "akin",
@@ -12899,7 +12836,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-flash-attn"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec#d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -12910,7 +12847,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-macros"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec#d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -12921,7 +12858,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-mcp"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec#d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12942,7 +12879,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-metal-compile"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec#d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec"
 dependencies = [
  "candle-metal-kernels",
  "objc2-metal 0.3.2",
@@ -12951,7 +12888,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec#d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -12969,7 +12906,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec#d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec"
 dependencies = [
  "bytemuck",
  "byteorder",
@@ -13008,7 +12945,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-sandbox"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec#d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec"
 dependencies = [
  "anyhow",
  "itoa",
@@ -13025,7 +12962,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c#e40436e44aa1fc558c0ddb2c7d4430bcc1ce8e4c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec#d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec"
 dependencies = [
  "candle-core",
  "image 0.25.10",
@@ -14903,18 +14840,6 @@ name = "p256"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
-dependencies = [
- "ecdsa",
- "elliptic-curve",
- "primeorder",
- "sha2 0.10.9",
-]
-
-[[package]]
-name = "p384"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe42f1670a52a47d448f14b6a5c61dd78fce51856e68edaa38f7ae3a46b8d6b6"
 dependencies = [
  "ecdsa",
  "elliptic-curve",
@@ -18197,6 +18122,7 @@ dependencies = [
  "datafusion-table-providers",
  "fundu",
  "globset",
+ "insta",
  "key-index",
  "logos",
  "opentelemetry 0.32.0",
@@ -19523,8 +19449,6 @@ dependencies = [
  "datafusion-expr",
  "datafusion-functions-json",
  "datafusion-optimizer-rules",
- "datafusion-table-providers",
- "duckdb",
  "elasticsearch",
  "futures",
  "insta",
@@ -20606,6 +20530,7 @@ dependencies = [
  "futures",
  "iceberg",
  "iceberg-storage-opendal",
+ "jsonwebtoken",
  "libc",
  "llms-llamacpp",
  "mimalloc",
@@ -22340,8 +22265,10 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 name = "token_provider"
 version = "2.5.0-unstable"
 dependencies = [
+ "axum",
  "base64 0.22.1",
  "chrono",
+ "http-body-limit",
  "jsonwebtoken",
  "reqwest 0.13.4",
  "secrecy",
@@ -22349,6 +22276,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "snafu",
+ "tempfile",
  "tokio",
  "tracing",
  "util",
@@ -25831,7 +25759,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7e8131a03190127fb2263afc72b322ecadae46b6ff8c6f399ff5d02f5559af6"
 dependencies = [
- "curve25519-dalek 5.0.0",
+ "curve25519-dalek",
  "rand_core 0.10.1",
 ]
 

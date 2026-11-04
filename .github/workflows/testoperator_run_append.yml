@@ -40,7 +40,6 @@ on:
           - 'sqlite'
           - 'postgresql'
           - 'mysql'
-          - 'dremio'
           - 'odbc-athena'
           - 'odbc-databricks'
           - 'oracle'
