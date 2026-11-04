@@ -1302,9 +1302,8 @@ mod flight_prepared_statements {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                let table = format!(
-                    "WITH t(id, ts_utc, ts_la, ts_us, ts_naive) AS (VALUES {values})"
-                );
+                let table =
+                    format!("WITH t(id, ts_utc, ts_la, ts_us, ts_naive) AS (VALUES {values})");
 
                 // 2026-03-08T10:00:00Z
                 let instant_us = 1_772_964_000_000_000_i64;
@@ -1333,9 +1332,8 @@ mod flight_prepared_statements {
                     let literal = format!("arrow_cast('{literal_text}', '{param_type}')");
 
                     // The bound type keeps its zone, as the literal's does.
-                    let typeof_sql = format!(
-                        "SELECT arrow_typeof($1) AS p, arrow_typeof({literal}) AS l"
-                    );
+                    let typeof_sql =
+                        format!("SELECT arrow_typeof($1) AS p, arrow_typeof({literal}) AS l");
                     let results =
                         execute_parameterized_query(&mut client, &typeof_sql, batch()?).await?;
                     let (bound, lit) = string_pair(&results)?;
@@ -1353,21 +1351,15 @@ mod flight_prepared_statements {
 
                     for column in ["ts_utc", "ts_la", "ts_us", "ts_naive"] {
                         let ids_sql = |rhs: &str| {
-                            format!(
-                                "{table} SELECT id FROM t WHERE {column} = {rhs} ORDER BY id"
-                            )
+                            format!("{table} SELECT id FROM t WHERE {column} = {rhs} ORDER BY id")
                         };
                         let bound = ids_of(
                             &execute_parameterized_query(&mut client, &ids_sql("$1"), batch()?)
                                 .await?,
                         );
                         let lit = ids_of(
-                            &execute_parameterized_query(
-                                &mut client,
-                                &ids_sql(&literal),
-                                batch()?,
-                            )
-                            .await?,
+                            &execute_parameterized_query(&mut client, &ids_sql(&literal), batch()?)
+                                .await?,
                         );
                         assert_eq!(bound, lit, "[{label}] {column} = $1 vs literal");
 
