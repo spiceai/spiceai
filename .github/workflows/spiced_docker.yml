@@ -440,13 +440,6 @@ jobs:
     env:
       CUDA_COMPUTE_CAP: 80
     steps:
-      - name: Free disk space
-        # The CUDA base is ~3 GB compressed and is stored packed, unpacked, exported and loaded.
-        run: |
-          df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h /
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
