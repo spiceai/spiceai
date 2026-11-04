@@ -1,0 +1,190 @@
+name: BigQuery workload identity federation test
+
+# Temporary: proves a GitHub OIDC `external_account` credential works through the
+# ADBC BigQuery `json_credential_string` parameter. Not for merge.
+on:
+  push:
+    branches:
+      - sgrebnov/bigquery-wif-test
+
+permissions:
+  contents: read
+
+env:
+  WIF_PROVIDER: projects/198677639031/locations/global/workloadIdentityPools/github-actions-test/providers/github
+  WIF_SERVICE_ACCOUNT: spiceai-testing-bq@spiceai-testing.iam.gserviceaccount.com
+  SPICED_RELEASE: v2.4.1
+  SPICEPOD: test/spicepods/tpch/sf1/federated/adbc[bigquery].yaml
+
+jobs:
+  wif:
+    name: BigQuery via workload identity federation
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Authenticate with workload identity federation
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.WIF_SERVICE_ACCOUNT }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Show the credential's shape (no values)
+        env:
+          CREDS: ${{ steps.auth.outputs.credentials_file_path }}
+        run: |
+          set -euo pipefail
+          jq '{type, audience, subject_token_type, token_url,
+               service_account_impersonation_url,
+               credential_source_keys: (.credential_source | keys),
+               credential_source_url_host: (.credential_source.url | capture("^https://(?<h>[^/]+)").h),
+               credential_source_format: .credential_source.format}' "$CREDS"
+          if grep -q ';' "$CREDS"; then
+            echo "::error::credential JSON contains ';', which adbc_driver_options would split on"
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Query BigQuery with Google's client library (ADC)
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/bq-venv"
+          "$RUNNER_TEMP/bq-venv/bin/python" -m pip install --quiet google-cloud-bigquery==3.38.0
+          "$RUNNER_TEMP/bq-venv/bin/python" - <<'PY'
+          import google.auth
+          from google.cloud import bigquery
+          creds, project = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+          print("credential class:", type(creds).__module__ + "." + type(creds).__name__)
+          print("impersonates:", getattr(creds, "service_account_email", None))
+          rows = list(bigquery.Client(project="spiceai-testing", credentials=creds)
+                      .query("SELECT COUNT(*) AS n FROM `spiceai-testing.tpch_sf1.nation`").result())
+          n = rows[0]["n"]
+          print("nation rows:", n)
+          assert n == 25, f"expected 25 nation rows (TPC-H spec), got {n}"
+          PY
+
+      - name: Negative check - a credential for an unknown provider is refused
+        env:
+          CREDS: ${{ steps.auth.outputs.credentials_file_path }}
+        run: |
+          set -euo pipefail
+          bad="$RUNNER_TEMP/bad-audience.json"
+          jq '.audience |= sub("providers/github$"; "providers/does-not-exist")' "$CREDS" > "$bad"
+          set +e
+          GOOGLE_APPLICATION_CREDENTIALS="$bad" "$RUNNER_TEMP/bq-venv/bin/python" - <<'PY'
+          import google.auth, google.auth.transport.requests
+          creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+          creds.refresh(google.auth.transport.requests.Request())
+          print("UNEXPECTED: token issued")
+          PY
+          rc=$?
+          set -e
+          rm -f "$bad"
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::a credential naming an unknown provider was accepted"
+            exit 1
+          fi
+          echo "refused as expected (exit $rc)"
+
+      - name: Put the credential in BIGQUERY_SERVICE_ACCOUNT_JSON (10-minute token lifetime)
+        env:
+          CREDS: ${{ steps.auth.outputs.credentials_file_path }}
+        run: |
+          set -euo pipefail
+          json="$(jq -c '. + {service_account_impersonation: {token_lifetime_seconds: 600}}' "$CREDS")"
+          echo "::add-mask::$json"
+          echo "BIGQUERY_SERVICE_ACCOUNT_JSON=$json" >> "$GITHUB_ENV"
+
+      - name: Set up ADBC BigQuery driver
+        uses: ./.github/actions/setup-adbc-bigquery
+
+      - name: Install released spiced
+        uses: ./.github/actions/setup-released-spiced
+        with:
+          release: ${{ env.SPICED_RELEASE }}
+          spicepod_file: ${{ env.SPICEPOD }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start spiced on the unchanged adbc[bigquery] spicepod
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/app"
+          mkdir -p "$app"
+          cp "$SPICEPOD" "$app/spicepod.yaml"
+          grep -n 'adbc_driver_options' "$app/spicepod.yaml" | head -1
+          cd "$app"
+          # Hide the ADC variables the auth step exported, so the driver can only use the
+          # credential passed through json_credential_string.
+          nohup env -u GOOGLE_APPLICATION_CREDENTIALS -u CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE \
+            -u GOOGLE_GHA_CREDS_PATH spiced > "$RUNNER_TEMP/spiced.log" 2>&1 &
+          for i in $(seq 1 120); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/v1/ready || true)"
+            if [ "$code" = "200" ]; then echo "ready after ${i}x5s"; exit 0; fi
+            sleep 5
+          done
+          echo "::error::spiced not ready after 10 minutes (last /v1/ready status: $code)"
+          tail -n 50 "$RUNNER_TEMP/spiced.log"
+          exit 1
+
+      - name: Query through spiced (first token)
+        run: |
+          set -euo pipefail
+          q() {
+            curl -sf -X POST http://127.0.0.1:8090/v1/sql \
+              -H 'Content-Type: text/plain' -H 'Cache-Control: no-cache' -d "$1"
+          }
+          nation="$(q "SELECT COUNT(*) AS n, 'first' AS pass FROM nation" | jq -r '.[0].n')"
+          lineitem="$(q "SELECT COUNT(*) AS n, 'first' AS pass FROM lineitem" | jq -r '.[0].n')"
+          echo "nation=$nation lineitem=$lineitem at $(date -u +%FT%TZ)"
+          [ "$nation" = "25" ] || { echo "::error::expected 25 nation rows, got $nation"; exit 1; }
+          [ "$lineitem" = "6001215" ] || { echo "::error::expected 6001215 lineitem rows, got $lineitem"; exit 1; }
+          date +%s > "$RUNNER_TEMP/first_query_epoch"
+
+      - name: Wait past the 10-minute token lifetime
+        # Time is what is under test here: the first service-account token must expire
+        # so the next query needs a token the library fetched again without a key.
+        run: |
+          set -euo pipefail
+          first="$(cat "$RUNNER_TEMP/first_query_epoch")"
+          target=$((first + 660))
+          now="$(date +%s)"
+          if [ "$target" -gt "$now" ]; then sleep $((target - now)); fi
+          echo "waited until $(date -u +%FT%TZ), $(( $(date +%s) - first ))s after the first query"
+
+      - name: Query through spiced again (renewed token)
+        run: |
+          set -euo pipefail
+          q() {
+            curl -sf -X POST http://127.0.0.1:8090/v1/sql \
+              -H 'Content-Type: text/plain' -H 'Cache-Control: no-cache' -d "$1"
+          }
+          nation="$(q "SELECT COUNT(*) AS n, 'second' AS pass FROM nation" | jq -r '.[0].n')"
+          region="$(q "SELECT COUNT(*) AS n, 'second' AS pass FROM region" | jq -r '.[0].n')"
+          echo "nation=$nation region=$region at $(date -u +%FT%TZ)"
+          [ "$nation" = "25" ] || { echo "::error::expected 25 nation rows, got $nation"; exit 1; }
+          [ "$region" = "5" ] || { echo "::error::expected 5 region rows, got $region"; exit 1; }
+
+      - name: spiced log
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/spiced.log" ]; then
+            grep -iE 'bigquery|adbc|error|warn' "$RUNNER_TEMP/spiced.log" | grep -v 'Usage telemetry' | tail -n 60 || true
+          fi
+
+      - name: Stop spiced
+        if: always()
+        run: pkill -x spiced || true
