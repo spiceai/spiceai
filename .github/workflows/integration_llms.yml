@@ -177,6 +177,8 @@ jobs:
     needs: [build, setup-matrix]
     # Slowest observed success in the 2026-07-25..08-08 window: 4 min.
     timeout-minutes: 90
+    # The provider credentials these tests read are in the `ci` environment, as on trunk.
+    environment: ci
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
       TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
