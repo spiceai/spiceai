@@ -1178,7 +1178,10 @@ jobs:
     # 60 is kept deliberately as a stuck-runner backstop, 6.7x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    permissions: read-all
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1220,14 +1223,20 @@ jobs:
       - name: Run AWS SDK credential bridge integration test
         env:
           AWS_EC2_METADATA_DISABLED: true
-          AWS_S3_CLIENT_ID: ${{ secrets.AWS_S3_CLIENT_ID }}
-          AWS_S3_IDENTITY_POOL_ID: ${{ secrets.AWS_S3_IDENTITY_POOL_ID }}
-          AWS_S3_USERNAME: ${{ secrets.AWS_S3_USERNAME }}
-          AWS_S3_PASSWORD: ${{ secrets.AWS_S3_PASSWORD }}
-          AWS_COGNITO_IDP_URI: ${{ vars.AWS_COGNITO_IDP_URI }}
           AWS_REGION: ${{ vars.AWS_REGION }}
-          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          AWS_ROLE_ARN: ${{ vars.AWS_WEB_IDENTITY_TEST_ROLE_ARN }}
+        # A GitHub OIDC token lives 5 minutes, enough for these tests' STS exchanges.
         run: |
+          set -euo pipefail
+          export AWS_WEB_IDENTITY_TOKEN_FILE="${RUNNER_TEMP}/aws-web-identity-token"
+          trap 'rm -f "$AWS_WEB_IDENTITY_TOKEN_FILE"' EXIT
+          umask 077
+          # The request token goes to curl on stdin, out of the process list.
+          printf 'header = "Authorization: bearer %s"\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" |
+            curl --config - --fail --silent --show-error --max-time 30 \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" |
+            python3 -c 'import json, sys; sys.stdout.write(json.load(sys.stdin)["value"])' \
+              > "$AWS_WEB_IDENTITY_TOKEN_FILE"
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=aws-sdk-credential-bridge::credential_provider)'
 
   test-snapshot-refresh:
