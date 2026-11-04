@@ -1262,6 +1262,154 @@ mod flight_prepared_statements {
             .await
     }
 
+    /// Matrix for timestamp parameters bound over Flight SQL (#15739).
+    ///
+    /// Each parameter (UTC, `America/Los_Angeles`, `Asia/Kolkata` and naive) is
+    /// compared with zoned columns of two units and with a naive column. A zoned
+    /// parameter must match the row for its instant, return the same rows as the
+    /// equivalent literal, and keep its zone in `arrow_typeof($1)`. Rows 2 and 3
+    /// hold the Los Angeles and Kolkata wall-clock times read as UTC, so a
+    /// parameter whose zone is dropped matches the wrong row.
+    #[tokio::test]
+    async fn test_timestamp_parameter_matrix() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+
+        test_request_context()
+            .scope(async {
+                use arrow::array::TimestampMicrosecondArray;
+                use arrow::datatypes::{DataType, TimeUnit};
+
+                let (channel, _df) = start_spice_test_app(None, None, None).await?;
+                let mut client = FlightSqlServiceClient::new(channel);
+
+                // (id, instant, naive wall clock): 10:00Z is 03:00 in Los Angeles
+                // (DST starts that instant) and 15:30 in Kolkata.
+                let rows = [
+                    (1, "2026-03-08T10:00:00Z", "2026-03-08T10:00:00"),
+                    (2, "2026-03-08T03:00:00Z", "2026-03-08T03:00:00"),
+                    (3, "2026-03-08T15:30:00Z", "2026-03-08T15:30:00"),
+                ];
+                let values = rows
+                    .iter()
+                    .map(|(id, instant, naive)| {
+                        format!(
+                            "({id}, \
+                             arrow_cast('{instant}', 'Timestamp(ns, \"UTC\")'), \
+                             arrow_cast('{instant}', 'Timestamp(µs, \"America/Los_Angeles\")'), \
+                             arrow_cast('{instant}', 'Timestamp(µs, \"UTC\")'), \
+                             arrow_cast('{naive}', 'Timestamp(µs)'))"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let table = format!(
+                    "WITH t(id, ts_utc, ts_la, ts_us, ts_naive) AS (VALUES {values})"
+                );
+
+                // 2026-03-08T10:00:00Z
+                let instant_us = 1_772_964_000_000_000_i64;
+                // (label, zone, literal text for the same value)
+                let params: [(&str, Option<&str>, &str); 4] = [
+                    ("utc", Some("UTC"), "2026-03-08T10:00:00Z"),
+                    ("la", Some("America/Los_Angeles"), "2026-03-08T10:00:00Z"),
+                    ("kolkata", Some("Asia/Kolkata"), "2026-03-08T10:00:00Z"),
+                    ("naive", None, "2026-03-08T10:00:00"),
+                ];
+
+                for (label, zone, literal_text) in params {
+                    let array = TimestampMicrosecondArray::from(vec![instant_us]);
+                    let array = match zone {
+                        Some(zone) => array.with_timezone(zone),
+                        None => array,
+                    };
+                    let param_type =
+                        DataType::Timestamp(TimeUnit::Microsecond, zone.map(Into::into));
+                    let batch = || {
+                        create_param_batch(
+                            vec![("$1", param_type.clone(), false)],
+                            vec![Arc::new(array.clone()) as ArrayRef],
+                        )
+                    };
+                    let literal = format!("arrow_cast('{literal_text}', '{param_type}')");
+
+                    // The bound type keeps its zone, as the literal's does.
+                    let typeof_sql = format!(
+                        "SELECT arrow_typeof($1) AS p, arrow_typeof({literal}) AS l"
+                    );
+                    let results =
+                        execute_parameterized_query(&mut client, &typeof_sql, batch()?).await?;
+                    let (bound, lit) = string_pair(&results)?;
+                    assert_eq!(bound, lit, "[{label}] arrow_typeof($1)");
+                    if let Some(zone) = zone {
+                        assert!(bound.contains(zone), "[{label}] zone dropped: {bound}");
+                    }
+
+                    for column in ["ts_utc", "ts_la", "ts_us", "ts_naive"] {
+                        let ids_sql = |rhs: &str| {
+                            format!(
+                                "{table} SELECT id FROM t WHERE {column} = {rhs} ORDER BY id"
+                            )
+                        };
+                        let bound = ids_of(
+                            &execute_parameterized_query(&mut client, &ids_sql("$1"), batch()?)
+                                .await?,
+                        );
+                        let lit = ids_of(
+                            &execute_parameterized_query(
+                                &mut client,
+                                &ids_sql(&literal),
+                                batch()?,
+                            )
+                            .await?,
+                        );
+                        assert_eq!(bound, lit, "[{label}] {column} = $1 vs literal");
+
+                        let expected_instant = zone.is_some() && column != "ts_naive";
+                        let expected_naive = zone.is_none() && column == "ts_naive";
+                        if expected_instant || expected_naive {
+                            assert_eq!(bound, vec![1], "[{label}] {column} = $1");
+                        }
+                    }
+                }
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// The first two Utf8 columns of the first row.
+    fn string_pair(batches: &[RecordBatch]) -> Result<(String, String), anyhow::Error> {
+        let batch = batches
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no batches"))?;
+        let col = |i: usize| -> Result<String, anyhow::Error> {
+            let array = arrow::compute::cast(batch.column(i), &arrow::datatypes::DataType::Utf8)?;
+            let array = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("column {i} is not Utf8"))?;
+            Ok(array.value(0).to_string())
+        };
+        Ok((col(0)?, col(1)?))
+    }
+
+    /// The `id` column of every returned batch, as i64.
+    fn ids_of(batches: &[RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = arrow::compute::cast(batch.column(0), &arrow::datatypes::DataType::Int64)
+                    .expect("id casts to Int64");
+                ids.as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64")
+                    .iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// A stale-while-revalidate revalidation of a Flight SQL prepared statement
     /// must re-bind its parameter values.
     ///
