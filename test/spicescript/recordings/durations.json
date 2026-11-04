@@ -29,6 +29,7 @@
   "connector-errors": 44,
   "cron-and-reload": 15,
   "csv-header-binding": 32,
+  "databricks-credentials": 21,
   "debezium-direct": 10,
   "debezium-kafka": 62,
   "debezium-offset-recovery": 34,
