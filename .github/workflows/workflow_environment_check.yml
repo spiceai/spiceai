@@ -22,6 +22,15 @@ on:
       - trunk
     paths:
       - '.github/**'
+  # Fork pull requests skip the job below, so the merge queue checks their
+  # workflow changes before they land. `merge_group` takes no path filter, and
+  # the check takes seconds.
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
   workflow_dispatch:
 
 concurrency:
@@ -33,6 +42,9 @@ jobs:
     environment: secret-free
     name: Every workflow job selects an environment
     runs-on: spiceai-dev-runners
+    # Self-hosted pool: skip PRs from forks so an approved fork run does not
+    # execute here. Non-PR events and same-repo PRs still run.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     # Reads the checkout and nothing else.
     permissions:
       contents: read
