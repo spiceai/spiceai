@@ -1,0 +1,45 @@
+[package]
+name = "chrono"
+# Must stay semver-compatible with 0.4: the root `[patch.crates-io]` entry only
+# applies to dependents whose `chrono` requirement this version satisfies.
+version = "0.4.45"
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+# The code is chrono's: the upstream URL keeps chrono in acknowledgements.md,
+# whose generator (`make display-deps`) leaves out github.com/spiceai crates.
+repository = "https://github.com/chronotope/chrono"
+description = "Date and time types for Spice.ai, from the part of chrono 0.4.45 that Spice uses"
+autotests = false
+
+[dependencies]
+serde.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Names the system time zone when `TZ` is unset; `Local` then reads its TZif file.
+iana-time-zone = { version = "0.1.45", features = ["fallback"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-link = "0.2"
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[features]
+# Dependents still request these crates.io `chrono` 0.4 features. Everything
+# they enabled is always built, so all of them are no-ops.
+alloc = []
+clock = []
+default = []
+now = []
+oldtime = []
+serde = []
+std = []
+wasmbind = []
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[lints]
+workspace = true

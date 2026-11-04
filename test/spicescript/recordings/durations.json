@@ -61,6 +61,7 @@
   "freshness-status": 33,
   "full-refresh-chaos": 41,
   "full-refresh-outage": 53,
+  "github-app-key-service": 9,
   "graceful-shutdown": 49,
   "groupby-join-key-dependency": 4,
   "http-caching": 31,
