@@ -1418,7 +1418,7 @@ impl Default for RateLimits {
 mod tests {
     use super::*;
     use arrow::array::{
-        ArrayRef, DictionaryArray, Int64Array, StringArray, StringViewArray, StructArray,
+        Array, ArrayRef, DictionaryArray, Int64Array, StringArray, StringViewArray, StructArray,
     };
     use arrow::datatypes::{Field, Fields, Int32Type, SchemaRef};
     use datafusion::execution::SendableRecordBatchStream;
