@@ -902,11 +902,14 @@ jobs:
     # 34948795744). The two bounded steps below sum to 32, and everything else
     # in the job has taken at most 4.7 min in the same window.
     timeout-minutes: 40
+    # The Entra app that signs the organization App token trusts this environment.
+    environment: ci-integration
     permissions:
       # GitHub's GraphQL stargazers connection rejects contents: read, including
       # read-all. The read query requires contents: write on GITHUB_TOKEN.
       # Reproduction: https://github.com/spiceai/spiceai/actions/runs/34186688336
       contents: write
+      id-token: write
     # Shared with the live E2E smoke test: API quotas span processes and runs.
     concurrency:
       group: github-connector-live-api
@@ -959,14 +962,16 @@ jobs:
 
       - name: Set up Github Token
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v2
+        uses: ./.github/actions/key-vault-app-token
         id: github-app-token
         with:
           app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
-          private-key: ${{ secrets.ORG_MEMBERS_GITHUB_PRIVATE_KEY }}
-          owner: spiceai
-          repositories: |
-            spiceai
+          installation-id: ${{ vars.ORG_MEMBERS_GITHUB_INSTALLATION_ID }}
+          key-id: ${{ vars.ORG_MEMBERS_KEY_ID }}
+          azure-client-id: ${{ vars.ORG_MEMBERS_AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ vars.ORG_MEMBERS_AZURE_TENANT_ID }}
+          repositories: spiceai
+          permissions: '{"members": "read", "metadata": "read"}'
 
       - name: Run every GitHub connector integration test
         timeout-minutes: 30
@@ -975,9 +980,6 @@ jobs:
           SPICE_GITHUB_TEST_REQUIRED: '1'
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_ORG_TOKEN: ${{ steps.github-app-token.outputs.token }}
-          GITHUB_CLIENT_ID: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
-          GITHUB_INSTALLATION_ID: ${{ steps.github-app-token.outputs.installation-id }}
-          GITHUB_PRIVATE_KEY: ${{ secrets.ORG_MEMBERS_GITHUB_PRIVATE_KEY }}
           INSTA_WORKSPACE_ROOT: ${{ github.workspace }}
           CARGO_MANIFEST_DIR: ${{ github.workspace }}
         run: |
