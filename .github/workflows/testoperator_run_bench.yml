@@ -129,6 +129,18 @@ jobs:
     name: Run benchmark e2e tests
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
+    # Holds the BigQuery workload identity federation IDs (`BIGQUERY_*` secrets).
+    environment: ci
+    permissions:
+      contents: write
+      pull-requests: write
+      # Labels the snapshot PR.
+      issues: write
+      # Approves the snapshot PR's held pull_request runs.
+      actions: write
+      # Exchanged for a Google Cloud token that creates the run's BigQuery key: workload identity
+      # federation.
+      id-token: write
     services:
       mssql_tpch:
         image: ${{ contains(github.event.inputs.spicepod_path, 'mssql') && 'ghcr.io/spiceai/spice-mssql-bench:latest' || '' }}
@@ -445,6 +457,15 @@ jobs:
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
         uses: ./.github/actions/setup-adbc-bigquery
 
+      - name: Create the run's BigQuery service account key
+        if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
+        uses: ./.github/actions/bigquery-service-account-key
+        with:
+          mode: create
+          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
+          minter-service-account: ${{ secrets.BIGQUERY_KEY_MINTER_SERVICE_ACCOUNT }}
+          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
+
       # duckdb: and ducklake: datasets load the installed DuckDB through ADBC.
       - name: Install libduckdb
         if: ${{ contains(github.event.inputs.spicepod_path, 'duckdb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
@@ -671,7 +692,6 @@ jobs:
           AWS_DYNAMODB_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'http://127.0.0.1:9000' || '' }}
           AWS_ALLOW_HTTP: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'true' || '' }}
-          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
           DUCKLAKE_CONNECTION_STRING: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'postgres:dbname=ducklake_catalog host=localhost user=postgres password=postgres' || '' }}
           GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
@@ -710,6 +730,15 @@ jobs:
           SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
           SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
           CHBENCH_PG_HOST: 127.0.0.1
+
+      - name: Delete the run's BigQuery service account key
+        if: ${{ always() && contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
+        uses: ./.github/actions/bigquery-service-account-key
+        with:
+          mode: delete
+          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
+          minter-service-account: ${{ secrets.BIGQUERY_KEY_MINTER_SERVICE_ACCOUNT }}
+          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
 
       - name: Install GH CLI
         if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'

@@ -1,0 +1,33 @@
+name: BigQuery service account key
+description: >-
+  Creates a service account key for the BigQuery tests that lasts one job, or deletes it. Signs in
+  to Google Cloud with the job's GitHub OIDC token (workload identity federation), so CI stores no
+  BigQuery key. The job needs `environment: ci` and `permissions: id-token: write`; pull requests
+  from forks get no OIDC token. `create` exports BIGQUERY_SERVICE_ACCOUNT_JSON for the steps that
+  follow. Run `delete` in an `if: always()` step after the last step that uses the key.
+
+inputs:
+  mode:
+    description: "'create' or 'delete'."
+    required: true
+  workload-identity-provider:
+    description: Full resource name of the Google Cloud workload identity provider that trusts the job.
+    required: true
+  minter-service-account:
+    description: Service account the job acts as. It may only create and delete keys of `service-account`.
+    required: true
+  service-account:
+    description: Service account the BigQuery tests run as.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: ${{ inputs.mode == 'delete' && 'Delete' || 'Create' }} the BigQuery service account key
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        WIF_PROVIDER: ${{ inputs.workload-identity-provider }}
+        MINTER_SERVICE_ACCOUNT: ${{ inputs.minter-service-account }}
+        SERVICE_ACCOUNT: ${{ inputs.service-account }}
+      run: '"${GITHUB_ACTION_PATH}/key.sh" "${MODE}"'

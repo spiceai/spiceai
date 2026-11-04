@@ -84,6 +84,13 @@ jobs:
   run-throughput:
     name: Run throughput test
     runs-on: ${{ github.event.inputs.runner_type }}
+    # Holds the BigQuery workload identity federation IDs (`BIGQUERY_*` secrets).
+    environment: ci
+    permissions:
+      contents: read
+      # Exchanged for a Google Cloud token that creates the run's BigQuery key: workload identity
+      # federation.
+      id-token: write
     services:
       # Local, ephemeral PostgreSQL for TPC-H/TPC-DS SF1/SF10, seeded by the
       # "Seed postgres..." step below; SF100+ targets the externally
@@ -299,6 +306,15 @@ jobs:
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
         uses: ./.github/actions/setup-adbc-bigquery
 
+      - name: Create the run's BigQuery service account key
+        if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
+        uses: ./.github/actions/bigquery-service-account-key
+        with:
+          mode: create
+          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
+          minter-service-account: ${{ secrets.BIGQUERY_KEY_MINTER_SERVICE_ACCOUNT }}
+          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
+
       - name: Set up Python
         if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') }}
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -365,7 +381,15 @@ jobs:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           MONGODB_HOST: ${{ vars.TEST_MONGODB_HOST }}
           MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
-          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
           SCYLLADB_HOST: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '127.0.0.1' || '' }}
           SCYLLADB_PORT: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && '9042' || '' }}
           SCYLLADB_KEYSPACE: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') && 'tpch_sf1' || '' }}
+
+      - name: Delete the run's BigQuery service account key
+        if: ${{ always() && contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
+        uses: ./.github/actions/bigquery-service-account-key
+        with:
+          mode: delete
+          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
+          minter-service-account: ${{ secrets.BIGQUERY_KEY_MINTER_SERVICE_ACCOUNT }}
+          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
