@@ -203,7 +203,7 @@ jobs:
 
       - name: Get RustFS credentials
         id: rustfs
-        if: env.HAS_RUSTFS_ACCESS == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
@@ -387,7 +387,7 @@ jobs:
 
       - name: Get RustFS credentials
         id: rustfs
-        if: env.HAS_RUSTFS_ACCESS == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/rustfs-credentials
         with:
           endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
