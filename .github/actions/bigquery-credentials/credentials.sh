@@ -28,8 +28,9 @@ sts_audience="//iam.googleapis.com/${WIF_PROVIDER}"
 impersonation_url="https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${SERVICE_ACCOUNT}:generateAccessToken"
 
 # Google APIs report `{"error": {"message": …}}`; STS reports `{"error": "…", "error_description": "…"}`.
+# The trailing period is dropped because the message is quoted mid-sentence.
 google_error() {
-  jq -r 'if (.error | type) == "object" then .error.message else (.error_description // .error) end // "no error message"' \
+  jq -r '(if (.error | type) == "object" then .error.message else (.error_description // .error) end // "no error message") | sub("\\.$"; "")' \
     <<<"$1" 2>/dev/null || printf '%s' "$1"
 }
 

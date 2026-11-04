@@ -284,6 +284,8 @@ jobs:
     env:
       SPICED_BIN: ${{ github.workspace }}/build/spiced
       ADBC_BIGQUERY_DRIVER_PATH: /etc/adbc/drivers/libadbc_driver_bigquery.so
+      # The workload identity federation credential names no project.
+      BIGQUERY_PROJECT_ID: spiceai-testing
       BIGQUERY_TEST_CLEANUP: always
       BIGQUERY_EXPECT: single
     steps:
