@@ -1,11 +1,33 @@
 import os
 import re
+import sys
+
+with open("version.txt") as f:
+    version = f.read()
+releaseVersion = version.strip()
+
+# Release jobs publish to tag 'v$REL_VERSION'. On a tag run, a version.txt that
+# disagrees with the tag would publish this build into a different release, so
+# stop before anything reaches $GITHUB_ENV.
+if os.getenv("GITHUB_REF_TYPE") == "tag":
+    tag = os.getenv("GITHUB_REF_NAME", "")
+    expectedTag = "v{}".format(releaseVersion)
+    if tag != expectedTag:
+        print(
+            "::error title=Tag does not match version.txt::Tag '{tag}' does not match "
+            "version.txt '{version}' (expected tag '{expected}'), so a release from "
+            "this tag would publish to '{expected}' instead of '{tag}'. Bump "
+            "version.txt to '{tagVersion}' and move tag '{tag}' to that commit, or "
+            "move the tag to a commit whose version.txt is '{tagVersion}'.".format(
+                tag=tag,
+                version=releaseVersion,
+                expected=expectedTag,
+                tagVersion=tag[1:] if tag.startswith("v") else tag,
+            )
+        )
+        sys.exit(1)
 
 with open(os.getenv("GITHUB_ENV"), "a") as githubEnv:
-    with open("version.txt") as f:
-        version = f.read()
-    releaseVersion = version.strip()
-
     releaseNotePath = "docs/release_notes/v{}.md".format(releaseVersion)
 
     print("Checking if {} exists".format(releaseNotePath))
