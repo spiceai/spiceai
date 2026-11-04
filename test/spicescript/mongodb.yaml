@@ -9,7 +9,7 @@ description: >
 sources:
   mongo:
     kind: docker
-    image: docker.io/library/mongo:8.0
+    image: docker.io/library/mongo:9.0
     ports: [27017]
     command: [mongod, --replSet, rs0, --bind_ip_all]
     # Initiates the replica set on the first probe; ready once it accepts
