@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import http.client
 import json
 import os
 import sys
@@ -35,7 +36,7 @@ def request(service, url, body=None, headers=None):
             if err.code != 429 and err.code < 500:
                 fail(f"{service} refused the request: HTTP {err.code}: {error_detail(err)}")
             failure = f"HTTP {err.code}"
-        except (urllib.error.URLError, TimeoutError) as err:
+        except (OSError, http.client.HTTPException) as err:
             failure = str(err)
         print(f"{service} attempt {attempt} of {ATTEMPTS} failed: {failure}", flush=True)
         if attempt < ATTEMPTS:
