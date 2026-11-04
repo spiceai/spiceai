@@ -63,9 +63,10 @@ jobs:
     # other event: a debug build of the harness, then an SF 1 run that takes
     # about 11 seconds.
     runs-on: ${{ github.event_name == 'merge_group' && 'spiceai-macos-large' || 'spiceai-macos' }}
+    environment: ci-build
     timeout-minutes: 60
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
       # MinIO is only the fallback cache, and only on push: merge_group checks
       # out the queue merge commit, which contains the queued pull request, and
       # a spiceio miss must not fall through to those credentials.
@@ -99,7 +100,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
