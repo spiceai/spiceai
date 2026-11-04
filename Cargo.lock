@@ -20454,6 +20454,7 @@ dependencies = [
  "futures",
  "iceberg",
  "iceberg-storage-opendal",
+ "jsonwebtoken",
  "libc",
  "llms-llamacpp",
  "mimalloc",
