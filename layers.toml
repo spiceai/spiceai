@@ -233,8 +233,11 @@ connector-postgres-common = "shared-utility"
 # (crates/ libraries whose full normal-dep closure stays within foundation.)
 ansi_colors = "foundation"
 arrow_tools = "foundation"
+aws-kms-signer = "foundation"
+azure-key-vault-signer = "foundation"
 aws-sdk-credential-bridge = "foundation"
 backoff = "foundation"
+chrono = "foundation"
 chunking = "foundation"
 # Shared by implementations outside this repo via a git dependency, so its
 # dependency closure has to stay small — foundation is also a budget here.
