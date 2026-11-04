@@ -1,7 +1,8 @@
 name: BigQuery workload identity federation test
 
-# Temporary: proves the spiceai-ci-github-actions provider refuses a job outside the ci
-# environment. Not for merge.
+# Temporary: runs the e2e_test_ci `test-bigquery` job's steps from the PR branch against the
+# latest trunk spiced build, because that job cannot run while the e2e macOS build is failing.
+# Not for merge.
 on:
   push:
     branches:
@@ -11,36 +12,111 @@ permissions:
   contents: read
 
 jobs:
-  outside-ci:
-    name: Job outside the ci environment is refused
+  test-bigquery:
+    name: BigQuery Regression Tests (e2e job steps, trunk spiced)
     runs-on: spiceai-dev-runners
-    timeout-minutes: 10
+    timeout-minutes: 90
+    environment: ci
     permissions:
       contents: read
       id-token: write
+    env:
+      SPICED_BIN: /usr/local/bin/spiced
+      ADBC_BIGQUERY_DRIVER_PATH: /etc/adbc/drivers/libadbc_driver_bigquery.so
+      BIGQUERY_TEST_CLEANUP: always
+      BIGQUERY_EXPECT: single
     steps:
+      - name: Set test output paths
+        id: test_env
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'BIGQUERY_GATE_OUTPUT=%s/bigquery-regression-%s-%s\n' \
+            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          printf 'BIGQUERY_GATE_VENV=%s/bigquery-regression-venv-%s-%s\n' \
+            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: sgrebnov/bigquery-per-run-key
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Try to create a key without the ci environment
-        id: create
-        continue-on-error: true
+      - name: Create the run's BigQuery service account key
         uses: ./.github/actions/bigquery-service-account-key
         with:
           mode: create
-          workload-identity-provider: projects/198677639031/locations/global/workloadIdentityPools/spiceai-ci-github-actions/providers/github
-          minter-service-account: ci-bigquery-key-minter@spiceai-testing.iam.gserviceaccount.com
-          service-account: spiceai-testing-bq@spiceai-testing.iam.gserviceaccount.com
+          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
+          minter-service-account: ${{ secrets.BIGQUERY_KEY_MINTER_SERVICE_ACCOUNT }}
+          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
 
-      - name: Require the refusal
-        env:
-          OUTCOME: ${{ steps.create.outcome }}
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Setup spiced (latest trunk build)
+        uses: ./.github/actions/setup-spiced
+
+      - name: Prepare runtime
         run: |
-          echo "create outcome: ${OUTCOME}; key name: '${BIGQUERY_SERVICE_ACCOUNT_KEY_NAME:-}'"
-          if [ "${OUTCOME}" != failure ] || [ -n "${BIGQUERY_SERVICE_ACCOUNT_KEY_NAME:-}" ]; then
-            echo "::error::a job outside the ci environment was not refused"
-            exit 1
-          fi
+          "$SPICED_BIN" --version
+
+      - name: Set up ADBC BigQuery driver
+        uses: ./.github/actions/setup-adbc-bigquery
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Install BigQuery test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$BIGQUERY_GATE_VENV"
+          "$BIGQUERY_GATE_VENV/bin/python" -m pip install google-cloud-bigquery==3.38.0
+
+      - name: Validate the BigQuery corpus harness
+        run: '"$BIGQUERY_GATE_VENV/bin/python" test/scripts/bigquery_corpus.py --self-test'
+
+      - name: Run BigQuery regression tests
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$BIGQUERY_GATE_OUTPUT"
+          failed=0
+          for suite in corpus federation pushdown json_pushdown; do
+            if ! BIGQUERY_TEST_OUTPUT="$BIGQUERY_GATE_OUTPUT/$suite" \
+              "$BIGQUERY_GATE_VENV/bin/python" "test/scripts/bigquery_${suite}.py"; then
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+      - name: Delete the run's BigQuery service account key
+        if: ${{ always() }}
+        uses: ./.github/actions/bigquery-service-account-key
+        with:
+          mode: delete
+          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
+          minter-service-account: ${{ secrets.BIGQUERY_KEY_MINTER_SERVICE_ACCOUNT }}
+          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
+
+      - name: Upload BigQuery test evidence
+        if: ${{ always() && steps.test_env.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: bigquery-regression-evidence
+          path: ${{ env.BIGQUERY_GATE_OUTPUT }}
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove the test Python environment
+        if: ${{ always() && steps.test_env.outcome == 'success' }}
+        shell: bash
+        run: rm -rf -- "$BIGQUERY_GATE_VENV"
+
