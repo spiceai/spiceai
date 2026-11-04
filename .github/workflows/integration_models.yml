@@ -79,7 +79,6 @@ jobs:
         if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Set up Nextest
@@ -676,7 +675,6 @@ jobs:
         if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Set up Nextest

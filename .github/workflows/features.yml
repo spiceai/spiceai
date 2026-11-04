@@ -97,7 +97,6 @@ jobs:
         if: runner.os == 'macOS' && env.SCCACHE_SETUP == 'true' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Cache cargo-hack binary
