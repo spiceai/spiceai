@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
+repository.workspace = true
 description = "Git data connector for Spice.ai runtime"
 
 [dependencies]
