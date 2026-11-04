@@ -133,8 +133,10 @@ jobs:
       actions: write  # approves the held runs of its snapshot PR
       contents: write  # pushes a snapshot branch
       pull-requests: write  # and opens or auto-merges its PR
-      id-token: write  # RustFS credentials
+      id-token: write  # RustFS credentials, and Google Cloud access tokens for the BigQuery tests
     timeout-minutes: 600
+    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
+    environment: ci
     services:
       mssql_tpch:
         image: ${{ contains(github.event.inputs.spicepod_path, 'mssql') && 'ghcr.io/spiceai/spice-mssql-bench:latest' || '' }}
@@ -437,6 +439,13 @@ jobs:
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
         uses: ./.github/actions/setup-adbc-bigquery
 
+      - name: Set up BigQuery credentials (workload identity federation)
+        if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
+        uses: ./.github/actions/bigquery-credentials
+        with:
+          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
+          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
+
       - name: Set up Python
         if: ${{ contains(github.event.inputs.spicepod_path, 'scylladb') || contains(github.event.inputs.spicepod_path, 'ducklake') }}
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -648,7 +657,6 @@ jobs:
           AWS_DYNAMODB_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'http://127.0.0.1:9000' || '' }}
           AWS_ALLOW_HTTP: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'true' || '' }}
-          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
           DUCKLAKE_CONNECTION_STRING: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'postgres:dbname=ducklake_catalog host=localhost user=postgres password=postgres' || '' }}
           GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
