@@ -213,9 +213,9 @@ mod tests {
     /// can represent", and a Cayenne dataset holding the sentinel never loaded. The filter
     /// checks that pruning on an out-of-calendar statistic still keeps the matching rows.
     #[rstest]
-    #[case::seconds(datafusion::arrow::datatypes::TimeUnit::Second, &[-377_705_203_200, -62_135_596_800, 253_402_214_400, 253_402_300_799])]
-    #[case::milliseconds(datafusion::arrow::datatypes::TimeUnit::Millisecond, &[-377_705_203_200_000, -62_135_596_800_000, 253_402_214_400_000, 253_402_300_799_999])]
-    #[case::microseconds(datafusion::arrow::datatypes::TimeUnit::Microsecond, &[-377_705_203_200_000_000, -62_135_596_800_000_000, 253_402_214_400_000_000, 253_402_300_799_999_999])]
+    #[case::seconds(datafusion::arrow::datatypes::TimeUnit::Second, &[-377_705_116_800, -62_135_596_800, 253_402_214_400, 253_402_300_799])]
+    #[case::milliseconds(datafusion::arrow::datatypes::TimeUnit::Millisecond, &[-377_705_116_800_000, -62_135_596_800_000, 253_402_214_400_000, 253_402_300_799_999])]
+    #[case::microseconds(datafusion::arrow::datatypes::TimeUnit::Microsecond, &[-377_705_116_800_000_000, -62_135_596_800_000_000, 253_402_214_400_000_000, 253_402_300_799_999_999])]
     #[case::nanoseconds(datafusion::arrow::datatypes::TimeUnit::Nanosecond, &[i64::MIN, -1, 0, i64::MAX])]
     #[tokio::test]
     async fn timestamps_at_the_type_limits_roundtrip_through_a_vortex_file(
