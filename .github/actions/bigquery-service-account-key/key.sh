@@ -36,8 +36,10 @@ request() {
   body="${response%$'\n'*}"
 }
 
+# Google APIs report `{"error": {"message": …}}`; STS reports `{"error": "…", "error_description": "…"}`.
 google_error() {
-  jq -r '.error.message // .error_description // .error // "no error message"' <<<"${body}" 2>/dev/null || printf '%s' "${body}"
+  jq -r 'if (.error | type) == "object" then .error.message else (.error_description // .error) end // "no error message"' \
+    <<<"${body}" 2>/dev/null || printf '%s' "${body}"
 }
 
 # Exchanges the job's GitHub OIDC token for a short-lived token of the minter service account; sets `token`.
