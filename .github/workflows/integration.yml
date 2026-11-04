@@ -337,7 +337,9 @@ jobs:
     if: ${{ github.event_name != 'pull_request' }}
     permissions:
       contents: write
+      id-token: write
     runs-on: spiceai-dev-runners
+    environment: ci
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 30.7 min (run
     # 34948795744, merge_group, 2026-09-15), p99 27.8 min. The two bounded steps
     # below sum to 60, and everything else in the job (image pulls, the archive
@@ -403,12 +405,14 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-libduckdb
 
+      # Pulls are anonymous, and rate limited, until the connection is configured.
       - name: Login to DockerHub
-        if: needs.check_changes.outputs.relevant_changes == 'true' && github.repository == 'spiceai/spiceai'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.repository == 'spiceai/spiceai' && vars.DOCKERHUB_OIDC_CONNECTIONID != ''
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Pull database images
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -561,6 +565,10 @@ jobs:
     needs: [build, check_changes]
     if: ${{ github.event_name != 'pull_request' && needs.check_changes.outputs.relevant_changes == 'true' && needs.check_changes.outputs.source_changes == 'true' && needs.check_changes.outputs.source_versions_matrix != '[]' }}
     runs-on: spiceai-dev-runners
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
     # The largest leg, PostgreSQL, ran its 85 tests in 4.3 minutes locally (six
     # threads, PostgreSQL 14, 2026-10-08), against 13.1 minutes at most for a
     # whole partition in CI; the bound leaves a cold runner room for the archive
@@ -615,12 +623,14 @@ jobs:
       - name: Install libduckdb
         uses: ./.github/actions/setup-libduckdb
 
+      # Pulls are anonymous, and rate limited, until the connection is configured.
       - name: Login to DockerHub
-        if: github.repository == 'spiceai/spiceai'
+        if: github.repository == 'spiceai/spiceai' && vars.DOCKERHUB_OIDC_CONNECTIONID != ''
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Pull ${{ matrix.source }} ${{ matrix.version }}
         env:
@@ -1065,14 +1075,6 @@ jobs:
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
 
-      - name: Login to ACR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
-        if: github.repository == 'spiceai/spiceai'
-        with:
-          registry: spiceaitestimages.azurecr.io
-          username: spiceai-repo-pull
-          password: ${{ secrets.AZCR_PASSWORD }}
-
       - name: Run AWS SDK integration test
         env:
           AWS_EC2_METADATA_DISABLED: true
@@ -1127,14 +1129,6 @@ jobs:
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
-
-      - name: Login to ACR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
-        if: github.repository == 'spiceai/spiceai'
-        with:
-          registry: spiceaitestimages.azurecr.io
-          username: spiceai-repo-pull
-          password: ${{ secrets.AZCR_PASSWORD }}
 
       - name: Run AWS SDK credential bridge integration test
         env:
@@ -1193,14 +1187,6 @@ jobs:
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
-
-      - name: Login to ACR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
-        if: github.repository == 'spiceai/spiceai'
-        with:
-          registry: spiceaitestimages.azurecr.io
-          username: spiceai-repo-pull
-          password: ${{ secrets.AZCR_PASSWORD }}
 
       - name: Run snapshot refresh integration tests
         env:
@@ -1307,14 +1293,6 @@ jobs:
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
-
-      - name: Login to ACR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
-        if: github.repository == 'spiceai/spiceai'
-        with:
-          registry: spiceaitestimages.azurecr.io
-          username: spiceai-repo-pull
-          password: ${{ secrets.AZCR_PASSWORD }}
 
       - name: Run partition table integration test
         env:
