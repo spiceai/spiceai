@@ -63,6 +63,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration};
 use token_provider::github_app_token::GitHubAppTokenProvider;
+use token_provider::workload_identity::WorkloadIdentityTokenProvider;
 use token_provider::{StaticTokenProvider, TokenProvider};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use url::Url;
@@ -94,6 +95,7 @@ mod stargazers;
 mod users;
 mod workflow_runs;
 mod workflows;
+mod workload_identity;
 
 #[cfg(test)]
 mod test_util;
@@ -170,6 +172,12 @@ const GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 4;
 pub struct Github {
     params: Parameters,
     token: Option<Arc<dyn TokenProvider>>,
+    /// What GitHub meters this dataset's requests against, shared by the datasets it meters
+    /// together.
+    auth_context: Arc<str>,
+    /// Whether the token comes from workload identity, whose access no GitHub App installation
+    /// check applies to.
+    workload_identity: bool,
     rate_limiter: Arc<GitHubRateLimiter>,
     rest_limiter: Arc<GitHubRateLimiter>,
     semaphore: Arc<Semaphore>,
@@ -180,6 +188,8 @@ impl std::fmt::Debug for Github {
         f.debug_struct("Github")
             .field("params", &self.params)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("auth_context", &self.auth_context)
+            .field("workload_identity", &self.workload_identity)
             .field("rate_limiter", &self.rate_limiter)
             .field("rest_limiter", &self.rest_limiter)
             .field("semaphore", &"<Semaphore>")
@@ -306,6 +316,16 @@ impl Github {
         repo: Option<&str>,
         resource_type: &str,
     ) -> Result<(), String> {
+        // A workload identity's token comes from Octo STS's installation, and its access is what
+        // the trust policy grants, so there is no GitHub App installation of the user's to check.
+        // An `installation_id` may still be present, autoloaded from a secret store.
+        if self.workload_identity {
+            tracing::debug!(
+                "Skipping GitHub App access validation because workload identity is active"
+            );
+            return Ok(());
+        }
+
         // Skip validation when token-based auth is used (token takes precedence over app auth).
         // The `installation_id` parameter may be present due to secret autoloading from .env,
         // even when the dataset was explicitly configured with a token.
@@ -436,12 +456,9 @@ impl Github {
             .as_ref()
             .map(|token| Arc::clone(token) as Arc<dyn TokenProvider>);
 
-        let auth_context = token.as_ref().map_or_else(
-            || UNAUTHENTICATED_AUTH_CONTEXT.to_string(),
-            |t| t.dyn_hash(),
-        );
-
-        let rate_controller = get_github_auth_rate_control(auth_context).await.controller;
+        let rate_controller = get_github_auth_rate_control(self.auth_context.to_string())
+            .await
+            .controller;
 
         let client = reqwest::Client::builder()
             .user_agent(util::spiceai_user_agent())
@@ -838,6 +855,16 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("installation_id")
         .description("The Github App installation ID.")
         .secret(),
+    ParameterSpec::component("sts_identity")
+        .description("The name of the Octo STS trust policy, `.github/chainguard/<name>.sts.yaml`, that grants the dataset a short-lived GitHub token in exchange for the workload's identity token, instead of a token or a GitHub App."),
+    ParameterSpec::component("sts_scope")
+        .description("The repository (`owner/repo`) or owner whose trust policy `github_sts_identity` names. Defaults to the dataset's repository, or its owner for an owner-level table."),
+    ParameterSpec::component("sts_endpoint")
+        .description("The Octo STS instance that exchanges the workload's identity token. Defaults to https://octo-sts.dev."),
+    ParameterSpec::component("identity_token_file")
+        .description("A file that holds the workload's identity token, read again for every exchange, such as a Kubernetes projected service account token. Without it, the identity token is requested from GitHub Actions."),
+    ParameterSpec::component("identity_token_audience")
+        .description("The audience the identity token is requested from GitHub Actions for. Defaults to the domain of `github_sts_endpoint`, which Octo STS checks unless the trust policy names another."),
     ParameterSpec::component("query_mode")
         .description(
             "Specify what search mode (REST, GraphQL, Search API) to use when retrieving results.",
@@ -898,6 +925,49 @@ impl DataConnectorFactory for GithubFactory {
             .map(ToString::to_string);
 
         let connector_component = params.component.clone();
+        let github_endpoint = params
+            .parameters
+            .get("endpoint")
+            .expose()
+            .ok()
+            .unwrap_or("https://api.github.com")
+            .to_string();
+
+        let workload_identity = {
+            let path = match &connector_component {
+                ConnectorComponent::Dataset(dataset) => Some(dataset.path()),
+                ConnectorComponent::Catalog(_) => None,
+            };
+            let parsed = path.and_then(parse_github_path);
+            let wi_params = workload_identity::WorkloadIdentityParams {
+                identity: params.user_set("sts_identity"),
+                scope: params.user_set("sts_scope"),
+                endpoint: params.user_set("sts_endpoint"),
+                token_file: params.user_set("identity_token_file"),
+                audience: params.user_set("identity_token_audience"),
+                credentials_set: workload_identity::CREDENTIAL_PARAMS
+                    .iter()
+                    .filter(|(name, _)| params.user_set(name).is_some())
+                    .map(|(_, user_name)| *user_name)
+                    .collect(),
+                owner: parsed.as_ref().map(|parsed| parsed.owner),
+                repo: parsed.as_ref().and_then(|parsed| parsed.repo),
+            };
+            match workload_identity::resolve(
+                &wi_params,
+                workload_identity::GitHubActionsEnvironment::from_process(),
+            ) {
+                Ok(workload_identity) => workload_identity,
+                Err(message) => {
+                    let error = DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "github".to_string(),
+                        connector_component,
+                        message,
+                    };
+                    return Box::pin(async move { Err(Box::new(error) as _) });
+                }
+            }
+        };
 
         let dataset_max_concurrent_requests = match params
             .parameters
@@ -953,7 +1023,36 @@ impl DataConnectorFactory for GithubFactory {
             .unwrap_or(GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS);
 
         Box::pin(async move {
-            let (token_provider, semaphore_key): (Option<Arc<dyn TokenProvider>>, Option<String>) =
+            let uses_workload_identity = workload_identity.is_some();
+            let (token_provider, semaphore_key, auth_context): (
+                Option<Arc<dyn TokenProvider>>,
+                Option<String>,
+                Option<String>,
+            ) = if let Some(identity) = workload_identity {
+                // A secret store may supply `github_token` or a GitHub App unasked; the workload
+                // identity the dataset names takes precedence over them.
+                let rate_limit_key = identity.rate_limit_key(&github_endpoint);
+                let component = github_component_label(&connector_component);
+                let load_message = identity.load_message(&component);
+                let provider = WorkloadIdentityTokenProvider::try_new(
+                    component,
+                    identity.source,
+                    identity.exchange,
+                )
+                .await
+                .map_err(|source| DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "github".to_string(),
+                    connector_component: connector_component.clone(),
+                    source: Box::new(source),
+                })?;
+                tracing::info!("{load_message}");
+                (
+                    Some(Arc::new(provider) as Arc<dyn TokenProvider>),
+                    Some(rate_limit_key.clone()),
+                    Some(rate_limit_key),
+                )
+            } else {
+                let (token_provider, semaphore_key): (Option<Arc<dyn TokenProvider>>, Option<String>) =
                 match (token, client_id, private_key, installation_id) {
                     (Some(token), _, _, _) => {
                         let key = token.expose_secret().to_string();
@@ -976,6 +1075,8 @@ impl DataConnectorFactory for GithubFactory {
 
                     _ => (None, None),
                 };
+                (token_provider, semaphore_key, None)
+            };
 
             let semaphore = if let Some(key) = semaphore_key {
                 let mut limits = GITHUB_CONCURRENCY_LIMITS.lock().await;
@@ -1004,15 +1105,19 @@ impl DataConnectorFactory for GithubFactory {
                 Arc::new(Semaphore::new(max_concurrent_connections))
             };
 
-            let auth_context = token_provider.as_ref().map_or_else(
-                || UNAUTHENTICATED_AUTH_CONTEXT.to_string(),
-                |token| token.dyn_hash(),
-            );
-            let control = get_github_auth_rate_control(auth_context).await;
+            let auth_context = auth_context.unwrap_or_else(|| {
+                token_provider.as_ref().map_or_else(
+                    || UNAUTHENTICATED_AUTH_CONTEXT.to_string(),
+                    |token| token.dyn_hash(),
+                )
+            });
+            let control = get_github_auth_rate_control(auth_context.clone()).await;
 
             Ok(Arc::new(Github {
                 params: params.parameters,
                 token: token_provider,
+                auth_context: auth_context.into(),
+                workload_identity: uses_workload_identity,
                 rate_limiter: control.limiter,
                 rest_limiter: control.rest_limiter,
                 semaphore,
@@ -1026,6 +1131,14 @@ impl DataConnectorFactory for GithubFactory {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+}
+
+/// `component` as the logs of a token refresh name it, such as `dataset 'stars' (github)`.
+fn github_component_label(component: &ConnectorComponent) -> String {
+    match component {
+        ConnectorComponent::Dataset(dataset) => format!("dataset '{}' (github)", dataset.name),
+        ConnectorComponent::Catalog(catalog) => format!("catalog '{}' (github)", catalog.name),
     }
 }
 

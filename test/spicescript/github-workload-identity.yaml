@@ -1,0 +1,183 @@
+name: github-workload-identity
+description: >
+  A GitHub dataset with workload identity gets its GitHub token from an Octo
+  STS exchange of the workload's identity token, from a GitHub Actions job
+  (the `actions` variant) or a token file (the `file` variant), and sends that
+  token, never the identity token, to GitHub. A broker that reports the token's
+  lifetime has it exchanged again before then, and the new token reaches the
+  queries that follow; Octo STS, which reports none, is not asked again within
+  the run. A refused exchange leaves the dataset in Error with Octo STS's
+  reason and what to check. A configuration mistake fails the dataset with a
+  message naming the param to fix, before any exchange. The mock server stands
+  in for both Octo STS and the GitHub GraphQL API.
+
+sources:
+  api: { kind: mock-http }
+
+variants:
+  actions:
+    env:
+      ACTIONS_ID_TOKEN_REQUEST_URL: '${sources.api.url}/id-token?api-version=2.0'
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: request-token
+  file:
+    env:
+      ACTIONS_ID_TOKEN_REQUEST_URL: ''
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
+    datasets:
+      stars: { params: { github_identity_token_file: '${script.dir}/seed/workload-identity-token' } }
+      stars_octo: { params: { github_identity_token_file: '${script.dir}/seed/workload-identity-token' } }
+      denied: { params: { github_identity_token_file: '${script.dir}/seed/workload-identity-token' } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: github-workload-identity
+  datasets:
+    # A broker that reports a 2 s lifetime, as github-sts does.
+    - from: github:github.com/acme/widgets/stargazers
+      name: stars
+      params:
+        github_endpoint: ${sources.api.url}
+        github_sts_endpoint: ${sources.api.url}
+        github_sts_identity: spice-reader
+    # Octo STS's own answer: the token alone.
+    - from: github:github.com/acme/widgets/stargazers
+      name: stars_octo
+      params:
+        github_endpoint: ${sources.api.url}
+        github_sts_endpoint: ${sources.api.url}/octo
+        github_sts_identity: spice-reader
+    - from: github:github.com/acme/widgets/stargazers
+      name: denied
+      params:
+        github_endpoint: ${sources.api.url}
+        github_sts_endpoint: ${sources.api.url}/denied
+        github_sts_identity: spice-reader
+    # Configuration mistakes: none of these reaches a network.
+    - from: github:github.com/acme/widgets/stargazers
+      name: stray_endpoint
+      params:
+        github_sts_endpoint: https://octo-sts.example
+    - from: github:github.com/acme/widgets/stargazers
+      name: token_and_identity
+      params:
+        github_token: not-a-token
+        github_sts_identity: spice-reader
+    - from: github:github.com/acme/widgets/stargazers
+      name: insecure_endpoint
+      params:
+        github_sts_identity: spice-reader
+        github_sts_endpoint: http://octo-sts.example
+    - from: github:github.com/acme/widgets/stargazers
+      name: bad_identity
+      params:
+        github_sts_identity: ../spice-reader
+
+steps:
+  - source-exec:
+      api:
+        - |
+          path: /id-token
+          method: GET
+          headers-match: { authorization: Bearer request-token }
+          headers: { content-type: application/json }
+          body: '{"value": "workload-jwt"}'
+        - |
+          path: /sts/exchange
+          method: GET
+          headers-match: { authorization: Bearer workload-jwt }
+          headers: { content-type: application/json }
+          body: '{"token": "ghs-one", "expires_in": 2}'
+        - |
+          path: /octo/sts/exchange
+          method: GET
+          headers-match: { authorization: Bearer workload-jwt }
+          headers: { content-type: application/json }
+          body: '{"token": "ghs-octo"}'
+        - |
+          path: /denied/sts/exchange
+          method: GET
+          status: 403
+          headers: { content-type: application/json }
+          body: '{"code": 7, "message": "token does not match trust policy", "details": []}'
+        # One answer serves the load's health check and the stargazers query.
+        - |
+          path: /graphql
+          method: POST
+          headers-match: { authorization: Bearer ghs-one }
+          headers: { content-type: application/json }
+          body: '{"data": {"githubHealthCheck": {"id": "R_1", "nameWithOwner": "acme/widgets"}, "repository": {"stargazers": {"edges": [{"starred_at": "2026-01-02T03:04:05Z", "node": {"login": "alice", "name": "Alice"}}], "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}'
+        - |
+          path: /graphql
+          method: POST
+          headers-match: { authorization: Bearer ghs-octo }
+          headers: { content-type: application/json }
+          body: '{"data": {"githubHealthCheck": {"id": "R_1", "nameWithOwner": "acme/widgets"}, "repository": {"stargazers": {"edges": [{"starred_at": "2026-01-02T03:04:05Z", "node": {"login": "octocat", "name": "Octocat"}}], "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}'
+  - start: { ready: false }
+
+  - query: SELECT login, name, owner, repo FROM stars
+    expect: { rows: [[alice, Alice, acme, widgets]] }
+    eventually: 60s
+  - query: SELECT login, name, owner, repo FROM stars_octo
+    expect: { rows: [[octocat, Octocat, acme, widgets]] }
+    eventually: 60s
+  - source-query: { api: log /octo/sts/exchange }
+    expect: { rows: [[GET, '/octo/sts/exchange?scope=acme%2Fwidgets&scopes=acme%2Fwidgets&identity=spice-reader', '']] }
+  - source-query: { api: header /octo/sts/exchange authorization }
+    expect: { rows: [[Bearer workload-jwt]] }
+  - source-query: { api: count /id-token }
+    expect: { rows: [['0']] }
+    only: file
+
+  # The broker now issues another token, which GitHub alone accepts: the
+  # dataset answers from it once the refresh has replaced the first.
+  - source-exec:
+      api:
+        - |
+          path: /sts/exchange
+          method: GET
+          headers-match: { authorization: Bearer workload-jwt }
+          headers: { content-type: application/json }
+          body: '{"token": "ghs-two", "expires_in": 2}'
+        - |
+          path: /graphql
+          method: POST
+          headers-match: { authorization: Bearer ghs-two }
+          headers: { content-type: application/json }
+          body: '{"data": {"githubHealthCheck": {"id": "R_1", "nameWithOwner": "acme/widgets"}, "repository": {"stargazers": {"edges": [{"starred_at": "2026-01-02T03:04:05Z", "node": {"login": "alice", "name": "Alice"}}, {"starred_at": "2026-02-03T04:05:06Z", "node": {"login": "bob", "name": "Bob"}}], "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}'
+  - query: SELECT login FROM stars ORDER BY login
+    expect: { rows: [[alice], [bob]] }
+    eventually: 30s
+  # Octo STS reported no lifetime, so its token is kept: one exchange.
+  - source-query: { api: count /octo/sts/exchange }
+    expect: { rows: [['1']] }
+  - query: SELECT login FROM stars_octo
+    expect: { rows: [[octocat]] }
+
+  - assert-status:
+      dataset: denied
+      status: Error
+      message-contains: "Octo STS refused to exchange the workload identity token for an access token (HTTP 403 Forbidden): token does not match trust policy. Verify that the Octo STS GitHub App is installed on the owner of 'acme/widgets', that 'acme/widgets' has the trust policy `.github/chainguard/spice-reader.sts.yaml`"
+    eventually: 60s
+  - assert-status:
+      dataset: stray_endpoint
+      status: Error
+      message-contains: "Invalid value for parameter github_sts_endpoint. `github_sts_endpoint` applies only to workload identity, which `github_sts_identity` turns on, and `github_sts_identity` is not set."
+    eventually: 60s
+  - assert-status:
+      dataset: token_and_identity
+      status: Error
+      message-contains: "Invalid value for parameter github_token. A dataset authenticates with `github_token`, a GitHub App (`github_client_id`, `github_private_key` and `github_installation_id`) or workload identity (`github_sts_identity`), and both `github_token` and `github_sts_identity` are set. Remove one of them."
+    eventually: 60s
+  - assert-status:
+      dataset: insecure_endpoint
+      status: Error
+      message-contains: "Invalid value for parameter github_sts_endpoint. The Octo STS endpoint must be an https:// URL"
+    eventually: 60s
+  - assert-status:
+      dataset: bad_identity
+      status: Error
+      message-contains: "Invalid value for parameter github_sts_identity. `github_sts_identity` names one trust policy file"
+    eventually: 60s
+  - assert-log:
+      lacks: ["octo-sts\\.example", "ghs-one", "ghs-two", "ghs-octo", "workload-jwt"]
