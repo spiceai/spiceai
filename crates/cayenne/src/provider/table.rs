@@ -23700,15 +23700,32 @@ impl CayenneTableProvider {
     /// Arms a one-shot timer rather than re-queueing the request, so the
     /// background loop is not woken on every debounce while a failing pass
     /// backs off. A table quiesced in the meantime is not re-armed.
-    fn schedule_retention_retry(&self, delay: Duration) {
+    ///
+    /// The timer is tagged with the backoff `generation` of the failure that
+    /// armed it. If any retention pass completes or fails before it wakes (a
+    /// synchronous `flush_pending_maintenance` running the owed retry, say),
+    /// the timer is obsolete and queues nothing: otherwise it would start a
+    /// pass after `drain_in_flight_maintenance` returned, or fire a newer
+    /// failure's retry before that failure's own backoff elapsed.
+    fn schedule_retention_retry(&self, delay: Duration, generation: u64) {
         let table = self.clone_for_write();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            table
-                .post_write_maintenance
-                .state
-                .lock()
-                .retention_requested = true;
+            {
+                // Check and queue under the backoff lock, so a pass recording
+                // success or failure either lands first (and this timer sees it
+                // is obsolete) or after the request is queued (and the drain or
+                // loop that records it also consumes the request).
+                let backoff = table.post_write_maintenance.retention_backoff.lock();
+                if !backoff.timer_is_current(generation) {
+                    return;
+                }
+                table
+                    .post_write_maintenance
+                    .state
+                    .lock()
+                    .retention_requested = true;
+            }
             // Claim the loop before the admission check, so a racing `quiesce`
             // either sees the claim and drains it or closes first and is seen
             // here (see `maintenance_still_admitted`).
@@ -23945,17 +23962,19 @@ impl CayenneTableProvider {
                             // 100 ms debounce logged about ten errors a second
                             // without bound. Logged at `error` because each
                             // line is a pass that left expired rows queryable.
-                            let (attempt, delay) = self
-                                .post_write_maintenance
-                                .retention_backoff
-                                .lock()
-                                .record_failure(tokio::time::Instant::now());
+                            let (attempt, delay, generation) = {
+                                let mut backoff =
+                                    self.post_write_maintenance.retention_backoff.lock();
+                                let (attempt, delay) =
+                                    backoff.record_failure(tokio::time::Instant::now());
+                                (attempt, delay, backoff.generation())
+                            };
                             tracing::error!(
                                 table = self.table_metadata.table_name.as_str(),
                                 "Background retention scan failed (attempt {attempt}): {e}. Retrying in {}s.",
                                 delay.as_secs()
                             );
-                            self.schedule_retention_retry(delay);
+                            self.schedule_retention_retry(delay, generation);
                         }
                         RetentionFailureAction::ReturnError => return Err(e),
                     }

@@ -231,10 +231,20 @@ pub(crate) enum RetentionPass {
 /// second, each logging an error. The delay doubles from
 /// [`Self::BASE_DELAY`] per consecutive failure up to [`Self::MAX_DELAY`], and
 /// resets once a pass completes.
+///
+/// Each failure arms a one-shot retry timer tagged with the backoff's
+/// `generation`. Any later failure or success moves the generation on, so a
+/// timer armed for an earlier failure finds itself obsolete when it wakes and
+/// does not queue a pass: a synchronous drain that already ran the owed retry
+/// is not followed by a stray pass from the old timer, and an old timer cannot
+/// fire a newer failure's retry ahead of that failure's own backoff.
 #[derive(Debug, Default)]
 pub(crate) struct RetentionBackoff {
     consecutive_failures: u32,
     retry_at: Option<tokio::time::Instant>,
+    /// Bumped on every failure and success; never reset, so a stale timer's
+    /// tag cannot come back into use.
+    generation: u64,
 }
 
 impl RetentionBackoff {
@@ -250,16 +260,33 @@ impl RetentionBackoff {
     }
 
     /// Record a failed pass at `now`; returns the attempt number and the delay
-    /// before the next one.
+    /// before the next one. The retry timer armed for this failure should be
+    /// tagged with [`Self::generation`] read under the same lock.
     pub(crate) fn record_failure(&mut self, now: tokio::time::Instant) -> (u32, Duration) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         let delay = Self::delay_after(self.consecutive_failures);
         self.retry_at = Some(now + delay);
+        self.generation = self.generation.wrapping_add(1);
         (self.consecutive_failures, delay)
     }
 
+    /// Record a completed pass: clears the owed retry and invalidates any retry
+    /// timer still sleeping.
     pub(crate) fn record_success(&mut self) {
-        *self = Self::default();
+        self.consecutive_failures = 0;
+        self.retry_at = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Tag for the retry timer armed by the most recent failure.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether a retry timer tagged `generation` still owns the owed retry,
+    /// i.e. no pass has completed or failed since it was armed.
+    pub(crate) fn timer_is_current(&self, generation: u64) -> bool {
+        self.retry_at.is_some() && self.generation == generation
     }
 
     /// Whether a background pass at `now` should leave retention to the
@@ -483,6 +510,35 @@ mod post_write_maintenance_tests {
         backoff.record_success();
         assert!(!backoff.retry_owed());
         assert_eq!(backoff.record_failure(now), (1, Duration::from_secs(1)));
+    }
+
+    /// A retry timer armed for one failure is invalidated by any later success
+    /// or failure, so it neither queues a pass after a drain already ran the
+    /// owed retry nor fires a newer failure's retry early.
+    #[test]
+    fn retention_retry_timer_is_invalidated_by_later_outcomes() {
+        let now = tokio::time::Instant::now();
+        let mut backoff = RetentionBackoff::default();
+
+        backoff.record_failure(now);
+        let first = backoff.generation();
+        assert!(backoff.timer_is_current(first));
+
+        // A synchronous drain ran the owed retry and it completed.
+        backoff.record_success();
+        assert!(!backoff.timer_is_current(first));
+
+        // A newer failure arms its own timer; the old one stays obsolete.
+        backoff.record_failure(now);
+        let second = backoff.generation();
+        assert_ne!(first, second);
+        assert!(!backoff.timer_is_current(first));
+        assert!(backoff.timer_is_current(second));
+
+        // Consecutive failures without a success also retire the earlier timer.
+        backoff.record_failure(now);
+        assert!(!backoff.timer_is_current(second));
+        assert!(backoff.timer_is_current(backoff.generation()));
     }
 
     /// A table that has never queued a delta has nothing outstanding, so its
