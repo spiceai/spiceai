@@ -14,6 +14,7 @@ members = [
     "crates/azure-key-vault-signer",
     "crates/aws-sdk-credential-bridge",
     "crates/backoff",
+    "crates/chrono",
     "crates/chunking",
     "crates/cloud-connect-crypto",
     "crates/cpu-budget",
@@ -275,7 +276,7 @@ charset = "0.1.5"
 # AEAD for the at-rest delivered-secrets cache. Already in the tree via `hpke`,
 # which uses the same primitive for the sealed-secret wire format.
 chacha20poly1305 = "0.11"
-chrono = "0.4.44"
+chrono = { path = "crates/chrono" }
 clap = { version = "4.5.60", features = ["derive", "env"] }
 crash-handler = "0.8"
 ctor = "1.0.13"
@@ -644,6 +645,10 @@ tantivy-query-grammar = { path = "vendor/tantivy-query-grammar" }
 
 # Dependencies on crates.io `backoff` 0.4 resolve to the workspace crate.
 backoff = { path = "crates/backoff" }
+
+# Dependencies on crates.io `chrono` 0.4 resolve to the workspace crate, which
+# holds the part of chrono 0.4.45 the build uses. See crates/chrono/README.md.
+chrono = { path = "crates/chrono" }
 
 
 # Redirect candle-core / kernels / nn / transformers to the spiceai fork;
