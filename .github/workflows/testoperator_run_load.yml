@@ -37,7 +37,6 @@ on:
           - 'sqlite'
           - 'postgresql'
           - 'mysql'
-          - 'dremio'
           - 'odbc-athena'
           - 'odbc-databricks'
           - 'duckdb'
@@ -94,7 +93,12 @@ jobs:
   run-load:
     name: Run load test
     runs-on: ${{ github.event.inputs.runner_type }}
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials, and Google Cloud access tokens for the BigQuery tests
     timeout-minutes: 600
+    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
+    environment: ci
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -139,19 +143,29 @@ jobs:
           fi
           echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '36000'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
         uses: ./.github/actions/build-spicepod-validator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepod
         run: |
@@ -166,8 +180,9 @@ jobs:
         uses: ./.github/actions/build-testoperator
         with:
           minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup Testoperator
         uses: ./.github/actions/setup-testoperator-data
@@ -193,6 +208,13 @@ jobs:
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
         uses: ./.github/actions/setup-adbc-bigquery
 
+      - name: Set up BigQuery credentials (workload identity federation)
+        if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
+        uses: ./.github/actions/bigquery-credentials
+        with:
+          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
+          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
+
       - name: Run the load test - ${{ github.event.inputs.spicepod_path }}
         run: |
           rm -rf .spice/data
@@ -214,11 +236,11 @@ jobs:
         env:
           TEST_SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
           S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT}}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY}}
+          S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
+          S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
+          S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
           DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
           DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
           DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
           DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.DATABRICKS_SQL_WAREHOUSE_ID }}
@@ -240,9 +262,6 @@ jobs:
           SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
           SQL_WAREHOUSE_DATABRICKS_HOST: ${{ vars.SQL_WAREHOUSE_DATABRICKS_HOST }}
           SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
-          DREMIO_ENDPOINT: ${{ vars.SPICE_DREMIO_ENDPOINT}}
-          DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
-          DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
           MONGODB_HOST: ${{ vars.TEST_MONGODB_HOST }}
           MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}

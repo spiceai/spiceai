@@ -1,0 +1,153 @@
+name: github-app-key-service
+description: >
+  A GitHub App whose private key a key service holds: a dataset with
+  `github_private_key_kms` naming an AWS KMS key (LocalStack here) has KMS sign
+  the App JWT with the workload's AWS credentials, requests its installation
+  token from `github_endpoint`, and reads GitHub with that token, which never
+  reaches the log. A key KMS does not hold leaves the dataset in Error with
+  KMS's reason and what to check, before GitHub is asked for a token. A
+  configuration mistake, or an Azure Key Vault key with an incomplete Microsoft
+  Entra workload identity in the environment, fails the dataset with a message
+  naming what to fix, before any request. The mock server stands in for the GitHub API.
+
+sources:
+  kms:
+    kind: docker
+    image: docker.io/localstack/localstack:4.9
+    ports: [4566]
+    env: { SERVICES: kms, AWS_DEFAULT_REGION: us-east-1 }
+    ready: awslocal kms list-keys
+  api: { kind: mock-http }
+
+variants:
+  aws:
+    env:
+      AWS_ENDPOINT_URL_KMS: http://127.0.0.1:${sources.kms.port.4566}
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_EC2_METADATA_DISABLED: 'true'
+      # A token file without its tenant: an incomplete workload identity, which fails before
+      # any request rather than falling back to a managed identity or the Azure CLI.
+      AZURE_TENANT_ID: ''
+      AZURE_CLIENT_ID: 00000000-0000-0000-0000-000000000001
+      AZURE_FEDERATED_TOKEN_FILE: ${script.dir}/github-app-key-service.yaml
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: github-app-key-service
+  datasets:
+    - from: github:github.com/acme/widgets/stargazers
+      name: stars
+      params:
+        github_endpoint: ${sources.api.url}
+        github_client_id: Iv23liTest
+        github_installation_id: '42'
+        github_private_key_kms: arn:aws:kms:us-east-1:000000000000:alias/github-app-${sources.kms.namespace}
+    - from: github:github.com/acme/widgets/stargazers
+      name: missing_key
+      params:
+        github_endpoint: ${sources.api.url}
+        github_client_id: Iv23liTest
+        github_installation_id: '43'
+        github_private_key_kms: arn:aws:kms:us-east-1:000000000000:alias/no-such-key-${sources.kms.namespace}
+    # Configuration mistakes: none of these reaches a network.
+    - from: github:github.com/acme/widgets/stargazers
+      name: key_and_pem
+      params:
+        github_client_id: Iv23liTest
+        github_installation_id: '42'
+        github_private_key: not-a-key
+        github_private_key_kms: arn:aws:kms:us-east-1:000000000000:alias/github-app
+    - from: github:github.com/acme/widgets/stargazers
+      name: no_installation
+      params:
+        github_client_id: Iv23liTest
+        github_private_key_kms: arn:aws:kms:us-east-1:000000000000:alias/github-app
+    - from: github:github.com/acme/widgets/stargazers
+      name: bare_alias
+      params:
+        github_client_id: Iv23liTest
+        github_installation_id: '42'
+        github_private_key_kms: alias/github-app
+    - from: github:github.com/acme/widgets/stargazers
+      name: vault_incomplete_identity
+      params:
+        github_client_id: Iv23liTest
+        github_installation_id: '42'
+        github_private_key_kms: https://spice-test.vault.azure.net/keys/github-app
+
+steps:
+  - source-exec:
+      kms: >-
+        id=$(awslocal kms create-key --key-spec RSA_2048 --key-usage SIGN_VERIFY
+        --query KeyMetadata.KeyId --output text)
+        && awslocal kms create-alias --alias-name alias/github-app-${sources.kms.namespace}
+        --target-key-id "$id"
+  - source-exec:
+      api:
+        - |
+          path: /app/installations/42/access_tokens
+          method: POST
+          status: 201
+          headers: { content-type: application/json }
+          body: '{"token": "ghs-from-kms", "expires_at": "2099-01-01T00:00:00Z"}'
+        # The connector checks the installation's access before it loads the dataset.
+        - |
+          path: /repos/acme/widgets/stargazers
+          method: GET
+          headers-match: { authorization: Bearer ghs-from-kms }
+          headers: { content-type: application/json }
+          body: '[]'
+        # One answer serves the load's health check and the stargazers query.
+        - |
+          path: /graphql
+          method: POST
+          headers-match: { authorization: Bearer ghs-from-kms }
+          headers: { content-type: application/json }
+          body: '{"data": {"githubHealthCheck": {"id": "R_1", "nameWithOwner": "acme/widgets"}, "repository": {"stargazers": {"edges": [{"starred_at": "2026-01-02T03:04:05Z", "node": {"login": "alice", "name": "Alice"}}], "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}'
+  - start: { ready: false }
+
+  - query: SELECT login, name, owner, repo FROM stars
+    expect: { rows: [[alice, Alice, acme, widgets]] }
+    eventually: 60s
+  - source-query: { api: count /app/installations/42/access_tokens }
+    expect: { rows: [['1']] }
+  - assert-log:
+      count:
+        "INFO .*Authenticated dataset 'stars' \\(github\\) as a GitHub App whose private key is the AWS KMS key 'arn:aws:kms:us-east-1:000000000000:alias/github-app-[^']+', which signs with the workload's AWS credentials\\.": 1
+
+  - assert-status:
+      dataset: missing_key
+      status: Error
+      message-contains: "Failed to sign the GitHub App JWT with the key 'arn:aws:kms:us-east-1:000000000000:alias/no-such-key-"
+    eventually: 60s
+  - assert-status:
+      dataset: missing_key
+      status: Error
+      message-contains: "Verify the ARN, and that the key or alias is in that account and region."
+  - source-query: { api: count /app/installations/43/access_tokens }
+    expect: { rows: [['0']] }
+
+  - assert-status:
+      dataset: key_and_pem
+      status: Error
+      message-contains: "Invalid value for parameter github_private_key_kms. A GitHub App's private key is either `github_private_key` or a key service's key in `github_private_key_kms`, and both are set. Remove one of them."
+    eventually: 60s
+  - assert-status:
+      dataset: no_installation
+      status: Error
+      message-contains: "Invalid value for parameter github_installation_id. A GitHub App whose private key is in `github_private_key_kms` also needs `github_client_id` and `github_installation_id`, and `github_installation_id` is not set."
+    eventually: 60s
+  - assert-status:
+      dataset: bare_alias
+      status: Error
+      message-contains: "Invalid value for parameter github_private_key_kms. `github_private_key_kms` names the key that holds the GitHub App's private key"
+    eventually: 60s
+  - assert-status:
+      dataset: vault_incomplete_identity
+      status: Error
+      message-contains: "Signing with the Azure Key Vault key 'https://spice-test.vault.azure.net/keys/github-app' as a Microsoft Entra workload identity needs `AZURE_TENANT_ID` and `AZURE_CLIENT_ID` beside `AZURE_FEDERATED_TOKEN_FILE`, but `AZURE_TENANT_ID` is not set."
+    eventually: 60s
+  - assert-log:
+      lacks: ["ghs-from-kms", "spice-test\\.vault\\.azure\\.net/keys/github-app/sign"]
