@@ -425,6 +425,12 @@ jobs:
           mapfile -t images <<<"${list}"
           bash .github/scripts/docker_pull.sh "${images[@]}" docker.io/gvenzl/oracle-free:latest
 
+      # The login expires in about 5 minutes, and an expired login fails a later pull
+      # that would succeed anonymously.
+      - name: Log out of DockerHub
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.repository == 'spiceai/spiceai' && vars.DOCKERHUB_OIDC_CONNECTIONID != ''
+        run: docker logout
+
       - name: Set up Spice.ai API Key
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
@@ -619,6 +625,12 @@ jobs:
           set -euo pipefail
           image="$(jq -r --arg source "${SOURCE}" '.[$source].image' test/source_versions.json)"
           bash .github/scripts/docker_pull.sh "${image}:${VERSION}"
+
+      # The login expires in about 5 minutes, and an expired login fails a later pull
+      # that would succeed anonymously.
+      - name: Log out of DockerHub
+        if: github.repository == 'spiceai/spiceai' && vars.DOCKERHUB_OIDC_CONNECTIONID != ''
+        run: docker logout
 
       - name: Run ${{ matrix.source }} ${{ matrix.version }} tests
         timeout-minutes: 45
