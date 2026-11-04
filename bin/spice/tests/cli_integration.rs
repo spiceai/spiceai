@@ -2631,18 +2631,22 @@ if args[:1] == ["status"]:
         let project = fs::canonicalize(&lab.app).expect("resolve the project");
         // `PROJECT_TIMEOUT` starts after `git rev-parse` finds the project, and
         // `BUDGET` covers that lookup.
-        wait_within(ORCA_PROJECT_BUDGET + BUDGET, "the project to be added", || {
-            orca_calls(root).iter().any(|call| {
-                call["args"]
-                    == serde_json::json!([
-                        "repo",
-                        "add",
-                        "--path",
-                        project.display().to_string(),
-                        "--json"
-                    ])
-            })
-        });
+        wait_within(
+            ORCA_PROJECT_BUDGET + BUDGET,
+            "the project to be added",
+            || {
+                orca_calls(root).iter().any(|call| {
+                    call["args"]
+                        == serde_json::json!([
+                            "repo",
+                            "add",
+                            "--path",
+                            project.display().to_string(),
+                            "--json"
+                        ])
+                })
+            },
+        );
         let profile = lab.home.join(".spice/orca/profile");
         let calls = orca_calls(root);
         assert_eq!(
