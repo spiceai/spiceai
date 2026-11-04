@@ -902,11 +902,14 @@ jobs:
     # 34948795744). The two bounded steps below sum to 32, and everything else
     # in the job has taken at most 4.7 min in the same window.
     timeout-minutes: 40
+    # The Entra app that signs the organization App token trusts this environment.
+    environment: ci-integration
     permissions:
       # GitHub's GraphQL stargazers connection rejects contents: read, including
       # read-all. The read query requires contents: write on GITHUB_TOKEN.
       # Reproduction: https://github.com/spiceai/spiceai/actions/runs/34186688336
       contents: write
+      id-token: write
     # Shared with the live E2E smoke test: API quotas span processes and runs.
     concurrency:
       group: github-connector-live-api
@@ -980,6 +983,12 @@ jobs:
           GITHUB_PRIVATE_KEY: ${{ secrets.ORG_MEMBERS_GITHUB_PRIVATE_KEY }}
           INSTA_WORKSPACE_ROOT: ${{ github.workspace }}
           CARGO_MANIFEST_DIR: ${{ github.workspace }}
+          # The connector signs the same App's JWT through Key Vault, as the Entra app.
+          GITHUB_APP_KMS_CLIENT_ID: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
+          GITHUB_APP_KMS_INSTALLATION_ID: ${{ vars.ORG_MEMBERS_GITHUB_INSTALLATION_ID }}
+          GITHUB_APP_KMS_KEY: ${{ vars.ORG_MEMBERS_KEY_ID }}
+          AZURE_TENANT_ID: ${{ vars.ORG_MEMBERS_AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ vars.ORG_MEMBERS_AZURE_CLIENT_ID }}
         run: |
           cargo nextest run --workspace-remap "${PWD}" \
             --archive-file ./integration_tests/integration_tests.tar.zst \
