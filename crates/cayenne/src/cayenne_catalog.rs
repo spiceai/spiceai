@@ -2557,7 +2557,7 @@ impl MetadataCatalog for CayenneCatalog {
         // Memory mode (`mode: memory`) writes nothing to disk — the mem-tier is the
         // store and the metastore is an in-RAM memdb — so skip creating the initial
         // snapshot directory entirely.
-        if !base_path.starts_with("s3://") && !options.vortex_config.memory_mode {
+        if !crate::is_object_store_path(&base_path) && !options.vortex_config.memory_mode {
             let table_root = std::path::PathBuf::from(&base_path).join(&table_id);
             let snapshot_dir = table_root.join(&initial_snapshot_id);
 
@@ -5917,7 +5917,7 @@ fn inlined_data_insert(
 }
 
 async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResult<()> {
-    if table.path.starts_with("s3://") {
+    if crate::is_object_store_path(&table.path) {
         return Ok(());
     }
 

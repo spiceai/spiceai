@@ -24,9 +24,11 @@ limitations under the License.
 //! from a commit as soon as the call returns. Reads, lists and deletes are
 //! delegated unchanged.
 //!
-//! A directory the write created is synced only at its own level: a new parent
-//! is durable once the entry linking it into its own parent is, which the caller
-//! guarantees by creating directories through a synced path. (Prototype scope.)
+//! Directories a write creates are synced into their own parents too: before a
+//! write the store records the nearest existing ancestor of the target, and after
+//! it syncs every directory from the target's parent up to that ancestor. A copy
+//! or rename only syncs the destination directory: the contents were synced when
+//! they were written, and a local copy is a hard link to the same inode.
 
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -87,14 +89,26 @@ fn sync_error(source: io::Error) -> ObjectStoreError {
 
 static SYNCED_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Sync `path`'s contents, then its parent directory's entry for it.
-async fn sync_file_and_parent(path: PathBuf) -> Result<(), ObjectStoreError> {
-    let n = SYNCED_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    if n == 1 || n % 100 == 0 {
-        tracing::info!(synced_writes = n, "DurableLocalFileSystem synced {n} writes");
+/// The nearest ancestor of `path` that exists now; directories below it will be
+/// created by the write and must be synced afterwards.
+fn existing_ancestor(path: &std::path::Path) -> Option<PathBuf> {
+    path.ancestors().skip(1).find(|p| p.is_dir()).map(std::path::Path::to_path_buf)
+}
+
+/// Sync every directory from `path`'s parent up to and including `stop`.
+fn sync_dirs_up_to(path: &std::path::Path, stop: Option<&std::path::Path>) -> io::Result<()> {
+    for dir in path.ancestors().skip(1) {
+        std::fs::File::open(dir)?.sync_all()?;
+        if stop.is_none_or(|s| dir == s) {
+            break;
+        }
     }
+    Ok(())
+}
+
+/// Sync only the destination directory of a copy or rename.
+async fn sync_parent_dir(path: PathBuf) -> Result<(), ObjectStoreError> {
     tokio::task::spawn_blocking(move || -> io::Result<()> {
-        std::fs::File::open(&path)?.sync_all()?;
         if let Some(parent) = path.parent() {
             std::fs::File::open(parent)?.sync_all()?;
         }
@@ -105,10 +119,27 @@ async fn sync_file_and_parent(path: PathBuf) -> Result<(), ObjectStoreError> {
     .map_err(sync_error)
 }
 
+/// Sync `path`'s contents, then every directory the write created, up to the
+/// nearest ancestor that existed before it (`stop`).
+async fn sync_new_file(path: PathBuf, stop: Option<PathBuf>) -> Result<(), ObjectStoreError> {
+    let n = SYNCED_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || n % 100 == 0 {
+        tracing::info!(synced_writes = n, "DurableLocalFileSystem synced {n} writes");
+    }
+    tokio::task::spawn_blocking(move || -> io::Result<()> {
+        std::fs::File::open(&path)?.sync_all()?;
+        sync_dirs_up_to(&path, stop.as_deref())
+    })
+    .await
+    .map_err(|join| sync_error(io::Error::other(join)))?
+    .map_err(sync_error)
+}
+
 #[derive(Debug)]
 struct DurableUpload {
     inner: Box<dyn MultipartUpload>,
     path: PathBuf,
+    stop: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -119,7 +150,7 @@ impl MultipartUpload for DurableUpload {
 
     async fn complete(&mut self) -> Result<PutResult, ObjectStoreError> {
         let result = self.inner.complete().await?;
-        sync_file_and_parent(self.path.clone()).await?;
+        sync_new_file(self.path.clone(), self.stop.clone()).await?;
         Ok(result)
     }
 
@@ -137,8 +168,10 @@ impl ObjectStore for DurableLocalFileSystem {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult, ObjectStoreError> {
+        let path = self.path(location)?;
+        let stop = existing_ancestor(&path);
         let result = self.inner.put_opts(location, payload, opts).await?;
-        sync_file_and_parent(self.path(location)?).await?;
+        sync_new_file(path, stop).await?;
         Ok(result)
     }
 
@@ -148,8 +181,9 @@ impl ObjectStore for DurableLocalFileSystem {
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>, ObjectStoreError> {
         let path = self.path(location)?;
+        let stop = existing_ancestor(&path);
         let inner = self.inner.put_multipart_opts(location, opts).await?;
-        Ok(Box::new(DurableUpload { inner, path }))
+        Ok(Box::new(DurableUpload { inner, path, stop }))
     }
 
     async fn get_opts(
@@ -204,7 +238,7 @@ impl ObjectStore for DurableLocalFileSystem {
         options: CopyOptions,
     ) -> Result<(), ObjectStoreError> {
         self.inner.copy_opts(from, to, options).await?;
-        sync_file_and_parent(self.path(to)?).await
+        sync_parent_dir(self.path(to)?).await
     }
 
     async fn rename_opts(
@@ -214,6 +248,6 @@ impl ObjectStore for DurableLocalFileSystem {
         options: RenameOptions,
     ) -> Result<(), ObjectStoreError> {
         self.inner.rename_opts(from, to, options).await?;
-        sync_file_and_parent(self.path(to)?).await
+        sync_parent_dir(self.path(to)?).await
     }
 }

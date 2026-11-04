@@ -7549,7 +7549,7 @@ impl CayenneTableProvider {
             return;
         };
 
-        let swept = if self.table_metadata.path.starts_with("s3://") {
+        let swept = if crate::is_object_store_path(&self.table_metadata.path) {
             self.cleanup_old_snapshots_s3(&pins).await
         } else {
             Self::cleanup_old_snapshots_local(
@@ -7838,7 +7838,7 @@ impl CayenneTableProvider {
     /// The table root cannot be listed, or the deletion files cannot be read.
     pub async fn retire_unreferenced_snapshot_dirs(&self) -> CatalogResult<Vec<String>> {
         if self.table_metadata.partition_column.is_some()
-            || self.table_metadata.path.starts_with("s3://")
+            || crate::is_object_store_path(&self.table_metadata.path)
         {
             return Ok(Vec::new());
         }
@@ -8281,7 +8281,7 @@ impl CayenneTableProvider {
     pub(crate) fn sweep_retired_snapshot_dirs(&self) {
         // A closed instance's ledger and scan pins do not cover the scans of the
         // instance that replaced it, so it must not judge any directory unused.
-        if self.is_maintenance_closed() || self.table_metadata.path.starts_with("s3://") {
+        if self.is_maintenance_closed() || crate::is_object_store_path(&self.table_metadata.path) {
             return;
         }
         // Lock order everywhere in this file: ledger, then last-listed.
@@ -8558,7 +8558,7 @@ impl CayenneTableProvider {
         snapshot_id: &str,
     ) -> datafusion_common::Result<ListingTableUrl> {
         let dir = Self::snapshot_dir_path(table_path, table_id, snapshot_id);
-        if !table_path.starts_with("s3://")
+        if !crate::is_object_store_path(&table_path)
             && dir.is_absolute()
             && !dir.to_string_lossy().contains(['*', '?', '['])
             && let Ok(url) = url::Url::from_directory_path(&dir)
@@ -8633,7 +8633,7 @@ impl CayenneTableProvider {
         &self,
         snapshot_id: &str,
     ) -> Result<Option<ObjectStorePath>> {
-        if !self.table_metadata.path.starts_with("s3://") {
+        if !crate::is_object_store_path(&self.table_metadata.path) {
             return Ok(None);
         }
 
@@ -8999,7 +8999,7 @@ impl CayenneTableProvider {
     /// * `table_id` - The unique identifier for the table
     /// * `snapshot_id` - The snapshot identifier
     fn snapshot_dir_url(table_path: &str, table_id: &str, snapshot_id: &str) -> String {
-        if table_path.starts_with("s3://") {
+        if crate::is_object_store_path(&table_path) {
             // S3 URL: join path components with /
             let base = table_path.trim_end_matches('/');
             format!("{base}/{table_id}/{snapshot_id}/")
@@ -9070,7 +9070,7 @@ impl CayenneTableProvider {
         // removes a significant per-write cost for the common small-append
         // (inline) ingestion path, especially on S3.
         if !self.staging_may_have_files().load(Ordering::Acquire) {
-            if self.table_metadata.path.starts_with("s3://") {
+            if crate::is_object_store_path(&self.table_metadata.path) {
                 return Ok(());
             }
 
@@ -9089,7 +9089,7 @@ impl CayenneTableProvider {
             }
         }
 
-        if self.table_metadata.path.starts_with("s3://") {
+        if crate::is_object_store_path(&self.table_metadata.path) {
             // S3: delete all objects under the staging prefix
             if let Some(prefix) = self.snapshot_object_store_prefix(STAGING_DIR_NAME)? {
                 self.delete_prefix_with_object_store(&prefix).await?;
@@ -9132,7 +9132,7 @@ impl CayenneTableProvider {
     /// On S3 the staging prefix is cleared as a whole (no per-entry listing) —
     /// the lock exclusion in `ensure_no_incomplete_write` is the guard there.
     pub(crate) async fn clear_orphan_staging_dirs(&self) -> Result<()> {
-        if self.table_metadata.path.starts_with("s3://") {
+        if crate::is_object_store_path(&self.table_metadata.path) {
             if let Some(prefix) = self.snapshot_object_store_prefix(STAGING_DIR_NAME)? {
                 self.delete_prefix_with_object_store(&prefix).await?;
             }
@@ -9190,7 +9190,7 @@ impl CayenneTableProvider {
     /// still waiting for Stage B. The legacy `_staging/` path keeps the old
     /// whole-directory cleanup semantics through [`Self::clear_staging_dir`].
     pub(crate) async fn clear_staging_snapshot_dir(&self, staging_snapshot_id: &str) -> Result<()> {
-        if self.table_metadata.path.starts_with("s3://") {
+        if crate::is_object_store_path(&self.table_metadata.path) {
             if let Some(prefix) = self.snapshot_object_store_prefix(staging_snapshot_id)? {
                 self.delete_prefix_with_object_store(&prefix).await?;
             }
@@ -9237,7 +9237,7 @@ impl CayenneTableProvider {
         staging_snapshot_id: &str,
         target_snapshot_id: &str,
     ) -> Result<()> {
-        if self.table_metadata.path.starts_with("s3://") {
+        if crate::is_object_store_path(&self.table_metadata.path) {
             self.move_staging_files_s3(staging_snapshot_id, target_snapshot_id)
                 .await
         } else {
@@ -9524,10 +9524,7 @@ impl CayenneTableProvider {
         // footer cache re-reads once, never serves stale metadata).
         let mut moved_metas: Vec<ObjectMeta> = Vec::with_capacity(objects.len());
         for meta in &objects {
-            let relative = meta
-                .location
-                .as_ref()
-                .strip_prefix(staging_prefix.as_ref())
+            let relative = crate::object_relative(&staging_prefix, &meta.location)
                 .ok_or_else(|| Error::Internal {
                     table: self.table_metadata.table_name.clone(),
                     message: format!(
@@ -9544,8 +9541,7 @@ impl CayenneTableProvider {
             if relative == STAGING_WAL_FILENAME || relative == STAGING_WAL_TMP_FILENAME {
                 continue;
             }
-            let target_path =
-                ObjectStorePath::from(format!("{}{relative}", target_prefix.as_ref()));
+            let target_path = crate::object_child(&target_prefix, relative);
             if let Some(prefix) = &cache_prefix {
                 moved_metas.push(ObjectMeta {
                     location: prefix.clone().join(relative),
@@ -9704,7 +9700,7 @@ impl CayenneTableProvider {
             snapshot_id: target_snapshot_id.to_string(),
             armed: true,
         };
-        if self.table_metadata.path.starts_with("s3://") {
+        if crate::is_object_store_path(&self.table_metadata.path) {
             let config = self.require_object_store()?;
             let source_prefix = self
                 .snapshot_object_store_prefix(source_snapshot_id)?
@@ -9737,16 +9733,12 @@ impl CayenneTableProvider {
                     let source_prefix = source_prefix.clone();
                     let target_prefix = target_prefix.clone();
                     async move {
-                        let relative = meta
-                            .location
-                            .as_ref()
-                            .strip_prefix(source_prefix.as_ref())
+                        let relative = crate::object_relative(&source_prefix, &meta.location)
                             .ok_or_else(|| Error::Internal {
                                 table: table_name.clone(),
                                 message: "Source snapshot object escaped its prefix".to_string(),
                             })?;
-                        let target =
-                            ObjectStorePath::from(format!("{}{relative}", target_prefix.as_ref()));
+                        let target = crate::object_child(&target_prefix, relative);
                         store.copy(&meta.location, &target).await.map_err(|source| {
                             Error::ObjectStore {
                                 operation: "clone snapshot object",
@@ -9799,7 +9791,7 @@ impl CayenneTableProvider {
     }
 
     pub(crate) async fn clear_snapshot_dir(&self, snapshot_id: &str) -> Result<()> {
-        if self.table_metadata.path.starts_with("s3://") {
+        if crate::is_object_store_path(&self.table_metadata.path) {
             if let Some(prefix) = self.snapshot_object_store_prefix(snapshot_id)? {
                 self.delete_prefix_with_object_store(&prefix).await?;
             }
@@ -10181,7 +10173,7 @@ impl CayenneTableProvider {
             CayenneContext::new(&table_metadata.vortex_config, runtime_env, table_name)
         });
 
-        if table_metadata.path.starts_with("s3://") && object_store_config.is_none() {
+        if crate::is_object_store_path(&table_metadata.path) && object_store_config.is_none() {
             return Err(Error::Internal {
                 table: table_name.to_string(),
                 message: "Table uses S3 storage but no object_store_config was provided"
@@ -10333,7 +10325,7 @@ impl CayenneTableProvider {
             persisted_hi,
         }));
 
-        let force_staging_probe_on_startup = table_metadata.path.starts_with("s3://");
+        let force_staging_probe_on_startup = crate::is_object_store_path(&table_metadata.path);
         // A replacement inherits the replaced instance's pins; any other
         // instance starts with none.
         let snapshot_dir_pins = snapshot_dir_pins.unwrap_or_default();
@@ -10344,14 +10336,12 @@ impl CayenneTableProvider {
         // loading, deletion sinks) will automatically inherit the store.
         if let Some(ref config) = object_store_config {
             Self::register_object_store_if_needed(context.runtime_env(), config);
-        } else if !table_metadata.path.starts_with("s3://") {
+        } else if !crate::is_object_store_path(&table_metadata.path) {
             // Prototype: a local table's files go through one durable object store.
-            static DURABLE_LOCAL: std::sync::LazyLock<Arc<dyn object_store::ObjectStore>> =
-                std::sync::LazyLock::new(|| Arc::new(object_store_occ::DurableLocalFileSystem::new()));
             if let Ok(url) = url::Url::parse("file:///") {
                 Self::register_object_store_if_needed(
                     context.runtime_env(),
-                    &crate::metadata::ObjectStoreConfig { url, store: Arc::clone(&DURABLE_LOCAL) },
+                    &crate::metadata::ObjectStoreConfig { url, store: crate::durable_local_object_store() },
                 );
             }
         }
@@ -11166,7 +11156,7 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if the directory cannot be created.
     pub(crate) async fn ensure_local_snapshot_dir(&self, snapshot_id: &str) -> Result<()> {
-        if self.table_metadata.path.starts_with("s3://") {
+        if crate::is_object_store_path(&self.table_metadata.path) {
             return Ok(());
         }
         Self::ensure_snapshot_dir_exists(&self.snapshot_dir_path_for(snapshot_id)).await?;
@@ -11184,7 +11174,7 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if the directory cannot be synced.
     pub(crate) async fn sync_local_snapshot_dir(&self, snapshot_id: &str) -> CatalogResult<()> {
-        if self.table_metadata.path.starts_with("s3://") {
+        if crate::is_object_store_path(&self.table_metadata.path) {
             return Ok(());
         }
         Self::sync_snapshot_dir(&self.snapshot_dir_path_for(snapshot_id)).await
@@ -11531,7 +11521,7 @@ impl CayenneTableProvider {
         };
 
         // Progress tracking for S3 Express uploads
-        let is_s3_storage = self.table_metadata.path.starts_with("s3://");
+        let is_s3_storage = crate::is_object_store_path(&self.table_metadata.path);
         let start_time = Instant::now();
         let last_progress_ms = Arc::new(AtomicU64::new(0));
         let total_bytes_written = Arc::new(AtomicUsize::new(0));
@@ -12348,7 +12338,7 @@ impl CayenneTableProvider {
     /// approximated, so a missing series is never mistaken for an empty
     /// directory.
     async fn sample_data_dir_metrics(&self) -> bool {
-        if self.table_metadata.path.starts_with("s3://") {
+        if crate::is_object_store_path(&self.table_metadata.path) {
             // Not a failure: there is nothing to publish here on object storage,
             // and the gate should hold the full interval rather than retrying a
             // walk that will never run.
@@ -14512,7 +14502,7 @@ impl CayenneTableProvider {
         // auto-tuned config line.
         let storage = if table_metadata.vortex_config.memory_mode {
             TableStorage::Memory
-        } else if table_metadata.path.starts_with("s3://") {
+        } else if crate::is_object_store_path(&table_metadata.path) {
             TableStorage::ObjectStorage
         } else {
             TableStorage::LocalDisk
@@ -21131,7 +21121,7 @@ impl CayenneTableProvider {
         //  - delete old files first (which would break the lazy read), or
         //  - collect all sorted data into memory before writing
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-        let is_s3 = self.table_metadata.path.starts_with("s3://");
+        let is_s3 = crate::is_object_store_path(&self.table_metadata.path);
 
         let cleanup_failed_snapshot = async {
             if is_s3 {
@@ -22094,7 +22084,7 @@ impl CayenneTableProvider {
         // Staging snapshot holding ONLY the candidate files so a normal snapshot
         // scan reads just those bytes (no full-table re-read).
         let staging_snapshot_id = format!("subset-src-{new_snapshot_id}");
-        let is_s3 = self.table_metadata.path.starts_with("s3://");
+        let is_s3 = crate::is_object_store_path(&self.table_metadata.path);
 
         // Cleanup both dirs on any failure after creation.
         let cleanup_all = async {
@@ -22571,7 +22561,7 @@ impl CayenneTableProvider {
         if basenames.is_empty() {
             return Ok(());
         }
-        if self.table_metadata.path.starts_with("s3://") {
+        if crate::is_object_store_path(&self.table_metadata.path) {
             let config = self.require_object_store()?;
             let source_prefix = self
                 .snapshot_object_store_prefix(source_snapshot_id)?
@@ -22588,8 +22578,8 @@ impl CayenneTableProvider {
             let store = Arc::clone(&config.store);
             let table_name = self.table_name().to_string();
             for basename in basenames {
-                let source = ObjectStorePath::from(format!("{}{basename}", source_prefix.as_ref()));
-                let target = ObjectStorePath::from(format!("{}{basename}", target_prefix.as_ref()));
+                let source = crate::object_child(&source_prefix, basename);
+                let target = crate::object_child(&target_prefix, basename);
                 store
                     .copy(&source, &target)
                     .await
@@ -24284,7 +24274,7 @@ impl CayenneTableProvider {
         &self,
         snapshot_id: &str,
     ) -> Result<Vec<(String, u64)>> {
-        if self.table_metadata.path.starts_with("s3://") {
+        if crate::is_object_store_path(&self.table_metadata.path) {
             self.list_snapshot_files_with_sizes_s3(snapshot_id).await
         } else {
             self.list_snapshot_files_with_sizes_local(snapshot_id).await
@@ -24580,7 +24570,7 @@ impl CayenneTableProvider {
     /// [`Self::list_snapshot_files_with_sizes`]. This is a whole-file read, so
     /// it runs only when `integrity_checksums` is enabled.
     async fn read_data_file_bytes(&self, snapshot_id: &str, file_name: &str) -> Result<Vec<u8>> {
-        if self.table_metadata.path.starts_with("s3://") {
+        if crate::is_object_store_path(&self.table_metadata.path) {
             let Some(prefix) = self.snapshot_object_store_prefix(snapshot_id)? else {
                 return Err(Error::Internal {
                     table: self.table_metadata.table_name.clone(),
@@ -24590,7 +24580,7 @@ impl CayenneTableProvider {
                 });
             };
             let config = self.require_object_store()?;
-            let path = ObjectStorePath::from(format!("{}{file_name}", prefix.as_ref()));
+            let path = crate::object_child(&prefix, file_name);
             let result = config
                 .store
                 .get(&path)
@@ -25912,7 +25902,7 @@ impl CayenneTableProvider {
         let target_partitions = 1;
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-        let is_s3 = self.table_metadata.path.starts_with("s3://");
+        let is_s3 = crate::is_object_store_path(&self.table_metadata.path);
 
         if !is_s3 {
             let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
@@ -26767,7 +26757,7 @@ impl CayenneTableProvider {
         // the object-store write. Reuse the warm helper so cold dir creation gets
         // the same fsync-the-parent crash-safety (and error propagation) instead
         // of a bare create_dir_all. S3/object stores need no mkdir.
-        if !cold_base.starts_with("s3://") {
+        if !crate::is_object_store_path(&cold_base) {
             let local = cold_dir_url
                 .strip_prefix("file://")
                 .unwrap_or(cold_dir_url.as_str());
@@ -27502,7 +27492,7 @@ impl CayenneTableProvider {
         let mut cold_files = cold_files;
         cold_files.extend(clean_cold);
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-        if !self.table_metadata.path.starts_with("s3://") {
+        if !crate::is_object_store_path(&self.table_metadata.path) {
             let dir = self.snapshot_dir_path_for(&new_snapshot_id);
             Self::ensure_snapshot_dir_exists(&dir).await?;
         }
@@ -28282,7 +28272,7 @@ impl CayenneTableProvider {
         let plan_build_ms = phase2_start.elapsed().as_millis();
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-        let is_s3 = self.table_metadata.path.starts_with("s3://");
+        let is_s3 = crate::is_object_store_path(&self.table_metadata.path);
 
         if !is_s3 {
             let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
@@ -29083,7 +29073,7 @@ impl CayenneTableProvider {
         let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-        let is_s3 = self.table_metadata.path.starts_with("s3://");
+        let is_s3 = crate::is_object_store_path(&self.table_metadata.path);
         if !is_s3 {
             let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
             Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
@@ -36683,7 +36673,7 @@ impl CayenneTableProvider {
                 .await?
             };
 
-            let is_s3 = self.table_metadata.path.starts_with("s3://");
+            let is_s3 = crate::is_object_store_path(&self.table_metadata.path);
             if !is_s3 {
                 let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
                 Self::sync_snapshot_dir(&snapshot_dir).await?;
@@ -38333,7 +38323,7 @@ impl CayenneTableProvider {
         // as in the sort-rewrite and normal append paths: the Vortex files must
         // be durably present before the catalog metadata that makes them
         // visible (via sequence number / protected snapshot) is committed.
-        let is_s3 = self.table_metadata.path.starts_with("s3://");
+        let is_s3 = crate::is_object_store_path(&self.table_metadata.path);
         if !is_s3 {
             let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
             Self::sync_snapshot_dir(&snapshot_dir).await?;
@@ -43325,7 +43315,7 @@ impl TableProvider for CayenneTableProvider {
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        let is_s3 = self.table_metadata.path.starts_with("s3://");
+        let is_s3 = crate::is_object_store_path(&self.table_metadata.path);
 
         if is_s3 {
             tracing::debug!(
@@ -43978,7 +43968,7 @@ impl CayenneTableProvider {
             return false;
         };
 
-        if self.table_metadata.path.starts_with("s3://") {
+        if crate::is_object_store_path(&self.table_metadata.path) {
             return false;
         }
 

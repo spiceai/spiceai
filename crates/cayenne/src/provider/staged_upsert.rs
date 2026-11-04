@@ -584,7 +584,7 @@ impl CayenneTableProvider {
 /// (S3) have no atomic "remove dir" and are left to the next successful
 /// snapshot-cleanup cycle, mirroring [`super::overwrite::PreparedOverwrite::rollback`].
 pub(super) async fn cleanup_orphan_snapshot_dir(table: &CayenneTableProvider, snapshot_id: &str) {
-    if table.table_path().starts_with("s3://") {
+    if crate::is_object_store_path(&table.table_path()) {
         return;
     }
     let snapshot_dir = table.snapshot_dir_path_for(snapshot_id);

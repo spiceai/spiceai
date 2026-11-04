@@ -1331,7 +1331,7 @@ impl<'a> AppendMutationWriter<'a> {
     }
 
     async fn cleanup_layered_append_dirs(&self, snapshot_ids: &[String]) {
-        if self.table.table_path().starts_with("s3://") {
+        if crate::is_object_store_path(&self.table.table_path()) {
             return;
         }
         for snapshot_id in snapshot_ids {

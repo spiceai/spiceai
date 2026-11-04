@@ -164,3 +164,44 @@ pub use provider::{
     try_reserve_global_mem_tier_bytes, update_global_mem_tier_total,
 };
 pub use schema::{CAYENNE_TYPE_REWRITE_RULES, transform_schema_for_vortex};
+
+/// Whether a table path names an object-store location (`s3://`, or a local
+/// directory addressed as `file://`), so every data operation goes through the
+/// table's `ObjectStore` rather than the local filesystem. Prototype: a local
+/// table in file mode is given a `file://` path.
+#[must_use]
+pub fn is_object_store_path(path: &str) -> bool {
+    path.starts_with("s3://") || path.starts_with("file://")
+}
+
+/// `prefix/name` as an object path. [`object_store::path::Path`] keeps no trailing
+/// `/`, so joining by string concatenation alone fuses the last segment of the
+/// prefix with `name`; `Path::from` drops empty segments, so a leading `/` on
+/// `name` or an empty prefix is harmless here.
+#[must_use]
+pub(crate) fn object_child(prefix: &object_store::path::Path, name: &str) -> object_store::path::Path {
+    object_store::path::Path::from(format!("{}/{name}", prefix.as_ref()))
+}
+
+/// `location` relative to `prefix`, without the separating `/`; `None` when
+/// `location` is not under `prefix` on a segment boundary.
+#[must_use]
+pub(crate) fn object_relative<'a>(
+    prefix: &object_store::path::Path,
+    location: &'a object_store::path::Path,
+) -> Option<&'a str> {
+    let prefix = prefix.as_ref();
+    if prefix.is_empty() {
+        return Some(location.as_ref());
+    }
+    location.as_ref().strip_prefix(prefix)?.strip_prefix('/')
+}
+
+/// Prototype: the durable local-directory store that every local file-mode table
+/// writes and reads through, registered for `file:///` in the table's `RuntimeEnv`.
+#[must_use]
+pub fn durable_local_object_store() -> std::sync::Arc<dyn object_store::ObjectStore> {
+    static STORE: std::sync::LazyLock<std::sync::Arc<dyn object_store::ObjectStore>> =
+        std::sync::LazyLock::new(|| std::sync::Arc::new(object_store_occ::DurableLocalFileSystem::new()));
+    std::sync::Arc::clone(&STORE)
+}

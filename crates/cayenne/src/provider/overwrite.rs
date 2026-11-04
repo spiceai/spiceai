@@ -436,7 +436,7 @@ impl PreparedOverwrite {
         self.table
             .remove_unpublished_snapshot_dir(&self.new_snapshot_id)
             .await;
-        if !self.table.table_path().starts_with("s3://") {
+        if !crate::is_object_store_path(&self.table.table_path()) {
             remove_deletion_vectors(&self.delete_files).await;
         }
         Ok(())
@@ -624,7 +624,7 @@ impl CayenneTableProvider {
         let checkpoint_guard = self.mem_checkpoint_lock_for_writer().lock_owned().await;
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-        let is_s3 = self.table_path().starts_with("s3://");
+        let is_s3 = crate::is_object_store_path(&self.table_path());
 
         if !is_s3 {
             let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
@@ -937,7 +937,7 @@ impl CayenneTableProvider {
     /// directory left behind is pruned by the next snapshot cleanup, and object
     /// stores are left to it entirely.
     async fn remove_unpublished_snapshot_dir(&self, snapshot_id: &str) {
-        if self.table_path().starts_with("s3://") {
+        if crate::is_object_store_path(&self.table_path()) {
             return;
         }
         let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);

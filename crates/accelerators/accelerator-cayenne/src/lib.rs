@@ -3528,6 +3528,34 @@ impl CayenneAccelerator {
                 .context(S3Snafu)?
         };
 
+        // Prototype: a local file-mode table is addressed as `file://` and goes through
+        // the durable local object store, so local and S3 run one code path.
+        let (dir_path, object_store) =
+            if !memory_mode && object_store.is_none() && !dir_path.starts_with("s3://") {
+                let abs = tokio::fs::canonicalize(dir_path)
+                    .await
+                    .boxed()
+                    .context(AccelerationCreationFailedSnafu)?;
+                let dir_url = url::Url::from_directory_path(&abs).map_err(|()| {
+                    Error::InvalidConfiguration {
+                        detail: Arc::from(format!(
+                            "Cannot address data directory '{}' as a file:// URL",
+                            abs.display()
+                        )),
+                    }
+                })?;
+                let root = url::Url::parse("file:///").boxed().context(AccelerationCreationFailedSnafu)?;
+                (
+                    dir_url.to_string(),
+                    Some(cayenne::metadata::ObjectStoreConfig {
+                        url: root,
+                        store: cayenne::durable_local_object_store(),
+                    }),
+                )
+            } else {
+                (dir_path.to_string(), object_store)
+            };
+
         // Log S3 Express configuration
         if is_s3_express {
             tracing::info!(
@@ -3542,7 +3570,7 @@ impl CayenneAccelerator {
             schema: Arc::<arrow_schema::Schema>::clone(&schema),
             primary_key: primary_keys,
             on_conflict,
-            base_path: dir_path.to_string(),
+            base_path: dir_path.clone(),
             partition_column: None, // Non-partitioned table
             vortex_config,
         };

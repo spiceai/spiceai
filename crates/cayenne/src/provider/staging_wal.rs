@@ -1171,7 +1171,7 @@ impl CayenneTableProvider {
     /// Returns an error if object-store configuration or the canonical table
     /// prefix cannot be resolved.
     pub fn partitioned_wal_object_store(&self) -> Result<Option<PartitionedWalObjectStore>> {
-        if !self.table_path().starts_with("s3://") {
+        if !crate::is_object_store_path(&self.table_path()) {
             return Ok(None);
         }
         let config = self.require_object_store()?;
@@ -1527,7 +1527,7 @@ impl CayenneTableProvider {
         target_snapshot: &str,
         target_kind: StagingWalTargetKind,
     ) -> Result<()> {
-        if self.table_path().starts_with("s3://") {
+        if crate::is_object_store_path(&self.table_path()) {
             self.write_staging_wal_s3(staging_snapshot_id, target_snapshot, target_kind)
                 .await?;
         } else {
@@ -1670,10 +1670,7 @@ impl CayenneTableProvider {
         let staged_files: Vec<String> = objects
             .iter()
             .filter_map(|meta| {
-                let name = meta
-                    .location
-                    .as_ref()
-                    .strip_prefix(staging_prefix.as_ref())
+                let name = crate::object_relative(&staging_prefix, &meta.location)
                     .unwrap_or(meta.location.as_ref());
                 if name == STAGING_WAL_FILENAME || name == STAGING_WAL_TMP_FILENAME {
                     None
@@ -1706,8 +1703,7 @@ impl CayenneTableProvider {
             content.into_bytes()
         };
 
-        let wal_key =
-            ObjectStorePath::from(format!("{}{STAGING_WAL_FILENAME}", staging_prefix.as_ref()));
+        let wal_key = crate::object_child(&staging_prefix, STAGING_WAL_FILENAME);
         config
             .store
             .put(&wal_key, record_bytes.into())
@@ -1733,13 +1729,10 @@ impl CayenneTableProvider {
     /// removal fails, the commit is not reported as complete: callers must retain
     /// the recovery intent and surface the failure.
     pub(crate) async fn remove_staging_wal_for(&self, staging_snapshot_id: &str) -> Result<()> {
-        if self.table_path().starts_with("s3://") {
+        if crate::is_object_store_path(&self.table_path()) {
             let config = self.require_object_store()?;
             if let Some(staging_prefix) = self.snapshot_object_store_prefix(staging_snapshot_id)? {
-                let wal_key = ObjectStorePath::from(format!(
-                    "{}{STAGING_WAL_FILENAME}",
-                    staging_prefix.as_ref()
-                ));
+                let wal_key = crate::object_child(&staging_prefix, STAGING_WAL_FILENAME);
                 match config.store.delete(&wal_key).await {
                     Ok(()) | Err(object_store::Error::NotFound { .. }) => {
                         if !self.has_inflight_staging_appends() {
@@ -1857,7 +1850,7 @@ impl CayenneTableProvider {
         if !self.staging_wal_present().load(Ordering::Acquire)
             && !self.staging_may_have_files().load(Ordering::Acquire)
         {
-            if self.table_path().starts_with("s3://") {
+            if crate::is_object_store_path(&self.table_path()) {
                 return Ok(());
             }
 
@@ -2075,7 +2068,7 @@ impl CayenneTableProvider {
             // empty, recovery is just a WAL unlink) from "filesystem-level
             // corruption that lost staged files" (file in neither location).
             // Only the former should self-heal.
-            if !self.table_path().starts_with("s3://") && !wal.staged_files.is_empty() {
+            if !crate::is_object_store_path(&self.table_path()) && !wal.staged_files.is_empty() {
                 let staging_dir = Self::snapshot_dir_path(
                     self.table_path(),
                     self.table_id(),
@@ -2121,7 +2114,7 @@ impl CayenneTableProvider {
                         ),
                     });
                 }
-            } else if self.table_path().starts_with("s3://") && !wal.staged_files.is_empty() {
+            } else if crate::is_object_store_path(&self.table_path()) && !wal.staged_files.is_empty() {
                 // Pre-recovery audit (S3): symmetric to the local-FS audit.
                 // List the staging prefix and the target snapshot prefix. Every
                 // WAL-listed file must appear in at least one of those prefixes.
@@ -2171,7 +2164,7 @@ impl CayenneTableProvider {
                 let expected = wal
                     .staged_files
                     .iter()
-                    .map(String::as_str)
+                    .map(|f| f.trim_start_matches('/'))
                     .collect::<std::collections::HashSet<_>>();
 
                 let mut staging_objects = config.store.list(Some(&staging_prefix));
@@ -2184,7 +2177,7 @@ impl CayenneTableProvider {
                             wal.target_snapshot
                         ),
                     })?;
-                    if let Some(rel) = meta.location.as_ref().strip_prefix(staging_prefix.as_ref())
+                    if let Some(rel) = crate::object_relative(&staging_prefix, &meta.location)
                         && expected.contains(rel)
                     {
                         reachable.insert(rel.to_string());
@@ -2205,8 +2198,7 @@ impl CayenneTableProvider {
                                 wal.target_snapshot
                             ),
                         })?;
-                        if let Some(rel) =
-                            meta.location.as_ref().strip_prefix(target_prefix.as_ref())
+                        if let Some(rel) = crate::object_relative(&target_prefix, &meta.location)
                             && expected.contains(rel)
                         {
                             reachable.insert(rel.to_string());
@@ -2219,7 +2211,7 @@ impl CayenneTableProvider {
 
                 let mut missing_files: Vec<String> = Vec::new();
                 for staged_file in &wal.staged_files {
-                    if !reachable.contains(staged_file) {
+                    if !reachable.contains(staged_file.trim_start_matches('/')) {
                         missing_files.push(staged_file.clone());
                     }
                 }
@@ -2362,7 +2354,7 @@ impl CayenneTableProvider {
     }
 
     async fn read_staging_wals(&self) -> Result<Vec<LocatedStagingWal>> {
-        if self.table_path().starts_with("s3://") {
+        if crate::is_object_store_path(&self.table_path()) {
             self.read_staging_wals_s3().await
         } else {
             self.read_staging_wals_local().await
@@ -2470,8 +2462,7 @@ impl CayenneTableProvider {
 
         let mut wals = Vec::new();
         for meta in objects {
-            let Some(relative) = meta.location.as_ref().strip_prefix(staging_prefix.as_ref())
-            else {
+            let Some(relative) = crate::object_relative(&staging_prefix, &meta.location) else {
                 continue;
             };
             let staging_snapshot_id = if relative == STAGING_WAL_FILENAME {
