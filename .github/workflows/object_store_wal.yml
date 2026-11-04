@@ -130,8 +130,9 @@ jobs:
     timeout-minutes: 45
     services:
       redis:
-        # GitHub service containers require Linux. An empty image skips macOS.
-        image: ${{ matrix.os == 'Linux' && 'redis:7.4.11-bookworm' || '' }}
+        # GitHub service containers require Linux. An empty image skips macOS. A service
+        # starts before any step can log in, so it pulls from ECR Public, not Docker Hub.
+        image: ${{ matrix.os == 'Linux' && 'public.ecr.aws/docker/library/redis:7.4.11-bookworm' || '' }}
         ports:
           - 6379/tcp
         options: >-
