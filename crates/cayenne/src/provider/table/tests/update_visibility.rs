@@ -22,6 +22,7 @@ use super::*;
 use crate::metadata::DeletionMode;
 use crate::provider::append_commit::test_seams;
 use arrow::array::{AsArray, StringArray};
+use datafusion::prelude::lit;
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
