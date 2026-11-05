@@ -3,7 +3,7 @@
 Used by publish_release.yml:
 
   find-build  Prints the id of the one successful build_release run of the tag.
-  publish     Attaches the files listed in SHA256SUMS to the tag's draft release
+  publish     Checks the tag still points at the built commit, attaches the files listed in SHA256SUMS to the tag's draft release
               (created when there is none), checks every asset against its
               sha256, and publishes the release.
 
@@ -21,6 +21,10 @@ import requests
 
 API = "https://api.github.com"
 UPLOADS = "https://uploads.github.com"
+
+# (connect, read) seconds. An upload of the largest binary must fit in read.
+TIMEOUT = (10, 60)
+UPLOAD_TIMEOUT = (10, 900)
 
 # GitHub rejects a release body longer than this with a 422.
 MAX_BODY_CHARS = 125000
@@ -58,21 +62,24 @@ class Api:
         params = dict(params or {}, per_page=100)
         items = []
         while url:
-            resp = self._check(self.session.get(url, params=params), f"list {path}")
+            resp = self._check(self.session.get(url, params=params, timeout=TIMEOUT), f"list {path}")
             body = resp.json()
             items.extend(body[key] if key else body)
             url = resp.links.get("next", {}).get("url")
             params = None
         return items
 
+    def get(self, path):
+        return self._check(self.session.get(f"{API}/{path}", timeout=TIMEOUT), f"read {path}").json()
+
     def post(self, path, payload):
-        return self._check(self.session.post(f"{API}/{path}", json=payload), f"create {path}").json()
+        return self._check(self.session.post(f"{API}/{path}", json=payload, timeout=TIMEOUT), f"create {path}").json()
 
     def patch(self, path, payload):
-        return self._check(self.session.patch(f"{API}/{path}", json=payload), f"update {path}").json()
+        return self._check(self.session.patch(f"{API}/{path}", json=payload, timeout=TIMEOUT), f"update {path}").json()
 
     def delete(self, path):
-        self._check(self.session.delete(f"{API}/{path}"), f"delete {path}")
+        self._check(self.session.delete(f"{API}/{path}", timeout=TIMEOUT), f"delete {path}")
 
     def upload(self, repo, release_id, name, path):
         with open(path, "rb") as f:
@@ -81,6 +88,7 @@ class Api:
                 params={"name": name},
                 headers={"Content-Type": "application/octet-stream"},
                 data=f,
+                timeout=UPLOAD_TIMEOUT,
             )
         return self._check(resp, f"upload {name}").json()
 
@@ -102,6 +110,19 @@ def find_build_run(api, repo, workflow, tag, sha):
             f"is more than one, delete the runs that should not be published."
         )
     return matches[0]["id"]
+
+
+def require_tag_at(api, repo, tag, sha):
+    """Fail unless tag still points at sha, the commit whose build is being published."""
+    obj = api.get(f"repos/{repo}/git/ref/tags/{tag}")["object"]
+    # An annotated tag points at a tag object; peel it to the commit.
+    while obj["type"] == "tag":
+        obj = api.get(f"repos/{repo}/git/tags/{obj['sha']}")["object"]
+    if obj["sha"] != sha:
+        raise PublishError(
+            f"Tag {tag} now points at {obj['sha']}, not at {sha}, whose build this run found. "
+            f"The tag moved after this run started; start publish_release again on the tag."
+        )
 
 
 def read_sums(path):
@@ -290,6 +311,7 @@ def main(argv=None):
     pub.add_argument("--sums", required=True, help="SHA256SUMS manifest of the build_release run")
     pub.add_argument("--notes-file", help="Release notes, used when the draft has none")
     pub.add_argument("--prerelease", choices=["true", "false"], required=True)
+    pub.add_argument("--sha", required=True, help="Commit the build was made from")
 
     args = parser.parse_args(argv)
     token = os.getenv("GITHUB_TOKEN")
@@ -319,6 +341,7 @@ def main(argv=None):
                 notes = f.read()
         if not notes:
             notes = f"This is the release candidate {args.tag[1:]}"
+        require_tag_at(api, args.repo, args.tag, args.sha)
         latest = publish(api, args.repo, args.tag, files, notes, args.prerelease == "true")
         write_output("make_latest", "true" if latest else "false")
         return 0

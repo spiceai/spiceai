@@ -250,6 +250,8 @@ Testing focus DRIs are responsible for:
 
 ## Release Publication Steps
 
+Release lines cut before `publish_release` existed (2.4 and earlier) still publish from the tag build: for those, follow the steps in that release branch's copy of this template.
+
 - [ ] Cherry-pick release notes onto the release branch.
 - [ ] Push the release tag (e.g. `v1.0.0-rc.1`) to the release branch commit that passed testing. `version.txt` at that commit must match the tag, or the build fails.
 - [ ] Check that the [build_release](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) run for the tag is green. It builds every binary, CUDA included, and publishes nothing.

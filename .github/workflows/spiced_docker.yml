@@ -43,8 +43,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
+          SHA256_AMD64: ${{ inputs.spiced_sha256_amd64 }}
+          SHA256_ARM64: ${{ inputs.spiced_sha256_arm64 }}
+          SHA256_CUDA: ${{ inputs.spiced_sha256_cuda }}
         run: |
           set -euo pipefail
+          # The Dockerfiles skip the check when SPICED_SHA256 is empty.
+          for sha in "$SHA256_AMD64" "$SHA256_ARM64" "$SHA256_CUDA"; do
+            if ! [[ "$sha" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::'${sha}' is not a sha256, so the downloaded binaries could not be checked."
+              exit 1
+            fi
+          done
           if [[ "$RELEASE_TAG" != v* ]]; then
             echo "::error::release_tag '${RELEASE_TAG}' is not a release tag (vX.Y.Z)."
             exit 1

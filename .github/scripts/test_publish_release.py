@@ -28,6 +28,8 @@ class FakeApi:
             r.setdefault("body", "")
             r.setdefault("name", "")
         self.runs = list(runs)
+        # Git refs and tag objects, by path below repos/{owner}/{repo}/.
+        self.objects = {}
         self.next_id = 1000
         self.patches = []
         self.uploads = []
@@ -47,6 +49,9 @@ class FakeApi:
         if parts[3] == "releases" and parts[5] == "assets":
             return [dict(a) for a in self._release(int(parts[4]))["assets"]]
         raise AssertionError(f"unexpected GET {path}")
+
+    def get(self, path):
+        return self.objects[path.split("/", 3)[3]]
 
     def post(self, path, payload):
         assert path == f"repos/{REPO}/releases", path
@@ -232,6 +237,25 @@ class FindBuildTests(unittest.TestCase):
         with self.assertRaises(PublishError) as ctx:
             publish_release.find_build_run(api, REPO, "build_release.yml", "v2.4.2", self.SHA)
         self.assertIn("found 4, 5", str(ctx.exception))
+
+
+class TagTests(unittest.TestCase):
+    SHA = "c" * 40
+
+    def test_accepts_a_lightweight_and_an_annotated_tag_at_the_commit(self):
+        api = FakeApi()
+        api.objects["git/ref/tags/v2.4.2"] = {"object": {"type": "commit", "sha": self.SHA}}
+        publish_release.require_tag_at(api, REPO, "v2.4.2", self.SHA)
+        api.objects["git/ref/tags/v2.4.2"] = {"object": {"type": "tag", "sha": "t" * 40}}
+        api.objects["git/tags/" + "t" * 40] = {"object": {"type": "commit", "sha": self.SHA}}
+        publish_release.require_tag_at(api, REPO, "v2.4.2", self.SHA)
+
+    def test_fails_when_the_tag_moved(self):
+        api = FakeApi()
+        api.objects["git/ref/tags/v2.4.2"] = {"object": {"type": "commit", "sha": "d" * 40}}
+        with self.assertRaises(PublishError) as ctx:
+            publish_release.require_tag_at(api, REPO, "v2.4.2", self.SHA)
+        self.assertIn(f"now points at {'d' * 40}, not at {self.SHA}", str(ctx.exception))
 
 
 class ReadSumsTests(unittest.TestCase):
