@@ -3,7 +3,7 @@ name: publish_release
 # Publishes a release from its build_release run. Start it on the release tag
 # (Use workflow from: Tags > vX.Y.Z) once the tag's build_release run is green.
 # After one approval of the `publish` job it:
-#   1. attaches the binaries of that run to the tag's draft release, or a new
+#   1. checks the tag still points at the built commit, attaches the binaries of that run to the tag's draft release, or a new
 #      one, checking each against the run's SHA256SUMS, and publishes it;
 #   2. builds the Docker images from the published binaries and pushes them.
 # Nothing already published is replaced. To retry a failed step, re-run the
@@ -99,7 +99,7 @@ jobs:
           python3 ./.github/scripts/publish_release.py --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" \
             publish --dir release --sums release/SHA256SUMS \
             --notes-file "docs/release_notes/${GITHUB_REF_NAME}.md" \
-            --prerelease "${PRE_RELEASE:-false}"
+            --prerelease "${PRE_RELEASE:-false}" --sha "$GITHUB_SHA"
 
       # The image builds download these binaries from the published release
       # and check them against the sha256 recorded here.

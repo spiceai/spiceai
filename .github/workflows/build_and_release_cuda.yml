@@ -63,8 +63,8 @@ on:
 
 # A trunk push cancels the CUDA build of any older trunk push, queued or
 # running. Every other run, including a call from build_release, gets a group
-# of its own, so it never cancels or waits on another run. build_release's own
-# group cancels an older build of the same tag, and this call with it.
+# of its own, so it never cancels or waits on another run. A cancelled
+# build_release run cancels its call with it.
 concurrency:
   group: ${{ format('build-cuda-{0}', (github.event_name == 'push' && github.ref == 'refs/heads/trunk') && 'trunk' || github.run_id) }}
   cancel-in-progress: true
