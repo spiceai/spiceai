@@ -27,6 +27,7 @@ env:
 
 jobs:
   test-install:
+    environment: secret-free
     name: install on ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -256,6 +257,7 @@ jobs:
 
   # Test Windows with WSL - runtime runs in WSL, not native Windows
   test-install-windows-wsl:
+    environment: secret-free
     name: install on Windows x64 (WSL)
     runs-on: windows-latest
     env:

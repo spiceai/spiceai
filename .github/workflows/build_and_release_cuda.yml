@@ -61,14 +61,20 @@ on:
         default: 'release'
 
 # A trunk push cancels the CUDA build of any older trunk push, queued or
-# running. Tag and manual runs each get a group of their own, so they never
-# cancel or wait on another run.
+# running. A tag run cancels any older run for the same tag, so a moved tag
+# publishes the CUDA binaries of one build. Other manual runs each get a group
+# of their own, so they never cancel or wait on another run. The tag group name
+# differs from build_and_release's, since groups are shared across workflows.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref == 'refs/heads/trunk' && 'trunk' || github.run_id }}
+  group: ${{ github.ref_type == 'tag' && format('build-release-cuda-{0}', github.ref) || format('{0}-{1}', github.workflow, (github.event_name == 'push' && github.ref == 'refs/heads/trunk') && 'trunk' || github.run_id) }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   setup-matrix:
+    environment: secret-free
     name: Setup CUDA matrix
     runs-on: ubuntu-24.04
     outputs:
@@ -138,6 +144,7 @@ jobs:
             return matrix;
 
   build:
+    environment: secret-free
     name: Build CUDA ${{ matrix.target.compute_cap }} binaries
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
@@ -153,6 +160,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
@@ -184,53 +193,13 @@ jobs:
           target_os: ${{ matrix.target.target_os }}
           rust-profile: ${{ env.RUST_PROFILE }}
 
-  publish-minio:
-    name: Publish linux-x86_64 CUDA binaries to Minio
-    runs-on: spiceai-dev-runners
-    needs: build
-    env:
-      ARTIFACT_DIR: ./release
-      MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
-      MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
-      MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
-      COMMIT_SHA: ${{ github.sha }}
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Create artifact directory
-        run: mkdir -p ${{ env.ARTIFACT_DIR }}
-
-      # Download all Linux CUDA artifacts
-      - name: Download Linux CUDA artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        continue-on-error: true
-        with:
-          pattern: spiced_cuda_*_linux_x86_64
-          path: ${{ env.ARTIFACT_DIR }}
-          merge-multiple: true
-
-      - name: Upload artifacts to Minio
-        run: |
-          sudo apt-get update
-          sudo apt-get install wget -y
-          sudo wget https://public-data.spiceai.org/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z -O /usr/local/bin/mc
-          sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-minio ${{ env.MINIO_ENDPOINT }} ${{ env.MINIO_ACCESS_KEY }} ${{ env.MINIO_SECRET_KEY }}
-
-          # Upload any CUDA artifacts that were successfully built
-          for file in ${{ env.ARTIFACT_DIR }}/spiced_cuda_*_linux_x86_64.tar.gz; do
-            if [ -f "$file" ]; then
-              echo "Uploading $file to Minio..."
-              mc cp "$file" spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
-            fi
-          done
-
   publish:
+    environment: github-publish
     name: Publish CUDA binaries
     needs: build
     if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
+    permissions:
+      contents: write  # Upload assets to the GitHub release
     env:
       ARTIFACT_DIR: ./release
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
@@ -238,6 +207,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Create artifact directory
         run: mkdir -p ${{ env.ARTIFACT_DIR }}
@@ -257,11 +228,12 @@ jobs:
         run: ls -l ${{ env.ARTIFACT_DIR }}
 
       - name: Publish CUDA binaries to GitHub
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Parse repository to get owner and repo names
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
-          export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
 
           # First check if we have any files to upload
           if [ -z "$(ls -A ${ARTIFACT_DIR})" ]; then

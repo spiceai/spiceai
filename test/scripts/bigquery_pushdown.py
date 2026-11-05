@@ -53,9 +53,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import google.auth
 from google.api_core.exceptions import Conflict
 from google.cloud import bigquery
-from google.oauth2 import service_account
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SPICED = ROOT / "target" / "debug" / "spiced"
@@ -448,10 +448,13 @@ def credential_info() -> tuple[dict[str, Any], str]:
         raise HarnessError(
             f"The BigQuery service-account JSON is invalid: {error}"
         ) from error
-    if info.get("type") != "service_account" or not info.get("project_id"):
+    if info.get("type") not in ("service_account", "external_account"):
         raise HarnessError(
-            "The credential must be a service-account key with a project_id."
+            "The credential must be a service-account key or a workload identity "
+            "federation credential (external_account)."
         )
+    if not (os.environ.get("BIGQUERY_PROJECT_ID") or info.get("project_id")):
+        raise HarnessError("Set BIGQUERY_PROJECT_ID: the credential names no project_id.")
     return info, json.dumps(info, separators=(",", ":"))
 
 
@@ -890,7 +893,7 @@ def stop_spiced(process: subprocess.Popen[bytes]) -> None:
 
 def main() -> int:
     info, compact_credential = credential_info()
-    project = os.environ.get("BIGQUERY_PROJECT_ID", str(info["project_id"]))
+    project = os.environ.get("BIGQUERY_PROJECT_ID") or str(info["project_id"])
     if not PROJECT_ID_PATTERN.fullmatch(project):
         raise HarnessError(f"Invalid BIGQUERY_PROJECT_ID: {project!r}")
     location = os.environ.get("BIGQUERY_LOCATION", "US")
@@ -919,7 +922,7 @@ def main() -> int:
     ).resolve()
     output.mkdir(parents=True, exist_ok=False)
 
-    credentials = service_account.Credentials.from_service_account_info(info)
+    credentials = google.auth.load_credentials_from_dict(info, scopes=["https://www.googleapis.com/auth/cloud-platform"])[0]
     client = bigquery.Client(project=project, credentials=credentials)
     dataset_ref = bigquery.Dataset(f"{project}.{dataset}")
     dataset_ref.location = location

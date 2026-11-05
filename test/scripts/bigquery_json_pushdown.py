@@ -35,8 +35,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import google.auth
 from google.cloud import bigquery
-from google.oauth2 import service_account
 
 import bigquery_pushdown as harness
 
@@ -92,8 +92,8 @@ FROM {table} WHERE scalar_text ORDER BY id""",
 def main():
     info, credential = harness.credential_info()
     client = bigquery.Client(
-        project=info["project_id"],
-        credentials=service_account.Credentials.from_service_account_info(info),
+        project=os.environ.get("BIGQUERY_PROJECT_ID") or info["project_id"],
+        credentials=google.auth.load_credentials_from_dict(info, scopes=["https://www.googleapis.com/auth/cloud-platform"])[0],
     )
     driver = harness.required_path("ADBC_BIGQUERY_DRIVER_PATH")
     binary = harness.required_path("SPICED_BIN", harness.DEFAULT_SPICED)
