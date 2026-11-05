@@ -223,11 +223,12 @@ jobs:
         run: ls -l ${{ env.ARTIFACT_DIR }}
 
       - name: Publish CUDA binaries to GitHub
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Parse repository to get owner and repo names
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
-          export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
 
           # First check if we have any files to upload
           if [ -z "$(ls -A ${ARTIFACT_DIR})" ]; then
