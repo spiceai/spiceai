@@ -107,7 +107,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | Fork | Pinned revision | Branch |
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `6e4119ac2007c6647702a1817505d6849b07e0e0` | `spiceai-24` |
-| [arrow-rs](#arrow-rs) | `a613c5c13755eacdfa78ed7563ee3a692b1c2e5a` | `spiceai-59` (TEMPORARY: spiceai/arrow-rs#35) |
+| [arrow-rs](#arrow-rs) | `6d198c9ed5f0d0d31e36b7860a71914bb318fd8d` | `spiceai-59` (TEMPORARY: spiceai/arrow-rs#35) |
 | [async-openai](#async-openai) | `c1bf4a090c50e18f27663b008dac4c108e49b994` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `829b57522e601ea169b04e2d4a375c3abe3ed58c` | `spiceai` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
