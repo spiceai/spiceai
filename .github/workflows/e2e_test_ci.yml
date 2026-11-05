@@ -279,22 +279,20 @@ jobs:
     if: ${{ inputs.run_all_tests }}
     runs-on: spiceai-dev-runners
     timeout-minutes: 90
+    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
+    environment: ci
     permissions:
       contents: read
+      # Exchanged for Google Cloud access tokens for the BigQuery tests: workload identity federation.
+      id-token: write
     env:
       SPICED_BIN: ${{ github.workspace }}/build/spiced
       ADBC_BIGQUERY_DRIVER_PATH: /etc/adbc/drivers/libadbc_driver_bigquery.so
+      # The workload identity federation credential names no project.
+      BIGQUERY_PROJECT_ID: spiceai-testing
       BIGQUERY_TEST_CLEANUP: always
       BIGQUERY_EXPECT: single
     steps:
-      - name: Require BigQuery test credentials
-        shell: bash
-        env:
-          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
-        run: |
-          set -euo pipefail
-          : "${BIGQUERY_SERVICE_ACCOUNT_JSON:?BIGQUERY_SERVICE_ACCOUNT_JSON is required for run_all_tests}"
-
       - name: Set test output paths
         id: test_env
         shell: bash
@@ -309,6 +307,12 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+
+      - name: Set up BigQuery credentials (workload identity federation)
+        uses: ./.github/actions/bigquery-credentials
+        with:
+          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
+          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
 
       - name: Download Linux runtime artifact
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -342,8 +346,6 @@ jobs:
       - name: Run BigQuery regression tests
         timeout-minutes: 60
         shell: bash
-        env:
-          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
         run: |
           set -euo pipefail
           mkdir -p "$BIGQUERY_GATE_OUTPUT"
