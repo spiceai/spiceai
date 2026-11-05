@@ -18,6 +18,7 @@ permissions:
 
 jobs:
   publish:
+    environment: github-publish
     name: Publish binaries from existing run
     runs-on: ubuntu-24.04
     env:
@@ -68,12 +69,13 @@ jobs:
 
       - name: Publish binaries to GitHub release
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
-          export GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}"
 
           shopt -s nullglob
           RELEASE_ARTIFACT=("${ARTIFACT_DIR}"/*.tar.gz)

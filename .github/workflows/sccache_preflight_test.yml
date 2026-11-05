@@ -51,6 +51,7 @@ concurrency:
 
 jobs:
   test-sccache-preflight:
+    environment: secret-free
     name: Unit tests for the compiler-cache pre-flight
     # GitHub-hosted on purpose: this is a sub-second check and must not queue
     # behind the self-hosted pool whose cache it is about.
