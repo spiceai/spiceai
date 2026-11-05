@@ -4,7 +4,7 @@
   </a>
 </p>
 
-<h3 align="center">The open data lakehouse for agents.</h3>
+<h3 align="center">The portable data lakehouse for every agent.</h3>
 
 <p align="center">Serve enterprise data to agents securely and at scale on object storage.</p>
 
