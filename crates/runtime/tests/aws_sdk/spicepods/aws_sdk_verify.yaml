@@ -30,7 +30,8 @@ datasets:
     params:
       mode: delta_lake
       databricks_endpoint: dbc-46470731-42e5.cloud.databricks.com
-      databricks_token: ${secrets:TEST_DATABRICKS_TOKEN}
+      databricks_client_id: ${secrets:DATABRICKS_OIDC_CLIENT_ID}
+      databricks_token_audience: ${secrets:DATABRICKS_OIDC_AUDIENCE}
       databricks_aws_region: us-west-2
 
   # Iceberg
