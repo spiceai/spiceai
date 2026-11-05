@@ -273,14 +273,13 @@ jobs:
           if-no-files-found: ignore
 
   test-bigquery:
+    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
     environment: ci
     name: BigQuery Regression Tests
     needs: build
     if: ${{ inputs.run_all_tests }}
     runs-on: spiceai-dev-runners
     timeout-minutes: 90
-    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
-    environment: ci
     permissions:
       contents: read
       # Exchanged for Google Cloud access tokens for the BigQuery tests: workload identity federation.
