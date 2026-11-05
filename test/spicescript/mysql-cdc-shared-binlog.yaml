@@ -3,7 +3,9 @@ description: >
   Datasets on one MySQL connection share one binlog reader and each follows its
   own table, including a transaction spanning tables; across a clean restart
   they resume with the changes made while Spice was down, even when the source
-  table's statistics changed meanwhile. When the binlog they
+  table's statistics changed meanwhile, and after concurrent writes to their
+  tables each resumes from a saved GTID set without a gap for each other
+  table's transaction. When the binlog they
   would resume from has been purged, they fail with a message naming the fix
   by default, and with `invalid_checkpoint_behavior: restart` rebuild from the
   source and serve its rows, deletions included.
@@ -40,6 +42,10 @@ spicepod:
 defaults:
   expect: { oracle: src }
   compare-variants: false
+  # The variants share the MySQL server, and one variant's purge removes the
+  # binlog the other resumes from: run them a step at a time, so both have
+  # resumed before either purges.
+  run-variants: side-by-side
 
 steps:
   - source-exec:
@@ -78,6 +84,28 @@ steps:
     oracle-sql: SELECT * FROM tc
     eventually: 30s
 
+  # Both tables written concurrently in many small transactions, so each
+  # dataset keeps receiving the other's transactions while its own are still
+  # being applied. Its saved GTID set must still hold the other's, or it gains
+  # a range per transaction that passed while it was busy (checked after the
+  # restart below).
+  - background: { id: wa, concurrency: 4, source-exec: { src: "INSERT INTO ta VALUES (10000 + ${round}, 'busy')" } }
+  - background: { id: wb, concurrency: 4, source-exec: { src: "INSERT INTO tb VALUES (10000 + ${round}, 'busy', 1)" } }
+  - query: SELECT count(*) >= 1000 AS written FROM a WHERE id > 10000
+    expect: { rows: [['true']] }
+    eventually: 120s
+  - query: SELECT count(*) >= 1000 AS written FROM b WHERE id > 10000
+    expect: { rows: [['true']] }
+    eventually: 120s
+  - stop-background: { id: wa }
+  - stop-background: { id: wb }
+  - query: SELECT * FROM a
+    oracle-sql: SELECT * FROM ta
+    eventually: 60s
+  - query: SELECT * FROM b
+    oracle-sql: SELECT * FROM tb
+    eventually: 60s
+
   # A clean restart resumes from the binlog, also when the source table has
   # grown and its statistics were refreshed meanwhile: the row and size
   # estimates schema inference reads from MySQL change, its columns do not.
@@ -88,6 +116,15 @@ steps:
         INSERT INTO ta WITH RECURSIVE s(i) AS (SELECT 1001 UNION ALL SELECT i + 1 FROM s WHERE i < 2000) SELECT i, CONCAT('grown', i) FROM s;
         ANALYZE TABLE ta;
   - start: {}
+  # Each saved GTID set is one range up to the dataset's own changes still in
+  # flight at the stop (an accelerator may acknowledge applied changes later),
+  # which are re-read. The concurrent writes are GTIDs from about 30 to past
+  # 2000, so a gap below 1000 is a transaction the dataset was never credited.
+  - assert-log:
+      contains:
+        - 'resuming from persisted GTID position dataset=a gtid_set=[0-9a-f-]{36}:1-[0-9]{4,}'
+        - 'resuming from persisted GTID position dataset=b gtid_set=[0-9a-f-]{36}:1-[0-9]{4,}'
+      lacks: 'resuming from persisted GTID position .*gtid_set=[0-9a-f-]{36}:1-[0-9]{1,3}:'
   - query: SELECT * FROM a
     oracle-sql: SELECT * FROM ta
     eventually: 60s

@@ -262,11 +262,14 @@ const STREAMING: u8 = 0b100;
 struct AckSlot {
     committed: Mutex<BinlogPosition>,
     delivered: Mutex<BinlogPosition>,
-    /// Executed GTID set for this member, advanced in lockstep with `committed`
-    /// (folded on commit and on idle-credit), so it describes exactly the
-    /// transactions at or below the member's committed position. Empty when the
-    /// source is not GTID-positioning. The shared dump's GTID resume set is the
-    /// intersection of these across members (see [`AckTable::resume_gtid`]).
+    /// Executed GTID set for this member: every transaction it has applied or
+    /// needs nothing from. Folded on commit, on idle-credit, and, under GTID
+    /// positioning, on [`AckSlot::credit_gtid`] for transactions passing while
+    /// the member is busy. It never holds a transaction delivered to the member
+    /// and not yet committed, so resuming from it re-reads exactly those. Empty
+    /// when the source is not GTID-positioning. The shared dump's GTID resume
+    /// set is the intersection of these across members (see
+    /// [`AckTable::resume_gtid`]).
     gtid: Mutex<GtidSet>,
     /// GTIDs of the transactions delivered into this member's channel, on top
     /// of the executed set it was registered with: the GTID analog of
@@ -334,6 +337,27 @@ impl AckSlot {
             lock(&self.delivered_gtid).add(uuid, gno);
             self.fold_gtid(uuid, gno);
         }
+    }
+
+    /// Credit a transaction to a member with envelopes still in flight, by GTID
+    /// only: when the transaction was not delivered to the member, the member
+    /// needs nothing from it, so its executed set may hold it although earlier
+    /// transactions of its own are not yet committed. A GTID set is not a
+    /// watermark: resuming from it re-reads every transaction it lacks, so the
+    /// in-flight ones stay out of it and are re-read, while everything that
+    /// passed meanwhile coalesces with them once they commit. Without this,
+    /// each transaction for other tables that passes while the member is busy
+    /// leaves a range in its set that never closes. The committed position
+    /// stays put, because a position cannot skip past an uncommitted
+    /// transaction.
+    fn credit_gtid(&self, (uuid, gno): Gtid) {
+        let mut delivered = lock(&self.delivered_gtid);
+        if delivered.contains(uuid, gno) {
+            return;
+        }
+        delivered.add(uuid, gno);
+        drop(delivered);
+        self.fold_gtid(uuid, gno);
     }
 
     /// Whether every envelope delivered to this member has been committed.
@@ -478,16 +502,26 @@ impl AckTable {
 
     /// Credit streaming members with no in-flight envelopes up to `upto` — the
     /// connection's in-order replay guarantees their routed changes below `upto`
-    /// were already delivered. Held/detached members are never credited.
+    /// were already delivered. Under GTID positioning, members with envelopes
+    /// in flight are credited the transaction's GTID when it was not delivered
+    /// to them ([`AckSlot::credit_gtid`]). Called after the transaction was
+    /// routed, so a member it was delivered to holds its GTID in
+    /// `delivered_gtid` and is not credited it. Held/detached members are
+    /// never credited.
     fn credit_idle(&self, upto: &BinlogPosition, gtid: Option<Gtid>) {
         let gtid_positioned = self.gtid_positioned();
         for slot in read_lock(&self.members).values() {
             let s = slot.state.load(Ordering::Acquire);
-            if s & (LIVE | STREAMING) == (LIVE | STREAMING) && slot.is_idle(gtid_positioned) {
+            if s & (LIVE | STREAMING) != (LIVE | STREAMING) {
+                continue;
+            }
+            if slot.is_idle(gtid_positioned) {
                 // An idle member's committed advances past this transaction, so
                 // its executed set gains the transaction's GTID too (idempotent
                 // — re-folding an already-present GTID is a no-op).
                 slot.credit(upto, gtid);
+            } else if let Some(gtid) = gtid.filter(|_| gtid_positioned) {
+                slot.credit_gtid(gtid);
             }
         }
     }
@@ -3928,10 +3962,13 @@ mod tests {
             "an in-flight transaction must not be credited as applied"
         );
 
-        // A later transaction for another table must not be credited to this
-        // member while its envelope is in flight either.
+        // A later transaction for another table is credited by GTID while the
+        // member's own envelope is in flight, without the in-flight one.
         ack.credit_idle(&pos("binlog.000002", 900), Some(gtid_of(SRC_B, 2)));
-        assert_eq!(slot.gtid_snapshot(), gtids(&format!("{SRC_A}:1-11")));
+        assert_eq!(
+            slot.gtid_snapshot(),
+            gtids(&format!("{SRC_A}:1-11,{SRC_B}:2"))
+        );
 
         SharedPositionCommitter {
             slot: Arc::clone(&slot),
@@ -3946,7 +3983,7 @@ mod tests {
         ack.credit_idle(&pos("binlog.000002", 1200), Some(gtid_of(SRC_B, 3)));
         assert_eq!(
             slot.gtid_snapshot(),
-            gtids(&format!("{SRC_A}:1-11,{SRC_B}:1:3")),
+            gtids(&format!("{SRC_A}:1-11,{SRC_B}:1-3")),
             "once idle again, the member is credited"
         );
     }
@@ -3976,6 +4013,96 @@ mod tests {
         // Delivered once, not again on a reconnect replay.
         slot.deliver(&later, Some(gtid_of(SRC_A, 12)));
         assert!(!slot.routes(&later, ack.routing_gtid(Some(gtid_of(SRC_A, 12)))));
+    }
+
+    /// Number of ranges in a single-source GTID set's text (`uuid:1-5:7` is 2).
+    fn range_count(set: &GtidSet) -> usize {
+        set.to_string().split(':').count() - 1
+    }
+
+    /// Under GTID positioning, transactions for other tables that pass while a
+    /// member has its own in flight are credited to it by GTID, so its executed
+    /// set has at most one gap per in-flight transaction instead of one per
+    /// passing transaction, and never holds an in-flight one.
+    #[tokio::test]
+    async fn a_busy_member_has_a_gap_only_per_in_flight_transaction() {
+        let ack = AckTable::default();
+        ack.set_gtid_positioned(true);
+        let (ka, kb) = (key("db", "a"), key("db", "b"));
+        let seed = gtids(&format!("{SRC_A}:1"));
+        ack.register_with_gtid(&ka, pos("binlog.000001", 100), seed.clone(), false);
+        ack.register_with_gtid(&kb, pos("binlog.000001", 100), seed, false);
+        ack.promote_ready_members();
+        let slots = [
+            ack.slot(&ka).expect("slot a"),
+            ack.slot(&kb).expect("slot b"),
+        ];
+        let mut in_flight: [std::collections::VecDeque<(BinlogPosition, Gtid)>; 2] =
+            Default::default();
+        let commit =
+            |slot: &Arc<AckSlot>, (at, gtid): (BinlogPosition, Gtid)| SharedPositionCommitter {
+                slot: Arc::clone(slot),
+                flush_to: at,
+                dataset: "t".into(),
+                source_commit_ts_ms: None,
+                gtids: vec![gtid],
+            };
+
+        // Transactions 2..=2001, for `a` and `b` in an uneven interleaving;
+        // each member's consumer keeps up to two transactions in flight.
+        let last = 2001;
+        for gno in 2..=last {
+            let at = pos("binlog.000001", 100 + gno * 100);
+            let gtid = gtid_of(SRC_A, gno);
+            let target = usize::from(gno % 3 == 0);
+            assert!(slots[target].routes(&at, ack.routing_gtid(Some(gtid))));
+            slots[target].deliver(&at, Some(gtid));
+            in_flight[target].push_back((at.clone(), gtid));
+            ack.credit_idle(&at, Some(gtid));
+            for (slot, queue) in slots.iter().zip(&mut in_flight) {
+                if queue.len() > 2 {
+                    let oldest = queue.pop_front().expect("in flight");
+                    commit(slot, oldest).commit().await.expect("commit");
+                }
+                let set = slot.gtid_snapshot();
+                for &(_, (uuid, gno)) in queue.iter() {
+                    assert!(!set.contains(uuid, gno), "in-flight {gno} credited: {set}");
+                }
+                assert!(
+                    range_count(&set) <= queue.len() + 1,
+                    "{} ranges with {} in flight: {set}",
+                    range_count(&set),
+                    queue.len()
+                );
+            }
+        }
+
+        for (slot, queue) in slots.iter().zip(&mut in_flight) {
+            while let Some(oldest) = queue.pop_front() {
+                commit(slot, oldest).commit().await.expect("commit");
+            }
+            assert_eq!(slot.gtid_snapshot(), gtids(&format!("{SRC_A}:1-{last}")));
+        }
+    }
+
+    /// File+offset positioning keeps a busy member's executed set as it is:
+    /// only idle members are credited.
+    #[test]
+    fn a_file_positioned_busy_member_is_not_credited() {
+        let ack = AckTable::default();
+        let member = key("db", "t");
+        ack.register_with_gtid(
+            &member,
+            pos("binlog.000001", 500),
+            gtids(&format!("{SRC_A}:1")),
+            false,
+        );
+        ack.promote_ready_members();
+        let slot = ack.slot(&member).expect("slot");
+        let at = pos("binlog.000001", 600);
+        slot.deliver(&at, Some(gtid_of(SRC_A, 2)));
+        ack.credit_idle(&pos("binlog.000001", 700), Some(gtid_of(SRC_A, 3)));
+        assert_eq!(slot.gtid_snapshot(), gtids(&format!("{SRC_A}:1")));
     }
 
     /// File+offset positioning keeps routing by position even when the

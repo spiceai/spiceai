@@ -86,7 +86,7 @@
   "mysql-cdc-gtid-failover": 77,
   "mysql-cdc-kill-during-compaction": 51,
   "mysql-cdc-parity": 43,
-  "mysql-cdc-shared-binlog": 23,
+  "mysql-cdc-shared-binlog": 38,
   "mysql-cdc-upgrade": 25,
   "mysql-connection-pool": 65,
   "mysql-join-capabilities": 11,
