@@ -1,0 +1,331 @@
+"""Publish a release from the artifacts of its build_release run.
+
+Used by publish_release.yml:
+
+  find-build  Prints the id of the one successful build_release run of the tag.
+  publish     Attaches the files listed in SHA256SUMS to the tag's draft release
+              (created when there is none), checks every asset against its
+              sha256, and publishes the release.
+
+A published release is never changed. An asset that already exists is accepted
+only when its sha256 matches, so re-running a failed job resumes the upload.
+"""
+
+import argparse
+import hashlib
+import os
+import re
+import sys
+
+import requests
+
+API = "https://api.github.com"
+UPLOADS = "https://uploads.github.com"
+
+# GitHub rejects a release body longer than this with a 422.
+MAX_BODY_CHARS = 125000
+
+# A stable release tag: v2.4.1 or v2.4.1-enterprise. Release candidates and
+# other pre-releases never become the latest release.
+STABLE_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(-enterprise)?$")
+
+SHA256_LINE = re.compile(r"^([0-9a-f]{64}) [ *](\S+)$")
+
+
+class PublishError(Exception):
+    pass
+
+
+class Api:
+    def __init__(self, token):
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+        )
+
+    def _check(self, resp, what):
+        if not resp.ok:
+            raise PublishError(f"Failed to {what}: HTTP {resp.status_code}: {resp.text[:500]}")
+        return resp
+
+    def get_all(self, path, params=None, key=None):
+        """Every item of a paginated list. `key` names the list inside an object response."""
+        url = f"{API}/{path}"
+        params = dict(params or {}, per_page=100)
+        items = []
+        while url:
+            resp = self._check(self.session.get(url, params=params), f"list {path}")
+            body = resp.json()
+            items.extend(body[key] if key else body)
+            url = resp.links.get("next", {}).get("url")
+            params = None
+        return items
+
+    def post(self, path, payload):
+        return self._check(self.session.post(f"{API}/{path}", json=payload), f"create {path}").json()
+
+    def patch(self, path, payload):
+        return self._check(self.session.patch(f"{API}/{path}", json=payload), f"update {path}").json()
+
+    def delete(self, path):
+        self._check(self.session.delete(f"{API}/{path}"), f"delete {path}")
+
+    def upload(self, repo, release_id, name, path):
+        with open(path, "rb") as f:
+            resp = self.session.post(
+                f"{UPLOADS}/repos/{repo}/releases/{release_id}/assets",
+                params={"name": name},
+                headers={"Content-Type": "application/octet-stream"},
+                data=f,
+            )
+        return self._check(resp, f"upload {name}").json()
+
+
+def find_build_run(api, repo, workflow, tag, sha):
+    runs = api.get_all(
+        f"repos/{repo}/actions/workflows/{workflow}/runs",
+        {"head_sha": sha, "status": "success"},
+        key="workflow_runs",
+    )
+    # A branch push of the same commit is a successful run too; only a run of
+    # the tag itself built release binaries.
+    matches = [r for r in runs if r["head_branch"] == tag]
+    if len(matches) != 1:
+        found = ", ".join(str(r["id"]) for r in matches) or "none"
+        raise PublishError(
+            f"Expected exactly one successful {workflow} run of tag {tag} at {sha}, found {found}. "
+            f"Wait for the tag's {workflow} run to succeed, or re-run its failed jobs. When there "
+            f"is more than one, delete the runs that should not be published."
+        )
+    return matches[0]["id"]
+
+
+def read_sums(path):
+    """Map each file name in a sha256sum manifest to its sha256."""
+    sums = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            m = SHA256_LINE.match(line)
+            if not m:
+                raise PublishError(f"Unreadable line in {path}: '{line}'")
+            sha, name = m.groups()
+            if os.path.basename(name) != name or name in sums:
+                raise PublishError(f"Invalid file name '{name}' in {path}")
+            sums[name] = sha
+    if not sums:
+        raise PublishError(f"{path} lists no files")
+    return sums
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def asset_sha256(asset):
+    digest = asset.get("digest") or ""
+    return digest[len("sha256:"):] if digest.startswith("sha256:") else None
+
+
+def truncate_body(body, repo, tag):
+    """Trim an oversized body to fit GitHub's limit, linking to the full notes."""
+    if body is None or len(body) <= MAX_BODY_CHARS:
+        return body
+    notice = (
+        "\n\n---\n\n"
+        f"Release notes truncated to fit GitHub's {MAX_BODY_CHARS} character limit. "
+        f"Full notes: https://github.com/{repo}/blob/{tag}/docs/release_notes/{tag}.md\n"
+    )
+    kept = body[: MAX_BODY_CHARS - len(notice)]
+    boundary = kept.rfind("\n")
+    if boundary <= 0:
+        boundary = kept.rfind(" ")
+    if boundary > 0:
+        kept = kept[:boundary]
+    return kept + notice
+
+
+def title_and_body(body, fallback):
+    """Use a leading '# ' heading of the notes as the release title."""
+    lines = (body or "").splitlines()
+    if lines and lines[0].startswith("# "):
+        return lines[0][2:].strip(), "\n".join(lines[1:]).lstrip("\n")
+    return fallback, body
+
+
+def find_release(api, repo, tag):
+    # The by-tag endpoint does not return drafts, so search the list.
+    releases = [r for r in api.get_all(f"repos/{repo}/releases") if r["tag_name"] == tag]
+    if len(releases) > 1:
+        ids = ", ".join(str(r["id"]) for r in releases)
+        raise PublishError(f"More than one release has tag {tag} (ids {ids}). Delete the extra drafts.")
+    return releases[0] if releases else None
+
+
+def is_latest(api, repo, tag, prerelease):
+    """True when tag is a stable version at least as high as every published stable release."""
+    m = STABLE_TAG.match(tag)
+    if prerelease or not m:
+        return False
+    version = tuple(int(x) for x in m.groups()[:3])
+    for release in api.get_all(f"repos/{repo}/releases"):
+        if release["draft"] or release["prerelease"]:
+            continue
+        other = STABLE_TAG.match(release["tag_name"])
+        if other and other.group(4) == m.group(4) and tuple(int(x) for x in other.groups()[:3]) > version:
+            return False
+    return True
+
+
+def publish(api, repo, tag, files, notes, prerelease):
+    """Attach `files` ({name: (path, sha256)}) to the tag's release and publish it.
+
+    Returns whether the release was made the latest release.
+    """
+    release = find_release(api, repo, tag)
+    title, body = title_and_body(truncate_body(notes, repo, tag), tag)
+    if release is None:
+        print(f"Creating draft release {tag}")
+        release = api.post(
+            f"repos/{repo}/releases",
+            {"tag_name": tag, "name": title, "body": body, "draft": True, "prerelease": prerelease},
+        )
+
+    assets = {a["name"]: a for a in api.get_all(f"repos/{repo}/releases/{release['id']}/assets")}
+    unexpected = sorted(set(assets) - set(files))
+    if unexpected:
+        raise PublishError(
+            f"Release {tag} has assets that are not in this build: {', '.join(unexpected)}. "
+            f"A release holds only the files of its build_release run; delete them from the draft."
+        )
+
+    # Check every attached asset before uploading anything, so a conflict
+    # leaves the draft as it was.
+    to_upload = []
+    for name, (path, sha) in sorted(files.items()):
+        asset = assets.get(name)
+        if asset is not None and asset.get("state") != "uploaded" and release["draft"]:
+            # An upload that broke off leaves an asset with no content. The
+            # release is still a draft, so nobody has downloaded it.
+            print(f"Removing incomplete upload of {name}")
+            api.delete(f"repos/{repo}/releases/assets/{asset['id']}")
+            asset = None
+        if asset is not None:
+            existing = asset_sha256(asset)
+            if existing != sha:
+                raise PublishError(
+                    f"Release {tag} already has {name} with sha256 {existing}, but this build's is {sha}. "
+                    f"Release assets are never replaced. If the draft holds assets of another build, "
+                    f"delete them and re-run this job."
+                )
+            print(f"{name} is already attached with sha256 {sha}")
+        elif not release["draft"]:
+            raise PublishError(
+                f"Release {tag} is already published without {name}. A published release is never changed."
+            )
+        else:
+            to_upload.append((name, path, sha))
+
+    for name, path, sha in to_upload:
+        print(f"Uploading {name}")
+        uploaded = api.upload(repo, release["id"], name, path)
+        if asset_sha256(uploaded) != sha:
+            raise PublishError(
+                f"GitHub reports sha256 {asset_sha256(uploaded)} for the uploaded {name}, but the file's is {sha}."
+            )
+
+    # Read the assets back before publishing, so a release is only published
+    # when it holds exactly this build.
+    attached = {a["name"]: asset_sha256(a) for a in api.get_all(f"repos/{repo}/releases/{release['id']}/assets")}
+    expected = {name: sha for name, (_, sha) in files.items()}
+    if attached != expected:
+        raise PublishError(f"Release {tag} assets do not match the build: attached {attached}, expected {expected}")
+
+    if not release["draft"]:
+        print(f"Release {tag} is already published with every asset of this build.")
+        return is_latest(api, repo, tag, release["prerelease"])
+
+    latest = is_latest(api, repo, tag, prerelease)
+    update = {"draft": False, "prerelease": prerelease, "make_latest": "true" if latest else "false"}
+    # A draft written during the endgame keeps its own title and notes.
+    if not (release.get("body") or "").strip():
+        update["body"] = body
+    if not (release.get("name") or "").strip():
+        update["name"] = title
+    api.patch(f"repos/{repo}/releases/{release['id']}", update)
+    print(f"Published release {tag} (pre-release: {prerelease}, latest: {latest})")
+    return latest
+
+
+def write_output(name, value):
+    path = os.getenv("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{name}={value}\n")
+    print(f"{name}={value}")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--tag", required=True)
+    sub = parser.add_subparsers(dest="action", required=True)
+
+    find = sub.add_parser("find-build")
+    find.add_argument("--workflow", required=True)
+    find.add_argument("--sha", required=True)
+
+    pub = sub.add_parser("publish")
+    pub.add_argument("--dir", required=True, help="Directory holding the downloaded artifacts")
+    pub.add_argument("--sums", required=True, help="SHA256SUMS manifest of the build_release run")
+    pub.add_argument("--notes-file", help="Release notes, used when the draft has none")
+    pub.add_argument("--prerelease", choices=["true", "false"], required=True)
+
+    args = parser.parse_args(argv)
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        print("::error::GITHUB_TOKEN is not set")
+        return 1
+    api = Api(token)
+
+    try:
+        if args.action == "find-build":
+            write_output("build_run_id", find_build_run(api, args.repo, args.workflow, args.tag, args.sha))
+            return 0
+
+        sums = read_sums(args.sums)
+        files = {}
+        for name, sha in sums.items():
+            path = os.path.join(args.dir, name)
+            if not os.path.isfile(path):
+                raise PublishError(f"{name} is listed in {args.sums} but was not downloaded")
+            actual = sha256_file(path)
+            if actual != sha:
+                raise PublishError(f"{name} has sha256 {actual}, but the build recorded {sha}")
+            files[name] = (path, sha)
+        notes = None
+        if args.notes_file and os.path.isfile(args.notes_file):
+            with open(args.notes_file, encoding="utf-8") as f:
+                notes = f.read()
+        if not notes:
+            notes = f"This is the release candidate {args.tag[1:]}"
+        latest = publish(api, args.repo, args.tag, files, notes, args.prerelease == "true")
+        write_output("make_latest", "true" if latest else "false")
+        return 0
+    except PublishError as e:
+        print(f"::error::{e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

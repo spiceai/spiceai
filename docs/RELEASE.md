@@ -52,8 +52,9 @@ Create a [Milestone Endgame](https://github.com/spiceai/spiceai/issues/new?assig
 - Create a PR updating version.txt to the next planned version number.
   - i.e. `0.2.1-alpha` -> `0.3.0-alpha`
 - Ensure the release notes at `docs/release_notes/v{version}.md` exist
-- Create a new pre-release [GitHub release](https://github.com/spiceai/spiceai/releases/new) with placeholder information. Create a tag that matches the version to be released. The details of the release will be filled in by the automation.
-  - Alternatively push a new tag via the git command line to the GitHub repository, and the release automation will be triggered.
+- Push a tag that matches the version to be released. The tag starts the `build_release` workflow, which builds the binaries and publishes nothing.
+- Create a draft [GitHub release](https://github.com/spiceai/spiceai/releases/new) for the tag. Leave the body empty to use the checked-in release notes.
+- Start the `publish_release` workflow on the tag. After one approval from someone other than the person who started it, it publishes the release with the binaries of that `build_release` run, then builds and pushes the Docker images.
 
 ## Acknowledgements update
 

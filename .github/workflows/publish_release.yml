@@ -1,0 +1,124 @@
+name: publish_release
+
+# Publishes a release from its build_release run. Start it on the release tag
+# (Use workflow from: Tags > vX.Y.Z) once the tag's build_release run is green.
+# After one approval of the `publish` job it:
+#   1. attaches the binaries of that run to the tag's draft release, or a new
+#      one, checking each against the run's SHA256SUMS, and publishes it;
+#   2. builds the Docker images from the published binaries and pushes them.
+# Nothing already published is replaced. To retry a failed step, re-run the
+# failed jobs of the same run.
+on:
+  workflow_dispatch:
+
+# A publish is never cancelled halfway; a second run for the same tag waits.
+concurrency:
+  group: publish-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Find the build of ${{ github.ref_name }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      build_run_id: ${{ steps.find.outputs.build_run_id }}
+    steps:
+      - name: Require a release tag
+        if: github.ref_type != 'tag' || !startsWith(github.ref_name, 'v')
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::publish_release runs on a release tag, not '${REF}'. Start it again with Use workflow from: Tags > the release tag."
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Fails when version.txt at the tag does not match the tag.
+      - name: Check version.txt matches the tag
+        run: python3 ./.github/scripts/get_release_version.py
+
+      - name: Find the build_release run
+        id: find
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 ./.github/scripts/publish_release.py --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" \
+            find-build --workflow build_release.yml --sha "$GITHUB_SHA"
+
+  publish:
+    name: Publish GitHub release ${{ github.ref_name }}
+    needs: resolve
+    runs-on: ubuntu-24.04
+    # One required reviewer, who cannot be the person who started this run.
+    environment: github-publish
+    permissions:
+      contents: write
+      actions: read
+    outputs:
+      make_latest: ${{ steps.publish.outputs.make_latest }}
+      spiced_sha256_amd64: ${{ steps.sha256.outputs.amd64 }}
+      spiced_sha256_arm64: ${{ steps.sha256.outputs.arm64 }}
+      spiced_sha256_cuda: ${{ steps.sha256.outputs.cuda }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set REL_VERSION from version.txt
+        run: python3 ./.github/scripts/get_release_version.py
+
+      - name: Download the artifacts of run ${{ needs.resolve.outputs.build_run_id }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: release
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.resolve.outputs.build_run_id }}
+
+      - name: Publish the release
+        id: publish
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 ./.github/scripts/publish_release.py --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" \
+            publish --dir release --sums release/SHA256SUMS \
+            --notes-file "docs/release_notes/${GITHUB_REF_NAME}.md" \
+            --prerelease "${PRE_RELEASE:-false}"
+
+      # The image builds download these binaries from the published release
+      # and check them against the sha256 recorded here.
+      - name: Record the sha256 of the binaries the images use
+        id: sha256
+        working-directory: release
+        run: |
+          set -euo pipefail
+          sum() { awk -v f="$1" '$2 == f || $2 == "*" f { print $1 }' SHA256SUMS; }
+          {
+            echo "amd64=$(sum spiced_linux_x86_64.tar.gz)"
+            echo "arm64=$(sum spiced_linux_aarch64.tar.gz)"
+            echo "cuda=$(sum spiced_cuda_80_linux_x86_64.tar.gz)"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  images:
+    name: Docker images
+    needs: publish
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      actions: read
+    uses: ./.github/workflows/spiced_docker.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+      tag_latest: ${{ needs.publish.outputs.make_latest == 'true' }}
+      spiced_sha256_amd64: ${{ needs.publish.outputs.spiced_sha256_amd64 }}
+      spiced_sha256_arm64: ${{ needs.publish.outputs.spiced_sha256_arm64 }}
+      spiced_sha256_cuda: ${{ needs.publish.outputs.spiced_sha256_cuda }}
