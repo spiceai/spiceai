@@ -56,7 +56,10 @@ use super::params::spiceai::SpiceAiModelParams;
 use super::params::xai::XaiModelParams;
 use super::wrapper::OPENAI_DEFAULT_PARAM_KEYS;
 use super::{tool_use::ToolUsingChat, wrapper::ChatWrapper};
-use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
+use crate::token_providers::databricks::{
+    DatabricksM2MTokenProvider, DatabricksU2MTokenProvider, get_workload_identity_token_provider,
+    model_error,
+};
 use crate::{
     Runtime,
     tools::{
@@ -281,7 +284,18 @@ pub async fn construct_model(
             let p =
                 typed_params::<DatabricksModelParams>(component, params, source.clone(), secrets)
                     .await?;
-            databricks(model_id, &p, Arc::clone(&token_registry)).await
+            let key_in_spicepod = workload_identity::key_in_spicepod(
+                params,
+                &["databricks_token", "databricks_client_secret"],
+            );
+            databricks(
+                &component.name,
+                model_id,
+                &p,
+                key_in_spicepod,
+                Arc::clone(&token_registry),
+            )
+            .await
         }
         #[cfg(feature = "bedrock")]
         ModelSource::Bedrock => {
@@ -590,8 +604,10 @@ fn parse_distributed_config(
 }
 
 async fn databricks(
+    model_name: &str,
     model_id: Option<String>,
     params: &DatabricksModelParams,
+    key_in_spicepod: Option<&str>,
     token_provider_registry: Arc<TokenProviderRegistry>,
 ) -> Result<Arc<dyn Chat>, LlmError> {
     // Required parameters
@@ -618,6 +634,28 @@ async fn databricks(
     let user_agent = Some(data_components::databricks::user_agent());
     #[cfg(not(feature = "databricks"))]
     let user_agent: Option<&'static str> = None;
+
+    if let Some(identity) = params
+        .federation()
+        .workload_identity(key_in_spicepod)
+        .map_err(model_error)?
+    {
+        let token_provider = get_workload_identity_token_provider(
+            &format!("model '{model_name}' (databricks)"),
+            endpoint,
+            identity,
+            &token_provider_registry,
+        )
+        .await
+        .map_err(model_error)?;
+        return Ok(Arc::new(llms::databricks::from_token_provider(
+            endpoint,
+            model_id.as_str(),
+            token_provider,
+            user_agent,
+            HealthCheck::Required,
+        )) as Arc<dyn Chat>);
+    }
 
     match (token_opt, client_id, client_secret) {
         (Some(_), Some(_) | None, Some(_)) => {
