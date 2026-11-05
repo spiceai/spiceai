@@ -92,9 +92,9 @@ Next, connect your own sources with the [data connector docs](https://spiceai.or
 ## The data primitives agents need in one runtime
 
 - **SQL federation and acceleration.** Connect to and query operational databases, data lakes, and warehouses across the enterprise. Materialize and accelerate working sets in memory or on disk with Spice Cayenne for sub-second access, with secondary indexes for point lookups.
-- **Analytical query on operational data.** Deploy an analytics replica of PostgreSQL, MySQL, or MongoDB in minutes. High-throughput CDC keeps it current, so agents run large analytical queries on near real-time data without impacting production.
+- **Analytical query on operational data.** Run large analytical queries against an analytics replica of your operational database, kept current through high-throughput CDC.
 - **Hybrid search.** Combine structured filters, vector similarity, and keyword matches in one SQL query with `vector_search`, `text_search`, `rrf`, and `rerank`, then rank the merged results by relevance.
-- **Embedded AI inference.** Call hosted or local LLMs inline with SQL functions or natural language, and serve them through OpenAI-compatible APIs and an MCP server and gateway.
+- **AI gateway and SQL functions.** An OpenAI-compatible gateway to local and hosted models, with AI SQL functions, MCP tools, memory, evals, and observability built into the runtime.
 
 ## Use cases
 
