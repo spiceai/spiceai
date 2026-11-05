@@ -23,7 +23,7 @@
   <a href="https://spice.ai/blog"><b>Blog</b></a>
 </p>
 
-**Spice** is a single SQL endpoint for retrieving, accelerating, searching, and reasoning over operational and analytical data. It's incrementally adoptable and built for object storage. Spice gives each app and agent fast, sandboxed access to only the data it needs, and stays simple to operate from one deployment to thousands.
+**Spice** gives each app and agent fast, sandboxed access to only the data it needs, through a single SQL endpoint for retrieving, accelerating, searching, and reasoning over operational and analytical data. It's incrementally adoptable, deploys anywhere from a laptop to a cluster, and stays simple to operate from one deployment to thousands.
 
 This repository contains Spice.ai Open Source: the Apache-2.0 runtime (`spiced`) and CLI (`spice`), a single Rust binary built on [Apache DataFusion](https://datafusion.apache.org), [Apache Arrow](https://arrow.apache.org), [Apache Ballista](https://datafusion.apache.org/ballista/), [Apache Iceberg](https://iceberg.apache.org), and [Vortex](https://github.com/vortex-data/vortex). [Spice.ai Cloud](https://spice.ai) and [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise) are managed and enterprise distributions built on it.
 
@@ -39,7 +39,28 @@ Install the CLI on macOS, Linux, or WSL:
 curl https://install.spiceai.org | /bin/bash   # or: brew install spiceai/spiceai/spice
 ```
 
-Create an app, add the sample Spicepod, and start the runtime:
+Or let your coding agent set it up. Install [Spice Skills](https://github.com/spiceai/skills), and your agent can write and run the Spicepod for you:
+
+| Agent        | Install                                                                                   |
+| ------------ | ----------------------------------------------------------------------------------------- |
+| Claude Code  | `/plugin marketplace add spiceai/skills`, then `/plugin install spiceai@spiceai`          |
+| Codex        | `codex plugin marketplace add spiceai/skills`, then `codex plugin add spiceai@spiceai`    |
+| Other agents | `npx skills add spiceai/skills -a <agent>`                                                |
+
+<details>
+<summary>Or paste this prompt into any coding agent</summary>
+
+```text
+Install the Spice.ai skills from github.com/spiceai/skills, using one method:
+- Claude Code: `claude plugin marketplace add spiceai/skills`, then `claude plugin install spiceai@spiceai`
+- Codex: `codex plugin marketplace add spiceai/skills`, then `codex plugin add spiceai@spiceai`
+- Other agents: `npx skills add spiceai/skills -a <agent-id>`
+Then follow the setup skill (skills/setup/SKILL.md) to run Spice in this project and show me a SQL query result.
+```
+
+</details>
+
+To run it yourself, create an app, add the sample Spicepod, and start the runtime:
 
 ```bash
 spice init spice_qs && cd spice_qs
@@ -70,14 +91,14 @@ Next, connect your own sources with the [data connector docs](https://spiceai.or
 
 ## The data primitives agents need in one runtime
 
-- **SQL federation and acceleration.** Connect to and query operational databases, data lakes, and warehouses across the enterprise. Materialize and accelerate working sets in memory or on disk with Spice Cayenne for millisecond access, with secondary indexes for point lookups.
+- **SQL federation and acceleration.** Connect to and query operational databases, data lakes, and warehouses across the enterprise. Materialize and accelerate working sets in memory or on disk with Spice Cayenne for sub-second access, with secondary indexes for point lookups.
 - **Analytical query on operational data.** Deploy an analytics replica of PostgreSQL, MySQL, or MongoDB in minutes. High-throughput CDC keeps it current, so agents run large analytical queries on near real-time data without impacting production.
 - **Hybrid search.** Combine structured filters, vector similarity, and keyword matches in one SQL query with `vector_search`, `text_search`, `rrf`, and `rerank`, then rank the merged results by relevance.
 - **Embedded AI inference.** Call hosted or local LLMs inline with SQL functions or natural language, and serve them through OpenAI-compatible APIs and an MCP server and gateway.
 
 ## Use cases
 
-- **Agent data serving.** Give each agent sandboxed, accelerated access to only the data it needs, with search and tools built in. [MCP recipe](https://github.com/spiceai/cookbook/blob/trunk/mcp/README.md)
+- **Agent data serving.** Serve each agent federated SQL across its sources, with hot datasets accelerated locally for sub-second queries and search and tools built in. Each agent sees only the datasets it declares, and Spice holds the source credentials. [MCP recipe](https://github.com/spiceai/cookbook/blob/trunk/mcp/README.md)
 - **Fast queries without ETL delays.** Run federated SQL across operational databases, warehouses, and APIs, and accelerate the hot path with fewer pipelines to maintain. [Federation recipe](https://github.com/spiceai/cookbook/tree/trunk/federation)
 - **Real-time analytics on operational data.** Point BI tools and agents at a CDC-fed analytics replica instead of the production database. [CDC docs](https://spiceai.org/docs/features/cdc)
 - **One standard lakehouse for every tenant.** Define the lakehouse once in a Spicepod and deploy it for each customer, team, or agent, each with its own sources and settings. [Multi-tenancy patterns](https://spice.ai/blog/multi-tenancy-for-ai-agents-without-pipelines)
@@ -118,17 +139,6 @@ helm repo add spiceai https://helm.spiceai.org && helm install spiceai spiceai/s
 ```
 
 Spice is also available on the [AWS Marketplace](https://aws.amazon.com/marketplace/pp/prodview-jmf6jskjvnq7i). For multi-node deployments, see the [distributed query docs](https://spiceai.org/docs/features/distributed-query), the [cluster-sidecar architecture](https://spice.ai/blog/cluster-sidecar-architecture), and the [Apache Ballista deep dive](https://spice.ai/blog/apache-ballista-at-spice-ai).
-
-## Build with AI coding agents
-
-A coding agent can write and run the Spicepod for you in minutes. [Spice Skills](https://github.com/spiceai/skills) work with Claude Code, Codex, Cursor, and other agents. In Claude Code:
-
-```text
-/plugin marketplace add spiceai/skills
-/plugin install spiceai@spiceai
-```
-
-In Codex, run `codex plugin marketplace add spiceai/skills`, then `codex plugin add spiceai@spiceai`. In Cursor and other agents, run `npx skills add spiceai/skills -a <agent>`.
 
 ## Learn more
 
