@@ -56,6 +56,7 @@ spicepod = { path = "../spicepod" }
 sse-stream = { version = "0.2.6", optional = true }
 tools = { path = "../tools" }
 tokio.workspace = true
+tokio-util = { workspace = true, optional = true }
 uuid.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
@@ -67,7 +68,7 @@ util = { path = "../util" }
 default = []
 # `tools/mcp` gates `tools::McpProxy` and `SpiceModelTool::as_mcp_proxy`, both of which
 # `mcp::tool` names, so the crate's MCP code needs it as much as it needs `rmcp` itself.
-mcp = ["dep:bytes", "dep:reqwest", "dep:rmcp", "dep:sse-stream", "tools/mcp"]
+mcp = ["dep:bytes", "dep:reqwest", "dep:rmcp", "dep:sse-stream", "dep:tokio-util", "tools/mcp"]
 openapi = ["dep:utoipa"]
 
 [dev-dependencies]

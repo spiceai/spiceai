@@ -18795,6 +18795,7 @@ dependencies = [
  "spicepod",
  "sse-stream",
  "tokio",
+ "tokio-util",
  "tools",
  "tower 0.5.3",
  "tracing",
