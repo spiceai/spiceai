@@ -74,6 +74,16 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
+# A tag build publishes the release named by the tag. If the tag moves while a
+# build is running, the newer run cancels the older one, so the release and its
+# images come from one build. Every other run gets a group of its own, so trunk
+# and release-branch pushes still build every commit. Concurrency groups are
+# shared by every workflow in the repository, so this name differs from
+# build_and_release_cuda's.
+concurrency:
+  group: ${{ github.ref_type == 'tag' && format('build-release-{0}', github.ref) || format('{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.ref_type == 'tag' }}
+
 jobs:
   setup-matrix:
     name: Setup strategy matrix

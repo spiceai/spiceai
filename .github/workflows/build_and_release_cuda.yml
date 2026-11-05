@@ -61,10 +61,12 @@ on:
         default: 'release'
 
 # A trunk push cancels the CUDA build of any older trunk push, queued or
-# running. Tag and manual runs each get a group of their own, so they never
-# cancel or wait on another run.
+# running. A tag run cancels any older run for the same tag, so a moved tag
+# publishes the CUDA binaries of one build. Other manual runs each get a group
+# of their own, so they never cancel or wait on another run. The tag group name
+# differs from build_and_release's, since groups are shared across workflows.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref == 'refs/heads/trunk' && 'trunk' || github.run_id }}
+  group: ${{ github.ref_type == 'tag' && format('build-release-cuda-{0}', github.ref) || format('{0}-{1}', github.workflow, (github.event_name == 'push' && github.ref == 'refs/heads/trunk') && 'trunk' || github.run_id) }}
   cancel-in-progress: true
 
 jobs:
