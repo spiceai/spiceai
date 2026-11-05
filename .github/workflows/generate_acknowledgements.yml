@@ -5,6 +5,7 @@ on:
 
 jobs:
   generate:
+    environment: secret-free
     name: Generate Acknowledgements
     runs-on: self-hosted
     permissions:
