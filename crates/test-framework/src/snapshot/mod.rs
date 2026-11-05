@@ -68,6 +68,14 @@ const CONNECTION_CONTEXT_FILTER_REPLACEMENT: &str = "compute_context=<CONNECTION
 const ENDPOINT_CONTEXT_FILTER_PATTERN: &str = r"compute_context=(?:url=|sc://)\S+";
 const ENDPOINT_CONTEXT_FILTER_REPLACEMENT: &str = CONNECTION_CONTEXT_FILTER_REPLACEMENT;
 
+/// ADBC renders its compute context as a SHA-256 of the connection settings, credentials
+/// included, so a plan never shows a secret. The hash therefore changes whenever the
+/// credential does — a rotated key, or the service account key CI creates for each run — so
+/// it is redacted like the plain-text contexts above. Anchored on `name=adbc` so the hashed
+/// contexts of other connectors are left to their own snapshots.
+const ADBC_CONTEXT_FILTER_PATTERN: &str = r"(name=adbc )compute_context=[0-9a-f]{64}\b";
+const ADBC_CONTEXT_FILTER_REPLACEMENT: &str = "${1}compute_context=<CONNECTION>";
+
 /// Redact the scan counters `CayenneAccelerationExec` surfaces in its plan display.
 /// `snapshots_scanned`/`files_scanned` report read amplification, which depends on
 /// ingestion batching and how far compaction has progressed when the query runs —
@@ -157,6 +165,10 @@ fn build_explain_filters(temp_dir: &std::path::Path) -> Vec<(String, &'static st
         (
             ENDPOINT_CONTEXT_FILTER_PATTERN.to_string(),
             ENDPOINT_CONTEXT_FILTER_REPLACEMENT,
+        ),
+        (
+            ADBC_CONTEXT_FILTER_PATTERN.to_string(),
+            ADBC_CONTEXT_FILTER_REPLACEMENT,
         ),
         (
             CAYENNE_SCAN_COUNTERS_FILTER_PATTERN.to_string(),
@@ -864,6 +876,34 @@ mod tests {
         // The `host=` form stays the other pattern's job; this one must not half-match
         // it and leave a partially-redacted context behind.
         let input = "VirtualExecutionPlan name=mysql compute_context=host=db,port=3306,db=tpch,user=root base_sql=SELECT 1";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_adbc_context_filter() -> Result<(), String> {
+        let regex =
+            regex::Regex::new(super::ADBC_CONTEXT_FILTER_PATTERN).map_err(|e| format!("{e}"))?;
+        let replacement = super::ADBC_CONTEXT_FILTER_REPLACEMENT;
+
+        // Two credentials for the same BigQuery dataset hash differently and must redact to
+        // the same token.
+        let expected = "VirtualExecutionPlan name=adbc compute_context=<CONNECTION> base_sql=SELECT `l_orderkey` FROM `lineitem`";
+        let input = "VirtualExecutionPlan name=adbc compute_context=2ccce95fe2d4be687104db4fa81b90e6f680f2d2a8a2b7739b83e7164907678e base_sql=SELECT `l_orderkey` FROM `lineitem`";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+        let input = "VirtualExecutionPlan name=adbc compute_context=331039639bda0f4eac6001824ee914bd9186bdd24241554179e6d6397161e435 base_sql=SELECT `l_orderkey` FROM `lineitem`";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Idempotent: an already-redacted snapshot is left unchanged.
+        assert_eq!(regex.replace_all(expected, replacement), expected);
+
+        // Other connectors' hashed contexts are left to their own snapshots.
+        let input = "VirtualExecutionPlan name=odbc compute_context=30213f5dd5458a0b9c41e5f7a3c1d2b4e6f8091a2b3c4d5e6f708192a3b4c5d6 base_sql=SELECT 1";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        // A context that is not a full SHA-256 is not an ADBC hash and stays as it is.
+        let input = "VirtualExecutionPlan name=adbc compute_context=2ccce95fe2d4 base_sql=SELECT 1";
         assert_eq!(regex.replace_all(input, replacement), input);
 
         Ok(())

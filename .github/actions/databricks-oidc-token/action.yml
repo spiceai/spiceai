@@ -1,0 +1,58 @@
+name: 'Databricks OIDC token'
+description: >-
+  Exchange the job's GitHub OIDC token for a Databricks OAuth token. The job needs
+  `id-token: write`, and the service principal needs a federation policy for the job's subject.
+
+inputs:
+  host:
+    description: 'Workspace host, without a scheme'
+    required: true
+  client-id:
+    description: "Application ID of the service principal"
+    required: true
+  audience:
+    description: "Audience in the service principal's federation policy"
+    required: true
+
+outputs:
+  token:
+    description: 'Databricks token. It expires with the GitHub OIDC token, 5 minutes after this action runs.'
+    value: ${{ steps.exchange.outputs.token }}
+
+runs:
+  using: composite
+  steps:
+    - id: exchange
+      shell: bash
+      env:
+        HOST: ${{ inputs.host }}
+        CLIENT_ID: ${{ inputs.client-id }}
+        AUDIENCE: ${{ inputs.audience }}
+      run: |
+        set -euo pipefail
+        # Each retry replaces this file, so it only ever holds the last response.
+        response="$(mktemp)"
+        trap 'rm -f "${response}"' EXIT
+        curl_args=(--silent --show-error --fail-with-body --max-time 30 --retry 3 --retry-all-errors --output "${response}")
+
+        # Tokens reach curl on stdin, out of the process list.
+        printf 'header = "Authorization: bearer %s"\n' "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" |
+          curl "${curl_args[@]}" --config - --get --data-urlencode "audience=${AUDIENCE}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}"
+        oidc_token="$(jq -er .value "${response}")"
+        echo "::add-mask::${oidc_token}"
+
+        if ! printf 'data-urlencode = "subject_token=%s"\n' "${oidc_token}" |
+          curl "${curl_args[@]}" --config - "https://${HOST}/oidc/v1/token" \
+            --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+            --data-urlencode "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
+            --data-urlencode "client_id=${CLIENT_ID}" \
+            --data-urlencode "scope=all-apis"; then
+          echo "::error::Databricks refused the token exchange at ${HOST}: $(cat "${response}")"
+          exit 1
+        fi
+
+        token="$(jq -er .access_token "${response}")"
+        echo "::add-mask::${token}"
+        echo "Databricks token expires in $(jq -r .expires_in "${response}") seconds."
+        echo "token=${token}" >> "${GITHUB_OUTPUT}"

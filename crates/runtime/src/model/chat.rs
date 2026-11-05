@@ -265,7 +265,7 @@ pub async fn construct_model(
         ModelSource::Azure => {
             let p = typed_params::<AzureModelParams>(component, params, source.clone(), secrets)
                 .await?;
-            azure(model_id, component.name.as_str(), &p)
+            azure(model_id, component.name.as_str(), &p).await
         }
         ModelSource::Xai => {
             let p =
@@ -793,24 +793,29 @@ fn validate_temperature(
     Ok(())
 }
 
-fn azure(
+/// An Azure model's client, for chat or responses: the one workload identity federation builds
+/// when the model is configured for it, or else the one its `azure_api_key` or
+/// `azure_entra_token` builds. `component_name` is the model's name in the Spicepod.
+pub(crate) enum AzureClient {
+    Federated(llms::openai::Openai<llms::openai::AzureTokenConfig>),
+    Key(llms::openai::Openai<llms::openai::AzureConfig>),
+}
+
+pub(crate) async fn azure_client(
     model_id: Option<String>,
-    model_name: &str,
+    component_name: &str,
     params: &AzureModelParams,
-) -> Result<Arc<dyn Chat>, LlmError> {
+) -> Result<AzureClient, LlmError> {
     let Some(model_name) = model_id else {
         return Err(LlmError::FailedToLoadModel {
             source: format!(
-    "Azure model '{model_name}' requires a model ID in the format `from:azure:<model_id>`. See https://spiceai.org/docs/components/models/azure for details."
+    "Azure model '{component_name}' requires a model ID in the format `from:azure:<model_id>`. See https://spiceai.org/docs/components/models/azure for details."
 ).into(),
         });
     };
     let api_base = params.endpoint.as_deref();
-    let api_version = params.api_version.as_deref();
-    let deployment_name = params.deployment_name.as_deref();
     let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
     let entra_token = params.entra_token.as_ref().map(ExposeSecret::expose_secret);
-    let chat_backend = params.responses_api;
 
     if api_base.is_none() {
         return Err(LlmError::FailedToLoadModel {
@@ -829,24 +834,57 @@ fn azure(
         });
     }
 
+    let key_param = params.key_param();
+    if let Some(client) = workload_identity::azure_federated_client(
+        &format!("model '{component_name}' (azure)"),
+        &model_name,
+        &params.federation(),
+        key_param,
+        key_param.is_some(),
+        &workload_identity::AzureEnvironment::from_process(),
+        params.responses_api,
+    )
+    .await
+    .map_err(workload_identity::FederationError::into_llm_error)?
+    {
+        return Ok(AzureClient::Federated(client));
+    }
+
     if api_key.is_none() && entra_token.is_none() {
-        return Err(LlmError::FailedToLoadModel {
+        // Not `FailedToLoadModel`, which presents the cause as a bug to report: this is a
+        // credential the configuration does not give.
+        return Err(LlmError::FailedToAuthenticate {
             source: format!(
-                "Azure model '{model_name}' requires either 'azure_api_key' or 'azure_entra_token'. See https://spiceai.org/docs/components/models/azure for details."
+                "Azure model '{component_name}' requires `azure_api_key`, `azure_entra_token`, or a Microsoft Entra workload identity: `azure_tenant_id` and `azure_client_id`, or on AKS a pod labeled `azure.workload.identity/use: \"true\"`. See https://spiceai.org/docs/components/models/azure for details."
             )
             .into(),
         });
     }
 
-    Ok(Arc::new(llms::openai::new_azure_client_with_chat_backend(
-        model_name,
-        api_base,
-        api_version,
-        deployment_name,
-        entra_token,
-        api_key,
-        chat_backend,
-    )) as Arc<dyn Chat>)
+    Ok(AzureClient::Key(
+        llms::openai::new_azure_client_with_chat_backend(
+            model_name,
+            api_base,
+            params.api_version.as_deref(),
+            params.deployment_name.as_deref(),
+            entra_token,
+            api_key,
+            params.responses_api,
+        ),
+    ))
+}
+
+async fn azure(
+    model_id: Option<String>,
+    component_name: &str,
+    params: &AzureModelParams,
+) -> Result<Arc<dyn Chat>, LlmError> {
+    Ok(
+        match azure_client(model_id, component_name, params).await? {
+            AzureClient::Federated(client) => Arc::new(client) as Arc<dyn Chat>,
+            AzureClient::Key(client) => Arc::new(client) as Arc<dyn Chat>,
+        },
+    )
 }
 
 #[cfg(feature = "models")]

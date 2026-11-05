@@ -6,7 +6,9 @@ description: >
   last version of a key, a primary key without `on_conflict` keeps the first,
   and no primary key keeps every row; across inserts repeating keys within
   and across statements, updates, deletes and re-inserts, a thousand-row
-  insert, NULLs, boundary values and special characters, plain and
+  insert, NULLs, boundary values and special characters, deletes by filters
+  that Cayenne's Vortex scan cannot evaluate (arithmetic and functions, over
+  NULLs), plain and
   partitioned, in file and memory mode; and a full refresh replaces
   everything written, after which a key it removed can be written again and a
   key it kept is replaced, not duplicated.
@@ -148,14 +150,20 @@ steps:
     when: { policy: none }
   - query: SELECT id, region, name, v, f, ts FROM ev
     oracle-sql: SELECT id, region, name, v, f, ts FROM model
-  # A bulk delete (refused without a primary key: cayenne-writes-known.yaml).
+  # A bulk delete by arithmetic, which Vortex cannot evaluate: a table without a
+  # primary key evaluates it with DataFusion over each data file instead.
   - spice-exec: 'DELETE FROM ev WHERE id > 1000 AND id % 2 = 0'
-    when: { policy: [upsert, drop, keep] }
   - source-exec: { src: 'DELETE FROM model WHERE id > 1000 AND id % 2 = 0' }
-    when: { policy: [upsert, drop, keep] }
   - query: SELECT id, region, name, v, f, ts FROM ev
     oracle-sql: SELECT id, region, name, v, f, ts FROM model
-    when: { policy: [upsert, drop, keep] }
+  # The same over NULLs in the filter's columns: NULL OR TRUE deletes the row, and
+  # NULL OR NULL keeps it.
+  - spice-exec: 'INSERT INTO ev VALUES (2001, ''us'', NULL, NULL, NULL, NULL), (2002, ''eu'', ''gamma'', NULL, 1.0, NULL), (2003, ''asia'', NULL, 8, 2.0, NULL)'
+  - source-exec: { src: 'INSERT INTO model VALUES (2001, ''us'', NULL, NULL, NULL, NULL), (2002, ''eu'', ''gamma'', NULL, 1.0, NULL), (2003, ''asia'', NULL, 8, 2.0, NULL)' }
+  - spice-exec: 'DELETE FROM ev WHERE id > 2000 AND (v % 4 = 0 OR upper(name) = ''GAMMA'')'
+  - source-exec: { src: 'DELETE FROM model WHERE id > 2000 AND (v % 4 = 0 OR upper(name) = ''GAMMA'')' }
+  - query: SELECT id, region, name, v, f, ts FROM ev
+    oracle-sql: SELECT id, region, name, v, f, ts FROM model
   # Every row deleted, then one inserted.
   - spice-exec: 'DELETE FROM ev'
     when: { policy: [upsert, drop, keep] }

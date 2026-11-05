@@ -42,34 +42,32 @@ use token_provider::{StaticTokenProvider, TokenProvider};
 pub(crate) async fn create_bedrock(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
     let mut config_builder = default_aws_config();
 
-    if let Ok(region) = std::env::var("SPICE_BEDROCK_REGION") {
+    if let Some(region) = env_nonempty("SPICE_BEDROCK_REGION") {
         config_builder = config_builder.region(Region::new(region));
     }
 
     match (
-        std::env::var("SPICE_BEDROCK_ACCESS_KEY"),
-        std::env::var("SPICE_BEDROCK_SECRET_KEY"),
+        env_nonempty("SPICE_BEDROCK_ACCESS_KEY"),
+        env_nonempty("SPICE_BEDROCK_SECRET_KEY"),
     ) {
-        (Ok(access_key), Ok(secret_key)) => {
+        (Some(access_key), Some(secret_key)) => {
             config_builder = config_builder.credentials_provider(Credentials::new(
                 access_key,
                 secret_key,
-                std::env::var("SPICE_BEDROCK_SESSION_TOKEN").ok(),
+                env_nonempty("SPICE_BEDROCK_SESSION_TOKEN"),
                 None,
                 "bedrock-chat",
             ));
         }
-        (Err(_), Ok(_)) => {
+        (None, Some(_)) => {
             return Err(anyhow::anyhow!("SPICE_BEDROCK_ACCESS_KEY not set"));
         }
-        (Ok(_), Err(_)) => {
+        (Some(_), None) => {
             return Err(anyhow::anyhow!("SPICE_BEDROCK_SECRET_KEY not set"));
         }
-        (Err(_), Err(_)) => {
-            return Err(anyhow::anyhow!(
-                "SPICE_BEDROCK_ACCESS_KEY & SPICE_BEDROCK_SECRET_KEY not set"
-            ));
-        }
+        // No key pair: the AWS credential chain, such as the role a GitHub Actions job assumes
+        // with its OIDC token, or `AWS_ROLE_ARN` with `AWS_WEB_IDENTITY_TOKEN_FILE`.
+        (None, None) => {}
     }
 
     let config: aws_config::SdkConfig = config_builder.load().await;
@@ -175,6 +173,59 @@ pub(crate) async fn create_anthropic(
         );
     };
     Ok(Arc::new(Anthropic::new(auth, model_id, None, None)?))
+}
+
+/// The Azure `OpenAI` model the suite runs against: deployment `AZURE_OPENAI_DEPLOYMENT` (default
+/// `gpt-4o-mini`) of the resource at `AZURE_OPENAI_ENDPOINT`. It authenticates with Microsoft
+/// Entra workload identity federation when `AZURE_OPENAI_CLIENT_ID` is set, as in CI, through the
+/// same function a `spiced` Azure model uses; otherwise with `AZURE_OPENAI_API_KEY`.
+pub(crate) async fn create_azure() -> Result<Arc<dyn Chat>, anyhow::Error> {
+    let endpoint =
+        env_nonempty("AZURE_OPENAI_ENDPOINT").context("AZURE_OPENAI_ENDPOINT is not set")?;
+    let deployment =
+        env_nonempty("AZURE_OPENAI_DEPLOYMENT").unwrap_or_else(|| "gpt-4o-mini".to_string());
+    let api_version =
+        env_nonempty("AZURE_OPENAI_API_VERSION").unwrap_or_else(|| "2024-10-21".to_string());
+
+    if let Some(client_id) = env_nonempty("AZURE_OPENAI_CLIENT_ID") {
+        let tenant_id =
+            env_nonempty("AZURE_OPENAI_TENANT_ID").context("AZURE_OPENAI_TENANT_ID is not set")?;
+        let federation = llms::workload_identity::AzureFederation {
+            tenant_id: Some(&tenant_id),
+            client_id: Some(&client_id),
+            federated_token_audience: None,
+            federated_token_file: None,
+            endpoint: Some(&endpoint),
+            api_version: Some(&api_version),
+            deployment_name: Some(&deployment),
+        };
+        let client = llms::workload_identity::azure_federated_client(
+            "test model (azure)",
+            &deployment,
+            &federation,
+            None,
+            false,
+            // Only the IDs above, never this process's own `AZURE_*` identity.
+            &llms::workload_identity::AzureEnvironment::default(),
+            ChatBackend::ChatCompletions,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{}", error.into_llm_error()))?
+        .context("the Azure federation params configure no client")?;
+        return Ok(Arc::new(client));
+    }
+
+    let api_key = env_nonempty("AZURE_OPENAI_API_KEY").context(
+        "Set `AZURE_OPENAI_CLIENT_ID` and `AZURE_OPENAI_TENANT_ID` for workload identity federation, or `AZURE_OPENAI_API_KEY`",
+    )?;
+    Ok(Arc::new(llms::openai::new_azure_client(
+        deployment.clone(),
+        Some(&endpoint),
+        Some(&api_version),
+        Some(&deployment),
+        None,
+        Some(&api_key),
+    )))
 }
 
 pub(crate) async fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError> {
