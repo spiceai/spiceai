@@ -211,17 +211,17 @@ ahash = "0.8.12"
 anyhow = "1.0.103"
 async-channel = "1.9"
 arc-swap = "1.7"
-arrow = { version = "59.3.0", features = ["prettyprint"] }
-arrow-array = "59.3.0"
-arrow-buffer = "59.3.0"
-arrow-cast = "59.3.0"
-arrow-csv = "59.3.0"
-arrow-flight = "59.3.0"
-arrow-ipc = "59.3.0"
-arrow-json = "59.3.0"
+arrow = { version = "59.3.2", features = ["prettyprint"] }
+arrow-array = "59.3.2"
+arrow-buffer = "59.3.2"
+arrow-cast = "59.3.2"
+arrow-csv = "59.3.2"
+arrow-flight = "59.3.2"
+arrow-ipc = "59.3.2"
+arrow-json = "59.3.2"
 arrow-odbc = "25.3" # 25.2+ accepts arrow ">=29, <60", so it resolves to the workspace Arrow 59
-arrow-row = "59.3.0"
-arrow-schema = "59.3.0"
+arrow-row = "59.3.2"
+arrow-schema = "59.3.2"
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "c1bf4a090c50e18f27663b008dac4c108e49b994", features = [
     "byot",
     "embedding",
@@ -398,7 +398,7 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = [
     "experimental_metrics_custom_reader",
 ] }
 parking_lot = "0.12"
-parquet = "59.3.0"
+parquet = "59.3.2"
 paste = "1.0.15"
 pem = "3.0.4"
 percent-encoding = "2.3.1"
@@ -681,22 +681,22 @@ iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev 
 # a duplicate-key error.
 
 # arrow-rs 59.3 with spice patches (spiceai-59-patches)
-arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6d198c9ed5f0d0d31e36b7860a71914bb318fd8d" }        # branch: spiceai-59 (arrow 59.3.0 + RUSTSEC-2026-0442 via spiceai/arrow-rs#35; TEMPORARY until that merges)
-arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6d198c9ed5f0d0d31e36b7860a71914bb318fd8d" }  # branch: spiceai-59 (arrow 59.3.0 + RUSTSEC-2026-0442 via spiceai/arrow-rs#35; TEMPORARY until that merges)
-arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6d198c9ed5f0d0d31e36b7860a71914bb318fd8d" }  # branch: spiceai-59 (arrow 59.3.0 + RUSTSEC-2026-0442 via spiceai/arrow-rs#35; TEMPORARY until that merges)
-arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6d198c9ed5f0d0d31e36b7860a71914bb318fd8d" } # branch: spiceai-59 (arrow 59.3.0 + RUSTSEC-2026-0442 via spiceai/arrow-rs#35; TEMPORARY until that merges)
-arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6d198c9ed5f0d0d31e36b7860a71914bb318fd8d" }   # branch: spiceai-59 (arrow 59.3.0 + RUSTSEC-2026-0442 via spiceai/arrow-rs#35; TEMPORARY until that merges)
-arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6d198c9ed5f0d0d31e36b7860a71914bb318fd8d" }    # branch: spiceai-59 (arrow 59.3.0 + RUSTSEC-2026-0442 via spiceai/arrow-rs#35; TEMPORARY until that merges)
-arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6d198c9ed5f0d0d31e36b7860a71914bb318fd8d" }   # branch: spiceai-59 (arrow 59.3.0 + RUSTSEC-2026-0442 via spiceai/arrow-rs#35; TEMPORARY until that merges)
-arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6d198c9ed5f0d0d31e36b7860a71914bb318fd8d" } # branch: spiceai-59 (arrow 59.3.0 + RUSTSEC-2026-0442 via spiceai/arrow-rs#35; TEMPORARY until that merges)
-arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6d198c9ed5f0d0d31e36b7860a71914bb318fd8d" }    # branch: spiceai-59 (arrow 59.3.0 + RUSTSEC-2026-0442 via spiceai/arrow-rs#35; TEMPORARY until that merges)
-arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6d198c9ed5f0d0d31e36b7860a71914bb318fd8d" }   # branch: spiceai-59 (arrow 59.3.0 + RUSTSEC-2026-0442 via spiceai/arrow-rs#35; TEMPORARY until that merges)
-arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6d198c9ed5f0d0d31e36b7860a71914bb318fd8d" }    # branch: spiceai-59 (arrow 59.3.0 + RUSTSEC-2026-0442 via spiceai/arrow-rs#35; TEMPORARY until that merges)
-arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6d198c9ed5f0d0d31e36b7860a71914bb318fd8d" }    # branch: spiceai-59 (arrow 59.3.0 + RUSTSEC-2026-0442 via spiceai/arrow-rs#35; TEMPORARY until that merges)
-arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6d198c9ed5f0d0d31e36b7860a71914bb318fd8d" } # branch: spiceai-59 (arrow 59.3.0 + RUSTSEC-2026-0442 via spiceai/arrow-rs#35; TEMPORARY until that merges)
-arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6d198c9ed5f0d0d31e36b7860a71914bb318fd8d" } # branch: spiceai-59 (arrow 59.3.0 + RUSTSEC-2026-0442 via spiceai/arrow-rs#35; TEMPORARY until that merges)
-arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6d198c9ed5f0d0d31e36b7860a71914bb318fd8d" } # branch: spiceai-59 (arrow 59.3.0 + RUSTSEC-2026-0442 via spiceai/arrow-rs#35; TEMPORARY until that merges)
-parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6d198c9ed5f0d0d31e36b7860a71914bb318fd8d" }      # branch: spiceai-59 (arrow 59.3.0 + RUSTSEC-2026-0442 via spiceai/arrow-rs#35; TEMPORARY until that merges)
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "e56e5cf4e9d51685fed197dbd477eca690f0eb87" }        # branch: lukim/spiceai-59.3.2-patches (arrow 59.3.2 + spice patches; TEMPORARY until spiceai/arrow-rs#36 merges into spiceai-59.3.2)
+arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "e56e5cf4e9d51685fed197dbd477eca690f0eb87" }  # branch: lukim/spiceai-59.3.2-patches (arrow 59.3.2 + spice patches; TEMPORARY until spiceai/arrow-rs#36 merges into spiceai-59.3.2)
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "e56e5cf4e9d51685fed197dbd477eca690f0eb87" }  # branch: lukim/spiceai-59.3.2-patches (arrow 59.3.2 + spice patches; TEMPORARY until spiceai/arrow-rs#36 merges into spiceai-59.3.2)
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "e56e5cf4e9d51685fed197dbd477eca690f0eb87" } # branch: lukim/spiceai-59.3.2-patches (arrow 59.3.2 + spice patches; TEMPORARY until spiceai/arrow-rs#36 merges into spiceai-59.3.2)
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "e56e5cf4e9d51685fed197dbd477eca690f0eb87" }   # branch: lukim/spiceai-59.3.2-patches (arrow 59.3.2 + spice patches; TEMPORARY until spiceai/arrow-rs#36 merges into spiceai-59.3.2)
+arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "e56e5cf4e9d51685fed197dbd477eca690f0eb87" }    # branch: lukim/spiceai-59.3.2-patches (arrow 59.3.2 + spice patches; TEMPORARY until spiceai/arrow-rs#36 merges into spiceai-59.3.2)
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "e56e5cf4e9d51685fed197dbd477eca690f0eb87" }   # branch: lukim/spiceai-59.3.2-patches (arrow 59.3.2 + spice patches; TEMPORARY until spiceai/arrow-rs#36 merges into spiceai-59.3.2)
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "e56e5cf4e9d51685fed197dbd477eca690f0eb87" } # branch: lukim/spiceai-59.3.2-patches (arrow 59.3.2 + spice patches; TEMPORARY until spiceai/arrow-rs#36 merges into spiceai-59.3.2)
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "e56e5cf4e9d51685fed197dbd477eca690f0eb87" }    # branch: lukim/spiceai-59.3.2-patches (arrow 59.3.2 + spice patches; TEMPORARY until spiceai/arrow-rs#36 merges into spiceai-59.3.2)
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "e56e5cf4e9d51685fed197dbd477eca690f0eb87" }   # branch: lukim/spiceai-59.3.2-patches (arrow 59.3.2 + spice patches; TEMPORARY until spiceai/arrow-rs#36 merges into spiceai-59.3.2)
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "e56e5cf4e9d51685fed197dbd477eca690f0eb87" }    # branch: lukim/spiceai-59.3.2-patches (arrow 59.3.2 + spice patches; TEMPORARY until spiceai/arrow-rs#36 merges into spiceai-59.3.2)
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "e56e5cf4e9d51685fed197dbd477eca690f0eb87" }    # branch: lukim/spiceai-59.3.2-patches (arrow 59.3.2 + spice patches; TEMPORARY until spiceai/arrow-rs#36 merges into spiceai-59.3.2)
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "e56e5cf4e9d51685fed197dbd477eca690f0eb87" } # branch: lukim/spiceai-59.3.2-patches (arrow 59.3.2 + spice patches; TEMPORARY until spiceai/arrow-rs#36 merges into spiceai-59.3.2)
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "e56e5cf4e9d51685fed197dbd477eca690f0eb87" } # branch: lukim/spiceai-59.3.2-patches (arrow 59.3.2 + spice patches; TEMPORARY until spiceai/arrow-rs#36 merges into spiceai-59.3.2)
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "e56e5cf4e9d51685fed197dbd477eca690f0eb87" } # branch: lukim/spiceai-59.3.2-patches (arrow 59.3.2 + spice patches; TEMPORARY until spiceai/arrow-rs#36 merges into spiceai-59.3.2)
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "e56e5cf4e9d51685fed197dbd477eca690f0eb87" }      # branch: lukim/spiceai-59.3.2-patches (arrow 59.3.2 + spice patches; TEMPORARY until spiceai/arrow-rs#36 merges into spiceai-59.3.2)
 
 vortex = { git = "https://github.com/spiceai/vortex.git", rev = "e5566746d966da8a9da901573083fdf222fcc0f6" } # branch: spiceai-55 (vortex 0.86.1)
 vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "e5566746d966da8a9da901573083fdf222fcc0f6" } # branch: spiceai-55 (vortex 0.86.1)
