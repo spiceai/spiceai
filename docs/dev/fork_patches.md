@@ -124,7 +124,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [duckdb-rs](#duckdb-rs) | `40a0ad2a7de6a8ba06d242ce7e04ffcd7a664df9` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1f0744b900e69e1b3fafa721aa4283bd4b048a61` | `spiceai-0.11.0-df-55` |
-| [llama.cpp](#llamacpp) | `6b673b0b6895977d4a6fc85f43761a2717e0df3e` | `spiceai-b11999` |
+| [llama.cpp](#llamacpp) | `b20c7a2bee3203728ec0fbb7b3e616a60fe86d8c` | `spiceai-b11999` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `d7ddf3bb84ad753e6da385c02e9f8e16bc9a39ec` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [orc-rust](#orc-rust) | `d9632e7ae973456c81c660c04e5f55cc86489bcb` | `spiceai-0.9` |
@@ -793,8 +793,8 @@ Upstream [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). The fork c
 upstream releases with the Spice patches below: each `spiceai-<release>` branch is the previous
 Spice branch with the upstream release tag merged in, and the pin is its tagged tip,
 `<release>-spiceai.<n>`, or a commit on it that no tag names yet: today the squash of
-spiceai/llama.cpp#31, eleven commits past `b11999-spiceai.1` (#21, #20, #23, #25, then #22, which
-carried #18 and #19 over from `spiceai-b11803`, then #24, #26, #27, #29, #30, #31), which is upstream
+spiceai/llama.cpp#33, twelve commits past `b11999-spiceai.1` (#21, #20, #23, #25, then #22, which
+carried #18 and #19 over from `spiceai-b11803`, then #24, #26, #27, #29, #30, #31, #33), which is upstream
 `b11984` and then `b11999` merged into `spiceai-b11803`, with `spiceai-b11803` merged in again at
 spiceai/llama.cpp#16. Since `b11984` the DeepSeek-V4.1 model (`deepseek41`) is upstream's, and the fork keeps only
 its fixes on top; of those, the ones without a row below (a LoRA adapter on `output.weight`,
@@ -826,6 +826,7 @@ release, follow `spiceai/README.md` in the fork.
 | A quantized rows view on a meta backend, flattened to one dimension, offsets each device's part by whole blocks rather than elements (spiceai/llama.cpp#29) | Every device after the first reads past the matrix. The DSpark drafter multiplies its rows view without flattening it, so nothing Spice serves builds such a view today | crash (out-of-bounds read) | **GAP** — the fork's `test-argmax-split` (`test_meta_flat_quantized_rows`) covers it; see [Open gaps](#open-gaps) |
 | The argmax output: `llama_set_argmax_output` and `llama_get_argmax_ith` compute a split output head's picks on its devices and return only the picks, with no logits (spiceai/llama.cpp#30) | Nothing yet: Spice does not turn it on. The change that does will call both, so losing them will then fail the build | none | none needed until Spice calls it |
 | The MTP draft head pairs a batch's first token only with the hidden state at the position before it: it keeps that state and the one before it with their positions, saves and restores them through `common_speculative_get_state` and `common_speculative_set_state`, and moves them with the sequence through `common_speculative_seq_add` (spiceai/llama.cpp#31) | A second request on a sequence, or a turn that reads only past a cached prefix, drafts from the hidden state the previous request left, not as the same request does on a fresh context. Losing the patch still builds: `crates/llama-cpp`'s MTP shim calls the getters, which exist without it and then save nothing for the MTP head | silent (different drafts) | `mtp::a_second_request_drafts_as_on_a_fresh_context` and `mtp::a_reused_prefix_drafts_as_on_a_fresh_context` (`crates/llms-llamacpp/tests/mtp.rs`), run by the llama.cpp engine job in `.github/workflows/integration_llms.yml`; both fail without the patch on Metal and on CPU |
+| A meta backend rebuilds a split it would reuse when another backend's rebuilds have reset the containers holding the device tensors of its views (spiceai/llama.cpp#33) | With one graph slot (`LLAMA_GRAPH_SLOTS=0`), DeepSeek-V4.1 split by tensor with its DSpark drafter aborts on its first or second request at `ggml-cuda/binbcast.cu:417`: since spiceai/llama.cpp#27 the drafter's graphs view the target's weights, and their rebuilds reset the views the target's reused split points at. Spice runs a tensor split with two graph slots, whose splits are built from clones, so only that variable reaches it | crash | **GAP** — the fork's `test-meta-shared-views` covers it; see [Open gaps](#open-gaps) |
 | A DeepSeek-V4 GGUF whose `attention.output_group_count` is 0 fails its load while its hyperparameters are read (`deepseek4`, whose hyperparameters `deepseek41` shares); the attention heads are divided among that many groups | The load goes on to divide by the group count when it sizes the attention output tensors: undefined behaviour in C++, and a `SIGFPE` that takes `spiced` down where the CPU traps it, as x86 does | crash | `a_zero_output_group_count_fails_a_deepseek_load` (`crates/llama-cpp/tests/gguf_corruption.rs`); without the check, the same header fails later, on a missing key |
 | A failed check while loading a model throws instead of aborting: libllama defines `GGML_ABORT_THROWS`, under which `GGML_ABORT` throws a `std::runtime_error` inside the `llama_abort_throws_scope` that `llama_model_load` opens in the try block that catches it, and aborts as upstream everywhere else | Without the patch, a GGUF whose metadata fails a `GGML_ASSERT`, such as an unknown `<arch>.classifier.activation`, aborts `spiced` at load instead of failing that model. Without its scope, a failed check outside a load throws out of a C API function that catches nothing, into Rust | crash | `an_unknown_classifier_activation_fails_the_load_instead_of_aborting` and `a_corrupted_gguf_fails_its_load_without_taking_the_process_down` (`crates/llama-cpp/tests`) for the load, and `sampler::tests::a_failed_check_outside_a_model_load_aborts_instead_of_throwing` (`crates/llama-cpp/src/sampler.rs`) for everywhere else |
 
@@ -897,7 +898,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**58 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**59 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -977,6 +978,10 @@ They are not equal in consequence; this is the order to close them in.
    need two split models on one host to reach. Its quantized rows-view offsets on
    a meta backend (spiceai/llama.cpp#29) would be an out-of-bounds read if lost,
    covered by the fork's `test-argmax-split`; no model Spice serves builds such a view.
+   Its rebuild of a reused split whose views another backend's rebuilds reset
+   (spiceai/llama.cpp#33) would be an abort with one graph slot if lost, covered by
+   the fork's `test-meta-shared-views`; a guard here would need a model split by
+   tensor across devices, and Spice's default of two graph slots does not reach it.
 9. `orc-rust` in-codec decode allowance — losing it lets one compressed metadata
    chunk decode in full before the stream is rejected. A guard needs a memory
    measurement around one ORC open; the rejection itself is guarded.
