@@ -713,7 +713,6 @@ mod tests {
         assert_eq!(expanded.metadata(), &schema_metadata);
     }
 
-
     /// Guard for spiceai/arrow-rs#35 / RUSTSEC-2026-0442: a RunEndEncoded array
     /// whose logical length past the last run end must not validate. Without the
     /// fork patch, `build` returns Ok and a later value read indexes past the
