@@ -42,6 +42,7 @@ concurrency:
 
 jobs:
   test-coverage:
+    environment: secret-free
     name: Sign-off coverage integration tests
     runs-on: spiceai-macos
     timeout-minutes: 10
@@ -60,6 +61,7 @@ jobs:
         run: python3 scripts/test_signoff_coverage.py
 
   test-commit-status:
+    environment: secret-free
     name: Unit tests for signoff commit statuses
     # GitHub-hosted on purpose: a sub-second test must not queue behind the
     # saturated self-hosted pool this workflow exists to keep honest.
@@ -77,6 +79,7 @@ jobs:
         run: bash scripts/test_signoff_status.sh
 
   test-attestation-refresh:
+    environment: secret-free
     name: Unit tests for the sign-off Attestation refresh
     # `refresh_attestation_check` re-runs the PR's pr.yml run so Attestation
     # re-reads the status just posted, selecting that run by commit. When a long
@@ -102,6 +105,7 @@ jobs:
         run: bash scripts/test_signoff_attestation_refresh.sh
 
   test-signoff-batch:
+    environment: secret-free
     name: Tests for signoff-batch
     # Real Git against a local bare "origin", with stub gh and scripts/signoff:
     # pushes stay in the job's temp directory and no status is posted.

@@ -91,14 +91,14 @@ on:
 
 jobs:
   run-load:
+    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
+    environment: ci
     name: Run load test
     runs-on: ${{ github.event.inputs.runner_type }}
     permissions:
       contents: read
       id-token: write  # RustFS credentials, and Google Cloud access tokens for the BigQuery tests
     timeout-minutes: 600
-    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
-    environment: ci
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

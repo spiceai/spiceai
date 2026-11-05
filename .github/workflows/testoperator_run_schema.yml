@@ -27,6 +27,7 @@ on:
 
 jobs:
   run-schema:
+    environment: ci
     name: Run schema tests
     runs-on: ${{ github.event.inputs.runner_type }}
     permissions:

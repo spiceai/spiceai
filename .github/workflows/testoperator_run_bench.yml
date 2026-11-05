@@ -126,6 +126,8 @@ on:
 
 jobs:
   run-bench:
+    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
+    environment: ci
     name: Run benchmark e2e tests
     runs-on: ${{ github.event.inputs.runner_type }}
     permissions:
@@ -134,8 +136,6 @@ jobs:
       pull-requests: write  # and opens or auto-merges its PR
       id-token: write  # RustFS credentials, and Google Cloud access tokens for the BigQuery tests
     timeout-minutes: 600
-    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
-    environment: ci
     services:
       mssql_tpch:
         image: ${{ contains(github.event.inputs.spicepod_path, 'mssql') && 'ghcr.io/spiceai/spice-mssql-bench:latest' || '' }}

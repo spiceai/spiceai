@@ -24,6 +24,7 @@ permissions:
 
 jobs:
   long:
+    environment: ci
     name: 'spicescript: long'
     runs-on: spiceai-dev-runners
     # The scripts' own waits are about 15 minutes; the rest is starting

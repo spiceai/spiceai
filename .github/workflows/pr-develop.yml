@@ -26,6 +26,7 @@ env:
 
 jobs:
   check_changes:
+    environment: secret-free
     name: Check for code changes
     runs-on: spiceai-macos
     outputs:

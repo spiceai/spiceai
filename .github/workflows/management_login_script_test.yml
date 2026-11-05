@@ -24,6 +24,7 @@ concurrency:
 
 jobs:
   test-token-response-script:
+    environment: secret-free
     name: Unit tests for token_response.sh
     runs-on: ubuntu-24.04
     steps:

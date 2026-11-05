@@ -86,6 +86,7 @@ on:
 
 jobs:
   run-append:
+    environment: ci
     name: Run append test
     runs-on: spiceai-dev-runners
     permissions:
