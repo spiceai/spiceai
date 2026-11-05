@@ -24,7 +24,8 @@ limitations under the License.
 //!
 //! Required environment for CI:
 //!
-//! * `AWS_SNAPSHOT_KEY` + `AWS_SNAPSHOT_SECRET`, **or**
+//! * `AWS_SNAPSHOT_KEY` + `AWS_SNAPSHOT_SECRET` (+ `AWS_SNAPSHOT_SESSION_TOKEN`
+//!   for short-lived credentials), **or**
 //! * `AWS_PROFILE` configured with read/write access to the test bucket.
 //!
 //! Each test reserves its own UUID-prefixed key range under the shared
@@ -362,6 +363,10 @@ impl SnapshotRefreshFixture {
                 "s3_secret".to_string(),
                 "${secrets:AWS_SNAPSHOT_SECRET}".to_string(),
             );
+            params.extend(crate::utils::aws_session_token_param(
+                "s3_session_token",
+                "AWS_SNAPSHOT_SESSION_TOKEN",
+            ));
         }
         if let Ok(endpoint) = env::var("AWS_SNAPSHOT_ENDPOINT") {
             params.insert(

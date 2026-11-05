@@ -327,6 +327,23 @@ pub(crate) async fn verify_env_secret_exists(secret_name: &str) -> Result<(), St
     Ok(())
 }
 
+/// The value of `env_var`, or `None` when it is unset or empty.
+pub(crate) fn nonempty_env(env_var: &str) -> Option<String> {
+    std::env::var(env_var)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+/// A `(param, "${ env:<env_var> }")` pair for an AWS session token, or `None`
+/// when `env_var` is unset or empty.
+///
+/// CI uses short-lived AWS credentials, which need the token. Local runs use
+/// static keys without one, and there the parameter is left out so an
+/// unresolved `${ env:... }` does not log a missing-secret error.
+pub(crate) fn aws_session_token_param(param: &str, env_var: &str) -> Option<(String, String)> {
+    nonempty_env(env_var).map(|_| (param.to_string(), format!("${{ env:{env_var} }}")))
+}
+
 pub(crate) fn test_request_context() -> Arc<RequestContext> {
     Arc::clone(&TEST_REQUEST_CONTEXT)
 }
