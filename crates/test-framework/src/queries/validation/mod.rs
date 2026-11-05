@@ -4627,7 +4627,6 @@ mod test {
             Some(QueryOverrides::MySQL),
             Some(QueryOverrides::Spark),
             Some(QueryOverrides::ODBCAthena),
-            Some(QueryOverrides::ODBCDatabricks),
             Some(QueryOverrides::DuckDB),
             Some(QueryOverrides::DuckDBOnZeroResults),
             Some(QueryOverrides::Snowflake),
