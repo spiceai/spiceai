@@ -8,7 +8,8 @@ datasets:
     params: &databricks_sql_warehouse_params
       mode: sql_warehouse
       client_timeout: 600s
-      databricks_token: ${ secrets:SQL_WAREHOUSE_DATABRICKS_TOKEN }
+      databricks_client_id: ${ secrets:DATABRICKS_OIDC_CLIENT_ID }
+      databricks_token_audience: ${ secrets:DATABRICKS_OIDC_AUDIENCE }
       databricks_endpoint: ${ secrets:SQL_WAREHOUSE_DATABRICKS_HOST }
       databricks_sql_warehouse_id: ${ secrets:SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }
   - from: databricks:spiceai_sandbox.tpch.customer
