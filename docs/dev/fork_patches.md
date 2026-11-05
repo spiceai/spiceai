@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `bcc3c58969d55c462199578d43c85cb086f3fc32` | `lukim/count-distinct-compact-nested-on-cf084aa` (TEMPORARY: spiceai/datafusion#287) |
+| [datafusion](#datafusion) | `bcc3c58969d55c462199578d43c85cb086f3fc32` | `spiceai-55-release-2.4` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `f0af9b628dc48f0227ce6daf3d323b2ead3cc8a5` | `spiceai-55-release-2.4` |
@@ -199,8 +199,9 @@ row here. Its behaviour is covered where the code lives, by
 ## datafusion
 
 Upstream [apache/datafusion](https://github.com/apache/datafusion), branch
-`spiceai-55` (upstream `55.2.0-rc1` merged into the previous line in
-spiceai/datafusion#248) and spiceai/datafusion#249, which carries three
+`spiceai-55-release-2.4`, cut from `spiceai-55` at #260's merge commit (`cf084aa`, the
+revision v2.4.0 and v2.4.1 ship). That base carries upstream `55.2.0-rc1` (merged into the
+previous line in spiceai/datafusion#248) and spiceai/datafusion#249, which carries three
 `spiceai-54` patches onto 55. On top of #249 come #240, the metadata-column listing
 pruning that #229 carried on `spiceai-54`, #251, which gives a file that holds no
 rows no partition-column bounds, #252, #256, which reads a Substrait string or
@@ -211,8 +212,8 @@ fractional-second precision, and #257, which writes a join key that matches NULL
 as `IS NOT DISTINCT FROM`, #258, the `IoWaitHook` patch
 ([#15049](https://github.com/spiceai/spiceai/issues/15049)), #259, which keeps placeholder type
 inference linear in the depth of an expression, and #260, which carries an eliminated sort's
-fetch through a single-input repartition. On top of #260's merge commit, #287 stores a
-compacted copy of each nested `COUNT(DISTINCT …)` value. None changes a
+fetch through a single-input repartition. On top of #260's merge commit, `spiceai-55-release-2.4` carries
+#287 (merged to `spiceai-55` separately), which stores a compacted copy of each nested `COUNT(DISTINCT …)` value. None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
 code, and removes no line of it. The branch also carries
