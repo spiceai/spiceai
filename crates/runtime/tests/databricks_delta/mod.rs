@@ -42,8 +42,12 @@ fn get_params() -> Params {
                 "${ env:TEST_DATABRICKS_HOST }".to_string(),
             ),
             (
-                "databricks_token".to_string(),
-                "${ env:TEST_DATABRICKS_TOKEN }".to_string(),
+                "databricks_client_id".to_string(),
+                "${ env:DATABRICKS_OIDC_CLIENT_ID }".to_string(),
+            ),
+            (
+                "databricks_token_audience".to_string(),
+                "${ env:DATABRICKS_OIDC_AUDIENCE }".to_string(),
             ),
             (
                 "databricks_aws_secret_access_key".to_string(),
@@ -53,6 +57,7 @@ fn get_params() -> Params {
                 "databricks_aws_access_key_id".to_string(),
                 "${ env:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }".to_string(),
             ),
+            ("databricks_aws_region".to_string(), "us-west-2".to_string()),
             ("client_timeout".to_string(), "120s".to_string()),
             ("mode".to_string(), "delta_lake".to_string()),
         ]

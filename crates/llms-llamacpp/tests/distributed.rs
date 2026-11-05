@@ -312,15 +312,17 @@ async fn a_rank_without_the_model_directory_holds_a_share_over_llama_cpp() {
 /// Hub with a range read, so it decides as the head does without downloading the weights.
 #[tokio::test]
 async fn a_rank_reads_the_architecture_from_the_hub() {
-    let arch = llms::chat::hf_files::model_architecture(
+    let resolved = llms::chat::hf_files::model_architecture(
         "unsloth/Qwen3-0.6B-GGUF:50968a4468ef4233ed78cd7c3de230dd1d61a56b",
         &["Qwen3-0.6B-Q6_K.gguf"],
+        llms::chat::hf_files::Budget::Split,
         llms::hf::HubParams::default(),
         "qwen3-0.6b",
     )
     .await
     .expect("the header is read");
-    assert_eq!(arch.as_deref(), Some("qwen3"));
+    assert_eq!(resolved.gguf, ["Qwen3-0.6B-Q6_K.gguf"]);
+    assert_eq!(resolved.architecture.as_deref(), Some("qwen3"));
 }
 
 /// A `tracing` writer into a shared buffer.
@@ -351,11 +353,13 @@ async fn local_gguf() -> PathBuf {
     llms::chat::hf_files::download_model(
         &format!("{MODEL}:{REVISION}"),
         &[FILE],
+        llms::chat::hf_files::Budget::Unmeasured,
         llms::hf::HubParams::default(),
         "qwen3-0.6b",
     )
     .await
     .expect("the GGUF downloads")
+    .dir
     .join(FILE)
 }
 

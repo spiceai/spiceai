@@ -414,7 +414,6 @@ async fn sqlite_on_zero_results_subqueries() -> anyhow::Result<()> {
     check_engine("sqlite", &[Mode::Memory, Mode::File]).await
 }
 
-#[cfg(not(windows))]
 #[tokio::test]
 async fn cayenne_on_zero_results_subqueries() -> anyhow::Result<()> {
     check_engine("cayenne", &[Mode::File]).await

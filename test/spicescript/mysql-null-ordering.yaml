@@ -1,0 +1,41 @@
+name: mysql-null-ordering
+description: Numeric NULL placement and window ranking agree with PostgreSQL across federation and acceleration.
+sources:
+  my: { kind: mysql }
+  pg: { kind: postgres }
+variants:
+  federated: {}
+  postgres: { datasets: { e: { from: 'postgres:e', params: '${sources.pg.params}' } } }
+  cayenne: { datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mysql-null-ordering
+  datasets:
+    - { from: 'mysql:e', name: e, params: '${sources.my.params}' }
+defaults:
+  expect: { oracle: pg }
+  compare-variants: false
+steps:
+  - source-exec:
+      my: CREATE TABLE e (id INT PRIMARY KEY, v INT); INSERT INTO e VALUES (1,NULL),(2,2),(3,1),(4,NULL),(5,3);
+  - source-exec:
+      pg: CREATE TABLE e (id INT PRIMARY KEY, v INT); INSERT INTO e VALUES (1,NULL),(2,2),(3,1),(4,NULL),(5,3);
+  - start: {}
+  - query: SELECT id FROM e ORDER BY v ASC NULLS FIRST, id
+  - query: SELECT id FROM e ORDER BY v DESC NULLS LAST, id
+  - query: SELECT id FROM e ORDER BY v ASC NULLS LAST, id LIMIT 3
+  - query: SELECT id FROM e ORDER BY v DESC NULLS FIRST, id LIMIT 3
+  - query: SELECT id, row_number() OVER (ORDER BY v ASC NULLS LAST, id) AS n FROM e ORDER BY id
+  - query: SELECT id FROM e ORDER BY id % 2, v ASC NULLS LAST, id LIMIT 3
+  - query: SELECT id, row_number() OVER (ORDER BY id % 2, v ASC NULLS LAST, id) AS n FROM e ORDER BY id
+  - explain: SELECT id FROM e ORDER BY v ASC NULLS LAST, id LIMIT 3
+    contains: [SortExec, VirtualExecutionPlan]
+    omits: ['LIMIT 3']
+    only: federated
+  - explain: SELECT id FROM e ORDER BY id LIMIT 2
+    contains: [VirtualExecutionPlan]
+    only: federated
+  - explain: SELECT id, row_number() OVER (ORDER BY id % 2, v ASC NULLS LAST, id) AS n FROM e ORDER BY id
+    contains: [WindowAggExec, VirtualExecutionPlan]
+    only: federated

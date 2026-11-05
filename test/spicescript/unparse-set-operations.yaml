@@ -39,3 +39,15 @@ steps:
   - query: SELECT a, s FROM w EXCEPT SELECT a, s FROM w2
   - query: SELECT a FROM w INTERSECT SELECT a FROM w WHERE id > 1
   - query: SELECT a, s FROM w EXCEPT SELECT a, s FROM w WHERE id IN (2, 4)
+  - query: SELECT a AS x FROM w INTERSECT SELECT a AS x FROM w WHERE id > 1
+  - query: SELECT a + 1 AS x FROM w EXCEPT SELECT a + 1 AS x FROM w WHERE id > 1
+    expect-empty: true
+  - query: SELECT count(*) AS n, sum(x) AS s FROM (SELECT a + 1 AS x FROM w INTERSECT SELECT a + 1 AS x FROM w WHERE id > 1) q
+  - query: SELECT count(*) AS n, sum(x) AS s FROM (SELECT a + 1 AS x FROM w EXCEPT SELECT a + 1 AS x FROM w WHERE id > 1) q
+  - query: >-
+      SELECT x FROM (SELECT y AS x FROM (SELECT a AS y, s AS label FROM w) q WHERE label IS NOT NULL INTERSECT SELECT y AS x FROM (SELECT a AS y, s AS label FROM w) q WHERE y > 0) r
+  - query: >-
+      SELECT x FROM (SELECT y AS x FROM (SELECT a AS y, s AS label FROM w) q WHERE label IS NOT NULL EXCEPT SELECT y AS x FROM (SELECT a AS y, s AS label FROM w) q WHERE y > 0) r
+  - query: >-
+      SELECT count(*) AS n, sum(x) AS s FROM (SELECT y + 1 AS x FROM (SELECT a AS y, s AS label FROM w) q WHERE label IS NOT NULL EXCEPT SELECT y + 1 AS x FROM (SELECT a AS y, s AS label FROM w) q WHERE y > 0) r
+  - query: SELECT count(*) AS n FROM (SELECT a + 1 FROM w INTERSECT SELECT a + 1 FROM w WHERE id > 1) q

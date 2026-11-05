@@ -239,7 +239,13 @@ impl ReloadableServerCerts {
             path: key_path.clone(),
             source,
         })?;
-        let certified = build_certified_key(&cert_pem, &key_pem)?;
+        let certified = build_certified_key(&cert_pem, &key_pem).map_err(|err| match err {
+            ReloadError::KeyMismatch => ReloadError::KeyMismatchFiles {
+                cert_path: cert_path.clone(),
+                key_path: key_path.clone(),
+            },
+            other => other,
+        })?;
         let (verifier_swap, verifier_swap_lax) = if let Some(ca_path) = &client_ca_path {
             let ca_pem = fs::read(ca_path).map_err(|source| ReloadError::Io {
                 path: ca_path.clone(),
@@ -314,6 +320,17 @@ impl ReloadableServerCerts {
                 }
             };
             match build_certified_key(&cert_pem, &key_pem) {
+                // A rotation touches both the cert and the key file and the
+                // watcher fires once per changed file, so the second pass
+                // usually re-reads exactly what is already served. Don't
+                // swap, log, or count it again.
+                Ok(new_ck) if same_material(&new_ck, &self.inner.load()) => {
+                    tracing::debug!(
+                        cert_path = %cert_path.display(),
+                        scope = self.scope.as_str(),
+                        "TLS reload: server certificate and key unchanged, not swapping"
+                    );
+                }
                 Ok(new_ck) => {
                     let fp = cert_fingerprint_short(&new_ck);
                     self.inner.store(Arc::new(new_ck));
@@ -324,6 +341,21 @@ impl ReloadableServerCerts {
                         "TLS reload: swapped server certificate"
                     );
                     metrics().reload(self.scope, "ok");
+                }
+                Err(ReloadError::KeyMismatch) => {
+                    // Typically a rotation that replaced only one of the two
+                    // files. Serving it would fail every handshake, so keep
+                    // the old pair; a later write of the matching file
+                    // triggers another reload that picks up the new pair.
+                    tracing::warn!(
+                        cert_path = %cert_path.display(),
+                        key_path = %key_path.display(),
+                        scope = self.scope.as_str(),
+                        "TLS reload: new certificate {} does not match private key {}, keeping the current certificate",
+                        cert_path.display(),
+                        key_path.display(),
+                    );
+                    metrics().reload(self.scope, "key_mismatch");
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -794,7 +826,28 @@ fn build_certified_key(cert_pem: &[u8], key_pem: &[u8]) -> Result<CertifiedKey, 
     let key = load_key(key_pem)?;
     let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
         .map_err(|source| ReloadError::Sign { source })?;
-    Ok(CertifiedKey::new(cert_chain, signing_key))
+    let certified = CertifiedKey::new(cert_chain, signing_key);
+    // rustls does not check that the leaf certificate belongs to the private
+    // key; a mismatched pair loads fine and then fails every handshake.
+    // `Unknown` (the key can't report its public key) is accepted, matching
+    // rustls' own `CertifiedKey::from_der`.
+    match certified.keys_match() {
+        Ok(()) | Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {
+            Ok(certified)
+        }
+        Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch)) => {
+            Err(ReloadError::KeyMismatch)
+        }
+        Err(source) => Err(ReloadError::Rustls { source }),
+    }
+}
+
+/// Whether `new` serves exactly what `current` already serves: the same
+/// chain and the same private key (compared by its public half).
+fn same_material(new: &CertifiedKey, current: &CertifiedKey) -> bool {
+    new.cert == current.cert
+        && new.key.public_key().is_some()
+        && new.key.public_key() == current.key.public_key()
 }
 
 /// Whether to build the strict (rejects no-cert at handshake) or lax
@@ -894,6 +947,17 @@ pub enum ReloadError {
     MissingKey,
     #[snafu(display("TLS PEM contained no certificates"))]
     EmptyCertChain,
+    #[snafu(display("TLS certificate does not match the private key"))]
+    KeyMismatch,
+    #[snafu(display(
+        "TLS certificate {} does not match private key {}",
+        cert_path.display(),
+        key_path.display()
+    ))]
+    KeyMismatchFiles {
+        cert_path: PathBuf,
+        key_path: PathBuf,
+    },
     #[snafu(display("client CA bundle contained no certificates"))]
     EmptyClientCa,
     #[snafu(display("failed to build rustls client cert verifier: {message}"))]
@@ -1043,6 +1107,120 @@ mod tests {
         )
         .expect_err("must reject malformed cert");
         assert!(matches!(err, ReloadError::EmptyCertChain), "got: {err:?}");
+    }
+
+    const CERT: &[u8] = include_bytes!("../../../test/tls/spiced_cert.pem");
+    const KEY: &[u8] = include_bytes!("../../../test/tls/spiced_key.pem");
+    /// A valid certificate whose public key is *not* the one in `KEY`.
+    const OTHER_CERT: &[u8] = include_bytes!("../../../test/tls/spiced_root_cert.pem");
+
+    fn pem_chain(pem: &[u8]) -> Vec<CertificateDer<'static>> {
+        CertificateDer::pem_slice_iter(pem)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("fixture is a PEM certificate chain")
+    }
+
+    /// Cert and key on disk under a tempdir, served by a resolver wired to a
+    /// live watcher (the watcher must outlive the resolver's registration).
+    fn on_disk(
+        scope: ReloadScope,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        CertWatcher,
+        Arc<ReloadableServerCerts>,
+    ) {
+        install_crypto_provider();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let cert_path = dir.path().join("server.pem");
+        let key_path = dir.path().join("server.key");
+        fs::write(&cert_path, CERT).expect("write cert");
+        fs::write(&key_path, KEY).expect("write key");
+        let watcher = CertWatcher::spawn().expect("spawn watcher");
+        let certs = ReloadableServerCerts::from_paths(cert_path.clone(), key_path, scope, &watcher)
+            .expect("build from paths");
+        (dir, cert_path, watcher, certs)
+    }
+
+    #[test]
+    fn build_rejects_key_that_does_not_match_certificate() {
+        install_crypto_provider();
+        let err = ReloadableServerCerts::from_pem(OTHER_CERT, KEY, ReloadScope::Public)
+            .expect_err("a certificate whose public key isn't the private key's must be rejected");
+        assert!(
+            matches!(err, ReloadError::KeyMismatch),
+            "expected KeyMismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn startup_from_mismatched_files_names_both_files() {
+        install_crypto_provider();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let cert_path = dir.path().join("server.pem");
+        let key_path = dir.path().join("server.key");
+        fs::write(&cert_path, OTHER_CERT).expect("write cert");
+        fs::write(&key_path, KEY).expect("write key");
+        let watcher = CertWatcher::spawn().expect("spawn watcher");
+        let err = ReloadableServerCerts::from_paths(
+            cert_path.clone(),
+            key_path.clone(),
+            ReloadScope::Public,
+            &watcher,
+        )
+        .expect_err("a mismatched pair must not start serving");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&cert_path.display().to_string())
+                && msg.contains(&key_path.display().to_string()),
+            "startup error should name both files, got: {msg}"
+        );
+    }
+
+    /// A rotation that replaces the cert but not the key (or vice versa)
+    /// must not be served: every handshake would fail. The old pair stays
+    /// and the failure is counted.
+    #[test]
+    fn reload_keeps_old_certificate_when_new_one_does_not_match_key() {
+        let (_dir, cert_path, _watcher, certs) = on_disk(ReloadScope::Public);
+        let mismatches_before = reload_count_for_tests(ReloadScope::Public, "key_mismatch");
+
+        fs::write(&cert_path, OTHER_CERT).expect("replace cert, keep key");
+        certs.reload_now();
+
+        assert!(
+            certs.current_cert_chain() == pem_chain(CERT),
+            "the mismatched certificate was swapped in"
+        );
+        assert_eq!(
+            reload_count_for_tests(ReloadScope::Public, "key_mismatch"),
+            mismatches_before + 1,
+            "the rejected reload was not counted"
+        );
+    }
+
+    /// One rotation touches both the cert and the key file, so the watcher
+    /// fires the reload once per file. The second pass re-reads material
+    /// that is already being served and must not swap (or log) again.
+    #[test]
+    fn reload_of_unchanged_material_does_not_swap_again() {
+        // Cluster scope: no other test in this crate reloads it, so the
+        // `ok` bucket isn't moved by unrelated tests running in parallel.
+        let (_dir, _cert_path, _watcher, certs) = on_disk(ReloadScope::Cluster);
+        let served = certs.inner.load_full();
+        let ok_before = reload_count_for_tests(ReloadScope::Cluster, "ok");
+
+        certs.reload_now();
+
+        assert!(
+            Arc::ptr_eq(&certs.inner.load_full(), &served),
+            "unchanged cert and key were swapped in again"
+        );
+        assert_eq!(
+            reload_count_for_tests(ReloadScope::Cluster, "ok"),
+            ok_before,
+            "an unchanged reload was counted as a swap"
+        );
     }
 
     #[test]

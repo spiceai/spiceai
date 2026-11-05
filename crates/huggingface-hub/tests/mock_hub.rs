@@ -114,6 +114,20 @@ pub struct Faults {
     pub ignore_range: bool,
     /// CDN responses held back this long before they start.
     pub delay: Option<Duration>,
+    /// How the revision endpoint answers when asked for the files too.
+    pub revision_files: RevisionFiles,
+}
+
+/// How the revision endpoint answers a request for the files with the revision.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionFiles {
+    /// As the Hub: every file, with its blob.
+    #[default]
+    Described,
+    /// Without the files, as a mirror that implements only part of the Hub's API may.
+    Omitted,
+    /// HTTP 400: `huggingface_hub` never asks for the files' blobs and chosen fields together.
+    Refused,
 }
 
 #[derive(Default)]
@@ -226,10 +240,29 @@ impl MockHub {
 
     /// The requests that downloaded file content, from the Hub or its CDN.
     pub fn downloads(&self) -> Vec<Seen> {
+        self.seen().into_iter().filter(Seen::downloads).collect()
+    }
+
+    /// The path and query of every request, in order.
+    pub fn seen_paths(&self) -> Vec<String> {
+        self.seen().into_iter().map(|seen| seen.path).collect()
+    }
+
+    /// The path and query of every request to the Hub's API, in order: every request but the
+    /// downloads.
+    pub fn api_paths(&self) -> Vec<String> {
         self.seen()
             .into_iter()
-            .filter(|seen| seen.cdn || seen.path.contains("/resolve"))
+            .filter(|seen| !seen.downloads())
+            .map(|seen| seen.path)
             .collect()
+    }
+}
+
+impl Seen {
+    /// Whether the request downloaded file content, from the Hub or its CDN.
+    fn downloads(&self) -> bool {
+        self.cdn || self.path.contains("/resolve")
     }
 }
 
@@ -334,6 +367,20 @@ fn entry_json(path: &str, file: &MockFile, gated: bool) -> serde_json::Value {
             serde_json::json!({"oid": oid, "size": file.bytes.len(), "pointerSize": 133});
     }
     entry
+}
+
+/// A file as the revision endpoint lists it with `blobs=true`: its blob id, size and LFS
+/// SHA-256, which the Hub does not mask for a gated repository.
+fn sibling_json(path: &str, file: &MockFile) -> serde_json::Value {
+    let mut sibling = serde_json::json!({
+        "rfilename": path,
+        "blobId": file.git_oid(),
+        "size": file.bytes.len(),
+    });
+    if file.lfs {
+        sibling["lfs"] = serde_json::json!({"sha256": file.sha256(), "size": file.bytes.len(), "pointerSize": 133});
+    }
+    sibling
 }
 
 /// The byte range a `Range` header asks of a file of `size` bytes, inclusive.
@@ -493,13 +540,33 @@ async fn hub_handler(State(mock): State<MockHub>, request: Request<Body>) -> Res
                     &format!("Invalid rev id: {revision}"),
                 );
             };
-            response(
-                StatusCode::OK,
-                &[],
-                format!(
-                    "{{\"id\":\"{owner}/{name}\",\"sha\":\"{sha}\",\"lastModified\":\"2026-01-02T03:04:05.000Z\"}}"
-                ),
-            )
+            let mut body = serde_json::json!({
+                "id": format!("{owner}/{name}"),
+                "sha": sha,
+                "lastModified": "2026-01-02T03:04:05.000Z",
+            });
+            // As on the Hub, `expand[]=siblings` lists the files (the client always asks with
+            // `blobs=true`, which describes them).
+            let lists_files = url::form_urlencoded::parse(query.as_bytes())
+                .any(|(key, value)| key == "expand[]" && value == "siblings");
+            if lists_files && state.faults.revision_files == RevisionFiles::Refused {
+                return hub_error(
+                    StatusCode::BAD_REQUEST,
+                    "",
+                    "expand cannot be used with blobs",
+                );
+            }
+            if lists_files && state.faults.revision_files == RevisionFiles::Described {
+                let siblings: Vec<serde_json::Value> = repo
+                    .commits
+                    .get(&sha)
+                    .into_iter()
+                    .flatten()
+                    .map(|(path, file)| sibling_json(path, file))
+                    .collect();
+                body["siblings"] = siblings.into();
+            }
+            response(StatusCode::OK, &[], body.to_string())
         }
         ["api", plural, owner, name, "tree", commit, rest @ ..] => {
             let Some(repo) = state.repos.get(&format!("{plural}/{owner}/{name}")) else {

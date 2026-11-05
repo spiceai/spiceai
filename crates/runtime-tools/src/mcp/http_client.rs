@@ -35,6 +35,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -61,10 +62,25 @@ use rmcp::{
 };
 use snafu::Snafu;
 use sse_stream::{Sse, SseStream};
+use tokio_util::sync::CancellationToken;
 
 use super::MAX_TOOL_RESULT_SIZE;
 
 type HttpResult<T> = Result<T, StreamableHttpError<reqwest::Error>>;
+
+/// Longest wait for a TCP and TLS connection to the MCP server. There is no total request
+/// timeout here because an SSE response stays open for as long as the server streams; the MCP
+/// client in `catalog.rs` bounds each request instead.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Drops the request URL from a transport error. The error text reaches API callers and the
+/// model, and an MCP URL can carry a credential in its path or query.
+fn without_url<T>(result: HttpResult<T>) -> HttpResult<T> {
+    result.map_err(|e| match e {
+        StreamableHttpError::Client(e) => StreamableHttpError::Client(e.without_url()),
+        other => other,
+    })
+}
 
 /// The single-line message for a response that exceeded [`MAX_TOOL_RESULT_SIZE`].
 ///
@@ -92,21 +108,28 @@ pub(crate) struct BoundedHttpClient {
     inner: reqwest::Client,
     /// Spicepod name of the MCP tool catalog, for the over-limit message.
     server_name: Arc<str>,
+    /// Cancelled when the connection attempt that built this client is given up on. rmcp
+    /// sends the first request of a handshake outside its own cancellation, so without this
+    /// a handshake that timed out would keep that request, the task waiting on it, and its
+    /// connection open for as long as the server stays silent.
+    abandoned: CancellationToken,
 }
 
 impl BoundedHttpClient {
-    pub(crate) fn new(server_name: &str) -> reqwest::Result<Self> {
+    pub(crate) fn new(server_name: &str, abandoned: CancellationToken) -> reqwest::Result<Self> {
         // The same settings rmcp's default client uses: no idle pooling (a
         // pooled connection whose previous body was not fully read stalls on
         // delayed ACK), and no redirects, so custom headers such as an API key
         // are never replayed to a redirect target.
         let inner = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
             .pool_max_idle_per_host(0)
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
             inner,
             server_name: server_name.into(),
+            abandoned,
         })
     }
 
@@ -129,7 +152,11 @@ impl BoundedHttpClient {
         }
         let capacity = declared.map_or(0, |len| usize::try_from(len).unwrap_or(0));
         let mut body = Vec::with_capacity(capacity);
-        while let Some(chunk) = response.chunk().await? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(reqwest::Error::without_url)?
+        {
             if body.len() + chunk.len() > MAX_TOOL_RESULT_SIZE {
                 return Ok(None);
             }
@@ -201,7 +228,9 @@ impl Stream for BoundedByteStream {
                     Some(Ok(chunk))
                 }
             }
-            Some(Err(source)) => Some(Err(ResponseBodyError::Read { source })),
+            Some(Err(source)) => Some(Err(ResponseBodyError::Read {
+                source: source.without_url(),
+            })),
             None => None,
         })
     }
@@ -287,38 +316,16 @@ fn legacy_discover_response(
     ))
 }
 
-impl StreamableHttpClient for BoundedHttpClient {
-    type Error = reqwest::Error;
-
-    async fn post_message(
+impl BoundedHttpClient {
+    /// Sends one POST and reads its response, never buffering more than
+    /// [`MAX_TOOL_RESULT_SIZE`] of it.
+    async fn post_bounded(
         &self,
         uri: Arc<str>,
         message: ClientJsonRpcMessage,
         session_id: Option<Arc<str>>,
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
-    ) -> HttpResult<StreamableHttpPostResponse> {
-        self.post_message_with_max_sse_event_size(
-            uri,
-            message,
-            session_id,
-            auth_header,
-            custom_headers,
-            MAX_TOOL_RESULT_SIZE,
-        )
-        .await
-    }
-
-    async fn post_message_with_max_sse_event_size(
-        &self,
-        uri: Arc<str>,
-        message: ClientJsonRpcMessage,
-        session_id: Option<Arc<str>>,
-        auth_header: Option<String>,
-        custom_headers: HashMap<HeaderName, HeaderValue>,
-        // The whole response is bounded by `MAX_TOOL_RESULT_SIZE`, which the
-        // transport config also sets as its event limit.
-        _max_sse_event_size: usize,
     ) -> HttpResult<StreamableHttpPostResponse> {
         let mut request = self
             .inner
@@ -332,7 +339,11 @@ impl StreamableHttpClient for BoundedHttpClient {
         if let Some(session_id) = session_id {
             request = request.header(HEADER_SESSION_ID, session_id.as_ref());
         }
-        let response = request.json(&message).send().await?;
+        let response = request
+            .json(&message)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         let status = response.status();
         if status == StatusCode::UNAUTHORIZED
@@ -422,7 +433,12 @@ impl StreamableHttpClient for BoundedHttpClient {
                     _ => None,
                 };
                 let bytes = BoundedByteStream {
-                    inner: response.bytes_stream().boxed(),
+                    // A handshake waits on this stream for its answer, so it ends with the
+                    // attempt like the POST does.
+                    inner: response
+                        .bytes_stream()
+                        .take_until(self.abandoned.clone().cancelled_owned())
+                        .boxed(),
                     client: self.clone(),
                     request_id,
                     received: 0,
@@ -455,6 +471,48 @@ impl StreamableHttpClient for BoundedHttpClient {
             _ => Err(StreamableHttpError::UnexpectedContentType(content_type)),
         }
     }
+}
+
+impl StreamableHttpClient for BoundedHttpClient {
+    type Error = reqwest::Error;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> HttpResult<StreamableHttpPostResponse> {
+        self.post_message_with_max_sse_event_size(
+            uri,
+            message,
+            session_id,
+            auth_header,
+            custom_headers,
+            MAX_TOOL_RESULT_SIZE,
+        )
+        .await
+    }
+
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        // The whole response is bounded by `MAX_TOOL_RESULT_SIZE`, which the
+        // transport config also sets as its event limit.
+        _max_sse_event_size: usize,
+    ) -> HttpResult<StreamableHttpPostResponse> {
+        tokio::select! {
+            () = self.abandoned.cancelled() => Err(StreamableHttpError::TransportChannelClosed),
+            response = self.post_bounded(uri, message, session_id, auth_header, custom_headers) => {
+                response
+            }
+        }
+    }
 
     async fn delete_session(
         &self,
@@ -463,9 +521,11 @@ impl StreamableHttpClient for BoundedHttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> HttpResult<()> {
-        self.inner
-            .delete_session(uri, session_id, auth_header, custom_headers)
-            .await
+        without_url(
+            self.inner
+                .delete_session(uri, session_id, auth_header, custom_headers)
+                .await,
+        )
     }
 
     async fn get_stream(
@@ -496,16 +556,18 @@ impl StreamableHttpClient for BoundedHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> HttpResult<BoxStream<'static, Result<Sse, SseError>>> {
-        self.inner
-            .get_stream_with_max_sse_event_size(
-                uri,
-                session_id,
-                last_event_id,
-                auth_header,
-                custom_headers,
-                max_sse_event_size.min(MAX_TOOL_RESULT_SIZE),
-            )
-            .await
+        without_url(
+            self.inner
+                .get_stream_with_max_sse_event_size(
+                    uri,
+                    session_id,
+                    last_event_id,
+                    auth_header,
+                    custom_headers,
+                    max_sse_event_size.min(MAX_TOOL_RESULT_SIZE),
+                )
+                .await,
+        )
     }
 }
 
@@ -536,7 +598,7 @@ mod tests {
     use super::*;
     use crate::{
         catalog::SpiceToolCatalog,
-        mcp::{MCPConfig, catalog::McpToolCatalog},
+        mcp::{MCP_CALL_TOOL_TIMEOUT, MCP_HANDSHAKE_TIMEOUT, MCPConfig, catalog::McpToolCatalog},
     };
 
     const SERVER_NAME: &str = "hostile";
@@ -549,7 +611,7 @@ mod tests {
     const MAX_FLOOD_BYTES_SENT: usize = 4 * MAX_TOOL_RESULT_SIZE;
     const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
-    /// Lists `sized`, which returns `{"bytes": n}` bytes of text, and `flood`,
+    /// Lists `sized`, which returns `{"bytes": n}` bytes of text, and `flood` and `hang`,
     /// which [`route`] answers itself.
     #[derive(Clone, Copy)]
     struct SizedResultServer;
@@ -572,7 +634,12 @@ mod tests {
                         "returns `bytes` bytes of text",
                         Arc::clone(&schema),
                     ),
-                    Tool::new("flood", "never answered by this handler", schema),
+                    Tool::new(
+                        "flood",
+                        "never answered by this handler",
+                        Arc::clone(&schema),
+                    ),
+                    Tool::new("hang", "never answered at all", schema),
                 ],
                 ..ListToolsResult::default()
             }))
@@ -602,9 +669,12 @@ mod tests {
         mcp: StreamableHttpService<SizedResultServer, LocalSessionManager>,
         flood_requests: Arc<AtomicUsize>,
         flood_bytes_sent: Arc<AtomicUsize>,
+        /// Notified when a `tools/call` of `hang` arrives.
+        hang_received: Arc<tokio::sync::Notify>,
     }
 
-    /// Forwards to the real MCP server, except a `tools/call` of `flood`,
+    /// Forwards to the real MCP server, except a `tools/call` of `hang`, which never gets a
+    /// response (each one notifies `hang_received`), and of `flood`,
     /// which gets a body of [`FLOOD_SIZE`] bytes in the shape its `mode`
     /// argument names. Chunks are generated as the client reads them, and
     /// counted in `flood_bytes_sent`; each such call counts in `flood_requests`.
@@ -616,6 +686,10 @@ mod tests {
             .expect("read the MCP request body")
             .to_bytes();
         let message: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        if message["method"] == "tools/call" && message["params"]["name"] == "hang" {
+            upstream.hang_received.notify_one();
+            return std::future::pending().await;
+        }
         let is_flood = message["method"] == "tools/call" && message["params"]["name"] == "flood";
         if !is_flood {
             return upstream
@@ -684,6 +758,7 @@ mod tests {
             mcp,
             flood_requests: Arc::new(AtomicUsize::new(0)),
             flood_bytes_sent: Arc::new(AtomicUsize::new(0)),
+            hang_received: Arc::new(tokio::sync::Notify::new()),
         };
         let app = axum::Router::new()
             .route("/mcp", axum::routing::any(route))
@@ -831,5 +906,122 @@ mod tests {
             response_too_large_message("github"),
             "MCP server 'github' sent a response larger than the 16 MiB limit, so the request failed and the response was discarded. Make the MCP tool return a smaller result, for example by paginating it. See https://spiceai.org/docs/components/tools/mcp"
         );
+    }
+
+    /// Waits, on the real clock, until the server has received a request the test is about to
+    /// time out. Only then may the test pause the clock: a paused clock jumps to the next timer
+    /// whenever the runtime is idle, including while a connection to the server is still being
+    /// set up, so pausing earlier lets the 30 s connect timeout fire instead of the timeout under
+    /// test.
+    async fn wait_until_received(received: &tokio::sync::Notify, what: &str) {
+        tokio::time::timeout(Duration::from_secs(10), received.notified())
+            .await
+            .unwrap_or_else(|_| panic!("the server did not receive {what} within 10 s"));
+    }
+
+    /// An MCP server that accepts the connection but never answers the handshake fails to
+    /// connect after the handshake timeout, instead of holding model loading forever.
+    #[tokio::test]
+    async fn a_server_that_never_answers_the_handshake_fails_to_connect() {
+        let received = Arc::new(tokio::sync::Notify::new());
+        let app = axum::Router::new().fallback({
+            let received = Arc::clone(&received);
+            move || {
+                received.notify_one();
+                std::future::pending::<Response>()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let url = url::Url::parse(&format!("http://{addr}/mcp")).expect("valid url");
+
+        let connect = tokio::spawn(McpToolCatalog::try_new(
+            MCPConfig::StreamableHttp {
+                url,
+                auth_token: None,
+                headers: HashMap::new(),
+            },
+            SERVER_NAME,
+            None,
+        ));
+        wait_until_received(&received, "the handshake").await;
+        tokio::time::pause();
+        let Err(e) = tokio::time::timeout(3 * MCP_HANDSHAKE_TIMEOUT, connect)
+            .await
+            .expect("the connection attempt ends instead of hanging")
+            .expect("the connection attempt does not panic")
+        else {
+            panic!("a server that never answers must not connect");
+        };
+        assert!(
+            e.to_string().contains("did not complete its handshake"),
+            "unexpected error: {e}"
+        );
+    }
+
+    /// A `tools/call` the server never answers fails after the call timeout.
+    #[tokio::test]
+    async fn a_tool_call_the_server_never_answers_times_out() {
+        for json_response in [true, false] {
+            let (url, upstream) = start_upstream(json_response).await;
+            let catalog = connect(url).await;
+            let tool = catalog.get("hang").await.expect("tool 'hang' is listed");
+
+            let call =
+                tokio::spawn(async move { tool.call("{}").await.map_err(|e| e.to_string()) });
+            wait_until_received(&upstream.hang_received, "the tool call").await;
+            tokio::time::pause();
+            let result = tokio::time::timeout(2 * MCP_CALL_TOOL_TIMEOUT, call)
+                .await
+                .expect("the tool call ends instead of hanging")
+                .expect("the tool call does not panic");
+            tokio::time::resume();
+            let Err(e) = result else {
+                panic!("a call that is never answered must fail (json_response={json_response})");
+            };
+            assert!(
+                e.contains("timeout"),
+                "unexpected error (json_response={json_response}): {e}"
+            );
+        }
+    }
+
+    /// A transport error does not show the MCP server URL, which can carry a credential.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transport_errors_do_not_show_the_server_url() {
+        const SECRET: &str = "url-secret-7f3a";
+        let mcp = StreamableHttpService::new(
+            || Ok(SizedResultServer),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default()
+                .disable_allowed_hosts()
+                .with_json_response(true),
+        );
+        let upstream = Upstream {
+            mcp,
+            flood_requests: Arc::new(AtomicUsize::new(0)),
+            flood_bytes_sent: Arc::new(AtomicUsize::new(0)),
+            hang_received: Arc::new(tokio::sync::Notify::new()),
+        };
+        let app = axum::Router::new()
+            .route("/s/{token}/mcp", axum::routing::any(route))
+            .with_state(upstream);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let url = url::Url::parse(&format!("http://{addr}/s/{SECRET}/mcp")).expect("valid url");
+        let catalog = connect(url).await;
+
+        server.abort();
+        let _ = server.await;
+        let e = call(&catalog, "sized", &json!({"bytes": 1}))
+            .await
+            .expect_err("the server is gone, so the call fails");
+        assert!(!e.contains(SECRET), "the error shows the server URL: {e}");
     }
 }

@@ -710,7 +710,6 @@ async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
 }
 
 /// The same lifecycle on Cayenne, keyed by `primary_key` alone.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn tpch_postgres_replication_end_to_end_cayenne() -> Result<(), anyhow::Error> {
     run_tpch_postgres_replication("cayenne", false).await
@@ -720,7 +719,6 @@ async fn tpch_postgres_replication_end_to_end_cayenne() -> Result<(), anyhow::Er
 /// primary key, then a restart. Regression test for #14947: each update kept
 /// the row's earlier versions, and a restart read every partition's earlier
 /// snapshots again.
-#[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn tpch_postgres_replication_end_to_end_cayenne_partitioned() -> Result<(), anyhow::Error> {
     run_tpch_postgres_replication("cayenne", true).await

@@ -231,6 +231,25 @@ impl StreamState {
         }
     }
 
+    /// Adds the checkpoint of every shard waiting for an iterator to a batch
+    /// checkpoint, which otherwise holds only the shards polled this round.
+    ///
+    /// A persisted checkpoint replaces the previous one, and a restart reads
+    /// only the shards it names (with their descendants): a shard missing from
+    /// it is never read again. A shard waits here after its iterator expired
+    /// and the request for a new one failed, or after its parent was
+    /// exhausted, so its checkpoint is still where reading resumes. Blocked
+    /// shards are left out: their parent is in the checkpoint and a restart
+    /// blocks them behind it again.
+    pub fn add_initializing_checkpoints(&self, checkpoint: &mut Checkpoint) {
+        for shard in self.initializing.values() {
+            checkpoint
+                .shards
+                .entry(shard.shard_id.clone())
+                .or_insert_with(|| shard.last_checkpoint.clone());
+        }
+    }
+
     /// Add discovered shards, returns shard IDs that need initialization
     pub fn add_discovered(&mut self, shards: &[ApiShard]) {
         for shard in shards.iter().cloned() {
@@ -1389,6 +1408,86 @@ mod tests {
                 CheckpointPosition::After
             );
             assert_eq!(init_shard.current_watermark, Some(watermark));
+        }
+
+        #[test]
+        fn test_checkpoint_keeps_a_shard_whose_reinitialization_failed() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            let after = |seq: &str, parent: Option<&str>| ShardCheckpoint {
+                sequence_number: seq.to_string(),
+                parent_id: parent.map(str::to_string),
+                updated_at: SystemTime::now(),
+                position: CheckpointPosition::After,
+            };
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "expired-iter".to_string(),
+                    last_checkpoint: after("100", None),
+                    current_watermark: None,
+                },
+            );
+            state.blocked.insert(
+                "shard-2".to_string(),
+                BlockedShard {
+                    shard_id: "shard-2".to_string(),
+                    parent_shard_id: Some("shard-1".to_string()),
+                    last_checkpoint: after("200", Some("shard-1")),
+                },
+            );
+            // The iterator expired; the request for a new one then fails, so
+            // the shard is not polled this round.
+            state.reinitialize_shard_with_checkpoint("shard-1");
+            let mut checkpoint = Checkpoint {
+                shards: HashMap::new(),
+            };
+
+            state.add_initializing_checkpoints(&mut checkpoint);
+
+            let shards: Vec<(&str, &str)> = checkpoint
+                .shards
+                .iter()
+                .map(|(id, c)| (id.as_str(), c.sequence_number.as_str()))
+                .collect();
+            assert_eq!(
+                shards,
+                vec![("shard-1", "100")],
+                "the waiting shard resumes from its own checkpoint, and its blocked child stays out"
+            );
+        }
+
+        #[test]
+        fn test_polled_checkpoint_wins_over_initializing() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            state.initializing.insert(
+                "shard-1".to_string(),
+                InitializingShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: "100".to_string(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::At,
+                    },
+                    current_watermark: None,
+                },
+            );
+            let polled = ShardCheckpoint {
+                sequence_number: "150".to_string(),
+                parent_id: None,
+                updated_at: SystemTime::now(),
+                position: CheckpointPosition::After,
+            };
+            let mut checkpoint = Checkpoint {
+                shards: HashMap::from([("shard-1".to_string(), polled.clone())]),
+            };
+
+            state.add_initializing_checkpoints(&mut checkpoint);
+
+            assert_eq!(checkpoint.shards.get("shard-1"), Some(&polled));
         }
 
         #[test]

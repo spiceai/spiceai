@@ -230,16 +230,6 @@ fn get_os_version_internal() -> Result<String, GenericError> {
     Ok(version)
 }
 
-#[cfg(target_family = "windows")]
-fn get_os_version_internal() -> Result<String, GenericError> {
-    use winver::WindowsVersion;
-    if let Some(version) = WindowsVersion::detect() {
-        Ok(version.to_string())
-    } else {
-        Ok("unknown".to_string())
-    }
-}
-
 #[must_use]
 fn get_runtime_os_string() -> String {
     let os_type = os_type();

@@ -17,7 +17,7 @@ limitations under the License.
 //! Acceleration command implementation - manage dataset acceleration features.
 
 use crate::context::RuntimeContext;
-use crate::error::{self, InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
+use crate::error::{self, InvalidResponseSnafu, Result};
 use crate::output::{OutputFormat, TableRow, write_json, write_table};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -197,12 +197,10 @@ async fn execute_snapshots(ctx: &RuntimeContext, args: &SnapshotsArgs) -> Result
         args.dataset, args.limit
     );
 
-    let response = ctx.get(&url).await.map_err(|_| {
-        RuntimeUnavailableSnafu {
-            endpoint: ctx.http_endpoint().to_string(),
-        }
-        .build()
-    })?;
+    let response = ctx
+        .get(&url)
+        .await
+        .map_err(|e| error::runtime_unreachable(ctx.http_endpoint(), &e))?;
 
     // Check for authentication errors before other status handling
     let response = error::check_response(response, ctx.http_endpoint()).await?;
@@ -267,12 +265,10 @@ async fn execute_snapshot(ctx: &RuntimeContext, args: &SnapshotArgs) -> Result<(
         args.dataset, args.snapshot_id
     );
 
-    let response = ctx.get(&url).await.map_err(|_| {
-        RuntimeUnavailableSnafu {
-            endpoint: ctx.http_endpoint().to_string(),
-        }
-        .build()
-    })?;
+    let response = ctx
+        .get(&url)
+        .await
+        .map_err(|e| error::runtime_unreachable(ctx.http_endpoint(), &e))?;
 
     let response = error::check_response(response, ctx.http_endpoint()).await?;
 
@@ -321,12 +317,10 @@ async fn execute_set_snapshot(ctx: &RuntimeContext, args: &SetSnapshotArgs) -> R
         snapshot_id: args.snapshot_id,
     };
 
-    let response = ctx.post_json(&url, &request).await.map_err(|_| {
-        RuntimeUnavailableSnafu {
-            endpoint: ctx.http_endpoint().to_string(),
-        }
-        .build()
-    })?;
+    let response = ctx
+        .post_json(&url, &request)
+        .await
+        .map_err(|e| error::runtime_unreachable(ctx.http_endpoint(), &e))?;
 
     let response = error::check_response(response, ctx.http_endpoint()).await?;
 

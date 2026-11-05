@@ -55,6 +55,9 @@ pub enum ParseError {
     #[snafu(display("Unknown acceleration engine '{name}'"))]
     AcceleratorEngineNotAvailable { name: String },
 
+    #[snafu(display("{}", crate::removed_engine_message(name)))]
+    AcceleratorEngineRemoved { name: &'static str },
+
     #[snafu(display("Invalid acceleration configuration: {detail}"))]
     InvalidAccelerationConfiguration { detail: String },
 
@@ -1067,9 +1070,14 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             .engine
             .as_deref()
             .unwrap_or(spicepod_acceleration::DEFAULT_ENGINE);
-        let engine = match Engine::try_from(engine_str).map_err(|_| {
-            ParseError::AcceleratorEngineNotAvailable {
-                name: engine_str.to_string(),
+        let engine = match Engine::try_from(engine_str).map_err(|err| match err {
+            crate::Error::AcceleratorEngineRemoved { name } => {
+                ParseError::AcceleratorEngineRemoved { name }
+            }
+            crate::Error::AcceleratorEngineNotAvailable { .. } => {
+                ParseError::AcceleratorEngineNotAvailable {
+                    name: engine_str.to_string(),
+                }
             }
         })? {
             Engine::Arrow if !acceleration.partition_by.is_empty() => Engine::PartitionedArrow,
@@ -1934,14 +1942,10 @@ mod tests {
         let parsed = Acceleration::try_from(spicepod_acceleration::Acceleration::default())
             .expect("acceleration should parse");
         assert_eq!(parsed.engine, Engine::default());
-        #[cfg(not(windows))]
         assert_eq!(parsed.engine, Engine::Cayenne);
-        #[cfg(windows)]
-        assert_eq!(parsed.engine, Engine::Arrow);
     }
 
     #[test]
-    #[cfg(not(windows))]
     fn a_partitioned_acceleration_without_an_engine_uses_cayenne() {
         let acceleration = spicepod_acceleration::Acceleration {
             partition_by: vec![PartitionedBy {

@@ -20,8 +20,9 @@ pushdown and JSON harnesses in `test/scripts/` with explicit result oracles.
 
 These tests reuse the Linux `spiced` artifact from the same E2E workflow run and
 use the pinned ADBC driver.
-They require the `BIGQUERY_SERVICE_ACCOUNT_JSON` repository secret; missing
-credentials fail the gate. The service account needs query-job and dataset/table creation/deletion
+The job runs in the `ci` environment and authenticates through workload identity
+federation (`.github/actions/bigquery-credentials`), so CI stores no BigQuery key;
+missing federation settings fail the gate. The service account needs query-job and dataset/table creation/deletion
 permissions in its own project. Each harness deletes its datasets on exit, and
 fixture tables expire after one day if a run is interrupted. Results, plans and
 job evidence are uploaded as `bigquery-regression-evidence`.
