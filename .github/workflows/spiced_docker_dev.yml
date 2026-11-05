@@ -71,6 +71,7 @@ on:
 
 jobs:
   setup:
+    environment: secret-free
     runs-on: ubuntu-24.04
     outputs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
@@ -188,6 +189,10 @@ jobs:
     needs: setup
     if: needs.setup.outputs.run_arm64 == 'true'
     runs-on: hosted-linux-arm-runner
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
     env:
       RUST_PROFILE: release
 
@@ -236,9 +241,11 @@ jobs:
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: github.repository == 'spiceai/spiceai'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Build ARM64 image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -275,6 +282,10 @@ jobs:
     needs: setup
     if: needs.setup.outputs.run_amd64 == 'true'
     runs-on: spiceai-dev-runners
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
     env:
       RUST_PROFILE: release
 
@@ -304,9 +315,11 @@ jobs:
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: github.repository == 'spiceai/spiceai'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Build AMD64 image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -343,6 +356,11 @@ jobs:
     needs: [setup, build-amd64, build-arm64]
     if: always() && (needs.build-amd64.result == 'success' || needs.build-arm64.result == 'success')
     runs-on: ubuntu-24.04
+    environment: ci
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -364,9 +382,11 @@ jobs:
         # registry:2 below.
         if: github.repository == 'spiceai/spiceai'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Start local registry
         run: |

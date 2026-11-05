@@ -22,6 +22,8 @@ repository.workspace = true
 description = "GitHub data connector for Spice.ai runtime"
 
 [dependencies]
+aws-kms-signer = { path = "../../aws-kms-signer" }
+azure-key-vault-signer = { path = "../../azure-key-vault-signer" }
 data-connector-api = { path = "../../data-connector-api" }
 linkme.workspace = true
 app = { path = "../../app" }

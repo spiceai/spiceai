@@ -126,8 +126,15 @@ on:
 
 jobs:
   run-bench:
+    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
+    environment: ci
     name: Run benchmark e2e tests
     runs-on: ${{ github.event.inputs.runner_type }}
+    permissions:
+      actions: write  # approves the held runs of its snapshot PR
+      contents: write  # pushes a snapshot branch
+      pull-requests: write  # and opens or auto-merges its PR
+      id-token: write  # RustFS credentials, and Google Cloud access tokens for the BigQuery tests
     timeout-minutes: 600
     services:
       mssql_tpch:
@@ -230,19 +237,29 @@ jobs:
           fi
           echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '36000'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
         uses: ./.github/actions/build-spicepod-validator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepod
         run: |
@@ -287,9 +304,10 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Setup Testoperator
         uses: ./.github/actions/setup-testoperator-data
@@ -444,6 +462,13 @@ jobs:
       - name: Install ADBC BigQuery Driver
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
         uses: ./.github/actions/setup-adbc-bigquery
+
+      - name: Set up BigQuery credentials (workload identity federation)
+        if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
+        uses: ./.github/actions/bigquery-credentials
+        with:
+          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
+          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
 
       # duckdb: and ducklake: datasets load the installed DuckDB through ADBC.
       - name: Install libduckdb
@@ -654,9 +679,10 @@ jobs:
             --scale-factor ${{ github.event.inputs.scale_factor }}
         env:
           LAYOUT: ${{ github.event.inputs.layout }}
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
+          S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
+          S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
           DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
           DATABRICKS_ODBC_PATH: ${{ vars.DATABRICKS_ODBC_PATH }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
@@ -671,7 +697,6 @@ jobs:
           AWS_DYNAMODB_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'http://127.0.0.1:9000' || '' }}
           AWS_ALLOW_HTTP: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'true' || '' }}
-          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
           DUCKLAKE_CONNECTION_STRING: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'postgres:dbname=ducklake_catalog host=localhost user=postgres password=postgres' || '' }}
           GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}

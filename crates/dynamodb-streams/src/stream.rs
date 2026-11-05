@@ -96,7 +96,10 @@ impl DynamodbStreamProducer {
             }
         }
 
-        (combine_shard_batches(&poll_results), had_error)
+        let mut batch = combine_shard_batches(&poll_results);
+        self.state
+            .add_initializing_checkpoints(&mut batch.checkpoint);
+        (batch, had_error)
     }
 
     async fn initialize_shards_iterators(&mut self) -> bool {

@@ -1,0 +1,34 @@
+name: BigQuery credentials
+description: >-
+  Exports BIGQUERY_SERVICE_ACCOUNT_JSON as a workload identity federation credential, which
+  trades the job's GitHub OIDC token for short-lived Google Cloud tokens. No key is stored, and
+  it stops working when the job ends. Needs `environment: ci` and `id-token: write`.
+
+inputs:
+  workload-identity-provider:
+    description: Full resource name of the Google Cloud workload identity provider that trusts the job.
+    required: true
+  service-account:
+    description: Service account the BigQuery tests act as.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Authenticate to Google Cloud
+      id: auth
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        workload_identity_provider: ${{ inputs.workload-identity-provider }}
+        service_account: ${{ inputs.service-account }}
+        export_environment_variables: false
+
+    - name: Export BIGQUERY_SERVICE_ACCOUNT_JSON
+      shell: bash
+      env:
+        CREDENTIALS_FILE: ${{ steps.auth.outputs.credentials_file_path }}
+      run: |
+        set -euo pipefail
+        json="$(jq -c . "${CREDENTIALS_FILE}")"
+        echo "::add-mask::${json}"
+        echo "BIGQUERY_SERVICE_ACCOUNT_JSON=${json}" >> "${GITHUB_ENV}"

@@ -700,7 +700,7 @@ fn seed_mark(files: &[AddedFile], time: &TimeColumn, schema: &Schema) -> SeedMar
     let format = match &time.format {
         // A string column's bounds compare as strings, which misorders values with
         // different UTC offsets, so they are never used as an instant bound.
-        Some(TimestampFormat::Iso8601) => return SeedMark::AllStoredRows("string time column"),
+        Some(TimestampFormat::Iso8601(_)) => return SeedMark::AllStoredRows("string time column"),
         Some(format) => format,
         None => return SeedMark::AllStoredRows("time column type not comparable"),
     };
@@ -1221,7 +1221,7 @@ mod tests {
         };
         let text = TimeColumn {
             name: "note".to_string(),
-            format: Some(TimestampFormat::Iso8601),
+            format: Some(TimestampFormat::Iso8601(arrow::datatypes::DataType::Utf8)),
         };
 
         let plan = plan_for("events", &provider, Some(&cursor), Some(&text)).await;

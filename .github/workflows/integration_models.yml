@@ -46,8 +46,9 @@ jobs:
   build:
     name: Build Test Binary (macOS)
     runs-on: spiceai-macos-large
+    environment: ci-build
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,7 +65,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
@@ -79,10 +80,7 @@ jobs:
         if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
@@ -94,8 +92,6 @@ jobs:
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
           FEATURES="flightsql,models,metal,s3_vectors,kafka,duckdb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
@@ -125,7 +121,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: build
           region: us-west-1
@@ -145,8 +141,9 @@ jobs:
           archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}"
           curl --fail --silent --show-error --upload-file ./integration.tar.zst "$archive_url"
 
+      # `test-models` and `test-bedrock` run in `ci`, which has no NAS password, so they
+      # read this copy.
       - name: Upload test archive
-        if: env.HAS_SPICEIO_SECRET != 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ai-integration-test-archive
@@ -188,7 +185,7 @@ jobs:
       # Exchanged for OpenAI and Anthropic access tokens: workload identity federation.
       id-token: write
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
       HAS_OPENAI_WIF: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID != '' }}
       HAS_ANTHROPIC_WIF: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID != '' }}
       HAS_XAI_SECRET: ${{ secrets.SPICE_SECRET_XAI_API_KEY != '' }}
@@ -218,7 +215,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: build
           region: us-west-1
@@ -247,8 +244,10 @@ jobs:
           path: ./integration_test
 
       - name: Set up API Keys
+        env:
+          SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
-          echo 'SPICE_XAI_API_KEY="${{ secrets.SPICE_SECRET_XAI_API_KEY }}"' > .env
+          printf 'SPICE_XAI_API_KEY="%s"\n' "$SPICE_XAI_API_KEY" > .env
 
       # OpenAI tests
       - name: Run OpenAI integration test
@@ -429,8 +428,9 @@ jobs:
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
     runs-on: spiceai-macos-large
+    environment: ci-build
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
       HAS_HF_SECRET: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -449,7 +449,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: build
           region: us-west-1
@@ -514,60 +514,24 @@ jobs:
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
-  # Rejected AWS keys fail every Bedrock test the same way, each after a 120-second readiness
-  # wait. This asks AWS once, before the build finishes, and names the cause. STS
-  # GetCallerIdentity needs no IAM permission, so only an invalid key pair fails it.
-  check-bedrock-credentials:
-    name: Check Bedrock credentials
-    if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
-    runs-on: spiceai-dev-runners
-    timeout-minutes: 5
-    permissions: {}
-    steps:
-      - name: Ask AWS STS whether the Bedrock access key is valid
-        shell: bash
-        env:
-          AWS_BEDROCK_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
-          AWS_BEDROCK_SECRET: ${{ secrets.AWS_BEDROCK_SECRET }}
-        run: |
-          set -uo pipefail
-          if [ -z "$AWS_BEDROCK_KEY" ] || [ -z "$AWS_BEDROCK_SECRET" ]; then
-            echo "::error::AWS_BEDROCK_KEY or AWS_BEDROCK_SECRET is empty, so the Bedrock tests cannot authenticate. Set both repository secrets."
-            exit 1
-          fi
-          # Logged because --aws-sigv4 needs curl 7.75 or later.
-          curl --version | head -n 1
-          body=$(mktemp)
-          # The key pair goes to curl on stdin, out of the process list. `|| curl_exit=$?` keeps
-          # `shell: bash`'s -e from ending the step before the fallback below.
-          curl_exit=0
-          status=$(printf 'user = "%s:%s"\n' "$AWS_BEDROCK_KEY" "$AWS_BEDROCK_SECRET" |
-            curl --config - --silent --show-error --max-time 30 --retry 3 \
-              --aws-sigv4 'aws:amz:us-east-1:sts' --output "$body" --write-out '%{http_code}' \
-              'https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15') ||
-            curl_exit=$?
-          # The body is never printed: a successful one names the AWS account.
-          code=$(sed -n 's:.*<Code>\([A-Za-z]*\)</Code>.*:\1:p' "$body" | head -n 1)
-          rm -f "$body"
-          if [ "$curl_exit" -eq 0 ] && [ "$status" = 200 ]; then
-            echo "AWS accepted the Bedrock credentials."
-          elif [ "$status" = 403 ] && { [ "$code" = InvalidClientTokenId ] || [ "$code" = SignatureDoesNotMatch ]; }; then
-            echo "::error::AWS rejected the Bedrock credentials (${code}): AWS_BEDROCK_KEY and AWS_BEDROCK_SECRET are not a valid access key pair, so every Bedrock test would fail to authenticate and they are not run. Replace both repository secrets with a working key pair."
-            exit 1
-          else
-            # No verdict on the key pair, so the tests still run and report for themselves.
-            echo "::warning::Could not check the Bedrock credentials (curl exit ${curl_exit}, HTTP ${status}${code:+, ${code}}). Running the Bedrock tests anyway."
-          fi
-
   test-bedrock:
     name: Test Bedrock Models
-    needs: [build, check-bedrock-credentials]
+    needs: [build]
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
     # The large pool for the same reason as `test-models`: a Mac mini cannot
     # reliably start this archive's test binary.
     runs-on: spiceai-macos-large
+    # Holds the ARN of the IAM role the tests call Bedrock as (`AWS_BEDROCK_ROLE_ARN`).
+    environment: ci
+    permissions:
+      contents: write
+      pull-requests: write
+      # Approves the snapshot PR's held pull_request runs.
+      actions: write
+      # Exchanged for the Bedrock role's AWS credentials: workload identity federation.
+      id-token: write
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -579,13 +543,36 @@ jobs:
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
 
+      # The role trusts this job's GitHub OIDC token (subject
+      # `repo:spiceai/spiceai:environment:ci`), so CI holds no AWS access key. The credentials
+      # go to the test step alone, not the job's environment. Assumed before spiceio starts, so
+      # no build-cache endpoint can reach the STS call.
+      - name: Check for the Bedrock role
+        env:
+          AWS_BEDROCK_ROLE_ARN: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+        run: |
+          if [ -z "$AWS_BEDROCK_ROLE_ARN" ]; then
+            echo "::error::AWS_BEDROCK_ROLE_ARN is not set in the ci environment, so the Bedrock tests cannot authenticate. Create the IAM role that trusts this repository's GitHub OIDC tokens and set the secret to its ARN."
+            exit 1
+          fi
+
+      - name: Assume the Bedrock role
+        id: bedrock-role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          role-session-name: gha-bedrock-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: build
           region: us-west-1
@@ -616,11 +603,35 @@ jobs:
       - name: Run Beta functionality embedding tests
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
-          AWS_BEDROCK_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
-          AWS_BEDROCK_SECRET: ${{ secrets.AWS_BEDROCK_SECRET }}
+          AWS_BEDROCK_KEY: ${{ steps.bedrock-role.outputs.aws-access-key-id }}
+          AWS_BEDROCK_SECRET: ${{ steps.bedrock-role.outputs.aws-secret-access-key }}
+          AWS_BEDROCK_SESSION_TOKEN: ${{ steps.bedrock-role.outputs.aws-session-token }}
         run: |
           unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- bedrock_test
+
+      # The path EKS (IRSA) and any other OIDC token file take: no key at all, only
+      # `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`, which spiced's AWS credential chain
+      # exchanges with STS itself. A GitHub OIDC token lives 5 minutes, which this one test
+      # needs for a single exchange; STS's credentials then last the role's session.
+      - name: Run a Bedrock test with web identity credentials
+        if: ${{ !cancelled() }}
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          AWS_ROLE_SESSION_NAME: gha-bedrock-web-identity-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          export AWS_WEB_IDENTITY_TOKEN_FILE="${RUNNER_TEMP}/aws-web-identity-token"
+          trap 'rm -f "$AWS_WEB_IDENTITY_TOKEN_FILE"' EXIT
+          umask 077
+          # The request token goes to curl on stdin, out of the process list.
+          printf 'header = "Authorization: bearer %s"\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" |
+            curl --config - --fail --silent --show-error --max-time 30 \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" |
+            python3 -c 'import json, sys; sys.stdout.write(json.load(sys.stdin)["value"])' \
+              > "$AWS_WEB_IDENTITY_TOKEN_FILE"
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- bedrock_test_ai_if_answers
 
       - name: Push snapshots to branch
         if: ${{ !cancelled() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
@@ -636,8 +647,9 @@ jobs:
   build-extended:
     name: Build Test Binary (Extended)
     runs-on: spiceai-macos-large
+    environment: ci-build
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -654,7 +666,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
@@ -669,10 +681,7 @@ jobs:
         if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
@@ -681,8 +690,6 @@ jobs:
       - name: Build AI integration test binary
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
           FEATURES="flightsql,models,s3_vectors,kafka,duckdb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
@@ -712,7 +719,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: build
           region: us-west-1
