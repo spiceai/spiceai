@@ -83159,4 +83159,5 @@ mod tests {
 
     mod layered_upsert_state;
     mod repeated_keys;
+    mod update_visibility;
 }
