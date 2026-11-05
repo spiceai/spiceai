@@ -302,9 +302,11 @@ impl FileBasedDeletionSink {
         // file already removed by this partial batch releases its cached
         // segments immediately and cannot disappear from a later directory
         // listing before ever being invalidated.
+        let removed_files: Vec<_> = retired_cache_paths.iter().cloned().collect();
         self.provider
             .invalidate_retired_paths(retired_cache_paths)
             .await;
+        self.remove_manifest_rows(&removed_files).await;
         if let Some(error) = delete_error {
             return Err(error);
         }
@@ -316,6 +318,43 @@ impl FileBasedDeletionSink {
         );
 
         Ok(total_rows)
+    }
+
+    /// Drop the snapshot-manifest rows (`cayenne_snapshot_file`) of data files this
+    /// sink removed, so the manifest goes on naming only files their snapshot still
+    /// holds. Opening the table compares the manifest with the files on disk, and a
+    /// row left for a file retention removed would read as a file lost outside Spice.
+    ///
+    /// Each path ends `<snapshot_id>/<file name>`, the manifest's key. Best-effort,
+    /// like the rest of the post-delete cleanup: the files are already gone, and a
+    /// row left behind is dropped the next time the manifest is rebuilt from the
+    /// directory listing.
+    async fn remove_manifest_rows(&self, removed_files: &[object_store::path::Path]) {
+        let mut by_snapshot: HashMap<String, Vec<String>> = HashMap::new();
+        for path in removed_files {
+            let parts: Vec<_> = path.parts().collect();
+            let [.., snapshot_id, file_name] = parts.as_slice() else {
+                continue;
+            };
+            by_snapshot
+                .entry(snapshot_id.as_ref().to_string())
+                .or_default()
+                .push(file_name.as_ref().to_string());
+        }
+        for (snapshot_id, file_names) in by_snapshot {
+            if let Err(error) = self
+                .catalog
+                .remove_snapshot_files(&self.table_id, &snapshot_id, &file_names)
+                .await
+            {
+                tracing::warn!(
+                    table = %self.table_name,
+                    snapshot_id,
+                    %error,
+                    "Retention: failed to drop the snapshot-manifest rows of deleted files"
+                );
+            }
+        }
     }
 
     /// Internal implementation that returns structured deletion results
