@@ -13,6 +13,7 @@ env:
 
 jobs:
   advisories:
+    environment: secret-free
     name: Check Rust Advisories
     runs-on: self-hosted
     permissions:

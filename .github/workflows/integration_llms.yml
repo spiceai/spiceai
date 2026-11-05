@@ -53,6 +53,7 @@ env:
 
 jobs:
   setup-matrix:
+    environment: secret-free
     name: Setup strategy matrix
     runs-on: spiceai-dev-runners
     # Evaluates one inline script.

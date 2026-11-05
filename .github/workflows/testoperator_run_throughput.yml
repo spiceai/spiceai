@@ -83,10 +83,10 @@ on:
 
 jobs:
   run-throughput:
-    name: Run throughput test
-    runs-on: ${{ github.event.inputs.runner_type }}
     # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
     environment: ci
+    name: Run throughput test
+    runs-on: ${{ github.event.inputs.runner_type }}
     permissions:
       contents: read
       id-token: write  # RustFS credentials, and Google Cloud access tokens for the BigQuery tests

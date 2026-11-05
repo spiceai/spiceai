@@ -30,6 +30,7 @@ env:
 
 jobs:
   check_commits:
+    environment: secret-free
     runs-on: ubuntu-24.04
     outputs:
       has_new_commits: ${{ steps.check_commits.outputs.has_new_commits }}
@@ -60,6 +61,7 @@ jobs:
         shell: bash
 
   setup:
+    environment: secret-free
     needs: check_commits
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
@@ -91,6 +93,7 @@ jobs:
   # ==================== BINARY BUILD JOBS ====================
 
   build-linux-x64:
+    environment: secret-free
     name: Build - Linux x64
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
@@ -160,6 +163,7 @@ jobs:
           path: spice_linux_x86_64.tar.gz
 
   build-linux-arm64:
+    environment: secret-free
     name: Build - Linux aarch64
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
@@ -231,6 +235,7 @@ jobs:
           path: spice_linux_aarch64.tar.gz
 
   build-macos-arm64:
+    environment: secret-free
     name: Build - macOS aarch64
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'

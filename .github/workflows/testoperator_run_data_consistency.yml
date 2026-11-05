@@ -62,6 +62,7 @@ on:
 
 jobs:
   run-data-consistency:
+    environment: ci
     name: Run data consistency tests
     runs-on: ${{ github.event.inputs.runner_type }}
     permissions:
