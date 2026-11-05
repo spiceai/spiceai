@@ -450,8 +450,10 @@ jobs:
 
       - name: Set up Spice.ai API Key
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         run: |
-          echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_KEY }}"' > .env
+          printf 'SPICEAI_API_KEY="%s"\n' "$SPICEAI_API_KEY" > .env
 
       - name: Run integration test
         if: needs.check_changes.outputs.relevant_changes == 'true'
