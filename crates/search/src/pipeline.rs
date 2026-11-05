@@ -53,14 +53,43 @@ pub enum Error {
 
     #[snafu(display("An invalid keyword was specified: {keyword}"))]
     InvalidKeyword { keyword: String },
+
+    /// More search keywords than [`MAX_SEARCH_KEYWORDS`].
+    ///
+    /// Each keyword becomes one predicate. `DataFusion` re-folds a conjunction
+    /// into a left-deep tree (`reduce(Expr::and)`) and then walks it
+    /// recursively, so the keyword count — not only the tree this pipeline
+    /// builds — has to stay under the depth that overflows a worker stack.
+    #[snafu(display(
+        "Search request rejected: {count} keywords were provided, and at most {max} are accepted. Shorten the `keywords` list."
+    ))]
+    TooManyKeywords { count: usize, max: usize },
 }
 
 impl Error {
     #[must_use]
     pub fn is_user_error(&self) -> bool {
-        matches!(self, Error::CandidateAggregationError { source } if source.is_user_error())
+        match self {
+            Error::TooManyKeywords { .. } => true,
+            Error::CandidateAggregationError { source } => source.is_user_error(),
+            Error::CandidateGenerationError { .. }
+            | Error::SearchRequestConstructionError { .. }
+            | Error::InvalidKeyword { .. } => false,
+        }
     }
 }
+
+/// Most keywords accepted on one search request.
+///
+/// A flat keyword list is folded into an `AND` tree. On a debug build with a
+/// default ~2 MiB worker stack, a left-deep chain of these predicates still
+/// plans at 750 keywords and aborts the process near 1000. `DataFusion`'s
+/// optimizer splits that conjunction and rebuilds it with `reduce(Expr::and)`,
+/// so a later pass sees a left-deep tree even when the pipeline balanced the
+/// one it constructed. 512 is the same fixed cap used for SQL expression depth:
+/// under the observed abort, above any realistic lexical pre-filter, and not a
+/// configuration knob.
+pub const MAX_SEARCH_KEYWORDS: usize = 512;
 
 pub use runtime_query_engine::query_engine::QueryEngine;
 
@@ -189,7 +218,12 @@ fn construct_logical_plan(
     let mut scan =
         LogicalPlanBuilder::scan(name.clone(), Arc::new(DefaultTableSource::new(tbl)), None)?;
 
-    if let Some(filter) = filters.into_iter().reduce(Expr::and) {
+    // Balance the conjunction. `reduce(Expr::and)` is left-deep, with one stack
+    // frame per keyword in every recursive planning pass. AND is associative, so
+    // a balanced tree is the same predicate at depth log2(n). The keyword-count
+    // cap is what keeps DataFusion's own later left-deep rebuild under the
+    // stack limit; this fold keeps the tree this function hands over shallow.
+    if let Some(filter) = conjoin_balanced(filters) {
         scan = scan.filter(filter)?;
     }
     let mut sort_exprs = vec![SortExpr::new(ident(SEARCH_SCORE_COLUMN_NAME), false, false)];
@@ -203,10 +237,44 @@ fn construct_logical_plan(
         .build()
 }
 
+/// Fold `exprs` with logical AND into a balanced binary tree.
+///
+/// Returns `None` when `exprs` is empty. A single expression is returned
+/// unchanged. AND is associative, so the result matches a left fold.
+fn conjoin_balanced(mut exprs: Vec<Expr>) -> Option<Expr> {
+    if exprs.is_empty() {
+        return None;
+    }
+    while exprs.len() > 1 {
+        let mut paired = Vec::with_capacity(exprs.len().div_ceil(2));
+        let mut rest = exprs.into_iter();
+        while let Some(left) = rest.next() {
+            if let Some(right) = rest.next() {
+                paired.push(left.and(right));
+            } else {
+                paired.push(left);
+            }
+        }
+        exprs = paired;
+    }
+    exprs.pop()
+}
+
+fn ensure_keyword_count(count: usize) -> Result<(), Error> {
+    if count > MAX_SEARCH_KEYWORDS {
+        return Err(Error::TooManyKeywords {
+            count,
+            max: MAX_SEARCH_KEYWORDS,
+        });
+    }
+    Ok(())
+}
+
 /// Convert each keyword into an `ILIKE %keyword%` [`Expr`].
 ///
 /// Also validates keywords against being SQL injections.
 fn prepare_keywords(keywords: &[String], column: &str) -> Result<Vec<Expr>, Error> {
+    ensure_keyword_count(keywords.len())?;
     keywords
         .iter()
         .map(|k| validate_keyword_to_ilike(k, column))
@@ -215,6 +283,7 @@ fn prepare_keywords(keywords: &[String], column: &str) -> Result<Vec<Expr>, Erro
 
 /// Ensure the provided keywords are valid string literal, useable as a keyword in an ILIKE expression (i.e. no SQL injection).
 pub fn valid_keywords(keywords: &[String]) -> Result<Vec<String>, Error> {
+    ensure_keyword_count(keywords.len())?;
     keywords
         .iter()
         .map(|k| {
@@ -361,5 +430,124 @@ pub(crate) mod tests {
         let keywords = vec!["'); DROP TABLE testing;".to_string()];
         let result = valid_keywords(&keywords);
         result.expect_err("should be invalid search keywords");
+    }
+
+    fn keyword_list(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("k{i}")).collect()
+    }
+
+    /// AND-nesting along the longest path, measured with an explicit stack.
+    fn and_depth(root: &Expr) -> usize {
+        let mut stack = vec![(root, 0usize)];
+        let mut max_depth = 0usize;
+        while let Some((expr, depth)) = stack.pop() {
+            if let Expr::BinaryExpr(binary) = expr
+                && binary.op == datafusion_expr::Operator::And
+            {
+                let next = depth + 1;
+                max_depth = max_depth.max(next);
+                stack.push((binary.left.as_ref(), next));
+                stack.push((binary.right.as_ref(), next));
+            }
+        }
+        max_depth
+    }
+
+    fn conjunction_leaves(root: &Expr) -> usize {
+        let mut stack = vec![root];
+        let mut leaves = 0usize;
+        while let Some(expr) = stack.pop() {
+            if let Expr::BinaryExpr(binary) = expr
+                && binary.op == datafusion_expr::Operator::And
+            {
+                stack.push(binary.left.as_ref());
+                stack.push(binary.right.as_ref());
+            } else {
+                leaves += 1;
+            }
+        }
+        leaves
+    }
+
+    #[test]
+    fn rejects_too_many_keywords() {
+        let over = keyword_list(MAX_SEARCH_KEYWORDS + 1);
+        let err = valid_keywords(&over).expect_err("a keyword list over the cap is rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains(&MAX_SEARCH_KEYWORDS.to_string())
+                && message.contains(&(MAX_SEARCH_KEYWORDS + 1).to_string())
+                && message.contains("keywords"),
+            "unexpected error: {message}"
+        );
+        let _ =
+            prepare_keywords(&over, "body").expect_err("prepare_keywords enforces the same cap");
+        assert!(err.is_user_error(), "too many keywords is a client error");
+    }
+
+    #[test]
+    fn allows_keyword_count_at_the_cap() {
+        let keywords = keyword_list(MAX_SEARCH_KEYWORDS);
+        valid_keywords(&keywords).expect("a keyword list at the cap is accepted");
+    }
+
+    /// Four keyword predicates folded left-deep have AND-depth 3. The balanced
+    /// fold has depth 2, and a list at the cap stays logarithmic with every
+    /// keyword still present as a leaf.
+    #[test]
+    fn keyword_conjunction_is_balanced() {
+        let four = prepare_keywords(&keyword_list(4), "body").expect("four keywords parse");
+        let four = conjoin_balanced(four).expect("four keywords conjoin");
+        assert_eq!(and_depth(&four), 2);
+        assert_eq!(conjunction_leaves(&four), 4);
+
+        let capped = prepare_keywords(&keyword_list(MAX_SEARCH_KEYWORDS), "body")
+            .expect("keywords at the cap parse");
+        let capped = conjoin_balanced(capped).expect("keywords at the cap conjoin");
+        assert_eq!(conjunction_leaves(&capped), MAX_SEARCH_KEYWORDS);
+        assert_eq!(and_depth(&capped), 9);
+    }
+
+    /// Optimizing and physically planning the deepest accepted keyword filter
+    /// must return. A left-deep chain of this width is what overflows the
+    /// worker stack inside `DataFusion`.
+    #[tokio::test]
+    async fn keyword_filter_at_cap_plans() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec![Some("hello")]))],
+        )
+        .expect("one-row batch");
+        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).expect("memtable");
+        let filters = prepare_keywords(&keyword_list(MAX_SEARCH_KEYWORDS), "body")
+            .expect("keywords at the cap");
+        let filter = conjoin_balanced(filters).expect("conjunction");
+        let plan = LogicalPlanBuilder::scan(
+            TableReference::bare("docs"),
+            Arc::new(DefaultTableSource::new(Arc::new(table))),
+            None,
+        )
+        .expect("scan")
+        .filter(filter)
+        .expect("filter")
+        .build()
+        .expect("logical plan");
+
+        let ctx = SessionContext::new();
+        let optimized = ctx
+            .state()
+            .optimize(&plan)
+            .expect("optimizing the keyword filter");
+        ctx.state()
+            .create_physical_plan(&optimized)
+            .await
+            .expect("physical plan of the keyword filter");
     }
 }

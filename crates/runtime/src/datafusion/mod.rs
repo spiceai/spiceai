@@ -179,6 +179,9 @@ pub use runtime_table::table_provider_with_spicepod_metadata;
 pub mod secrets_context_extension;
 pub mod table;
 pub use runtime_datafusion::sort_columns;
+pub(crate) use runtime_query_engine::sql_depth_guard;
+#[cfg(test)]
+mod sql_depth_guard_tests;
 pub(crate) mod sql_validator;
 pub mod tool_udf;
 pub mod udf;
@@ -1498,6 +1501,8 @@ pub struct DataFusion {
     // EXECUTE (not lightweight PREPARE/DEALLOCATE/SET) — i.e. query admission
     // control; `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
     query_admission_semaphore: Option<Arc<Semaphore>>,
+    // Permits in `query_admission_semaphore`; `None` when admission is unbounded.
+    query_admission_limit: Option<usize>,
     pub(crate) task_history_enabled: bool,
     /// Which failed queries are logged; `runtime.query.log_errors`.
     pub(crate) query_error_logging: QueryErrorLogging,
@@ -1740,6 +1745,12 @@ impl DataFusion {
     /// `acceleration_refresh_semaphore` for the read/query side.
     pub(crate) fn query_admission_semaphore(&self) -> Option<Arc<Semaphore>> {
         self.query_admission_semaphore.clone()
+    }
+
+    /// The number of permits in the query-admission semaphore; `None` when
+    /// admission is unbounded.
+    pub(crate) fn query_admission_limit(&self) -> Option<usize> {
+        self.query_admission_limit
     }
 
     #[must_use]
@@ -6814,6 +6825,7 @@ impl DataFusion {
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
         let statement = planner::parse_sql_statement(sql, session)?;
+        sql_depth_guard::ensure_statement_within_depth_limits(&statement)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
 
@@ -6842,7 +6854,8 @@ impl DataFusion {
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
         let dialect = session.config().options().sql_parser.dialect;
-        let statement = session.sql_to_statement(sql, &dialect)?;
+        let statement = sql_depth_guard::sql_to_statement(session, sql, &dialect)?;
+        sql_depth_guard::ensure_statement_within_depth_limits(&statement)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
         let spellings =

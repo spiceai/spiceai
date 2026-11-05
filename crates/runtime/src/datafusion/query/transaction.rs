@@ -128,6 +128,11 @@ pub fn transaction_statements(sql: &str) -> Option<Vec<String>> {
 /// [`transaction_statements`] without the leading-word check: parses `sql` in
 /// full to find out.
 fn parse_transaction_statements(sql: &str) -> Option<Vec<String>> {
+    crate::datafusion::sql_depth_guard::ensure_data_types_within_depth_limit(
+        sql,
+        &PostgreSqlDialect {},
+    )
+    .ok()?;
     let statements: Vec<DFStatement> = DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {})
         .ok()?
         .into_iter()
@@ -315,8 +320,13 @@ async fn prepare_transaction(
     let mut write_refs: Vec<TableReference> = Vec::new();
     let mut read_refs: Vec<TableReference> = Vec::new();
     for stmt_sql in inner_sqls {
+        let statement = session
+            .sql_to_statement(stmt_sql, &session.config().options().sql_parser.dialect)
+            .map_err(TransactionError::Plan)?;
+        crate::datafusion::sql_depth_guard::ensure_statement_within_depth_limits(&statement)
+            .map_err(TransactionError::Plan)?;
         let plan = session
-            .create_logical_plan(stmt_sql)
+            .statement_to_plan(statement)
             .await
             .map_err(TransactionError::Plan)?;
         // A read-only body (`None`) contributes no write ref; a write target
