@@ -19,7 +19,6 @@
   <a href="https://spiceai.org/docs"><b>Docs</b></a> ·
   <a href="#quickstart"><b>Quickstart</b></a> ·
   <a href="https://github.com/spiceai/cookbook"><b>Cookbook</b></a> ·
-  <a href="https://spice.ai/benchmarks"><b>Benchmarks</b></a> ·
   <a href="https://github.com/spiceai/skills"><b>AI Skills</b></a> ·
   <a href="https://spice.ai/blog"><b>Blog</b></a>
 </p>
@@ -82,19 +81,6 @@ Next, connect your own sources with the [data connector docs](https://spiceai.or
 - **Fast queries without ETL delays.** Run federated SQL across operational databases, warehouses, and APIs, and accelerate the hot path with fewer pipelines to maintain. [Federation recipe](https://github.com/spiceai/cookbook/tree/trunk/federation)
 - **Real-time analytics on operational data.** Point BI tools and agents at a CDC-fed analytics replica instead of the production database. [CDC docs](https://spiceai.org/docs/features/cdc)
 - **One standard lakehouse for every tenant.** Define the lakehouse once in a Spicepod and deploy it for each customer, team, or agent, each with its own sources and settings. [Multi-tenancy patterns](https://spice.ai/blog/multi-tenancy-for-ai-agents-without-pipelines)
-
-## Benchmarks
-
-| Stage     | Result                                                                                        |
-| --------- | --------------------------------------------------------------------------------------------- |
-| Query     | **31x** faster than querying object storage directly                                          |
-| Query     | **1.57x** faster than DuckDB on the TPC-H SF100 query set                                     |
-| Ingest    | **566K** rows/s source bootstrap ingest                                                       |
-| Serve     | **266K+** tpmC of live transactional load while serving **1,046** analytical queries per hour |
-| Scale     | **300M+** rows replicated and queried live                                                    |
-| Scale out | **2.9x** faster on three nodes than on one                                                    |
-
-Workloads derived from TPC-H and CH-benCHmark; not audited TPC results. Methodology and full results at [spice.ai/benchmarks](https://spice.ai/benchmarks).
 
 ## Interfaces
 
