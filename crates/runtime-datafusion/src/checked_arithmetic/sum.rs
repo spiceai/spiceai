@@ -1496,7 +1496,7 @@ mod state_tests {
                 (0..len)
                     .map(|i| {
                         let bits = next_random(&mut state);
-                        if bits % 4 == 0 {
+                        if bits.is_multiple_of(4) {
                             signed_extremes[i % signed_extremes.len()]
                         } else {
                             bits.cast_signed()
@@ -1508,7 +1508,7 @@ mod state_tests {
                 (0..len)
                     .map(|i| {
                         let bits = next_random(&mut state);
-                        if bits % 4 == 0 {
+                        if bits.is_multiple_of(4) {
                             unsigned_extremes[i % unsigned_extremes.len()]
                         } else {
                             bits

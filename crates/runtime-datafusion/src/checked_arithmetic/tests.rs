@@ -541,12 +541,13 @@ async fn skip_partial_aggregation_after_one_row(ctx: &SessionContext) {
 }
 
 fn skipped_aggregation_rows(plan: &Arc<dyn ExecutionPlan>) -> usize {
-    let own = match plan
+    let skipped = plan
         .metrics()
-        .and_then(|metrics| metrics.sum_by_name("skipped_aggregation_rows"))
-    {
-        Some(value) => value.as_usize(),
-        None => 0,
+        .and_then(|metrics| metrics.sum_by_name("skipped_aggregation_rows"));
+    let own = if let Some(value) = skipped {
+        value.as_usize()
+    } else {
+        0
     };
     own + plan
         .children()
@@ -594,7 +595,7 @@ fn group_by_partitions() -> (Arc<Schema>, Vec<Vec<RecordBatch>>) {
                     }));
                     let u = UInt64Array::from_iter(rows.iter().map(|row| {
                         let row = u64::try_from(*row).expect("row numbers are non-negative");
-                        (row % 11 != 0).then_some(row * 3_000_000_019)
+                        (!row.is_multiple_of(11)).then_some(row * 3_000_000_019)
                     }));
                     let keep = arrow::array::BooleanArray::from_iter(
                         rows.iter()
