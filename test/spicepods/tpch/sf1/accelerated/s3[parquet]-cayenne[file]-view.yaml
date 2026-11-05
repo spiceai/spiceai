@@ -18,6 +18,7 @@ datasets:
       mode: file
       params:
         cayenne_file_path: cayenne-1
+        cayenne_metadata_dir: cayenne-metadata
   - from: s3://benchmarks/tpch_sf1/lineitem.parquet
     name: lineitem
     params: *s3_params
@@ -35,6 +36,7 @@ datasets:
       mode: file
       params:
         cayenne_file_path: cayenne-2
+        cayenne_metadata_dir: cayenne-metadata
   - from: s3://benchmarks/tpch_sf1/part.parquet
     name: part
     params: *s3_params
@@ -48,6 +50,7 @@ datasets:
       mode: file
       params:
         cayenne_file_path: cayenne-3
+        cayenne_metadata_dir: cayenne-metadata
   - from: s3://benchmarks/tpch_sf1/region.parquet
     name: region_ds
     params: *s3_params
@@ -67,6 +70,7 @@ views:
       mode: file
       params:
         cayenne_file_path: cayenne-view
+        cayenne_metadata_dir: cayenne-metadata
   - name: region
     sql: |
       SELECT * FROM region_ds
