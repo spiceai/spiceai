@@ -18432,7 +18432,6 @@ dependencies = [
 name = "runtime-secrets"
 version = "2.4.1"
 dependencies = [
- "app",
  "async-trait",
  "aws-config",
  "aws-credential-types",
