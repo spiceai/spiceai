@@ -107,7 +107,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | Fork | Pinned revision | Branch |
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `6e4119ac2007c6647702a1817505d6849b07e0e0` | `spiceai-24` |
-| [arrow-rs](#arrow-rs) | `e56e5cf4e9d51685fed197dbd477eca690f0eb87` | `lukim/spiceai-59.3.2-patches` (TEMPORARY: spiceai/arrow-rs#36) |
+| [arrow-rs](#arrow-rs) | `510ef234e1444f2c4aaf748d0c905787738afa7a` | `spiceai-59.3.2` |
 | [async-openai](#async-openai) | `307eaf407cbf71afa967f3008250ba96c79626b7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `5a67f5ecd62321b019c0daffd6613cfb9f71505e` | `spiceai-release-2.4` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
@@ -326,7 +326,7 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 ## arrow-rs
 
 Upstream [apache/arrow-rs](https://github.com/apache/arrow-rs), branch
-`lukim/spiceai-59.3.2-patches` (TEMPORARY: [spiceai/arrow-rs#36](https://github.com/spiceai/arrow-rs/pull/36); upstream `59.3.2` merged into the previous `spiceai-59` line). Every row
+`spiceai-59.3.2` (upstream `59.3.2` merged into the previous `spiceai-59` line by [spiceai/arrow-rs#36](https://github.com/spiceai/arrow-rs/pull/36)). Every row
 below was re-confirmed present at the pinned revision. Upstream deprecates
 `ParquetObjectReader` in 59 (apache/arrow-rs#10354); the Spice patches to it
 merged cleanly and are kept. The pin lives in the object-store Parquet reader
