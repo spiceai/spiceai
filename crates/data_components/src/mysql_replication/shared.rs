@@ -2260,23 +2260,38 @@ async fn deliver_commit(
     shutdown_epoch: u64,
     gtid: Option<(uuid::Uuid, u64)>,
 ) {
+    // Every member the transaction routes to is marked delivered before any is
+    // handed it. A shutdown can abandon the sends part way, and the pump goes
+    // on to credit the transaction: a member not yet marked would count as
+    // needing nothing from it, be credited it as applied, and skip it after
+    // the restart. Marked, it stays in flight, so it is never credited and its
+    // saved position re-reads it.
+    let routing_gtid = source.ack.routing_gtid(gtid);
+    let mut recipients = Vec::with_capacity(txn.len());
     for (table_id, events) in txn {
         if events.is_empty() {
             continue;
         }
-        let Some(Route {
+        let Some(route) = routes.get(&table_id) else {
+            continue;
+        };
+        if !route.slot.routes(commit_pos, routing_gtid) {
+            continue;
+        }
+        route.slot.deliver(commit_pos, gtid);
+        recipients.push((route, events));
+    }
+    for (
+        Route {
             key,
             member,
             slot,
             tme,
             layout,
-        }) = routes.get(&table_id)
-        else {
-            continue;
-        };
-        if !slot.routes(commit_pos, source.ack.routing_gtid(gtid)) {
-            continue;
-        }
+        },
+        events,
+    ) in recipients
+    {
         // O(1), no decode: freshness watermark + transaction count. The per-row
         // op counters are recorded off-pump in `MysqlChangeRows::build`.
         record_watermark(&member.metrics, commit_ts);
@@ -2304,7 +2319,6 @@ async fn deliver_commit(
             Box::new(rows),
             is_ready,
         );
-        slot.deliver(commit_pos, gtid);
         match deliver_to_member(
             &member.metrics,
             &member.sender,
@@ -2341,7 +2355,13 @@ async fn handle_statement(
     shutdown_epoch: u64,
     gtid: Option<(uuid::Uuid, u64)>,
 ) {
-    // A statement can target any subscribed table; scan the live members.
+    let commit_pos = BinlogPosition::new(current_file.to_string(), event_end_pos);
+    let routing_gtid = source.ack.routing_gtid(gtid);
+    // A statement can target any subscribed table; scan the live members. As
+    // in `deliver_commit`, a `TRUNCATE` is marked delivered to every member it
+    // routes to before any is handed it, so one abandoned on shutdown cannot
+    // leave a later member credited with it.
+    let mut affected = Vec::new();
     for (mkey, member) in source.live_members() {
         let Some(kind) = classify_statement(statement, default_db, &mkey.0, &mkey.1) else {
             continue;
@@ -2352,12 +2372,17 @@ async fn handle_statement(
         if !slot.has(STREAMING) {
             continue;
         }
+        if matches!(kind, StatementKind::Truncate) {
+            if !slot.routes(&commit_pos, routing_gtid) {
+                continue;
+            }
+            slot.deliver(&commit_pos, gtid);
+        }
+        affected.push((mkey, member, kind, slot));
+    }
+    for (mkey, member, kind, slot) in affected {
         match kind {
             StatementKind::Truncate => {
-                let commit_pos = BinlogPosition::new(current_file.to_string(), event_end_pos);
-                if !slot.routes(&commit_pos, source.ack.routing_gtid(gtid)) {
-                    continue;
-                }
                 member.metrics.inc_truncate();
                 member.metrics.inc_transaction();
                 record_watermark(&member.metrics, commit_ts);
@@ -2395,7 +2420,6 @@ async fn handle_statement(
                     batch,
                     is_ready,
                 );
-                slot.deliver(&commit_pos, gtid);
                 match deliver_to_member(
                     &member.metrics,
                     &member.sender,
@@ -2997,9 +3021,9 @@ mod tests {
         receiver: mpsc::Receiver<std::result::Result<ChangeEnvelope, StreamError>>,
     }
 
-    fn source_with_member(member_key: &MemberKey) -> TestMember {
+    fn test_source() -> Arc<SharedSource> {
         let params = test_params();
-        let source = Arc::new(SharedSource {
+        Arc::new(SharedSource {
             key: SourceKey {
                 host: "localhost".to_string(),
                 port: 3306,
@@ -3008,7 +3032,7 @@ mod tests {
                 ssl: None,
                 server_id: params.server_id,
             },
-            params: params.clone(),
+            params,
             setup_lock: tokio::sync::Mutex::new(()),
             members: Mutex::new(HashMap::new()),
             ack: Arc::new(AckTable::default()),
@@ -3016,11 +3040,17 @@ mod tests {
             restart_requested: AtomicBool::new(false),
             dead: AtomicBool::new(false),
             detached: Mutex::new(HashSet::new()),
-        });
-        let (sender, receiver) = mpsc::channel(8);
-        let position_store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
-        let member = Arc::new(MemberHandle {
-            dataset_name: "orders".to_string(),
+        })
+    }
+
+    fn test_member(
+        dataset_name: &str,
+        sender: mpsc::Sender<std::result::Result<ChangeEnvelope, StreamError>>,
+        position_store: &Arc<MemoryPositionStore>,
+    ) -> Arc<MemberHandle> {
+        let params = test_params();
+        Arc::new(MemberHandle {
+            dataset_name: dataset_name.to_string(),
             primary_keys: vec!["id".to_string()],
             column_type_changes: ColumnTypeChanges::Keep,
             layout: Mutex::new(Arc::new(MemberLayout {
@@ -3053,11 +3083,18 @@ mod tests {
             sender,
             metrics: MetricsCollector::new(),
             ready_lag: params.ready_lag,
-            position_store: Arc::clone(&position_store) as Arc<dyn PositionStore>,
+            position_store: Arc::clone(position_store) as Arc<dyn PositionStore>,
             checkpoint_schema_json: None,
             cursor_type: CursorType::File,
             snapshot_mode: params.snapshot_mode,
-        });
+        })
+    }
+
+    fn source_with_member(member_key: &MemberKey) -> TestMember {
+        let source = test_source();
+        let (sender, receiver) = mpsc::channel(8);
+        let position_store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
+        let member = test_member("orders", sender, &position_store);
         lock(&source.members).insert(member_key.clone(), Arc::clone(&member));
         // A streaming member: the rebuild is what puts it back into SNAPSHOTTING.
         source
@@ -4117,5 +4154,125 @@ mod tests {
         let gtid = Some(gtid_of(SRC_A, 1));
         assert!(!slot.routes(&pos("binlog.000001", 400), ack.routing_gtid(gtid)));
         assert!(slot.routes(&pos("binlog.000001", 600), ack.routing_gtid(gtid)));
+    }
+
+    /// A table map for `db.t` (`BIGINT`, `VARCHAR(64)`) and a rows event, both
+    /// for `table_id`, parsed from their wire bytes. `deliver_commit` hands the
+    /// rows on without decoding them, so the rows event carries none.
+    fn table_events(table_id: u8) -> (Arc<TableMapEvent<'static>>, RowsEventData<'static>) {
+        use mysql_common::binlog::BinlogCtx;
+        use mysql_common::binlog::consts::{BinlogVersion, EventType};
+        use mysql_common::binlog::events::{FormatDescriptionEvent, WriteRowsEvent};
+        use mysql_common::io::ParseBuf;
+        use mysql_common::proto::MyDeserialize;
+
+        let fde = FormatDescriptionEvent::new(BinlogVersion::Version4);
+        // Table id (6 bytes), flags (2), `db` and `t` each NUL-terminated, two
+        // columns typed LONGLONG (8) and VARCHAR (15), the VARCHAR's maximum
+        // length as metadata, and the null bitmap.
+        let table_map = [
+            table_id, 0, 0, 0, 0, 0, 0, 0, 2, b'd', b'b', 0, 1, b't', 0, 2, 8, 15, 2, 64, 0, 0b10,
+        ];
+        let tme = TableMapEvent::deserialize(
+            BinlogCtx::new(table_map.len(), &fde, EventType::TABLE_MAP_EVENT as u8),
+            &mut ParseBuf(&table_map),
+        )
+        .expect("parse the table map")
+        .into_owned();
+        // Table id (6 bytes), flags (2), the extra-data length (2, so none),
+        // two columns, both present.
+        let rows = [table_id, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0b11];
+        let rows = WriteRowsEvent::deserialize(
+            BinlogCtx::new(rows.len(), &fde, EventType::WRITE_ROWS_EVENT as u8),
+            &mut ParseBuf(&rows),
+        )
+        .expect("parse the rows event")
+        .into_owned();
+        (Arc::new(tme), RowsEventData::WriteRowsEvent(rows))
+    }
+
+    /// A shutdown abandons a transaction's delivery at a member whose channel
+    /// stays full, so the members after it are never handed the transaction.
+    /// The pump then still credits the transaction (the idle safe-advance after
+    /// a commit) before it saves every member's position. A member that was
+    /// never handed the transaction must not be credited it, or the restart
+    /// resumes it past changes it never applied.
+    #[tokio::test(start_paused = true)]
+    async fn a_delivery_abandoned_on_shutdown_credits_no_member_the_transaction() {
+        for gtid_positioned in [true, false] {
+            let source = test_source();
+            source.ack.set_gtid_positioned(gtid_positioned);
+            let floor = pos("binlog.000001", 100);
+            let seed = gtids(&format!("{SRC_A}:1"));
+            let position_store = Arc::new(MemoryPositionStore::default());
+            let mut routes = FxHashMap::default();
+            let mut txn = FxHashMap::default();
+            let mut receivers = Vec::new();
+            for (table_id, name) in [(1_u8, "a"), (2, "b")] {
+                let member_key = key("db", name);
+                // Both channels are full, so whichever member the delivery
+                // reaches first stalls until the shutdown abandons it, and the
+                // other is never reached.
+                let (sender, receiver) = mpsc::channel(1);
+                sender
+                    .try_send(Err(StreamError::External("occupies the channel".into())))
+                    .expect("the channel starts empty");
+                receivers.push(receiver);
+                let member = test_member(name, sender, &position_store);
+                lock(&source.members).insert(member_key.clone(), Arc::clone(&member));
+                source
+                    .ack
+                    .register_with_gtid(&member_key, floor.clone(), seed.clone(), false);
+                let (tme, rows) = table_events(table_id);
+                let layout = Arc::clone(&lock(&member.layout));
+                let slot = source.ack.slot(&member_key).expect("slot");
+                routes.insert(
+                    u64::from(table_id),
+                    Route {
+                        key: member_key,
+                        member,
+                        slot,
+                        tme,
+                        layout,
+                    },
+                );
+                txn.insert(u64::from(table_id), vec![rows]);
+            }
+            source.ack.promote_ready_members();
+
+            let commit_pos = pos("binlog.000001", 500);
+            let gtid = gtid_of(SRC_A, 2);
+            // The epoch the pump captured at its start is no longer current:
+            // shutdown has been signalled.
+            let shutdown_epoch = crate::cdc::shutdown_epoch().wrapping_add(1);
+            deliver_commit(
+                &source,
+                &routes,
+                txn,
+                &commit_pos,
+                None,
+                shutdown_epoch,
+                Some(gtid),
+            )
+            .await;
+            // The idle safe-advance the event loop runs after the commit.
+            source.ack.credit_idle(&commit_pos, Some(gtid));
+
+            for route in routes.values() {
+                let name = &route.member.dataset_name;
+                // What `persisted_for` saves.
+                assert_eq!(
+                    route.slot.committed(),
+                    floor,
+                    "{name} (GTID-positioned: {gtid_positioned}) must resume before the transaction"
+                );
+                assert_eq!(
+                    route.slot.gtid_snapshot(),
+                    seed,
+                    "{name} (GTID-positioned: {gtid_positioned}) must not hold the transaction"
+                );
+            }
+            drop(receivers);
+        }
     }
 }
