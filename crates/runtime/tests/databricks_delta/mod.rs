@@ -42,8 +42,12 @@ fn get_params() -> Params {
                 "${ env:TEST_DATABRICKS_HOST }".to_string(),
             ),
             (
-                "databricks_token".to_string(),
-                "${ env:TEST_DATABRICKS_TOKEN }".to_string(),
+                "databricks_client_id".to_string(),
+                "${ env:DATABRICKS_OIDC_CLIENT_ID }".to_string(),
+            ),
+            (
+                "databricks_token_audience".to_string(),
+                "${ env:DATABRICKS_OIDC_AUDIENCE }".to_string(),
             ),
             (
                 "databricks_aws_secret_access_key".to_string(),

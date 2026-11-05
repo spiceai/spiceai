@@ -1,0 +1,42 @@
+version: v1
+kind: Spicepod
+name: databricks[spark_connect]-arrow
+datasets:
+  - from: databricks:spiceai_sandbox.tpch.customer
+    name: customer
+    params: &databricks_spark_params
+      mode: spark_connect
+      databricks_endpoint: ${ env:DATABRICKS_HOST }
+      databricks_cluster_id: ${ env:DATABRICKS_CLUSTER_ID }
+      databricks_client_id: ${ env:DATABRICKS_OIDC_CLIENT_ID }
+      databricks_token_audience: ${ env:DATABRICKS_OIDC_AUDIENCE }
+    acceleration: &acceleration
+      enabled: true
+      engine: arrow
+  - from: databricks:spiceai_sandbox.tpch.lineitem
+    name: lineitem
+    params: *databricks_spark_params
+    acceleration: *acceleration
+  - from: databricks:spiceai_sandbox.tpch.nation
+    name: nation
+    params: *databricks_spark_params
+    acceleration: *acceleration
+  - from: databricks:spiceai_sandbox.tpch.orders
+    name: orders
+    params: *databricks_spark_params
+    acceleration: *acceleration
+  - from: databricks:spiceai_sandbox.tpch.part
+    name: part
+    params: *databricks_spark_params
+  - from: databricks:spiceai_sandbox.tpch.partsupp
+    name: partsupp
+    params: *databricks_spark_params
+    acceleration: *acceleration
+  - from: databricks:spiceai_sandbox.tpch.region
+    name: region
+    params: *databricks_spark_params
+    acceleration: *acceleration
+  - from: databricks:spiceai_sandbox.tpch.supplier
+    name: supplier
+    params: *databricks_spark_params
+    acceleration: *acceleration

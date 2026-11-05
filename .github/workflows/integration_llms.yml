@@ -55,6 +55,7 @@ env:
 
 jobs:
   setup-matrix:
+    environment: secret-free
     name: Setup strategy matrix
     runs-on: spiceai-dev-runners
     # Evaluates one inline script.
@@ -363,6 +364,7 @@ jobs:
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
   llama-cpp-engine:
+    environment: secret-free
     name: llama.cpp engine (Qwen3-0.6B GGUF)
     # The engine's model, differential and greedy-pick tests download Qwen3-0.6B (639 MB), its
     # MTP tests Qwen3.5-0.8B (550 MB), and its content-part tests both, from Hugging Face and run

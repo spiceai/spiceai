@@ -52,6 +52,9 @@ use crate::{
     embeddings::{Embed, FailedToCreateEmbeddingSnafu, HealthCheckSnafu, Result},
 };
 
+/// The path of a serving endpoint's invocations, relative to the client's base URL.
+const INVOCATIONS_PATH: &str = "/invocations";
+
 /// [`Databricks`] is provides both [`Chat`] and [`Embed`] capabilities for Databricks models.
 pub struct Databricks {
     pub model: String,
@@ -173,8 +176,7 @@ pub fn from_access_token(
     user_agent: Option<&'static str>,
 ) -> Databricks {
     let mut cfg = HostedModelConfig::from_url(
-        format!("https://token:{access_token}@{endpoint}/serving-endpoints/{model}/invocations")
-            .as_str(),
+        format!("https://token:{access_token}@{endpoint}/serving-endpoints/{model}").as_str(),
     );
 
     if let Some(user_agent) = user_agent {
@@ -197,7 +199,7 @@ pub fn from_token_provider(
     health_check: HealthCheck,
 ) -> Databricks {
     let mut cfg = HostedModelConfig::from_url(
-        format!("https://{endpoint}/serving-endpoints/{model}/invocations").as_str(),
+        format!("https://{endpoint}/serving-endpoints/{model}").as_str(),
     )
     .with_auth(GenericAuthMechanism::from_bearer_token_provider(
         token_provider,
@@ -332,7 +334,7 @@ impl Chat for Databricks {
         > = self
             .client
             .chat()
-            .path("")?
+            .path(INVOCATIONS_PATH)?
             .create_stream_byot(altered_req)
             .await?;
         Ok(Box::pin(stream.map_ok(Into::into)))
@@ -342,10 +344,11 @@ impl Chat for Databricks {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        // Must use `create_byot` with empty path to avoid concatenation of `chat/completions`.
+        // Must use `create_byot` with the invocations path to avoid concatenation of
+        // `chat/completions`.
         self.client
             .chat()
-            .path("")?
+            .path(INVOCATIONS_PATH)?
             .create_byot(self.alter_request_body(req, false)?)
             .await
     }
@@ -384,11 +387,11 @@ impl Embed for Databricks {
             return Ok(std::sync::Arc::clone(response));
         }
 
-        // Must use `create_byot` with empty path to avoid concatenation of `/embeddings`.
+        // Must use `create_byot` with the invocations path to avoid concatenation of `/embeddings`.
         let response: CreateEmbeddingResponse = self
             .client
             .embeddings()
-            .path("")
+            .path(INVOCATIONS_PATH)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
             .context(FailedToCreateEmbeddingSnafu)?
             .create_byot(req.clone())
@@ -469,6 +472,75 @@ impl std::fmt::Debug for Databricks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A model that sends requests to `server`, as a serving endpoint named `model`.
+    fn model_at(server: &MockServer) -> Databricks {
+        let config =
+            HostedModelConfig::from_url(&format!("{}/serving-endpoints/model", server.uri()))
+                .with_bearer_token(Some("token"));
+        Databricks {
+            model: "model".to_string(),
+            client: crate::provider::client_without_retry(config),
+            health_check: HealthCheck::Required,
+            cache: None,
+        }
+    }
+
+    async fn serve(server: &MockServer, body: &Value) {
+        Mock::given(method("POST"))
+            .and(path("/serving-endpoints/model/invocations"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_chat_model_calls_the_invocations_path_of_its_serving_endpoint() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            &json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "model",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "pong"},
+                }],
+            }),
+        )
+        .await;
+
+        Chat::health(&model_at(&server))
+            .await
+            .expect("the health check reaches the serving endpoint");
+    }
+
+    #[tokio::test]
+    async fn an_embedding_model_calls_the_invocations_path_of_its_serving_endpoint() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            &json!({
+                "object": "list",
+                "model": "model",
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.1]}],
+                "usage": {"prompt_tokens": 1, "total_tokens": 1},
+            }),
+        )
+        .await;
+
+        Embed::health(&model_at(&server))
+            .await
+            .expect("the health check reaches the serving endpoint");
+    }
 
     #[test]
     fn prompt_cache_control_is_added_to_last_text_message() {
