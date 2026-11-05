@@ -57,9 +57,6 @@ paths:
     ignore:
       # `queue: max`, as under `e2e_test_ci.yml` above.
       - 'unexpected key "queue" for "concurrency" section'
-  .github/workflows/spiced_docker.yml:
-    ignore:
-      - 'anchor ".+" is defined but not used'
   .github/workflows/testoperator_dispatch.yml:
     ignore:
       - 'constant expression "false" in condition'

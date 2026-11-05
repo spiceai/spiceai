@@ -9,6 +9,9 @@ ARG BINARY_VARIANT=default
 ARG TARGETOS
 ARG TARGETARCH
 ARG GITHUB_REPOSITORY=spiceai/spiceai
+# sha256 of the downloaded release asset. When set, the build fails on any
+# other file. spiced_docker.yml passes the sha256 publish_release recorded.
+ARG SPICED_SHA256=
 
 RUN if [ -z "$REL_VERSION" ]; then echo "REL_VERSION build-arg is required" >&2; exit 1; fi
 
@@ -47,6 +50,7 @@ RUN set -eux; \
         exit 1; \
       fi; \
     fi; \
+    if [ -n "${SPICED_SHA256}" ]; then echo "${SPICED_SHA256}  /tmp/spiced.tar.gz" | sha256sum -c -; fi; \
     tar -C /root -xzf /tmp/spiced.tar.gz; \
     chmod +x /root/spiced; \
     rm -f /tmp/spiced.tar.gz

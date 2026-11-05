@@ -1,5 +1,9 @@
-name: build_and_release
+name: build_release
 
+# Builds the binaries. A tag run builds every release binary, CUDA included, on
+# GitHub-hosted runners and keeps them as artifacts of this run with a
+# SHA256SUMS manifest; it publishes nothing. publish_release publishes them to
+# the GitHub release after approval.
 on:
   push:
     # Release branches build for the same reason trunk does: the `build` job uploads
@@ -7,8 +11,7 @@ on:
     # `testoperator dispatch` has for a branch's binary. Without it the dispatch
     # walks back ten commits, finds nothing, and the branch silently loses its
     # benchmark coverage. `setup-matrix` already recognizes release branches; only
-    # the trigger was missing. Releasing stays tag-gated — the `publish` job runs
-    # for `refs/tags/v*` alone.
+    # the trigger was missing.
     branches:
       - trunk
       - release/**
@@ -496,118 +499,64 @@ jobs:
           source_path: spice_linux_x86_64.tar.gz
           destination_path: spice-minio/artifacts/spice/linux-x86_64/${{ github.sha }}/
 
-  publish:
-    name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
-    needs: build
-    if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
-    env:
-      ARTIFACT_DIR: ./release
-
-    strategy:
-      matrix:
-        include:
-          - target_os: linux
-            target_arch: x86_64
-          - target_os: linux
-            target_arch: aarch64
-          - target_os: darwin
-            target_arch: aarch64
-          - target_os: windows
-            target_arch: x86_64
-
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Set REL_VERSION from version.txt
-        run: python3 ./.github/scripts/get_release_version.py
-
-      - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        with:
-          name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        with:
-          name: spice.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        with:
-          name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      # macOS metal variant
-      - name: download artifacts - spiced_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'darwin'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        with:
-          name: spiced_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: lists artifacts
-        run: ls -l ${{ env.ARTIFACT_DIR }}
-
-      - name: publish ${{ matrix.target_os }}/${{ matrix.target_arch }} binaries to github
-        run: |
-          # Parse repository to get owner and repo names
-          OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
-          REPO_NAME="${GITHUB_REPOSITORY#*/}"
-          export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
-          # Get the list of files
-          RELEASE_ARTIFACT=(${ARTIFACT_DIR}/*)
-          # Delete existing release artifact
-          python ./.github/scripts/github_release.py delete \
-            --owner $OWNER_NAME --repo $REPO_NAME \
-            --tag "v${{ env.REL_VERSION }}" \
-            ${RELEASE_ARTIFACT[*]}
-          # Pass the notes by path, not by value: a release body over 128 KiB
-          # exceeds MAX_ARG_STRLEN and the exec fails with E2BIG (exit 126)
-          # after every build has already succeeded.
-          if [ "$HAS_RELEASE_NOTES" = "true" ]; then
-            BODY_ARGS=(--body-file "./docs/release_notes/v${{ env.REL_VERSION }}.md")
-          else
-            BODY_ARGS=(--body "This is the release candidate ${{ env.REL_VERSION }}")
-          fi
-          echo "Uploading Spice.ai Binaries to GitHub Release"
-          python ./.github/scripts/github_release.py upload \
-            --owner $OWNER_NAME --repo $REPO_NAME \
-            --tag "v${{ env.REL_VERSION }}" \
-            --release-name "v${{ env.REL_VERSION }}" \
-            "${BODY_ARGS[@]}" \
-            --prerelease "$PRE_RELEASE" \
-            ${RELEASE_ARTIFACT[*]}
-
-  # A release's images are built from the binaries the `publish` jobs above
-  # attach to its GitHub release, so they can only be built after those jobs
-  # finish. The `release: published` event fires when the tag is created, hours
-  # too early, which is why spiced_docker no longer listens for it.
-  #
-  # Stable releases are built here too. Marking a release 'latest' still fires
-  # spiced_docker's `release: edited` trigger, but that alone misses two cases:
-  # a release marked 'latest' before its binaries exist (that run 404s), and a
-  # release created already 'latest', which fires no `edited` event at all.
-  # The called run applies ':latest' only when GitHub already marks the release
-  # latest (`tag_latest` defaults to auto), so a release that is not the latest
-  # one never takes the tag from here.
-  docker-release:
-    name: Docker images for the release
-    needs: publish
+  # The CUDA binaries of a tag are built in this run, so one run holds every
+  # binary publish_release needs. Trunk pushes build CUDA in
+  # build_and_release_cuda's own runs.
+  build-cuda:
+    name: Build CUDA binaries
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
-      contents: write
-      packages: write
-      id-token: write
-    uses: ./.github/workflows/spiced_docker.yml
-    with:
-      release_tag: ${{ github.ref_name }}
-      publish: true
-    secrets: inherit
+      contents: read
+    uses: ./.github/workflows/build_and_release_cuda.yml
+
+  # publish_release checks every artifact against this manifest before it
+  # publishes, and publishes exactly the files it lists. A tag run that misses
+  # a release binary fails here, so publish_release never finds it.
+  checksums:
+    name: Record release checksums
+    needs: [build, build-cuda]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Write SHA256SUMS
+        working-directory: release
+        run: |
+          set -euo pipefail
+          # The ODBC build is for internal testing and has never been a release asset.
+          assets=(
+            spice_linux_x86_64.tar.gz
+            spice_linux_aarch64.tar.gz
+            spice_darwin_aarch64.tar.gz
+            spice.exe_windows_x86_64.tar.gz
+            spiced_linux_x86_64.tar.gz
+            spiced_linux_aarch64.tar.gz
+            spiced_darwin_aarch64.tar.gz
+            spiced_metal_darwin_aarch64.tar.gz
+            spiced_cuda_80_linux_x86_64.tar.gz
+            spiced_cuda_86_linux_x86_64.tar.gz
+            spiced_cuda_87_linux_x86_64.tar.gz
+            spiced_cuda_89_linux_x86_64.tar.gz
+            spiced_cuda_90_linux_x86_64.tar.gz
+          )
+          missing=()
+          for asset in "${assets[@]}"; do
+            [ -f "$asset" ] || missing+=("$asset")
+          done
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::This run did not build ${missing[*]}, so it cannot be published. A tag build must build every platform: run it without platform, tag or compute-capability filters."
+            exit 1
+          fi
+          sha256sum "${assets[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-sha256sums
+          path: release/SHA256SUMS
+          if-no-files-found: error

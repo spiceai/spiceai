@@ -41,7 +41,12 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
 ## Release Publication Steps
 
 - [ ] Cherry-pick release notes onto the release branch.
-- [ ] Create a **pre-release** [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with a tag (e.g. `v1.0.1`). Leave the body empty so automation can populate it from the checked-in notes.
+- [ ] Push the release tag (e.g. `v1.0.1`) to the release branch commit that passed testing. `version.txt` at that commit must match the tag, or the build fails.
+- [ ] Check that the [build_release](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) run for the tag is green. It builds every binary, CUDA included, and publishes nothing.
+- [ ] Create a **draft** [GitHub Release](https://github.com/spiceai/spiceai/releases/new) for the tag. Leave the body empty to use the checked-in notes, or write the notes in the draft.
+- [ ] Start [publish_release](https://github.com/spiceai/spiceai/actions/workflows/publish_release.yml) on the tag (**Use workflow from** > **Tags** > the release tag).
+- [ ] Get one approval of its `publish` job from a release approver other than the person who started it. The run then attaches the binaries, publishes the release, and builds and pushes the Docker images. A stable release that is the highest version becomes the latest release and moves the `latest` Docker tags; a pre-release never does. To retry a failed step, re-run the failed jobs of the same run.
+- [ ] Check the published release assets and the `spiceai/spiceai` and `ghcr.io/spiceai/spiceai` image tags.
 - [ ] Perform a final test pass on the released binaries and Docker images.
 - [ ] Notify that the OSS release is complete and ready for communications in the release coordination channel.
 
