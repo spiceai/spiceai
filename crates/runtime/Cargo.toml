@@ -268,8 +268,8 @@ aws-credential-types = { workspace = true, features = [
 aws-sdk-dynamodb.workspace = true
 # Used directly by the `tests/cosmosdb` integration suite to create the emulator's
 # database and container; the same version and features as `connector-cosmosdb`.
-azure_core = "1.1.0"
-azure_data_cosmos = { version = "1.0.0", default-features = false, features = [
+azure_core = "0.31.0"
+azure_data_cosmos = { version = "0.30.0", default-features = false, features = [
     "hmac_rust",
     "key_auth",
 ] }

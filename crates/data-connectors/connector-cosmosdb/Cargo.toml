@@ -12,8 +12,8 @@ arrow.workspace = true
 data-connector-api = { path = "../../data-connector-api" }
 linkme.workspace = true
 async-trait.workspace = true
-azure_core = "1.1.0"
-azure_data_cosmos = { version = "1.0.0", default-features = false, features = [
+azure_core = "0.31.0"
+azure_data_cosmos = { version = "0.30.0", default-features = false, features = [
     "hmac_rust",
     "key_auth",
 ] }
