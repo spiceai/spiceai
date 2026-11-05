@@ -293,6 +293,10 @@ fn generate(spec: &mut Mtp<'_>, prompt: &[Token], steps: usize) -> (Vec<Vec<Toke
         drafts.push(draft);
         id = next;
     }
+    assert!(
+        drafts.iter().any(|d| !d.is_empty()),
+        "at least one draft must be non-empty so the regression guards exercise drafting"
+    );
     (drafts, reply)
 }
 
@@ -457,5 +461,9 @@ fn generate_after_read(
         drafts.push(draft);
         id = next;
     }
+    assert!(
+        drafts.iter().any(|d| !d.is_empty()),
+        "at least one draft must be non-empty so the regression guards exercise drafting"
+    );
     (drafts, reply)
 }
