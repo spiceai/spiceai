@@ -54,6 +54,7 @@ use datafusion::logical_expr::{
     Accumulator, AggregateUDF, AggregateUDFImpl, Documentation, EmitTo, GroupsAccumulator,
     ReversedUDAF, SetMonotonicity, Signature, StatisticsArgs,
 };
+use datafusion::physical_expr::NullState;
 
 use super::is_checked_sum_return_type;
 
@@ -409,7 +410,8 @@ fn fold_distinct_u64(values: &HashSet<u64>) -> Result<ScalarValue> {
 }
 
 /// Values per lane pass in [`exact_sum_i64`] and [`exact_sum_u64`]. Each value
-/// adds less than 2^32 to a lane, so 2^31 of them keep every lane below 2^63.
+/// adds less than 2^32 to a `u64` lane, so no lane can overflow in a chunk of
+/// 2^31 values.
 const EXACT_SUM_CHUNK: usize = 1 << 31;
 
 /// Mask of the low 32 bits of a `u64`.
@@ -466,7 +468,7 @@ fn exact_sum_u64_in_chunks(values: &[u64], chunk_len: usize) -> u128 {
 }
 
 /// The `Int64` / `UInt64` input of a [`CheckedSumGroups`].
-trait CheckedSumInput: ArrowPrimitiveType + Sized {
+trait CheckedSumInput: ArrowPrimitiveType + Send + Sized {
     fn values_of(array: &ArrayRef) -> Result<&PrimitiveArray<Self>>;
 
     fn widen(value: Self::Native) -> i128;
@@ -531,46 +533,70 @@ impl CheckedSumInput for UInt64Type {
 /// before 2^64 values reach one group; every add is still checked, and
 /// [`GroupsAccumulator::evaluate`] is the only narrowing point, as in
 /// [`CheckedInt64Sum`]. The partial state is the row accumulators':
-/// `Decimal128(38, 0)`, null for a group that has seen no value.
+/// `Decimal128(38, 0)`, null for a group that has seen no value. As for the
+/// built-in `SUM`, [`NullState`] tracks which groups have seen a value.
 #[derive(Debug)]
 struct CheckedSumGroups<T: CheckedSumInput> {
+    /// One total per group; 0 for a group that has seen no value.
     sums: Vec<i128>,
-    /// Whether each group has seen a non-null value. A group that has not
-    /// sums to null.
-    seen: Vec<bool>,
-    /// `fn() -> T` keeps the accumulator `Send` whatever `T` is.
-    input: PhantomData<fn() -> T>,
+    null_state: NullState,
+    input: PhantomData<T>,
 }
 
 impl<T: CheckedSumInput> CheckedSumGroups<T> {
     fn new() -> Self {
         Self {
             sums: Vec::new(),
-            seen: Vec::new(),
+            null_state: NullState::new(),
             input: PhantomData,
         }
     }
 
-    fn resize(&mut self, total_num_groups: usize) {
+    /// Adds each non-null row of `values` that `opt_filter` keeps to its
+    /// group. `widen` gives the amount a value adds, or `None` when the value
+    /// is out of range for `T`.
+    fn accumulate<V: ArrowPrimitiveType + Send>(
+        &mut self,
+        values: &PrimitiveArray<V>,
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+        widen: impl Fn(V::Native) -> Option<i128> + Send + Sync,
+    ) -> Result<()> {
+        ensure_rows(values.len(), group_indices.len(), "group indices")?;
+        if let Some(filter) = opt_filter {
+            ensure_rows(values.len(), filter.len(), "filter values")?;
+        }
         self.sums.resize(total_num_groups, 0);
-        self.seen.resize(total_num_groups, false);
-    }
-
-    fn add(&mut self, group: usize, value: i128) -> Result<()> {
-        let groups = self.sums.len();
-        let (Some(sum), Some(seen)) = (self.sums.get_mut(group), self.seen.get_mut(group)) else {
-            return internal_err!("checked SUM got group index {group} for {groups} groups");
-        };
-        *sum = sum.checked_add(value).ok_or_else(T::overflow)?;
-        *seen = true;
+        let sums = &mut self.sums;
+        let mut overflow = false;
+        let mut bad_group = None;
+        self.null_state.accumulate(
+            group_indices,
+            values,
+            opt_filter,
+            total_num_groups,
+            |group, value| {
+                let Some(sum) = sums.get_mut(group) else {
+                    bad_group = Some(group);
+                    return;
+                };
+                if let Some(total) = widen(value).and_then(|wide| sum.checked_add(wide)) {
+                    *sum = total;
+                } else {
+                    overflow = true;
+                }
+            },
+        );
+        if let Some(group) = bad_group {
+            return internal_err!(
+                "checked SUM got group index {group} for {total_num_groups} groups"
+            );
+        }
+        if overflow {
+            return Err(T::overflow());
+        }
         Ok(())
-    }
-
-    /// Takes the totals and the null mask of the groups `emit_to` names.
-    fn take(&mut self, emit_to: EmitTo) -> (Vec<i128>, NullBuffer) {
-        let sums = emit_to.take_needed(&mut self.sums);
-        let seen = emit_to.take_needed(&mut self.seen);
-        (sums, NullBuffer::from(seen))
     }
 }
 
@@ -597,25 +623,13 @@ impl<T: CheckedSumInput> GroupsAccumulator for CheckedSumGroups<T> {
         total_num_groups: usize,
     ) -> Result<()> {
         let values = T::values_of(first_array(values)?)?;
-        ensure_rows(values.len(), group_indices.len(), "group indices")?;
-        if let Some(filter) = opt_filter {
-            ensure_rows(values.len(), filter.len(), "filter values")?;
-        }
-        self.resize(total_num_groups);
-        if values.null_count() == 0 && opt_filter.is_none() {
-            for (&group, &value) in group_indices.iter().zip(values.values().iter()) {
-                self.add(group, T::widen(value))?;
-            }
-            return Ok(());
-        }
-        for (row, &group) in group_indices.iter().enumerate() {
-            let selected = values.is_valid(row)
-                && opt_filter.is_none_or(|filter| filter.is_valid(row) && filter.value(row));
-            if selected {
-                self.add(group, T::widen(values.value(row)))?;
-            }
-        }
-        Ok(())
+        self.accumulate(
+            values,
+            group_indices,
+            opt_filter,
+            total_num_groups,
+            |value| Some(T::widen(value)),
+        )
     }
 
     fn merge_batch(
@@ -625,40 +639,29 @@ impl<T: CheckedSumInput> GroupsAccumulator for CheckedSumGroups<T> {
         total_num_groups: usize,
     ) -> Result<()> {
         let partials = decimal128_values(first_array(values)?)?;
-        ensure_rows(partials.len(), group_indices.len(), "group indices")?;
-        self.resize(total_num_groups);
-        for (row, &group) in group_indices.iter().enumerate() {
-            if partials.is_null(row) {
-                continue;
-            }
-            let partial = partials.value(row);
-            if !T::partial_in_range(partial) {
-                return Err(T::overflow());
-            }
-            self.add(group, partial)?;
-        }
-        Ok(())
+        self.accumulate(partials, group_indices, None, total_num_groups, |partial| {
+            T::partial_in_range(partial).then_some(partial)
+        })
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
-        let (sums, nulls) = self.take(emit_to);
-        let mut totals = Vec::with_capacity(sums.len());
-        for (row, &sum) in sums.iter().enumerate() {
-            if nulls.is_valid(row) {
-                totals.push(T::narrow(sum).ok_or_else(T::overflow)?);
-            } else {
-                totals.push(T::Native::default());
-            }
-        }
+        let sums = emit_to.take_needed(&mut self.sums);
+        let nulls = self.null_state.build(emit_to);
+        // A group that has seen no value holds 0, so every total narrows.
+        let totals = sums
+            .into_iter()
+            .map(|sum| T::narrow(sum).ok_or_else(T::overflow))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Arc::new(PrimitiveArray::<T>::try_new(
             totals.into(),
-            Some(nulls),
+            nulls,
         )?))
     }
 
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
-        let (sums, nulls) = self.take(emit_to);
-        Ok(vec![decimal_state(sums, Some(nulls))?])
+        let sums = emit_to.take_needed(&mut self.sums);
+        let nulls = self.null_state.build(emit_to);
+        Ok(vec![decimal_state(sums, nulls)?])
     }
 
     /// Each row becomes its own partial total: the widened value, or null
@@ -678,17 +681,19 @@ impl<T: CheckedSumInput> GroupsAccumulator for CheckedSumGroups<T> {
             None => values.nulls().cloned(),
             Some(filter) => {
                 ensure_rows(values.len(), filter.len(), "filter values")?;
-                let selected: Vec<bool> = (0..values.len())
-                    .map(|row| values.is_valid(row) && filter.is_valid(row) && filter.value(row))
-                    .collect();
-                Some(NullBuffer::from(selected))
+                // A null filter value drops the row, as `false` does.
+                let kept = filter.nulls().map_or_else(
+                    || filter.values().clone(),
+                    |filter_nulls| filter_nulls.inner() & filter.values(),
+                );
+                NullBuffer::union(values.nulls(), Some(&NullBuffer::new(kept)))
             }
         };
         Ok(vec![decimal_state(sums, nulls)?])
     }
 
     fn size(&self) -> usize {
-        self.sums.capacity() * size_of::<i128>() + self.seen.capacity()
+        self.sums.capacity() * size_of::<i128>() + self.null_state.size()
     }
 }
 
@@ -1701,11 +1706,7 @@ mod state_tests {
             .expect_err("MAX+1 must overflow at evaluate");
         assert_eq!(error.to_string(), uint64_overflow().to_string());
 
-        let negative: ArrayRef = Arc::new(
-            PrimitiveArray::<Decimal128Type>::from(vec![Some(-1_i128)])
-                .with_precision_and_scale(CHECKED_SUM_STATE_PRECISION, CHECKED_SUM_STATE_SCALE)
-                .expect("decimal state"),
-        );
+        let negative = decimal_state(vec![-1], None).expect("decimal state");
         let mut rejected = CheckedSumGroups::<UInt64Type>::new();
         let error = rejected
             .merge_batch(&[negative], &[0], 1)
