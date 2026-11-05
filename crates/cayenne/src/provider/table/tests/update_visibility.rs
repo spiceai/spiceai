@@ -33,9 +33,7 @@ fn schema() -> SchemaRef {
 
 const ROWS: i64 = 20;
 
-async fn seeded(
-    mode: DeletionMode,
-) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+async fn seeded(mode: DeletionMode) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
     let runtime_env = SessionContext::new().runtime_env();
     let (provider, catalog, dir) = create_cdc_table_with_schema(
         "t",
@@ -119,7 +117,11 @@ async fn read(provider: &CayenneTableProvider, value: &str) -> (i64, i64, i64) {
 /// UPDATE already rewrote (the delete leg's tombstone count missed those).
 #[tokio::test(flavor = "multi_thread")]
 async fn update_counts_matched_rows_after_earlier_updates() {
-    for mode in [DeletionMode::Auto, DeletionMode::Key, DeletionMode::Position] {
+    for mode in [
+        DeletionMode::Auto,
+        DeletionMode::Key,
+        DeletionMode::Position,
+    ] {
         let (provider, _catalog, _dir) = seeded(mode).await;
         let mut wrong = Vec::new();
         for step in 0..60_i64 {
@@ -141,7 +143,11 @@ async fn update_counts_matched_rows_after_earlier_updates() {
 /// the matched rows tombstoned without their replacements.
 #[tokio::test(flavor = "multi_thread")]
 async fn update_is_invisible_until_its_single_publish() {
-    for mode in [DeletionMode::Auto, DeletionMode::Key, DeletionMode::Position] {
+    for mode in [
+        DeletionMode::Auto,
+        DeletionMode::Key,
+        DeletionMode::Position,
+    ] {
         let (provider, _catalog, _dir) = seeded(mode).await;
         let (reached_tx, reached) = tokio::sync::oneshot::channel::<()>();
         let release = Arc::new(tokio::sync::Notify::new());
