@@ -82,6 +82,7 @@ pub struct Mtp<'m> {
     draft: Context<'m>,
     target: Context<'m>,
     n_max: usize,
+    kind: DraftKind,
 }
 
 // SAFETY: the drafting state, like the contexts it drives, is used by one thread at a time,
@@ -123,7 +124,14 @@ impl<'m> Mtp<'m> {
             draft,
             target,
             n_max: usize::try_from(mtp.n_max).unwrap_or(0),
+            kind: mtp.kind,
         })
+    }
+
+    /// What kind of draft model drafts.
+    #[must_use]
+    pub fn kind(&self) -> DraftKind {
+        self.kind
     }
 
     #[must_use]

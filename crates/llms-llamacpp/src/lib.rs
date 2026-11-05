@@ -1409,7 +1409,10 @@ impl<'m> Target<'m> for Mtp<'m> {
         self.process(batch).map_err(|e| e.to_string())
     }
     fn has_head(&self) -> bool {
-        true
+        // Only an MTP head pairs a token with the hidden state before it and carries that state
+        // from one read to the next. A DFlash or DSpark drafter reads its features from the batch
+        // in hand, and keeps no state to save, so its prompt cache reuses what it shares.
+        self.kind() == DraftKind::Mtp
     }
     fn head_state(&mut self) -> Option<Vec<u8>> {
         self.state().ok().flatten()
