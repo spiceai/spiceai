@@ -95,8 +95,10 @@ jobs:
     runs-on: ${{ github.event.inputs.runner_type }}
     permissions:
       contents: read
-      id-token: write  # RustFS credentials
+      id-token: write  # RustFS credentials, and Google Cloud access tokens for the BigQuery tests
     timeout-minutes: 600
+    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
+    environment: ci
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -206,6 +208,13 @@ jobs:
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
         uses: ./.github/actions/setup-adbc-bigquery
 
+      - name: Set up BigQuery credentials (workload identity federation)
+        if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
+        uses: ./.github/actions/bigquery-credentials
+        with:
+          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
+          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
+
       - name: Run the load test - ${{ github.event.inputs.spicepod_path }}
         run: |
           rm -rf .spice/data
@@ -232,7 +241,6 @@ jobs:
           S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
           DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
           DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
           DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
           DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.DATABRICKS_SQL_WAREHOUSE_ID }}

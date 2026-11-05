@@ -1,0 +1,137 @@
+name: dynamodb-iterator-expiry
+description: >
+  A DynamoDB Streams changes-mode acceleration keeps every change across a
+  shard iterator expiry and a kill: whether the request that re-initializes
+  the expired iterator fails (and spiced is killed before a retry succeeds)
+  or succeeds, the acceleration ends equal to a PostgreSQL mirror after the
+  restart.
+
+sources:
+  # spiced reaches LocalStack through a TCP forwarder inside the container
+  # (port 4567). Stopping the forwarder refuses spiced's requests at once,
+  # where freezing the container would only stall them.
+  ddb:
+    kind: docker
+    image: docker.io/localstack/localstack:4.9
+    ports: [4566, 4567]
+    env: { SERVICES: dynamodb, AWS_DEFAULT_REGION: us-east-1 }
+    ready: awslocal dynamodb list-tables
+  ref: { kind: postgres }
+
+matrix:
+  # fails: the request for the expired shard's new iterator is refused, and
+  # spiced is killed before a later one succeeds. succeeds: the control,
+  # killed after the new iterator is in place.
+  reinit: [fails, succeeds]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: dynamodb-iterator-expiry
+  datasets:
+    - from: dynamodb:t_${sources.ddb.namespace}
+      name: t
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://127.0.0.1:${sources.ddb.port.4567}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+
+defaults:
+  expect: { oracle: ref }
+  # Every instance of a combination shares the one LocalStack container and its
+  # forwarder on port 4567, so instances run one after another: a second
+  # forwarder cannot bind the port, and one instance's outage stops it for all.
+  exclusive: true
+
+steps:
+  - source-exec:
+      ddb: |
+        cat > /tmp/forward.py <<'PY'
+        import asyncio
+        async def pipe(r, w):
+            try:
+                while (b := await r.read(65536)):
+                    w.write(b)
+                    await w.drain()
+            finally:
+                w.close()
+        async def handle(cr, cw):
+            ur, uw = await asyncio.open_connection('127.0.0.1', 4566)
+            await asyncio.gather(pipe(cr, uw), pipe(ur, cw), return_exceptions=True)
+        async def main():
+            s = await asyncio.start_server(handle, '0.0.0.0', 4567)
+            async with s:
+                await s.serve_forever()
+        asyncio.run(main())
+        PY
+  - source-exec: { ddb: &forward-on 'nohup python3 /tmp/forward.py > /dev/null 2>&1 < /dev/null & sleep 1' }
+  - source-exec:
+      ddb: |
+        python3 - <<'PY'
+        import boto3
+        d = boto3.resource('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        t = d.create_table(TableName='t_${sources.ddb.namespace}', KeySchema=[{'AttributeName': 'id', 'KeyType': 'HASH'}],
+            AttributeDefinitions=[{'AttributeName': 'id', 'AttributeType': 'N'}], BillingMode='PAY_PER_REQUEST',
+            StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'NEW_AND_OLD_IMAGES'})
+        t.wait_until_exists()
+        with t.batch_writer() as w:
+            for g in range(1, 101):
+                w.put_item(Item={'id': g, 'n': g * 10, 's': 'start'})
+        PY
+  - source-exec:
+      ref: >-
+        CREATE TABLE t (id bigint PRIMARY KEY, n bigint, s text);
+        INSERT INTO t SELECT g, g * 10, 'start' FROM generate_series(1, 100) g;
+  - start: {}
+  - query: &rows SELECT id, n, s FROM t
+    eventually: 90s
+
+  # Outage longer than the ~5 min iterator lifetime: every poll fails fast and
+  # the shard keeps its aging iterator.
+  - source-exec: { ddb: &forward-off "pkill -f 'python3 /tmp/[f]orward.py'" }
+  - sleep: 330s
+  - source-exec: { ddb: *forward-on }
+  - assert-log:
+      contains: ['Iterator expired for shard']
+    eventually: 150s
+  # The shard now waits for a new iterator; make that request fail.
+  - source-exec: { ddb: *forward-off }
+    when: { reinit: fails }
+  - assert-log:
+      contains: ['Failed to initialize shard']
+    eventually: 150s
+    when: { reinit: fails }
+  # The retry backoff is capped at 60 s, so the new iterator is in place by then.
+  - sleep: 75s
+    when: { reinit: succeeds }
+  - sleep: 10s
+  - kill-spiced: {}
+  - source-exec: { ddb: *forward-on }
+    when: { reinit: fails }
+
+  - source-exec:
+      ddb: |
+        python3 - <<'PY'
+        import boto3
+        t = boto3.resource('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test').Table('t_${sources.ddb.namespace}')
+        for g in range(101, 151):
+            t.put_item(Item={'id': g, 'n': g * 10, 's': 'after'})
+        for g in range(1, 21):
+            t.update_item(Key={'id': g}, UpdateExpression='SET s = :s', ExpressionAttributeValues={':s': 'updated'})
+        for g in range(40, 50):
+            t.delete_item(Key={'id': g})
+        PY
+  - source-exec:
+      ref: >-
+        INSERT INTO t SELECT g, g * 10, 'after' FROM generate_series(101, 150) g;
+        UPDATE t SET s = 'updated' WHERE id <= 20;
+        DELETE FROM t WHERE id BETWEEN 40 AND 49;
+  - start: {}
+  - query: *rows
+    eventually: 90s
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['140']] }
+    eventually: 30s
