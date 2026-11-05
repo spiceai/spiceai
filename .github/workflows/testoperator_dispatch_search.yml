@@ -13,6 +13,7 @@ on:
 
 jobs:
   dispatch-search:
+    environment: ci
     name: Dispatch search benchmarks
     runs-on: spiceai-dev-runners
     permissions:

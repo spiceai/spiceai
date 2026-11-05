@@ -21,6 +21,7 @@ env:
 
 jobs:
   generate_openapi:
+    environment: secret-free
     runs-on: self-hosted
 
     steps:

@@ -59,6 +59,7 @@ jobs:
   # nothing ran for (#13841). Queue entry is gated by the approval rules and
   # `Attestation`; the merge-group commit is what runs the suite.
   check_changes:
+    environment: secret-free
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
     # A full-history checkout (`fetch-depth: 0`) and a path diff. Measured at
@@ -148,6 +149,7 @@ jobs:
           echo "Source versions beyond each default: ${matrix}"
 
   build:
+    environment: ci
     name: Build Test Binary
     needs: check_changes
     if: ${{ github.event_name != 'pull_request' }}
@@ -453,8 +455,10 @@ jobs:
 
       - name: Set up Spice.ai API Key
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         run: |
-          echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_KEY }}"' > .env
+          printf 'SPICEAI_API_KEY="%s"\n' "$SPICEAI_API_KEY" > .env
 
       - name: Run integration test
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -705,6 +709,7 @@ jobs:
   # lookup does not yield exactly one conclusion, the gate falls back to the
   # combined result: it can only ever be as strict as before, never laxer.
   test-part-1:
+    environment: secret-free
     name: Integration Tests (part 1)
     needs: [check_changes, test-partitions, test-github, test-databricks]
     if: ${{ always() && github.event_name != 'pull_request' }}
@@ -763,6 +768,7 @@ jobs:
           [ "$ok" = true ]
 
   test-part-2:
+    environment: secret-free
     name: Integration Tests (part 2)
     needs: [check_changes, test-partitions, test-github, test-databricks]
     if: ${{ always() && github.event_name != 'pull_request' }}
@@ -821,6 +827,7 @@ jobs:
           [ "$ok" = true ]
 
   test-part-3:
+    environment: secret-free
     name: Integration Tests (part 3)
     needs: [check_changes, test-partitions, test-github, test-databricks]
     if: ${{ always() && github.event_name != 'pull_request' }}
@@ -879,6 +886,7 @@ jobs:
           [ "$ok" = true ]
 
   upload-integration-snapshots:
+    environment: secret-free
     name: Upload Integration Snapshots
     if: github.event.inputs.update_snapshots == 'always'
     # A checkout, a commit and a push.
@@ -1347,6 +1355,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=aws-sdk-credential-bridge::credential_provider)'
 
   test-snapshot-refresh:
+    environment: ci
     name: Snapshot Refresh Mode Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 10.9 min (run 34213792762).
@@ -1412,6 +1421,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration_snapshot_refresh)'
 
   test-data-components:
+    environment: ci
     name: Data Components Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 7.5 min (run 33859377810).
@@ -1479,6 +1489,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=data_components::integration) & test(/^hadoop_catalog_test::/)'
 
   test-runtime-partition:
+    environment: ci
     name: Partition Table Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 7.7 min (run 34213792762).

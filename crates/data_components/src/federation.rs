@@ -2790,6 +2790,123 @@ mod tests {
         }
     }
 
+    /// `PostgreSQL` keeps the first 63 bytes of an identifier and drops the rest
+    /// without an error, so two outputs of a derived table whose names agree in
+    /// those bytes become one column, and the `SELECT` that reads the table by
+    /// name fails with `column reference "ooo…o" is ambiguous`. For `PostgreSQL`
+    /// the unparser refuses both derived tables it reads by name, the scope a sort
+    /// key over a volatile output builds and a projected `EXISTS` input, rather
+    /// than send that SQL. Names that still differ once shortened are built as
+    /// before, and so is every name for a dialect that compares names whole
+    /// (spiceai/datafusion#282).
+    #[test]
+    fn outputs_postgresql_shortens_to_one_name_are_refused_in_a_derived_table() {
+        fn sort_scope(one: &str, two: &str) -> LogicalPlan {
+            LogicalPlanBuilder::scan("t", two_column_source(), None)
+                .expect("scan t")
+                .project(vec![
+                    col("t.a").alias(one),
+                    (col("t.a") + lit(1)).alias(two),
+                    random_call().alias("r"),
+                ])
+                .expect("project")
+                .sort(vec![(col("r") + lit(1.0)).sort(true, true)])
+                .expect("sort")
+                .build()
+                .expect("build")
+        }
+        fn exists_input(one: &str, two: &str) -> LogicalPlan {
+            let probe = LogicalPlanBuilder::scan("p", two_column_source(), Some(vec![0]))
+                .expect("scan p")
+                .build()
+                .expect("build the probe");
+            let build = LogicalPlanBuilder::scan("person", two_column_source(), Some(vec![0]))
+                .expect("scan person")
+                .project(vec![
+                    col("person.a").alias(one),
+                    (col("person.a") + lit(1)).alias(two),
+                ])
+                .expect("project")
+                .alias("b")
+                .expect("alias")
+                .build()
+                .expect("build the build side");
+            LogicalPlanBuilder::from(probe)
+                .join(
+                    build,
+                    JoinType::LeftSemi,
+                    (
+                        vec![Column::new(Some("p"), "a")],
+                        vec![Column::new(Some("b"), one)],
+                    ),
+                    None,
+                )
+                .expect("semi join")
+                .build()
+                .expect("build")
+        }
+
+        // Past 63 ASCII bytes, and past a two-byte character that straddles byte
+        // 63, which `PostgreSQL` drops whole, keeping 62.
+        let ascii = "o".repeat(63);
+        let straddling = "o".repeat(62);
+        for (one, two) in [
+            (format!("{ascii}_one"), format!("{ascii}_two")),
+            (format!("{straddling}é_one"), format!("{straddling}è_two")),
+        ] {
+            for (shape, plan, refusal) in [
+                (
+                    "sort scope",
+                    sort_scope(&one, &two),
+                    format!(
+                        "This feature is not implemented: Unparsing a sort key reading a \
+                         projection output that cannot be repeated is not supported when two \
+                         outputs the derived table exposes, {one} and {two}, become one name \
+                         once the dialect shortens each to at most 63 bytes"
+                    ),
+                ),
+                (
+                    "projected EXISTS input",
+                    exists_input(&one, &two),
+                    "This feature is not implemented: A projected EXISTS input requires unique \
+                     output names"
+                        .to_string(),
+                ),
+            ] {
+                match Unparser::new(&PostgreSqlDialect {}).plan_to_sql(&plan) {
+                    Ok(sql) => panic!(
+                        "{shape}: PostgreSQL reads {one} and {two} as one name, so the derived \
+                         table has to be refused rather than sent: {sql}"
+                    ),
+                    Err(error) => assert_eq!(
+                        error.strip_backtrace(),
+                        refusal,
+                        "{shape}: refused for another reason"
+                    ),
+                }
+                let sql = unparse_with("default", &DefaultDialect {}, &plan);
+                assert!(
+                    sql.contains(one.as_str()) && sql.contains(two.as_str()),
+                    "{shape}: a dialect that compares names whole keeps both outputs: {sql}"
+                );
+            }
+        }
+
+        // Long names that differ within the first 63 bytes stay distinct once
+        // `PostgreSQL` shortens them, so it is the shared prefix that is refused.
+        let (one, two) = (format!("one_{ascii}"), format!("two_{ascii}"));
+        for (shape, plan) in [
+            ("sort scope", sort_scope(&one, &two)),
+            ("projected EXISTS input", exists_input(&one, &two)),
+        ] {
+            let sql = unparse_with("postgres", &PostgreSqlDialect {}, &plan);
+            assert!(
+                sql.contains(one.as_str()) && sql.contains(two.as_str()),
+                "{shape}: names PostgreSQL keeps apart are emitted: {sql}"
+            );
+        }
+    }
+
     /// The same unresolved key over a `DISTINCT` whose outputs can be repeated.
     /// The `ORDER BY` of a `SELECT DISTINCT` may name only what its list shows, so
     /// inlining the output does not help there: `PostgreSQL` refuses

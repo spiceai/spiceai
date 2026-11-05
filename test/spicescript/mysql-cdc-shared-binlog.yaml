@@ -2,7 +2,8 @@ name: mysql-cdc-shared-binlog
 description: >
   Datasets on one MySQL connection share one binlog reader and each follows its
   own table, including a transaction spanning tables; across a clean restart
-  they resume with the changes made while Spice was down. When the binlog they
+  they resume with the changes made while Spice was down, even when the source
+  table's statistics changed meanwhile. When the binlog they
   would resume from has been purged, they fail with a message naming the fix
   by default, and with `invalid_checkpoint_behavior: restart` rebuild from the
   source and serve its rows, deletions included.
@@ -77,9 +78,15 @@ steps:
     oracle-sql: SELECT * FROM tc
     eventually: 30s
 
-  # A clean restart resumes from the binlog.
+  # A clean restart resumes from the binlog, also when the source table has
+  # grown and its statistics were refreshed meanwhile: the row and size
+  # estimates schema inference reads from MySQL change, its columns do not.
   - stop: {}
   - source-exec: { src: "INSERT INTO ta VALUES (300, 'while down'); UPDATE tb SET n = 0 WHERE id = 5; DELETE FROM tc WHERE id = 7" }
+  - source-exec:
+      src: |
+        INSERT INTO ta WITH RECURSIVE s(i) AS (SELECT 1001 UNION ALL SELECT i + 1 FROM s WHERE i < 2000) SELECT i, CONCAT('grown', i) FROM s;
+        ANALYZE TABLE ta;
   - start: {}
   - query: SELECT * FROM a
     oracle-sql: SELECT * FROM ta

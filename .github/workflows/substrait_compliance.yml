@@ -156,6 +156,7 @@ jobs:
           if-no-files-found: ignore
 
   mode_b_tpch:
+    environment: ci
     name: Mode B TPC-H (${{ matrix.engine }}, ${{ matrix.mode }})
     # Nightly and on manual dispatch only. Mode B serves the suite from a trunk
     # spiced (`setup-spiced` takes the newest build among the last 10 trunk

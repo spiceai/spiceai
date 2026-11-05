@@ -123,6 +123,7 @@ jobs:
   # GitHub-hosted on purpose. It is two API calls and must not queue behind the
   # saturated self-hosted pool — every sign-off now waits on it.
   resolve:
+    environment: secret-free
     name: "Resolve sign-off target"
     runs-on: ubuntu-24.04
     timeout-minutes: 5
