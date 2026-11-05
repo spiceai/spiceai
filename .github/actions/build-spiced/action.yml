@@ -57,6 +57,9 @@ inputs:
   minio_secret_key:
     description: 'MinIO secret key for sccache'
     required: false
+  minio_session_token:
+    description: 'Session token of temporary MinIO credentials.'
+    required: false
   spiceio_endpoint:
     description: 'Spiceio S3-compatible endpoint for sccache (macOS)'
     required: false
@@ -197,6 +200,7 @@ runs:
         spiceio_endpoint: ${{ inputs.spiceio_endpoint }}
         minio_access_key: ${{ inputs.minio_access_key }}
         minio_secret_key: ${{ inputs.minio_secret_key }}
+        minio_session_token: ${{ inputs.minio_session_token }}
 
     - name: Resolve build paths
       id: resolve-build-paths
@@ -227,6 +231,7 @@ runs:
         CARGO_TARGET_DIR: ${{ steps.resolve-build-paths.outputs.target_dir }}
         AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
         AWS_SECRET_ACCESS_KEY: ${{ inputs.minio_secret_key }}
+        AWS_SESSION_TOKEN: ${{ inputs.minio_session_token }}
         CARGO_INCREMENTAL: 0
         CARGO_NET_GIT_FETCH_WITH_CLI: true
         # Skip Metal kernel precompilation on macOS to avoid requiring Xcode Metal Toolchain
@@ -244,6 +249,7 @@ runs:
       env:
         AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
         AWS_SECRET_ACCESS_KEY: ${{ inputs.minio_secret_key }}
+        AWS_SESSION_TOKEN: ${{ inputs.minio_session_token }}
         CARGO_INCREMENTAL: 0
         CARGO_NET_GIT_FETCH_WITH_CLI: true
         MISTRALRS_METAL_PRECOMPILE: 0
@@ -263,6 +269,7 @@ runs:
         CARGO_TARGET_DIR: ${{ steps.resolve-build-paths.outputs.target_dir }}
         AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
         AWS_SECRET_ACCESS_KEY: ${{ inputs.minio_secret_key }}
+        AWS_SESSION_TOKEN: ${{ inputs.minio_session_token }}
         CARGO_INCREMENTAL: 0
         CARGO_NET_GIT_FETCH_WITH_CLI: true
       run: |

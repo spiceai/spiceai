@@ -11,6 +11,8 @@ members = [
     "crates/ansi_colors",
     "crates/app",
     "crates/arrow_tools",
+    "crates/aws-kms-signer",
+    "crates/azure-key-vault-signer",
     "crates/aws-sdk-credential-bridge",
     "crates/backoff",
     "crates/chunking",
@@ -224,11 +226,10 @@ aws-runtime = "1.7.1"
 # connector → rustls 0.21) and `default-https-client` (modern rustls-aws-lc → rustls 0.23).
 # Drop `rustls` (keep `default-https-client`) so only the modern rustls 0.23 connector is built.
 aws-sdk-bedrockruntime = { version = "1.132.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
-aws-sdk-cognitoidentity = { version = "1.101.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
-aws-sdk-cognitoidentityprovider = { version = "1.118.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-dynamodb = { version = "1.115.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-ec2 = { version = "1.113.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-dynamodbstreams = { version = "1.101.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-kms = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-glue = { version = "1.149.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-s3 = { version = "1.134.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-sdk-sqs = { version = "1.102.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
