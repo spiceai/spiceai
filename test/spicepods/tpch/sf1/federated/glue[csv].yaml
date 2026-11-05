@@ -9,6 +9,7 @@ datasets:
       glue_region: us-east-1
       glue_key: ${secrets:GLUE_AWS_KEY}
       glue_secret: ${secrets:GLUE_AWS_SECRET}
+      glue_session_token: ${secrets:GLUE_AWS_SESSION_TOKEN}
   - from: glue:tpch.lineitem_csv
     name: lineitem
     params: *glue_params

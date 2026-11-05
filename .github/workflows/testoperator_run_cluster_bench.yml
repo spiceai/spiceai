@@ -373,6 +373,20 @@ jobs:
             echo "SPIDAPTER_EC2_EXECUTOR_COUNT=${CB_EXECUTOR_REPLICAS}"
           } >> "${GITHUB_ENV}"
 
+      # Off EC2 the benchmark reads S3 with the Iceberg role. On EC2 it keeps the benchmark role
+      # assumed above, which is in the job's environment.
+      - name: Assume the Iceberg role
+        id: aws-iceberg
+        if: env.CB_COMPUTE != 'ec2'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-session-name: gha-iceberg-${{ github.run_id }}
+          role-duration-seconds: 36000
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
       - name: Run the cluster benchmark - ${{ env.CB_SPICEPOD_PATH }}
         env:
           SPICEAI_API_KEY: ${{ env.SPICEAI_API_KEY }}
@@ -381,8 +395,9 @@ jobs:
           S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
           S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
           S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
-          AWS_ACCESS_KEY_ID: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_ACCESS_KEY_ID || secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_SECRET_ACCESS_KEY || secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_ACCESS_KEY_ID || steps.aws-iceberg.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_SECRET_ACCESS_KEY || steps.aws-iceberg.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ env.CB_COMPUTE == 'ec2' && env.AWS_SESSION_TOKEN || steps.aws-iceberg.outputs.aws-session-token }}
           AWS_REGION: ${{ env.CB_COMPUTE == 'ec2' && env.CB_EC2_REGION || 'us-east-1' }}
           AWS_DEFAULT_REGION: ${{ env.CB_COMPUTE == 'ec2' && env.CB_EC2_REGION || 'us-east-1' }}
           # Select the nodegroup for the spidapter cluster app via tags.organization.

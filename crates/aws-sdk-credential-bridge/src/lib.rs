@@ -506,6 +506,12 @@ pub fn should_use_sdk_credentials<V, S: std::hash::BuildHasher>(
     }
 }
 
+/// A session token parameter whose secret is not set resolves to an empty string. AWS signers
+/// still send an empty token, so treat it as absent: static keys need no token.
+fn non_empty_session_token(session_token: Option<String>) -> Option<String> {
+    session_token.filter(|token| !token.is_empty())
+}
+
 /// Initiates an AWS SDK configuration with the provided credentials.
 ///
 /// This is a convenience function for creating AWS SDK configurations with explicit credentials
@@ -540,7 +546,7 @@ pub async fn initiate_config_with_credentials(
         let credentials = Credentials::new(
             access_key_id,
             secret_access_key,
-            session_token,
+            non_empty_session_token(session_token),
             None,
             provider_name,
         );
@@ -671,7 +677,7 @@ pub fn initiate_config_auth_key(
     let credentials = Credentials::new(
         access_key_id,
         secret_access_key,
-        session_token,
+        non_empty_session_token(session_token),
         None,
         provider_name,
     );
@@ -1109,6 +1115,38 @@ mod tests {
         assert!(
             described.contains(r#"region: "ap-south-1""#),
             "the store must use the SDK config's region: {described}"
+        );
+    }
+
+    async fn provided_session_token(session_token: Option<&str>) -> Option<String> {
+        use aws_credential_types::provider::ProvideCredentials;
+
+        let config = initiate_config_auth_key(
+            "test",
+            "us-east-1".to_string(),
+            "AKIDEXAMPLE".to_string(),
+            "secret".to_string(),
+            session_token.map(ToString::to_string),
+        )
+        .load()
+        .await;
+        config
+            .credentials_provider()
+            .expect("static credentials are configured")
+            .provide_credentials()
+            .await
+            .expect("static credentials resolve")
+            .session_token()
+            .map(ToString::to_string)
+    }
+
+    #[tokio::test]
+    async fn empty_session_token_is_not_sent() {
+        assert_eq!(provided_session_token(Some("")).await, None);
+        assert_eq!(provided_session_token(None).await, None);
+        assert_eq!(
+            provided_session_token(Some("FwoToken")).await.as_deref(),
+            Some("FwoToken")
         );
     }
 }

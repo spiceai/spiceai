@@ -57,7 +57,7 @@ pub(super) async fn prepare_for_aws_tests(
                 std::env::var("AWS_S3_VECTORS_SECRET")
                     .ok()
                     .unwrap_or_default(),
-                None,
+                crate::utils::nonempty_env("AWS_S3_VECTORS_SESSION_TOKEN"),
                 None,
                 "S3Vectors",
             ))

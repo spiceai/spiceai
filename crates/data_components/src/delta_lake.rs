@@ -194,6 +194,8 @@ impl DeltaTable {
         for (key, value) in options {
             match key.as_ref() {
                 "token" | "endpoint" | "credential_vending" => {}
+                // An unset session-token secret resolves to an empty string; static keys need no token.
+                "aws_session_token" if value.expose_secret().is_empty() => {}
                 "client_timeout" => {
                     storage_options.insert("timeout".into(), value.expose_secret().to_string());
                 }
