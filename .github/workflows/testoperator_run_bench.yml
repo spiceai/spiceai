@@ -125,10 +125,10 @@ on:
 
 jobs:
   run-bench:
-    name: Run benchmark e2e tests
     # The Databricks service principal's federation policy trusts this environment's subject.
     # The environment also holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
     environment: ci
+    name: Run benchmark e2e tests
     runs-on: ${{ github.event.inputs.runner_type }}
     permissions:
       actions: write  # approves the held runs of its snapshot PR

@@ -27,9 +27,9 @@ on:
 
 jobs:
   run-schema:
-    name: Run schema tests
     # The service principal's federation policy trusts this environment's subject.
     environment: ci
+    name: Run schema tests
     runs-on: ${{ github.event.inputs.runner_type }}
     permissions:
       actions: write  # approves the held runs of its snapshot PR

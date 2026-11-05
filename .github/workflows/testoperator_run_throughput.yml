@@ -81,10 +81,10 @@ on:
 
 jobs:
   run-throughput:
-    name: Run throughput test
     # The Databricks service principal's federation policy trusts this environment's subject.
     # The environment also holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
     environment: ci
+    name: Run throughput test
     runs-on: ${{ github.event.inputs.runner_type }}
     permissions:
       contents: read

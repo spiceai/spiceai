@@ -222,6 +222,7 @@ env:
 
 jobs:
   run-cluster-bench:
+    environment: ci
     name: Run cluster benchmark
     runs-on: ${{ github.event.inputs.runner_type || 'spiceai-dev-runners' }}
     timeout-minutes: 600
