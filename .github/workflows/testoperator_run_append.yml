@@ -41,7 +41,6 @@ on:
           - 'postgresql'
           - 'mysql'
           - 'odbc-athena'
-          - 'odbc-databricks'
           - 'oracle'
           - 'duckdb-zero-results'
           - 'snowflake'
@@ -86,6 +85,7 @@ on:
 
 jobs:
   run-append:
+    environment: ci
     name: Run append test
     runs-on: spiceai-dev-runners
     permissions:

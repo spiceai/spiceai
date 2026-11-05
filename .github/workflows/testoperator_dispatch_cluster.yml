@@ -51,6 +51,7 @@ jobs:
   #    runs on the same commit reuse the previously-built image.
   # ---------------------------------------------------------------------------
   resolve-image:
+    environment: secret-free
     name: Resolve spiced image tag
     runs-on: ubuntu-24.04
     outputs:
@@ -123,6 +124,7 @@ jobs:
   #    Spice Cloud clustered app.
   # ---------------------------------------------------------------------------
   dispatch-cluster-bench:
+    environment: secret-free
     name: Dispatch cluster benchmarks
     needs: [resolve-image, build-image]
     if: |

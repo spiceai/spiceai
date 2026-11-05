@@ -13,10 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use super::refresh_modes::TimeFormatCase;
 use crate::acceleration::refresh::common::{
     execute_rt_sql, get_acceleration_config_append, get_acceleration_config_full,
-    get_dataset_no_time_column, initialize_postgres, test_append_iso8601_for_engine,
-    test_append_timestamp_for_engine, test_append_unix_seconds_for_engine,
+    get_dataset_no_time_column, initialize_postgres,
 };
 use crate::postgres::common;
 use crate::{
@@ -237,23 +237,36 @@ fn cayenne_params() -> (tempfile::TempDir, Params) {
     (temp_dir, Params::from_string_map(map))
 }
 
+/// Append refresh, `mode: file`, for each `time_format`; see
+/// [`super::refresh_modes::append_time_format_matches_postgres_source`] for the history.
+async fn cayenne_time_format_matches_source(format: TimeFormatCase) -> Result<(), anyhow::Error> {
+    let (_temp_dir, params) = cayenne_params();
+    super::refresh_modes::append_time_format_matches_postgres_source(
+        "cayenne",
+        format,
+        move |_port| {
+            let mut acceleration = get_acceleration_config_append("cayenne", Some(params));
+            acceleration.mode = Mode::File;
+            acceleration
+        },
+    )
+    .await
+}
+
 #[tokio::test]
 async fn test_cayenne_append_mode_timestamp() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let (_td, params) = cayenne_params();
-    test_append_timestamp_for_engine("cayenne", Some(Mode::File), Some(params)).await
+    cayenne_time_format_matches_source(TimeFormatCase::Timestamp).await
 }
 
 #[tokio::test]
 async fn test_cayenne_append_mode_unix_seconds() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let (_td, params) = cayenne_params();
-    test_append_unix_seconds_for_engine("cayenne", Some(Mode::File), Some(params)).await
+    cayenne_time_format_matches_source(TimeFormatCase::UnixSeconds).await
 }
 
 #[tokio::test]
 async fn test_cayenne_append_mode_iso8601() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let (_td, params) = cayenne_params();
-    test_append_iso8601_for_engine("cayenne", Some(Mode::File), Some(params)).await
+    cayenne_time_format_matches_source(TimeFormatCase::Iso8601).await
 }

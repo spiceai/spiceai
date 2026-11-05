@@ -24,6 +24,7 @@ concurrency:
 
 jobs:
   crash_report:
+    environment: ci
     name: crash report (${{ matrix.profile }})
     runs-on: spiceai-dev-runners
     permissions:
