@@ -418,7 +418,11 @@ impl SpiceObjectStoreRegistry {
         {
             s3_builder = s3_builder.with_access_key_id(key);
             s3_builder = s3_builder.with_secret_access_key(secret);
-            if let Some(token) = params.get("session_token") {
+            // An unset session-token secret resolves to an empty string; static keys need no token.
+            if let Some(token) = params
+                .get("session_token")
+                .filter(|token| !token.is_empty())
+            {
                 s3_builder = s3_builder.with_token(token);
             }
         }

@@ -103,11 +103,14 @@ fn ensure_aws_profile() {
 region = us-east-1
 output = json
 ";
+    let session_token_line = crate::utils::nonempty_env("AWS_DATABRICKS_DELTA_SESSION_TOKEN")
+        .map(|token| format!("aws_session_token = {token}\n"))
+        .unwrap_or_default();
     let credentials_content = format!(
         "[default]
 aws_access_key_id = {access_key_id}
 aws_secret_access_key = {secret_access_key}
-"
+{session_token_line}"
     );
 
     // Create the .aws directory if it doesn't exist
