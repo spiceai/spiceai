@@ -39,6 +39,8 @@ struct spice_mtp {
     std::vector<llama_token> draft;
     // A non-empty draft owes an accept before the next draft.
     bool accept_owed = false;
+    // What spice_mtp_get_state last returned.
+    std::vector<uint8_t> state;
     std::string error;
 };
 
@@ -213,6 +215,37 @@ extern "C" spice_mtp_status spice_mtp_draft(spice_mtp * mtp, llama_pos n_past, l
             std::memcpy(out, mtp->draft.data(), mtp->draft.size() * sizeof(llama_token));
         }
         mtp->accept_owed = !mtp->draft.empty();
+        return SPICE_MTP_OK;
+    });
+}
+
+extern "C" spice_mtp_status spice_mtp_get_state(spice_mtp * mtp, const uint8_t ** data, size_t * n) {
+    if (mtp == nullptr) {
+        return SPICE_MTP_INVALID;
+    }
+    if (data == nullptr || n == nullptr) {
+        return invalid(mtp, "the state's outputs are null");
+    }
+    return guarded(mtp, [&] {
+        mtp->state.clear();
+        if (!common_speculative_get_state(mtp->spec, SEQ, mtp->state)) {
+            mtp->state.clear();
+        }
+        *data = mtp->state.data();
+        *n = mtp->state.size();
+        return SPICE_MTP_OK;
+    });
+}
+
+extern "C" spice_mtp_status spice_mtp_set_state(spice_mtp * mtp, const uint8_t * data, size_t n) {
+    if (mtp == nullptr) {
+        return SPICE_MTP_INVALID;
+    }
+    if (data == nullptr || n == 0) {
+        return invalid(mtp, "the state is empty");
+    }
+    return guarded(mtp, [&] {
+        common_speculative_set_state(mtp->spec, SEQ, std::vector<uint8_t>(data, data + n));
         return SPICE_MTP_OK;
     });
 }
