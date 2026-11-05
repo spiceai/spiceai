@@ -2494,8 +2494,8 @@ dependencies = [
  "async-trait",
  "aws-lc-rs",
  "axum",
- "azure_core",
- "azure_identity",
+ "azure_core 0.31.0",
+ "azure_identity 0.31.0",
  "base64 0.22.1",
  "http-body-limit",
  "reqwest 0.13.4",
@@ -2586,6 +2586,24 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "azure_identity"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c0c8cb8886f2bdabb3501476fa53f87fa9efea9d457ff991c5ce80052c4774"
+dependencies = [
+ "async-lock",
+ "async-trait",
+ "azure_core 0.31.0",
+ "futures",
+ "pin-project",
+ "serde",
+ "serde_json",
+ "time",
  "tracing",
  "url",
 ]
@@ -18446,7 +18464,7 @@ dependencies = [
  "aws-sdk-secretsmanager",
  "aws-sdk-sts",
  "azure_core 1.1.0",
- "azure_identity",
+ "azure_identity 1.0.0",
  "azure_security_keyvault_secrets",
  "base64 0.22.1",
  "dotenv 2.4.1",
