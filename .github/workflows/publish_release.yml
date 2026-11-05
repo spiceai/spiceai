@@ -29,6 +29,14 @@ jobs:
     outputs:
       build_run_id: ${{ steps.find.outputs.build_run_id }}
     steps:
+      # Forks and downstream repositories that merge this one have their own
+      # release workflows.
+      - name: Require spiceai/spiceai
+        if: github.repository != 'spiceai/spiceai'
+        run: |
+          echo "::error::publish_release publishes spiceai/spiceai releases only, not ${GITHUB_REPOSITORY} releases."
+          exit 1
+
       - name: Require a release tag
         if: github.ref_type != 'tag' || !startsWith(github.ref_name, 'v')
         env:
