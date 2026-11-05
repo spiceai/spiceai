@@ -69,6 +69,9 @@ concurrency:
   group: ${{ github.ref_type == 'tag' && format('build-release-cuda-{0}', github.ref) || format('{0}-{1}', github.workflow, (github.event_name == 'push' && github.ref == 'refs/heads/trunk') && 'trunk' || github.run_id) }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   setup-matrix:
     name: Setup CUDA matrix
@@ -155,6 +158,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
@@ -186,63 +191,12 @@ jobs:
           target_os: ${{ matrix.target.target_os }}
           rust-profile: ${{ env.RUST_PROFILE }}
 
-  publish-minio:
-    name: Publish linux-x86_64 CUDA binaries to Minio
-    runs-on: spiceai-dev-runners
-    permissions:
-      contents: read
-      id-token: write  # RustFS credentials
-    needs: build
-    env:
-      ARTIFACT_DIR: ./release
-      COMMIT_SHA: ${{ github.sha }}
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Create artifact directory
-        run: mkdir -p ${{ env.ARTIFACT_DIR }}
-
-      # Download all Linux CUDA artifacts
-      - name: Download Linux CUDA artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        continue-on-error: true
-        with:
-          pattern: spiced_cuda_*_linux_x86_64
-          path: ${{ env.ARTIFACT_DIR }}
-          merge-multiple: true
-
-      - name: Get RustFS credentials
-        id: rustfs
-        uses: ./.github/actions/rustfs-credentials
-        with:
-          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
-          duration-seconds: '21600'
-          export-env: 'false'
-
-      - name: Set up MinIO client
-        uses: ./.github/actions/setup-minio
-        with:
-          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
-          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
-          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
-
-      - name: Upload artifacts to Minio
-        run: |
-          # Upload any CUDA artifacts that were successfully built
-          for file in ${{ env.ARTIFACT_DIR }}/spiced_cuda_*_linux_x86_64.tar.gz; do
-            if [ -f "$file" ]; then
-              echo "Uploading $file to Minio..."
-              mc cp "$file" spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
-            fi
-          done
-
   publish:
     name: Publish CUDA binaries
     needs: build
     if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
+    permissions:
+      contents: write  # Upload assets to the GitHub release
     env:
       ARTIFACT_DIR: ./release
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
@@ -250,6 +204,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Create artifact directory
         run: mkdir -p ${{ env.ARTIFACT_DIR }}
