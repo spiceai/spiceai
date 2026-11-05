@@ -68,6 +68,10 @@ pub(crate) struct CayenneUpdateExec {
     session_state: SessionState,
     filters: Vec<Expr>,
     validator: Option<Arc<dyn UpdateValidator>>,
+    /// The table upserts on its primary key and the statement assigns no key
+    /// or partition column: the insert leg alone supersedes every matched row
+    /// in one commit, so the separate delete leg is skipped.
+    upsert_only: bool,
     properties: Arc<PlanProperties>,
 }
 
@@ -78,6 +82,7 @@ impl CayenneUpdateExec {
         session_state: SessionState,
         filters: Vec<Expr>,
         validator: Option<Arc<dyn UpdateValidator>>,
+        upsert_only: bool,
     ) -> Self {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "count",
@@ -96,6 +101,7 @@ impl CayenneUpdateExec {
             session_state,
             filters,
             validator,
+            upsert_only,
             properties,
         }
     }
@@ -183,6 +189,7 @@ impl ExecutionPlan for CayenneUpdateExec {
         let session_state = self.session_state.clone();
         let filters = self.filters.clone();
         let validator = self.validator.clone();
+        let upsert_only = self.upsert_only;
         let schema = Arc::new(Schema::new(vec![Field::new(
             "count",
             DataType::UInt64,
@@ -202,6 +209,7 @@ impl ExecutionPlan for CayenneUpdateExec {
                     session_state,
                     filters,
                     validator,
+                    upsert_only,
                     context,
                 ),
             )
@@ -218,6 +226,7 @@ async fn apply_update(
     session_state: SessionState,
     filters: Vec<Expr>,
     validator: Option<Arc<dyn UpdateValidator>>,
+    upsert_only: bool,
     context: Arc<TaskContext>,
 ) -> Result<RecordBatch, DataFusionError> {
     // Always rematerialize under the already-held `write_lock`. Prepare-time
@@ -231,21 +240,23 @@ async fn apply_update(
         Arc::clone(&context),
     )
     .await?;
+    // The affected-row count is the rows the predicate matched — the rows this
+    // statement rewrites. The delete leg's count is not that number: it counts
+    // what the deletion sink newly tombstoned, which misses a key an earlier
+    // UPDATE already re-inserted.
+    let matched: u64 = rows.iter().map(|b| b.num_rows() as u64).sum();
     let provider: Arc<dyn TableProvider> = Arc::new(table.clone_for_write());
     let target_schema = provider.schema();
 
-    let delete_plan = provider.delete_from(&session_state, filters).await?;
-    let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
-    let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
-    let deleted_count = delete_batches
-        .iter()
-        .flat_map(RecordBatch::columns)
-        .find_map(|arr| {
-            arr.as_any()
-                .downcast_ref::<UInt64Array>()
-                .and_then(|counts| counts.values().first().copied())
-        })
-        .unwrap_or(0);
+    // A separate delete leg publishes the tombstones in their own commit, so a
+    // reader resolving the snapshot between that commit and the insert sees
+    // the matched rows missing. On an upsert-on-key table the insert leg alone
+    // supersedes each matched row by key in a single commit.
+    if !upsert_only {
+        let delete_plan = provider.delete_from(&session_state, filters).await?;
+        let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
+        let _delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
+    }
 
     if !rows.is_empty() {
         let input_exec =
@@ -259,7 +270,7 @@ async fn apply_update(
 
     RecordBatch::try_from_iter_with_nullable(vec![(
         "count",
-        Arc::new(UInt64Array::from(vec![deleted_count])) as ArrayRef,
+        Arc::new(UInt64Array::from(vec![matched])) as ArrayRef,
         false,
     )])
     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
