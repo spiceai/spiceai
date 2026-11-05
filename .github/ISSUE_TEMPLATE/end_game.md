@@ -250,14 +250,14 @@ Testing focus DRIs are responsible for:
 
 ## Release Publication Steps
 
-Release lines cut before `publish_release` existed (2.4 and earlier) still publish from the tag build: for those, follow the steps in that release branch's copy of this template.
+Release lines cut before `publish_release` existed (2.4 and earlier) still publish from a pushed tag: for those, follow the steps in that release branch's copy of this template.
 
 - [ ] Cherry-pick release notes onto the release branch.
-- [ ] Push the release tag (e.g. `v1.0.0-rc.1`) to the release branch commit that passed testing. `version.txt` at that commit must match the tag, or the build fails.
-- [ ] Check that the [build_release](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) run for the tag is green. It builds every binary, CUDA included, and publishes nothing.
-- [ ] Create a **draft** [GitHub Release](https://github.com/spiceai/spiceai/releases/new) for the tag. Leave the body empty to use the checked-in notes, or write the notes in the draft.
-- [ ] Start [publish_release](https://github.com/spiceai/spiceai/actions/workflows/publish_release.yml) on the tag (**Use workflow from** > **Tags** > the release tag).
-- [ ] Get one approval of its `publish` job from a release approver other than the person who started it. The run then attaches the binaries, publishes the release, and builds and pushes the Docker images. A stable release that is the highest version becomes the latest release and moves the `latest` Docker tags; a pre-release never does. To retry a failed step, re-run the failed jobs of the same run.
+- [ ] Start [build_release](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) on the release branch with `release_version` set to the version (e.g. `1.0.0-rc.1`), once the branch head is the commit that passed testing. `version.txt` at that commit must match, or the build fails. Do not push the tag: `publish_release` creates it.
+- [ ] Check that the build_release run is green. It builds every binary, CUDA included, and publishes nothing.
+- [ ] Create a **draft** [GitHub Release](https://github.com/spiceai/spiceai/releases/new) for tag `v1.0.0-rc.1` (a new tag, created on publish) targeting the release branch. Leave the body empty to use the checked-in notes, or write the notes in the draft.
+- [ ] Start [publish_release](https://github.com/spiceai/spiceai/actions/workflows/publish_release.yml) on the release branch with the same `release_version`. It publishes the build of the branch head at the moment it starts, so start it before anything else merges to the release branch.
+- [ ] Get one approval of its `publish` job from a release approver other than the person who started it. The run then attaches the binaries, publishes the release, which creates the tag at the built commit, and builds and pushes the Docker images. A stable release that is the highest version becomes the latest release and moves the `latest` Docker tags; a pre-release never does. To retry a failed step, re-run the failed jobs of the same run.
 - [ ] Check the published release assets and the `spiceai/spiceai` and `ghcr.io/spiceai/spiceai` image tags.
 - [ ] Ensure all newly released SDKs (mentioned in release notes) are published
 - [ ] Publish [spiceai/skills](https://github.com/spiceai/skills) GitHub Release for this runtime version (bump `.claude-plugin/plugin.json` + `marketplace.json` version to match runtime; tag `vX.Y.Z`; confirm [Release Plugin](https://github.com/spiceai/skills/actions/workflows/release.yml) uploaded the zip asset)

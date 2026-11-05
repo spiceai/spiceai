@@ -3,7 +3,7 @@ name: build_and_release_cuda
 # CUDA is not part of pull-request CI: a single compute-cap 90 compile takes
 # hours on the large runners, and the workflow is not a required check. Trunk
 # pushes and manual dispatches still build every compute capability. A release
-# tag builds CUDA inside build_release, which calls this workflow, so the
+# build builds CUDA inside build_release, which calls this workflow, so the
 # release's CUDA binaries are artifacts of the same run as every other binary.
 on:
   push:
@@ -29,6 +29,11 @@ on:
       - 'Dockerfile*'
 
   workflow_call:
+    inputs:
+      release_version:
+        description: Version of the release build calling this workflow
+        required: true
+        type: string
 
   workflow_dispatch:
     inputs:
@@ -72,6 +77,10 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Checked against version.txt by get_release_version.py; set only by a release build.
+  RELEASE_VERSION: ${{ inputs.release_version }}
+
 jobs:
   setup-matrix:
     name: Setup CUDA matrix
@@ -85,8 +94,10 @@ jobs:
         id: setup-matrix
         with:
           script: |
-            const isTaggedRelease = context.ref.startsWith('refs/tags/v');
-            const runner = isTaggedRelease ? "ubuntu-24.04-16core" : "spiceai-dev-large-runners";
+            // A release build calls this workflow with its version and builds on
+            // GitHub-hosted runners.
+            const isRelease = process.env.RELEASE_VERSION !== '';
+            const runner = isRelease ? "ubuntu-24.04-16core" : "spiceai-dev-large-runners";
 
             const matrix = [
               {

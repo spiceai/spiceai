@@ -1,9 +1,11 @@
 name: build_release
 
-# Builds the binaries. A tag run builds every release binary, CUDA included, on
+# Builds the binaries. A release build is a dispatch with `release_version`
+# on the release branch: it builds every release binary, CUDA included, on
 # GitHub-hosted runners and keeps them as artifacts of this run with a
-# SHA256SUMS manifest; it publishes nothing. publish_release publishes them to
-# the GitHub release after approval.
+# SHA256SUMS manifest. It creates no tag and publishes nothing. publish_release
+# publishes them after approval, and creates the release tag at the commit
+# this run built, so release tags can be protected by a ruleset.
 on:
   push:
     # Release branches build for the same reason trunk does: the `build` job uploads
@@ -15,8 +17,6 @@ on:
     branches:
       - trunk
       - release/**
-    tags:
-      - v*
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
@@ -38,6 +38,11 @@ on:
 
   workflow_dispatch:
     inputs:
+      release_version:
+        description: 'Release build of this version, without the leading v (e.g. 2.4.2). Must match version.txt; builds every platform. Empty for a test build.'
+        required: false
+        type: string
+        default: ''
       platform_option:
         description: 'Which option do you want to run on? (Default is ALL)'
         required: false
@@ -70,12 +75,21 @@ on:
         default: 'release'
 
 env:
+  # Checked against version.txt by get_release_version.py; empty except on a release build.
+  RELEASE_VERSION: ${{ inputs.release_version }}
   # CI performance optimizations
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_NET_RETRY: 10
   CARGO_HTTP_TIMEOUT: 60
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+# A newer release build of a version cancels an older one still running, so
+# publish_release finds one build of the commit it releases. Every other run
+# gets a group of its own, so trunk and release-branch pushes build every commit.
+concurrency:
+  group: ${{ inputs.release_version && format('build-release-v{0}', inputs.release_version) || format('{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ inputs.release_version && true || false }}
 
 jobs:
   setup-matrix:
@@ -90,8 +104,9 @@ jobs:
         id: setup-matrix
         with:
           script: |
-            // Check if this is a tagged release (uses GitHub hosted runners, no minio)
-            const isTaggedRelease = context.ref.startsWith('refs/tags/v');
+            // A release build (GitHub-hosted runners, no MinIO, every platform) is a
+            // dispatch with `release_version`.
+            const isRelease = (context.payload.inputs?.release_version ?? '') !== '';
 
             // Check if this is a release branch (uses spiceai runners with minio)
             const isReleaseBranch = context.ref.startsWith('refs/heads/release-') ||
@@ -100,19 +115,19 @@ jobs:
             // Check if this is a manual workflow dispatch
             const isManualDispatch = context.eventName === 'workflow_dispatch';
 
-            // Include Windows and Linux ARM only for tagged releases, release branches, or manual dispatch (exclude trunk pushes)
-            const includeWindowsAndLinuxArm = isTaggedRelease || isReleaseBranch || isManualDispatch;
+            // Include Windows and Linux ARM only for release builds, release branches, or manual dispatch (exclude trunk pushes)
+            const includeWindowsAndLinuxArm = isRelease || isReleaseBranch || isManualDispatch;
 
-            // Tagged releases use hosted macOS; every other macOS build uses `spiceai-macos-large`.
+            // Release builds use hosted macOS; every other macOS build uses `spiceai-macos-large`.
             // Trunk pushes stay on it too: the `spiceai-macos` minis share each host between
             // several runner instances, and a release build there can run past the job's
             // 360-minute bound without finishing (#14557). The `concurrency` group on `build`
             // bounds trunk pushes to one running macOS build at a time instead.
-            const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos-large";
-            const linuxRunner = isTaggedRelease ? "ubuntu-24.04" : "spiceai-dev-runners";
+            const macosRunner = isRelease ? "macos-15" : "spiceai-macos-large";
+            const linuxRunner = isRelease ? "ubuntu-24.04" : "spiceai-dev-runners";
 
-            // Use minio for spiceai runners (trunk, release branches, manual dispatch on non-tagged)
-            const useMinio = !isTaggedRelease;
+            // Use minio for spiceai runners (trunk, release branches, manual test builds)
+            const useMinio = !isRelease;
 
             const matrix = [
               {
@@ -122,7 +137,7 @@ jobs:
                 target_arch: "x86_64",
                 tags: ["default", "odbc"],
                 use_minio: useMinio,
-                is_tagged_release: isTaggedRelease,
+                is_release: isRelease,
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
                 runner: macosRunner,
@@ -130,20 +145,20 @@ jobs:
                 target_arch: "aarch64",
                 tags: ["default", "metal"],
                 use_minio: false,
-                is_tagged_release: isTaggedRelease,
+                is_release: isRelease,
               }
             ];
 
-            // Add Linux ARM and Windows only for tagged releases, release branches, or manual dispatch
+            // Add Linux ARM and Windows only for release builds, release branches, or manual dispatch
             if (includeWindowsAndLinuxArm) {
               matrix.push({
                 name: "Linux aarch64",
-                runner: isTaggedRelease ? "hosted-linux-arm-runner" : "hosted-linux-arm-runner",
+                runner: isRelease ? "hosted-linux-arm-runner" : "hosted-linux-arm-runner",
                 target_os: "linux",
                 target_arch: "aarch64",
                 tags: ["default"],
                 use_minio: false,
-                is_tagged_release: isTaggedRelease,
+                is_release: isRelease,
               });
               matrix.push({
                 name: "Windows x64",
@@ -152,7 +167,7 @@ jobs:
                 target_arch: "x86_64",
                 tags: ["default"],
                 use_minio: false,
-                is_tagged_release: isTaggedRelease,
+                is_release: isRelease,
               });
             }
 
@@ -160,6 +175,12 @@ jobs:
             if (isManualDispatch) {
               const platform_option = context.payload.inputs.platform_option;
               const tag_option = context.payload.inputs.tag_option;
+
+              // A release build holds every release binary, so it takes no filter.
+              if (isRelease && (platform_option !== 'all' || tag_option !== 'all')) {
+                core.setFailed(`A release build builds every platform and build tag, so platform_option and tag_option must be 'all', not '${platform_option}' and '${tag_option}'.`);
+                return [];
+              }
 
               // Filter by platform
               let filtered = matrix;
@@ -199,8 +220,8 @@ jobs:
       cancel-in-progress: false
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
-      # Internal builds include PostgreSQL acceleration for benchmarks; tagged releases omit it.
-      SPICED_FEATURES: ${{ matrix.target.is_tagged_release && 'release,models' || 'release,models,postgres-accel' }}
+      # Internal builds include PostgreSQL acceleration for benchmarks; release builds omit it.
+      SPICED_FEATURES: ${{ matrix.target.is_release && 'release,models' || 'release,models,postgres-accel' }}
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_NET_GIT_FETCH_WITH_CLI: true
@@ -499,23 +520,26 @@ jobs:
           source_path: spice_linux_x86_64.tar.gz
           destination_path: spice-minio/artifacts/spice/linux-x86_64/${{ github.sha }}/
 
-  # The CUDA binaries of a tag are built in this run, so one run holds every
+  # The CUDA binaries of a release are built in this run, so one run holds every
   # binary publish_release needs. Trunk pushes build CUDA in
   # build_and_release_cuda's own runs.
   build-cuda:
     name: Build CUDA binaries
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: inputs.release_version
     permissions:
       contents: read
     uses: ./.github/workflows/build_and_release_cuda.yml
+    with:
+      release_version: ${{ inputs.release_version }}
 
   # publish_release checks every artifact against this manifest before it
-  # publishes, and publishes exactly the files it lists. A tag run that misses
-  # a release binary fails here, so publish_release never finds it.
+  # publishes, and publishes exactly the files it lists. It finds this run by
+  # the manifest's artifact name, which carries the version. A release build
+  # that misses a binary fails here, so publish_release never finds it.
   checksums:
     name: Record release checksums
     needs: [build, build-cuda]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: inputs.release_version
     runs-on: ubuntu-24.04
     permissions: {}
     steps:
@@ -549,7 +573,7 @@ jobs:
             [ -f "$asset" ] || missing+=("$asset")
           done
           if [ ${#missing[@]} -ne 0 ]; then
-            echo "::error::This run did not build ${missing[*]}, so it cannot be published. A tag build must build every platform: run it without platform, tag or compute-capability filters."
+            echo "::error::This run did not build ${missing[*]}, so it cannot be published. Start the release build again."
             exit 1
           fi
           sha256sum "${assets[@]}" > SHA256SUMS
@@ -557,6 +581,6 @@ jobs:
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: release-sha256sums
+          name: release-v${{ inputs.release_version }}-sha256sums
           path: release/SHA256SUMS
           if-no-files-found: error

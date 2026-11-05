@@ -30,7 +30,7 @@ runs:
         approvers=$(gh api "repos/${REPOSITORY}/actions/runs/${RUN_ID}/approvals" \
           --jq "[.[] | select(.state == \"approved\" and any(.environments[]; .name == env.ENVIRONMENT)) | .user.login] | join(\", \")")
         if [ -z "$approvers" ]; then
-          echo "::error::Workflow run ${RUN_ID} has no approved deployment to the '${ENVIRONMENT}' environment, so this job will not publish. Start publish_release on the release tag and have a reviewer approve its 'publish' job."
+          echo "::error::Workflow run ${RUN_ID} has no approved deployment to the '${ENVIRONMENT}' environment, so this job will not publish. Start publish_release on the release branch and have a reviewer approve its 'publish' job."
           exit 1
         fi
         echo "Run ${RUN_ID} was approved for '${ENVIRONMENT}' by ${approvers}."

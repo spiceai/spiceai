@@ -2,11 +2,14 @@
 
 Used by publish_release.yml:
 
-  find-build  Prints the id of the one successful build_release run of the tag.
-  publish     Checks the tag still points at the built commit, attaches the files listed in SHA256SUMS to the tag's draft release
-              (created when there is none), checks every asset against its
-              sha256, and publishes the release.
+  find-build  Prints the id of the one successful release build of a version
+              at a commit.
+  publish     Attaches the files listed in SHA256SUMS to the tag's draft
+              release (created when there is none), checks every asset against
+              its sha256, and publishes the release at the built commit, which
+              creates the tag there.
 
+The tag is created only by publishing, so a ruleset can protect release tags.
 A published release is never changed. An asset that already exists is accepted
 only when its sha256 matches, so re-running a failed job resumes the upload.
 """
@@ -70,7 +73,11 @@ class Api:
         return items
 
     def get(self, path):
-        return self._check(self.session.get(f"{API}/{path}", timeout=TIMEOUT), f"read {path}").json()
+        """The object at path, or None when it does not exist."""
+        resp = self.session.get(f"{API}/{path}", timeout=TIMEOUT)
+        if resp.status_code == 404:
+            return None
+        return self._check(resp, f"read {path}").json()
 
     def post(self, path, payload):
         return self._check(self.session.post(f"{API}/{path}", json=payload, timeout=TIMEOUT), f"create {path}").json()
@@ -93,35 +100,57 @@ class Api:
         return self._check(resp, f"upload {name}").json()
 
 
-def find_build_run(api, repo, workflow, tag, sha):
+def build_artifact_name(version):
+    """Name of the SHA256SUMS artifact of a release build, which build_release.yml uploads."""
+    return f"release-v{version}-sha256sums"
+
+
+def find_build_run(api, repo, workflow, version, sha):
     runs = api.get_all(
         f"repos/{repo}/actions/workflows/{workflow}/runs",
         {"head_sha": sha, "status": "success"},
         key="workflow_runs",
     )
-    # A branch push of the same commit is a successful run too; only a run of
-    # the tag itself built release binaries.
-    matches = [r for r in runs if r["head_branch"] == tag]
+    # A branch push of the same commit is a successful run too; only a release
+    # build of this version uploaded its manifest.
+    name = build_artifact_name(version)
+    matches = [
+        r
+        for r in runs
+        if any(
+            a["name"] == name and not a.get("expired")
+            for a in api.get_all(f"repos/{repo}/actions/runs/{r['id']}/artifacts", key="artifacts")
+        )
+    ]
     if len(matches) != 1:
         found = ", ".join(str(r["id"]) for r in matches) or "none"
         raise PublishError(
-            f"Expected exactly one successful {workflow} run of tag {tag} at {sha}, found {found}. "
-            f"Wait for the tag's {workflow} run to succeed, or re-run its failed jobs. When there "
-            f"is more than one, delete the runs that should not be published."
+            f"Expected exactly one successful {workflow} release build of {version} at {sha}, found {found}. "
+            f"Start {workflow} on this branch with release_version {version} and wait for it to succeed. "
+            f"When there is more than one, delete the runs that should not be published."
         )
     return matches[0]["id"]
 
 
-def require_tag_at(api, repo, tag, sha):
-    """Fail unless tag still points at sha, the commit whose build is being published."""
-    obj = api.get(f"repos/{repo}/git/ref/tags/{tag}")["object"]
+def tag_commit(api, repo, tag):
+    """The commit tag points at, or None when the tag does not exist."""
+    ref = api.get(f"repos/{repo}/git/ref/tags/{tag}")
+    if ref is None:
+        return None
+    obj = ref["object"]
     # An annotated tag points at a tag object; peel it to the commit.
     while obj["type"] == "tag":
         obj = api.get(f"repos/{repo}/git/tags/{obj['sha']}")["object"]
-    if obj["sha"] != sha:
+    return obj["sha"]
+
+
+def require_tag_free_or_at(api, repo, tag, sha):
+    """Fail when tag already exists at a commit other than sha, the commit being released."""
+    existing = tag_commit(api, repo, tag)
+    if existing is not None and existing != sha:
         raise PublishError(
-            f"Tag {tag} now points at {obj['sha']}, not at {sha}, whose build this run found. "
-            f"The tag moved after this run started; start publish_release again on the tag."
+            f"Tag {tag} already points at {existing}, not at {sha}, the commit this run releases. "
+            f"A release tag is never moved."
         )
 
 
@@ -208,9 +237,11 @@ def is_latest(api, repo, tag, prerelease):
     return True
 
 
-def publish(api, repo, tag, files, notes, prerelease):
-    """Attach `files` ({name: (path, sha256)}) to the tag's release and publish it.
+def publish(api, publish_api, repo, tag, sha, files, notes, prerelease):
+    """Attach `files` ({name: (path, sha256)}) to the tag's release and publish it at sha.
 
+    publish_api publishes the draft, which creates the tag; with a ruleset on
+    release tags it carries the token of the ruleset's bypass actor.
     Returns whether the release was made the latest release.
     """
     release = find_release(api, repo, tag)
@@ -219,7 +250,7 @@ def publish(api, repo, tag, files, notes, prerelease):
         print(f"Creating draft release {tag}")
         release = api.post(
             f"repos/{repo}/releases",
-            {"tag_name": tag, "name": title, "body": body, "draft": True, "prerelease": prerelease},
+            {"tag_name": tag, "target_commitish": sha, "name": title, "body": body, "draft": True, "prerelease": prerelease},
         )
 
     assets = {a["name"]: a for a in api.get_all(f"repos/{repo}/releases/{release['id']}/assets")}
@@ -233,7 +264,7 @@ def publish(api, repo, tag, files, notes, prerelease):
     # Check every attached asset before uploading anything, so a conflict
     # leaves the draft as it was.
     to_upload = []
-    for name, (path, sha) in sorted(files.items()):
+    for name, (path, digest) in sorted(files.items()):
         asset = assets.get(name)
         if asset is not None and asset.get("state") != "uploaded" and release["draft"]:
             # An upload that broke off leaves an asset with no content. The
@@ -243,48 +274,62 @@ def publish(api, repo, tag, files, notes, prerelease):
             asset = None
         if asset is not None:
             existing = asset_sha256(asset)
-            if existing != sha:
+            if existing != digest:
                 raise PublishError(
-                    f"Release {tag} already has {name} with sha256 {existing}, but this build's is {sha}. "
+                    f"Release {tag} already has {name} with sha256 {existing}, but this build's is {digest}. "
                     f"Release assets are never replaced. If the draft holds assets of another build, "
                     f"delete them and re-run this job."
                 )
-            print(f"{name} is already attached with sha256 {sha}")
+            print(f"{name} is already attached with sha256 {digest}")
         elif not release["draft"]:
             raise PublishError(
                 f"Release {tag} is already published without {name}. A published release is never changed."
             )
         else:
-            to_upload.append((name, path, sha))
+            to_upload.append((name, path, digest))
 
-    for name, path, sha in to_upload:
+    for name, path, digest in to_upload:
         print(f"Uploading {name}")
         uploaded = api.upload(repo, release["id"], name, path)
-        if asset_sha256(uploaded) != sha:
+        if asset_sha256(uploaded) != digest:
             raise PublishError(
-                f"GitHub reports sha256 {asset_sha256(uploaded)} for the uploaded {name}, but the file's is {sha}."
+                f"GitHub reports sha256 {asset_sha256(uploaded)} for the uploaded {name}, but the file's is {digest}."
             )
 
     # Read the assets back before publishing, so a release is only published
     # when it holds exactly this build.
     attached = {a["name"]: asset_sha256(a) for a in api.get_all(f"repos/{repo}/releases/{release['id']}/assets")}
-    expected = {name: sha for name, (_, sha) in files.items()}
+    expected = {name: digest for name, (_, digest) in files.items()}
     if attached != expected:
         raise PublishError(f"Release {tag} assets do not match the build: attached {attached}, expected {expected}")
 
     if not release["draft"]:
+        if tag_commit(api, repo, tag) != sha:
+            raise PublishError(f"Release {tag} is already published, but not at the built commit {sha}.")
         print(f"Release {tag} is already published with every asset of this build.")
         return is_latest(api, repo, tag, release["prerelease"])
 
     latest = is_latest(api, repo, tag, prerelease)
-    update = {"draft": False, "prerelease": prerelease, "make_latest": "true" if latest else "false"}
+    # Publishing creates the tag at target_commitish, the built commit. A draft
+    # written by hand may target the branch instead, whose head can move.
+    update = {
+        "draft": False,
+        "tag_name": tag,
+        "target_commitish": sha,
+        "prerelease": prerelease,
+        "make_latest": "true" if latest else "false",
+    }
     # A draft written during the endgame keeps its own title and notes.
     if not (release.get("body") or "").strip():
         update["body"] = body
     if not (release.get("name") or "").strip():
         update["name"] = title
-    api.patch(f"repos/{repo}/releases/{release['id']}", update)
-    print(f"Published release {tag} (pre-release: {prerelease}, latest: {latest})")
+    publish_api.patch(f"repos/{repo}/releases/{release['id']}", update)
+
+    created = tag_commit(api, repo, tag)
+    if created != sha:
+        raise PublishError(f"Published release {tag}, but the tag points at {created}, not at the built commit {sha}.")
+    print(f"Published release {tag} at {sha} (pre-release: {prerelease}, latest: {latest})")
     return latest
 
 
@@ -311,7 +356,7 @@ def main(argv=None):
     pub.add_argument("--sums", required=True, help="SHA256SUMS manifest of the build_release run")
     pub.add_argument("--notes-file", help="Release notes, used when the draft has none")
     pub.add_argument("--prerelease", choices=["true", "false"], required=True)
-    pub.add_argument("--sha", required=True, help="Commit the build was made from")
+    pub.add_argument("--sha", required=True, help="Commit the build was made from, where the tag is created")
 
     args = parser.parse_args(argv)
     token = os.getenv("GITHUB_TOKEN")
@@ -322,7 +367,8 @@ def main(argv=None):
 
     try:
         if args.action == "find-build":
-            write_output("build_run_id", find_build_run(api, args.repo, args.workflow, args.tag, args.sha))
+            version = args.tag[1:]
+            write_output("build_run_id", find_build_run(api, args.repo, args.workflow, version, args.sha))
             return 0
 
         sums = read_sums(args.sums)
@@ -341,8 +387,9 @@ def main(argv=None):
                 notes = f.read()
         if not notes:
             notes = f"This is the release candidate {args.tag[1:]}"
-        require_tag_at(api, args.repo, args.tag, args.sha)
-        latest = publish(api, args.repo, args.tag, files, notes, args.prerelease == "true")
+        require_tag_free_or_at(api, args.repo, args.tag, args.sha)
+        publish_token = os.getenv("RELEASE_PUBLISH_TOKEN") or token
+        latest = publish(api, Api(publish_token), args.repo, args.tag, args.sha, files, notes, args.prerelease == "true")
         write_output("make_latest", "true" if latest else "false")
         return 0
     except PublishError as e:
