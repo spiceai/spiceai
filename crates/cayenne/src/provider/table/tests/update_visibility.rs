@@ -44,6 +44,9 @@ async fn seeded(
         VortexConfig {
             deletion_mode: mode,
             compaction_background_interval_ms: 3_600_000,
+            // Staged (non-inline) writes: the staged-commit pause hook below
+            // only fires on that path.
+            inline_max_rows: 0,
             ..VortexConfig::default()
         },
         OnConflict::Upsert(
