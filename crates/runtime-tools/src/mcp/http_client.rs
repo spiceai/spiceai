@@ -66,6 +66,15 @@ use super::MAX_TOOL_RESULT_SIZE;
 
 type HttpResult<T> = Result<T, StreamableHttpError<reqwest::Error>>;
 
+/// Drops the request URL from a transport error. The error text reaches API callers and the
+/// model, and an MCP URL can carry a credential in its path or query.
+fn without_url<T>(result: HttpResult<T>) -> HttpResult<T> {
+    result.map_err(|e| match e {
+        StreamableHttpError::Client(e) => StreamableHttpError::Client(e.without_url()),
+        other => other,
+    })
+}
+
 /// The single-line message for a response that exceeded [`MAX_TOOL_RESULT_SIZE`].
 ///
 /// It is both the `WARN` log line and the error the failed request surfaces,
@@ -129,7 +138,11 @@ impl BoundedHttpClient {
         }
         let capacity = declared.map_or(0, |len| usize::try_from(len).unwrap_or(0));
         let mut body = Vec::with_capacity(capacity);
-        while let Some(chunk) = response.chunk().await? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(reqwest::Error::without_url)?
+        {
             if body.len() + chunk.len() > MAX_TOOL_RESULT_SIZE {
                 return Ok(None);
             }
@@ -201,7 +214,9 @@ impl Stream for BoundedByteStream {
                     Some(Ok(chunk))
                 }
             }
-            Some(Err(source)) => Some(Err(ResponseBodyError::Read { source })),
+            Some(Err(source)) => Some(Err(ResponseBodyError::Read {
+                source: source.without_url(),
+            })),
             None => None,
         })
     }
@@ -332,7 +347,11 @@ impl StreamableHttpClient for BoundedHttpClient {
         if let Some(session_id) = session_id {
             request = request.header(HEADER_SESSION_ID, session_id.as_ref());
         }
-        let response = request.json(&message).send().await?;
+        let response = request
+            .json(&message)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         let status = response.status();
         if status == StatusCode::UNAUTHORIZED
@@ -463,9 +482,11 @@ impl StreamableHttpClient for BoundedHttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> HttpResult<()> {
-        self.inner
-            .delete_session(uri, session_id, auth_header, custom_headers)
-            .await
+        without_url(
+            self.inner
+                .delete_session(uri, session_id, auth_header, custom_headers)
+                .await,
+        )
     }
 
     async fn get_stream(
@@ -496,16 +517,18 @@ impl StreamableHttpClient for BoundedHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> HttpResult<BoxStream<'static, Result<Sse, SseError>>> {
-        self.inner
-            .get_stream_with_max_sse_event_size(
-                uri,
-                session_id,
-                last_event_id,
-                auth_header,
-                custom_headers,
-                max_sse_event_size.min(MAX_TOOL_RESULT_SIZE),
-            )
-            .await
+        without_url(
+            self.inner
+                .get_stream_with_max_sse_event_size(
+                    uri,
+                    session_id,
+                    last_event_id,
+                    auth_header,
+                    custom_headers,
+                    max_sse_event_size.min(MAX_TOOL_RESULT_SIZE),
+                )
+                .await,
+        )
     }
 }
 
@@ -831,5 +854,40 @@ mod tests {
             response_too_large_message("github"),
             "MCP server 'github' sent a response larger than the 16 MiB limit, so the request failed and the response was discarded. Make the MCP tool return a smaller result, for example by paginating it. See https://spiceai.org/docs/components/tools/mcp"
         );
+    }
+
+    /// A transport error does not show the MCP server URL, which can carry a credential.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transport_errors_do_not_show_the_server_url() {
+        const SECRET: &str = "url-secret-7f3a";
+        let mcp = StreamableHttpService::new(
+            || Ok(SizedResultServer),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default()
+                .disable_allowed_hosts()
+                .with_json_response(true),
+        );
+        let upstream = Upstream {
+            mcp,
+            flood_requests: Arc::new(AtomicUsize::new(0)),
+            flood_bytes_sent: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = axum::Router::new()
+            .route("/s/{token}/mcp", axum::routing::any(route))
+            .with_state(upstream);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let url = url::Url::parse(&format!("http://{addr}/s/{SECRET}/mcp")).expect("valid url");
+        let catalog = connect(url).await;
+
+        server.abort();
+        let _ = server.await;
+        let e = call(&catalog, "sized", &json!({"bytes": 1}))
+            .await
+            .expect_err("the server is gone, so the call fails");
+        assert!(!e.contains(SECRET), "the error shows the server URL: {e}");
     }
 }
