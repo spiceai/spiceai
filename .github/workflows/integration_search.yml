@@ -42,6 +42,10 @@ jobs:
     name: Test Search Integration
     runs-on: spiceai-macos-large
     environment: ci
+    env:
+      # Metal runners do not have `xcrun metal`
+      # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
+      MISTRALRS_METAL_PRECOMPILE: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -52,8 +56,12 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      # The step below builds the tests before it runs them, so the credentials last as long as
-      # the job's default 6-hour limit.
+      # Build before the OpenAI token is minted, so that the token's short lifetime is spent
+      # only on running the tests.
+      - name: Build search integration tests
+        run: cargo test --test integration_models -p runtime --features models,metal,s3_vectors,kafka,duckdb,extended_tests --no-run
+
+      # The credentials last as long as the job's default 6-hour limit.
       - name: Assume the S3 Vectors role
         id: aws-s3-vectors
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
@@ -76,9 +84,6 @@ jobs:
 
       - name: Run search integration tests
         env:
-          # Metal runners do not have `xcrun metal`
-          # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
-          MISTRALRS_METAL_PRECOMPILE: 0
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           AWS_S3_VECTORS_KEY: ${{ steps.aws-s3-vectors.outputs.aws-access-key-id }}
           AWS_S3_VECTORS_SECRET: ${{ steps.aws-s3-vectors.outputs.aws-secret-access-key }}
