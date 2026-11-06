@@ -43,10 +43,6 @@ async fn accelerated_view_cayenne() -> Result<(), anyhow::Error> {
         .scope(async {
             let temp_dir = tempfile::tempdir()?;
             let db_path = temp_dir.path().join("cayenne");
-            // Clean up any existing acceleration file
-            if std::path::Path::new("./taxi_trips_vw.db").exists() {
-                std::fs::remove_dir_all(&db_path).expect("to remove Cayenne directory");
-            }
 
             let dataset = Dataset::new("s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet", "taxi_trips");
             let mut view = View::new("taxi_trips_vw".to_string());

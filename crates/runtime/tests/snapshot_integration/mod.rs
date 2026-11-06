@@ -2011,7 +2011,6 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
 /// Rows appended to the source between the two arms of
 /// `snapshot_int_test14_file_create_skips_snapshot_bootstrap`, which is what makes a
 /// bootstrap and a rebuild-from-source land on different row counts.
-#[cfg(feature = "duckdb")]
 const FILE_CREATE_EXTRA_ROWS: usize = 5;
 
 /// `mode: file_create` must not bootstrap the snapshot it just discarded.
