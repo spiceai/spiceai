@@ -3,8 +3,7 @@ name: publish_release
 # Publishes a release from its build_release run, and creates the release tag.
 # Start it on the release branch with the version, once the branch head's
 # build_release release build of that version is green. Every job that
-# publishes needs its own approval, in `github-publish` for the release and
-# `release-publish` for the Docker images:
+# publishes runs in `release-publish` and needs its own approval:
 #   1. `publish` attaches the binaries of that run to the tag's draft release,
 #      or a new one, checking each against the run's SHA256SUMS, and publishes
 #      the release at the built commit, which creates the tag there;
@@ -84,7 +83,7 @@ jobs:
     needs: resolve
     runs-on: ubuntu-24.04
     # One required reviewer, who cannot be the person who started this run.
-    environment: github-publish
+    environment: release-publish
     permissions:
       contents: write
       actions: read
