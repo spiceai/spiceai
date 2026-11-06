@@ -38,44 +38,33 @@ models:
     from: openai:gpt-5
     params:
       tools: auto
-      openai_identity_provider_id: ${ secrets:OPENAI_IDENTITY_PROVIDER_ID }
-      openai_service_account_id: ${ secrets:OPENAI_SERVICE_ACCOUNT_ID }
-      openai_identity_token_audience: https://api.openai.com
+      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
       system_prompt: *system_prompt
   - name: gpt-5-mini
     from: openai:gpt-5-mini
     params:
       tools: auto
-      openai_identity_provider_id: ${ secrets:OPENAI_IDENTITY_PROVIDER_ID }
-      openai_service_account_id: ${ secrets:OPENAI_SERVICE_ACCOUNT_ID }
-      openai_identity_token_audience: https://api.openai.com
+      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
       system_prompt: *system_prompt
   - name: o1
     from: openai:o1-2024-12-17
     params:
       tools: auto
-      openai_identity_provider_id: ${ secrets:OPENAI_IDENTITY_PROVIDER_ID }
-      openai_service_account_id: ${ secrets:OPENAI_SERVICE_ACCOUNT_ID }
-      openai_identity_token_audience: https://api.openai.com
+      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
       reasoning_effort: high
       system_prompt: *system_prompt
   - name: o3-mini
     from: openai:o3-mini-2025-01-31
     params:
       tools: auto
-      openai_identity_provider_id: ${ secrets:OPENAI_IDENTITY_PROVIDER_ID }
-      openai_service_account_id: ${ secrets:OPENAI_SERVICE_ACCOUNT_ID }
-      openai_identity_token_audience: https://api.openai.com
+      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
       reasoning_effort: high
       system_prompt: *system_prompt
   - name: claude-haiku-3-5
     from: anthropic:claude-haiku-3-5
     params:
       tools: auto
-      anthropic_federation_rule_id: ${ secrets:ANTHROPIC_FEDERATION_RULE_ID }
-      anthropic_organization_id: ${ secrets:ANTHROPIC_ORGANIZATION_ID }
-      anthropic_service_account_id: ${ secrets:ANTHROPIC_SERVICE_ACCOUNT_ID }
-      anthropic_workspace_id: ${ secrets:ANTHROPIC_WORKSPACE_ID }
+      anthropic_auth_token: ${ secrets:SPICE_ANTHROPIC_AUTH_TOKEN }
       system_prompt: *system_prompt
   - name: grok4
     from: xai:grok-4

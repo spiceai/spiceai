@@ -430,13 +430,8 @@ jobs:
       # The Spicepod's `github:` dataset reads this repository's issues with `GITHUB_TOKEN`.
       issues: read
       pull-requests: read
-      # Exchanged for OpenAI access tokens: workload identity federation.
+      # OpenAI access tokens are minted from this job's GitHub OIDC token.
       id-token: write
-    env:
-      # Workload identity federation: spiced and the tests exchange this job's GitHub OIDC token
-      # for provider access tokens with these IDs, and exchange again before each expires.
-      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
-      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
     strategy:
       fail-fast: false
       matrix:
@@ -468,6 +463,15 @@ jobs:
       # 8090/50051 cannot be assumed free (#12419).
       - name: Allocate Spice runtime ports
         uses: ./.github/actions/allocate-spice-ports
+
+      # spiced holds this token until the job ends. It expires about 300 s after it is minted,
+      # so the steps from here to "Test chat" must end within that time.
+      - name: Mint an OpenAI access token
+        uses: ./.github/actions/openai-token
+        with:
+          identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+          service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+          audience: ${{ secrets.OPENAI_WIF_AUDIENCE }}
 
       - name: Start spice runtime
         env:

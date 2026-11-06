@@ -62,7 +62,7 @@ use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration};
-use token_provider::github_app_token::{AppKey, GitHubAppTokenProvider};
+use token_provider::github_app_token::GitHubAppTokenProvider;
 use token_provider::{StaticTokenProvider, TokenProvider};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use url::Url;
@@ -76,7 +76,6 @@ use runtime_parameters::{ParameterSpec, Parameters};
 
 pub mod github;
 
-mod app_key;
 mod commits;
 mod identity;
 mod issues;
@@ -836,8 +835,6 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("private_key")
         .description("The Github App private key.")
         .secret(),
-    ParameterSpec::component("private_key_kms")
-        .description("The key that holds the GitHub App's private key, which signs the App's JWTs so the private key is never stored: an Azure Key Vault key URL (https://<vault>.vault.azure.net/keys/<name>) or an AWS KMS key or alias ARN (arn:aws:kms:<region>:<account>:alias/<name>). Use with `github_client_id` and `github_installation_id`, instead of `github_private_key`."),
     ParameterSpec::component("installation_id")
         .description("The Github App installation ID.")
         .secret(),
@@ -901,31 +898,6 @@ impl DataConnectorFactory for GithubFactory {
             .map(ToString::to_string);
 
         let connector_component = params.component.clone();
-        let github_endpoint = params
-            .parameters
-            .get("endpoint")
-            .expose()
-            .ok()
-            .unwrap_or("https://api.github.com")
-            .to_string();
-
-        let key_service_app = match app_key::resolve(&app_key::AppKeyParams {
-            private_key_kms: params.user_set("private_key_kms"),
-            private_key_set: params.user_set("private_key").is_some(),
-            token_set: params.user_set("token").is_some(),
-            client_id: client_id.as_deref(),
-            installation_id: installation_id.as_deref(),
-        }) {
-            Ok(app) => app,
-            Err(error) => {
-                let error = DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "github".to_string(),
-                    connector_component,
-                    message: error.to_string(),
-                };
-                return Box::pin(async move { Err(Box::new(error) as _) });
-            }
-        };
 
         let dataset_max_concurrent_requests = match params
             .parameters
@@ -981,75 +953,28 @@ impl DataConnectorFactory for GithubFactory {
             .unwrap_or(GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS);
 
         Box::pin(async move {
-            let unable_to_authenticate =
-                |source: token_provider::github_app_token::GitHubAppError| {
-                    DataConnectorError::UnableToConnectInternal {
-                        dataconnector: "github".to_string(),
-                        connector_component: connector_component.clone(),
-                        source: Box::new(source),
-                    }
-                };
             let (token_provider, semaphore_key): (Option<Arc<dyn TokenProvider>>, Option<String>) =
-                if let Some(app) = key_service_app {
-                    // A key service the Spicepod names takes precedence over a token or private key
-                    // a secret store supplies unasked.
-                    let component = github_component_label(&connector_component);
-                    let (signer, load_message) = app_key::signer(app.service, &component)
-                        .await
-                        .map_err(|error| {
-                            if error.is_configuration() {
-                                DataConnectorError::InvalidConfigurationNoSource {
-                                    dataconnector: "github".to_string(),
-                                    connector_component: connector_component.clone(),
-                                    message: error.to_string(),
-                                }
-                            } else {
-                                DataConnectorError::UnableToConnectInternal {
-                                    dataconnector: "github".to_string(),
-                                    connector_component: connector_component.clone(),
-                                    source: Box::new(error),
-                                }
-                            }
-                        })?;
-                    // GitHub rate limits are per installation, so use the installation ID as the key
-                    let key = app.installation_id.clone();
-                    let provider = GitHubAppTokenProvider::try_new(
-                        component,
-                        app.client_id.into(),
-                        AppKey::Signer(signer),
-                        app.installation_id.into(),
-                        github_endpoint.into(),
-                    )
-                    .await
-                    .map_err(unable_to_authenticate)?;
-                    tracing::info!("{load_message}");
-                    (Some(Arc::new(provider)), Some(key))
-                } else {
-                    match (token, client_id, private_key, installation_id) {
-                        (Some(token), _, _, _) => {
-                            let key = token.expose_secret().to_string();
-                            (Some(Arc::new(StaticTokenProvider::new(token))), Some(key))
-                        }
-
-                        (None, Some(client_id), Some(private_key), Some(installation_id)) => {
-                            // GitHub rate limits are per installation, so use the installation ID as the key
-                            let key = installation_id.clone();
-                            let provider = Arc::new(
-                                GitHubAppTokenProvider::try_new(
-                                    github_component_label(&connector_component),
-                                    client_id.into(),
-                                    AppKey::Pem(private_key.into()),
-                                    installation_id.into(),
-                                    github_endpoint.into(),
-                                )
-                                .await
-                                .map_err(unable_to_authenticate)?,
-                            );
-                            (Some(provider), Some(key))
-                        }
-
-                        _ => (None, None),
+                match (token, client_id, private_key, installation_id) {
+                    (Some(token), _, _, _) => {
+                        let key = token.expose_secret().to_string();
+                        (Some(Arc::new(StaticTokenProvider::new(token))), Some(key))
                     }
+
+                    (None, Some(client_id), Some(private_key), Some(installation_id)) => {
+                        // GitHub rate limits are per installation, so use the installation ID as the key
+                        let key = installation_id.clone();
+                        let provider = Arc::new(
+                            GitHubAppTokenProvider::try_new(
+                                client_id.into(),
+                                private_key.into(),
+                                installation_id.into(),
+                            )
+                            .await?,
+                        );
+                        (Some(provider), Some(key))
+                    }
+
+                    _ => (None, None),
                 };
 
             let semaphore = if let Some(key) = semaphore_key {
@@ -1101,14 +1026,6 @@ impl DataConnectorFactory for GithubFactory {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
-    }
-}
-
-/// `component` as a log line names it, such as `dataset 'stars' (github)`.
-fn github_component_label(component: &ConnectorComponent) -> String {
-    match component {
-        ConnectorComponent::Dataset(dataset) => format!("dataset '{}' (github)", dataset.name),
-        ConnectorComponent::Catalog(catalog) => format!("catalog '{}' (github)", catalog.name),
     }
 }
 

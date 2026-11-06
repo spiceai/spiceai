@@ -147,7 +147,6 @@ static TEST_MODELS: LazyLock<Vec<TestModel>> = LazyLock::new(|| {
             create: Box::new(|| {
                 Box::pin(async {
                     create::create_anthropic(None)
-                        .await
                         .map_err(|e| anyhow::anyhow!("failed to create anthropic model: {e}"))
                 })
             }),
@@ -164,20 +163,9 @@ static TEST_MODELS: LazyLock<Vec<TestModel>> = LazyLock::new(|| {
             }),
         },
         TestModel {
-            name: "azure",
-            fetch_repo: None,
-            create: Box::new(|| {
-                Box::pin(async {
-                    create::create_azure()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("failed to create azure model: {e}"))
-                })
-            }),
-        },
-        TestModel {
             name: "openai",
             fetch_repo: None,
-            create: Box::new(|| Box::pin(async { create::create_openai("gpt-4o-mini").await })),
+            create: Box::new(|| Box::pin(async { Ok(create::create_openai("gpt-4o-mini")) })),
         },
         TestModel {
             name: "xai",
@@ -516,7 +504,6 @@ async fn test_basic(
     #[values(
         "anthropic",
         "openai",
-        "azure",
         "xai",
         "local_phi3",
         "hf_phi3",
@@ -570,7 +557,6 @@ async fn test_usage(
     #[values(
         "anthropic",
         "openai",
-        "azure",
         "xai",
         "local_phi3",
         "hf_phi3",
@@ -626,16 +612,7 @@ async fn test_usage(
 #[rstest]
 #[tokio::test]
 async fn test_system_prompt(
-    #[values(
-        "anthropic",
-        "openai",
-        "azure",
-        "xai",
-        "local_phi3",
-        "hf_phi3",
-        "google"
-    )]
-    model_name: &str,
+    #[values("anthropic", "openai", "xai", "local_phi3", "hf_phi3", "google")] model_name: &str,
     #[values(false, true)] as_stream: bool,
 ) {
     let req: CreateChatCompletionRequest = serde_json::from_value(json!({
@@ -682,7 +659,6 @@ async fn test_supports_basic_message_roles(
     #[values(
         "anthropic",
         "openai",
-        "azure",
         "xai",
         "local_phi3",
         "hf_phi3",
@@ -729,7 +705,7 @@ async fn test_supports_basic_message_roles(
 #[rstest]
 #[tokio::test]
 async fn test_supports_all_message_roles(
-    #[values("anthropic", "openai", "azure", "xai", "bedrock", "google")] model_name: &str,
+    #[values("anthropic", "openai", "xai", "bedrock", "google")] model_name: &str,
     #[values(false, true)] as_stream: bool,
 ) {
     let req: CreateChatCompletionRequest = serde_json::from_value(json!({
@@ -792,7 +768,7 @@ async fn test_supports_all_message_roles(
 #[rstest]
 #[tokio::test]
 async fn test_tool_use(
-    #[values("anthropic", "openai", "azure", "google", "xai", "bedrock")] model_name: &str,
+    #[values("anthropic", "openai", "google", "xai", "bedrock")] model_name: &str,
     #[values(false, true)] as_stream: bool,
 ) {
     // serde_json::from_value(
@@ -1080,7 +1056,6 @@ async fn default_anthropic_model_accepts_forwarded_sampling_controls() {
     }
 
     let model = create::create_anthropic(None)
-        .await
         .unwrap_or_else(|e| panic!("failed to build the default Anthropic model: {e}"));
 
     // Every control `crates/llms/src/anthropic/chat.rs` forwards to Anthropic. `top_logprobs` is

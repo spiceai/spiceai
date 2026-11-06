@@ -67,23 +67,13 @@ jobs:
     name: Run Text-to-SQL tests
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
-    # Holds the OpenAI and Anthropic workload identity federation IDs (`OPENAI_*` and
-    # `ANTHROPIC_*` secrets).
+    # Holds the Anthropic workload identity federation IDs (`ANTHROPIC_*` secrets).
     environment: ci
     permissions:
       contents: read
       actions: read
-      # Exchanged for OpenAI and Anthropic access tokens: workload identity federation.
+      # Anthropic access tokens are minted from this job's GitHub OIDC token.
       id-token: write
-    env:
-      # Workload identity federation: spiced and the tests exchange this job's GitHub OIDC token
-      # for provider access tokens with these IDs, and exchange again before each expires.
-      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
-      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
-      ANTHROPIC_FEDERATION_RULE_ID: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
-      ANTHROPIC_ORGANIZATION_ID: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
-      ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
-      ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -172,6 +162,31 @@ jobs:
           queryset_name: ${{ github.event.inputs.benchmark_queryset }}
           use_evidence: ${{ github.event.inputs.use_evidence }}
 
+      # Only a Spicepod whose models authenticate to Anthropic needs a token: any other benchmark
+      # must not depend on Anthropic credentials or availability.
+      - name: Check whether the Spicepod authenticates to Anthropic
+        id: anthropic
+        env:
+          SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
+        run: |
+          if grep -Eq 'secrets: *SPICE_ANTHROPIC_AUTH_TOKEN' "$SPICEPOD_PATH"; then
+            echo "needs_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_token=false" >> "$GITHUB_OUTPUT"
+            echo "${SPICEPOD_PATH} does not use SPICE_ANTHROPIC_AUTH_TOKEN, so no Anthropic access token is minted."
+          fi
+
+      # spiced holds this one token for the whole run and does not refresh it, so a run longer than
+      # the federation rule's token lifetime (`expires_in` in this step's log) loses Anthropic.
+      - name: Mint an Anthropic access token
+        if: steps.anthropic.outputs.needs_token == 'true'
+        uses: ./.github/actions/anthropic-token
+        with:
+          federation-rule-id: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
+          organization-id: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
+          service-account-id: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          workspace-id: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         run: |
           rm -rf .spice/data
@@ -226,5 +241,6 @@ jobs:
           MINIO_KEY: ${{ steps.rustfs.outputs.access-key-id }}
           MINIO_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
           MINIO_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}

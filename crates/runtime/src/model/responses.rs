@@ -176,12 +176,12 @@ async fn construct_model(
         ModelSource::OpenAi => {
             let p = typed_params::<OpenAiModelParams>(component, params, source.clone(), secrets)
                 .await?;
-            openai(&component.name, model_id, params, &p).await
+            openai(model_id, params, &p)
         }
         ModelSource::Azure => {
             let p = typed_params::<AzureModelParams>(component, params, source.clone(), secrets)
                 .await?;
-            azure(model_id, component.name.as_str(), &p).await
+            azure(model_id, component.name.as_str(), &p)
         }
         ModelSource::Xai => {
             let p =
@@ -227,8 +227,7 @@ pub fn get_openai_responses_request_overrides(model: &Model, prefix: &str) -> Ve
     request_overrides.into_iter().collect()
 }
 
-async fn openai(
-    model_name: &str,
+fn openai(
     model_id: Option<String>,
     raw_params: &HashMap<String, SecretString>,
     params: &OpenAiModelParams,
@@ -256,36 +255,68 @@ async fn openai(
         });
     }
 
-    let model = model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string());
-    if let Some(client) = llms::workload_identity::openai_federated_client(
-        &format!("model '{model_name}' (openai)"),
-        &model,
-        &params.federation(),
-        llms::workload_identity::openai_api_key_in_spicepod(raw_params),
-        llms::openai::ChatBackend::ChatCompletions,
-    )
-    .await
-    .map_err(llms::workload_identity::FederationError::into_llm_error)?
-    {
-        return Ok(Arc::new(client) as Arc<dyn Responses>);
-    }
-
     Ok(Arc::new(llms::openai::new_openai_client(
-        model, api_base, api_key, org_id, project_id, usage_tier,
+        model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
+        api_base,
+        api_key,
+        org_id,
+        project_id,
+        usage_tier,
     )) as Arc<dyn Responses>)
 }
 
-async fn azure(
+fn azure(
     model_id: Option<String>,
-    component_name: &str,
+    model_name: &str,
     params: &AzureModelParams,
 ) -> Result<Arc<dyn Responses>, LlmError> {
-    Ok(
-        match super::chat::azure_client(model_id, component_name, params).await? {
-            super::chat::AzureClient::Federated(client) => Arc::new(client) as Arc<dyn Responses>,
-            super::chat::AzureClient::Key(client) => Arc::new(client) as Arc<dyn Responses>,
-        },
-    )
+    let Some(model_name) = model_id else {
+        return Err(LlmError::FailedToLoadModel {
+            source: format!(
+    "Azure model '{model_name}' requires a model ID in the format `from:azure:<model_id>`. See https://spiceai.org/docs/components/models/azure for details."
+).into(),
+        });
+    };
+    let api_base = params.endpoint.as_deref();
+    let api_version = params.api_version.as_deref();
+    let deployment_name = params.deployment_name.as_deref();
+    let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
+    let entra_token = params.entra_token.as_ref().map(ExposeSecret::expose_secret);
+
+    if api_base.is_none() {
+        return Err(LlmError::FailedToLoadModel {
+            source: format!(
+    "Azure model '{model_name}' requires the 'endpoint' parameter. See https://spiceai.org/docs/components/models/azure for details."
+).into(),
+        });
+    }
+
+    if api_key.is_some() && entra_token.is_some() {
+        return Err(LlmError::FailedToLoadModel {
+            source: format!(
+                "Azure model '{model_name}' allows only one of 'azure_api_key' or 'azure_entra_token'. See https://spiceai.org/docs/components/models/azure for details."
+            )
+            .into(),
+        });
+    }
+
+    if api_key.is_none() && entra_token.is_none() {
+        return Err(LlmError::FailedToLoadModel {
+            source: format!(
+                "Azure model '{model_name}' requires either 'azure_api_key' or 'azure_entra_token'. See https://spiceai.org/docs/components/models/azure for details."
+            )
+            .into(),
+        });
+    }
+
+    Ok(Arc::new(llms::openai::new_azure_client(
+        model_name,
+        api_base,
+        api_version,
+        deployment_name,
+        entra_token,
+        api_key,
+    )) as Arc<dyn Responses>)
 }
 
 fn xai(model_id: Option<&str>, params: &XaiModelParams) -> Result<Arc<dyn Responses>, LlmError> {
