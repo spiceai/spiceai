@@ -43,7 +43,6 @@ use spicepod::component::dataset::Dataset;
 use spicepod::component::embeddings::EmbeddingChunkConfig;
 use spicepod::param::Params;
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig};
-#[cfg(feature = "duckdb")]
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Display;
