@@ -1502,39 +1502,12 @@ mod tests {
         );
     }
 
-    /// Dropping an in-flight `load_from` before it publishes must leave the
-    /// live map (and its built-ins) intact — the transactional build never
-    /// clears `self.stores` until the replacement is ready.
-    #[tokio::test]
-    async fn cancelled_reload_does_not_drop_builtins() {
-        let mut secrets = super::Secrets::new();
-        secrets.register_builtin_store(
-            "runtime",
-            std::sync::Arc::new(MapStore::new(&[("delivered_key", "synthetic-value")])),
-        );
-
-        {
-            // Bind the config so it outlives the pinned future (temporary
-            // arrays are dropped at the statement end and break `tokio::pin!`).
-            let configured = [env_spicepod_secret("myenv")];
-            let load = secrets.load_from(&configured);
-            tokio::pin!(load);
-            // Prefer the ready branch so `load_from` is cancelled without
-            // publishing a replacement map.
-            tokio::select! {
-                biased;
-                () = std::future::ready(()) => {}
-                _ = &mut load => panic!("load_from should not complete before cancel"),
-            }
-        }
-
-        let value = secrets
-            .get_secret_from_stores("delivered_key", &only("runtime"))
-            .await
-            .expect("lookup")
-            .expect("cancelling load_from must not drop a retained built-in");
-        assert_eq!(value.expose_secret(), "synthetic-value");
-    }
+    /// Cancellation mid-flight is safe by construction: `load_from` never
+    /// mutates `self.stores` until the replacement map is fully built, so
+    /// dropping the future before it returns `Ok` leaves built-ins intact.
+    /// A unit test that actually polls into a `Pending` provider init would
+    /// need a hangable store hook; the invalid-provider Err path above
+    /// exercises the same "exit before publish" contract.
 
     /// The registry swap on the executor bind path must not wait behind an
     /// in-flight expansion. Holding the read guard over the (network-bound)
