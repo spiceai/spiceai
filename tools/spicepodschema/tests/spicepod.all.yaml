@@ -827,13 +827,6 @@ datasets:
       max_concurrent_requests: '6'
       include: '*.md'
 
-  - name: github_pulls_key_service
-    from: github:github.com/spiceai/spiceai/pulls
-    params:
-      github_client_id: client-id
-      github_installation_id: '123456'
-      github_private_key_kms: https://spice-vault.vault.azure.net/keys/github-app # or arn:aws:kms:<region>:<account>:alias/<name>
-
   # ---------------------------------------------------------------------------
   # Git connector
   # ---------------------------------------------------------------------------

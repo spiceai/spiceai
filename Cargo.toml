@@ -11,8 +11,6 @@ members = [
     "crates/ansi_colors",
     "crates/app",
     "crates/arrow_tools",
-    "crates/aws-kms-signer",
-    "crates/azure-key-vault-signer",
     "crates/aws-sdk-credential-bridge",
     "crates/backoff",
     "crates/chunking",
@@ -229,7 +227,6 @@ aws-sdk-bedrockruntime = { version = "1.132.0", default-features = false, featur
 aws-sdk-dynamodb = { version = "1.115.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-ec2 = { version = "1.113.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-dynamodbstreams = { version = "1.101.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
-aws-sdk-kms = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-glue = { version = "1.149.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-s3 = { version = "1.134.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-sdk-sqs = { version = "1.102.0", default-features = false, features = ["default-https-client", "rt-tokio"] }

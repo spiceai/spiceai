@@ -1035,12 +1035,6 @@ jobs:
           GITHUB_ORG_TOKEN: ${{ steps.github-app-token.outputs.token }}
           INSTA_WORKSPACE_ROOT: ${{ github.workspace }}
           CARGO_MANIFEST_DIR: ${{ github.workspace }}
-          # The connector signs the same App's JWT through Key Vault, as the Entra app.
-          GITHUB_APP_KMS_CLIENT_ID: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
-          GITHUB_APP_KMS_INSTALLATION_ID: ${{ vars.ORG_MEMBERS_GITHUB_INSTALLATION_ID }}
-          GITHUB_APP_KMS_KEY: ${{ vars.ORG_MEMBERS_KEY_ID }}
-          AZURE_TENANT_ID: ${{ vars.ORG_MEMBERS_AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ vars.ORG_MEMBERS_AZURE_CLIENT_ID }}
         run: |
           cargo nextest run --workspace-remap "${PWD}" \
             --archive-file ./integration_tests/integration_tests.tar.zst \
