@@ -3,7 +3,8 @@
 Used by publish_release.yml:
 
   find-build  Prints the id of the latest successful release build of a
-              version, dispatched on a branch at a commit.
+              version, dispatched on a branch at its head or at another
+              commit of the branch, and the commit it built.
   publish     Attaches the files listed in SHA256SUMS to the tag's draft
               release (created when there is none), checks every asset against
               its sha256, and publishes the release at the built commit, which
@@ -37,6 +38,8 @@ MAX_BODY_CHARS = 125000
 STABLE_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(-enterprise)?$")
 
 SHA256_LINE = re.compile(r"^([0-9a-f]{64}) [ *](\S+)$")
+
+FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
 class PublishError(Exception):
@@ -135,6 +138,20 @@ def find_build_run(api, repo, workflow, version, sha, branch):
         others = ", ".join(str(r["id"]) for r in matches if r is not latest)
         print(f"Publishing the latest release build of {sha}, run {latest['id']}, not the earlier runs {others}.")
     return latest["id"]
+
+
+def require_on_branch(api, repo, sha, branch, head):
+    """Fail unless sha is a commit of branch: head, its head, is sha or a descendant of it."""
+    if not FULL_SHA.match(sha):
+        raise PublishError(f"Commit '{sha}' is not a full 40-character commit SHA.")
+    comparison = api.get(f"repos/{repo}/compare/{sha}...{head}")
+    if comparison is None:
+        raise PublishError(f"Commit {sha} does not exist in {repo}.")
+    if comparison["status"] not in ("ahead", "identical"):
+        raise PublishError(
+            f"Commit {sha} is not on {branch}: the head of {branch}, {head}, does not contain it. "
+            f"Publish a commit of {branch}, or leave commit empty to publish its head."
+        )
 
 
 def tag_commit(api, repo, tag):
@@ -353,8 +370,9 @@ def main(argv=None):
 
     find = sub.add_parser("find-build")
     find.add_argument("--workflow", required=True)
-    find.add_argument("--sha", required=True)
     find.add_argument("--branch", required=True, help="Branch the release build was dispatched on")
+    find.add_argument("--head", required=True, help="Commit at the head of the branch")
+    find.add_argument("--commit", default="", help="Commit of the branch to publish, instead of its head")
 
     pub = sub.add_parser("publish")
     pub.add_argument("--dir", required=True, help="Directory holding the downloaded artifacts")
@@ -373,7 +391,11 @@ def main(argv=None):
     try:
         if args.action == "find-build":
             version = args.tag[1:]
-            write_output("build_run_id", find_build_run(api, args.repo, args.workflow, version, args.sha, args.branch))
+            commit = args.commit or args.head
+            if commit != args.head:
+                require_on_branch(api, args.repo, commit, args.branch, args.head)
+            write_output("build_run_id", find_build_run(api, args.repo, args.workflow, version, commit, args.branch))
+            write_output("commit", commit)
             return 0
 
         sums = read_sums(args.sums)

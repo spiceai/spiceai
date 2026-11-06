@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -297,6 +298,61 @@ class FindBuildTests(unittest.TestCase):
         with self.assertRaises(publish_release.PublishError) as ctx:
             self.find(api)
         self.assertIn(f"No successful build_release.yml release build of 2.4.2 on {self.BRANCH} at {self.SHA}", str(ctx.exception))
+
+
+class CommitOverrideTests(unittest.TestCase):
+    HEAD = "e" * 40
+    BUILT = "a" * 40
+    BRANCH = "release/2.4"
+
+    def api_with_comparison(self, status):
+        api = FakeApi()
+        api.objects[f"compare/{self.BUILT}...{self.HEAD}"] = {"status": status}
+        return api
+
+    def test_accepts_a_commit_the_branch_head_contains(self):
+        for status in ("ahead", "identical"):
+            publish_release.require_on_branch(self.api_with_comparison(status), REPO, self.BUILT, self.BRANCH, self.HEAD)
+
+    def test_refuses_a_commit_that_is_not_on_the_branch(self):
+        for status in ("behind", "diverged"):
+            with self.assertRaises(publish_release.PublishError) as ctx:
+                publish_release.require_on_branch(self.api_with_comparison(status), REPO, self.BUILT, self.BRANCH, self.HEAD)
+            self.assertIn(f"Commit {self.BUILT} is not on {self.BRANCH}", str(ctx.exception))
+
+    def test_refuses_an_unknown_or_abbreviated_commit(self):
+        with self.assertRaises(publish_release.PublishError) as ctx:
+            publish_release.require_on_branch(FakeApi(), REPO, self.BUILT, self.BRANCH, self.HEAD)
+        self.assertIn(f"Commit {self.BUILT} does not exist", str(ctx.exception))
+        with self.assertRaises(publish_release.PublishError) as ctx:
+            publish_release.require_on_branch(FakeApi(), REPO, "aaaaaaa", self.BRANCH, self.HEAD)
+        self.assertIn("is not a full 40-character commit SHA", str(ctx.exception))
+
+    def find_build(self, api, commit):
+        with tempfile.TemporaryDirectory() as d:
+            output = os.path.join(d, "output")
+            env = {"GITHUB_TOKEN": "t", "GITHUB_OUTPUT": output}
+            with mock.patch.dict(os.environ, env), mock.patch.object(publish_release, "Api", lambda token: api):
+                code = publish_release.main([
+                    "--repo", REPO, "--tag", "v2.4.2", "find-build", "--workflow", "build_release.yml",
+                    "--branch", self.BRANCH, "--head", self.HEAD, "--commit", commit,
+                ])
+            with open(output) as f:
+                return code, dict(line.split("=", 1) for line in f.read().splitlines())
+
+    def run_at(self, run_id, sha):
+        return {"id": run_id, "head_sha": sha, "conclusion": "success", "event": "workflow_dispatch",
+                "head_branch": self.BRANCH, "created_at": f"2026-11-0{run_id}T00:00:00Z",
+                "artifacts": ["release-v2.4.2-sha256sums"]}
+
+    def test_find_build_publishes_the_given_commit_of_the_branch(self):
+        api = self.api_with_comparison("ahead")
+        api.runs = [self.run_at(1, self.BUILT), self.run_at(2, self.HEAD)]
+        self.assertEqual(self.find_build(api, self.BUILT), (0, {"build_run_id": "1", "commit": self.BUILT}))
+
+    def test_find_build_defaults_to_the_branch_head(self):
+        api = FakeApi(runs=[self.run_at(1, self.BUILT), self.run_at(2, self.HEAD)])
+        self.assertEqual(self.find_build(api, ""), (0, {"build_run_id": "2", "commit": self.HEAD}))
 
 
 class TagTests(unittest.TestCase):

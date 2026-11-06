@@ -46,9 +46,9 @@ In these steps, `{version}` is the version in `version.txt` on the release branc
 
 - [ ] Cherry-pick release notes onto the release branch.
 - [ ] Run [build_release](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) on the release branch with `release_version` set to `{version}`. Don't create or push the release tag: `publish_release` creates it.
-  - [ ] Wait for the [build_release run](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) to finish successfully. Don't merge anything else into the release branch until `publish_release` has started.
+  - [ ] Wait for the [build_release run](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) to finish successfully.
 - [ ] Create a [draft GitHub Release](https://github.com/spiceai/spiceai/releases/new) with the new tag `v{version}`, targeting the release branch. Leave the description empty to use the checked-in release notes, or paste the notes.
-- [ ] Run [publish_release](https://github.com/spiceai/spiceai/actions/workflows/publish_release.yml) on the release branch with `release_version` set to `{version}`.
+- [ ] Run [publish_release](https://github.com/spiceai/spiceai/actions/workflows/publish_release.yml) on the release branch with `release_version` set to `{version}`. If commits that don't change the release were merged to the release branch after the build, set `commit` to the full SHA that `build_release` built.
   - [ ] Have a release approver other than the person who started the run approve the `publish` job, which publishes the release.
   - [ ] Validate the [GitHub Release](https://github.com/spiceai/spiceai/releases) has its binaries, and is marked as a pre-release for an RC, or as the latest release for the newest stable version.
   - [ ] Monitor the [publish_release run](https://github.com/spiceai/spiceai/actions/workflows/publish_release.yml) for the Docker image builds. When they finish, approve the two Docker image publish jobs.

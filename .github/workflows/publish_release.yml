@@ -2,7 +2,9 @@ name: publish_release
 
 # Publishes a release from its build_release run, and creates the release tag.
 # Start it on the release branch with the version, once the branch head's
-# build_release release build of that version is green. Every job that
+# build_release release build of that version is green. Set `commit` to
+# publish an earlier commit of the branch instead, when the branch has moved
+# since its build with no change to the released code. Every job that
 # publishes runs in `release-publish` and needs its own approval:
 #   1. `publish` attaches the binaries of that run to the tag's draft release,
 #      or a new one, checking each against the run's SHA256SUMS, and publishes
@@ -18,6 +20,11 @@ on:
         description: 'Version to release, without the leading v (e.g. 2.4.2). Must match version.txt at the branch head.'
         required: true
         type: string
+      commit:
+        description: 'Full SHA of the release branch commit to publish, when the branch has moved since its build with no change to the released code. Empty publishes the branch head.'
+        required: false
+        type: string
+        default: ''
 
 # One publish at a time across all versions, never cancelled halfway. Each run
 # decides whether its release is the latest from the releases already
@@ -46,6 +53,7 @@ jobs:
       actions: read
     outputs:
       build_run_id: ${{ steps.find.outputs.build_run_id }}
+      commit: ${{ steps.find.outputs.commit }}
     steps:
       # Forks and downstream repositories that merge this one have their own
       # release workflows.
@@ -74,13 +82,14 @@ jobs:
       - name: Check version.txt matches the version
         run: python3 ./.github/scripts/get_release_version.py
 
-      - name: Find the release build of this commit
+      - name: Find the release build of the commit
         id: find
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          COMMIT: ${{ inputs.commit }}
         run: |
           python3 ./.github/scripts/publish_release.py --repo "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" \
-            find-build --workflow build_release.yml --sha "$GITHUB_SHA" --branch "$GITHUB_REF_NAME"
+            find-build --workflow build_release.yml --branch "$GITHUB_REF_NAME" --head "$GITHUB_SHA" --commit "$COMMIT"
 
   publish:
     name: Publish GitHub release v${{ inputs.release_version }}
@@ -118,11 +127,12 @@ jobs:
         id: publish
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
         run: |
           python3 ./.github/scripts/publish_release.py --repo "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" \
             publish --dir release --sums release/SHA256SUMS \
             --notes-file "docs/release_notes/${RELEASE_TAG}.md" \
-            --prerelease "${PRE_RELEASE:-false}" --sha "$GITHUB_SHA"
+            --prerelease "${PRE_RELEASE:-false}" --sha "$COMMIT"
 
       # The image builds download these binaries from the published release
       # and check them against the sha256 recorded here.
