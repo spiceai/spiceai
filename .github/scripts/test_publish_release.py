@@ -5,7 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
-from unittest import mock
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -332,7 +332,7 @@ class CommitOverrideTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             output = os.path.join(d, "output")
             env = {"GITHUB_TOKEN": "t", "GITHUB_OUTPUT": output}
-            with mock.patch.dict(os.environ, env), mock.patch.object(publish_release, "Api", lambda token: api):
+            with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(publish_release, "Api", lambda token: api):
                 code = publish_release.main([
                     "--repo", REPO, "--tag", "v2.4.2", "find-build", "--workflow", "build_release.yml",
                     "--branch", self.BRANCH, "--head", self.HEAD, "--commit", commit,
