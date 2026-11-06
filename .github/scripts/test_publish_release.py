@@ -43,7 +43,14 @@ class FakeApi:
     def get_all(self, path, params=None, key=None):
         parts = path.split("/")
         if parts[3:5] == ["actions", "workflows"]:
-            return [r for r in self.runs if r["head_sha"] == params["head_sha"] and r["conclusion"] == params["status"]]
+            return [
+                r
+                for r in self.runs
+                if r["head_sha"] == params["head_sha"]
+                and r["conclusion"] == params["status"]
+                and r["event"] == params.get("event", r["event"])
+                and r["head_branch"] == params.get("branch", r["head_branch"])
+            ]
         if parts[3:5] == ["actions", "runs"]:
             run = next(r for r in self.runs if r["id"] == int(parts[5]))
             return [{"name": n, "expired": False} for n in run.get("artifacts", [])]
@@ -243,32 +250,53 @@ class LatestTests(unittest.TestCase):
 
 class FindBuildTests(unittest.TestCase):
     SHA = "a" * 40
+    BRANCH = "release/2.4"
     MANIFEST = "release-v2.4.2-sha256sums"
 
-    def run_(self, run_id, artifacts=(), conclusion="success", head_sha=SHA):
-        return {"id": run_id, "head_sha": head_sha, "conclusion": conclusion, "artifacts": list(artifacts)}
+    def run_(self, run_id, artifacts=(), conclusion="success", head_sha=SHA, event="workflow_dispatch", head_branch=BRANCH, created_at=None):
+        return {
+            "id": run_id,
+            "head_sha": head_sha,
+            "conclusion": conclusion,
+            "event": event,
+            "head_branch": head_branch,
+            "created_at": created_at or f"2026-11-0{run_id}T00:00:00Z",
+            "artifacts": list(artifacts),
+        }
+
+    def find(self, api):
+        return publish_release.find_build_run(api, REPO, "build_release.yml", "2.4.2", self.SHA, self.BRANCH)
 
     def test_finds_the_release_build_and_ignores_a_branch_push_of_the_same_commit(self):
         api = FakeApi(runs=[
-            self.run_(1, ["spiced_linux_x86_64"]),
+            self.run_(1, ["spiced_linux_x86_64"], event="push"),
             self.run_(2, [self.MANIFEST, "spiced_linux_x86_64"]),
             self.run_(3, ["release-v2.4.1-sha256sums"]),
             self.run_(4, [self.MANIFEST], conclusion="cancelled"),
             self.run_(5, [self.MANIFEST], head_sha="b" * 40),
         ])
-        self.assertEqual(publish_release.find_build_run(api, REPO, "build_release.yml", "2.4.2", self.SHA), 2)
+        self.assertEqual(self.find(api), 2)
+
+    def test_picks_the_latest_of_two_release_builds_of_the_commit(self):
+        api = FakeApi(runs=[self.run_(4, [self.MANIFEST]), self.run_(6, [self.MANIFEST]), self.run_(5, [self.MANIFEST])])
+        self.assertEqual(self.find(api), 6)
+
+    def test_ignores_a_release_build_of_the_commit_from_another_branch(self):
+        api = FakeApi(runs=[
+            self.run_(2, [self.MANIFEST]),
+            self.run_(3, [self.MANIFEST], head_branch="peasee/test"),
+        ])
+        self.assertEqual(self.find(api), 2)
 
     def test_fails_without_a_release_build_of_the_commit(self):
-        api = FakeApi(runs=[self.run_(1, ["spiced_linux_x86_64"]), self.run_(3, [self.MANIFEST], conclusion="failure")])
+        api = FakeApi(runs=[
+            self.run_(1, ["spiced_linux_x86_64"], event="push"),
+            self.run_(2, [self.MANIFEST], head_branch="peasee/test"),
+            self.run_(3, [self.MANIFEST], conclusion="failure"),
+        ])
         with self.assertRaises(publish_release.PublishError) as ctx:
-            publish_release.find_build_run(api, REPO, "build_release.yml", "2.4.2", self.SHA)
-        self.assertIn("release build of 2.4.2 at " + self.SHA + ", found none", str(ctx.exception))
-
-    def test_fails_with_two_release_builds_of_the_commit(self):
-        api = FakeApi(runs=[self.run_(4, [self.MANIFEST]), self.run_(5, [self.MANIFEST])])
-        with self.assertRaises(publish_release.PublishError) as ctx:
-            publish_release.find_build_run(api, REPO, "build_release.yml", "2.4.2", self.SHA)
-        self.assertIn("found 4, 5", str(ctx.exception))
+            self.find(api)
+        self.assertIn(f"No successful build_release.yml release build of 2.4.2 on {self.BRANCH} at {self.SHA}", str(ctx.exception))
 
 
 class TagTests(unittest.TestCase):

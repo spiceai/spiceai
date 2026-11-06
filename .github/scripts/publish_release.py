@@ -2,8 +2,8 @@
 
 Used by publish_release.yml:
 
-  find-build  Prints the id of the one successful release build of a version
-              at a commit.
+  find-build  Prints the id of the latest successful release build of a
+              version, dispatched on a branch at a commit.
   publish     Attaches the files listed in SHA256SUMS to the tag's draft
               release (created when there is none), checks every asset against
               its sha256, and publishes the release at the built commit, which
@@ -105,31 +105,36 @@ def build_artifact_name(version):
     return f"release-v{version}-sha256sums"
 
 
-def find_build_run(api, repo, workflow, version, sha):
+def find_build_run(api, repo, workflow, version, sha, branch):
+    """The latest successful release build of version, dispatched on branch at sha."""
     runs = api.get_all(
         f"repos/{repo}/actions/workflows/{workflow}/runs",
-        {"head_sha": sha, "status": "success"},
+        {"head_sha": sha, "status": "success", "event": "workflow_dispatch", "branch": branch},
         key="workflow_runs",
     )
-    # A branch push of the same commit is a successful run too; only a release
-    # build of this version uploaded its manifest.
+    # Only a release build of this version uploads its manifest; a branch build
+    # of the same commit does not.
     name = build_artifact_name(version)
     matches = [
         r
         for r in runs
-        if any(
+        if r["event"] == "workflow_dispatch"
+        and r["head_branch"] == branch
+        and any(
             a["name"] == name and not a.get("expired")
             for a in api.get_all(f"repos/{repo}/actions/runs/{r['id']}/artifacts", key="artifacts")
         )
     ]
-    if len(matches) != 1:
-        found = ", ".join(str(r["id"]) for r in matches) or "none"
+    if not matches:
         raise PublishError(
-            f"Expected exactly one successful {workflow} release build of {version} at {sha}, found {found}. "
-            f"Start {workflow} on this branch with release_version {version} and wait for it to succeed. "
-            f"When there is more than one, delete the runs that should not be published."
+            f"No successful {workflow} release build of {version} on {branch} at {sha}. "
+            f"Start {workflow} on {branch} with release_version {version} and wait for it to succeed."
         )
-    return matches[0]["id"]
+    latest = max(matches, key=lambda r: (r["created_at"], r["id"]))
+    if len(matches) > 1:
+        others = ", ".join(str(r["id"]) for r in matches if r is not latest)
+        print(f"Publishing the latest release build of {sha}, run {latest['id']}, not the earlier runs {others}.")
+    return latest["id"]
 
 
 def tag_commit(api, repo, tag):
@@ -349,6 +354,7 @@ def main(argv=None):
     find = sub.add_parser("find-build")
     find.add_argument("--workflow", required=True)
     find.add_argument("--sha", required=True)
+    find.add_argument("--branch", required=True, help="Branch the release build was dispatched on")
 
     pub = sub.add_parser("publish")
     pub.add_argument("--dir", required=True, help="Directory holding the downloaded artifacts")
@@ -367,7 +373,7 @@ def main(argv=None):
     try:
         if args.action == "find-build":
             version = args.tag[1:]
-            write_output("build_run_id", find_build_run(api, args.repo, args.workflow, version, args.sha))
+            write_output("build_run_id", find_build_run(api, args.repo, args.workflow, version, args.sha, args.branch))
             return 0
 
         sums = read_sums(args.sums)

@@ -80,7 +80,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           python3 ./.github/scripts/publish_release.py --repo "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" \
-            find-build --workflow build_release.yml --sha "$GITHUB_SHA"
+            find-build --workflow build_release.yml --sha "$GITHUB_SHA" --branch "$GITHUB_REF_NAME"
 
   publish:
     name: Publish GitHub release v${{ inputs.release_version }}
