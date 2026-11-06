@@ -1,0 +1,140 @@
+name: mysql-cdc-shutdown-mid-delivery
+description: >
+  Two datasets share one MySQL binlog reader. One cannot apply changes because
+  its embedding model is not answering, so transactions writing both tables
+  fill its queue and the reader waits to hand it the next one. Spice is stopped
+  during that wait, which abandons the hand-off part way through a transaction
+  that writes both tables. After a restart, both datasets must equal MySQL:
+  neither may skip the abandoned transaction.
+
+sources:
+  src: { kind: mysql }
+  # An OpenAI-compatible embeddings endpoint that holds every request while
+  # /tmp/hold exists.
+  emb:
+    kind: docker
+    image: docker.io/library/python:3.12-slim
+    ports: [8000]
+    command:
+      - python
+      - -c
+      - |
+        import json, os, time
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+
+            def do_POST(self):
+                request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                while os.path.exists("/tmp/hold"):
+                    time.sleep(0.1)
+                inputs = request["input"]
+                if isinstance(inputs, str):
+                    inputs = [inputs]
+                body = json.dumps({
+                    "object": "list",
+                    "data": [{"object": "embedding", "index": i, "embedding": [float(len(t)), 1.0]} for i, t in enumerate(inputs)],
+                    "model": request["model"],
+                    "usage": {"prompt_tokens": 0, "total_tokens": 0},
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        ThreadingHTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+    ready: python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/')"
+
+matrix:
+  # The reader hands a two-table transaction to its datasets in an order set by
+  # their tables' binlog ids, which MySQL assigns as each table is first
+  # written. Each table is written first in one run, so the held dataset is
+  # handed the transaction first in one run and last in the other.
+  written_first: [held, free]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mysql-cdc-shutdown-mid-delivery
+  embeddings:
+    - from: openai:held
+      name: emb
+      params:
+        endpoint: http://127.0.0.1:${sources.emb.port.8000}/${sources.emb.namespace}/v1
+        openai_api_key: test
+  datasets:
+    # Its changes wait on the embedding model.
+    - from: mysql:t_held
+      name: held
+      params: { $merge: '${sources.src.params}' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+      columns:
+        - name: v
+          embeddings: [{ from: emb }]
+    - from: mysql:t_free
+      name: free
+      params: { $merge: '${sources.src.params}' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t_held (id int PRIMARY KEY, v varchar(64));
+        CREATE TABLE t_free (id int PRIMARY KEY, v varchar(64));
+  - source-exec: { src: "INSERT INTO t_held VALUES (1, 'h1'); INSERT INTO t_free VALUES (1, 'f1')" }
+    when: { written_first: held }
+  - source-exec: { src: "INSERT INTO t_free VALUES (1, 'f1'); INSERT INTO t_held VALUES (1, 'h1')" }
+    when: { written_first: free }
+  - source-exec:
+      src: |
+        DELIMITER //
+        CREATE PROCEDURE both_tables(first int, n int)
+        BEGIN
+          DECLARE i int DEFAULT first;
+          WHILE i < first + n DO
+            START TRANSACTION;
+            INSERT INTO t_held VALUES (i, 'both');
+            INSERT INTO t_free VALUES (i, 'both');
+            COMMIT;
+            SET i = i + 1;
+          END WHILE;
+        END //
+        DELIMITER ;
+  - start: {}
+  - query: SELECT id, v FROM held
+    oracle-sql: SELECT id, v FROM t_held
+    eventually: 60s
+  - query: SELECT id, v FROM free
+    oracle-sql: SELECT id, v FROM t_free
+    eventually: 60s
+
+  # Hold the model, then write more two-table transactions than the held
+  # dataset can take in (its 1,024-entry queue and the up to 1,024 its apply
+  # loop gathers), so the reader waits to hand it one. Stopping Spice during
+  # that wait abandons the transaction after the datasets handed it before the
+  # held one; with `written_first: free`, that is the free dataset.
+  - source-exec: { emb: touch /tmp/hold }
+  - source-exec: { src: "CALL both_tables(100, 5000)" }
+  # The reader has waited at least 5 s to hand the held dataset a transaction.
+  - wait-metric: { name: dataset_mysql_replication_member_send_stalled_seconds_total, above: 0, timeout: 60s }
+  - stop: {}
+  - source-exec: { emb: rm -f /tmp/hold }
+
+  - start: {}
+  - query: SELECT count(*) AS n FROM held
+    oracle-sql: SELECT count(*) AS n FROM t_held
+    eventually: 120s
+  - query: SELECT count(*) AS n FROM free
+    oracle-sql: SELECT count(*) AS n FROM t_free
+    eventually: 120s
+  - query: SELECT id, v FROM held
+    oracle-sql: SELECT id, v FROM t_held
+  - query: SELECT id, v FROM free
+    oracle-sql: SELECT id, v FROM t_free
