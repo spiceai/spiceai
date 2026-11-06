@@ -19,9 +19,13 @@ on:
         required: true
         type: string
 
-# A publish is never cancelled halfway; a second run for the same version waits.
+# One publish at a time across all versions, never cancelled halfway. Each run
+# decides whether its release is the latest from the releases already
+# published, and moves the `latest` image tags in a later job, so two versions
+# publishing at once could leave `latest` on the lower one. GitHub keeps one
+# waiting run per group: a third run started while one waits replaces it.
 concurrency:
-  group: publish-release-v${{ inputs.release_version }}
+  group: publish-release
   cancel-in-progress: false
 
 permissions:
