@@ -9,8 +9,9 @@ description: >
 
 sources:
   src: { kind: mysql }
-  # An OpenAI-compatible embeddings endpoint that holds every request while
-  # /tmp/hold exists.
+  # An OpenAI-compatible embeddings endpoint. Instances share the container
+  # and each calls it under its own namespace, the first path segment, so a
+  # request is held while /tmp/hold-<namespace> exists.
   emb:
     kind: docker
     image: docker.io/library/python:3.12-slim
@@ -29,7 +30,8 @@ sources:
 
             def do_POST(self):
                 request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                while os.path.exists("/tmp/hold"):
+                hold = "/tmp/hold-" + self.path.strip("/").split("/")[0]
+                while os.path.exists(hold):
                     time.sleep(0.1)
                 inputs = request["input"]
                 if isinstance(inputs, str):
@@ -120,12 +122,12 @@ steps:
   # loop gathers), so the reader waits to hand it one. Stopping Spice during
   # that wait abandons the transaction after the datasets handed it before the
   # held one; with `written_first: free`, that is the free dataset.
-  - source-exec: { emb: touch /tmp/hold }
+  - source-exec: { emb: "touch /tmp/hold-${sources.emb.namespace}" }
   - source-exec: { src: "CALL both_tables(100, 5000)" }
   # The reader has waited at least 5 s to hand the held dataset a transaction.
   - wait-metric: { name: dataset_mysql_replication_member_send_stalled_seconds_total, above: 0, timeout: 60s }
   - stop: {}
-  - source-exec: { emb: rm -f /tmp/hold }
+  - source-exec: { emb: "rm -f /tmp/hold-${sources.emb.namespace}" }
 
   - start: {}
   - query: SELECT count(*) AS n FROM held
