@@ -1664,7 +1664,7 @@ dependencies = [
 
 [[package]]
 name = "aws-kms-signer"
-version = "2.4.1"
+version = "2.5.0-unstable"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2489,7 +2489,7 @@ dependencies = [
 
 [[package]]
 name = "azure-key-vault-signer"
-version = "2.4.1"
+version = "2.5.0-unstable"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
