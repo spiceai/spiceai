@@ -34,7 +34,6 @@ pub mod responses;
 pub mod spiceai;
 pub mod streaming_utils;
 pub mod typesafe;
-pub mod workload_identity;
 pub mod xai;
 
 pub enum HealthCheck {

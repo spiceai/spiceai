@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use anyhow::Context;
-use async_openai::config::OPENAI_API_BASE;
+use async_openai::error::OpenAIError;
 use aws_config::Region;
 use aws_credential_types::Credentials;
 use aws_sdk_credential_bridge::default_aws_config;
@@ -27,7 +27,7 @@ use llms::{
     config::GenericAuthMechanism,
     embeddings::candle::link_files_into_tmp_dir,
     google::{Google, auth},
-    openai::{ChatBackend, Openai, new_openai_client_with_token_provider},
+    openai::new_openai_client,
     xai::Xai,
 };
 use secrecy::SecretString;
@@ -37,10 +37,6 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use token_provider::workload_identity::{
-    ANTHROPIC_AUDIENCE, Exchange, SubjectTokenSource, WorkloadIdentityTokenProvider,
-};
-use token_provider::{StaticTokenProvider, TokenProvider};
 
 pub(crate) async fn create_bedrock(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
     let mut config_builder = default_aws_config();
@@ -89,79 +85,28 @@ pub(crate) fn create_xai(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error>
     Ok(Arc::new(Xai::new(Some(model_id), api_key.as_str())))
 }
 
-fn env_nonempty(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-/// The token CI authenticates `OpenAI` with: workload identity federation when
-/// `OPENAI_IDENTITY_PROVIDER_ID` is set, exchanging the job's GitHub OIDC token and refreshing it;
-/// otherwise `SPICE_OPENAI_API_KEY`, for a local run.
-async fn openai_token() -> Result<Arc<dyn TokenProvider>, anyhow::Error> {
-    let Some(provider_id) = env_nonempty("OPENAI_IDENTITY_PROVIDER_ID") else {
-        let api_key = std::env::var("SPICE_OPENAI_API_KEY").unwrap_or_default();
-        return Ok(Arc::new(StaticTokenProvider::new(SecretString::from(
-            api_key,
-        ))));
-    };
-    let service_account = env_nonempty("OPENAI_SERVICE_ACCOUNT_ID")
-        .context("OPENAI_SERVICE_ACCOUNT_ID is not set")?;
-    let audience =
-        env_nonempty("OPENAI_WIF_AUDIENCE").unwrap_or_else(|| "https://api.openai.com".to_string());
-    let source = SubjectTokenSource::github_actions_from_env(audience)?;
-    let provider = WorkloadIdentityTokenProvider::try_new(
-        "test model (openai)",
-        source,
-        Exchange::openai(provider_id, service_account),
-    )
-    .await?;
-    Ok(Arc::new(provider))
-}
-
-async fn openai(model_id: &str) -> Result<Openai<llms::config::HostedModelConfig>, anyhow::Error> {
-    Ok(new_openai_client_with_token_provider(
+pub(crate) fn create_openai(model_id: &str) -> Arc<dyn Chat> {
+    let api_key = std::env::var("SPICE_OPENAI_API_KEY").ok();
+    Arc::new(new_openai_client(
         model_id.to_string(),
-        OPENAI_API_BASE,
-        openai_token().await?,
+        None,
+        api_key.as_deref(),
         None,
         None,
         None,
-        ChatBackend::ChatCompletions,
-    )?)
+    ))
 }
 
-pub(crate) async fn create_openai(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
-    Ok(Arc::new(openai(model_id).await?))
-}
-
-/// Anthropic with workload identity federation when `ANTHROPIC_FEDERATION_RULE_ID` is set, as in
-/// CI; otherwise with `SPICE_ANTHROPIC_API_KEY` or `SPICE_ANTHROPIC_AUTH_TOKEN`.
-pub(crate) async fn create_anthropic(
-    model_id: Option<&str>,
-) -> Result<Arc<dyn Chat>, anyhow::Error> {
-    let auth = if let Some(rule_id) = env_nonempty("ANTHROPIC_FEDERATION_RULE_ID") {
-        let source = SubjectTokenSource::github_actions_from_env(ANTHROPIC_AUDIENCE)?;
-        let provider = WorkloadIdentityTokenProvider::try_new(
-            "test model (anthropic)",
-            source,
-            Exchange::anthropic(
-                rule_id,
-                env_nonempty("ANTHROPIC_ORGANIZATION_ID")
-                    .context("ANTHROPIC_ORGANIZATION_ID is not set")?,
-                env_nonempty("ANTHROPIC_SERVICE_ACCOUNT_ID")
-                    .context("ANTHROPIC_SERVICE_ACCOUNT_ID is not set")?,
-                env_nonempty("ANTHROPIC_WORKSPACE_ID"),
-            ),
-        )
-        .await?;
-        GenericAuthMechanism::from_bearer_token_provider(Arc::new(provider))
-    } else if let Some(api_key) = env_nonempty("SPICE_ANTHROPIC_API_KEY") {
-        GenericAuthMechanism::from_api_key(api_key)
-    } else if let Some(auth_token) = env_nonempty("SPICE_ANTHROPIC_AUTH_TOKEN") {
-        GenericAuthMechanism::from_bearer_token(auth_token)
-    } else {
-        anyhow::bail!(
-            "Set the `ANTHROPIC_*` workload identity federation IDs, 'SPICE_ANTHROPIC_API_KEY', or 'SPICE_ANTHROPIC_AUTH_TOKEN'"
-        );
+pub(crate) fn create_anthropic(model_id: Option<&str>) -> Result<Arc<dyn Chat>, OpenAIError> {
+    let auth = match (
+        std::env::var("SPICE_ANTHROPIC_API_KEY"),
+        std::env::var("SPICE_ANTHROPIC_AUTH_TOKEN"),
+    ) {
+        (Ok(api_key), _) => GenericAuthMechanism::from_api_key(api_key),
+        (_, Ok(auth_token)) => {
+            GenericAuthMechanism::from_bearer_token(auth_token)
+        }
+        _ => return Err(OpenAIError::InvalidArgument("One and only one of 'SPICE_ANTHROPIC_API_KEY' or 'SPICE_ANTHROPIC_AUTH_TOKEN' must be set".to_string())),
     };
     Ok(Arc::new(Anthropic::new(auth, model_id, None, None)?))
 }

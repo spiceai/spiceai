@@ -618,9 +618,15 @@ pub(crate) fn get_anthropic_model(
 ) -> spicepod::component::model::Model {
     let mut model =
         spicepod::component::model::Model::new(format!("anthropic:{}", model.into()), name);
+    let secret = crate::utils::anthropic_credential_secret();
+    let param = if secret == crate::utils::ANTHROPIC_AUTH_TOKEN_SECRET {
+        "anthropic_auth_token"
+    } else {
+        "anthropic_api_key"
+    };
     model
         .params
-        .extend(crate::utils::anthropic_credential_params());
+        .insert(param.to_string(), format!("${{ secrets:{secret} }}").into());
     model
 }
 

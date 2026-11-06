@@ -88,14 +88,6 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    /// The model's provider refused, or could not be reached for, the exchange that gives the
-    /// model its access token. The source names the provider, its reason and where to look, so it
-    /// is the whole message.
-    #[snafu(display("{source}"))]
-    FailedToAuthenticate {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
     #[snafu(display(
         "Unsupported value for `model_type` parameter. {source}  Verify the `model_type` parameter, and try again"
     ))]

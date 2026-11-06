@@ -69,7 +69,7 @@ mod nsql {
         let _tracing = init_tracing(None);
 
         test_request_context().scope_retry(3, || async {
-            verify_env_secret_exists(crate::utils::openai_credential_secret())
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
 
@@ -173,7 +173,7 @@ mod search {
 
     #[tokio::test]
     async fn openai_test_search() -> Result<(), anyhow::Error> {
-        verify_env_secret_exists(crate::utils::openai_credential_secret())
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
             .await
             .map_err(anyhow::Error::msg)?;
         run_search_w_explain(
@@ -241,7 +241,7 @@ mod search {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_search_column_casing() -> Result<(), anyhow::Error> {
-        verify_env_secret_exists(crate::utils::openai_credential_secret())
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
             .await
             .map_err(anyhow::Error::msg)?;
 
@@ -342,7 +342,7 @@ mod embeddings {
     #[tokio::test]
     async fn openai_embeddings_beta_requirements() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(None);
-        verify_env_secret_exists(crate::utils::openai_credential_secret())
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
             .await
             .map_err(anyhow::Error::msg)?;
 
@@ -362,7 +362,7 @@ mod embeddings {
     #[tokio::test]
     async fn openai_test_embeddings() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(None);
-        verify_env_secret_exists(crate::utils::openai_credential_secret())
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
             .await
             .map_err(anyhow::Error::msg)?;
 
@@ -454,7 +454,7 @@ async fn openai_test_chat_completion() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
     test_request_context().scope(async {
-        verify_env_secret_exists(crate::utils::openai_credential_secret())
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
             .await
             .map_err(anyhow::Error::msg)?;
 
@@ -510,7 +510,7 @@ async fn openai_test_chat_completion_gpt5_mini() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
     test_request_context().scope(async {
-        verify_env_secret_exists(crate::utils::openai_credential_secret())
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
             .await
             .map_err(anyhow::Error::msg)?;
 
@@ -566,7 +566,7 @@ async fn openai_test_chat_completion_gpt5_mini_with_endpoint() -> Result<(), any
     let _tracing = init_tracing(None);
 
     test_request_context().scope(async {
-        verify_env_secret_exists(crate::utils::openai_credential_secret())
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
             .await
             .map_err(anyhow::Error::msg)?;
 
@@ -626,7 +626,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope_retry(3, || async {
-            verify_env_secret_exists(crate::utils::openai_credential_secret())
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
 
@@ -707,7 +707,7 @@ async fn openai_test_responses_api_non_streaming() -> Result<(), anyhow::Error> 
 
     test_request_context()
         .scope(async {
-            verify_env_secret_exists(crate::utils::openai_credential_secret())
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
 
@@ -757,7 +757,7 @@ async fn openai_test_responses_api_streaming() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            verify_env_secret_exists(crate::utils::openai_credential_secret())
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
 
@@ -968,7 +968,7 @@ async fn openai_test_responses_api_with_tools_streaming() -> Result<(), anyhow::
 
     test_request_context()
         .scope(async {
-            verify_env_secret_exists(crate::utils::openai_credential_secret())
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
 
@@ -1073,7 +1073,7 @@ async fn openai_test_responses_api_with_tools_non_streaming() -> Result<(), anyh
 
     test_request_context()
         .scope(async {
-            verify_env_secret_exists(crate::utils::openai_credential_secret())
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
 
@@ -1295,7 +1295,7 @@ async fn openai_test_responses_api_tool_history_replay() -> Result<(), anyhow::E
 
     test_request_context()
         .scope(async {
-            verify_env_secret_exists(crate::utils::openai_credential_secret())
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
 
@@ -1510,7 +1510,7 @@ async fn openai_test_responses_api_tools() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            verify_env_secret_exists(crate::utils::openai_credential_secret())
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
 
@@ -1720,9 +1720,10 @@ async fn verify_similarity_search_chat_completion(rt: Arc<Runtime>) -> Result<()
 
 pub(crate) fn get_openai_model(model: impl Into<String>, name: impl Into<String>) -> Model {
     let mut model = Model::new(format!("openai:{}", model.into()), name);
-    model
-        .params
-        .extend(crate::utils::openai_credential_params());
+    model.params.insert(
+        "openai_api_key".to_string(),
+        "${ secrets:SPICE_OPENAI_API_KEY }".into(),
+    );
     model.params.insert("system_prompt".to_string(), r#"
     When writing SQL queries, do not put double quotes around schema-qualified table names. For example:
 
@@ -1766,8 +1767,9 @@ pub(crate) fn get_openai_embeddings(
         Some(model) => Embeddings::new(format!("openai:{}", model.into()), name),
         None => Embeddings::new("openai", name),
     };
-    embedding
-        .params
-        .extend(crate::utils::openai_credential_params());
+    embedding.params.insert(
+        "openai_api_key".to_string(),
+        "${ secrets:SPICE_OPENAI_API_KEY }".into(),
+    );
     embedding
 }

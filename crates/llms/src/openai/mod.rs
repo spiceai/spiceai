@@ -258,43 +258,6 @@ pub fn new_openai_client_with_chat_backend(
     }
 }
 
-/// An `OpenAI` client that authenticates every request with the current token of `token`, a
-/// provider that refreshes it, such as a workload identity federation token provider. The
-/// organization and project headers are the ones [`OpenAIConfig`] would send.
-///
-/// # Errors
-///
-/// When `org_id` or `project_id` is not a valid header value.
-pub fn new_openai_client_with_token_provider(
-    model: String,
-    api_base: &str,
-    token: Arc<dyn token_provider::TokenProvider>,
-    org_id: Option<&str>,
-    project_id: Option<&str>,
-    usage_tier: Option<UsageTier>,
-    chat_backend: ChatBackend,
-) -> Result<Openai<crate::config::HostedModelConfig>, async_openai::error::OpenAIError> {
-    let mut cfg = crate::config::HostedModelConfig::from_url(api_base)
-        .with_auth(crate::config::GenericAuthMechanism::from_bearer_token_provider(token));
-    for (header, value) in [
-        ("openai-organization", org_id),
-        ("openai-project", project_id),
-    ] {
-        if let Some(value) = value {
-            let value = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
-                async_openai::error::OpenAIError::InvalidArgument(format!("{header}: {e}"))
-            })?;
-            cfg = cfg.with_header_value(header, value);
-        }
-    }
-    Ok(Openai {
-        client: crate::provider::client_without_retry(cfg),
-        model,
-        rate_controller: usage_tier.map_or_else(default_rate_controller, Into::into),
-        chat_backend,
-    })
-}
-
 #[must_use]
 pub fn new_openai_client_with_config<C: async_openai::config::Config + Clone>(
     model: String,
