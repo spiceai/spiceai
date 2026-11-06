@@ -113,8 +113,7 @@ pub struct SearchTestCase {
 enum AccelerationOptions {
     NoAcceleration,
     Arrow,
-    DuckDb,
-    DuckDbFile,
+    CayenneMemory,
     Cayenne,
     /// Cayenne acceleration with `on_zero_results: use_source`, so a warm search
     /// tier that returns nothing falls through to the external vector engine index.
@@ -126,8 +125,7 @@ impl fmt::Display for AccelerationOptions {
         let s = match self {
             AccelerationOptions::NoAcceleration => "no_acceleration",
             AccelerationOptions::Arrow => "arrow",
-            AccelerationOptions::DuckDb => "duckdb",
-            AccelerationOptions::DuckDbFile => "duckdb_file",
+            AccelerationOptions::CayenneMemory => "cayenne_memory",
             AccelerationOptions::Cayenne => "cayenne",
             AccelerationOptions::CayenneWithZeroResults => "cayenne_with_zero_results",
         };
@@ -151,19 +149,9 @@ impl AccelerationOptions {
                 engine: Some("arrow".to_string()),
                 ..Default::default()
             },
-            AccelerationOptions::DuckDb => Acceleration {
+            AccelerationOptions::CayenneMemory => Acceleration {
                 enabled: true,
-                engine: Some("duckdb".to_string()),
-                ..Default::default()
-            },
-            AccelerationOptions::DuckDbFile => Acceleration {
-                enabled: true,
-                engine: Some("duckdb".to_string()),
-                mode: Mode::File,
-                params: Some(spicepod::param::Params::from_string_map(HashMap::from([(
-                    "duckdb_file".to_string(),
-                    format!(".spice/data/duckdb_acceleration_{unique_id}.db"),
-                )]))),
+                engine: Some("cayenne".to_string()),
                 ..Default::default()
             },
             AccelerationOptions::Cayenne | AccelerationOptions::CayenneWithZeroResults => {
@@ -359,8 +347,7 @@ async fn test_megascience_permutations(
     #[values(
         AccelerationOptions::NoAcceleration,
         AccelerationOptions::Arrow,
-        AccelerationOptions::DuckDb,
-        AccelerationOptions::DuckDbFile,
+        AccelerationOptions::CayenneMemory,
         AccelerationOptions::Cayenne,
         AccelerationOptions::CayenneWithZeroResults
     )]
@@ -593,7 +580,7 @@ fn validate_combination(
             (
                 megascience::TableOptions::Dataset,
                 AccelerationOptions::Arrow
-                    | AccelerationOptions::DuckDb
+                    | AccelerationOptions::CayenneMemory
                     | AccelerationOptions::Cayenne
             )
         )
