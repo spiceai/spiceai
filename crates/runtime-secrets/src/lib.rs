@@ -1416,7 +1416,10 @@ mod tests {
         );
 
         {
-            let load = secrets.load_from(&[env_spicepod_secret("myenv")]);
+            // Bind the config so it outlives the pinned future (temporary
+            // arrays are dropped at the statement end and break `tokio::pin!`).
+            let configured = [env_spicepod_secret("myenv")];
+            let load = secrets.load_from(&configured);
             tokio::pin!(load);
             // Prefer the ready branch so `load_from` is cancelled without
             // publishing a replacement map.
