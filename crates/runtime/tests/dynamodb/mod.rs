@@ -781,6 +781,10 @@ fn get_test_dataset(
             "2006-01-02T15:04:05.000Z07:00".to_string(),
         ),
     ];
+    params.extend(crate::utils::aws_session_token_param(
+        "dynamodb_aws_session_token",
+        "AWS_DYNAMODB_SESSION_TOKEN",
+    ));
 
     if let Some(extra) = extra_params {
         params.extend(extra);
@@ -805,7 +809,7 @@ pub async fn get_dynamodb_client() -> Result<aws_sdk_dynamodb::Client, anyhow::E
     let credentials = Credentials::new(
         dynamodb_access_key_id,
         dynamodb_secret_access_key,
-        None,
+        crate::utils::nonempty_env("AWS_DYNAMODB_SESSION_TOKEN"),
         None,
         "dynamodb",
     );
