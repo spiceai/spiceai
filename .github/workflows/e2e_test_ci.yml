@@ -3006,6 +3006,9 @@ jobs:
           # release test/duckdb_versions.json lists; this one runs the scripts
           # with DuckDB sources again on each older listed release.
           - { name: 'spicescript: older DuckDB releases', partition: 1/1, older_duckdb: true }
+          # test/spicescript/live: real providers through static credential params, with
+          # tokens minted from this job's GitHub OIDC token just before the run.
+          - { name: 'spicescript: live', live: true }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -3085,7 +3088,7 @@ jobs:
       # and downloads each release it needs into ~/.cache/spicescript, so no
       # `--from` is passed here. The token is for the releases API's rate limit.
       - name: Run scenario scripts
-        if: ${{ !matrix.older_duckdb }}
+        if: ${{ !matrix.older_duckdb && !matrix.live }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -3098,28 +3101,18 @@ jobs:
             --log-capture "$RUNNER_TEMP/spicescript-logs" \
             ${{ matrix.args }}
 
-      # test/spicescript/live: real providers through static credential params. Each token is
-      # minted from this job's GitHub OIDC token right before its script; it expires in ~5 min.
+      # Each minted token expires about 5 minutes later, so all are minted right before the
+      # one run, which runs the scripts side by side.
       - name: Mint an OpenAI access token
-        if: ${{ !cancelled() && matrix.partition == '1/4' && env.HAS_OPENAI_WIF == 'true' }}
+        if: ${{ matrix.live && env.HAS_OPENAI_WIF == 'true' }}
         uses: ./.github/actions/openai-token
         with:
           identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
           service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
           audience: ${{ secrets.OPENAI_WIF_AUDIENCE }}
 
-      - name: Run live OpenAI static key script
-        if: ${{ !cancelled() && matrix.partition == '1/4' && env.HAS_OPENAI_WIF == 'true' }}
-        run: |
-          "${{ steps.spicescript.outputs.path }}" \
-            --spiced "$(command -v spiced)" \
-            --work-dir "$RUNNER_TEMP/spicescript-live" \
-            --results "$RUNNER_TEMP/spicescript-results-live-openai.json" \
-            --log-capture "$RUNNER_TEMP/spicescript-logs" \
-            test/spicescript/live/openai-static-key.yaml
-
       - name: Mint an Anthropic access token
-        if: ${{ !cancelled() && matrix.partition == '1/4' && env.HAS_ANTHROPIC_WIF == 'true' }}
+        if: ${{ matrix.live && env.HAS_ANTHROPIC_WIF == 'true' }}
         uses: ./.github/actions/anthropic-token
         with:
           federation-rule-id: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
@@ -3127,19 +3120,9 @@ jobs:
           service-account-id: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
           workspace-id: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
 
-      - name: Run live Anthropic static token script
-        if: ${{ !cancelled() && matrix.partition == '1/4' && env.HAS_ANTHROPIC_WIF == 'true' }}
-        run: |
-          "${{ steps.spicescript.outputs.path }}" \
-            --spiced "$(command -v spiced)" \
-            --work-dir "$RUNNER_TEMP/spicescript-live" \
-            --results "$RUNNER_TEMP/spicescript-results-live-anthropic.json" \
-            --log-capture "$RUNNER_TEMP/spicescript-logs" \
-            test/spicescript/live/anthropic-static-token.yaml
-
       - name: Assume the Databricks Delta role
         id: aws-databricks-delta
-        if: ${{ !cancelled() && matrix.partition == '1/4' }}
+        if: ${{ matrix.live }}
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
@@ -3148,8 +3131,8 @@ jobs:
           output-env-credentials: false
           output-credentials: true
 
-      - name: Run live Databricks static token script
-        if: ${{ !cancelled() && matrix.partition == '1/4' && steps.aws-databricks-delta.outcome == 'success' }}
+      - name: Run live scripts
+        if: ${{ !cancelled() && matrix.live }}
         env:
           DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
           DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
@@ -3160,12 +3143,12 @@ jobs:
         run: |
           DATABRICKS_TOKEN="$(bash .github/scripts/databricks_oidc_token.sh)"
           export DATABRICKS_TOKEN
-          "${{ steps.spicescript.outputs.path }}" \
+          "${{ steps.spicescript.outputs.path }}" --jobs 3 \
             --spiced "$(command -v spiced)" \
-            --work-dir "$RUNNER_TEMP/spicescript-live" \
-            --results "$RUNNER_TEMP/spicescript-results-live-databricks.json" \
+            --work-dir "$RUNNER_TEMP/spicescript" \
+            --results "$RUNNER_TEMP/spicescript-results.json" \
             --log-capture "$RUNNER_TEMP/spicescript-logs" \
-            test/spicescript/live/databricks-static-token.yaml
+            test/spicescript/live
 
       # The combinations whose source is DuckDB or DuckLake (matrix keys
       # backend, src and source), then the DuckDB and DuckLake scripts without
