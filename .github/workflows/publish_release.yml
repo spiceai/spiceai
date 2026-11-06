@@ -2,12 +2,14 @@ name: publish_release
 
 # Publishes a release from its build_release run, and creates the release tag.
 # Start it on the release branch with the version, once the branch head's
-# build_release release build of that version is green. After one approval of
-# the `publish` job it:
-#   1. attaches the binaries of that run to the tag's draft release, or a new
-#      one, checking each against the run's SHA256SUMS, and publishes the
-#      release at the built commit, which creates the tag there;
-#   2. builds the Docker images from the published binaries and pushes them.
+# build_release release build of that version is green. Every job that
+# publishes needs its own approval, in `github-publish` for the release and
+# `release-publish` for the Docker images:
+#   1. `publish` attaches the binaries of that run to the tag's draft release,
+#      or a new one, checking each against the run's SHA256SUMS, and publishes
+#      the release at the built commit, which creates the tag there;
+#   2. `images` builds the Docker images from the published binaries, and its
+#      two push jobs (the multi-arch image and the CUDA image) push them.
 # Only publishing creates a release tag, so a ruleset can protect `v*` tags
 # with the release App as its one bypass actor. Nothing already published is
 # replaced. To retry a failed step, re-run the failed jobs of the same run.
@@ -157,7 +159,6 @@ jobs:
       contents: read
       packages: write
       id-token: write
-      actions: read
     uses: ./.github/workflows/spiced_docker.yml
     with:
       release_tag: v${{ inputs.release_version }}

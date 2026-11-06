@@ -36,6 +36,7 @@ ALLOWED_ENVIRONMENTS = frozenset(
         "ci-integration",
         "github-publish",
         "github-publish-autoapprove",
+        "release-publish",
         SECRET_FREE,
     }
 )

@@ -54,7 +54,7 @@ Create a [Milestone Endgame](https://github.com/spiceai/spiceai/issues/new?assig
 - Ensure the release notes at `docs/release_notes/v{version}.md` exist
 - Start the `build_release` workflow on the release branch with `release_version` set to the version. It builds the binaries and publishes nothing. Do not push the release tag.
 - Create a draft [GitHub release](https://github.com/spiceai/spiceai/releases/new) for the new tag `v{version}`, targeting the release branch. Leave the body empty to use the checked-in release notes.
-- Start the `publish_release` workflow on the release branch with the same version. After one approval from someone other than the person who started it, it publishes the release with the binaries of that `build_release` run, which creates the tag at the built commit, then builds and pushes the Docker images.
+- Start the `publish_release` workflow on the release branch with the same version. Each publishing job needs approval from someone other than the person who started it: `publish` publishes the release with the binaries of that `build_release` run, which creates the tag at the built commit, and the two Docker push jobs push the images.
 
 ## Acknowledgements update
 

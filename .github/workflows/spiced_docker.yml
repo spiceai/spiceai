@@ -3,8 +3,9 @@ name: spiced_docker
 # Builds the release Docker images from the binaries of a published GitHub
 # release and pushes them. publish_release calls it after the release is
 # published; it has no trigger of its own. The build jobs hold no credentials.
-# The push jobs run in `github-publish-autoapprove` and first check that a
-# reviewer approved the calling run's `github-publish` deployment.
+# The push jobs run in `release-publish`, the environment the Docker Hub
+# connection trusts, and each needs its own approval there: an environment
+# without reviewers could be used by any workflow to push images.
 on:
   workflow_call:
     inputs:
@@ -209,12 +210,11 @@ jobs:
   publish:
     needs: [setup, build-amd64, build-arm64]
     runs-on: ubuntu-24.04
-    environment: github-publish-autoapprove
+    environment: release-publish
     permissions:
       contents: read
       packages: write
       id-token: write
-      actions: read
     env:
       REL_VERSION: ${{ needs.setup.outputs.rel_version }}
       TAG_LATEST: ${{ inputs.tag_latest }}
@@ -222,8 +222,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - uses: ./.github/actions/require-release-approval
 
       - name: Download images
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -273,12 +271,11 @@ jobs:
   publish-cuda:
     needs: [setup, build-cuda]
     runs-on: ubuntu-24.04
-    environment: github-publish-autoapprove
+    environment: release-publish
     permissions:
       contents: read
       packages: write
       id-token: write
-      actions: read
     env:
       REL_VERSION: ${{ needs.setup.outputs.rel_version }}
       TAG_LATEST: ${{ inputs.tag_latest }}
@@ -286,8 +283,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - uses: ./.github/actions/require-release-approval
 
       - name: Download CUDA image
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
