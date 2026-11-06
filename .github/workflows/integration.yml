@@ -47,7 +47,9 @@ env:
   CARGO_HTTP_TIMEOUT: 60
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
-  HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
+  # RustFS credentials come from the job's OIDC token, which pull requests from forks
+  # and Dependabot never get; those runs pass test archives as artifacts instead.
+  HAS_RUSTFS_ACCESS: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
   INTEGRATION_TESTS_ARCHIVE_S3_URI: s3://build/test_binaries/${{ github.run_id }}/integration-tests-archive/integration_tests.tar.zst
 
 jobs:
@@ -57,6 +59,7 @@ jobs:
   # nothing ran for (#13841). Queue entry is gated by the approval rules and
   # `Attestation`; the merge-group commit is what runs the suite.
   check_changes:
+    environment: secret-free
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
     # A full-history checkout (`fetch-depth: 0`) and a path diff. Measured at
@@ -146,10 +149,14 @@ jobs:
           echo "Source versions beyond each default: ${matrix}"
 
   build:
+    environment: ci
     name: Build Test Binary
     needs: check_changes
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     # Slowest successful run from 2026-08-20 to 2026-09-25 (UTC), after the archive
     # step was consolidated to one `nextest archive` invocation: 151.4 min
     # (run 34988348747, merge_group, 2026-09-15), p99 115 min over 880 `push`
@@ -196,13 +203,23 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/install-protoc
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '12000'
+          export-env: 'false'
+
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -291,25 +308,25 @@ jobs:
           if command -v sccache >/dev/null 2>&1; then sccache --show-stats || true; fi
 
       - name: Set up MinIO client
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Upload test archives to local MinIO
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to upload integration test archives}"
-          mc mb --ignore-existing spice-minio/build
           mc cp ./integration_tests.tar.zst "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}"
 
       - name: Upload test archive (artifact fallback)
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: integration-tests-archive
@@ -336,8 +353,10 @@ jobs:
     needs: [build, check_changes]
     if: ${{ github.event_name != 'pull_request' }}
     permissions:
+      id-token: write
       contents: write
     runs-on: spiceai-dev-runners
+    environment: ci
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 30.7 min (run
     # 34948795744, merge_group, 2026-09-15), p99 27.8 min. The two bounded steps
     # below sum to 60, and everything else in the job (image pulls, the archive
@@ -369,18 +388,28 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-oracle-odpi
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '5400'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download test archive from local MinIO
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
@@ -388,7 +417,7 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
@@ -403,12 +432,15 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-libduckdb
 
+      # Tests also pull images, so the login has to last the whole job.
       - name: Login to DockerHub
         if: needs.check_changes.outputs.relevant_changes == 'true' && github.repository == 'spiceai/spiceai'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Pull database images
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -423,8 +455,60 @@ jobs:
 
       - name: Set up Spice.ai API Key
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         run: |
-          echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_KEY }}"' > .env
+          printf 'SPICEAI_API_KEY="%s"\n' "$SPICEAI_API_KEY" > .env
+
+      # Short-lived AWS credentials, one role per test area. They are kept out of the job's
+      # environment so they do not replace the RustFS credentials, and are passed to the test step.
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta-new
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          role-duration-seconds: 5400
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Assume the Iceberg role
+        id: aws-iceberg
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-session-name: gha-iceberg-${{ github.run_id }}
+          role-duration-seconds: 5400
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Assume the DynamoDB role
+        id: aws-dynamodb
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DYNAMODB_ROLE_ARN }}
+          role-session-name: gha-dynamodb-${{ github.run_id }}
+          role-duration-seconds: 5400
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Assume the S3 Vectors role
+        id: aws-s3-vectors
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_S3_VECTORS_ROLE_ARN }}
+          role-session-name: gha-s3-vectors-${{ github.run_id }}
+          role-duration-seconds: 5400
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
 
       - name: Run integration test
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -446,49 +530,44 @@ jobs:
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
           # MinIO/S3-compatible storage for TPC-DS and other S3 tests
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          # old dbc instance
-          TEST_DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
-          TEST_DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          TEST_DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
-          TEST_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.DATABRICKS_SQL_WAREHOUSE_ID }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          # new dbc instance
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY_ID: ${{ steps.rustfs.outputs.access-key-id }}
+          MINIO_SECRET_ACCESS_KEY: ${{ steps.rustfs.outputs.secret-access-key }}
+          MINIO_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
+          NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta-new.outputs.aws-access-key-id }}
+          NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta-new.outputs.aws-secret-access-key }}
+          NEW_AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta-new.outputs.aws-session-token }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta-new.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta-new.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta-new.outputs.aws-session-token }}
+          TEST_DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
           NEW_DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
-          NEW_DATABRICKS_TOKEN: ${{ secrets.NEW_DATABRICKS_TOKEN }}
           NEW_DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
           NEW_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
-          NEW_DATABRICKS_SP_CLIENT_ID: ${{ secrets.NEW_DATABRICKS_SP_CLIENT_ID }}
-          NEW_DATABRICKS_SP_CLIENT_SECRET: ${{ secrets.NEW_DATABRICKS_SP_CLIENT_SECRET }}
-          TEST_DATABRICKS_PERMISSIONS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
-          TEST_DATABRICKS_PRO_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
-          TEST_DATABRICKS_CLASSIC_WAREHOUSE_ID: ${{ vars.NEW_DATABRICKS_CLASSIC_WAREHOUSE_ID }}
-          TEST_DATABRICKS_SP_WITH_INFOSCHEMA_CLIENT_ID: ${{ secrets.TEST_DATABRICKS_SP_WITH_INFOSCHEMA_CLIENT_ID }}
-          TEST_DATABRICKS_SP_WITH_INFOSCHEMA_CLIENT_SECRET: ${{ secrets.TEST_DATABRICKS_SP_WITH_INFOSCHEMA_CLIENT_SECRET }}
-          TEST_DATABRICKS_SP_WITHOUT_INFOSCHEMA_CLIENT_ID: ${{ secrets.TEST_DATABRICKS_SP_WITHOUT_INFOSCHEMA_CLIENT_ID }}
-          TEST_DATABRICKS_SP_WITHOUT_INFOSCHEMA_CLIENT_SECRET: ${{ secrets.TEST_DATABRICKS_SP_WITHOUT_INFOSCHEMA_CLIENT_SECRET }}
-          NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
           SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
-          AWS_ICEBERG_ACCESS_KEY_ID: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
-          AWS_ICEBERG_SECRET_ACCESS_KEY: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
-          AWS_ICEBERG_REGION: ${{ secrets.AWS_ICEBERG_REGION }}
-          AWS_ICEBERG_ACCOUNT_ID: ${{ secrets.AWS_ICEBERG_ACCOUNT_ID }}
-          AWS_GLUE_KEY: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
-          AWS_GLUE_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
-          AWS_DYNAMODB_KEY: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
-          AWS_DYNAMODB_SECRET: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
+          AWS_ICEBERG_ACCESS_KEY_ID: ${{ steps.aws-iceberg.outputs.aws-access-key-id }}
+          AWS_ICEBERG_SECRET_ACCESS_KEY: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
+          AWS_ICEBERG_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
+          AWS_ICEBERG_REGION: ${{ vars.AWS_ICEBERG_REGION }}
+          AWS_ICEBERG_ACCOUNT_ID: ${{ vars.AWS_ICEBERG_ACCOUNT_ID }}
+          AWS_GLUE_KEY: ${{ steps.aws-iceberg.outputs.aws-access-key-id }}
+          AWS_GLUE_SECRET: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
+          AWS_GLUE_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
+          AWS_DYNAMODB_KEY: ${{ steps.aws-dynamodb.outputs.aws-access-key-id }}
+          AWS_DYNAMODB_SECRET: ${{ steps.aws-dynamodb.outputs.aws-secret-access-key }}
+          AWS_DYNAMODB_SESSION_TOKEN: ${{ steps.aws-dynamodb.outputs.aws-session-token }}
           ORACLE_CLOUD_CONNECTION_STRING: ${{ secrets.ORACLE_CLOUD_CONNECTION_STRING }}
           ORACLE_CLOUD_USERNAME: ${{ secrets.ORACLE_CLOUD_USERNAME }}
           ORACLE_CLOUD_PASSWORD: ${{ secrets.ORACLE_CLOUD_PASSWORD }}
           ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
-          AWS_SNAPSHOT_KEY: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
-          AWS_SNAPSHOT_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
-          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
-          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
+          AWS_SNAPSHOT_KEY: ${{ steps.aws-iceberg.outputs.aws-access-key-id }}
+          AWS_SNAPSHOT_SECRET: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
+          AWS_SNAPSHOT_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
+          AWS_S3_VECTORS_KEY: ${{ steps.aws-s3-vectors.outputs.aws-access-key-id }}
+          AWS_S3_VECTORS_SECRET: ${{ steps.aws-s3-vectors.outputs.aws-secret-access-key }}
+          AWS_S3_VECTORS_SESSION_TOKEN: ${{ steps.aws-s3-vectors.outputs.aws-session-token }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
             INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(/^github::/)'
@@ -561,6 +640,10 @@ jobs:
     needs: [build, check_changes]
     if: ${{ github.event_name != 'pull_request' && needs.check_changes.outputs.relevant_changes == 'true' && needs.check_changes.outputs.source_changes == 'true' && needs.check_changes.outputs.source_versions_matrix != '[]' }}
     runs-on: spiceai-dev-runners
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     # The largest leg, PostgreSQL, ran its 85 tests in 4.3 minutes locally (six
     # threads, PostgreSQL 14, 2026-10-08), against 13.1 minutes at most for a
     # whole partition in CI; the bound leaves a cold runner room for the archive
@@ -583,18 +666,28 @@ jobs:
       - name: Install Oracle ODPI-C
         uses: ./.github/actions/setup-oracle-odpi
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
@@ -602,7 +695,7 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        if: env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
@@ -615,12 +708,15 @@ jobs:
       - name: Install libduckdb
         uses: ./.github/actions/setup-libduckdb
 
+      # Tests also pull images, so the login has to last the whole job.
       - name: Login to DockerHub
         if: github.repository == 'spiceai/spiceai'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Pull ${{ matrix.source }} ${{ matrix.version }}
         env:
@@ -678,6 +774,7 @@ jobs:
   # lookup does not yield exactly one conclusion, the gate falls back to the
   # combined result: it can only ever be as strict as before, never laxer.
   test-part-1:
+    environment: secret-free
     name: Integration Tests (part 1)
     needs: [check_changes, test-partitions, test-github]
     if: ${{ always() && github.event_name != 'pull_request' }}
@@ -731,6 +828,7 @@ jobs:
           [ "$ok" = true ]
 
   test-part-2:
+    environment: secret-free
     name: Integration Tests (part 2)
     needs: [check_changes, test-partitions, test-github]
     if: ${{ always() && github.event_name != 'pull_request' }}
@@ -784,6 +882,7 @@ jobs:
           [ "$ok" = true ]
 
   test-part-3:
+    environment: secret-free
     name: Integration Tests (part 3)
     needs: [check_changes, test-partitions, test-github]
     if: ${{ always() && github.event_name != 'pull_request' }}
@@ -837,6 +936,7 @@ jobs:
           [ "$ok" = true ]
 
   upload-integration-snapshots:
+    environment: secret-free
     name: Upload Integration Snapshots
     if: github.event.inputs.update_snapshots == 'always'
     # A checkout, a commit and a push.
@@ -902,7 +1002,10 @@ jobs:
     # 34948795744). The two bounded steps below sum to 32, and everything else
     # in the job has taken at most 4.7 min in the same window.
     timeout-minutes: 40
+    # The Entra app that signs the organization App token trusts this environment.
+    environment: ci-integration
     permissions:
+      id-token: write
       # GitHub's GraphQL stargazers connection rejects contents: read, including
       # read-all. The read query requires contents: write on GITHUB_TOKEN.
       # Reproduction: https://github.com/spiceai/spiceai/actions/runs/34186688336
@@ -929,18 +1032,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '2400'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download GitHub test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download GitHub test archive}"
@@ -948,7 +1061,7 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download GitHub test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        if: env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
@@ -959,14 +1072,16 @@ jobs:
 
       - name: Set up Github Token
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v2
+        uses: ./.github/actions/key-vault-app-token
         id: github-app-token
         with:
           app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
-          private-key: ${{ secrets.ORG_MEMBERS_GITHUB_PRIVATE_KEY }}
-          owner: spiceai
-          repositories: |
-            spiceai
+          installation-id: ${{ vars.ORG_MEMBERS_GITHUB_INSTALLATION_ID }}
+          key-id: ${{ vars.ORG_MEMBERS_KEY_ID }}
+          azure-client-id: ${{ vars.ORG_MEMBERS_AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ vars.ORG_MEMBERS_AZURE_TENANT_ID }}
+          repositories: spiceai
+          permissions: '{"members": "read", "metadata": "read"}'
 
       - name: Run every GitHub connector integration test
         timeout-minutes: 30
@@ -975,11 +1090,14 @@ jobs:
           SPICE_GITHUB_TEST_REQUIRED: '1'
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_ORG_TOKEN: ${{ steps.github-app-token.outputs.token }}
-          GITHUB_CLIENT_ID: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
-          GITHUB_INSTALLATION_ID: ${{ steps.github-app-token.outputs.installation-id }}
-          GITHUB_PRIVATE_KEY: ${{ secrets.ORG_MEMBERS_GITHUB_PRIVATE_KEY }}
           INSTA_WORKSPACE_ROOT: ${{ github.workspace }}
           CARGO_MANIFEST_DIR: ${{ github.workspace }}
+          # The connector signs the same App's JWT through Key Vault, as the Entra app.
+          GITHUB_APP_KMS_CLIENT_ID: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
+          GITHUB_APP_KMS_INSTALLATION_ID: ${{ vars.ORG_MEMBERS_GITHUB_INSTALLATION_ID }}
+          GITHUB_APP_KMS_KEY: ${{ vars.ORG_MEMBERS_KEY_ID }}
+          AZURE_TENANT_ID: ${{ vars.ORG_MEMBERS_AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ vars.ORG_MEMBERS_AZURE_CLIENT_ID }}
         run: |
           cargo nextest run --workspace-remap "${PWD}" \
             --archive-file ./integration_tests/integration_tests.tar.zst \
@@ -1024,7 +1142,10 @@ jobs:
     # 60 is kept deliberately as a stuck-runner backstop, 4.8x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    permissions: read-all
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1035,18 +1156,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download AWS SDK test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK test archive}"
@@ -1054,7 +1185,7 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download AWS SDK test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        if: env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
@@ -1063,20 +1194,22 @@ jobs:
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
 
-      - name: Login to ACR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
-        if: github.repository == 'spiceai/spiceai'
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          registry: spiceaitestimages.azurecr.io
-          username: spiceai-repo-pull
-          password: ${{ secrets.AZCR_PASSWORD }}
+          role-to-assume: ${{ secrets.AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
 
       - name: Run AWS SDK integration test
         env:
           AWS_EC2_METADATA_DISABLED: true
-          TEST_DATABRICKS_TOKEN: ${{ secrets.NEW_DATABRICKS_TOKEN }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta.outputs.aws-session-token }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration_aws_sdk)'
 
@@ -1087,7 +1220,10 @@ jobs:
     # 60 is kept deliberately as a stuck-runner backstop, 6.7x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    permissions: read-all
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1098,18 +1234,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download AWS SDK credential bridge test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download AWS SDK credential bridge test archive}"
@@ -1117,7 +1263,7 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download AWS SDK credential bridge test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        if: env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
@@ -1126,35 +1272,36 @@ jobs:
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
 
-      - name: Login to ACR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
-        if: github.repository == 'spiceai/spiceai'
-        with:
-          registry: spiceaitestimages.azurecr.io
-          username: spiceai-repo-pull
-          password: ${{ secrets.AZCR_PASSWORD }}
-
       - name: Run AWS SDK credential bridge integration test
         env:
           AWS_EC2_METADATA_DISABLED: true
-          AWS_S3_CLIENT_ID: ${{ secrets.AWS_S3_CLIENT_ID }}
-          AWS_S3_IDENTITY_POOL_ID: ${{ secrets.AWS_S3_IDENTITY_POOL_ID }}
-          AWS_S3_USERNAME: ${{ secrets.AWS_S3_USERNAME }}
-          AWS_S3_PASSWORD: ${{ secrets.AWS_S3_PASSWORD }}
-          AWS_COGNITO_IDP_URI: ${{ vars.AWS_COGNITO_IDP_URI }}
           AWS_REGION: ${{ vars.AWS_REGION }}
-          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          AWS_ROLE_ARN: ${{ vars.AWS_WEB_IDENTITY_TEST_ROLE_ARN }}
+        # A GitHub OIDC token lives 5 minutes, enough for these tests' STS exchanges.
         run: |
+          set -euo pipefail
+          export AWS_WEB_IDENTITY_TOKEN_FILE="${RUNNER_TEMP}/aws-web-identity-token"
+          trap 'rm -f "$AWS_WEB_IDENTITY_TOKEN_FILE"' EXIT
+          umask 077
+          # The request token goes to curl on stdin, out of the process list.
+          printf 'header = "Authorization: bearer %s"\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" |
+            curl --config - --fail --silent --show-error --max-time 30 \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" |
+            python3 -c 'import json, sys; sys.stdout.write(json.load(sys.stdin)["value"])' \
+              > "$AWS_WEB_IDENTITY_TOKEN_FILE"
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=aws-sdk-credential-bridge::credential_provider)'
 
   test-snapshot-refresh:
+    environment: ci
     name: Snapshot Refresh Mode Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 10.9 min (run 34213792762).
     # 60 is kept deliberately as a stuck-runner backstop, 5.5x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    permissions: read-all
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1164,18 +1311,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download snapshot refresh test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download snapshot refresh test archive}"
@@ -1183,7 +1340,7 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download snapshot refresh test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        if: env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
@@ -1192,30 +1349,37 @@ jobs:
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
 
-      - name: Login to ACR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
-        if: github.repository == 'spiceai/spiceai'
+      - name: Assume the Iceberg role
+        id: aws-iceberg
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          registry: spiceaitestimages.azurecr.io
-          username: spiceai-repo-pull
-          password: ${{ secrets.AZCR_PASSWORD }}
+          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-session-name: gha-iceberg-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
 
       - name: Run snapshot refresh integration tests
         env:
           AWS_EC2_METADATA_DISABLED: true
-          AWS_SNAPSHOT_KEY: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
-          AWS_SNAPSHOT_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          AWS_SNAPSHOT_KEY: ${{ steps.aws-iceberg.outputs.aws-access-key-id }}
+          AWS_SNAPSHOT_SECRET: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
+          AWS_SNAPSHOT_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration_snapshot_refresh)'
 
   test-data-components:
+    environment: ci
     name: Data Components Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 7.5 min (run 33859377810).
     # 60 is kept deliberately as a stuck-runner backstop, 8.0x that.
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    permissions: read-all
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1226,18 +1390,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download data components test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download data components test archive}"
@@ -1245,7 +1419,7 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download data components test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        if: env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
@@ -1256,13 +1430,15 @@ jobs:
 
       - name: Run data components integration test
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY_ID: ${{ steps.rustfs.outputs.access-key-id }}
+          MINIO_SECRET_ACCESS_KEY: ${{ steps.rustfs.outputs.secret-access-key }}
+          MINIO_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=data_components::integration) & test(/^hadoop_catalog_test::/)'
 
   test-runtime-partition:
+    environment: ci
     name: Partition Table Integration Tests
     needs: [build, check_changes]
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 7.7 min (run 34213792762).
@@ -1270,6 +1446,11 @@ jobs:
     timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-dev-runners
+    permissions:
+      actions: write  # approves the held runs of its snapshot PR
+      contents: write  # push-snap-changes pushes a snapshot branch
+      pull-requests: write  # and opens, auto-merges or closes its PR
+      id-token: write  # RustFS credentials
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1278,18 +1459,28 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Set up MinIO client
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download partition table test archive from local MinIO
-        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        if: env.HAS_RUSTFS_ACCESS == 'true'
         env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
         run: |
           set -euo pipefail
           : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download partition table test archive}"
@@ -1297,7 +1488,7 @@ jobs:
           mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
 
       - name: Download partition table test archive
-        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        if: env.HAS_RUSTFS_ACCESS != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
@@ -1305,14 +1496,6 @@ jobs:
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
-
-      - name: Login to ACR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
-        if: github.repository == 'spiceai/spiceai'
-        with:
-          registry: spiceaitestimages.azurecr.io
-          username: spiceai-repo-pull
-          password: ${{ secrets.AZCR_PASSWORD }}
 
       - name: Run partition table integration test
         env:

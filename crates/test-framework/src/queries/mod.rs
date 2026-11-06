@@ -765,7 +765,6 @@ pub enum QueryOverrides {
     MySQL,
     Spark,
     ODBCAthena,
-    ODBCDatabricks,
     DuckDB,
     DuckDBOnZeroResults,
     Snowflake,
@@ -821,10 +820,6 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             queries, 2,  // https://github.com/spiceai/spiceai/issues/8379
             4,  // https://github.com/spiceai/spiceai/issues/2077
             20  // https://github.com/spiceai/spiceai/issues/2078
-        ),
-        Some(QueryOverrides::ODBCDatabricks) => remove_tpch_query!(
-            queries,
-            2 // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
         ),
         Some(QueryOverrides::Spark) => remove_tpch_query!(
             queries,
@@ -1261,28 +1256,6 @@ pub fn get_tpcds_test_queries(
             38, 87, // https://github.com/spiceai/spiceai/issues/5247
             6, 32, 92 // https://github.com/spiceai/spiceai/issues/5246
         ),
-        Some(QueryOverrides::ODBCDatabricks) => {
-            let queries: Vec<Query> = remove_tpcds_query!(
-                queries, 6, 8, 13, 14, 23, 24, 32, 36, 38, 39, 44, 47, 49, 57, 67, 70, 86, 87, 91,
-                92
-            );
-
-            add_tpcds_query_overrides!(
-                queries,
-                "odbc_databricks",
-                6,
-                32,
-                36,
-                44,
-                47,
-                49,
-                57,
-                67,
-                70,
-                86,
-                92
-            )
-        }
         Some(QueryOverrides::Arrow) => remove_tpcds_query!(
             queries, 72 // 'offset overflow' https://github.com/spiceai/spiceai/issues/4216
         ),

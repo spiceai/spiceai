@@ -46,8 +46,9 @@ jobs:
   build:
     name: Build Test Binary (macOS)
     runs-on: spiceai-macos-large
+    environment: ci-build
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,7 +65,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
@@ -79,10 +80,7 @@ jobs:
         if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
@@ -94,8 +92,6 @@ jobs:
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
           FEATURES="flightsql,models,metal,s3_vectors,kafka,duckdb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
@@ -125,7 +121,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: build
           region: us-west-1
@@ -145,8 +141,9 @@ jobs:
           archive_url="${SPICEIO_ENDPOINT%/}/${AI_INTEGRATION_TEST_ARCHIVE_S3_URI#s3://}"
           curl --fail --silent --show-error --upload-file ./integration.tar.zst "$archive_url"
 
+      # `test-models` and `test-bedrock` run in `ci`, which has no NAS password, so they
+      # read this copy.
       - name: Upload test archive
-        if: env.HAS_SPICEIO_SECRET != 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ai-integration-test-archive
@@ -188,7 +185,7 @@ jobs:
       # Exchanged for OpenAI and Anthropic access tokens: workload identity federation.
       id-token: write
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
       HAS_OPENAI_WIF: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID != '' }}
       HAS_ANTHROPIC_WIF: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID != '' }}
       HAS_XAI_SECRET: ${{ secrets.SPICE_SECRET_XAI_API_KEY != '' }}
@@ -218,7 +215,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: build
           region: us-west-1
@@ -247,8 +244,10 @@ jobs:
           path: ./integration_test
 
       - name: Set up API Keys
+        env:
+          SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
-          echo 'SPICE_XAI_API_KEY="${{ secrets.SPICE_SECRET_XAI_API_KEY }}"' > .env
+          printf 'SPICE_XAI_API_KEY="%s"\n' "$SPICE_XAI_API_KEY" > .env
 
       # OpenAI tests
       - name: Run OpenAI integration test
@@ -429,8 +428,9 @@ jobs:
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
     runs-on: spiceai-macos-large
+    environment: ci-build
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
       HAS_HF_SECRET: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -449,7 +449,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: build
           region: us-west-1
@@ -531,7 +531,7 @@ jobs:
       # Exchanged for the Bedrock role's AWS credentials: workload identity federation.
       id-token: write
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -572,7 +572,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: build
           region: us-west-1
@@ -647,8 +647,9 @@ jobs:
   build-extended:
     name: Build Test Binary (Extended)
     runs-on: spiceai-macos-large
+    environment: ci-build
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -665,7 +666,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
@@ -680,10 +681,7 @@ jobs:
         if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
@@ -692,8 +690,6 @@ jobs:
       - name: Build AI integration test binary
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
           FEATURES="flightsql,models,s3_vectors,kafka,duckdb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
@@ -723,7 +719,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: build
           region: us-west-1

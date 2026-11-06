@@ -15,11 +15,11 @@ limitations under the License.
 */
 
 //! Workload identity federation: a [`TokenProvider`] that exchanges an identity token issued by
-//! the platform a workload runs on for a short-lived model provider access token, and exchanges
-//! again before that access token expires.
+//! the platform a workload runs on for a short-lived provider access token, and exchanges again
+//! before that access token expires.
 //!
-//! The providers are Anthropic, `OpenAI` and Microsoft Entra ID, whose tokens authenticate Azure
-//! `OpenAI`.
+//! The providers are Anthropic, `OpenAI`, Microsoft Entra ID, whose tokens authenticate Azure
+//! `OpenAI`, and Databricks.
 //!
 //! The access tokens are short-lived by design. An `OpenAI` token never outlives the identity
 //! token it was exchanged for, so one exchanged for a GitHub Actions OIDC token (which lives five
@@ -64,6 +64,9 @@ const ENTRA_AUTHORITY_HOST: &str = "https://login.microsoftonline.com";
 
 const ENTRA_WORKLOAD_IDENTITY_DOCS: &str =
     "https://learn.microsoft.com/entra/workload-id/workload-identity-federation";
+
+const DATABRICKS_FEDERATION_POLICY_DOCS: &str =
+    "https://docs.databricks.com/aws/en/dev-tools/auth/oauth-federation-policy";
 
 const ANTHROPIC_AUTHENTICATION_HISTORY: &str =
     "https://platform.claude.com/settings/workload-identity-federation?tab=history";
@@ -229,7 +232,13 @@ impl SubjectTokenSource {
         )
     }
 
-    fn github_actions(
+    /// The OIDC token endpoint of a GitHub Actions job, from the values of its
+    /// `ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` variables.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkloadIdentityError::GitHubActionsEnvironmentMissing`] when either is absent or empty.
+    pub fn github_actions(
         request_url: Option<String>,
         request_token: Option<String>,
         audience: impl Into<String>,
@@ -332,6 +341,12 @@ pub enum Exchange {
         client_id: String,
         scope: String,
     },
+    /// Databricks' RFC 8693 token exchange at a workspace's token endpoint. A federation policy
+    /// of the service principal `client_id` must match the identity token's claims.
+    Databricks {
+        token_url: String,
+        client_id: String,
+    },
 }
 
 impl Exchange {
@@ -403,11 +418,22 @@ impl Exchange {
         })
     }
 
+    /// An exchange at the Databricks workspace token endpoint `token_url`, for a token of the
+    /// service principal `client_id`.
+    #[must_use]
+    pub fn databricks(token_url: impl Into<String>, client_id: impl Into<String>) -> Self {
+        Self::Databricks {
+            token_url: token_url.into(),
+            client_id: client_id.into(),
+        }
+    }
+
     fn provider(&self) -> &'static str {
         match self {
             Self::Anthropic { .. } => "Anthropic",
             Self::OpenAi { .. } => "OpenAI",
             Self::Entra { .. } => "Microsoft Entra ID",
+            Self::Databricks { .. } => "Databricks",
         }
     }
 
@@ -415,11 +441,13 @@ impl Exchange {
         match self {
             Self::Anthropic { token_url, .. }
             | Self::OpenAi { token_url, .. }
-            | Self::Entra { token_url, .. } => token_url,
+            | Self::Entra { token_url, .. }
+            | Self::Databricks { token_url, .. } => token_url,
         }
     }
 
-    /// The exchange request: JSON for Anthropic and `OpenAI`, a form for Microsoft Entra ID.
+    /// The exchange request: JSON for Anthropic and `OpenAI`, a form for Microsoft Entra ID and
+    /// Databricks.
     fn request(
         &self,
         http: &reqwest::Client,
@@ -469,6 +497,16 @@ impl Exchange {
                 ),
                 ("client_assertion", subject_token.expose_secret()),
             ]),
+            Self::Databricks { client_id, .. } => request.form(&[
+                (
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                ),
+                ("subject_token_type", "urn:ietf:params:oauth:token-type:jwt"),
+                ("subject_token", subject_token.expose_secret()),
+                ("client_id", client_id.as_str()),
+                ("scope", "all-apis"),
+            ]),
         }
     }
 
@@ -483,6 +521,9 @@ impl Exchange {
             ),
             Self::Entra { client_id, .. } => format!(
                 "Verify that the application or managed identity '{client_id}' has a federated credential whose issuer, subject and audience match the workload identity token: {ENTRA_WORKLOAD_IDENTITY_DOCS}"
+            ),
+            Self::Databricks { client_id, .. } => format!(
+                "Verify that the service principal '{client_id}' has a federation policy whose issuer, subject and audience match the workload identity token: {DATABRICKS_FEDERATION_POLICY_DOCS}"
             ),
         }
     }
@@ -831,8 +872,9 @@ mod tests {
         issue(&mock, body)
     }
 
-    /// Microsoft Entra ID's token endpoint, which reads a form rather than JSON.
-    async fn entra_token(
+    /// A token endpoint that reads a form rather than JSON, as Microsoft Entra ID's and
+    /// Databricks' do.
+    async fn form_token(
         State(mock): State<Arc<Mock>>,
         Form(form): Form<HashMap<String, String>>,
     ) -> Response {
@@ -887,6 +929,17 @@ mod tests {
             .into_response()
     }
 
+    async fn refuse_databricks() -> Response {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "invalid_client",
+                "error_description": "Client authentication failed",
+            })),
+        )
+            .into_response()
+    }
+
     async fn redirect_to_token() -> Response {
         (
             StatusCode::TEMPORARY_REDIRECT,
@@ -912,8 +965,10 @@ mod tests {
             .route("/token", post(token))
             .route("/refuse/anthropic", post(refuse_anthropic))
             .route("/refuse/openai", post(refuse_openai))
-            .route("/entra/token", post(entra_token))
+            .route("/entra/token", post(form_token))
             .route("/refuse/entra", post(refuse_entra))
+            .route("/databricks/token", post(form_token))
+            .route("/refuse/databricks", post(refuse_databricks))
             .route("/redirect", post(redirect_to_token))
             .with_state(Arc::clone(&mock));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1118,6 +1173,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn databricks_receives_the_token_exchange_grant_with_a_new_identity_token_for_its_service_principal()
+     {
+        let (base, mock) = start(4).await;
+        let provider = WorkloadIdentityTokenProvider::try_new(
+            "Databricks service principal 'client-1'",
+            github_actions(&base, "account-1"),
+            Exchange::databricks(format!("{base}/databricks/token"), "client-1"),
+        )
+        .await
+        .expect("the first exchange");
+        assert_eq!(provider.get_token(), "tok-1");
+        wait_for_token(&provider, "tok-2").await;
+
+        let grant = |subject_token: &str| {
+            json!({
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "subject_token": subject_token,
+                "client_id": "client-1",
+                "scope": "all-apis",
+            })
+        };
+        assert_eq!(
+            mock.exchanges.lock().expect("lock").clone(),
+            vec![grant("jwt-1"), grant("jwt-2")],
+            "each exchange is a form carrying a new identity token"
+        );
+    }
+
     #[test]
     fn an_entra_exchange_goes_to_the_tenant_of_the_authority() {
         let url = |authority: Option<&str>, tenant: &str| {
@@ -1284,6 +1369,18 @@ mod tests {
         assert_eq!(
             entra.to_string(),
             "Microsoft Entra ID refused to exchange the workload identity token for an access token (HTTP 400 Bad Request): invalid_client: AADSTS700213: No matching federated identity record found for presented assertion subject 'repo:org/repo:environment:prod'. Check your federated identity credential Subject, Audience and Issuer against the presented assertion. Verify that the application or managed identity 'client-1' has a federated credential whose issuer, subject and audience match the workload identity token: https://learn.microsoft.com/entra/workload-id/workload-identity-federation"
+        );
+
+        let databricks = WorkloadIdentityTokenProvider::try_new(
+            "Databricks service principal 'client-1'",
+            github_actions(&base, "account-1"),
+            Exchange::databricks(format!("{base}/refuse/databricks"), "client-1"),
+        )
+        .await
+        .expect_err("Databricks refuses the exchange");
+        assert_eq!(
+            databricks.to_string(),
+            "Databricks refused to exchange the workload identity token for an access token (HTTP 401 Unauthorized): invalid_client: Client authentication failed. Verify that the service principal 'client-1' has a federation policy whose issuer, subject and audience match the workload identity token: https://docs.databricks.com/aws/en/dev-tools/auth/oauth-federation-policy"
         );
     }
 

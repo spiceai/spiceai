@@ -5,6 +5,7 @@ on:
 
 jobs:
   build:
+    environment: secret-free
     name: Build ${{ matrix.name }} binaries
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -60,6 +61,7 @@ jobs:
           fi
 
   test_acceleration:
+    environment: secret-free
     name: '${{ matrix.acceleration.engine }} acceleration on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:

@@ -48,6 +48,9 @@ pub struct ContainerSpec {
     /// A Docker network to join (created if missing), so containers of one
     /// source can reach each other by name.
     pub network: Option<String>,
+    /// Another name peers on `network` reach the container by. A container
+    /// name can outgrow the 63 characters a host name label may hold.
+    pub alias: Option<String>,
 }
 
 pub struct Container {
@@ -172,14 +175,19 @@ impl Container {
                 let mut config = config.clone();
                 // Under another name, keep the original as an alias on the
                 // container's network, so its peers still find it by it.
-                if name != spec.name
+                let aliases: Vec<String> = (name != spec.name)
+                    .then(|| spec.name.clone())
+                    .into_iter()
+                    .chain(spec.alias.clone())
+                    .collect();
+                if !aliases.is_empty()
                     && let Some(network) = spec.network.as_deref().filter(|n| *n != "host")
                 {
                     config.networking_config = Some(NetworkingConfig {
                         endpoints_config: HashMap::from([(
                             network.to_string(),
                             EndpointSettings {
-                                aliases: Some(vec![spec.name.clone()]),
+                                aliases: Some(aliases),
                                 ..Default::default()
                             },
                         )]),
