@@ -1416,7 +1416,7 @@ mod tests {
 
     /// An invalid configured provider must not wipe a retained built-in: the
     /// replacement registry is built off to the side and only published after
-    /// every `from:` validates. (F1 / BuiltinSurvivesReload.)
+    /// every `from:` validates. (F1 / `BuiltinSurvivesReload`.)
     #[tokio::test]
     async fn builtin_store_survives_an_invalid_secrets_reload() {
         let mut secrets = super::Secrets::new();
