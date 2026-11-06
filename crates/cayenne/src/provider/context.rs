@@ -736,6 +736,43 @@ impl CayenneContext {
             .record(rows_removed, tombstones_reclaimed);
     }
 
+    /// The last measured reclaim yield, in rows per thousand tombstones.
+    pub(crate) fn deletion_index_yield_per_thousand(&self) -> u32 {
+        self.deletion_index_yield.rows_per_thousand()
+    }
+
+    /// Record a reclaim that took `tombstones_reclaimed` tombstones out of the
+    /// index without counting the rows they hid: the yield measured before it
+    /// stands.
+    pub(crate) fn record_unmeasured_deletion_index_reclaim(&self, tombstones_reclaimed: u64) {
+        self.deletion_index_yield
+            .record_unmeasured(tombstones_reclaimed);
+    }
+
+    /// Record a committed rewrite that removed `rows` rows by deletion filter and
+    /// kept their tombstones, which the next reclaim's yield counts.
+    pub(crate) fn record_rows_removed_before_reclaim(&self, rows: u64) {
+        self.deletion_index_yield
+            .record_rows_removed_before_reclaim(rows);
+    }
+
+    /// Record the highest delete sequence of the deletion index loaded at open.
+    pub(crate) fn record_tombstones_from_open(&self, max_delete_seq: Option<i64>) {
+        self.deletion_index_yield
+            .record_tombstones_from_open(max_delete_seq);
+    }
+
+    /// The highest delete sequence of the tombstones loaded at open, while one of
+    /// them may still be held.
+    pub(crate) fn tombstones_from_open_through(&self) -> Option<i64> {
+        self.deletion_index_yield.tombstones_from_open_through()
+    }
+
+    /// Record that the index no longer holds a tombstone loaded at open.
+    pub(crate) fn forget_tombstones_from_open(&self) {
+        self.deletion_index_yield.forget_tombstones_from_open();
+    }
+
     /// Apply-back-pressure gate for the seq-prefix bake: `true` when the CDC
     /// apply is at or over capacity, so the background bake — whose merge
     /// (re-encode survivors + publish) competes with the apply for the shared
