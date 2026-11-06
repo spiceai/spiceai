@@ -23,10 +23,10 @@ limitations under the License.
 //! the wrapped `FullTextConnector` index the accelerated table discovers, before the dataset is
 //! registered.
 //!
-//! Covers both DuckDB (the original #14618 engine) and Cayenne. Cayenne was still empty after a
+//! Covers both `DuckDB` (the original #14618 engine) and Cayenne. Cayenne was still empty after a
 //! restart on v2.4.1 because #14954 had not been backported; the rebuild path is engine-agnostic
 //! once present, and this test keeps Cayenne on the matrix so a future regression cannot hide
-//! behind DuckDB-only coverage.
+//! behind `DuckDB`-only coverage.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -139,7 +139,7 @@ async fn row_count(rt: &Arc<Runtime>) -> anyhow::Result<i64> {
         .context("no count row")
 }
 
-async fn write_fixture(dir: &tempfile::TempDir) -> anyhow::Result<String> {
+fn write_fixture(dir: &tempfile::TempDir) -> anyhow::Result<String> {
     let csv = dir.path().join("docs.csv");
     std::fs::write(&csv, "id,text\n1,alpha\n2,beta\n3,gamma\n")?;
     Ok(format!("file://{}", csv.display()))
@@ -181,7 +181,7 @@ async fn full_text_search_finds_persisted_rows_after_a_restart() -> anyhow::Resu
     register_test_connectors().await;
 
     let dir = tempfile::tempdir()?;
-    let source = write_fixture(&dir).await?;
+    let source = write_fixture(&dir)?;
     let db_path = dir.path().join("docs.db").to_string_lossy().to_string();
 
     let first = start_with(duckdb_docs_dataset(&source, &db_path)).await?;
@@ -196,7 +196,7 @@ async fn cayenne_full_text_search_finds_persisted_rows_after_a_restart() -> anyh
     register_test_connectors().await;
 
     let dir = tempfile::tempdir()?;
-    let source = write_fixture(&dir).await?;
+    let source = write_fixture(&dir)?;
     let data_dir = dir.path().join("cayenne-data");
     let metadata_dir = dir.path().join("cayenne-metadata");
     std::fs::create_dir_all(&data_dir)?;
