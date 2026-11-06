@@ -382,6 +382,10 @@ fn build_snapshots_config(
             "s3_secret".to_string(),
             "${secrets:AWS_SNAPSHOT_SECRET}".to_string(),
         );
+        param_map.extend(crate::utils::aws_session_token_param(
+            "s3_session_token",
+            "AWS_SNAPSHOT_SESSION_TOKEN",
+        ));
     }
 
     if let Ok(endpoint) = env::var("AWS_SNAPSHOT_ENDPOINT") {

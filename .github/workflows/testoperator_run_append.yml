@@ -41,7 +41,6 @@ on:
           - 'postgresql'
           - 'mysql'
           - 'odbc-athena'
-          - 'odbc-databricks'
           - 'oracle'
           - 'duckdb-zero-results'
           - 'snowflake'

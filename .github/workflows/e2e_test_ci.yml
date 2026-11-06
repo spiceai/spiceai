@@ -2470,28 +2470,34 @@ jobs:
           echo "      mode: delta_lake" >> spicepod.yaml
           echo "      databricks_aws_access_key_id: \${ secrets:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }" >> spicepod.yaml
           echo "      databricks_aws_secret_access_key: \${ secrets:AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }" >> spicepod.yaml
+          echo "      databricks_aws_session_token: \${ secrets:AWS_DATABRICKS_DELTA_SESSION_TOKEN }" >> spicepod.yaml
           echo "      databricks_aws_region: us-west-2" >> spicepod.yaml
           echo "      databricks_endpoint: \${ secrets:DATABRICKS_ENDPOINT }" >> spicepod.yaml
-          echo "      databricks_token: \${ secrets:DATABRICKS_TOKEN }" >> spicepod.yaml
+          echo "      databricks_client_id: \${ secrets:DATABRICKS_OIDC_CLIENT_ID }" >> spicepod.yaml
+          echo "      databricks_token_audience: \${ secrets:DATABRICKS_OIDC_AUDIENCE }" >> spicepod.yaml
 
           cat spicepod.yaml
 
-      - name: Get Databricks token
-        id: databricks-token
-        uses: ./.github/actions/databricks-oidc-token
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta-new
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          host: ${{ vars.NEW_DATABRICKS_HOST }}
-          client-id: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
-          audience: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
 
       - name: Start spice runtime
         working-directory: test_app
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta-new.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta-new.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta-new.outputs.aws-session-token }}
           DATABRICKS_ENDPOINT: ${{ vars.NEW_DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ steps.databricks-token.outputs.token }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
         run: |
           spice run &> spice.log &
           # time to initialize added datasets

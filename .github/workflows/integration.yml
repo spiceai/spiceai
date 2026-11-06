@@ -460,6 +460,56 @@ jobs:
         run: |
           printf 'SPICEAI_API_KEY="%s"\n' "$SPICEAI_API_KEY" > .env
 
+      # Short-lived AWS credentials, one role per test area. They are kept out of the job's
+      # environment so they do not replace the RustFS credentials, and are passed to the test step.
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta-new
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          role-duration-seconds: 5400
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Assume the Iceberg role
+        id: aws-iceberg
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-session-name: gha-iceberg-${{ github.run_id }}
+          role-duration-seconds: 5400
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Assume the DynamoDB role
+        id: aws-dynamodb
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DYNAMODB_ROLE_ARN }}
+          role-session-name: gha-dynamodb-${{ github.run_id }}
+          role-duration-seconds: 5400
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Assume the S3 Vectors role
+        id: aws-s3-vectors
+        if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_RUSTFS_ACCESS == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_S3_VECTORS_ROLE_ARN }}
+          role-session-name: gha-s3-vectors-${{ github.run_id }}
+          role-duration-seconds: 5400
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
       - name: Run integration test
         if: needs.check_changes.outputs.relevant_changes == 'true'
         # 13.1 minutes at most across the three partitions (run 36019894787, part 2,
@@ -484,30 +534,45 @@ jobs:
           MINIO_ACCESS_KEY_ID: ${{ steps.rustfs.outputs.access-key-id }}
           MINIO_SECRET_ACCESS_KEY: ${{ steps.rustfs.outputs.secret-access-key }}
           MINIO_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
-          NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta-new.outputs.aws-access-key-id }}
+          NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta-new.outputs.aws-secret-access-key }}
+          NEW_AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta-new.outputs.aws-session-token }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta-new.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta-new.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta-new.outputs.aws-session-token }}
+          TEST_DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
+          NEW_DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
+          NEW_DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
+          NEW_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
           SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
-          AWS_ICEBERG_ACCESS_KEY_ID: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
-          AWS_ICEBERG_SECRET_ACCESS_KEY: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          AWS_ICEBERG_ACCESS_KEY_ID: ${{ steps.aws-iceberg.outputs.aws-access-key-id }}
+          AWS_ICEBERG_SECRET_ACCESS_KEY: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
+          AWS_ICEBERG_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
           AWS_ICEBERG_REGION: ${{ vars.AWS_ICEBERG_REGION }}
           AWS_ICEBERG_ACCOUNT_ID: ${{ vars.AWS_ICEBERG_ACCOUNT_ID }}
-          AWS_GLUE_KEY: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
-          AWS_GLUE_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
-          AWS_DYNAMODB_KEY: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
-          AWS_DYNAMODB_SECRET: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
+          AWS_GLUE_KEY: ${{ steps.aws-iceberg.outputs.aws-access-key-id }}
+          AWS_GLUE_SECRET: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
+          AWS_GLUE_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
+          AWS_DYNAMODB_KEY: ${{ steps.aws-dynamodb.outputs.aws-access-key-id }}
+          AWS_DYNAMODB_SECRET: ${{ steps.aws-dynamodb.outputs.aws-secret-access-key }}
+          AWS_DYNAMODB_SESSION_TOKEN: ${{ steps.aws-dynamodb.outputs.aws-session-token }}
           ORACLE_CLOUD_CONNECTION_STRING: ${{ secrets.ORACLE_CLOUD_CONNECTION_STRING }}
           ORACLE_CLOUD_USERNAME: ${{ secrets.ORACLE_CLOUD_USERNAME }}
           ORACLE_CLOUD_PASSWORD: ${{ secrets.ORACLE_CLOUD_PASSWORD }}
           ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
-          AWS_SNAPSHOT_KEY: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
-          AWS_SNAPSHOT_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
-          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
-          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
+          AWS_SNAPSHOT_KEY: ${{ steps.aws-iceberg.outputs.aws-access-key-id }}
+          AWS_SNAPSHOT_SECRET: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
+          AWS_SNAPSHOT_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
+          AWS_S3_VECTORS_KEY: ${{ steps.aws-s3-vectors.outputs.aws-access-key-id }}
+          AWS_S3_VECTORS_SECRET: ${{ steps.aws-s3-vectors.outputs.aws-secret-access-key }}
+          AWS_S3_VECTORS_SESSION_TOKEN: ${{ steps.aws-s3-vectors.outputs.aws-session-token }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(/^github::/) - test(/^databricks_/) - test(/^spark::/)'
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(/^github::/)'
           else
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(spiceai_integration_test) - test(/^github::/) - test(/^databricks_/) - test(/^spark::/)'
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(spiceai_integration_test) - test(/^github::/)'
           fi
 
       - name: Configure apt mirrors for the retention OOM test
@@ -711,7 +776,7 @@ jobs:
   test-part-1:
     environment: secret-free
     name: Integration Tests (part 1)
-    needs: [check_changes, test-partitions, test-github, test-databricks]
+    needs: [check_changes, test-partitions, test-github]
     if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -726,7 +791,6 @@ jobs:
           RELEVANT_CHANGES: ${{ needs.check_changes.outputs.relevant_changes }}
           PARTITIONS_RESULT: ${{ needs.test-partitions.result }}
           GITHUB_RESULT: ${{ needs.test-github.result }}
-          DATABRICKS_RESULT: ${{ needs.test-databricks.result }}
         run: |
           set -euo pipefail
           if [ "$CHANGE_CHECK_RESULT" != success ]; then
@@ -737,10 +801,6 @@ jobs:
           ok=true
           if [ "$GITHUB_RESULT" != success ]; then
             echo "::error::'GitHub Connector Integration Tests' concluded '$GITHUB_RESULT'. Its log names the failing tests."
-            ok=false
-          fi
-          if [ "$DATABRICKS_RESULT" != success ]; then
-            echo "::error::'Databricks Connector Integration Tests' concluded '$DATABRICKS_RESULT'. Its log names the failing tests."
             ok=false
           fi
           leg="Run Integration Tests (part $PART)"
@@ -770,7 +830,7 @@ jobs:
   test-part-2:
     environment: secret-free
     name: Integration Tests (part 2)
-    needs: [check_changes, test-partitions, test-github, test-databricks]
+    needs: [check_changes, test-partitions, test-github]
     if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -785,7 +845,6 @@ jobs:
           RELEVANT_CHANGES: ${{ needs.check_changes.outputs.relevant_changes }}
           PARTITIONS_RESULT: ${{ needs.test-partitions.result }}
           GITHUB_RESULT: ${{ needs.test-github.result }}
-          DATABRICKS_RESULT: ${{ needs.test-databricks.result }}
         run: |
           set -euo pipefail
           if [ "$CHANGE_CHECK_RESULT" != success ]; then
@@ -796,10 +855,6 @@ jobs:
           ok=true
           if [ "$GITHUB_RESULT" != success ]; then
             echo "::error::'GitHub Connector Integration Tests' concluded '$GITHUB_RESULT'. Its log names the failing tests."
-            ok=false
-          fi
-          if [ "$DATABRICKS_RESULT" != success ]; then
-            echo "::error::'Databricks Connector Integration Tests' concluded '$DATABRICKS_RESULT'. Its log names the failing tests."
             ok=false
           fi
           leg="Run Integration Tests (part $PART)"
@@ -829,7 +884,7 @@ jobs:
   test-part-3:
     environment: secret-free
     name: Integration Tests (part 3)
-    needs: [check_changes, test-partitions, test-github, test-databricks]
+    needs: [check_changes, test-partitions, test-github]
     if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -844,7 +899,6 @@ jobs:
           RELEVANT_CHANGES: ${{ needs.check_changes.outputs.relevant_changes }}
           PARTITIONS_RESULT: ${{ needs.test-partitions.result }}
           GITHUB_RESULT: ${{ needs.test-github.result }}
-          DATABRICKS_RESULT: ${{ needs.test-databricks.result }}
         run: |
           set -euo pipefail
           if [ "$CHANGE_CHECK_RESULT" != success ]; then
@@ -855,10 +909,6 @@ jobs:
           ok=true
           if [ "$GITHUB_RESULT" != success ]; then
             echo "::error::'GitHub Connector Integration Tests' concluded '$GITHUB_RESULT'. Its log names the failing tests."
-            ok=false
-          fi
-          if [ "$DATABRICKS_RESULT" != success ]; then
-            echo "::error::'Databricks Connector Integration Tests' concluded '$DATABRICKS_RESULT'. Its log names the failing tests."
             ok=false
           fi
           leg="Run Integration Tests (part $PART)"
@@ -1085,121 +1135,6 @@ jobs:
           path: integration-snapshots-part-github.tar.gz
           retention-days: 1
 
-  # The Databricks token expires with the job's GitHub OIDC token after 5 minutes, too
-  # soon for a partition, so these tests run here straight after the exchange.
-  test-databricks:
-    name: Databricks Connector Integration Tests
-    needs: [build, check_changes]
-    if: needs.check_changes.outputs.relevant_changes == 'true'
-    runs-on: spiceai-dev-runners
-    timeout-minutes: 30
-    # The service principal's federation policy trusts this environment.
-    environment: ci
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 1
-
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
-
-      - name: Get RustFS credentials
-        id: rustfs
-        if: env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/rustfs-credentials
-        with:
-          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
-          export-env: 'false'
-
-      - name: Set up MinIO client
-        if: env.HAS_RUSTFS_ACCESS == 'true'
-        uses: ./.github/actions/setup-minio
-        with:
-          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
-          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
-          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
-
-      - name: Download test archive from local MinIO
-        if: env.HAS_RUSTFS_ACCESS == 'true'
-        env:
-          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
-        run: |
-          set -euo pipefail
-          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download the test archive}"
-          mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
-
-      - name: Download test archive
-        if: env.HAS_RUSTFS_ACCESS != 'true'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        with:
-          name: integration-tests-archive
-          path: ./integration_tests
-
-      - name: Set up Nextest
-        uses: ./.github/actions/setup-nextest
-
-      - name: Get Databricks token
-        id: databricks-token
-        uses: ./.github/actions/databricks-oidc-token
-        with:
-          host: ${{ vars.NEW_DATABRICKS_HOST }}
-          client-id: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
-          audience: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
-
-      - name: Run every Databricks connector integration test
-        timeout-minutes: 20
-        env:
-          AWS_EC2_METADATA_DISABLED: true
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
-          INSTA_WORKSPACE_ROOT: ${{ github.workspace }}
-          CARGO_MANIFEST_DIR: ${{ github.workspace }}
-          TEST_DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
-          TEST_DATABRICKS_TOKEN: ${{ steps.databricks-token.outputs.token }}
-          TEST_DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
-          TEST_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          NEW_DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
-          NEW_DATABRICKS_TOKEN: ${{ steps.databricks-token.outputs.token }}
-          NEW_DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
-          NEW_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
-          NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-        run: |
-          cargo nextest run --workspace-remap "${PWD}" \
-            --archive-file ./integration_tests/integration_tests.tar.zst \
-            -E 'binary_id(=runtime::integration) & (test(/^databricks_/) | test(/^spark::/))'
-
-      - name: Upload integration snapshots artifact
-        id: create_snapshot_archive
-        if: github.event.inputs.update_snapshots == 'always' && needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          git diff --name-only -- '*.snap' > snapshot-files
-          git ls-files -o --exclude-standard -- '*.snap' >> snapshot-files
-          if [ -s snapshot-files ]; then
-            tr '\n' '\0' < snapshot-files > snapshot-files-0
-            tar --null -czf integration-snapshots-part-databricks.tar.gz --files-from snapshot-files-0
-            echo "created=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "No snapshot files found"
-            echo "created=false" >> "$GITHUB_OUTPUT"
-          fi
-          rm -f snapshot-files snapshot-files-0
-        shell: bash
-      - name: Store integration snapshots artifact
-        if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true' && needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: integration-snapshots-part-databricks
-          path: integration-snapshots-part-databricks.tar.gz
-          retention-days: 1
-
   test-aws-sdk:
     name: AWS SDK Integration Tests
     needs: [build, check_changes]
@@ -1259,20 +1194,22 @@ jobs:
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
 
-      - name: Get Databricks token
-        id: databricks-token
-        uses: ./.github/actions/databricks-oidc-token
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          host: ${{ vars.NEW_DATABRICKS_HOST }}
-          client-id: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
-          audience: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+          role-to-assume: ${{ secrets.AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
 
       - name: Run AWS SDK integration test
         env:
           AWS_EC2_METADATA_DISABLED: true
-          TEST_DATABRICKS_TOKEN: ${{ steps.databricks-token.outputs.token }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta.outputs.aws-session-token }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration_aws_sdk)'
 
@@ -1412,11 +1349,23 @@ jobs:
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
 
+      - name: Assume the Iceberg role
+        id: aws-iceberg
+        if: env.HAS_RUSTFS_ACCESS == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-session-name: gha-iceberg-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
       - name: Run snapshot refresh integration tests
         env:
           AWS_EC2_METADATA_DISABLED: true
-          AWS_SNAPSHOT_KEY: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
-          AWS_SNAPSHOT_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          AWS_SNAPSHOT_KEY: ${{ steps.aws-iceberg.outputs.aws-access-key-id }}
+          AWS_SNAPSHOT_SECRET: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
+          AWS_SNAPSHOT_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration_snapshot_refresh)'
 
