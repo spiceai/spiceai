@@ -32,7 +32,7 @@ use aws_sdk_kms::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_kms::primitives::Blob;
 use aws_sdk_kms::types::{MessageType, SigningAlgorithmSpec};
 use snafu::prelude::*;
-use token_provider::github_app_token::{JwtSigner, SignError};
+use token_provider::jwt_signer::{JwtSigner, SignError};
 
 #[derive(Debug, Snafu)]
 pub enum Error {

@@ -20,7 +20,10 @@ use app::AppBuilder;
 
 use crate::{
     ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::{register_test_connectors, runtime_ready_check, test_request_context},
+    utils::{
+        aws_session_token_param, register_test_connectors, runtime_ready_check,
+        test_request_context,
+    },
 };
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
@@ -42,8 +45,12 @@ fn get_params() -> Params {
                 "${ env:TEST_DATABRICKS_HOST }".to_string(),
             ),
             (
-                "databricks_token".to_string(),
-                "${ env:TEST_DATABRICKS_TOKEN }".to_string(),
+                "databricks_client_id".to_string(),
+                "${ env:DATABRICKS_OIDC_CLIENT_ID }".to_string(),
+            ),
+            (
+                "databricks_token_audience".to_string(),
+                "${ env:DATABRICKS_OIDC_AUDIENCE }".to_string(),
             ),
             (
                 "databricks_aws_secret_access_key".to_string(),
@@ -58,6 +65,10 @@ fn get_params() -> Params {
             ("mode".to_string(), "delta_lake".to_string()),
         ]
         .into_iter()
+        .chain(aws_session_token_param(
+            "databricks_aws_session_token",
+            "AWS_DATABRICKS_DELTA_SESSION_TOKEN",
+        ))
         .collect(),
     )
 }

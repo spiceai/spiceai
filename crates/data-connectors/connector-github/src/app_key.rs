@@ -21,8 +21,11 @@ limitations under the License.
 use std::sync::Arc;
 
 use aws_kms_signer::{AwsKmsSigner, KmsKey};
-use azure_key_vault_signer::{AzureIdentityEnvironment, KeyVaultKey, KeyVaultSigner};
-use token_provider::github_app_token::JwtSigner;
+use azure_key_vault_signer::{
+    AzureIdentityEnvironment, KeyVaultError, KeyVaultKey, KeyVaultSigner,
+};
+use snafu::prelude::*;
+use token_provider::jwt_signer::JwtSigner;
 
 const DOCS: &str =
     "https://spiceai.org/docs/components/data-connectors/github#github-app-installation";
@@ -57,64 +60,78 @@ pub(crate) struct AppKeyParams<'a> {
     pub installation_id: Option<&'a str>,
 }
 
-fn invalid(param: &str, message: &str) -> String {
-    format!("Invalid value for parameter {param}. {message} See: {DOCS}")
-}
-
 fn set(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
-/// The App `params` describe when `github_private_key_kms` is set, or the message of the
-/// configuration error to report. Nothing here reaches a network.
+/// Why a GitHub App whose private key a key service holds cannot be set up.
+#[derive(Debug, Snafu)]
+pub(crate) enum AppKeyError {
+    #[snafu(display(
+        "Invalid value for parameter github_private_key_kms. A GitHub App's private key is either `github_private_key` or a key service's key in `github_private_key_kms`, and both are set. Remove one of them. See: {DOCS}"
+    ))]
+    BothPrivateKeys,
+
+    #[snafu(display(
+        "Invalid value for parameter github_token. A dataset authenticates with either `github_token` or a GitHub App, and both `github_token` and `github_private_key_kms` are set. Remove one of them. See: {DOCS}"
+    ))]
+    TokenAndApp,
+
+    #[snafu(display(
+        "Invalid value for parameter {param}. A GitHub App whose private key is in `github_private_key_kms` also needs `github_client_id` and `github_installation_id`, and `{param}` is not set. See: {DOCS}"
+    ))]
+    MissingAppParam { param: &'static str },
+
+    #[snafu(display("Invalid value for parameter github_private_key_kms. {source} See: {DOCS}"))]
+    InvalidKeyVaultKey { source: KeyVaultError },
+
+    #[snafu(display("Invalid value for parameter github_private_key_kms. {source} See: {DOCS}"))]
+    InvalidKmsKey { source: aws_kms_signer::Error },
+
+    #[snafu(display(
+        "Invalid value for parameter github_private_key_kms. `github_private_key_kms` names the key that holds the GitHub App's private key: an Azure Key Vault key URL, such as https://my-vault.vault.azure.net/keys/github-app, or an AWS KMS key or alias ARN, such as arn:aws:kms:us-east-1:111122223333:alias/github-app. Found '{value}'. See: {DOCS}"
+    ))]
+    UnrecognizedKey { value: String },
+
+    /// The environment lacks the Azure identity the vault needs; retrying cannot fix it.
+    #[snafu(display("{source}"))]
+    IncompleteIdentity { source: KeyVaultError },
+
+    /// The identity provider refused the identity, or could not be reached.
+    #[snafu(display("{source}"))]
+    IdentityUnavailable { source: KeyVaultError },
+}
+
+impl AppKeyError {
+    /// Whether the error is a mistake in the configuration, which retrying cannot fix.
+    pub(crate) fn is_configuration(&self) -> bool {
+        !matches!(self, Self::IdentityUnavailable { .. })
+    }
+}
+
+/// The App `params` describe when `github_private_key_kms` is set. Nothing here reaches a
+/// network.
 ///
 /// A `github_token` or `github_private_key` that a secret store supplies unasked is not counted:
 /// the key service the Spicepod names takes precedence over it.
-pub(crate) fn resolve(params: &AppKeyParams<'_>) -> Result<Option<KeyServiceApp>, String> {
+pub(crate) fn resolve(params: &AppKeyParams<'_>) -> Result<Option<KeyServiceApp>, AppKeyError> {
     let Some(value) = set(params.private_key_kms) else {
         return Ok(None);
     };
-    if params.private_key_set {
-        return Err(invalid(
-            "github_private_key_kms",
-            "A GitHub App's private key is either `github_private_key` or a key service's key in `github_private_key_kms`, and both are set. Remove one of them.",
-        ));
-    }
-    if params.token_set {
-        return Err(invalid(
-            "github_token",
-            "A dataset authenticates with either `github_token` or a GitHub App, and both `github_token` and `github_private_key_kms` are set. Remove one of them.",
-        ));
-    }
-    let client_id = set(params.client_id).ok_or_else(|| {
-        invalid(
-            "github_client_id",
-            "A GitHub App whose private key is in `github_private_key_kms` also needs `github_client_id` and `github_installation_id`, and `github_client_id` is not set.",
-        )
+    ensure!(!params.private_key_set, BothPrivateKeysSnafu);
+    ensure!(!params.token_set, TokenAndAppSnafu);
+    let client_id = set(params.client_id).context(MissingAppParamSnafu {
+        param: "github_client_id",
     })?;
-    let installation_id = set(params.installation_id).ok_or_else(|| {
-        invalid(
-            "github_installation_id",
-            "A GitHub App whose private key is in `github_private_key_kms` also needs `github_client_id` and `github_installation_id`, and `github_installation_id` is not set.",
-        )
+    let installation_id = set(params.installation_id).context(MissingAppParamSnafu {
+        param: "github_installation_id",
     })?;
     let service = if value.starts_with("https://") {
-        KeyService::AzureKeyVault(
-            KeyVaultKey::parse(value)
-                .map_err(|error| invalid("github_private_key_kms", &error.to_string()))?,
-        )
+        KeyService::AzureKeyVault(KeyVaultKey::parse(value).context(InvalidKeyVaultKeySnafu)?)
     } else if value.starts_with("arn:") {
-        KeyService::AwsKms(
-            KmsKey::parse(value)
-                .map_err(|error| invalid("github_private_key_kms", &error.to_string()))?,
-        )
+        KeyService::AwsKms(KmsKey::parse(value).context(InvalidKmsKeySnafu)?)
     } else {
-        return Err(invalid(
-            "github_private_key_kms",
-            &format!(
-                "`github_private_key_kms` names the key that holds the GitHub App's private key: an Azure Key Vault key URL, such as https://my-vault.vault.azure.net/keys/github-app, or an AWS KMS key or alias ARN, such as arn:aws:kms:us-east-1:111122223333:alias/github-app. Found '{value}'."
-            ),
-        ));
+        return UnrecognizedKeySnafu { value }.fail();
     };
     Ok(Some(KeyServiceApp {
         service,
@@ -123,33 +140,24 @@ pub(crate) fn resolve(params: &AppKeyParams<'_>) -> Result<Option<KeyServiceApp>
     }))
 }
 
-/// Why a key service's signer could not be set up.
-#[derive(Debug)]
-pub(crate) enum SignerError {
-    /// The environment lacks the identity the key service needs; retrying cannot fix it.
-    Configuration(String),
-    /// The identity provider refused the identity, or could not be reached.
-    Unavailable(Box<dyn std::error::Error + Send + Sync>),
-}
-
 /// The signer for `service`, and the `info` line to log once `component` has its first token.
 /// For Azure Key Vault, the Microsoft Entra identity's first access token is obtained here; AWS
 /// credentials are resolved by the first signature.
 pub(crate) async fn signer(
     service: KeyService,
     component: &str,
-) -> Result<(Arc<dyn JwtSigner>, String), SignerError> {
+) -> Result<(Arc<dyn JwtSigner>, String), AppKeyError> {
     match service {
         KeyService::AzureKeyVault(key) => {
             let url = key.url().to_string();
             let (signer, identity) =
                 KeyVaultSigner::try_new(component, key, AzureIdentityEnvironment::from_process())
                     .await
-                    .map_err(|error| {
-                        if error.is_configuration() {
-                            SignerError::Configuration(error.to_string())
+                    .map_err(|source| {
+                        if source.is_configuration() {
+                            AppKeyError::IncompleteIdentity { source }
                         } else {
-                            SignerError::Unavailable(Box::new(error))
+                            AppKeyError::IdentityUnavailable { source }
                         }
                     })?;
             Ok((
@@ -186,6 +194,8 @@ mod tests {
 
     #[test]
     fn the_key_service_is_named_by_the_form_of_the_key() {
+        let resolve =
+            |params: &AppKeyParams<'_>| resolve(params).map_err(|error| error.to_string());
         assert_eq!(resolve(&AppKeyParams::default()), Ok(None));
         assert_eq!(
             resolve(&AppKeyParams {
@@ -221,7 +231,11 @@ mod tests {
     #[test]
     fn each_configuration_mistake_names_the_param_to_fix() {
         let kms = "arn:aws:kms:us-east-1:111122223333:alias/github-app";
-        let error = |params: AppKeyParams<'_>| resolve(&params).expect_err("a configuration error");
+        let error = |params: AppKeyParams<'_>| {
+            let error = resolve(&params).expect_err("a configuration error");
+            assert!(error.is_configuration(), "{error}");
+            error.to_string()
+        };
         assert_eq!(
             [
                 error(AppKeyParams {

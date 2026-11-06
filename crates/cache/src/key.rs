@@ -62,6 +62,9 @@ impl SearchKey {
     }
 }
 
+/// Prefix hashed ahead of a [`CacheKey::ClientSupplied`] payload.
+const CLIENT_SUPPLIED_DOMAIN: &[u8] = b"spice.client_supplied.v2\0";
+
 #[derive(Clone, Copy)]
 pub enum CacheKey<'a> {
     LogicalPlan(&'a LogicalPlan),
@@ -70,13 +73,22 @@ pub enum CacheKey<'a> {
     SerializedPlan(&'a str, &'a LogicalPlan),
     Query(&'a str, Option<&'a ParamValues>),
     Search(&'a SearchKey),
-    /// A caller-supplied key (`Spice-Cache-Key` / `client_supplied`). This is an
-    /// explicit opt-in: the caller asserts that equal keys mean equal results.
+    /// A caller-supplied key (`Spice-Cache-Key` / `client_supplied`) scoped to
+    /// the request it was sent with.
+    ///
+    /// The client key is an opt-in *extra* partition, never the whole key: the
+    /// second field is the request's own key (its SQL text and bound parameter
+    /// values, or its search request), and both are hashed. Two requests that
+    /// share a client key but differ in SQL, parameters, or search input
+    /// therefore get distinct entries, so one caller cannot seed an entry that
+    /// another caller's different query is then served. The authorization
+    /// scope is mixed in separately, through the cache namespace and the
+    /// scoped client key.
+    ///
     /// A hit on this key is served before planning, so the volatility /
     /// cacheability checks in `QueryResultsCacheProvider::cache_is_enabled_for_plan`
-    /// do not apply to the lookup; callers must not reuse a key across
-    /// different queries or for queries with volatile functions.
-    ClientSupplied(&'a str),
+    /// do not apply to the lookup.
+    ClientSupplied(&'a str, &'a CacheKey<'a>),
     // Embedding keys could either be the full request (for distinguising between dimension count, encoding format, etc)
     // or just the individual input for less complex requests (e.g. via `.embed()` for some models instead of `.embed_request()`)
     EmbeddingRequest(&'a CreateEmbeddingRequest),
@@ -144,7 +156,13 @@ impl<'a> CacheKey<'a> {
                     }
                 }
             }
-            Self::ClientSupplied(user_key) => user_key.hash(hasher),
+            Self::ClientSupplied(user_key, request_key) => {
+                // Domain-separate the client key from a bare request key so the
+                // pair can never hash like a `Query` or `Search` payload alone.
+                hasher.write(CLIENT_SUPPLIED_DOMAIN);
+                user_key.hash(hasher);
+                request_key.hash_payload(hasher);
+            }
         }
     }
 
@@ -272,6 +290,62 @@ mod tests {
     use std::hash::RandomState;
 
     use super::*;
+
+    fn client_key_in_public_ns(user_key: &str, request_key: &CacheKey<'_>) -> RawCacheKey {
+        let hasher =
+            std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
+        CacheKey::ClientSupplied(user_key, request_key).as_raw_key_in_namespace(
+            hasher.build_hasher(),
+            0,
+            b"",
+        )
+    }
+
+    #[test]
+    fn client_supplied_key_is_scoped_to_sql_and_parameters() {
+        use datafusion::common::ScalarValue;
+
+        let p7 = ParamValues::from(vec![ScalarValue::Int64(Some(7))]);
+        let p8 = ParamValues::from(vec![ScalarValue::Int64(Some(8))]);
+        let sql = "select count(*) from t where id = $1";
+
+        let same_a = client_key_in_public_ns("k", &CacheKey::Query(sql, Some(&p7)));
+        let same_b = client_key_in_public_ns("k", &CacheKey::Query(sql, Some(&p7)));
+        assert!(
+            same_a == same_b,
+            "same key, SQL and params must share an entry"
+        );
+
+        let other_param = client_key_in_public_ns("k", &CacheKey::Query(sql, Some(&p8)));
+        assert!(
+            same_a != other_param,
+            "a different parameter must not share the entry"
+        );
+
+        let other_table =
+            client_key_in_public_ns("k", &CacheKey::Query("select count(*) from u", None));
+        let first_table =
+            client_key_in_public_ns("k", &CacheKey::Query("select count(*) from t", None));
+        assert!(
+            other_table != first_table,
+            "a different table must not share the entry"
+        );
+
+        let other_client_key = client_key_in_public_ns("k2", &CacheKey::Query(sql, Some(&p7)));
+        assert!(
+            same_a != other_client_key,
+            "the client key still partitions entries"
+        );
+
+        let hasher =
+            std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
+        let bare =
+            CacheKey::Query(sql, Some(&p7)).as_raw_key_in_namespace(hasher.build_hasher(), 0, b"");
+        assert!(
+            same_a != bare,
+            "a client-keyed entry is distinct from the bare SQL entry"
+        );
+    }
 
     #[test]
     fn as_raw_key_in_namespace_writes_the_verified_prefix_first() {
