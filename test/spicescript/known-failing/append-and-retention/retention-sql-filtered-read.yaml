@@ -47,3 +47,4 @@ steps:
   # A query filtered on the deleted column must not return it either.
   - query: SELECT id, deleted FROM appended WHERE deleted = true
     expect: { rows: [] }
+    expect-empty: true
