@@ -1286,6 +1286,12 @@ impl IngestStats {
     /// behind (a bake prunes only tombstones at or below its prefix cutoff, so
     /// this residual is the part of the index it could not remove) and when it
     /// committed.
+    /// The live deletion-index size the last committed bake left behind, or
+    /// `None` before the first one. See [`Self::record_bake`].
+    pub fn bake_residual(&self) -> Option<usize> {
+        self.inner.lock().bake_residual
+    }
+
     pub fn record_bake(&self, deletion_index_len: usize, now_ms: i64) {
         let mut inner = self.inner.lock();
         inner.bake_residual = Some(deletion_index_len);
@@ -3815,7 +3821,7 @@ fn clamp_move_usize(cur: usize, target: usize, (lo, hi): (usize, usize)) -> Opti
 /// tables' indexes grew linearly (`order_line` 3.4 M tombstones after 300 s) while
 /// query throughput rose 23 %, so a larger index costs the merge-on-read probe
 /// far less than the bake's prefix rewrites cost the whole process.
-const BAKE_TRIGGER_RESIDUAL_HEADROOM: usize = 4;
+pub(crate) const BAKE_TRIGGER_RESIDUAL_HEADROOM: usize = 4;
 
 /// The futile-bake backoff shared by both ladders: when the seq-prefix bake is
 /// futile at the current trigger, raise the trigger to
