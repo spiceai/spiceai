@@ -43487,12 +43487,25 @@ impl TableProvider for CayenneTableProvider {
         // the scan after it holds `write_lock` — the #13828 pattern for UPDATE.
         // Wrapped so a partitioned sink can `prepare` every partition before
         // writing any (a later partition's PK collision must change none).
+        // Upsert-only: the table keeps the last version of each key and the
+        // statement moves no row to another key (partitioned tables keep the
+        // delete leg: a row can change partition), so the insert
+        // leg supersedes every matched row in the same commit that makes the
+        // replacement visible (no torn "rows missing" window for readers).
+        let metadata = self.metadata();
+        let upsert_only = !metadata.primary_key.is_empty()
+            && matches!(metadata.on_conflict, Some(OnConflict::Upsert(_)))
+            && metadata.partition_column.is_none()
+            && !assigned
+                .iter()
+                .any(|col| metadata.primary_key.iter().any(|pk| pk == col));
         let exec = Arc::new(super::update_exec::CayenneUpdateExec::new(
             plan,
             self.clone_for_write(),
             session_state,
             filters,
             check.map(|check| Arc::new(check) as Arc<dyn data_components::update::UpdateValidator>),
+            upsert_only,
         ));
         Ok(Arc::new(
             data_components::update::PreparableUpdateExec::wrap(exec),
@@ -83159,4 +83172,5 @@ mod tests {
 
     mod layered_upsert_state;
     mod repeated_keys;
+    mod update_visibility;
 }
