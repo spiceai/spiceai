@@ -4625,7 +4625,6 @@ mod test {
             Some(QueryOverrides::SQLite),
             Some(QueryOverrides::PostgreSQL),
             Some(QueryOverrides::MySQL),
-            Some(QueryOverrides::Dremio),
             Some(QueryOverrides::Spark),
             Some(QueryOverrides::ODBCAthena),
             Some(QueryOverrides::ODBCDatabricks),

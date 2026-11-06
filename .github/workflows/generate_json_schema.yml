@@ -26,6 +26,7 @@ env:
 
 jobs:
   generate_schema:
+    environment: secret-free
     runs-on: self-hosted
     # Bound the blast radius: without this, a hung step runs until GitHub's
     # default 6h job timeout. The Create PR step previously hung for ~5.5h on an

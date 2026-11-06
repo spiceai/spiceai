@@ -77,6 +77,7 @@ on:
 
 jobs:
   setup:
+    environment: secret-free
     # Run on:
     #   - workflow_dispatch (manual runs)
     #   - workflow_call from build_and_release, for release-candidate tags
@@ -208,6 +209,24 @@ jobs:
               ;;
           esac
 
+          # A release can be marked 'latest' before build_and_release has
+          # attached its binaries, and Dockerfile-release would 404 on them.
+          # build_and_release builds the images itself once its `publish` jobs
+          # attach them, so skip the images until both Linux binaries are
+          # there. Both, not just the missing one: the publish job would
+          # otherwise push the version and 'latest' tags for one architecture.
+          # A failed lookup still fails the run.
+          if [ "$event_name" = "release" ]; then
+            assets=$(gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" --json assets -q '.assets[].name')
+            for arch in x86_64 aarch64; do
+              if ! grep -qxF "spiced_linux_${arch}.tar.gz" <<<"$assets"; then
+                echo "::notice::${release_tag} has no spiced_linux_${arch}.tar.gz yet, so no images are built here; build_and_release builds them once it attaches the binaries."
+                run_amd64=false
+                run_arm64=false
+              fi
+            done
+          fi
+
           # Determine if this release should be tagged as 'latest'.
           #
           # Rule: ONLY apply the ':latest' Docker tag when the GitHub release
@@ -263,34 +282,35 @@ jobs:
 
   build-amd64:
     needs: setup
-    runs-on: spiceai-dev-runners
+    if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
+    # Packages a released binary (no compile), so a GitHub-hosted runner suffices.
+    runs-on: ubuntu-24.04
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - name: Skip AMD64 build
-        if: ${{ needs.setup.outputs.run_amd64 != 'true' }}
-        run: echo "Skipping AMD64 image build per workflow configuration."
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before building so base image pulls (debian, etc.)
         # use authenticated rate limits instead of anonymous (per-IP) limits.
-        if: ${{ needs.setup.outputs.run_amd64 == 'true' && github.repository == 'spiceai/spiceai' }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: ${{ github.repository == 'spiceai/spiceai' }}
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: default
         run: |
           echo "IMAGE_TAG=default" >> $GITHUB_ENV
           echo "BINARY_VARIANT=default" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
       - &build-amd64-image
         name: Package AMD64 ${{ env.IMAGE_TAG }} image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -299,21 +319,20 @@ jobs:
           file: Dockerfile-release
           platforms: linux/amd64
           outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
-          cache-from: type=gha,scope=build-amd64
-          cache-to: type=gha,scope=build-amd64,mode=max
+          # Publish runs skip the shared cache: any run on trunk can write it, and a release reuses no layer from it.
+          cache-from: ${{ needs.setup.outputs.publish != 'true' && 'type=gha,scope=build-amd64' || '' }}
+          cache-to: ${{ needs.setup.outputs.publish != 'true' && 'type=gha,scope=build-amd64,mode=max' || '' }}
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             BINARY_VARIANT=${{ env.BINARY_VARIANT }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             APT_CACHE_BUST=${{ github.run_id }}-${{ github.run_attempt }}
             GITHUB_REPOSITORY=${{ github.repository }}
-        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: Validate AMD64 image
         run: |
           docker load -i /tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
           docker run --rm localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64 --version
-        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: Upload AMD64 artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -324,6 +343,10 @@ jobs:
   build-arm64:
     needs: setup
     runs-on: hosted-linux-arm-runner
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Skip ARM64 build
         if: ${{ needs.setup.outputs.run_arm64 != 'true' }}
@@ -362,10 +385,12 @@ jobs:
         # Authenticate to Docker Hub before building so base image pulls (debian, etc.)
         # use authenticated rate limits instead of anonymous (per-IP) limits.
         if: ${{ needs.setup.outputs.run_arm64 == 'true' && github.repository == 'spiceai/spiceai' }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: default
         run: |
@@ -406,36 +431,37 @@ jobs:
 
   build-cuda:
     needs: setup
-    runs-on: 'spiceai-dev-runners'
+    if: ${{ needs.setup.outputs.run_cuda == 'true' }}
+    # Packages a released binary (no compile), so a GitHub-hosted runner suffices.
+    runs-on: ubuntu-24.04
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
     env:
       CUDA_COMPUTE_CAP: 80
     steps:
-      - name: Skip CUDA build
-        if: ${{ needs.setup.outputs.run_cuda != 'true' }}
-        run: echo "Skipping CUDA image build per workflow configuration."
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Login to Docker Hub
         # Authenticate to Docker Hub before building so base image pulls (nvidia/cuda, etc.)
         # use authenticated rate limits instead of anonymous (per-IP) limits.
-        if: ${{ needs.setup.outputs.run_cuda == 'true' && github.repository == 'spiceai/spiceai' }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: ${{ github.repository == 'spiceai/spiceai' }}
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Configure CUDA build
         run: |
           echo "IMAGE_TAG=cuda" >> $GITHUB_ENV
           echo "BINARY_VARIANT=cuda" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release,models,cuda" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Package CUDA image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -444,33 +470,37 @@ jobs:
           file: Dockerfile-cuda-release
           platforms: linux/amd64
           outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/images-amd64-cuda.tar
-          cache-from: type=gha,scope=build-cuda
-          cache-to: type=gha,scope=build-cuda,mode=max
+          # Publish runs skip the shared cache: any run on trunk can write it, and a release reuses no layer from it.
+          cache-from: ${{ needs.setup.outputs.publish != 'true' && 'type=gha,scope=build-cuda' || '' }}
+          cache-to: ${{ needs.setup.outputs.publish != 'true' && 'type=gha,scope=build-cuda,mode=max' || '' }}
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             CUDA_COMPUTE_CAP=${{ env.CUDA_COMPUTE_CAP }}
             GITHUB_REPOSITORY=${{ github.repository }}
             APT_CACHE_BUST=${{ github.run_id }}-${{ github.run_attempt }}
-        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Validate CUDA image
         run: |
           docker load -i /tmp/images-amd64-cuda.tar
           docker run --rm localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64 --version
-        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Upload CUDA artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: images-amd64-cuda
           path: /tmp/images-amd64-cuda.tar
-        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
   publish:
-    if: ${{ needs.setup.outputs.run_amd64 == 'true' || needs.setup.outputs.run_arm64 == 'true' }}
+    # build-amd64 is skipped when `target` leaves it out; run past that skip, never past a failure.
+    if: ${{ !cancelled() && !failure() && (needs.setup.outputs.run_amd64 == 'true' || needs.setup.outputs.run_arm64 == 'true') }}
     needs: [setup, build-amd64, build-arm64]
     runs-on: ubuntu-24.04
+    environment: github-publish
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     env:
       REL_VERSION: ${{ needs.setup.outputs.rel_version }}
       PUBLISH: ${{ needs.setup.outputs.publish }}
@@ -504,10 +534,12 @@ jobs:
         # rate limits instead of anonymous (per-IP) limits when pulling
         # registry:2 below.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '3600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Start local registry
         run: |
@@ -515,7 +547,7 @@ jobs:
 
       - name: Login to GitHub Package Registry
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -523,10 +555,12 @@ jobs:
 
       - name: Login to DockerHub
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '3600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Import images and create manifests
         run: |
@@ -597,6 +631,11 @@ jobs:
     needs: [setup, build-cuda]
     if: ${{ needs.setup.outputs.run_cuda == 'true' }}
     runs-on: ubuntu-24.04
+    environment: github-publish
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     env:
       REL_VERSION: ${{ needs.setup.outputs.rel_version }}
       PUBLISH: ${{ needs.setup.outputs.publish }}
@@ -620,10 +659,12 @@ jobs:
         # rate limits instead of anonymous (per-IP) limits when pulling
         # registry:2 below.
         if: github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '3600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Start local registry
         run: |
@@ -631,7 +672,7 @@ jobs:
 
       - name: Login to GitHub Package Registry
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -639,10 +680,12 @@ jobs:
 
       - name: Login to DockerHub
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '3600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       - name: Import images and create manifests
         run: |

@@ -107,7 +107,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | Fork | Pinned revision | Branch |
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `6e4119ac2007c6647702a1817505d6849b07e0e0` | `spiceai-24` |
-| [arrow-rs](#arrow-rs) | `36fc2c9a9f34e530385c2028adde690c24ab5ef3` | `spiceai-59` |
+| [arrow-rs](#arrow-rs) | `510ef234e1444f2c4aaf748d0c905787738afa7a` | `spiceai-59.3.2` |
 | [async-openai](#async-openai) | `307eaf407cbf71afa967f3008250ba96c79626b7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `5a67f5ecd62321b019c0daffd6613cfb9f71505e` | `spiceai-release-2.4` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `cf084aa85dfdc27b4736208f5c132828020774ea` | `spiceai-55` |
+| [datafusion](#datafusion) | `2b8d3eecf94daba632586e8142f693f0a74f77df` | `spiceai-55-release-2.4` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `f0af9b628dc48f0227ce6daf3d323b2ead3cc8a5` | `spiceai-55-release-2.4` |
@@ -199,8 +199,9 @@ row here. Its behaviour is covered where the code lives, by
 ## datafusion
 
 Upstream [apache/datafusion](https://github.com/apache/datafusion), branch
-`spiceai-55` (upstream `55.2.0-rc1` merged into the previous line in
-spiceai/datafusion#248) and spiceai/datafusion#249, which carries three
+`spiceai-55-release-2.4`, cut from `spiceai-55` at #260's merge commit (`cf084aa`, the
+revision v2.4.0 and v2.4.1 ship). That base carries upstream `55.2.0-rc1` (merged into the
+previous line in spiceai/datafusion#248) and spiceai/datafusion#249, which carries three
 `spiceai-54` patches onto 55. On top of #249 come #240, the metadata-column listing
 pruning that #229 carried on `spiceai-54`, #251, which gives a file that holds no
 rows no partition-column bounds, #252, #256, which reads a Substrait string or
@@ -211,7 +212,9 @@ fractional-second precision, and #257, which writes a join key that matches NULL
 as `IS NOT DISTINCT FROM`, #258, the `IoWaitHook` patch
 ([#15049](https://github.com/spiceai/spiceai/issues/15049)), #259, which keeps placeholder type
 inference linear in the depth of an expression, and #260, which carries an eliminated sort's
-fetch through a single-input repartition; the pin is #260's merge commit. None changes a
+fetch through a single-input repartition. On top of #260's merge commit, `spiceai-55-release-2.4` carries
+#287 (merged to `spiceai-55` separately), which stores a compacted copy of each nested `COUNT(DISTINCT …)` value, and
+#275 (cherry-picked in #289), which limits the nesting depth of a SQL data type. None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
 code, and removes no line of it. The branch also carries
@@ -320,11 +323,13 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Unparser: a join whose keys match NULLs (`NullEquality::NullEqualsNull`) writes them as `IS NOT DISTINCT FROM` (`<=>` for MySQL), in an `EXISTS` correlation and in `ON`, and never as `USING`. `INTERSECT` and `EXCEPT` are always planned as such a semi or anti join, and the optimizer makes one from a join or `EXISTS` compared only with `IS NOT DISTINCT FROM` (spiceai/datafusion#257) | The keys are written as `=`, which is never true on NULL, so the remote engine drops every row with a NULL in a compared column from an `INTERSECT` and keeps it in an `EXCEPT`: on `DuckDB` file acceleration, TPC-DS q38 returns 0 rows instead of 111 and q87 46,704 instead of 46,449 ([#14941](https://github.com/spiceai/spiceai/issues/14941)) | silent (wrong data) | `crates/data_components/src/federation.rs::tests::intersect_and_except_unparse_keys_that_match_nulls`; real-engine guard `crates/runtime/tests/duckdb/mod.rs::duckdb_file_acceleration_set_operations_match_nulls` (`runtime::integration`, run by `integration.yml`) |
 | `IoWaitExt::io_wait` and the process-wide `IoWaitHook` in `common-runtime`, with `SpawnedTask` and `JoinSet` passing spawned work through the hook's `carry_future`/`carry_local_future`/`carry_block` (spiceai/datafusion#258, [#15049](https://github.com/spiceai/spiceai/issues/15049)) | Without the API, the HTTP connector's `io_wait()` calls and `RuntimeBuilder::build`'s `set_io_wait_hook` stop compiling. Without the carry, a wait inside a task DataFusion spawns (`RepartitionExec`, `CoalescePartitionsExec`) never reaches the hook, so a distributed task waiting there on a slow HTTP source holds its executor slot again | build; silent (throughput) for the carry | compile-guarded by `crates/data_components/src/http/provider.rs` and `crates/runtime/src/builder.rs`. The carry is **GAP**: with it disabled, `crates/runtime/tests/cluster/io_wait_lending.rs` still passes for a query whose single-node plan puts `RepartitionExec` over `HttpExec`, so no cluster query here polls a wait under a DataFusion spawn yet; the fork's `common-runtime` tests cover it |
 | `PushdownSort` passes the fetch of a sort it eliminates under a `SortPreservingMergeExec` that keeps that many rows, as a bound on the total output, through nodes that keep every row in order and through a `RepartitionExec` whose input is a single partition, to the node that takes it (fork PR #260, `physical-optimizer/src/pushdown_sort.rs`) | The fetch of an `ORDER BY … LIMIT` stopped above the round-robin repartition the planner puts above a single-partition scan, as a per-partition `LocalLimitExec`. A federated scan below a Spice-only function then received the `ORDER BY` without the `LIMIT`, and the remote sorted and returned every row | silent (perf) | `crates/data_components/src/federation.rs::tests::scan_pushdown::a_limit_above_a_refused_projection_reaches_the_source`, whose `ORDER BY … LIMIT` and `OFFSET` cases fail without it. In the fork, `core/tests/physical_optimizer/pushdown_sort.rs::test_sort_fetch_reaches_source_through_single_input_repartition` and `::test_sort_fetch_stays_above_a_multi_input_repartition`, and `limit_pushdown.rs::nested_limits_separated_by_a_repartition_keep_the_tighter_limit` and `::a_local_limit_over_a_round_robin_repartition_limits_each_partition` |
+| `COUNT(DISTINCT …)` over a list, struct, map or other nested value stores a compacted copy of each value it first inserts, in `DistinctCountAccumulator` and `SlidingDistinctCountAccumulator`, so a stored value no longer shares the buffers of the batch it was read from; `ScalarValue::compact` rebuilds a zero-width `FixedSizeList` with its row count, so compacting one keeps its row (`functions-aggregate/src/count.rs`, `common/src/scalar/mod.rs`; spiceai/datafusion#287) | With two or more `COUNT(DISTINCT …)` in a query (no single-distinct rewrite), every distinct nested value is a one-row slice that keeps its whole batch alive and is charged for it, so the reservation grows with rows × batch size: two `COUNT(DISTINCT)` over 50,000 three-element lists asked for 56.8 GB and failed with `ResourcesExhausted`, federated and accelerated alike, grouped or not | silent (query failure / memory) | `crates/runtime-datafusion/src/fork_backport_guards.rs::several_count_distinct_over_nested_values_charge_each_value_once` (lists, structs and a grouped variant under a 256 MiB pool with spilling disabled); in the fork, `count::tests::*_size_charges_each_value_once`, `count::tests::*zero_width_fixed_size_list*`, `scalar::tests::test_compact_zero_width_fixed_size_list_keeps_its_row` and `sqllogictest/test_files/count_distinct_nested_memory.slt` |
+| The SQL planner refuses a data type nested more than 64 array or struct levels deep (`check_data_type_nesting_depth` in `sql/src/planner.rs`; spiceai/datafusion#275) | A short statement such as `CAST(NULL AS INT[][]…[])` recurses once per level while planning, so a deep enough type exhausts the stack and aborts the process | silent (crash) | `crates/runtime-datafusion/src/fork_backport_guards.rs::a_cast_to_a_type_nested_past_the_limit_is_refused` |
 
 ## arrow-rs
 
 Upstream [apache/arrow-rs](https://github.com/apache/arrow-rs), branch
-`spiceai-59-patches` (upstream `59.3.0` merged into the previous line). Every row
+`spiceai-59.3.2` (upstream `59.3.2` merged into the previous `spiceai-59` line by [spiceai/arrow-rs#36](https://github.com/spiceai/arrow-rs/pull/36)). Every row
 below was re-confirmed present at the pinned revision. Upstream deprecates
 `ParquetObjectReader` in 59 (apache/arrow-rs#10354); the Spice patches to it
 merged cleanly and are kept. The pin lives in the object-store Parquet reader
@@ -353,6 +358,7 @@ path (`parquet/src/util/push_buffers.rs` and its callers), in the page decoder
 | Thrift list lengths in Parquet metadata are bounded by the bytes left in the input: `list_capacity` refuses a declared count the remaining bytes cannot encode, and caps the reservation where the input length is unknown ([spiceai/arrow-rs#32](https://github.com/spiceai/arrow-rs/pull/32)) | Every footer list (`schema`, `row_groups`, `key_value_metadata`, `column_orders`) and the offset index's `page_locations` decodes into a `Vec` sized from the element count in its Thrift list header. A file of a few bytes can declare `i32::MAX` elements, so the reader reserves room for all of them before reading one — during schema inference at dataset initialization, and again on every refresh of that dataset | not silent (memory exhaustion takes the runtime down) | `crates/data-connector-api/src/listing/connector.rs::an_oversized_footer_list_length_is_a_parquet_error_and_not_an_allocation` |
 | `schema_from_array_helper` refuses a footer schema nested more than 100 levels below its root ([spiceai/arrow-rs#33](https://github.com/spiceai/arrow-rs/pull/33)) | The footer's flat schema element list is rebuilt into a tree by recursing once per nesting level, with no bound. A Parquet file of a few KiB that declares a few hundred nested levels overflows the stack during schema inference at dataset initialization, and again on every refresh of that dataset | not silent (stack overflow aborts the runtime) | `crates/data-connector-api/src/listing/connector.rs::a_footer_schema_nested_past_the_depth_limit_is_a_parquet_error` |
 | The type-string parser (`DataType::from_str`) refuses a type nested more than 64 levels deep ([spiceai/arrow-rs#34](https://github.com/spiceai/arrow-rs/pull/34)) | The parser recurses once per nesting level with no bound. `arrow_cast` and `arrow_try_cast` parse their type argument at planning time, and the SQL text check bounds only a type string written as a literal in the query. A type string that reaches the parser any other way, such as a dataset's declared column type, is parsed unbounded, and a deep one overflows the stack | not silent (stack overflow aborts the runtime) | `crates/runtime-query-engine/src/sql_depth_guard.rs::tests::arrow_type_string_past_the_parser_depth_limit_is_a_parse_error` |
+| `check_run_ends` validates against the REE parent's `offset+len` (upstreamed in apache/arrow-rs#11668 / #11740, present in `59.3.2`; was [spiceai/arrow-rs#35](https://github.com/spiceai/arrow-rs/pull/35); RUSTSEC-2026-0442). Carried by the 59.3.2 merge in [spiceai/arrow-rs#36](https://github.com/spiceai/arrow-rs/pull/36) | A RunEndEncoded array whose last run_end is below `offset+len` was accepted; consumers then read past the values child (OOB) | not silent (OOB read) | `crates/arrow_tools/src/schema.rs::tests::run_end_encoded_past_last_run_is_rejected` |
 
 ## datafusion-ballista
 

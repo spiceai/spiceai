@@ -35,6 +35,7 @@ concurrency:
 
 jobs:
   test-signoff-resolve-target:
+    environment: secret-free
     name: Unit tests for the sign-off target resolution
     # GitHub-hosted on purpose: this is a sub-second check and must not queue
     # behind the saturated self-hosted pool this fix exists to stop wasting.

@@ -48,6 +48,7 @@ env:
 
 jobs:
   setup-matrix:
+    environment: secret-free
     name: Setup strategy matrix
     runs-on: spiceai-dev-runners
     # Evaluates one inline script.
@@ -106,13 +107,14 @@ jobs:
     # 2026-09-29..10-13). The `test` legs follow it there through
     # `setup-matrix`. The standard pool on every other event.
     runs-on: ${{ github.event_name == 'merge_group' && 'spiceai-macos-large' || 'spiceai-macos' }}
+    environment: ci-build
     # Slowest observed success in the 2026-07-25..08-08 window: 17 min, but
     # every sample had a warm sccache. Sized against the other macOS workspace
     # builds (pr.yml peaks at 117 min) so a cold cache cannot turn a passing
     # build into a red one.
     timeout-minutes: 300
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
       TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -138,7 +140,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: build
           region: us-west-1
@@ -158,8 +160,8 @@ jobs:
           test_binary_url="${SPICEIO_ENDPOINT%/}/build/${TEST_BINARY_OBJECT_KEY}"
           curl --fail --silent --show-error --upload-file ./llms_integration_test "$test_binary_url"
 
+      # The `test` legs run in `ci`, which has no NAS password, so they read this copy.
       - name: Upload test binary
-        if: env.HAS_SPICEIO_SECRET != 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: llms-integration-test-binary
@@ -177,7 +179,7 @@ jobs:
     # Slowest observed success in the 2026-07-25..08-08 window: 4 min.
     timeout-minutes: 90
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
       TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
     strategy:
       # The two arms cover disjoint model sets — self-hosted local models and the hosted
@@ -186,7 +188,14 @@ jobs:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
-    permissions: read-all
+    # Holds the OpenAI and Anthropic workload identity federation IDs (`OPENAI_*` and
+    # `ANTHROPIC_*` secrets).
+    environment: ci
+    permissions:
+      contents: read
+      actions: read
+      # OpenAI and Anthropic access tokens are minted from this job's GitHub OIDC token.
+      id-token: write
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -199,7 +208,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: build
           region: us-west-1
@@ -230,11 +239,27 @@ jobs:
       - name: Mark test binary as executable
         run: chmod +x ./integration_test/llms_integration_test
 
+      - name: Mint an Anthropic access token
+        if: matrix.target.needs_env == true
+        uses: ./.github/actions/anthropic-token
+        with:
+          federation-rule-id: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
+          organization-id: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
+          service-account-id: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          workspace-id: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+
+      # An OpenAI token lives about 300 s and is not refreshed, so mint it last.
+      - name: Mint an OpenAI access token
+        if: matrix.target.needs_env == true
+        uses: ./.github/actions/openai-token
+        with:
+          identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+          service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+          audience: ${{ secrets.OPENAI_WIF_AUDIENCE }}
+
       - name: Run integration test
         env:
           MODEL_ALLOWLIST: ${{ matrix.target.model_allowlist }}
-          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-          SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
           # The spiceio setup action exports AWS_ENDPOINT_URL for sccache; the AWS SDK
@@ -242,12 +267,12 @@ jobs:
           # calls to the local build cache instead of AWS.
           unset AWS_ENDPOINT_URL
           if [ "${{ matrix.target.needs_env }}" == "true" ]; then
-            if [ -z "$SPICE_OPENAI_API_KEY" ]; then
+            if [ -z "${SPICE_OPENAI_API_KEY:-}" ]; then
               echo "Error: 'SPICE_OPENAI_API_KEY' is not defined."
               exit 1
             fi
-            if [ -z "$SPICE_ANTHROPIC_API_KEY" ]; then
-              echo "Error: 'SPICE_ANTHROPIC_API_KEY' is not defined."
+            if [ -z "${SPICE_ANTHROPIC_AUTH_TOKEN:-}" ]; then
+              echo "Error: 'SPICE_ANTHROPIC_AUTH_TOKEN' is not defined."
               exit 1
             fi
             if [ -z "$SPICE_XAI_API_KEY" ]; then

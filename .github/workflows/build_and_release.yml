@@ -74,8 +74,19 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
+# A tag build publishes the release named by the tag. If the tag moves while a
+# build is running, the newer run cancels the older one, so the release and its
+# images come from one build. Every other run gets a group of its own, so trunk
+# and release-branch pushes still build every commit. Concurrency groups are
+# shared by every workflow in the repository, so this name differs from
+# build_and_release_cuda's.
+concurrency:
+  group: ${{ github.ref_type == 'tag' && format('build-release-{0}', github.ref) || format('{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.ref_type == 'tag' }}
+
 jobs:
   setup-matrix:
+    environment: secret-free
     name: Setup strategy matrix
     runs-on: ubuntu-24.04
     outputs:
@@ -180,8 +191,12 @@ jobs:
             return matrix;
 
   build:
+    environment: ci
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.runner }}
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     needs: setup-matrix
     # Trunk macOS builds run one at a time on `spiceai-macos-large`: a newer push replaces the
     # build still waiting, never the one running, so a burst of merges builds its first and
@@ -356,13 +371,23 @@ jobs:
           name: spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
+      - name: Get RustFS credentials
+        id: rustfs
+        if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64'
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '21600'
+          export-env: 'false'
+
       - name: Upload spiced to Minio
         if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default')
         uses: ./.github/actions/upload-to-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
           source_path: spiced_linux_x86_64.tar.gz
           destination_path: spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/
 
@@ -394,9 +419,10 @@ jobs:
         if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'odbc')
         uses: ./.github/actions/upload-to-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
           source_path: spiced_odbc_linux_x86_64.tar.gz
           destination_path: spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/
 
@@ -475,13 +501,15 @@ jobs:
         if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default')
         uses: ./.github/actions/upload-to-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
           source_path: spice_linux_x86_64.tar.gz
           destination_path: spice-minio/artifacts/spice/linux-x86_64/${{ github.sha }}/
 
   publish:
+    environment: github-publish
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
     needs: build
     if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
@@ -542,11 +570,12 @@ jobs:
         run: ls -l ${{ env.ARTIFACT_DIR }}
 
       - name: publish ${{ matrix.target_os }}/${{ matrix.target_arch }} binaries to github
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Parse repository to get owner and repo names
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
-          export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
           # Get the list of files
           RELEASE_ARTIFACT=(${ARTIFACT_DIR}/*)
           # Delete existing release artifact
@@ -571,16 +600,26 @@ jobs:
             --prerelease "$PRE_RELEASE" \
             ${RELEASE_ARTIFACT[*]}
 
-  # A release candidate's images are built from the binaries the `publish` jobs
-  # above attach to its GitHub release, so they can only be built after those
-  # jobs finish. The `release: published` event fires when the tag is created,
-  # hours too early, which is why spiced_docker no longer listens for it.
-  # Stable releases keep their manual step: marking the release 'latest' fires
-  # spiced_docker's `release: edited` trigger.
-  docker-release-candidate:
-    name: Docker images for the release candidate
+  # A release's images are built from the binaries the `publish` jobs above
+  # attach to its GitHub release, so they can only be built after those jobs
+  # finish. The `release: published` event fires when the tag is created, hours
+  # too early, which is why spiced_docker no longer listens for it.
+  #
+  # Stable releases are built here too. Marking a release 'latest' still fires
+  # spiced_docker's `release: edited` trigger, but that alone misses two cases:
+  # a release marked 'latest' before its binaries exist (that run 404s), and a
+  # release created already 'latest', which fires no `edited` event at all.
+  # The called run applies ':latest' only when GitHub already marks the release
+  # latest (`tag_latest` defaults to auto), so a release that is not the latest
+  # one never takes the tag from here.
+  docker-release:
+    name: Docker images for the release
     needs: publish
-    if: startsWith(github.ref, 'refs/tags/v') && contains(github.ref_name, '-rc.')
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
     uses: ./.github/workflows/spiced_docker.yml
     with:
       release_tag: ${{ github.ref_name }}

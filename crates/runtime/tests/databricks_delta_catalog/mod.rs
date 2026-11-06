@@ -16,7 +16,10 @@ limitations under the License.
 
 use crate::{
     ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::{register_test_connectors, runtime_ready_check, test_request_context},
+    utils::{
+        aws_session_token_param, register_test_connectors, runtime_ready_check,
+        test_request_context,
+    },
 };
 use app::AppBuilder;
 use futures::TryStreamExt;
@@ -240,10 +243,15 @@ fn get_params() -> Params {
                 "databricks_aws_access_key_id".to_string(),
                 "${ env:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }".to_string(),
             ),
+            ("databricks_aws_region".to_string(), "us-west-2".to_string()),
             ("client_timeout".to_string(), "120s".to_string()),
             ("mode".to_string(), "delta_lake".to_string()),
         ]
         .into_iter()
+        .chain(aws_session_token_param(
+            "databricks_aws_session_token",
+            "AWS_DATABRICKS_DELTA_SESSION_TOKEN",
+        ))
         .collect(),
     )
 }

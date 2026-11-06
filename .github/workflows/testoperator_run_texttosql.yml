@@ -67,6 +67,13 @@ jobs:
     name: Run Text-to-SQL tests
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
+    # Holds the Anthropic workload identity federation IDs (`ANTHROPIC_*` secrets).
+    environment: ci
+    permissions:
+      contents: read
+      actions: read
+      # Anthropic access tokens are minted from this job's GitHub OIDC token.
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -80,19 +87,29 @@ jobs:
           fi
           echo "Spicepod file found at ${{ github.event.inputs.spicepod_path }}"
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '36000'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Build spicepod validator
         uses: ./.github/actions/build-spicepod-validator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate spicepod
         run: |
@@ -110,9 +127,10 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Validate queryset inputs
         run: |
@@ -143,6 +161,31 @@ jobs:
           data_directory: /opt/spiced/data/
           queryset_name: ${{ github.event.inputs.benchmark_queryset }}
           use_evidence: ${{ github.event.inputs.use_evidence }}
+
+      # Only a Spicepod whose models authenticate to Anthropic needs a token: any other benchmark
+      # must not depend on Anthropic credentials or availability.
+      - name: Check whether the Spicepod authenticates to Anthropic
+        id: anthropic
+        env:
+          SPICEPOD_PATH: ${{ github.event.inputs.spicepod_path }}
+        run: |
+          if grep -Eq 'secrets: *SPICE_ANTHROPIC_AUTH_TOKEN' "$SPICEPOD_PATH"; then
+            echo "needs_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_token=false" >> "$GITHUB_OUTPUT"
+            echo "${SPICEPOD_PATH} does not use SPICE_ANTHROPIC_AUTH_TOKEN, so no Anthropic access token is minted."
+          fi
+
+      # spiced holds this one token for the whole run and does not refresh it, so a run longer than
+      # the federation rule's token lifetime (`expires_in` in this step's log) loses Anthropic.
+      - name: Mint an Anthropic access token
+        if: steps.anthropic.outputs.needs_token == 'true'
+        uses: ./.github/actions/anthropic-token
+        with:
+          federation-rule-id: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
+          organization-id: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
+          service-account-id: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          workspace-id: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
 
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         run: |
@@ -194,12 +237,10 @@ jobs:
         env:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          MINIO_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          MINIO_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          MINIO_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          MINIO_KEY: ${{ steps.rustfs.outputs.access-key-id }}
+          MINIO_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
+          MINIO_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-          SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
-          SPICE_BEDROCK_ACCESS_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
-          SPICE_BEDROCK_SECRET_KEY: ${{ secrets.AWS_BEDROCK_SECRET }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}

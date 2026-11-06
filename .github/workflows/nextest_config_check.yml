@@ -47,6 +47,7 @@ concurrency:
 
 jobs:
   check-nextest-config:
+    environment: secret-free
     name: Validate nextest timeout ceilings
     # GitHub-hosted on purpose: this is a sub-second check and must not queue
     # behind the saturated self-hosted pool.
