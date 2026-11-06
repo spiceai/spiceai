@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `2b8d3eecf94daba632586e8142f693f0a74f77df` | `spiceai-55-release-2.4` |
+| [datafusion](#datafusion) | `5c51d64a7728f052c121709d58ca56b25f9ba8b6` | `lukim/get-field-map-in-struct-pushdown-2.4` (TEMPORARY: spiceai/datafusion#288) |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `f0af9b628dc48f0227ce6daf3d323b2ead3cc8a5` | `spiceai-55-release-2.4` |
