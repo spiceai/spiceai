@@ -1401,12 +1401,12 @@ mod tests {
         );
     }
 
-    /// Cancellation mid-flight is safe by construction: `load_from` never
-    /// mutates `self.stores` until the replacement map is fully built, so
-    /// dropping the future before it returns `Ok` leaves built-ins intact.
-    /// A unit test that actually polls into a `Pending` provider init would
-    /// need a hangable store hook; the invalid-provider Err path above
-    /// exercises the same "exit before publish" contract.
+    // Cancellation mid-flight is safe by construction: `load_from` never
+    // mutates `self.stores` until the replacement map is fully built, so
+    // dropping the future before it returns `Ok` leaves built-ins intact.
+    // A unit test that actually polls into a `Pending` provider init would
+    // need a hangable store hook; the invalid-provider Err path above
+    // exercises the same "exit before publish" contract.
 
     /// The registry swap on the executor bind path must not wait behind an
     /// in-flight expansion. Holding the read guard over the (network-bound)
