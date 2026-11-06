@@ -425,7 +425,9 @@ async fn run_snapshot_workload(
             .create_snapshot(
                 federated_schema,
                 lock_guard,
-                Some(last_updated_at.load(Ordering::Relaxed)),
+                runtime_acceleration::snapshot::LocalData::synced(Some(
+                    last_updated_at.load(Ordering::Relaxed),
+                )),
                 row_count,
                 ForceCreate(false),
             )
