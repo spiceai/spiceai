@@ -46,6 +46,7 @@ use std::time::{Duration, Instant};
 
 use app::AppBuilder;
 use axum::{Router, routing::get};
+#[cfg(feature = "duckdb")]
 use datafusion::common::TableReference;
 use datafusion::prelude::*;
 use runtime::Runtime;
@@ -292,6 +293,7 @@ async fn wait_for_rows_driving_lookups(
 /// This is the completion signal for a refused write. Waiting a fixed time
 /// instead would let an assertion that nothing was cached pass simply because no
 /// write had been attempted yet.
+#[cfg(feature = "duckdb")]
 async fn wait_for_dataset_error(
     rt: &Runtime,
     dataset: &str,

@@ -45,7 +45,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use data_components::arrow::write::MemTable;
-use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
 use futures::future::join_all;
@@ -757,6 +756,7 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
         #[cfg(feature = "sqlite")]
         EngineType::Sqlite => {
             use accelerator_sqlite::SqliteAccelerator;
+            use datafusion::common::TableReference;
 
             let mut options = HashMap::new();
             options.insert("file".to_string(), db_file.display().to_string());

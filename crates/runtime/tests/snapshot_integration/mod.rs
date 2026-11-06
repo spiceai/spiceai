@@ -288,55 +288,111 @@ impl SnapshotFixture {
         Ok(runtime)
     }
 
-    /// A `SnapshotManager` for `taxi_trips` that snapshots the `DuckDB` file at
+    /// A `SnapshotManager` for `taxi_trips` that snapshots the acceleration at
     /// `local_db_path` into this fixture's location.
+    ///
+    /// For Cayenne the layout and the snapshot engine come from the runtime's Cayenne
+    /// accelerator for a dataset at `local_db_path`, as they do for a dataset the
+    /// runtime loads, so a snapshot published here has the dataset-level data root
+    /// and the metastore slice that a Cayenne bootstrap restores.
     async fn snapshot_manager(
         &self,
-        runtime: &Runtime,
+        runtime: &Arc<Runtime>,
         local_db_path: PathBuf,
         compaction: SnapshotsCompaction,
         policy: SnapshotsCreationPolicy,
     ) -> Result<SnapshotManager> {
-        let runtime_snapshots = runtime
-            .app()
-            .read()
+        match self.engine {
+            "cayenne" => {
+                self.cayenne_snapshot_manager(runtime, &local_db_path, compaction, policy)
+                    .await
+            }
+            #[cfg(feature = "duckdb")]
+            "duckdb" => Ok(SnapshotManager::try_new(
+                TAXI_TRIPS_DATASET_NAME.to_string(),
+                snapshot_behavior(runtime, compaction).await?,
+                runtime_acceleration::snapshot::AccelerationLayout::file(local_db_path),
+                AccelerationEngine::DuckDB,
+            )
             .await
-            .as_ref()
-            .map(|app| app.dataset_snapshots(&spicepod::acceleration::Acceleration::default()))
-            .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
-        let snapshot_behavior = RuntimeSnapshotBehavior::enabled(
-            runtime_snapshots,
-            runtime.secrets_weak(),
-            runtime.tokio_io_runtime(),
-            compaction,
+            .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager"))?
+            .with_snapshots_creation_policy(policy)),
+            other => Err(anyhow!("unsupported fixture engine {other}")),
+        }
+    }
+
+    async fn cayenne_snapshot_manager(
+        &self,
+        runtime: &Arc<Runtime>,
+        local_db_path: &Path,
+        compaction: SnapshotsCompaction,
+        policy: SnapshotsCreationPolicy,
+    ) -> Result<SnapshotManager> {
+        let spicepod_dataset = build_dataset(
+            &self.dataset_from,
+            TAXI_TRIPS_DATASET_NAME,
+            &self.dataset_params,
+            DatasetSnapshotBehavior::Enabled,
+            &HashMap::from([(
+                "cayenne_file_path".to_string(),
+                local_db_path.to_string_lossy().to_string(),
+            )]),
+            "cayenne",
+            RefreshOnStartup::Auto,
         );
+        let dataset = runtime::component::dataset::builder::DatasetBuilder::try_from(
+            spicepod_dataset,
+        )
+        .map_err(|err| anyhow!("Building the taxi_trips dataset: {err}"))?
+        .with_runtime(Arc::clone(runtime))
+        .build()
+        .map_err(|err| anyhow!("Building the taxi_trips dataset: {err}"))?;
+        let accelerator = runtime
+            .accelerator_engine_registry()
+            .get_accelerator_engine(runtime_acceleration::Engine::Cayenne)
+            .await
+            .ok_or_else(|| anyhow!("The runtime has no Cayenne accelerator"))?;
+        let snapshot_engine = accelerator
+            .snapshot_engine_for_source(&dataset)
+            .await
+            .ok_or_else(|| anyhow!("The Cayenne accelerator returned no snapshot engine"))?;
+
         Ok(SnapshotManager::try_new(
             TAXI_TRIPS_DATASET_NAME.to_string(),
-            snapshot_behavior,
-            if self.engine == "cayenne" {
-                runtime_acceleration::snapshot::AccelerationLayout::cayenne(
-                    local_db_path.join("metadata"),
-                    local_db_path,
-                )
-            } else {
-                runtime_acceleration::snapshot::AccelerationLayout::file(local_db_path)
-            },
-            match self.engine {
-                "cayenne" => AccelerationEngine::Cayenne,
-                #[cfg(feature = "duckdb")]
-                _ => AccelerationEngine::DuckDB,
-                #[cfg(not(feature = "duckdb"))]
-                other => return Err(anyhow!("unsupported fixture engine {other}")),
-            },
+            snapshot_behavior(runtime, compaction).await?,
+            accelerator.acceleration_layout(&dataset),
+            AccelerationEngine::Cayenne,
         )
         .await
         .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager"))?
+        .with_snapshot_engine(snapshot_engine)
         .with_snapshots_creation_policy(policy))
     }
 
     async fn cleanup(self) -> Result<()> {
         self.context.cleanup().await
     }
+}
+
+/// The runtime's snapshot settings for a `taxi_trips` acceleration, for a
+/// `SnapshotManager` a test drives itself.
+async fn snapshot_behavior(
+    runtime: &Runtime,
+    compaction: SnapshotsCompaction,
+) -> Result<RuntimeSnapshotBehavior> {
+    let runtime_snapshots = runtime
+        .app()
+        .read()
+        .await
+        .as_ref()
+        .map(|app| app.dataset_snapshots(&spicepod::acceleration::Acceleration::default()))
+        .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
+    Ok(RuntimeSnapshotBehavior::enabled(
+        runtime_snapshots,
+        runtime.secrets_weak(),
+        runtime.tokio_io_runtime(),
+        compaction,
+    ))
 }
 
 fn build_dataset(
@@ -534,7 +590,7 @@ async fn prepare_fixture(test_name: &str, engine: &'static str) -> Result<Snapsh
         .await
         .context("Writing sample CSV for dataset source")?;
     let dataset_from = format!("file://{}", sample_source_path.display());
-    let local_db_path = temp_dir.path().join("taxi_trips.duckdb");
+    let local_db_path = temp_dir.path().join(format!("taxi_trips.{engine}"));
 
     let dataset_params = HashMap::from([
         ("file_format".to_string(), "csv".to_string()),
@@ -1122,7 +1178,7 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
             let writers_dir = TempDir::new().context("Creating directory for writer files")?;
             let mut managers = Vec::with_capacity(10);
             for writer in 0..10 {
-                let local_db_path = writers_dir.path().join(format!("taxi_trips_{writer}.duckdb"));
+                let local_db_path = writers_dir.path().join(format!("taxi_trips_{writer}"));
                 copy_snapshot_directory(&fixture.local_db_path, &local_db_path)
                     .await
                     .context("Copying the acceleration file for a writer")?;

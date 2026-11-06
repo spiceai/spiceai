@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::utils::{
-    runtime_ready_check, runtime_ready_check_with_timeout_err, test_request_context,
-};
+#[cfg(feature = "duckdb")]
+use crate::utils::runtime_ready_check_with_timeout_err;
+use crate::utils::{runtime_ready_check, test_request_context};
 use crate::{configure_test_datafusion, init_tracing};
 use app::AppBuilder;
 use arrow::array::{ArrayRef, AsArray, StringArray};
@@ -30,6 +30,7 @@ use spicepod::component::dataset::Dataset;
 use std::collections::HashMap;
 use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
+#[cfg(feature = "duckdb")]
 use std::time::Duration;
 use test_framework::yaml;
 
