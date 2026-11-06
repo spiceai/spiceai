@@ -45,7 +45,8 @@ limitations under the License.
 //!
 //! Like the rest of the Iceberg suite, these tests read a Glue/S3 fixture and
 //! require `AWS_ICEBERG_ACCOUNT_ID`, `AWS_ICEBERG_REGION`,
-//! `AWS_ICEBERG_ACCESS_KEY_ID`, and `AWS_ICEBERG_SECRET_ACCESS_KEY`. They skip
+//! `AWS_ICEBERG_ACCESS_KEY_ID`, and `AWS_ICEBERG_SECRET_ACCESS_KEY`, plus
+//! `AWS_ICEBERG_SESSION_TOKEN` for short-lived credentials. They skip
 //! (and pass) when `AWS_ICEBERG_ACCOUNT_ID` is unset, so a local `cargo test`
 //! without credentials is not a spurious failure; CI provides the credentials.
 
@@ -80,7 +81,7 @@ fn iceberg_account_id() -> Option<String> {
 /// S3 storage params resolved from the environment, shared by the dataset and
 /// catalog components.
 fn iceberg_s3_params() -> HashMap<String, String> {
-    HashMap::from([
+    let mut params = HashMap::from([
         (
             "iceberg_s3_region".to_string(),
             "${ env:AWS_ICEBERG_REGION }".to_string(),
@@ -93,7 +94,12 @@ fn iceberg_s3_params() -> HashMap<String, String> {
             "iceberg_s3_secret_access_key".to_string(),
             "${ env:AWS_ICEBERG_SECRET_ACCESS_KEY }".to_string(),
         ),
-    ])
+    ]);
+    params.extend(crate::utils::aws_session_token_param(
+        "iceberg_s3_session_token",
+        "AWS_ICEBERG_SESSION_TOKEN",
+    ));
+    params
 }
 
 /// A Glue-backed Iceberg `Catalog` component scoped to the test namespaces.

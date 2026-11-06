@@ -169,6 +169,8 @@ permissions:
   # `actions: write` approves the PR's held pull_request runs
   # (.github/scripts/approve_bot_pr_runs.sh).
   actions: write
+  # Assumes the Iceberg role over OIDC for the benchmark's S3 reads.
+  id-token: write
 
 # Centralized defaults so workflow_dispatch runs have one fallback chain.
 # Defaults exercise the public-S3 TPC-H Ballista distributed-query path
@@ -301,6 +303,18 @@ jobs:
           # Exports SPICEAI_API_KEY for subsequent steps. Same prod creds
           # spicebench's run_spicebench.yml uses.
 
+      # Short-lived AWS credentials for the benchmark's S3 reads.
+      - name: Assume the Iceberg role
+        id: aws-iceberg
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ICEBERG_ROLE_ARN }}
+          role-session-name: gha-iceberg-${{ github.run_id }}
+          role-duration-seconds: 36000
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
       - name: Run the cluster benchmark - ${{ env.CB_SPICEPOD_PATH }}
         env:
           SPICEAI_API_KEY: ${{ env.SPICEAI_API_KEY }}
@@ -309,8 +323,9 @@ jobs:
           S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
           S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
           S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ steps.aws-iceberg.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws-iceberg.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws-iceberg.outputs.aws-session-token }}
           AWS_REGION: us-east-1
           AWS_DEFAULT_REGION: us-east-1
           # Select the nodegroup for the spidapter cluster app via tags.organization.
