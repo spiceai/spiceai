@@ -182,7 +182,7 @@ jobs:
       pull-requests: write
       # Approves the snapshot PR's held pull_request runs.
       actions: write
-      # Exchanged for OpenAI and Anthropic access tokens: workload identity federation.
+      # OpenAI and Anthropic access tokens are minted from this job's GitHub OIDC token.
       id-token: write
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
@@ -190,14 +190,6 @@ jobs:
       HAS_ANTHROPIC_WIF: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID != '' }}
       HAS_XAI_SECRET: ${{ secrets.SPICE_SECRET_XAI_API_KEY != '' }}
       HAS_HF_SECRET: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
-      # Workload identity federation: spiced and the tests exchange this job's GitHub OIDC token
-      # for provider access tokens with these IDs, and exchange again before each expires.
-      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
-      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
-      ANTHROPIC_FEDERATION_RULE_ID: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
-      ANTHROPIC_ORGANIZATION_ID: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
-      ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
-      ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -249,18 +241,35 @@ jobs:
         run: |
           printf 'SPICE_XAI_API_KEY="%s"\n' "$SPICE_XAI_API_KEY" > .env
 
-      # OpenAI tests
+      # OpenAI tests. An OpenAI token lives about 300 s and is not refreshed, so each step that
+      # calls OpenAI mints its own right before it runs.
+      - name: Mint an OpenAI access token
+        if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' }}
+        uses: ./.github/actions/openai-token
+        with:
+          identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+          service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+          audience: ${{ secrets.OPENAI_WIF_AUDIENCE }}
+
       - name: Run OpenAI integration test
         if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
         run: |
           unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
-          if [ -z "${OPENAI_IDENTITY_PROVIDER_ID:-}" ]; then
-            echo "ERROR: OPENAI_IDENTITY_PROVIDER_ID is required but not set"
+          if [ -z "${SPICE_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_OPENAI_API_KEY is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_test
+
+      - name: Mint an OpenAI access token
+        if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' }}
+        uses: ./.github/actions/openai-token
+        with:
+          identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+          service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+          audience: ${{ secrets.OPENAI_WIF_AUDIENCE }}
 
       - name: Run OpenAI Beta functionality embeddings test
         if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' }}
@@ -268,28 +277,53 @@ jobs:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
         run: |
           unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
-          if [ -z "${OPENAI_IDENTITY_PROVIDER_ID:-}" ]; then
-            echo "ERROR: OPENAI_IDENTITY_PROVIDER_ID is required but not set"
+          if [ -z "${SPICE_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_OPENAI_API_KEY is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_embeddings_beta_requirements
 
+      - name: Mint an Anthropic access token
+        if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' && env.HAS_ANTHROPIC_WIF == 'true' }}
+        uses: ./.github/actions/anthropic-token
+        with:
+          federation-rule-id: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
+          organization-id: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
+          service-account-id: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          workspace-id: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+
       # AI UDF tests
+      - name: Mint an OpenAI access token
+        if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' && env.HAS_ANTHROPIC_WIF == 'true' }}
+        uses: ./.github/actions/openai-token
+        with:
+          identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+          service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+          audience: ${{ secrets.OPENAI_WIF_AUDIENCE }}
+
       - name: Run AI UDF basic test
         if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' && env.HAS_ANTHROPIC_WIF == 'true' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
         run: |
           unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
-          if [ -z "${OPENAI_IDENTITY_PROVIDER_ID:-}" ]; then
-            echo "ERROR: OPENAI_IDENTITY_PROVIDER_ID is required but not set"
+          if [ -z "${SPICE_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_OPENAI_API_KEY is required but not set"
             exit 1
           fi
-          if [ -z "${ANTHROPIC_FEDERATION_RULE_ID:-}" ]; then
-            echo "ERROR: ANTHROPIC_FEDERATION_RULE_ID is required but not set"
+          if [ -z "${SPICE_ANTHROPIC_AUTH_TOKEN:-}" ]; then
+            echo "ERROR: SPICE_ANTHROPIC_AUTH_TOKEN is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_basic
+
+      - name: Mint an OpenAI access token
+        if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' && env.HAS_ANTHROPIC_WIF == 'true' && env.HAS_XAI_SECRET == 'true' }}
+        uses: ./.github/actions/openai-token
+        with:
+          identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+          service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+          audience: ${{ secrets.OPENAI_WIF_AUDIENCE }}
 
       - name: Run AI UDF with dataset test
         if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' && env.HAS_ANTHROPIC_WIF == 'true' && env.HAS_XAI_SECRET == 'true' }}
@@ -298,12 +332,12 @@ jobs:
           SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
           unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
-          if [ -z "${OPENAI_IDENTITY_PROVIDER_ID:-}" ]; then
-            echo "ERROR: OPENAI_IDENTITY_PROVIDER_ID is required but not set"
+          if [ -z "${SPICE_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_OPENAI_API_KEY is required but not set"
             exit 1
           fi
-          if [ -z "${ANTHROPIC_FEDERATION_RULE_ID:-}" ]; then
-            echo "ERROR: ANTHROPIC_FEDERATION_RULE_ID is required but not set"
+          if [ -z "${SPICE_ANTHROPIC_AUTH_TOKEN:-}" ]; then
+            echo "ERROR: SPICE_ANTHROPIC_AUTH_TOKEN is required but not set"
             exit 1
           fi
           if [ -z "${SPICE_SECRET_XAI_API_KEY:-}" ]; then
@@ -313,6 +347,14 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_with_dataset
 
       # NOTE: Step-level `if:` conditionals on secret-requiring AI test steps (OpenAI, workers, search, xAI/HF UDFs, etc.) cause the step to report "skipped" (neutral, job succeeds) on PRs where secrets are intentionally unavailable for security (forks/external PRs). When a step *does* execute (schedule/workflow_dispatch with secrets present), an explicit fast-fail guard at the start of `run:` errors immediately if a required key is missing, preserving the original intent. This is intentional and confirmed for schedule + workflow_dispatch (incl. `run_all_tests`). See Copilot review threads for context; prevents spurious reds unrelated to code.
+      - name: Mint an OpenAI access token
+        if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' && env.HAS_ANTHROPIC_WIF == 'true' && env.HAS_XAI_SECRET == 'true' }}
+        uses: ./.github/actions/openai-token
+        with:
+          identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+          service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+          audience: ${{ secrets.OPENAI_WIF_AUDIENCE }}
+
       - name: Run AI UDF LEFT truncate test
         if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' && env.HAS_ANTHROPIC_WIF == 'true' && env.HAS_XAI_SECRET == 'true' }}
         env:
@@ -320,8 +362,8 @@ jobs:
           SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
           unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
-          if [ -z "${OPENAI_IDENTITY_PROVIDER_ID:-}" ]; then
-            echo "ERROR: OPENAI_IDENTITY_PROVIDER_ID is required but not set"
+          if [ -z "${SPICE_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_OPENAI_API_KEY is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_left_truncate
@@ -345,14 +387,22 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_with_local_model
 
       # Workers tests
+      - name: Mint an OpenAI access token
+        if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' }}
+        uses: ./.github/actions/openai-token
+        with:
+          identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+          service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+          audience: ${{ secrets.OPENAI_WIF_AUDIENCE }}
+
       - name: Run workers integration test
         if: ${{ !cancelled() && env.HAS_OPENAI_WIF == 'true' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
         run: |
           unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
-          if [ -z "${OPENAI_IDENTITY_PROVIDER_ID:-}" ]; then
-            echo "ERROR: OPENAI_IDENTITY_PROVIDER_ID is required but not set"
+          if [ -z "${SPICE_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_OPENAI_API_KEY is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- workers

@@ -54,18 +54,11 @@ jobs:
     name: Run Search tests
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
-    # Holds the OpenAI workload identity federation IDs (`OPENAI_*` secrets).
     environment: ci
     permissions:
       contents: read
       actions: read
-      # Exchanged for OpenAI access tokens: workload identity federation.
-      id-token: write
-    env:
-      # Workload identity federation: spiced and the tests exchange this job's GitHub OIDC token
-      # for provider access tokens with these IDs, and exchange again before each expires.
-      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
-      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+      id-token: write  # RustFS credentials
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -155,6 +148,7 @@ jobs:
           S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
           S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
           S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
+          OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}

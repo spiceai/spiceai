@@ -89,8 +89,6 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "runtime",
     "secrets",
     "data_components",
-    // Which identity signs a GitHub App's JWTs when its private key is in a key service.
-    "connector_github",
     "cayenne",
     "cache",
     "extensions",
@@ -930,33 +928,6 @@ mod tests {
         assert!(env_filter_string(&LogVerbosity::Default).contains("tantivy=warn"));
         assert!(env_filter_string(&LogVerbosity::Verbose).contains("tantivy=warn"));
         assert!(!env_filter_string(&LogVerbosity::VeryVerbose).contains("tantivy=warn"));
-    }
-
-    #[test]
-    fn default_filter_shows_the_github_connectors_authentication_line() {
-        let probe = ProbeWriter::default();
-        let env_filter: EnvFilter = LogVerbosity::Default.into();
-        let subscriber = tracing_subscriber::registry()
-            .with(env_filter)
-            .with(console_layer(false, probe.clone()));
-
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::info!(
-                target: "connector_github",
-                "Authenticated dataset 'issues' (github) as a GitHub App"
-            );
-            tracing::debug!(target: "connector_github", "github debug detail that stays hidden");
-        });
-
-        let output = probe.contents();
-        assert!(
-            output.contains("Authenticated dataset 'issues' (github) as a GitHub App"),
-            "{output}"
-        );
-        assert!(
-            !output.contains("github debug detail that stays hidden"),
-            "{output}"
-        );
     }
 
     fn app_with_task_history(enabled: bool) -> Arc<App> {

@@ -1663,18 +1663,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-kms-signer"
-version = "2.4.2"
-dependencies = [
- "async-trait",
- "aws-config",
- "aws-sdk-credential-bridge",
- "aws-sdk-kms",
- "snafu",
- "token_provider",
-]
-
-[[package]]
 name = "aws-lc-rs"
 version = "1.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1863,31 +1851,6 @@ name = "aws-sdk-glue"
 version = "1.153.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48b33661f9c0b02b6c23d42646f43ea9eab6db37fdcbd80f85fabe72a70b9d8e"
-dependencies = [
- "arc-swap",
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http 0.63.6",
- "aws-smithy-json",
- "aws-smithy-observability 0.2.6",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
- "bytes",
- "fastrand",
- "http 0.2.12",
- "http 1.4.1",
- "regex-lite",
- "tracing",
-]
-
-[[package]]
-name = "aws-sdk-kms"
-version = "1.111.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c62d6d9b9c60e08be622a6bfc98e483d75683795caaf9704886970aa07ed8529"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -2488,26 +2451,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "azure-key-vault-signer"
-version = "2.4.2"
-dependencies = [
- "async-trait",
- "aws-lc-rs",
- "axum",
- "azure_core 0.31.0",
- "azure_identity 0.31.0",
- "base64 0.22.1",
- "http-body-limit",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "snafu",
- "token_provider",
- "tokio",
- "util",
-]
-
-[[package]]
 name = "azure_core"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2586,24 +2529,6 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "azure_identity"
-version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7c0c8cb8886f2bdabb3501476fa53f87fa9efea9d457ff991c5ce80052c4774"
-dependencies = [
- "async-lock",
- "async-trait",
- "azure_core 0.31.0",
- "futures",
- "pin-project",
- "serde",
- "serde_json",
- "time",
  "tracing",
  "url",
 ]
@@ -4861,8 +4786,6 @@ dependencies = [
  "arrow-schema",
  "arrow_tools",
  "async-trait",
- "aws-kms-signer",
- "azure-key-vault-signer",
  "chrono",
  "connector-graphql",
  "data-connector-api",
@@ -18464,7 +18387,7 @@ dependencies = [
  "aws-sdk-secretsmanager",
  "aws-sdk-sts",
  "azure_core 1.1.0",
- "azure_identity 1.0.0",
+ "azure_identity",
  "azure_security_keyvault_secrets",
  "base64 0.22.1",
  "dotenv 2.4.2",
@@ -22069,12 +21992,8 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 name = "token_provider"
 version = "2.4.2"
 dependencies = [
- "async-trait",
- "aws-lc-rs",
- "axum",
  "base64 0.22.1",
  "chrono",
- "http-body-limit",
  "jsonwebtoken",
  "reqwest 0.13.4",
  "secrecy",
@@ -22082,7 +22001,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "snafu",
- "tempfile",
  "tokio",
  "tracing",
  "util",

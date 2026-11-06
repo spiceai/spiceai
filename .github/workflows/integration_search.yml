@@ -21,8 +21,6 @@ permissions:
   pull-requests: write
   # Approves the snapshot PR's held pull_request runs.
   actions: write
-  # Exchanged for OpenAI access tokens: workload identity federation.
-  id-token: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -41,13 +39,7 @@ jobs:
   test-search:
     name: Test Search Integration
     runs-on: spiceai-macos-large
-    # Holds the OpenAI workload identity federation IDs (`OPENAI_*` secrets).
     environment: ci
-    env:
-      # Workload identity federation: spiced and the tests exchange this job's GitHub OIDC token
-      # for provider access tokens with these IDs, and exchange again before each expires.
-      OPENAI_IDENTITY_PROVIDER_ID: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
-      OPENAI_SERVICE_ACCOUNT_ID: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -58,20 +50,27 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Set up API Keys
+        env:
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          printf 'SPICE_OPENAI_API_KEY="%s"\n' "$SPICE_OPENAI_API_KEY" > .env
+
       - name: Run search integration tests
         env:
           # Metal runners do not have `xcrun metal`
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
+          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
           # ARN of the pre-seeded, long-lived S3 Vectors index the S3VectorsFallback permutation
           # falls back to (its zero-row acceleration never populates the index itself).
           AWS_S3_VECTORS_FALLBACK_INDEX_ARN: ${{ vars.AWS_S3_VECTORS_FALLBACK_INDEX_ARN }}
         run: |
-          if [ -z "${OPENAI_IDENTITY_PROVIDER_ID:-}" ] ; then
-            echo "Error: OPENAI_IDENTITY_PROVIDER_ID is not defined."
+          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
+            echo "Error: OpenAI API key is not defined."
             exit 1
           fi
           cargo test --test integration_models -p runtime --features models,metal,s3_vectors,kafka,duckdb,extended_tests -- search
