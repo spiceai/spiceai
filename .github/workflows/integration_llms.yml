@@ -188,12 +188,13 @@ jobs:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
-    # Holds the Anthropic workload identity federation IDs (`ANTHROPIC_*` secrets).
+    # Holds the OpenAI and Anthropic workload identity federation IDs (`OPENAI_*` and
+    # `ANTHROPIC_*` secrets).
     environment: ci
     permissions:
       contents: read
       actions: read
-      # Anthropic access tokens are minted from this job's GitHub OIDC token.
+      # OpenAI and Anthropic access tokens are minted from this job's GitHub OIDC token.
       id-token: write
 
     steps:
@@ -247,10 +248,18 @@ jobs:
           service-account-id: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
           workspace-id: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
 
+      # An OpenAI token lives about 300 s and is not refreshed, so mint it last.
+      - name: Mint an OpenAI access token
+        if: matrix.target.needs_env == true
+        uses: ./.github/actions/openai-token
+        with:
+          identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+          service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+          audience: ${{ secrets.OPENAI_WIF_AUDIENCE }}
+
       - name: Run integration test
         env:
           MODEL_ALLOWLIST: ${{ matrix.target.model_allowlist }}
-          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
           # The spiceio setup action exports AWS_ENDPOINT_URL for sccache; the AWS SDK
@@ -258,7 +267,7 @@ jobs:
           # calls to the local build cache instead of AWS.
           unset AWS_ENDPOINT_URL
           if [ "${{ matrix.target.needs_env }}" == "true" ]; then
-            if [ -z "$SPICE_OPENAI_API_KEY" ]; then
+            if [ -z "${SPICE_OPENAI_API_KEY:-}" ]; then
               echo "Error: 'SPICE_OPENAI_API_KEY' is not defined."
               exit 1
             fi
