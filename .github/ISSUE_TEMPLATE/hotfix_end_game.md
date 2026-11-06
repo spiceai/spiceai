@@ -40,15 +40,20 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
 
 ## Release Publication Steps
 
-Release lines cut before `publish_release` existed (2.4 and earlier) still publish from a pushed tag: for those, follow the steps in that release branch's copy of this template.
+For release lines 2.4 and earlier, follow the release steps in that branch's copy of this template instead.
+
+In these steps, `{version}` is the version in `version.txt` on the release branch, without a leading `v` (for example `1.0.1`).
 
 - [ ] Cherry-pick release notes onto the release branch.
-- [ ] Start [build_release](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) on the release branch with `release_version` set to the version (e.g. `1.0.1`), once the branch head is the commit that passed testing. `version.txt` at that commit must match, or the build fails. Do not push the tag: `publish_release` creates it.
-- [ ] Check that the build_release run is green. It builds every binary, CUDA included, and publishes nothing.
-- [ ] Create a **draft** [GitHub Release](https://github.com/spiceai/spiceai/releases/new) for tag `v1.0.1` (a new tag, created on publish) targeting the release branch. Leave the body empty to use the checked-in notes, or write the notes in the draft.
-- [ ] Start [publish_release](https://github.com/spiceai/spiceai/actions/workflows/publish_release.yml) on the release branch with the same `release_version`. It publishes the build of the branch head at the moment it starts, so start it before anything else merges to the release branch.
-- [ ] Approve its `publish` job, then the two Docker push jobs when they wait for approval, as a release approver other than the person who started the run. `publish` attaches the binaries and publishes the release, which creates the tag at the built commit; the push jobs push the Docker images. A stable release that is the highest version becomes the latest release and moves the `latest` Docker tags; a pre-release never does. To retry a failed step, re-run the failed jobs of the same run.
-- [ ] Check the published release assets and the `spiceai/spiceai` and `ghcr.io/spiceai/spiceai` image tags.
+- [ ] Run [build_release](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) on the release branch with `release_version` set to `{version}`. Don't create or push the release tag: `publish_release` creates it.
+  - [ ] Wait for the [build_release run](https://github.com/spiceai/spiceai/actions/workflows/build_release.yml) to finish successfully. Don't merge anything else into the release branch until `publish_release` has started.
+- [ ] Create a [draft GitHub Release](https://github.com/spiceai/spiceai/releases/new) with the new tag `v{version}`, targeting the release branch. Leave the description empty to use the checked-in release notes, or paste the notes.
+- [ ] Run [publish_release](https://github.com/spiceai/spiceai/actions/workflows/publish_release.yml) on the release branch with `release_version` set to `{version}`.
+  - [ ] Have a release approver other than the person who started the run approve the `publish` job, which publishes the release.
+  - [ ] Validate the [GitHub Release](https://github.com/spiceai/spiceai/releases) has its binaries, and is marked as a pre-release for an RC, or as the latest release for the newest stable version.
+  - [ ] Monitor the [publish_release run](https://github.com/spiceai/spiceai/actions/workflows/publish_release.yml) for the Docker image builds. When they finish, approve the two Docker image publish jobs.
+  - [ ] Validate the published [Docker Hub](https://hub.docker.com/r/spiceai/spiceai/tags) and [GHCR](https://github.com/spiceai/spiceai/pkgs/container/spiceai) image tags `{version}` and `{version}-cuda`, and for the newest stable version, `latest` and `latest-cuda`.
+  - If a job fails, re-run the failed jobs of the same run.
 - [ ] Perform a final test pass on the released binaries and Docker images.
 - [ ] Notify that the OSS release is complete and ready for communications in the release coordination channel.
 
