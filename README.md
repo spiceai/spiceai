@@ -28,7 +28,7 @@
 This repository contains Spice.ai Open Source: the Apache-2.0 runtime (`spiced`) and CLI (`spice`), a single Rust binary built on [Apache DataFusion](https://datafusion.apache.org), [Apache Arrow](https://arrow.apache.org), [Apache Ballista](https://datafusion.apache.org/ballista/), [Apache Iceberg](https://iceberg.apache.org), and [Vortex](https://github.com/vortex-data/vortex). [Spice.ai Cloud](https://spice.ai) and [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise) are managed and enterprise distributions built on it.
 
 <p align="center">
-  <img width="100%" alt="Spice.ai Open Source runtime architecture: a SQL Query API and an OpenAI-compatible API over query federation, accelerated data with Spice Cayenne, catalogs, hybrid search, indexes, embeddings, AI inference, tools and memory, and evals and observability, on top of databases, data lakes, and APIs" src="media/spice-oss-diagram.svg" />
+  <img width="100%" alt="Spice.ai Open Source runtime architecture: a SQL Query API and an OpenAI-compatible API over query federation, accelerated data with Spice Cayenne, catalogs, hybrid search, indexes, embeddings, AI inference, tools and memory, and evals and observability, on top of data sources: databases, warehouses, data lakes, streams, and APIs" src="media/spice-oss-diagram.svg" />
 </p>
 
 ## Quickstart
