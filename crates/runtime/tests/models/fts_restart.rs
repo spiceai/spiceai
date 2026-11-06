@@ -22,6 +22,11 @@ limitations under the License.
 //! rows. Regression test for #14618: the index has to be rebuilt from the acceleration, through
 //! the wrapped `FullTextConnector` index the accelerated table discovers, before the dataset is
 //! registered.
+//!
+//! Covers both DuckDB (the original #14618 engine) and Cayenne. Cayenne was still empty after a
+//! restart on v2.4.1 because #14954 had not been backported; the rebuild path is engine-agnostic
+//! once present, and this test keeps Cayenne on the matrix so a future regression cannot hide
+//! behind DuckDB-only coverage.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,16 +46,21 @@ use crate::{configure_test_datafusion, init_tracing};
 
 const LOAD_TIMEOUT: Duration = Duration::from_mins(2);
 
-fn docs_dataset(source: &str, db_path: &str) -> Dataset {
+fn docs_columns() -> Vec<Column> {
+    vec![
+        Column::new("text")
+            .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
+    ]
+}
+
+#[cfg(feature = "duckdb")]
+fn duckdb_docs_dataset(source: &str, db_path: &str) -> Dataset {
     let mut dataset = Dataset::new(source, "docs");
     dataset.params = Some(Params::from_string_map(HashMap::from([(
         "file_format".to_string(),
         "csv".to_string(),
     )])));
-    dataset.columns = vec![
-        Column::new("text")
-            .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
-    ];
+    dataset.columns = docs_columns();
     dataset.acceleration = Some(Acceleration {
         enabled: true,
         engine: Some("duckdb".to_string()),
@@ -65,10 +75,31 @@ fn docs_dataset(source: &str, db_path: &str) -> Dataset {
     dataset
 }
 
-async fn start(source: &str, db_path: &str) -> anyhow::Result<Arc<Runtime>> {
-    let app = AppBuilder::new("fts_restart")
-        .with_dataset(docs_dataset(source, db_path))
-        .build();
+fn cayenne_docs_dataset(source: &str, data_dir: &str, metadata_dir: &str) -> Dataset {
+    let mut dataset = Dataset::new(source, "docs");
+    dataset.params = Some(Params::from_string_map(HashMap::from([(
+        "file_format".to_string(),
+        "csv".to_string(),
+    )])));
+    dataset.columns = docs_columns();
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("cayenne".to_string()),
+        mode: Mode::File,
+        refresh_mode: Some(RefreshMode::Full),
+        // Keep data files and the metastore inside this run's temp directory so the test
+        // does not collide with other Cayenne file-mode datasets in the same process.
+        params: Some(Params::from_string_map(HashMap::from([
+            ("cayenne_file_path".to_string(), data_dir.to_string()),
+            ("cayenne_metadata_dir".to_string(), metadata_dir.to_string()),
+        ]))),
+        ..Acceleration::default()
+    });
+    dataset
+}
+
+async fn start_with(dataset: Dataset) -> anyhow::Result<Arc<Runtime>> {
+    let app = AppBuilder::new("fts_restart").with_dataset(dataset).build();
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
     let load_rt = Arc::clone(&rt);
     tokio::select! {
@@ -108,19 +139,17 @@ async fn row_count(rt: &Arc<Runtime>) -> anyhow::Result<i64> {
         .context("no count row")
 }
 
-#[tokio::test]
-async fn full_text_search_finds_persisted_rows_after_a_restart() -> anyhow::Result<()> {
-    let _tracing = init_tracing(None);
-    configure_test_datafusion();
-    register_test_connectors().await;
-
-    let dir = tempfile::tempdir()?;
+async fn write_fixture(dir: &tempfile::TempDir) -> anyhow::Result<String> {
     let csv = dir.path().join("docs.csv");
     std::fs::write(&csv, "id,text\n1,alpha\n2,beta\n3,gamma\n")?;
-    let source = format!("file://{}", csv.display());
-    let db_path = dir.path().join("docs.db").to_string_lossy().to_string();
+    Ok(format!("file://{}", csv.display()))
+}
 
-    let first = start(&source, &db_path).await?;
+/// Shared restart assertion: first load indexes, restart reusing the acceleration answers.
+async fn assert_persisted_rows_survive_restart(
+    first: Arc<Runtime>,
+    restart: impl std::future::Future<Output = anyhow::Result<Arc<Runtime>>>,
+) -> anyhow::Result<()> {
     assert_eq!(
         search_ids(&first, "alpha").await?,
         vec![1],
@@ -129,8 +158,7 @@ async fn full_text_search_finds_persisted_rows_after_a_restart() -> anyhow::Resu
     first.shutdown().await;
     drop(first);
 
-    // The acceleration file keeps its rows and checkpoint, so this start skips the refresh.
-    let restarted = start(&source, &db_path).await?;
+    let restarted = restart.await?;
     assert_eq!(
         row_count(&restarted).await?,
         3,
@@ -143,4 +171,43 @@ async fn full_text_search_finds_persisted_rows_after_a_restart() -> anyhow::Resu
     );
     restarted.shutdown().await;
     Ok(())
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn full_text_search_finds_persisted_rows_after_a_restart() -> anyhow::Result<()> {
+    let _tracing = init_tracing(None);
+    configure_test_datafusion();
+    register_test_connectors().await;
+
+    let dir = tempfile::tempdir()?;
+    let source = write_fixture(&dir).await?;
+    let db_path = dir.path().join("docs.db").to_string_lossy().to_string();
+
+    let first = start_with(duckdb_docs_dataset(&source, &db_path)).await?;
+    assert_persisted_rows_survive_restart(first, start_with(duckdb_docs_dataset(&source, &db_path)))
+        .await
+}
+
+#[tokio::test]
+async fn cayenne_full_text_search_finds_persisted_rows_after_a_restart() -> anyhow::Result<()> {
+    let _tracing = init_tracing(None);
+    configure_test_datafusion();
+    register_test_connectors().await;
+
+    let dir = tempfile::tempdir()?;
+    let source = write_fixture(&dir).await?;
+    let data_dir = dir.path().join("cayenne-data");
+    let metadata_dir = dir.path().join("cayenne-metadata");
+    std::fs::create_dir_all(&data_dir)?;
+    std::fs::create_dir_all(&metadata_dir)?;
+    let data_dir = data_dir.to_string_lossy().to_string();
+    let metadata_dir = metadata_dir.to_string_lossy().to_string();
+
+    let first = start_with(cayenne_docs_dataset(&source, &data_dir, &metadata_dir)).await?;
+    assert_persisted_rows_survive_restart(
+        first,
+        start_with(cayenne_docs_dataset(&source, &data_dir, &metadata_dir)),
+    )
+    .await
 }
