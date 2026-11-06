@@ -154,5 +154,15 @@
       "signature": "spiced not ready: a dataset is in Error: [{\"acceleration_enabled\":true,\"error\":{\"category\":\"dataset\",\"code\":\"dataset.validation\",\"type\":\"validation\"},\"error_message\":\"Failed to setup the dataset ret (postgres). Unable to create dataset acceleration: Acceleration creation failed: Acceleration creatio",
       "group": "append-and-retention"
     }
+  ],
+  "retention-sql-filtered-read": [
+    {
+      "run": "retention-sql-filtered-read",
+      "who": "cayenne",
+      "key": "query: SELECT id, deleted FROM appended WHERE deleted = true",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 0, actual: 1 }",
+      "group": "append-and-retention"
+    }
   ]
 }
