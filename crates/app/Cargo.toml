@@ -12,9 +12,9 @@ version.workspace = true
 percent-encoding.workspace = true
 serde.workspace = true
 snafu.workspace = true
-spicepod = { path = "../spicepod" }
+spicepod = { path = "../spicepod", default-features = false }
 tracing.workspace = true
-util = { path = "../util", features = ["datafusion"] }
+util = { path = "../util", default-features = false }
 
 [features]
 default = []

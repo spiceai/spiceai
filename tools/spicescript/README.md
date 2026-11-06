@@ -1,7 +1,7 @@
 # spicescript
 
-`spicescript` runs scenario scripts against a prebuilt `spiced`. A script is a
-YAML file that:
+`testoperator script` runs scenario scripts against a prebuilt `spiced`; this crate
+is the library behind it. A script is a YAML file that:
 1. starts the sources the scenario needs (PostgreSQL, MySQL, ClickHouse, an
    object store, any Docker image, a mock HTTP server);
 2. starts `spiced` on a spicepod;
@@ -39,28 +39,28 @@ The scripts live in `test/spicescript/`; see its README for their layout.
 ## Running
 
 ```bash
-cargo build -p spicescript
+cargo build -p testoperator
 # Every script in a directory, against the installed spiced (~/.spice/bin/spiced):
-target/debug/spicescript test/spicescript
+target/debug/testoperator script test/spicescript
 # The whole suite, eight spiced processes at a time:
-target/debug/spicescript --jobs 8 --spiced trunk=target/release/spiced test/spicescript
+target/debug/testoperator script --jobs 8 --spiced trunk=target/release/spiced test/spicescript
 # One script, against two builds; they must agree:
-target/debug/spicescript --jobs 4 \
+target/debug/testoperator script --jobs 4 \
   --spiced release=$HOME/.spice/bin/spiced --spiced dev=target/release/spiced \
   test/spicescript/postgres-cdc-parity.yaml
 # Upgrade scripts start on the release their `from:` names, downloaded once, and move
 # to the build under test at each `upgrade` step; --from replaces that release:
-target/debug/spicescript --spiced dev=target/release/spiced test/spicescript/cayenne-upgrade.yaml
-target/debug/spicescript --from $HOME/.spice/bin/spiced \
+target/debug/testoperator script --spiced dev=target/release/spiced test/spicescript/cayenne-upgrade.yaml
+target/debug/testoperator script --from $HOME/.spice/bin/spiced \
   --spiced dev=target/release/spiced test/spicescript/cayenne-upgrade.yaml
 # Every instance as a scheduler with one executor, over node mTLS:
-target/debug/spicescript --cluster test/spicescript/query-coverage.yaml
+target/debug/testoperator script --cluster test/spicescript/query-coverage.yaml
 # Known-failing scripts of one group, without waiting out every limit:
-target/debug/spicescript --max-wait 20s test/spicescript/known-failing/clickhouse
+target/debug/testoperator script --max-wait 20s test/spicescript/known-failing/clickhouse
 # One matrix combination and one variant of a script:
-target/debug/spicescript --matrix src=clickhouse --variant cayenne test/spicescript/full-refresh-chaos.yaml
+target/debug/testoperator script --matrix src=clickhouse --variant cayenne test/spicescript/full-refresh-chaos.yaml
 # Parse only:
-target/debug/spicescript --check test/spicescript
+target/debug/testoperator script --check test/spicescript
 ```
 
 Docker must be running. The `aws` CLI is needed for object-store sources, and
@@ -304,7 +304,7 @@ Flight SQL with HTTP using the generated SQL reference corpus and seeded
 random queries over local Parquet files. One seed also exercises plain Flight:
 
 ```bash
-target/debug/spicescript --spiced target/release/spiced test/spicescript/query-protocols.yaml
+target/debug/testoperator script --spiced target/release/spiced test/spicescript/query-protocols.yaml
 ```
 
 The [SQL surface generator](../../test/spicescript/corpus/sql_surface.py) maintains

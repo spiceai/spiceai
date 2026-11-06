@@ -2932,7 +2932,7 @@ jobs:
         with:
           working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
 
-  # The runner for the scenario scripts in test/spicescript. Built beside spiced
+  # testoperator, which runs the scenario scripts in test/spicescript. Built beside spiced
   # rather than after it, so it adds nothing to the run's critical path.
   build_spicescript:
     environment: ci
@@ -2968,10 +2968,10 @@ jobs:
           python3 -m unittest discover -s test/spicescript/corpus -p test_sql_surface.py
           python3 test/spicescript/corpus/sql_surface.py --check
 
-      - name: Build spicescript
+      - name: Build testoperator
         uses: ./.github/actions/build-tool
         with:
-          package: spicescript
+          package: testoperator
 
   # Runs the scenario scripts against this run's spiced and spice CLI.
   test_spicescript:
@@ -3033,11 +3033,11 @@ jobs:
           minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
           minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
-      - name: Download spicescript
+      - name: Download testoperator
         id: spicescript
         uses: ./.github/actions/build-tool
         with:
-          package: spicescript
+          package: testoperator
 
       # Sources run in containers; log in so image pulls are not rate limited. Scripts pull
       # images as they start, so the login has to last the whole job.
@@ -3073,7 +3073,7 @@ jobs:
         if: ${{ matrix.partition == '1/4' }}
         run: |
           python3 test/spicescript/check_harness.py \
-            --runner "${{ steps.spicescript.outputs.path }}" \
+            --runner "${{ steps.spicescript.outputs.path }}" script \
             --spiced "$(command -v spiced)" \
             --work-dir "$RUNNER_TEMP/spicescript/harness-checks"
 
@@ -3086,7 +3086,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+          "${{ steps.spicescript.outputs.path }}" script --jobs 4 \
             --partition ${{ matrix.partition }} \
             --spiced "$(command -v spiced)" \
             --spice-cli "$(command -v spice)" \
@@ -3113,7 +3113,7 @@ jobs:
               "--matrix source=ducklake test/spicescript" \
               "test/spicescript/adbc-duckdb-catalog.yaml test/spicescript/ducklake-coverage.yaml test/spicescript/ducklake-refresh.yaml"; do
               # shellcheck disable=SC2086 # args holds several words
-              "${{ steps.spicescript.outputs.path }}" --jobs 4 \
+              "${{ steps.spicescript.outputs.path }}" script --jobs 4 \
                 --duckdb-version "$version" \
                 --spiced "$(command -v spiced)" \
                 --spice-cli "$(command -v spice)" \
