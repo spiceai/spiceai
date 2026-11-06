@@ -69,6 +69,7 @@ jobs:
   # etc.). `build` — which every test job depends on — is gated on this, so the
   # whole matrix cascades to "skipped" while the E2E Test CI gate still reports.
   check_changes:
+    environment: secret-free
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
     # Every job here is bounded, because on a `merge_group` run an unbounded one does not
@@ -88,6 +89,7 @@ jobs:
         uses: ./.github/actions/check-code-changes
 
   setup-matrix:
+    environment: secret-free
     name: Setup strategy matrix
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
@@ -129,6 +131,7 @@ jobs:
   build:
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.builder }}
+    environment: ci-build
     needs: [setup-matrix, check_changes]
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
     # A backstop above the longest step bound below, leaving room for the artifact upload
@@ -137,7 +140,7 @@ jobs:
     # compile is exactly when the sccache stats are worth having.
     timeout-minutes: 200
     env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      HAS_SPICEIO_SECRET: ${{ secrets.SMB_PASSWORD != '' }}
 
     strategy:
       matrix:
@@ -186,7 +189,7 @@ jobs:
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          smb-pass: ${{ secrets.SMB_PASSWORD }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
@@ -270,6 +273,8 @@ jobs:
           if-no-files-found: ignore
 
   test-bigquery:
+    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
+    environment: ci
     name: BigQuery Regression Tests
     needs: build
     if: ${{ inputs.run_all_tests }}
@@ -277,20 +282,16 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
+      # Exchanged for Google Cloud access tokens for the BigQuery tests: workload identity federation.
+      id-token: write
     env:
       SPICED_BIN: ${{ github.workspace }}/build/spiced
       ADBC_BIGQUERY_DRIVER_PATH: /etc/adbc/drivers/libadbc_driver_bigquery.so
+      # The workload identity federation credential names no project.
+      BIGQUERY_PROJECT_ID: spiceai-testing
       BIGQUERY_TEST_CLEANUP: always
       BIGQUERY_EXPECT: single
     steps:
-      - name: Require BigQuery test credentials
-        shell: bash
-        env:
-          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
-        run: |
-          set -euo pipefail
-          : "${BIGQUERY_SERVICE_ACCOUNT_JSON:?BIGQUERY_SERVICE_ACCOUNT_JSON is required for run_all_tests}"
-
       - name: Set test output paths
         id: test_env
         shell: bash
@@ -305,6 +306,12 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+
+      - name: Set up BigQuery credentials (workload identity federation)
+        uses: ./.github/actions/bigquery-credentials
+        with:
+          workload-identity-provider: ${{ secrets.BIGQUERY_WIF_PROVIDER }}
+          service-account: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT }}
 
       - name: Download Linux runtime artifact
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -338,8 +345,6 @@ jobs:
       - name: Run BigQuery regression tests
         timeout-minutes: 60
         shell: bash
-        env:
-          BIGQUERY_SERVICE_ACCOUNT_JSON: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_JSON }}
         run: |
           set -euo pipefail
           mkdir -p "$BIGQUERY_GATE_OUTPUT"
@@ -367,6 +372,7 @@ jobs:
         run: rm -rf -- "$BIGQUERY_GATE_VENV"
 
   setup-model-matrix:
+    environment: secret-free
     name: Setup model strategy matrix
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
@@ -511,6 +517,7 @@ jobs:
         uses: ./.github/actions/stop-spice
 
   test_hf_model:
+    environment: ci
     name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     timeout-minutes: 10
     runs-on: ${{ matrix.target.runner }}
@@ -734,6 +741,7 @@ jobs:
           echo "Removed the job-scoped Hugging Face token."
 
   test_quickstart_dremio:
+    environment: secret-free
     name: 'Test Dremio quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     # run quickstart with external service dependency only on manual trigger
@@ -812,6 +820,7 @@ jobs:
   test_quickstart_spiceai:
     name: 'Test Spice.ai quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
+    environment: ci
     # run quickstart with external service dependency only on manual trigger
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs:
@@ -877,6 +886,7 @@ jobs:
   test_quickstart_s3:
     name: 'Test S3 quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
+    environment: ci
     # run quickstart with external service dependency only on manual trigger
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs:
@@ -969,12 +979,16 @@ jobs:
           working-directory: test_app
 
   test_cold_start_unkeyed_append:
+    environment: ci
     name: 'Cold start: unkeyed Cayenne append loads without rewriting itself'
     # The nightly `testoperator run cold-start` workflow times every acceleration shape
     # against the previous release; this is its timing-free bound, cheap enough for the
     # merge queue. A load into an empty table must not trigger a full compaction.
     if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     needs:
       - build
     timeout-minutes: 20
@@ -992,12 +1006,21 @@ jobs:
         with:
           build-path: ./build
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '1200'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Check for the fixture
         run: |
@@ -1013,9 +1036,10 @@ jobs:
           cd cold_start_app
           spiced --cpu-cores 2 --metrics 127.0.0.1:9095 &> spice.log &
         env:
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          S3_ENDPOINT: ${{ vars.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ steps.rustfs.outputs.access-key-id }}
+          S3_SECRET: ${{ steps.rustfs.outputs.secret-access-key }}
+          S3_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Wait for the dataset to be ready
         uses: ./.github/actions/wait-for-spice-ready
@@ -1041,6 +1065,7 @@ jobs:
           working-directory: cold_start_app
 
   test_quickstart_data_postgres:
+    environment: secret-free
     name: 'Test PostgreSQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1202,6 +1227,7 @@ jobs:
           working-directory: test_app
 
   test_quickstart_data_mysql:
+    environment: secret-free
     name: 'Test MySQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1425,6 +1451,7 @@ jobs:
           working-directory: test_app
 
   test_quickstart_clickhouse:
+    environment: secret-free
     name: 'Test Clickhouse quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1547,6 +1574,7 @@ jobs:
           working-directory: test_app
 
   test_quickstart_duckdb:
+    environment: secret-free
     env:
       duckdb_version: v0.10.2
     name: 'Test DuckDB quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -1635,6 +1663,7 @@ jobs:
           working-directory: duckdb-app
 
   test_local_acceleration:
+    environment: secret-free
     name: 'Test acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }} (${{ matrix.acceleration.mode }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1780,6 +1809,7 @@ jobs:
           working-directory: test_app
 
   test_results_caching:
+    environment: secret-free
     name: 'Test results caching on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1973,6 +2003,7 @@ jobs:
           working-directory: test_app
 
   test_results_caching_source_down:
+    environment: secret-free
     name: 'Test results caching with the source down'
     # Linux only: what it checks, that a cache miss reads the acceleration while the
     # source is unreadable, does not depend on the platform.
@@ -2135,6 +2166,7 @@ jobs:
           working-directory: test_app
 
   gh_connector_quickstart:
+    environment: secret-free
     name: 'Test GitHub connector on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -2230,6 +2262,7 @@ jobs:
           working-directory: test_app
 
   hf_connector_live:
+    environment: ci
     name: 'Test Hugging Face connector against the live Hub'
     # Reads pinned commits of public datasets through the Hub and compares every answer
     # with one recorded from DuckDB's own `hf://` reader (test/huggingface/check_live.py).
@@ -2275,6 +2308,7 @@ jobs:
           path: hf-live-results/
 
   mssql_connector_quickstart:
+    environment: secret-free
     name: 'Test MS SQL connector on ${{ matrix.target.name }}'
     # The Microsoft apt list below is the Ubuntu 24.04 repository. ubuntu-latest
     # moves on its own, so this Linux-only job stays on ubuntu-24.04.
@@ -2399,6 +2433,10 @@ jobs:
       - build
       - setup-matrix
     timeout-minutes: 5
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
 
     strategy:
       matrix:
@@ -2436,19 +2474,34 @@ jobs:
           echo "      mode: delta_lake" >> spicepod.yaml
           echo "      databricks_aws_access_key_id: \${ secrets:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }" >> spicepod.yaml
           echo "      databricks_aws_secret_access_key: \${ secrets:AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }" >> spicepod.yaml
+          echo "      databricks_aws_session_token: \${ secrets:AWS_DATABRICKS_DELTA_SESSION_TOKEN }" >> spicepod.yaml
+          echo "      databricks_aws_region: us-west-2" >> spicepod.yaml
           echo "      databricks_endpoint: \${ secrets:DATABRICKS_ENDPOINT }" >> spicepod.yaml
-          echo "      databricks_token: \${ secrets:DATABRICKS_TOKEN }" >> spicepod.yaml
+          echo "      databricks_client_id: \${ secrets:DATABRICKS_OIDC_CLIENT_ID }" >> spicepod.yaml
+          echo "      databricks_token_audience: \${ secrets:DATABRICKS_OIDC_AUDIENCE }" >> spicepod.yaml
 
           cat spicepod.yaml
+
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta-new
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
 
       - name: Start spice runtime
         working-directory: test_app
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta-new.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta-new.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta-new.outputs.aws-session-token }}
+          DATABRICKS_ENDPOINT: ${{ vars.NEW_DATABRICKS_HOST }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
         run: |
           spice run &> spice.log &
           # time to initialize added datasets
@@ -2483,6 +2536,7 @@ jobs:
           working-directory: test_app
 
   graceful_shutdown_test_append:
+    environment: secret-free
     name: '${{ matrix.spicepod }} acceleration and graceful shutdown on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -2723,6 +2777,7 @@ jobs:
           allow: ${{ env.PARQUET_RENAME_RACE_ALLOW }}
 
   graceful_shutdown_test_full:
+    environment: secret-free
     name: '${{ matrix.spicepod }} acceleration and graceful shutdown on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -2880,20 +2935,33 @@ jobs:
   # The runner for the scenario scripts in test/spicescript. Built beside spiced
   # rather than after it, so it adds nothing to the run's critical path.
   build_spicescript:
+    environment: ci
     name: Build spicescript
     needs: check_changes
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '1800'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Check documented SQL cases
         run: |
@@ -2910,6 +2978,10 @@ jobs:
     name: ${{ matrix.name }}
     needs: [build, build_spicescript]
     runs-on: spiceai-dev-runners
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -2945,12 +3017,21 @@ jobs:
         with:
           build-path: ./build
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download spicescript
         id: spicescript
@@ -2958,13 +3039,16 @@ jobs:
         with:
           package: spicescript
 
-      # Sources run in containers; log in so image pulls are not rate limited.
+      # Sources run in containers; log in so image pulls are not rate limited. Scripts pull
+      # images as they start, so the login has to last the whole job.
       - name: Login to DockerHub
         if: github.repository == 'spiceai/spiceai'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: '21600'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_ORGANIZATION }}
 
       # Object-store sources (rustfs) are managed with the aws CLI.
       - name: Install the AWS CLI
@@ -3071,6 +3155,7 @@ jobs:
   # along with every job it summarises, so the required check reads `skipped`,
   # not a `success` nothing ran for (#13841).
   e2e-gate:
+    environment: secret-free
     name: E2E Test CI
     runs-on: ubuntu-latest
     if: ${{ !cancelled() && github.event_name != 'pull_request' }}

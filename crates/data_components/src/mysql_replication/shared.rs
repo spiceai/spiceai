@@ -149,6 +149,9 @@ const MEMBER_SEND_STALL_WARN: Duration = Duration::from_secs(5);
 /// `(database, table)` of a member's source table — the routing key.
 type MemberKey = (String, String);
 
+/// A transaction's GTID: the source UUID and its sequence number.
+type Gtid = (uuid::Uuid, u64);
+
 /// Identity of a shared dump: the connection a dataset streams the binlog over.
 /// Every `refresh_mode: changes` dataset that connects the same way coalesces
 /// onto one pump for this key — no opt-in, no group label. The `MySQL` binlog
@@ -265,6 +268,17 @@ struct AckSlot {
     /// source is not GTID-positioning. The shared dump's GTID resume set is the
     /// intersection of these across members (see [`AckTable::resume_gtid`]).
     gtid: Mutex<GtidSet>,
+    /// GTIDs of the transactions delivered into this member's channel, on top
+    /// of the executed set it was registered with: the GTID analog of
+    /// `delivered`, and always a superset of `gtid`. Under GTID positioning it
+    /// is what decides routing, because binlog coordinates are local to one
+    /// server and a failover leaves `delivered` and `committed` holding the
+    /// previous server's.
+    delivered_gtid: Mutex<GtidSet>,
+    /// GTID of the last transaction delivered into this member's channel,
+    /// `None` until one is. The consumer commits in delivery order, so the
+    /// member is idle exactly when its executed set holds this one.
+    last_delivered_gtid: Mutex<Option<Gtid>>,
     state: AtomicU8,
 }
 
@@ -273,6 +287,8 @@ impl AckSlot {
         Self {
             committed: Mutex::new(at.clone()),
             delivered: Mutex::new(at),
+            delivered_gtid: Mutex::new(gtid_seed.clone()),
+            last_delivered_gtid: Mutex::new(None),
             gtid: Mutex::new(gtid_seed),
             state: AtomicU8::new(LIVE | if snapshotting { SNAPSHOTTING } else { 0 }),
         }
@@ -299,13 +315,51 @@ impl AckSlot {
     fn commit(&self, to: &BinlogPosition) {
         advance_position(&self.committed, to);
     }
-    /// Record an envelope delivered into this member's channel (monotonic-max).
-    fn deliver(&self, to: &BinlogPosition) {
+    /// Record an envelope delivered into this member's channel (monotonic-max),
+    /// and the GTID of the transaction it carries, if any.
+    fn deliver(&self, to: &BinlogPosition, gtid: Option<Gtid>) {
         advance_position(&self.delivered, to);
+        if let Some((uuid, gno)) = gtid {
+            lock(&self.delivered_gtid).add(uuid, gno);
+            *lock(&self.last_delivered_gtid) = Some((uuid, gno));
+        }
+    }
+
+    /// Credit a transaction the member needs nothing from, or already holds:
+    /// it counts as delivered and committed, without being in flight.
+    fn credit(&self, upto: &BinlogPosition, gtid: Option<Gtid>) {
+        self.commit(upto);
+        advance_position(&self.delivered, upto);
+        if let Some((uuid, gno)) = gtid {
+            lock(&self.delivered_gtid).add(uuid, gno);
+            self.fold_gtid(uuid, gno);
+        }
+    }
+
+    /// Whether every envelope delivered to this member has been committed.
+    ///
+    /// Under GTID positioning, positions cannot tell: after a failover the
+    /// `delivered` and `committed` recorded on the previous server stay above
+    /// every new one, and compare equal while an envelope is in flight.
+    fn is_idle(&self, gtid_positioned: bool) -> bool {
+        if gtid_positioned {
+            let last = *lock(&self.last_delivered_gtid);
+            last.is_none_or(|(uuid, gno)| lock(&self.gtid).contains(uuid, gno))
+        } else {
+            self.delivered() == self.committed()
+        }
     }
 
     /// Whether the pump routes the commit at `at` to this member: streaming,
-    /// and `delivered < at`.
+    /// and not yet delivered. `gtid` is the transaction's GTID when the dump is
+    /// GTID-positioned, and `None` otherwise.
+    ///
+    /// Under file+offset positioning, "delivered" is `delivered < at`. Under
+    /// GTID positioning it is membership of the transaction's GTID in
+    /// `delivered_gtid`: after a failover the dump reads another server's
+    /// binlog, whose coordinates do not order against the ones recorded from
+    /// the previous server, so comparing them would skip transactions the
+    /// member never received.
     ///
     /// Invariants for every caller that gets `true`:
     /// - call [`Self::deliver`] with `at` before the next `routes` check
@@ -314,8 +368,14 @@ impl AckSlot {
     ///   resets `delivered` with `committed`
     ///
     /// Why `delivered` and not `committed` is the module-level consistency note.
-    fn routes(&self, at: &BinlogPosition) -> bool {
-        self.has(STREAMING) && *lock(&self.delivered) < *at
+    fn routes(&self, at: &BinlogPosition, gtid: Option<Gtid>) -> bool {
+        if !self.has(STREAMING) {
+            return false;
+        }
+        match gtid {
+            Some((uuid, gno)) => !lock(&self.delivered_gtid).contains(uuid, gno),
+            None => *lock(&self.delivered) < *at,
+        }
     }
 
     fn has(&self, flag: u8) -> bool {
@@ -329,6 +389,10 @@ impl AckSlot {
 #[derive(Default)]
 struct AckTable {
     members: RwLock<HashMap<MemberKey, Arc<AckSlot>>>,
+    /// Whether the shared dump is GTID-positioned, decided once when the pump
+    /// starts. Selects how [`AckSlot::routes`] and [`Self::credit_idle`] tell
+    /// what a member was already delivered.
+    gtid_positioned: AtomicBool,
 }
 
 impl AckTable {
@@ -362,6 +426,8 @@ impl AckTable {
             Some(slot) => {
                 *lock(&slot.committed) = at.clone();
                 *lock(&slot.delivered) = at;
+                *lock(&slot.delivered_gtid) = gtid_seed.clone();
+                *lock(&slot.last_delivered_gtid) = None;
                 *lock(&slot.gtid) = gtid_seed;
                 slot.state.store(held, Ordering::Release);
             }
@@ -413,19 +479,15 @@ impl AckTable {
     /// Credit streaming members with no in-flight envelopes up to `upto` — the
     /// connection's in-order replay guarantees their routed changes below `upto`
     /// were already delivered. Held/detached members are never credited.
-    fn credit_idle(&self, upto: &BinlogPosition, gtid: Option<(uuid::Uuid, u64)>) {
+    fn credit_idle(&self, upto: &BinlogPosition, gtid: Option<Gtid>) {
+        let gtid_positioned = self.gtid_positioned();
         for slot in read_lock(&self.members).values() {
             let s = slot.state.load(Ordering::Acquire);
-            if s & (LIVE | STREAMING) == (LIVE | STREAMING) && slot.delivered() == slot.committed()
-            {
-                slot.commit(upto);
-                slot.deliver(upto);
+            if s & (LIVE | STREAMING) == (LIVE | STREAMING) && slot.is_idle(gtid_positioned) {
                 // An idle member's committed advances past this transaction, so
                 // its executed set gains the transaction's GTID too (idempotent
                 // — re-folding an already-present GTID is a no-op).
-                if let Some((uuid, gno)) = gtid {
-                    slot.fold_gtid(uuid, gno);
-                }
+                slot.credit(upto, gtid);
             }
         }
     }
@@ -440,6 +502,21 @@ impl AckTable {
             }
             None => false,
         }
+    }
+
+    fn set_gtid_positioned(&self, gtid_positioned: bool) {
+        self.gtid_positioned
+            .store(gtid_positioned, Ordering::Release);
+    }
+
+    fn gtid_positioned(&self) -> bool {
+        self.gtid_positioned.load(Ordering::Acquire)
+    }
+
+    /// The GTID [`AckSlot::routes`] decides by: the transaction's own under
+    /// GTID positioning, `None` (route by position) otherwise.
+    fn routing_gtid(&self, gtid: Option<Gtid>) -> Option<Gtid> {
+        gtid.filter(|_| self.gtid_positioned())
     }
 
     /// The shared resume position: the minimum `committed` over all members
@@ -1566,6 +1643,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
     // file+offset. When on, the dump is opened with `COM_BINLOG_DUMP_GTID` from
     // the intersection of members' executed sets, giving failover-safe resume.
     let use_gtid = detect_source_gtid(&params).await;
+    source.ack.set_gtid_positioned(use_gtid);
     let mut last_persist_at = Instant::now();
     // Throttles the head-poll + readiness heartbeat. Emitted on BOTH the idle
     // branch and the event path: the server streams its own binlog heartbeats
@@ -1792,6 +1870,12 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                     if let Some(target) = rotate_target(&rotate) {
                         current_file = target.file;
                         event_end_pos = target.pos;
+                    } else {
+                        // The fake rotate at the head of a dump names the file
+                        // the server reads from, which under GTID positioning
+                        // is the server's own choice (another server's, after
+                        // a failover), not the file of the shared floor.
+                        current_file = rotate.name().to_string();
                     }
                 }
                 Some(EventData::TableMapEvent(tme)) => {
@@ -2156,7 +2240,7 @@ async fn deliver_commit(
         else {
             continue;
         };
-        if !slot.routes(commit_pos) {
+        if !slot.routes(commit_pos, source.ack.routing_gtid(gtid)) {
             continue;
         }
         // O(1), no decode: freshness watermark + transaction count. The per-row
@@ -2186,7 +2270,7 @@ async fn deliver_commit(
             Box::new(rows),
             is_ready,
         );
-        slot.deliver(commit_pos);
+        slot.deliver(commit_pos, gtid);
         match deliver_to_member(
             &member.metrics,
             &member.sender,
@@ -2237,7 +2321,7 @@ async fn handle_statement(
         match kind {
             StatementKind::Truncate => {
                 let commit_pos = BinlogPosition::new(current_file.to_string(), event_end_pos);
-                if !slot.routes(&commit_pos) {
+                if !slot.routes(&commit_pos, source.ack.routing_gtid(gtid)) {
                     continue;
                 }
                 member.metrics.inc_truncate();
@@ -2277,7 +2361,7 @@ async fn handle_statement(
                     batch,
                     is_ready,
                 );
-                slot.deliver(&commit_pos);
+                slot.deliver(&commit_pos, gtid);
                 match deliver_to_member(
                     &member.metrics,
                     &member.sender,
@@ -3238,7 +3322,7 @@ mod tests {
         let next_commit = pos("binlog.000042", 1_182);
         let slot = ack.slot(&member).expect("registered member has a slot");
         assert!(
-            slot.routes(&next_commit),
+            slot.routes(&next_commit, None),
             "commit at {next_commit} was suppressed as already-applied, so its rows are lost"
         );
     }
@@ -3322,7 +3406,7 @@ mod tests {
         ack.promote_ready_members();
         let slot = ack.slot(&key("db", "a")).expect("slot");
         slot.commit(&pos("binlog.000001", 700));
-        slot.deliver(&pos("binlog.000001", 900));
+        slot.deliver(&pos("binlog.000001", 900), None);
         ack.detach(&key("db", "a"));
         // Rejoin re-resolves the start position from the member's sidecar
         // (layout-checked) and RESETS the slot to it — here a resume at 650,
@@ -3356,7 +3440,7 @@ mod tests {
         // `a` has an in-flight envelope: delivered past committed.
         ack.slot(&key("db", "a"))
             .expect("slot")
-            .deliver(&pos("binlog.000001", 300));
+            .deliver(&pos("binlog.000001", 300), None);
         ack.credit_idle(&pos("binlog.000001", 500), None);
 
         // `b` (idle) was credited to 500; `a` holds the floor at its committed
@@ -3394,7 +3478,7 @@ mod tests {
         ack.promote_ready_members();
         let slot = ack.slot(&key("db", "a")).expect("slot");
 
-        slot.deliver(&pos("binlog.000010", 900));
+        slot.deliver(&pos("binlog.000010", 900), None);
         slot.commit(&pos("binlog.000010", 900));
         assert_eq!(slot.committed(), pos("binlog.000010", 900));
 
@@ -3407,9 +3491,9 @@ mod tests {
         );
 
         // The replay is skipped, and only a strictly newer position is routed.
-        assert!(!slot.routes(&pos("binlog.000005", 100)));
-        assert!(!slot.routes(&pos("binlog.000010", 900)));
-        assert!(slot.routes(&pos("binlog.000010", 901)));
+        assert!(!slot.routes(&pos("binlog.000005", 100), None));
+        assert!(!slot.routes(&pos("binlog.000010", 900), None));
+        assert!(slot.routes(&pos("binlog.000010", 901), None));
     }
 
     /// A reconnect replay must not leave a row at an older version.
@@ -3434,8 +3518,8 @@ mod tests {
         // receives, in order.
         let mut channel = Vec::new();
         let route = |at: &BinlogPosition, channel: &mut Vec<BinlogPosition>| {
-            if slot.routes(at) {
-                slot.deliver(at);
+            if slot.routes(at, None) {
+                slot.deliver(at, None);
                 channel.push(at.clone());
             }
         };
@@ -3491,8 +3575,8 @@ mod tests {
 
         let mut channel = Vec::new();
         let route = |at: &BinlogPosition, slot: &AckSlot, channel: &mut Vec<BinlogPosition>| {
-            if slot.routes(at) {
-                slot.deliver(at);
+            if slot.routes(at, None) {
+                slot.deliver(at, None);
                 channel.push(at.clone());
             }
         };
@@ -3746,7 +3830,7 @@ mod tests {
                 let done = Arc::clone(&done);
                 s.spawn(move || {
                     for p in 2..=N {
-                        slot.deliver(&pos("binlog.000001", p));
+                        slot.deliver(&pos("binlog.000001", p), None);
                         slot.commit(&pos("binlog.000001", p));
                     }
                     done.store(true, Ordering::Release);
@@ -3804,5 +3888,107 @@ mod tests {
             Some(final_committed),
             "floor converged to the member's committed"
         );
+    }
+
+    fn gtid_of(src: &str, gno: u64) -> Gtid {
+        (uuid::Uuid::parse_str(src).expect("uuid"), gno)
+    }
+
+    /// After a failover, the new primary's binlog coordinates do not order
+    /// against the old primary's. A member resumed by GTID still holds the old
+    /// primary's position, so every new-primary commit that sorts below it
+    /// was skipped, and the idle credit then folded its GTID into the executed
+    /// set: the transaction was recorded as applied and never redelivered.
+    #[tokio::test]
+    async fn a_failover_resume_routes_by_gtid_not_by_the_old_servers_position() {
+        let ack = AckTable::default();
+        ack.set_gtid_positioned(true);
+        let member = key("db", "t");
+        // Persisted on the old primary, which had rotated to a later file.
+        ack.register_with_gtid(
+            &member,
+            pos("binlog.000005", 2113),
+            gtids(&format!("{SRC_A}:1-11")),
+            false,
+        );
+        ack.promote_ready_members();
+        let slot = ack.slot(&member).expect("slot");
+
+        // The new primary's first transaction, in its own (lower) file.
+        let at = pos("binlog.000002", 500);
+        let new_txn = gtid_of(SRC_B, 1);
+        assert!(
+            slot.routes(&at, ack.routing_gtid(Some(new_txn))),
+            "a transaction the member never received must be routed"
+        );
+        slot.deliver(&at, Some(new_txn));
+        ack.credit_idle(&at, Some(new_txn));
+        assert!(
+            !slot.gtid_snapshot().contains(new_txn.0, new_txn.1),
+            "an in-flight transaction must not be credited as applied"
+        );
+
+        // A later transaction for another table must not be credited to this
+        // member while its envelope is in flight either.
+        ack.credit_idle(&pos("binlog.000002", 900), Some(gtid_of(SRC_B, 2)));
+        assert_eq!(slot.gtid_snapshot(), gtids(&format!("{SRC_A}:1-11")));
+
+        SharedPositionCommitter {
+            slot: Arc::clone(&slot),
+            flush_to: at.clone(),
+            dataset: "t".into(),
+            source_commit_ts_ms: None,
+            gtids: vec![new_txn],
+        }
+        .commit()
+        .await
+        .expect("the consumer acknowledges the transaction");
+        ack.credit_idle(&pos("binlog.000002", 1200), Some(gtid_of(SRC_B, 3)));
+        assert_eq!(
+            slot.gtid_snapshot(),
+            gtids(&format!("{SRC_A}:1-11,{SRC_B}:1:3")),
+            "once idle again, the member is credited"
+        );
+    }
+
+    /// Under GTID positioning the shared dump starts from the intersection of
+    /// the members' executed sets, so a member ahead of it is sent transactions
+    /// it already applied; those are skipped by GTID, whatever their position.
+    #[test]
+    fn a_gtid_positioned_member_skips_what_it_already_holds() {
+        let ack = AckTable::default();
+        ack.set_gtid_positioned(true);
+        let member = key("db", "t");
+        ack.register_with_gtid(
+            &member,
+            pos("binlog.000001", 100),
+            gtids(&format!("{SRC_A}:1-11")),
+            false,
+        );
+        ack.promote_ready_members();
+        let slot = ack.slot(&member).expect("slot");
+
+        let later = pos("binlog.000001", 9000);
+        assert!(!slot.routes(&later, ack.routing_gtid(Some(gtid_of(SRC_A, 5)))));
+        assert!(!slot.routes(&later, ack.routing_gtid(Some(gtid_of(SRC_A, 11)))));
+        assert!(slot.routes(&later, ack.routing_gtid(Some(gtid_of(SRC_A, 12)))));
+
+        // Delivered once, not again on a reconnect replay.
+        slot.deliver(&later, Some(gtid_of(SRC_A, 12)));
+        assert!(!slot.routes(&later, ack.routing_gtid(Some(gtid_of(SRC_A, 12)))));
+    }
+
+    /// File+offset positioning keeps routing by position even when the
+    /// source's events carry GTIDs (`gtid_mode = ON_PERMISSIVE`).
+    #[test]
+    fn a_file_positioned_member_routes_by_position() {
+        let ack = AckTable::default();
+        let member = key("db", "t");
+        ack.register(&member, pos("binlog.000001", 500), false);
+        ack.promote_ready_members();
+        let slot = ack.slot(&member).expect("slot");
+        let gtid = Some(gtid_of(SRC_A, 1));
+        assert!(!slot.routes(&pos("binlog.000001", 400), ack.routing_gtid(gtid)));
+        assert!(slot.routes(&pos("binlog.000001", 600), ack.routing_gtid(gtid)));
     }
 }

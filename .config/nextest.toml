@@ -190,6 +190,15 @@ filter = 'test(=mysql::replication_e2e::mysql_binlog_replication_survives_a_dump
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 10 }
 
+# The `spice orca` test waits as long as the CLI itself may: up to 330s for the
+# Codex warning (the runtime's 120s health wait, Orca's 180s answer wait and 30s
+# between them), 90s for the project, then 30s each for Orca and the runtime to
+# stop, 480s in all. The global ceiling of 360s would kill it inside a wait the
+# CLI is still allowed to take. 600s keeps 1.25x headroom over the 480s.
+[[profile.default.overrides]]
+filter = 'test(=coding_agents::orca_runs_every_agent_through_spice_and_keeps_the_runtime_until_it_quits)'
+slow-timeout = { period = "120s", terminate-after = 5 }
+
 # Result-correctness parity lanes: Cayenne (and the Spice accelerators) against
 # standalone DuckDB/SQLite on the same rows. runtime's `result_correctness`
 # module is the accelerator lane.

@@ -33,6 +33,7 @@ permissions: {}
 
 jobs:
   test-approve-bot-pr-runs:
+    environment: secret-free
     name: Unit tests for approve_bot_pr_runs.sh
     runs-on: spiceai-dev-runners
     timeout-minutes: 5

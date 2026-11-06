@@ -32,8 +32,6 @@ util = { workspace = true, default-features = false, features = [] }
 url.workspace = true
 
 [dev-dependencies]
-aws-sdk-cognitoidentity.workspace = true
-aws-sdk-cognitoidentityprovider.workspace = true
 tempfile.workspace = true
 
 [lints]

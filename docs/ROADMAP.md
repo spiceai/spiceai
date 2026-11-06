@@ -15,22 +15,6 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### [v2.4](https://github.com/spiceai/spiceai/releases/tag/v2.4.0) (Released October 2026)
-
-**Focus:** Spice Cayenne by default, ingestion, caching, and AI decisions.
-
-**DataFusion:** v55
-
-- **Spice Cayenne by Default**: Datasets and views without `acceleration.engine` use Cayenne (except on native Windows), with automatic primary-key handling, persistent secondary indexes, and adaptive tuning (preview). Other accelerators are deprecated and scheduled for removal in v2.5.
-- **Faster Cayenne Lookups and Refreshes**: About 2x faster uncached primary-key lookups, and steady query latency during full refreshes.
-- **AI Decisions in SQL and HTTP**: SQL decision functions and an OpenAI-compatible `POST /v1/decisions` API.
-- **S3 Event-Driven Refresh**: `refresh_mode: changes` for accelerated S3 datasets via SQS event notifications.
-- **SQL Results-Cache Warmup** and a single shared `runtime.state` location for state kept across restarts and instances.
-- **New Connectors and Formats**: Hugging Face datasets, ORC, and Apache Iceberg tables without a catalog.
-- **Query Engine Upgrades**: Apache DataFusion v55, Arrow v59.3, Ballista v55, Vortex v0.86, and Iceberg v0.11.
-
-See the [v2.4.0 release notes](https://github.com/spiceai/spiceai/releases/tag/v2.4.0) for details and breaking changes. Fixes found after release ship in v2.4.x patch releases.
-
 ### [v2.5](https://github.com/spiceai/spiceai/milestone/102) (December 2026)
 
 **Focus:** Cayenne as the only accelerator, secure by default, and BYOC.

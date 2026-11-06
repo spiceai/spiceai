@@ -1,12 +1,17 @@
 name: retention
 description: >
-  Time retention keeps rows newer than `retention_period` by the time column
-  (and, as it stands, removes rows with no time),
-  and `retention_sql` deletes the rows its predicate matches, leaving rows the
+  Time retention keeps rows newer than `retention_period` by the time column,
+  and rows with no time, which the refresh window that `retention_period` implies
+  loads and retention never removes; `retention_sql` deletes the rows its predicate matches, leaving rows the
   predicate cannot evaluate (NULL); both apply again after every full refresh
   reloads the source's old rows; and a query that finds no rows in the
   acceleration under `on_zero_results: use_source` does not bring the removed
-  rows back from the source.
+  rows back from the source. ISO 8601 text times with UTC offsets, in a table
+  with no primary key, compare as the instants they name: time retention keeps
+  the rows inside the period and physically deletes the expired rows a wider
+  load window brought in, a `retention_sql` predicate that casts the text to a
+  timestamp deletes exactly the rows it is true for, and no retention check
+  fails.
 
 sources:
   src: { kind: postgres }
@@ -42,6 +47,41 @@ spicepod:
         retention_check_enabled: true
         retention_check_interval: 1s
         on_zero_results: use_source
+    - from: postgres:public.iso_events
+      name: iso_by_time
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: iso8601
+      acceleration:
+        enabled: true
+        engine: '${matrix.engine}'
+        refresh_mode: full
+        retention_period: 30d
+        retention_check_enabled: true
+        retention_check_interval: 1s
+    - from: postgres:public.iso_events
+      name: iso_by_sql
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: '${matrix.engine}'
+        refresh_mode: full
+        retention_sql: DELETE FROM iso_by_sql WHERE CAST(ts AS TIMESTAMP) < now() - INTERVAL '30 days'
+        retention_check_enabled: true
+        retention_check_interval: 1s
+    - from: postgres:public.iso_events
+      name: iso_window
+      params: ${sources.src.params}
+      time_column: ts
+      time_format: iso8601
+      acceleration:
+        enabled: true
+        engine: '${matrix.engine}'
+        refresh_mode: full
+        refresh_data_window: 365d
+        retention_period: 30d
+        retention_check_enabled: true
+        retention_check_interval: 1s
 
 defaults:
   # A cluster buckets each acceleration on this column (--cluster).
@@ -57,13 +97,19 @@ steps:
           CASE WHEN i % 7 = 0 THEN -i WHEN i % 13 = 0 THEN NULL ELSE i END
           FROM generate_series(1, 900) i;
         INSERT INTO events VALUES (901, NULL, 'live', 1), (902, now()::timestamp + INTERVAL '1 day', 'live', 2);
+        CREATE TABLE iso_events (id int, ts text, v int);
+        INSERT INTO iso_events SELECT i,
+          to_char((now() AT TIME ZONE 'UTC') - (i % 90) * INTERVAL '1 day' - INTERVAL '1 hour' + o.shift, 'YYYY-MM-DD"T"HH24:MI:SS') || o.suffix, i
+          FROM generate_series(1, 900) i
+          JOIN (VALUES (0, INTERVAL '0', 'Z'), (1, INTERVAL '9 hours', '+09:00'), (2, INTERVAL '-7 hours', '-07:00')) AS o(k, shift, suffix) ON o.k = i % 3;
+        INSERT INTO iso_events VALUES (901, NULL, 1);
   - start: {}
 
-  # Time retention also removes a row whose time is NULL, unlike retention_sql,
-  # which keeps a row its predicate cannot evaluate (an open question, asserted here
-  # as it stands).
+  # Time retention keeps a row whose time is NULL (row 901), as retention_sql keeps
+  # a row its predicate cannot evaluate: the refresh loads it, and retention removes
+  # only rows older than the period.
   - query: SELECT * FROM by_time
-    oracle-sql: SELECT * FROM events WHERE ts >= now()::timestamp - INTERVAL '30 days'
+    oracle-sql: SELECT * FROM events WHERE ts >= now()::timestamp - INTERVAL '30 days' OR ts IS NULL
     eventually: 30s
   - query: SELECT * FROM by_sql
     oracle-sql: SELECT * FROM events WHERE NOT coalesce(kind = 'expired' OR v < 0, false)
@@ -77,6 +123,23 @@ steps:
     oracle-sql: SELECT * FROM events WHERE false
   - query: SELECT count(*) FROM by_sql WHERE v < 0
     expect: { rows: [["0"]] }
+  # The ISO 8601 table has no primary key, so a Cayenne acceleration deletes by
+  # row position; Vortex cannot evaluate the casts these filters need.
+  - query: SELECT * FROM iso_by_time
+    oracle-sql: SELECT * FROM iso_events WHERE ts::timestamptz >= now() - INTERVAL '30 days' OR ts IS NULL
+    eventually: 30s
+  - query: SELECT * FROM iso_by_sql
+    oracle-sql: SELECT * FROM iso_events WHERE NOT coalesce(ts::timestamptz < now() - INTERVAL '30 days', false)
+    eventually: 30s
+  # A load window wider than the retention period brings expired rows in, and
+  # retention deletes them rather than only hiding them (Cayenne's scans hide them
+  # either way).
+  - query: SELECT * FROM iso_window
+    oracle-sql: SELECT * FROM iso_events WHERE ts::timestamptz >= now() - INTERVAL '30 days'
+    eventually: 30s
+  - assert-log: { contains: ['Evicted [1-9][0-9]* records for iso_window'] }
+    eventually: 30s
+  - assert-log: { lacks: ['Error running retention check'] }
   # The fallback is live: a row added at the source since the last refresh is
   # not in the acceleration, so the query is answered from the source.
   - source-exec: { src: "INSERT INTO events VALUES (2000, now()::timestamp, 'live', 2000)" }
@@ -88,7 +151,7 @@ steps:
   - refresh: by_time
   - refresh: by_sql
   - query: SELECT * FROM by_time
-    oracle-sql: SELECT * FROM events WHERE ts >= now()::timestamp - INTERVAL '30 days'
+    oracle-sql: SELECT * FROM events WHERE ts >= now()::timestamp - INTERVAL '30 days' OR ts IS NULL
     eventually: 30s
   - query: SELECT * FROM by_sql
     oracle-sql: SELECT * FROM events WHERE NOT coalesce(kind = 'expired' OR v < 0, false)
