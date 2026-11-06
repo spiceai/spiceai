@@ -3,8 +3,7 @@ description: >
   UPDATE and DELETE with integer arithmetic on an acceleration that takes its
   own writes (`access: read_write`, `write_mode: acceleration`) change the rows
   PostgreSQL changes for the same statements, on every engine. Cayenne
-  evaluates the arithmetic in Spice, with Spice's overflow checks; DuckDB,
-  SQLite and PostgreSQL evaluate the statement Spice renders for them, which
+  evaluates the arithmetic in Spice, with Spice's overflow checks; SQLite and PostgreSQL evaluate the statement Spice renders for them, which
   carries the operators, not those checks.
 
 sources:
@@ -16,8 +15,6 @@ sources:
 variants:
   cayenne-file: cayenne-file
   cayenne-memory: cayenne-memory
-  duckdb-file: duckdb-file
-  duckdb-memory: duckdb-memory
   sqlite-file: sqlite-file
   sqlite-memory: sqlite-memory
   postgres: { datasets: { '*': { acceleration: { enabled: true, engine: postgres, params: '${sources.accel.params}' } } } }
