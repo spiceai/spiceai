@@ -111,6 +111,12 @@ fn main() {
             spiced::Args::from_arg_matches_mut(&mut matches).unwrap_or_else(|err| err.exit());
         (args, open_telemetry_deprecated, flight_chosen, http_chosen)
     };
+    // A usage error like clap's own conflicts, reported before anything starts.
+    if let Err(message) = args.runtime.cluster.validate_role() {
+        spiced::Args::command()
+            .error(clap::error::ErrorKind::ArgumentConflict, message)
+            .exit();
+    }
     // Mutable extraction removes typed values from `ArgMatches`; ending its
     // scope here also drops clap's remaining parse state before startup. The
     // enrollment key is left only in the zeroizing `Args` value, which the

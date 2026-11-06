@@ -217,7 +217,8 @@ async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext)
 
     warn_beta_once();
 
-    let enabled_functions = enabled_function_declarations(&app.functions);
+    let enabled_functions =
+        refuse_sidecar_code_functions(runtime, enabled_function_declarations(&app.functions));
     if enabled_functions.is_empty() {
         return;
     }
@@ -366,13 +367,51 @@ pub fn registered_table_udf_name(ctx: &SessionContext, name: &str) -> Option<Str
         .cloned()
 }
 
-fn function_executes_code(decl: &Function) -> bool {
-    let scheme = decl
-        .from
+/// The `from` scheme of a function declaration, lowercased: `sql`, `http`, `wasm`, ...
+fn function_scheme(decl: &Function) -> String {
+    decl.from
         .split_once(':')
         .map_or(decl.from.as_str(), |(scheme, _)| scheme)
-        .to_ascii_lowercase();
-    matches!(scheme.as_str(), "http" | "https")
+        .to_ascii_lowercase()
+}
+
+fn function_executes_code(decl: &Function) -> bool {
+    matches!(function_scheme(decl).as_str(), "http" | "https")
+}
+
+/// Whether a sidecar refuses this declaration. HTTP and WebAssembly functions
+/// run code or make requests from inside the sidecar, which guards its
+/// application's access to the cluster. SQL functions are queries over the
+/// sidecar's own catalog and are kept.
+fn sidecar_refuses_function(decl: &Function) -> bool {
+    matches!(function_scheme(decl).as_str(), "http" | "https" | "wasm")
+}
+
+/// The error logged for each function a sidecar refuses to register.
+fn sidecar_refused_function_message(name: &str) -> String {
+    format!(
+        "Function '{name}' was not registered, so queries that call it fail: a sidecar does not run \
+         HTTP or WebAssembly functions. Remove it from the sidecar's Spicepod, or start Spice \
+         without `--role sidecar`."
+    )
+}
+
+/// On a sidecar, drops the declarations [`sidecar_refuses_function`] refuses,
+/// logging each; on any other role, returns `functions` unchanged.
+fn refuse_sidecar_code_functions(
+    runtime: &crate::Runtime,
+    mut functions: Vec<Function>,
+) -> Vec<Function> {
+    if runtime.role() == crate::config::Role::Sidecar {
+        functions.retain(|decl| {
+            let refused = sidecar_refuses_function(decl);
+            if refused {
+                tracing::error!("{}", sidecar_refused_function_message(&decl.name));
+            }
+            !refused
+        });
+    }
+    functions
 }
 
 fn enabled_function_declarations(functions: &[Function]) -> Vec<Function> {
@@ -531,6 +570,7 @@ async fn apply_function_diff_inner(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let functions_to_register = refuse_sidecar_code_functions(runtime, functions_to_register);
     let functions_to_register =
         resolve_function_params(runtime.secrets(), &functions_to_register).await;
     let (built, errors) =
@@ -884,6 +924,31 @@ mod tests {
             metrics: None,
             as_tool: true,
         }
+    }
+
+    /// A sidecar refuses the function schemes that run code or make requests,
+    /// and keeps SQL functions. The message names the function and the fix.
+    #[test]
+    fn sidecar_refuses_http_and_wasm_functions() {
+        for (from, refused) in [
+            ("sql", false),
+            ("SQL", false),
+            ("http://functions.internal/score", true),
+            ("https://functions.internal/score", true),
+            ("HTTPS://functions.internal/score", true),
+            ("wasm", true),
+            ("wasm:module", true),
+        ] {
+            let mut decl = test_user_function("f", true);
+            decl.from = from.to_string();
+            assert_eq!(sidecar_refuses_function(&decl), refused, "{from}");
+        }
+        assert_eq!(
+            sidecar_refused_function_message("score"),
+            "Function 'score' was not registered, so queries that call it fail: a sidecar does not \
+             run HTTP or WebAssembly functions. Remove it from the sidecar's Spicepod, or start \
+             Spice without `--role sidecar`."
+        );
     }
 
     #[test]
