@@ -422,6 +422,13 @@ jobs:
       - build
       - setup-model-matrix
     if: ${{ needs.setup-model-matrix.outputs.matrix != '[]' }}
+    environment: ci
+    permissions:
+      contents: read
+      actions: read
+      # The Spicepod's `github:` dataset reads this repository's issues with `GITHUB_TOKEN`.
+      issues: read
+      pull-requests: read
     strategy:
       fail-fast: false
       matrix:

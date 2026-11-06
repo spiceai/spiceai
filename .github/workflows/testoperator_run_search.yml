@@ -54,6 +54,11 @@ jobs:
     name: Run Search tests
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
+    environment: ci
+    permissions:
+      contents: read
+      actions: read
+      id-token: write  # RustFS credentials
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

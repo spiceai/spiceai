@@ -39,6 +39,7 @@ jobs:
   test-search:
     name: Test Search Integration
     runs-on: spiceai-macos-large
+    environment: ci
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -50,8 +51,10 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Set up API Keys
+        env:
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
-          echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
+          printf 'SPICE_OPENAI_API_KEY="%s"\n' "$SPICE_OPENAI_API_KEY" > .env
 
       - name: Run search integration tests
         env:
