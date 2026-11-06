@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{
     collections::HashMap,
-    ffi::OsString,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
@@ -47,7 +46,7 @@ use runtime::{Runtime, status::ComponentStatus};
 use runtime_acceleration::snapshot::{
     AccelerationEngine, ForceCreate, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use spicepod::acceleration::{
     RefreshMode, SnapshotsCompaction, SnapshotsCreationPolicy, SnapshotsTrigger,
 };
@@ -233,6 +232,21 @@ struct SnapshotFixture {
 }
 
 impl SnapshotFixture {
+    /// Points the fixture at a new, empty local acceleration path, so the next
+    /// runtime starts with no local data and bootstraps from the published
+    /// snapshot. The earlier runtime's files are left where they are: a runtime
+    /// that ran earlier in this process can keep its Cayenne metastore open, and
+    /// a metastore deleted and recreated under the same path is not one the
+    /// next runtime can read.
+    fn restart_on_empty_local_storage(&mut self) {
+        let name = self
+            .local_db_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.local_db_path = self.local_db_path.with_file_name(format!("restarted_{name}"));
+    }
+
     fn dataset(
         &self,
         snapshot_behavior: DatasetSnapshotBehavior,
@@ -348,10 +362,15 @@ impl SnapshotFixture {
             "cayenne",
             RefreshOnStartup::Auto,
         );
+        let app = runtime
+            .read_app()
+            .await
+            .ok_or_else(|| anyhow!("The runtime has no app"))?;
         let dataset = runtime::component::dataset::builder::DatasetBuilder::try_from(
             spicepod_dataset,
         )
         .map_err(|err| anyhow!("Building the taxi_trips dataset: {err}"))?
+        .with_app(app)
         .with_runtime(Arc::clone(runtime))
         .build()
         .map_err(|err| anyhow!("Building the taxi_trips dataset: {err}"))?;
@@ -449,65 +468,6 @@ fn build_snapshots_config(
     }
 }
 
-#[expect(clippy::expect_used)]
-fn build_metadata_document(
-    context: &SnapshotS3Context,
-    dataset_name: &str,
-    snapshot_objects: &[ObjectMeta],
-    schema: &SchemaRef,
-) -> Value {
-    let location = context.location_uri();
-    let last_updated_ms = Utc::now().timestamp_millis();
-
-    let mut snapshots: Vec<Value> = snapshot_objects
-        .iter()
-        .enumerate()
-        .map(|(idx, meta)| {
-            let timestamp_ms = meta.last_modified.timestamp_millis();
-            let snapshot_path = format!("s3://{SNAPSHOT_BUCKET}/{}", meta.location);
-            let checksum = meta.e_tag.clone().unwrap_or_default();
-            json!({
-                "snapshot-id": idx,
-                "timestamp-ms": timestamp_ms,
-                "snapshot": snapshot_path,
-                "snapshot-checksum": checksum,
-                "snapshot-checksum-algorithm": if checksum.is_empty() { Value::Null } else { Value::from("ETag") },
-                "snapshot-size": meta.size,
-            })
-        })
-        .collect();
-
-    snapshots.sort_by_key(|value| {
-        value
-            .get("timestamp-ms")
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
-    });
-
-    let current_snapshot_id = snapshots
-        .last()
-        .and_then(|value| value.get("snapshot-id").and_then(Value::as_i64))
-        .unwrap_or(0);
-
-    let schema_json = serde_json::to_value(schema.as_ref()).expect("Serializing schema to JSON");
-
-    json!({
-        "format-version": 1,
-        "location": location,
-        "last-updated-ms": last_updated_ms,
-        dataset_name: {
-            "name": dataset_name,
-            "schemas": [
-                { "schema-id": 0, "schema": schema_json }
-            ],
-            "current-schema-id": 0,
-            "snapshots": snapshots,
-            "current-snapshot-id": current_snapshot_id,
-            "properties": {},
-        }
-    })
-}
-
 fn build_snapshot_store(endpoint: &str) -> Result<Arc<dyn ObjectStore>> {
     Ok(Arc::new(
         AmazonS3Builder::new()
@@ -603,22 +563,18 @@ async fn prepare_fixture(test_name: &str, engine: &'static str) -> Result<Snapsh
 
     // Shutdown resigns the snapshot writer lease, and a snapshot that has not
     // taken the lease by then is skipped, so the first snapshot is awaited first.
-    let snapshot_objects = context
+    context
         .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_mins(1))
         .await?;
 
     runtime.shutdown().await;
 
-    let metadata = build_metadata_document(
-        &context,
-        TAXI_TRIPS_DATASET_NAME,
-        &snapshot_objects,
-        &schema,
-    );
-    context
-        .write_metadata(&metadata)
-        .await
-        .context("Writing initial snapshot metadata")?;
+    // The runtime's own `metadata.json` is what a bootstrap reads, so the fixture
+    // keeps it as published.
+    let initial_snapshot_count = context
+        .published_snapshots(TAXI_TRIPS_DATASET_NAME)
+        .await?
+        .len();
 
     Ok(SnapshotFixture {
         context,
@@ -629,7 +585,7 @@ async fn prepare_fixture(test_name: &str, engine: &'static str) -> Result<Snapsh
         schema,
         baseline,
         engine,
-        initial_snapshot_count: snapshot_objects.len(),
+        initial_snapshot_count,
     })
 }
 
@@ -694,22 +650,18 @@ async fn prepare_sqlite_fixture(test_name: &str) -> Result<SnapshotFixture> {
 
     // Shutdown resigns the snapshot writer lease, and a snapshot that has not
     // taken the lease by then is skipped, so the first snapshot is awaited first.
-    let snapshot_objects = context
+    context
         .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_mins(1))
         .await?;
 
     runtime.shutdown().await;
 
-    let metadata = build_metadata_document(
-        &context,
-        TAXI_TRIPS_DATASET_NAME,
-        &snapshot_objects,
-        &schema,
-    );
-    context
-        .write_metadata(&metadata)
-        .await
-        .context("Writing initial snapshot metadata")?;
+    // The runtime's own `metadata.json` is what a bootstrap reads, so the fixture
+    // keeps it as published.
+    let initial_snapshot_count = context
+        .published_snapshots(TAXI_TRIPS_DATASET_NAME)
+        .await?
+        .len();
 
     Ok(SnapshotFixture {
         context,
@@ -720,39 +672,8 @@ async fn prepare_sqlite_fixture(test_name: &str) -> Result<SnapshotFixture> {
         schema,
         baseline,
         engine: "sqlite",
-        initial_snapshot_count: snapshot_objects.len(),
+        initial_snapshot_count,
     })
-}
-
-fn remove_existing_local_files(path: &Path) {
-    let candidates = [
-        path.to_path_buf(),
-        path_with_appended_suffix(path, "-wal"),
-        path.with_added_extension("wal"),
-        path_with_appended_suffix(path, "-shm"),
-    ];
-    for candidate in candidates {
-        if let Err(err) = if candidate.is_dir() {
-            std::fs::remove_dir_all(&candidate)
-        } else {
-            std::fs::remove_file(&candidate)
-        } && err.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(
-                "Failed to remove local acceleration file {}: {err}",
-                candidate.display()
-            );
-        }
-    }
-}
-
-fn path_with_appended_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut file_name = path
-        .file_name()
-        .map(OsString::from)
-        .expect("database path should include a file name");
-    file_name.push(suffix);
-    path.with_file_name(file_name)
 }
 
 /// Appends `count` copies of the CSV's last data row, growing the source without
@@ -805,9 +726,9 @@ async fn snapshot_int_test1_cayenne_bootstrap_from_s3() -> Result<()> {
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_cayenne_fixture("snapshot_int_test1").await?;
+            let mut fixture = prepare_cayenne_fixture("snapshot_int_test1").await?;
 
-            remove_existing_local_files(&fixture.local_db_path);
+            fixture.restart_on_empty_local_storage();
 
             let dataset = fixture.dataset(
                 DatasetSnapshotBehavior::Enabled,
@@ -866,9 +787,9 @@ async fn snapshot_int_test2_cayenne_bootstrap_without_federation() -> Result<()>
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_cayenne_fixture("snapshot_int_test2").await?;
+            let mut fixture = prepare_cayenne_fixture("snapshot_int_test2").await?;
 
-            remove_existing_local_files(&fixture.local_db_path);
+            fixture.restart_on_empty_local_storage();
 
             let dataset = fixture.dataset(
                 DatasetSnapshotBehavior::BootstrapOnly,
@@ -924,9 +845,9 @@ async fn snapshot_int_test3_sqlite_bootstrap_from_s3() -> Result<()> {
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_sqlite_fixture("snapshot_int_test3").await?;
+            let mut fixture = prepare_sqlite_fixture("snapshot_int_test3").await?;
 
-            remove_existing_local_files(&fixture.local_db_path);
+            fixture.restart_on_empty_local_storage();
 
             let dataset = fixture.dataset(
                 DatasetSnapshotBehavior::Enabled,
@@ -1026,7 +947,7 @@ async fn snapshot_int_test5_creates_and_uses_snapshot_on_restart() -> Result<()>
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_cayenne_fixture("snapshot_int_test5").await?;
+            let mut fixture = prepare_cayenne_fixture("snapshot_int_test5").await?;
 
             let metadata = fixture.context.metadata_json().await?;
             assert_eq!(
@@ -1072,7 +993,7 @@ async fn snapshot_int_test5_creates_and_uses_snapshot_on_restart() -> Result<()>
                 );
             }
 
-            remove_existing_local_files(&fixture.local_db_path);
+            fixture.restart_on_empty_local_storage();
 
             let dataset = fixture.dataset(
                 DatasetSnapshotBehavior::Enabled,
@@ -1209,7 +1130,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_cayenne_fixture("snapshot_int_test7").await?;
+            let mut fixture = prepare_cayenne_fixture("snapshot_int_test7").await?;
             let schema = Arc::clone(fixture.schema());
             let runtime = fixture
                 .snapshots_only_runtime("snapshot_int_test7_prepare")
@@ -1276,7 +1197,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
 
             runtime.shutdown().await;
 
-            remove_existing_local_files(&fixture.local_db_path);
+            fixture.restart_on_empty_local_storage();
 
             let dataset = fixture.dataset(
                 DatasetSnapshotBehavior::Enabled,
@@ -1323,7 +1244,7 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_duckdb_fixture("snapshot_int_test8").await?;
+            let mut fixture = prepare_duckdb_fixture("snapshot_int_test8").await?;
             let schema = Arc::clone(fixture.schema());
 
             // Step 1: Create database fragmentation by inserting and deleting data
@@ -1454,7 +1375,7 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
             runtime.shutdown().await;
 
             // Step 4: Verify the compacted snapshot can be downloaded and used
-            remove_existing_local_files(&fixture.local_db_path);
+            fixture.restart_on_empty_local_storage();
 
             // The manager published the compacted snapshot as current, so a restart
             // bootstraps from it.
@@ -2047,7 +1968,7 @@ async fn snapshot_int_test14_file_create_skips_snapshot_bootstrap() -> Result<()
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_cayenne_fixture("snapshot_int_test14").await?;
+            let mut fixture = prepare_cayenne_fixture("snapshot_int_test14").await?;
             let source_path = PathBuf::from(
                 fixture
                     .dataset_from
@@ -2057,7 +1978,7 @@ async fn snapshot_int_test14_file_create_skips_snapshot_bootstrap() -> Result<()
                     })?,
             );
 
-            remove_existing_local_files(&fixture.local_db_path);
+            fixture.restart_on_empty_local_storage();
 
             let snapshot_rows = {
                 let dataset = fixture.dataset(
@@ -2117,16 +2038,31 @@ async fn snapshot_int_test14_file_create_skips_snapshot_bootstrap() -> Result<()
 
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime(Arc::clone(&runtime)).await?;
-            let rebuilt_rows = count_rows(&runtime)
+            let loaded_rows = count_rows(&runtime)
                 .await
                 .context("Counting rows after the file_create restart")?;
+            assert_ne!(
+                loaded_rows, snapshot_rows,
+                "file_create should not bootstrap back the snapshot it deleted"
+            );
+
+            // A file_create load does not refresh from the source on its own yet
+            // (#15919, guarded by known-failing/cayenne/cayenne-file-create-reload.yaml),
+            // so the rebuild from the grown source is requested here.
+            let source_rows = snapshot_rows + i64::try_from(FILE_CREATE_EXTRA_ROWS)?;
+            crate::acceleration::trigger_refresh(&runtime, TAXI_TRIPS_DATASET_NAME).await?;
+            let deadline = Instant::now() + Duration::from_mins(1);
+            let mut rebuilt_rows = loaded_rows;
+            while rebuilt_rows != source_rows && Instant::now() < deadline {
+                sleep(Duration::from_millis(100)).await;
+                rebuilt_rows = count_rows(&runtime).await.unwrap_or(rebuilt_rows);
+            }
             runtime.shutdown().await;
 
             assert_eq!(
-                rebuilt_rows,
-                snapshot_rows + i64::try_from(FILE_CREATE_EXTRA_ROWS)?,
-                "file_create should have rebuilt the acceleration from the grown source; \
-                 {snapshot_rows} rows means the snapshot it deleted was bootstrapped back"
+                rebuilt_rows, source_rows,
+                "file_create should rebuild the acceleration from the grown source \
+                 ({source_rows} rows), but it holds {rebuilt_rows} rows"
             );
 
             fixture.cleanup().await
