@@ -92,20 +92,20 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
                 port,
             );
 
-            let duckdb_mem_on_conflict_upsert = create_file_or_memory_test_dataset(
+            let cayenne_mem_on_conflict_upsert = create_file_or_memory_test_dataset(
                 OnConflictBehavior::Upsert,
                 "postgres:event_logs",
-                "duckdb_mem_on_conflict_upsert",
+                "cayenne_mem_on_conflict_upsert",
                 None,
                 port,
                 Mode::Memory,
                 "cayenne",
             );
 
-            let duckdb_mem_on_conflict_drop = create_file_or_memory_test_dataset(
+            let cayenne_mem_on_conflict_drop = create_file_or_memory_test_dataset(
                 OnConflictBehavior::Drop,
                 "postgres:event_logs",
-                "duckdb_mem_on_conflict_drop",
+                "cayenne_mem_on_conflict_drop",
                 None,
                 port,
                 Mode::Memory,
@@ -113,20 +113,20 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
             );
 
             let cayenne_file_path = random_db_name();
-            let duckdb_file_on_conflict_upsert = create_file_or_memory_test_dataset(
+            let cayenne_file_on_conflict_upsert = create_file_or_memory_test_dataset(
                 OnConflictBehavior::Upsert,
                 "postgres:event_logs",
-                "duckdb_file_on_conflict_upsert",
+                "cayenne_file_on_conflict_upsert",
                 Some(cayenne_file_path.clone()),
                 port,
                 Mode::File,
                 "cayenne",
             );
 
-            let duckdb_file_on_conflict_drop = create_file_or_memory_test_dataset(
+            let cayenne_file_on_conflict_drop = create_file_or_memory_test_dataset(
                 OnConflictBehavior::Drop,
                 "postgres:event_logs",
-                "duckdb_file_on_conflict_drop",
+                "cayenne_file_on_conflict_drop",
                 Some(cayenne_file_path.clone()),
                 port,
                 Mode::File,
@@ -178,10 +178,10 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
             let app = AppBuilder::new("on_conflict_behavior")
                 .with_dataset(pg_on_conflict_upsert)
                 .with_dataset(pg_on_conflict_drop)
-                .with_dataset(duckdb_mem_on_conflict_upsert)
-                .with_dataset(duckdb_mem_on_conflict_drop)
-                .with_dataset(duckdb_file_on_conflict_upsert)
-                .with_dataset(duckdb_file_on_conflict_drop)
+                .with_dataset(cayenne_mem_on_conflict_upsert)
+                .with_dataset(cayenne_mem_on_conflict_drop)
+                .with_dataset(cayenne_file_on_conflict_upsert)
+                .with_dataset(cayenne_file_on_conflict_drop)
                 .with_dataset(sqlite_mem_on_conflict_upsert)
                 .with_dataset(sqlite_mem_on_conflict_drop)
                 .with_dataset(sqlite_file_on_conflict_upsert)
@@ -229,24 +229,24 @@ WHERE event_name = 'File Download'
                 "SELECT * FROM pg_on_conflict_drop order by event_id asc",
             )
             .await?;
-            let duckdb_mem_upsert_data = get_query_result(
+            let cayenne_mem_upsert_data = get_query_result(
                 &rt,
-                "SELECT * FROM duckdb_mem_on_conflict_upsert order by event_id asc",
+                "SELECT * FROM cayenne_mem_on_conflict_upsert order by event_id asc",
             )
             .await?;
-            let duckdb_mem_drop_data = get_query_result(
+            let cayenne_mem_drop_data = get_query_result(
                 &rt,
-                "SELECT * FROM duckdb_mem_on_conflict_drop order by event_id asc",
+                "SELECT * FROM cayenne_mem_on_conflict_drop order by event_id asc",
             )
             .await?;
-            let duckdb_file_upsert_data = get_query_result(
+            let cayenne_file_upsert_data = get_query_result(
                 &rt,
-                "SELECT * FROM duckdb_file_on_conflict_upsert order by event_id asc",
+                "SELECT * FROM cayenne_file_on_conflict_upsert order by event_id asc",
             )
             .await?;
-            let duckdb_file_drop_data = get_query_result(
+            let cayenne_file_drop_data = get_query_result(
                 &rt,
-                "SELECT * FROM duckdb_file_on_conflict_drop order by event_id asc",
+                "SELECT * FROM cayenne_file_on_conflict_drop order by event_id asc",
             )
             .await?;
             let sqlite_mem_upsert_data = get_query_result(
@@ -296,10 +296,12 @@ WHERE event_name = 'File Download'
 
             assert_batches_eq!(upsert_expected_result, &pg_upsert_data);
             assert_batches_eq!(drop_expected_result, &pg_drop_data);
-            assert_batches_eq!(upsert_expected_result, &duckdb_mem_upsert_data);
-            assert_batches_eq!(drop_expected_result, &duckdb_mem_drop_data);
-            assert_batches_eq!(upsert_expected_result, &duckdb_file_upsert_data);
-            assert_batches_eq!(drop_expected_result, &duckdb_file_drop_data);
+            assert_batches_eq!(upsert_expected_result, &cayenne_mem_upsert_data);
+            // A Cayenne table with a primary key keeps the last version of a key
+            // whatever its `on_conflict` (#14576), so its `drop` tables hold the update.
+            assert_batches_eq!(upsert_expected_result, &cayenne_mem_drop_data);
+            assert_batches_eq!(upsert_expected_result, &cayenne_file_upsert_data);
+            assert_batches_eq!(upsert_expected_result, &cayenne_file_drop_data);
             assert_batches_eq!(upsert_expected_result, &sqlite_mem_upsert_data);
             assert_batches_eq!(drop_expected_result, &sqlite_mem_drop_data);
             assert_batches_eq!(upsert_expected_result, &sqlite_file_upsert_data);
