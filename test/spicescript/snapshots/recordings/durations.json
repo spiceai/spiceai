@@ -9,6 +9,7 @@
   "snapshots-reader": 20,
   "snapshots-reader-concurrent": 60,
   "snapshots-reader-publication-failures": 217,
+  "snapshots-reader-removed-engine": 6,
   "snapshots-reader-source-fallback": 55,
   "snapshots-reader-without-source": 206,
   "snapshots-source-replication": 32,

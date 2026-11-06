@@ -11,6 +11,7 @@ datasets:
       s3_endpoint: ${secrets:S3_ENDPOINT}
       s3_key: ${secrets:S3_KEY}
       s3_secret: ${secrets:S3_SECRET}
+      s3_session_token: ${secrets:S3_SESSION_TOKEN}
     acceleration: &acceleration1
       enabled: true
       engine: duckdb

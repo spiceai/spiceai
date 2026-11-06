@@ -24,7 +24,8 @@ limitations under the License.
 //!
 //! Required environment for CI:
 //!
-//! * `AWS_SNAPSHOT_KEY` + `AWS_SNAPSHOT_SECRET`, **or**
+//! * `AWS_SNAPSHOT_KEY` + `AWS_SNAPSHOT_SECRET` (+ `AWS_SNAPSHOT_SESSION_TOKEN`
+//!   for short-lived credentials), **or**
 //! * `AWS_PROFILE` configured with read/write access to the test bucket.
 //!
 //! Each test reserves its own UUID-prefixed key range under the shared
@@ -69,8 +70,6 @@ mod cayenne;
 mod duckdb;
 #[cfg(feature = "sqlite")]
 mod sqlite;
-#[cfg(feature = "turso")]
-mod turso;
 
 const DATASET_NAME: &str = "trips";
 const SNAPSHOT_BUCKET: &str = "spiceai-snapshot-integration-tests";
@@ -86,8 +85,6 @@ pub(crate) enum EngineKind {
     DuckDB,
     #[cfg(feature = "sqlite")]
     Sqlite,
-    #[cfg(feature = "turso")]
-    Turso,
 }
 
 impl EngineKind {
@@ -98,8 +95,6 @@ impl EngineKind {
             Self::DuckDB => "duckdb",
             #[cfg(feature = "sqlite")]
             Self::Sqlite => "sqlite",
-            #[cfg(feature = "turso")]
-            Self::Turso => "turso",
         }
     }
 
@@ -110,8 +105,6 @@ impl EngineKind {
             Self::DuckDB => "duckdb",
             #[cfg(feature = "sqlite")]
             Self::Sqlite => "sqlite",
-            #[cfg(feature = "turso")]
-            Self::Turso => "turso",
         }
     }
 }
@@ -280,13 +273,6 @@ impl SnapshotRefreshFixture {
                     local_db_path.to_string_lossy().into_owned(),
                 );
             }
-            #[cfg(feature = "turso")]
-            EngineKind::Turso => {
-                params.insert(
-                    "turso_file".to_string(),
-                    local_db_path.to_string_lossy().into_owned(),
-                );
-            }
         }
         params
     }
@@ -361,6 +347,10 @@ impl SnapshotRefreshFixture {
                 "s3_secret".to_string(),
                 "${secrets:AWS_SNAPSHOT_SECRET}".to_string(),
             );
+            params.extend(crate::utils::aws_session_token_param(
+                "s3_session_token",
+                "AWS_SNAPSHOT_SESSION_TOKEN",
+            ));
         }
         if let Ok(endpoint) = env::var("AWS_SNAPSHOT_ENDPOINT") {
             params.insert(
@@ -436,8 +426,7 @@ async fn load_runtime(rt: Arc<Runtime>) -> Result<()> {
 
 /// Run a query and return the total number of rows across all batches. We
 /// avoid `SELECT count(*)` so the assertion is robust across engines that
-/// reject or pushdown-translate the count differently (Turso in particular
-/// rejects the federation-pushed-down count form).
+/// reject or pushdown-translate the count differently.
 async fn count_rows(rt: &Arc<Runtime>, table: &str) -> Result<usize> {
     let batches = run_query(rt, &format!("SELECT id FROM {table}"))
         .await

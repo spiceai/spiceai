@@ -39,8 +39,6 @@ mod checkpoint_duckdb;
 mod checkpoint_postgres;
 #[cfg(feature = "sqlite")]
 mod checkpoint_sqlite;
-#[cfg(feature = "turso")]
-mod checkpoint_turso;
 #[cfg(feature = "duckdb")]
 mod cron;
 #[cfg(any(feature = "duckdb", feature = "sqlite"))]
@@ -63,7 +61,7 @@ mod on_conflict;
 mod pk_insert_semantics;
 #[cfg(feature = "sqlite")]
 mod sqlite_builtin_pushdown;
-#[cfg(any(feature = "sqlite", feature = "turso"))]
+#[cfg(feature = "sqlite")]
 mod sqlite_interval_arithmetic;
 #[cfg(feature = "sqlite")]
 mod sqlite_query_errors;
@@ -80,7 +78,7 @@ mod partition_by_cayenne;
 #[cfg(feature = "postgres-accel")]
 mod query_push_down;
 mod refresh;
-#[cfg(any(feature = "duckdb", feature = "sqlite", feature = "turso"))]
+#[cfg(any(feature = "duckdb", feature = "sqlite"))]
 mod reload_file_accelerated;
 mod retention_arrow;
 mod retention_cayenne;
@@ -184,7 +182,7 @@ pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Opt
 
 /// A CSV file dataset, accelerated in memory by `engine` with full refreshes,
 /// or unaccelerated when `engine` is `None`.
-#[cfg(any(feature = "sqlite", feature = "turso"))]
+#[cfg(feature = "sqlite")]
 pub(crate) fn csv_dataset(
     from: &str,
     name: &str,

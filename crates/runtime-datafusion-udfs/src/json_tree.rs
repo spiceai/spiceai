@@ -39,6 +39,10 @@ limitations under the License.
 //! - As a scalar UDF returning `List<Struct<...>>` for per-row /
 //!   `LATERAL json_tree(s.body)` usage via `UNNEST`. The scalar form takes
 //!   only the JSON argument and always runs with default caps.
+//!
+//! One document emits at most 32 times `max_bytes` of string data (256 MiB by
+//! default); a walk that reaches this cap stops and returns the rows emitted
+//! so far, like `max_rows`.
 
 use std::borrow::Cow;
 use std::fmt::{Debug, Formatter};
@@ -75,12 +79,19 @@ runtime_udfs_api::register_spice_function!(JSON_TREE_SPICE_FUNCTION, JSON_TREE_U
 const DEFAULT_MAX_DEPTH: usize = 64;
 const DEFAULT_MAX_ROWS: usize = 1_000_000;
 const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Every row repeats its ancestors' key path and its subtree's text, so the
+/// output can be far larger than the input. One document emits at most this
+/// many string bytes per byte of `max_bytes`.
+const OUTPUT_BYTES_PER_INPUT_BYTE: usize = 32;
 
 /// Scalar UDF ceiling across a single evaluated batch. Per-document caps
 /// already bound individual rows, but a wide input batch could still
 /// accumulate `number_rows * max_rows` entries in memory. Error out loudly
 /// past this watermark so operators see the condition rather than OOM.
 const SCALAR_BATCH_MAX_ROWS: usize = 10_000_000;
+/// Scalar UDF ceiling on the string bytes of one evaluated batch, kept well
+/// under the 2 GiB offset range of a `Utf8` column.
+const SCALAR_BATCH_MAX_OUTPUT_BYTES: usize = 1024 * 1024 * 1024;
 
 // -------- Metrics --------
 
@@ -104,7 +115,7 @@ static ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("json_tree_errors_total")
         .with_description(
-            "Errors inside json_tree, labelled by kind (parse|depth_exceeded|input_too_large|row_cap_hit).",
+            "Errors inside json_tree, labelled by kind (parse|depth_exceeded|input_too_large|row_cap_hit|output_cap_hit|batch_cap_hit).",
         )
         .build()
 });
@@ -174,6 +185,19 @@ pub struct TreeRow {
     pub path: Option<String>,
 }
 
+impl TreeRow {
+    fn output_bytes(&self) -> usize {
+        [&self.key, &self.value, &self.atom, &self.path]
+            .into_iter()
+            .flatten()
+            .map(String::len)
+            .sum::<usize>()
+            + self.type_name.len()
+            + self.fullkey.len()
+            + size_of::<Self>()
+    }
+}
+
 // -------- Public entry points --------
 
 #[must_use]
@@ -197,6 +221,7 @@ pub fn json_tree_with_options(input: &str, opts: &JsonTreeOptions) -> Vec<TreeRo
     let mut ctx = WalkCtx {
         rows: Vec::new(),
         next_id: 0,
+        output_bytes: 0,
         depth_cap_hit: false,
         row_cap_hit: false,
     };
@@ -208,6 +233,7 @@ pub fn json_tree_with_options(input: &str, opts: &JsonTreeOptions) -> Vec<TreeRo
 struct WalkCtx {
     rows: Vec<TreeRow>,
     next_id: i64,
+    output_bytes: usize,
     depth_cap_hit: bool,
     row_cap_hit: bool,
 }
@@ -243,19 +269,26 @@ fn visit(
         }
         return;
     }
-    let id = ctx.next_id;
-    ctx.next_id += 1;
-
-    ctx.rows.push(TreeRow {
+    let row = TreeRow {
         key,
         value: Some(node.to_string()),
         type_name: type_of(node),
         atom: atom_of(node),
-        id,
+        id: ctx.next_id,
         parent,
         fullkey: fullkey.to_owned(),
         path: path.map(ToOwned::to_owned),
-    });
+    };
+    let row_bytes = row.output_bytes();
+    if ctx.output_bytes + row_bytes > opts.max_bytes.saturating_mul(OUTPUT_BYTES_PER_INPUT_BYTE) {
+        ctx.row_cap_hit = true;
+        record_error("output_cap_hit");
+        return;
+    }
+    ctx.output_bytes += row_bytes;
+    let id = ctx.next_id;
+    ctx.next_id += 1;
+    ctx.rows.push(row);
 
     match node {
         Value::Object(map) => {
@@ -611,17 +644,25 @@ impl ScalarUDFImpl for JsonTreeScalar {
         // cannot overflow and silently drop rows. Per-document caps inside
         // `json_tree_with_options` still bound memory use.
         let mut all_rows: Vec<TreeRow> = Vec::new();
+        let mut batch_bytes = 0usize;
         let mut offsets: Vec<i64> = Vec::with_capacity(strings.len() + 1);
         offsets.push(0);
 
         for idx in 0..strings.len() {
             if !strings.is_null(idx) {
                 let rows = json_tree_with_options(strings.value(idx), &opts);
+                batch_bytes += rows.iter().map(TreeRow::output_bytes).sum::<usize>();
                 all_rows.extend(rows);
                 if all_rows.len() > SCALAR_BATCH_MAX_ROWS {
                     record_error("batch_cap_hit");
                     return Err(DataFusionError::Execution(format!(
                         "{JSON_TREE_UDTF_NAME}(): batch produced more than {SCALAR_BATCH_MAX_ROWS} rows; lower `max_rows` or split the input."
+                    )));
+                }
+                if batch_bytes > SCALAR_BATCH_MAX_OUTPUT_BYTES {
+                    record_error("batch_cap_hit");
+                    return Err(DataFusionError::Execution(format!(
+                        "{JSON_TREE_UDTF_NAME}(): batch produced more than {SCALAR_BATCH_MAX_OUTPUT_BYTES} bytes of output; split the input."
                     )));
                 }
             }
@@ -817,5 +858,45 @@ mod tests {
         assert_eq!(results[0].schema().field(0).name(), "key");
         assert_eq!(results[0].schema().field(1).name(), "type");
         assert_eq!(results[0].schema().field(2).name(), "fullkey");
+    }
+
+    fn long_key_doc() -> String {
+        let children = vec!["0"; 1000].join(",");
+        format!(r#"{{"{}":[{children}]}}"#, "k".repeat(4096))
+    }
+
+    #[test]
+    fn output_bytes_are_capped_per_document() {
+        let opts = JsonTreeOptions {
+            max_bytes: 8 * 1024,
+            ..Default::default()
+        };
+        let rows = json_tree_with_options(&long_key_doc(), &opts);
+        let bytes: usize = rows.iter().map(TreeRow::output_bytes).sum();
+        assert!(bytes <= 32 * 8 * 1024, "emitted {bytes} bytes");
+        assert!(
+            !rows.is_empty() && rows.len() < 1002,
+            "rows: {}",
+            rows.len()
+        );
+    }
+
+    #[test]
+    fn raising_max_bytes_raises_the_output_budget() {
+        let opts = JsonTreeOptions {
+            max_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+        assert_eq!(json_tree_with_options(&long_key_doc(), &opts).len(), 1002);
+    }
+
+    #[test]
+    fn output_byte_cap_leaves_small_documents_unchanged() {
+        let opts = JsonTreeOptions {
+            max_bytes: 256,
+            ..Default::default()
+        };
+        let doc = r#"{"a": {"b": [1, "x", null]}, "c": true}"#;
+        assert_eq!(json_tree_with_options(doc, &opts), json_tree(doc));
     }
 }

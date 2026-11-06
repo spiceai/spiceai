@@ -11,7 +11,7 @@ sources:
   src: { kind: postgres }
 
 matrix:
-  engine: [cayenne, duckdb, sqlite, turso]
+  engine: [cayenne, duckdb, sqlite]
   ready_state: [on_registration, on_load, on_schema_resolved]
 
 variants:

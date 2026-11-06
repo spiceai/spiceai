@@ -17,7 +17,7 @@ Opening the Change Stream before the snapshot prevents gaps between the snapshot
 ## Prerequisites
 
 - MongoDB Change Streams must be supported and enabled on the source deployment. MongoDB requires a replica set or sharded cluster for Change Streams.
-- The dataset must be accelerated with an engine that supports upsert behavior. Use `duckdb`, `sqlite`, `postgres`, `turso`, or `cayenne`.
+- The dataset must be accelerated with an engine that supports upsert behavior. Use `duckdb`, `sqlite`, `postgres`, or `cayenne`.
 - Configure `acceleration.primary_key: _id`. MongoDB delete events only include the document key, so Spice requires `_id` to route deletes correctly.
 - Configure `acceleration.on_conflict` on `_id` with `upsert` behavior so update and replacement events replace existing accelerator rows instead of appending duplicates.
 

@@ -45,8 +45,6 @@ mod fts_caching_restart;
 #[cfg(feature = "duckdb")]
 mod fts_restart;
 pub(crate) mod hf;
-#[cfg(feature = "duckdb")]
-mod hnsw_index;
 mod local;
 mod messages;
 mod models_http_endpoint;
@@ -626,10 +624,9 @@ pub(crate) fn get_anthropic_model(
 ) -> spicepod::component::model::Model {
     let mut model =
         spicepod::component::model::Model::new(format!("anthropic:{}", model.into()), name);
-    model.params.insert(
-        "anthropic_api_key".to_string(),
-        "${ secrets:SPICE_ANTHROPIC_API_KEY }".into(),
-    );
+    model
+        .params
+        .extend(crate::utils::anthropic_credential_params());
     model
 }
 

@@ -24,8 +24,12 @@ concurrency:
 
 jobs:
   crash_report:
+    environment: ci
     name: crash report (${{ matrix.profile }})
     runs-on: spiceai-dev-runners
+    permissions:
+      contents: read
+      id-token: write  # RustFS credentials
     # `release-lto` links the whole graph with fat LTO; it is far slower than release.
     timeout-minutes: 300
     strategy:
@@ -62,12 +66,22 @@ jobs:
       - name: Install protoc
         uses: ./.github/actions/install-protoc
 
+      - name: Get RustFS credentials
+        id: rustfs
+        continue-on-error: true
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '18000'
+          export-env: 'false'
+
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Environment
         run: |
@@ -79,8 +93,9 @@ jobs:
         env:
           CARGO_INCREMENTAL: 0
           PROFILE: ${{ matrix.profile }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ steps.rustfs.outputs.access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.rustfs.outputs.secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.rustfs.outputs.session-token }}
         run: |
           set -euo pipefail
           TEST_BIN=$(cargo test -p spiced --lib --profile "$PROFILE" --no-run \

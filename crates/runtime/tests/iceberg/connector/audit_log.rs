@@ -19,10 +19,11 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use futures::StreamExt;
 use runtime::Runtime;
+use spicepod::param::ParamValue;
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{aws_session_token_param, runtime_ready_check, test_request_context},
 };
 
 #[tokio::test]
@@ -33,9 +34,20 @@ async fn iceberg_integration_test_audit_log_query() -> Result<(), anyhow::Error>
     let _tracing = init_tracing(None);
     test_request_context()
         .scope(async {
-            let app = test_framework::app_utils::load_app_from_spicepod_str(include_str!(
+            let mut app = test_framework::app_utils::load_app_from_spicepod_str(include_str!(
                 "audit_log.yaml"
             )).await?;
+            if let Some((param, value)) =
+                aws_session_token_param("iceberg_s3_session_token", "AWS_ICEBERG_SESSION_TOKEN")
+            {
+                for dataset in &mut app.datasets {
+                    dataset
+                        .params
+                        .get_or_insert_default()
+                        .data
+                        .insert(param.clone(), ParamValue::String(value.clone()));
+                }
+            }
 
             configure_test_datafusion();
             let rt = Runtime::builder()

@@ -43,7 +43,8 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use opentelemetry::KeyValue;
 use runtime::token_providers::databricks::{
     AUTH_MODE_DESCRIPTION, AUTH_MODES, AuthConfigError, AuthCredentials,
-    DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
+    DatabricksM2MTokenProvider, DatabricksU2MTokenProvider, Error as DatabricksAuthError,
+    WorkloadIdentity,
 };
 use runtime_api_types::v1::ComponentType;
 use runtime_component::ComponentInitialization;
@@ -195,6 +196,8 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     // Databricks M2M Service Principal credentials
     ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
     ParameterSpec::component("client_secret").secret().description("The client secret of the Databricks service principal."),
+    ParameterSpec::component("oidc_token_filepath").description("A file that holds the workload's identity token, read again for every exchange, such as a Kubernetes projected service account token. With `databricks_client_id`, it authenticates with workload identity federation."),
+    ParameterSpec::component("token_audience").description("The audience of the identity token Spice requests from a GitHub Actions job, such as the Databricks account ID. With `databricks_client_id`, it authenticates with workload identity federation."),
 
     // S3 storage options
     ParameterSpec::component("aws_region")
@@ -297,6 +300,7 @@ impl Databricks {
     /// Returns an error if required parameters are missing or invalid,
     /// or if the connection to Databricks fails.
     pub async fn new(
+        component: &str,
         params: Parameters,
         io_runtime: Handle,
         token_provider_registry: Arc<TokenProviderRegistry>,
@@ -343,9 +347,13 @@ impl Databricks {
                     .expose()
                     .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
 
-                let token_provider =
-                    Self::get_token_provider(endpoint, auth_credentials, token_provider_registry)
-                        .await?;
+                let token_provider = Self::get_token_provider(
+                    component,
+                    endpoint,
+                    auth_credentials,
+                    token_provider_registry,
+                )
+                .await?;
 
                 let uc_client = match UnityCatalogClient::new_with_rate_controller(
                     Endpoint(endpoint.to_string()),
@@ -423,6 +431,15 @@ impl Databricks {
                         Self::get_u2m_token_provider(endpoint, client_id, &token_provider_registry)
                             .await?
                     }
+                    AuthCredentials::WorkloadIdentity(identity) => {
+                        Self::get_workload_identity_token_provider(
+                            component,
+                            endpoint,
+                            identity,
+                            &token_provider_registry,
+                        )
+                        .await?
+                    }
                 };
 
                 let uc_client = match UnityCatalogClient::new_with_rate_controller(
@@ -485,6 +502,7 @@ impl Databricks {
                 };
 
                 Self::build_spark_connect_connector(
+                    component,
                     endpoint,
                     auth_credentials,
                     token_provider_registry,
@@ -511,6 +529,7 @@ impl Databricks {
     ///
     /// Returns an error if token provider creation fails.
     pub async fn get_token_provider(
+        component: &str,
         endpoint: &str,
         auth_credentials: AuthCredentials<'_>,
         token_provider_registry: Arc<TokenProviderRegistry>,
@@ -528,6 +547,15 @@ impl Databricks {
             }
             AuthCredentials::U2M(client_id) => {
                 Self::get_u2m_token_provider(endpoint, client_id, &token_provider_registry).await?
+            }
+            AuthCredentials::WorkloadIdentity(identity) => {
+                Self::get_workload_identity_token_provider(
+                    component,
+                    endpoint,
+                    identity,
+                    &token_provider_registry,
+                )
+                .await?
             }
         })
     }
@@ -555,6 +583,7 @@ impl Databricks {
 
     #[cfg(feature = "spark")]
     async fn build_spark_connect_connector(
+        component: &str,
         endpoint: &str,
         auth_credentials: AuthCredentials<'_>,
         token_provider_registry: Arc<TokenProviderRegistry>,
@@ -601,6 +630,28 @@ impl Databricks {
                 let token_provider =
                     Self::get_u2m_token_provider(endpoint, client_id, &token_provider_registry)
                         .await?;
+
+                Arc::new(
+                    DatabricksSparkConnect::from_token_provider_with_rate_controller(
+                        endpoint.to_string(),
+                        cluster_id.expose_secret().to_string(),
+                        databricks_use_ssl,
+                        token_provider,
+                        rate_controller.clone(),
+                    )
+                    .await
+                    .context(UnableToConstructDatabricksSparkSnafu)?,
+                )
+            }
+
+            AuthCredentials::WorkloadIdentity(identity) => {
+                let token_provider = Self::get_workload_identity_token_provider(
+                    component,
+                    endpoint,
+                    identity,
+                    &token_provider_registry,
+                )
+                .await?;
 
                 Arc::new(
                     DatabricksSparkConnect::from_token_provider_with_rate_controller(
@@ -679,6 +730,35 @@ impl Databricks {
             .map_err(|err| Error::UnableToGetToken {
                 source: Box::new(err),
             })
+    }
+
+    /// Gets the refreshing token provider of a service principal that authenticates with workload
+    /// identity federation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is no identity token to request or the first exchange fails.
+    pub async fn get_workload_identity_token_provider(
+        component: &str,
+        endpoint: &str,
+        identity: WorkloadIdentity<'_>,
+        token_provider_registry: &Arc<TokenProviderRegistry>,
+    ) -> Result<Arc<dyn TokenProvider>> {
+        runtime::token_providers::databricks::get_workload_identity_token_provider(
+            component,
+            endpoint,
+            identity,
+            token_provider_registry,
+        )
+        .await
+        .map_err(|error| match error {
+            DatabricksAuthError::InvalidWorkloadIdentity { message, .. } => {
+                InvalidConfigurationSnafu { message }.build()
+            }
+            other => Error::UnableToGetToken {
+                source: Box::new(other),
+            },
+        })
     }
 
     /// Validates that a Unity Catalog table is of a supported type and that
@@ -982,7 +1062,16 @@ impl DataConnectorFactory for DatabricksFactory {
                     .as_ref()
                     .and_then(|reservation| reservation.shared().controller.clone());
 
+                let component = match &params.component {
+                    ConnectorComponent::Catalog(catalog) => {
+                        format!("catalog '{}' (databricks)", catalog.name)
+                    }
+                    ConnectorComponent::Dataset(dataset) => {
+                        format!("dataset '{}' (databricks)", dataset.name)
+                    }
+                };
                 let databricks_result = Databricks::new(
+                    &component,
                     params.parameters,
                     params.io_runtime,
                     context.token_provider_registry(),

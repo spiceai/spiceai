@@ -16,6 +16,7 @@ on:
 
 jobs:
   generate:
+    environment: secret-free
     name: Generate Changelog
     runs-on: self-hosted
 

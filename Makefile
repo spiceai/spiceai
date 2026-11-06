@@ -318,11 +318,11 @@ nextest-packages:
 test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso --no-capture
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite --no-capture
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso --no-capture -E 'not test(spiceai_integration_test)'
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite --no-capture -E 'not test(spiceai_integration_test)'
 
 .PHONY: test-integration-models
 test-integration-models:
@@ -532,7 +532,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # `default = [...]` array in bin/spiced/Cargo.toml.
 #
 # Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
-SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb
+SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,smb
 
 .PHONY: install
 install: build
