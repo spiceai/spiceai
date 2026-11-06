@@ -28,18 +28,15 @@ fn main() {
         return;
     }
 
+    rerun_when_head_moves();
     // A fixed 10 characters: `--short` alone scales with the repository's object
     // count, so a shallow CI checkout would print a shorter hash than a full clone
     // of the same commit.
-    println!(
-        "cargo:rustc-env=GIT_COMMIT_HASH={}",
-        git_rev_parse(&["--short=10", "HEAD"])
-    );
+    let hash = git(&["rev-parse", "--short=10", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=GIT_COMMIT_HASH={hash}");
     // The full hash, for anonymous telemetry: a prefix is ambiguous to join on.
-    println!(
-        "cargo:rustc-env=GIT_COMMIT_SHA={}",
-        git_rev_parse(&["HEAD"])
-    );
+    let sha = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=GIT_COMMIT_SHA={sha}");
     println!("cargo:rustc-env=SPICED_BUILD_PROFILE={}", build_profile());
     println!("cargo:rustc-env=SPICED_BUILD_FEATURES={}", build_features());
 
@@ -56,17 +53,36 @@ fn main() {
     }
 }
 
-/// `git rev-parse` of the commit being built, or `unknown` outside a git checkout.
-fn git_rev_parse(args: &[&str]) -> String {
+/// Output of `git` with these arguments, or `None` outside a git checkout.
+fn git(args: &[&str]) -> Option<String> {
     Command::new("git")
-        .arg("rev-parse")
         .args(args)
         .output()
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|hash| !hash.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
+        .filter(|out| !out.is_empty())
+}
+
+/// Reruns this script when the checked-out commit changes, so an incremental build
+/// does not keep the previous commit's hash: `HEAD`, the branch it points at, and
+/// `packed-refs`, where that branch may live instead. Only files that exist are
+/// named, because cargo reruns on every build for a missing one. Outside a git
+/// checkout none are, and cargo keeps its default of rerunning when a file of this
+/// package changes.
+fn rerun_when_head_moves() {
+    let branch = git(&["symbolic-ref", "-q", "HEAD"]);
+    let names = ["HEAD", "packed-refs"]
+        .into_iter()
+        .map(str::to_string)
+        .chain(branch);
+    for name in names {
+        if let Some(path) = git(&["rev-parse", "--git-path", &name])
+            && std::path::Path::new(&path).exists()
+        {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
 }
 
 /// The cargo profile the binary is being built with.
