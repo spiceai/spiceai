@@ -34,6 +34,7 @@ permissions:
 
 jobs:
   setup:
+    environment: secret-free
     runs-on: ubuntu-24.04
     outputs:
       rel_version: ${{ steps.resolve.outputs.rel_version }}
@@ -71,6 +72,7 @@ jobs:
   # The build jobs package a released binary (no compile) on GitHub-hosted
   # runners, pull base images anonymously, and use no build cache.
   build-amd64:
+    environment: secret-free
     needs: setup
     runs-on: ubuntu-24.04
     steps:
@@ -108,6 +110,7 @@ jobs:
           path: /tmp/image-amd64-default.tar
 
   build-arm64:
+    environment: secret-free
     needs: setup
     runs-on: hosted-linux-arm-runner
     steps:
@@ -164,6 +167,7 @@ jobs:
           path: /tmp/image-arm64-default.tar
 
   build-cuda:
+    environment: secret-free
     needs: setup
     runs-on: ubuntu-24.04
     steps:

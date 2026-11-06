@@ -25,8 +25,26 @@ use crate::{
 
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
+use token_provider::{
+    TokenProvider,
+    workload_identity::{Exchange, SubjectTokenSource, WorkloadIdentityTokenProvider},
+};
 
-fn make_spark_dataset(path: &str, name: &str) -> Dataset {
+async fn databricks_token() -> Result<String, anyhow::Error> {
+    let host = std::env::var("NEW_DATABRICKS_HOST")?;
+    let provider = WorkloadIdentityTokenProvider::try_new(
+        "spark integration test",
+        SubjectTokenSource::github_actions_from_env(std::env::var("DATABRICKS_OIDC_AUDIENCE")?)?,
+        Exchange::databricks(
+            format!("https://{host}/oidc/v1/token"),
+            std::env::var("DATABRICKS_OIDC_CLIENT_ID")?,
+        ),
+    )
+    .await?;
+    Ok(provider.get_token())
+}
+
+fn make_spark_dataset(path: &str, name: &str, token: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("spark:{path}"), name.to_string());
     dataset.params = Some(Params::from_string_map(
         vec![(
@@ -35,7 +53,7 @@ fn make_spark_dataset(path: &str, name: &str) -> Dataset {
                 "sc://{}:443/;use_ssl=true;user_id=spice.ai;session_id={};token={};x-databricks-cluster-id={}",
                 std::env::var("NEW_DATABRICKS_HOST").unwrap_or_default(),
                 uuid::Uuid::new_v4(),
-                std::env::var("NEW_DATABRICKS_TOKEN").unwrap_or_default(),
+                token,
                 std::env::var("NEW_DATABRICKS_CLUSTER_ID").unwrap_or_default(),
             ),
         )]
@@ -61,10 +79,12 @@ async fn spark_integration_test() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
+            let token = databricks_token().await?;
             let app = AppBuilder::new("spark_connector")
                 .with_dataset(make_spark_dataset(
                     "spiceai_sandbox.tpch.lineitem",
                     "lineitem",
+                    &token,
                 ))
                 .build();
 

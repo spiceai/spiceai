@@ -24,6 +24,7 @@ permissions:
   packages: write
 jobs:
   build-binary:
+    environment: ci
     name: Build testoperator
     runs-on: spiceai-dev-runners
     permissions:

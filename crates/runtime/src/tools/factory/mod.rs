@@ -149,9 +149,25 @@ pub async fn forge(
 
     match factory {
         Some(factory) => factory.construct(component, secrets, env).await,
-        None => Err(format!("Tool factory not found for source: {from_source}").into()),
+        None => Err(Box::new(ToolFactoryNotFound {
+            from_source: from_source.to_string(),
+        })),
     }
 }
+
+/// A tool's `from` names a source no tool factory handles. No retry can clear it.
+#[derive(Debug)]
+pub struct ToolFactoryNotFound {
+    from_source: String,
+}
+
+impl std::fmt::Display for ToolFactoryNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Tool factory not found for source: {}", self.from_source)
+    }
+}
+
+impl std::error::Error for ToolFactoryNotFound {}
 
 #[cfg(test)]
 mod tests {

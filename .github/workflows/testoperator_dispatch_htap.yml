@@ -39,6 +39,7 @@ on:
 
 jobs:
   dispatch-htap:
+    environment: ci
     name: Dispatch HTAP - ${{ github.event.inputs.scale_factor || github.event.schedule }}
     runs-on: spiceai-dev-runners
     permissions:

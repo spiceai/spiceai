@@ -83,6 +83,7 @@ env:
 
 jobs:
   setup-matrix:
+    environment: secret-free
     name: Setup CUDA matrix
     runs-on: ubuntu-24.04
     outputs:
@@ -157,6 +158,7 @@ jobs:
             return matrix;
 
   build:
+    environment: secret-free
     name: Build CUDA ${{ matrix.target.compute_cap }} binaries
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix

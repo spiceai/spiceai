@@ -28,8 +28,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::jwt_signer::{JwtSigner, SignError};
 use crate::{Result, TokenProvider, ensure_jwt_crypto_provider};
-use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
@@ -53,24 +53,6 @@ const MAX_REASON_LEN: usize = 300;
 
 /// How much of an error response is read for its reason.
 const MAX_ERROR_BODY_BYTES: usize = 4096;
-
-/// The error a [`JwtSigner`] reports.
-pub type SignError = Box<dyn std::error::Error + Send + Sync>;
-
-/// A key service that holds a GitHub App's private key and signs with it, so the key never
-/// leaves the service.
-#[async_trait]
-pub trait JwtSigner: Send + Sync + fmt::Debug {
-    /// The RS256 signature, RSASSA-PKCS1-v1_5 with SHA-256, of the message whose SHA-256 digest
-    /// is `digest`.
-    async fn sign_sha256_digest(
-        &self,
-        digest: &[u8; 32],
-    ) -> std::result::Result<Vec<u8>, SignError>;
-
-    /// The key as its key service names it, for messages. Never key material.
-    fn key_id(&self) -> &str;
-}
 
 /// Where a GitHub App's private key is.
 #[derive(Clone)]
@@ -453,6 +435,8 @@ async fn generate_token(installation: &Installation) -> Result<GitHubToken, GitH
 #[cfg(test)]
 pub(crate) mod tests {
     use std::sync::Mutex;
+
+    use async_trait::async_trait;
 
     use aws_lc_rs::digest::{Digest as LcDigest, SHA256};
     use aws_lc_rs::encoding::AsDer;

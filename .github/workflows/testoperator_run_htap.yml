@@ -108,6 +108,7 @@ concurrency:
 
 jobs:
   run-htap:
+    environment: ci
     name: Run CH-BenCHmark
     runs-on: ${{ github.event.inputs.runner_type }}
     permissions:

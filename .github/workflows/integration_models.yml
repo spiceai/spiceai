@@ -244,8 +244,10 @@ jobs:
           path: ./integration_test
 
       - name: Set up API Keys
+        env:
+          SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
-          echo 'SPICE_XAI_API_KEY="${{ secrets.SPICE_SECRET_XAI_API_KEY }}"' > .env
+          printf 'SPICE_XAI_API_KEY="%s"\n' "$SPICE_XAI_API_KEY" > .env
 
       # OpenAI tests
       - name: Run OpenAI integration test

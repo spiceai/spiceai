@@ -71,6 +71,7 @@ on:
 
 jobs:
   setup:
+    environment: secret-free
     runs-on: ubuntu-24.04
     outputs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}

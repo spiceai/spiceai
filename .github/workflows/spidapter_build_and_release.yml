@@ -29,6 +29,7 @@ permissions:
   packages: write
 jobs:
   build-binary:
+    environment: ci
     name: Build spidapter
     runs-on: spiceai-dev-runners
     permissions:

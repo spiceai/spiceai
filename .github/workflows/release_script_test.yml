@@ -34,6 +34,7 @@ concurrency:
 
 jobs:
   test-github-release-script:
+    environment: secret-free
     name: Unit tests for github_release.py
     runs-on: ubuntu-24.04
     steps:

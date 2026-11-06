@@ -34,6 +34,7 @@ env:
 
 jobs:
   resolve:
+    environment: secret-free
     name: Find the build of v${{ inputs.release_version }}
     runs-on: ubuntu-24.04
     permissions:

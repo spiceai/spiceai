@@ -1,0 +1,73 @@
+---
+name: Workflow Environment Check
+
+# Every credential a workflow uses lives in a GitHub environment, so every job
+# must select one, and a job in the unprotected `secret-free` environment must
+# read no secrets. A job that forgets `environment:` still resolves repository
+# and organization secrets, bypassing the environment's ref restrictions and
+# reviewers without any run failing. See docs/dev/github_actions_environments.md.
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    # Any change under `.github/`: a job is added or re-homed in a workflow, and
+    # the guard and its tests live in `.github/scripts/`.
+    paths:
+      - '.github/**'
+  push:
+    branches:
+      - trunk
+    paths:
+      - '.github/**'
+  # Fork pull requests skip the job below, so the merge queue checks their
+  # workflow changes before they land. `merge_group` takes no path filter, and
+  # the check takes seconds.
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  check-workflow-environments:
+    environment: secret-free
+    name: Every workflow job selects an environment
+    runs-on: spiceai-dev-runners
+    # Self-hosted pool: skip PRs from forks so an approved fork run does not
+    # execute here. Non-PR events and same-repo PRs still run.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    # Reads the checkout and nothing else.
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      # The guard's parser is exercised first: the live-tree scan only covers the
+      # shapes today's workflows happen to contain, so a parser that stopped
+      # recognising a secret reference would report a clean tree and pass unnoticed.
+      - name: Test the guard
+        run: python .github/scripts/test_check_workflow_environments.py -v
+
+      - name: Check workflow environments
+        run: python .github/scripts/check_workflow_environments.py

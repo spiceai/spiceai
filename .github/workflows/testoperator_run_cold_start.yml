@@ -45,6 +45,7 @@ concurrency:
 
 jobs:
   seed-fixture:
+    environment: ci
     name: Seed the Delta Lake fixture
     runs-on: spiceai-dev-runners
     permissions:
@@ -85,6 +86,7 @@ jobs:
         uses: ./.github/actions/seed-cold-start-fixture
 
   cold-start:
+    environment: ci
     name: Cold start ${{ matrix.spicepod }}
     needs: seed-fixture
     runs-on: spiceai-dev-runners
