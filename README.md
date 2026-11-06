@@ -91,8 +91,8 @@ Next, connect your own sources with the [data connector docs](https://spiceai.or
 
 ## The data primitives agents need in one runtime
 
-- **SQL federation and acceleration.** Connect to and query operational databases, data lakes, and warehouses across the enterprise. Materialize and accelerate working sets in memory or on disk with Spice Cayenne for sub-second access, with secondary indexes for point lookups.
-- **Analytical query on operational data.** Run large analytical queries against an analytics replica of your operational database, kept current through high-throughput CDC.
+- **SQL federation and acceleration.** Connect to and query operational databases, data lakes, and warehouses through a single SQL endpoint. Materialize and accelerate working sets in memory or on disk with Spice Cayenne for sub-second access, with secondary indexes for point lookups.
+- **Analytics replica.** Run large analytical queries against an analytics replica of your operational database, kept current through high-throughput CDC.
 - **Hybrid search.** Combine structured filters, vector similarity, and keyword matches in one SQL query with `vector_search`, `text_search`, `rrf`, and `rerank`, then rank the merged results by relevance.
 - **AI gateway and SQL functions.** An OpenAI-compatible gateway to local and hosted models, with AI SQL functions, MCP tools, memory, evals, and observability built into the runtime.
 
@@ -100,7 +100,7 @@ Next, connect your own sources with the [data connector docs](https://spiceai.or
 
 - **Agent data serving.** Serve each agent federated SQL across its sources, with hot datasets accelerated locally for sub-second queries and search and tools built in. Each agent sees only the datasets it declares, and Spice holds the source credentials. [MCP recipe](https://github.com/spiceai/cookbook/blob/trunk/mcp/README.md)
 - **Fast queries without ETL delays.** Run federated SQL across operational databases, warehouses, and APIs, and accelerate the hot path with fewer pipelines to maintain. [Federation recipe](https://github.com/spiceai/cookbook/tree/trunk/federation)
-- **Real-time analytics on operational data.** Point BI tools and agents at a CDC-fed analytics replica instead of the production database. [CDC docs](https://spiceai.org/docs/features/cdc)
+- **Real-time analytics on operational data.** Give dashboards, BI tools, and agents near real-time analytical queries over operational data, served from the replica instead of the production database. [CDC docs](https://spiceai.org/docs/features/cdc)
 - **One standard lakehouse for every tenant.** Define the lakehouse once in a Spicepod and deploy it for each customer, team, or agent, each with its own sources and settings. [Multi-tenancy patterns](https://spice.ai/blog/multi-tenancy-for-ai-agents-without-pipelines)
 
 ## Interfaces
