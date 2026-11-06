@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{
     collections::HashMap,
-    env,
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
@@ -24,7 +23,9 @@ use std::{
 };
 
 use crate::{
-    configure_test_datafusion, init_tracing,
+    configure_test_datafusion,
+    docker::RunningContainer,
+    init_tracing,
     utils::{run_query, runtime_ready_check, test_request_context, wait_until_true},
 };
 use anyhow::{Context, Result, anyhow};
@@ -32,14 +33,13 @@ use app::AppBuilder;
 use arrow::array::{AsArray, RecordBatch};
 use arrow::datatypes::{Int64Type, SchemaRef};
 use arrow::util::pretty::pretty_format_batches;
-use aws_sdk_credential_bridge::{S3CredentialProvider, get_or_init_sdk_config};
 use chrono::Utc;
 use datafusion::common::TableReference;
 #[cfg(feature = "duckdb")]
 use duckdb::Connection;
 use futures::{StreamExt, future::try_join_all};
 use object_store::{
-    ClientOptions, ObjectMeta, ObjectStore, ObjectStoreExt,
+    ObjectMeta, ObjectStore, ObjectStoreExt,
     aws::AmazonS3Builder,
     path::{Path as ObjectPath, PathPart},
 };
@@ -69,27 +69,35 @@ use tokio::{
 };
 use uuid::Uuid;
 
-const SNAPSHOT_BUCKET: &str = "spiceai-snapshot-integration-tests";
-const SNAPSHOT_REGION: &str = "us-west-2";
+const SNAPSHOT_BUCKET: &str = crate::rustfs::S3_BUCKET;
 const TAXI_TRIPS_DATASET_NAME: &str = "taxi_trips";
 
 static SNAPSHOT_TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+/// A snapshot location in a `RustFS` container this test owns, and a client for it.
 struct SnapshotS3Context {
     store: Arc<dyn ObjectStore>,
+    endpoint: String,
     prefix: String,
     base_path: ObjectPath,
+    _object_store: RunningContainer,
 }
 
 impl SnapshotS3Context {
     async fn new(test_name: &str) -> Result<Self> {
-        let store = build_snapshot_store().await?;
+        let object_store =
+            crate::rustfs::start_object_store(&format!("spice_test_rustfs_{test_name}")).await?;
+        let endpoint = format!("http://127.0.0.1:{}", object_store.host_port(9000)?);
+        crate::rustfs::create_bucket(&endpoint).await?;
+        let store = build_snapshot_store(&endpoint)?;
         let prefix = format!("{test_name}/{}", Uuid::now_v7());
         let base_path = ObjectPath::from(prefix.clone());
         Ok(Self {
             store,
+            endpoint,
             prefix,
             base_path,
+            _object_store: object_store,
         })
     }
 
@@ -424,33 +432,14 @@ fn build_snapshots_config(
     context: &SnapshotS3Context,
     behavior: BootstrapOnFailureBehavior,
 ) -> Snapshots {
-    let mut param_map = HashMap::from([("s3_region".to_string(), SNAPSHOT_REGION.to_string())]);
-
-    if env::var("AWS_PROFILE").is_ok() {
-        param_map.insert("s3_auth".to_string(), "iam_role".to_string());
-    } else {
-        param_map.insert("s3_auth".to_string(), "key".to_string());
-        param_map.insert(
-            "s3_key".to_string(),
-            "${secrets:AWS_SNAPSHOT_KEY}".to_string(),
-        );
-        param_map.insert(
-            "s3_secret".to_string(),
-            "${secrets:AWS_SNAPSHOT_SECRET}".to_string(),
-        );
-        param_map.extend(crate::utils::aws_session_token_param(
-            "s3_session_token",
-            "AWS_SNAPSHOT_SESSION_TOKEN",
-        ));
-    }
-
-    if let Ok(endpoint) = env::var("AWS_SNAPSHOT_ENDPOINT") {
-        param_map.insert(
-            "allow_http".to_string(),
-            endpoint.starts_with("http://").to_string(),
-        );
-        param_map.insert("s3_endpoint".to_string(), endpoint);
-    }
+    let param_map = HashMap::from([
+        ("s3_region".to_string(), "us-east-1".to_string()),
+        ("s3_endpoint".to_string(), context.endpoint.clone()),
+        ("allow_http".to_string(), "true".to_string()),
+        ("s3_auth".to_string(), "key".to_string()),
+        ("s3_key".to_string(), crate::rustfs::S3_ACCESS_KEY.to_string()),
+        ("s3_secret".to_string(), crate::rustfs::S3_SECRET_KEY.to_string()),
+    ]);
 
     Snapshots {
         enabled: true,
@@ -519,47 +508,18 @@ fn build_metadata_document(
     })
 }
 
-async fn build_snapshot_store() -> Result<Arc<dyn ObjectStore>> {
-    let mut builder = AmazonS3Builder::from_env()
-        .with_bucket_name(SNAPSHOT_BUCKET)
-        .with_region(SNAPSHOT_REGION)
-        .with_client_options(ClientOptions::default());
-
-    // An S3-compatible store (e.g. MinIO) in place of AWS, for running the suite locally.
-    if let Ok(endpoint) = env::var("AWS_SNAPSHOT_ENDPOINT") {
-        builder = builder
-            .with_allow_http(endpoint.starts_with("http://"))
-            .with_endpoint(endpoint);
-    }
-
-    if let (Ok(key), Ok(secret)) = (
-        env::var("AWS_SNAPSHOT_KEY"),
-        env::var("AWS_SNAPSHOT_SECRET"),
-    ) {
-        builder = builder
-            .with_access_key_id(key)
-            .with_secret_access_key(secret);
-        if let Ok(token) = env::var("AWS_SNAPSHOT_SESSION_TOKEN") {
-            builder = builder.with_token(token);
-        }
-    } else {
-        let config = get_or_init_sdk_config()
-            .await
-            .map_err(|err| anyhow!("Failed to initialize AWS credentials: {err}"))?;
-        let Some(config) = config else {
-            return Err(anyhow!(
-                "AWS credentials are required to run snapshot integration tests. Provide AWS_SNAPSHOT_KEY/AWS_SNAPSHOT_SECRET or configure AWS_PROFILE."
-            ));
-        };
-        builder = builder.with_credentials(Arc::new(
-            S3CredentialProvider::from_config(config.as_ref())
-                .context("Loading AWS credentials from environment")?,
-        ));
-    }
-
-    Ok(Arc::new(builder.build().context(
-        "Building Amazon S3 object store client for snapshots",
-    )?))
+fn build_snapshot_store(endpoint: &str) -> Result<Arc<dyn ObjectStore>> {
+    Ok(Arc::new(
+        AmazonS3Builder::new()
+            .with_bucket_name(SNAPSHOT_BUCKET)
+            .with_region("us-east-1")
+            .with_endpoint(endpoint)
+            .with_allow_http(true)
+            .with_access_key_id(crate::rustfs::S3_ACCESS_KEY)
+            .with_secret_access_key(crate::rustfs::S3_SECRET_KEY)
+            .build()
+            .context("Building the S3 client for the snapshot location")?,
+    ))
 }
 
 async fn load_runtime(rt: Arc<Runtime>) -> Result<()> {

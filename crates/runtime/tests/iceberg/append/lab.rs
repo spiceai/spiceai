@@ -58,9 +58,7 @@ use spicepod::{
 };
 
 use crate::docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port};
-use crate::iceberg::metadata_file::{
-    S3_ACCESS_KEY, S3_BUCKET, S3_SECRET_KEY, create_bucket, start_object_store,
-};
+use crate::rustfs::{S3_ACCESS_KEY, S3_BUCKET, S3_SECRET_KEY, create_bucket, start_object_store};
 pub const NAMESPACE: &str = "ns";
 pub const TABLE: &str = "events";
 /// The primary key an accelerated dataset declares.
