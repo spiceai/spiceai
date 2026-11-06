@@ -60,6 +60,7 @@ on:
 
 jobs:
   run-streaming-benchmark:
+    environment: ci
     name: Run DynamoDB streaming benchmark
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 120

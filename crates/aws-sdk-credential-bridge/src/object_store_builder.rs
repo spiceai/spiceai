@@ -192,9 +192,11 @@ impl S3ObjectStoreBuilder {
         if let Some(secret) = params.get("secret").or_else(|| params.get("s3_secret")) {
             self.secret_access_key = Some(secret.clone());
         }
+        // An unset session-token secret resolves to an empty string; static keys need no token.
         if let Some(token) = params
             .get("session_token")
             .or_else(|| params.get("s3_session_token"))
+            .filter(|token| !token.is_empty())
         {
             self.session_token = Some(token.clone());
         }
@@ -245,7 +247,10 @@ impl S3ObjectStoreBuilder {
         if let Some(secret) = params.get("secret") {
             self.secret_access_key = Some(secret.expose_secret().to_string());
         }
-        if let Some(token) = params.get("session_token") {
+        if let Some(token) = params
+            .get("session_token")
+            .filter(|token| !token.expose_secret().is_empty())
+        {
             self.session_token = Some(token.expose_secret().to_string());
         }
         if let Some(timeout) = params.get("client_timeout") {

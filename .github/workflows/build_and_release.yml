@@ -74,8 +74,19 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
+# A tag build publishes the release named by the tag. If the tag moves while a
+# build is running, the newer run cancels the older one, so the release and its
+# images come from one build. Every other run gets a group of its own, so trunk
+# and release-branch pushes still build every commit. Concurrency groups are
+# shared by every workflow in the repository, so this name differs from
+# build_and_release_cuda's.
+concurrency:
+  group: ${{ github.ref_type == 'tag' && format('build-release-{0}', github.ref) || format('{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.ref_type == 'tag' }}
+
 jobs:
   setup-matrix:
+    environment: secret-free
     name: Setup strategy matrix
     runs-on: ubuntu-24.04
     outputs:
@@ -180,6 +191,7 @@ jobs:
             return matrix;
 
   build:
+    environment: ci
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.runner }}
     permissions:
@@ -497,6 +509,7 @@ jobs:
           destination_path: spice-minio/artifacts/spice/linux-x86_64/${{ github.sha }}/
 
   publish:
+    environment: github-publish
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
     needs: build
     if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
@@ -557,11 +570,12 @@ jobs:
         run: ls -l ${{ env.ARTIFACT_DIR }}
 
       - name: publish ${{ matrix.target_os }}/${{ matrix.target_arch }} binaries to github
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Parse repository to get owner and repo names
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
-          export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
           # Get the list of files
           RELEASE_ARTIFACT=(${ARTIFACT_DIR}/*)
           # Delete existing release artifact

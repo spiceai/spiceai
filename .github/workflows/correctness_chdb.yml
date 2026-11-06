@@ -39,6 +39,7 @@ jobs:
   # for (#13841); the merge-group commit is what runs the lane, as the other
   # engine lanes do.
   check_changes:
+    environment: secret-free
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
     timeout-minutes: 45
@@ -55,6 +56,7 @@ jobs:
         uses: ./.github/actions/check-code-changes
 
   test:
+    environment: ci
     name: chDB Result Correctness
     needs: check_changes
     timeout-minutes: 90

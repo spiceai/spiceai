@@ -40,7 +40,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use snafu::prelude::*;
 use token_provider::TokenProvider;
-use token_provider::github_app_token::{JwtSigner, SignError};
+use token_provider::jwt_signer::{JwtSigner, SignError};
 use token_provider::workload_identity::{
     ENTRA_AUDIENCE, Exchange, SubjectTokenSource, WorkloadIdentityError,
     WorkloadIdentityTokenProvider,

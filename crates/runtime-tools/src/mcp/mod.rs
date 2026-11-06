@@ -63,6 +63,18 @@ pub enum Error {
     UnderlyingInitilizationError { source: McpError },
 }
 
+impl Error {
+    /// Returns `true` when the error is a mistake in the tool's Spicepod configuration, which
+    /// no retry can clear.
+    #[must_use]
+    pub fn is_configuration_error(&self) -> bool {
+        matches!(
+            self,
+            Error::InvalidMCPDirective { .. } | Error::InvalidMcpArgs { .. }
+        )
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Prefix every tool-use task name carries.

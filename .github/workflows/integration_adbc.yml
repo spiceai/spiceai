@@ -38,6 +38,7 @@ jobs:
   # check is published under its name as `skipped` rather than a `success`
   # nothing ran for (#13841); the merge-group commit is what runs the tests.
   check_changes:
+    environment: secret-free
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
     # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
@@ -57,6 +58,7 @@ jobs:
         uses: ./.github/actions/check-code-changes
 
   test:
+    environment: ci
     name: ADBC Integration Tests
     needs: check_changes
     # Slowest observed success in the 2026-07-25..08-08 window: 50 min.

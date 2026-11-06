@@ -61,10 +61,12 @@ on:
         default: 'release'
 
 # A trunk push cancels the CUDA build of any older trunk push, queued or
-# running. Tag and manual runs each get a group of their own, so they never
-# cancel or wait on another run.
+# running. A tag run cancels any older run for the same tag, so a moved tag
+# publishes the CUDA binaries of one build. Other manual runs each get a group
+# of their own, so they never cancel or wait on another run. The tag group name
+# differs from build_and_release's, since groups are shared across workflows.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref == 'refs/heads/trunk' && 'trunk' || github.run_id }}
+  group: ${{ github.ref_type == 'tag' && format('build-release-cuda-{0}', github.ref) || format('{0}-{1}', github.workflow, (github.event_name == 'push' && github.ref == 'refs/heads/trunk') && 'trunk' || github.run_id) }}
   cancel-in-progress: true
 
 permissions:
@@ -72,6 +74,7 @@ permissions:
 
 jobs:
   setup-matrix:
+    environment: secret-free
     name: Setup CUDA matrix
     runs-on: ubuntu-24.04
     outputs:
@@ -141,6 +144,7 @@ jobs:
             return matrix;
 
   build:
+    environment: secret-free
     name: Build CUDA ${{ matrix.target.compute_cap }} binaries
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
@@ -190,6 +194,7 @@ jobs:
           rust-profile: ${{ env.RUST_PROFILE }}
 
   publish:
+    environment: github-publish
     name: Publish CUDA binaries
     needs: build
     if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
@@ -223,11 +228,12 @@ jobs:
         run: ls -l ${{ env.ARTIFACT_DIR }}
 
       - name: Publish CUDA binaries to GitHub
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Parse repository to get owner and repo names
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
-          export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
 
           # First check if we have any files to upload
           if [ -z "$(ls -A ${ARTIFACT_DIR})" ]; then

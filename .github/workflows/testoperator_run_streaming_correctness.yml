@@ -55,6 +55,7 @@ on:
 
 jobs:
   run-streaming-correctness:
+    environment: ci
     name: Run DynamoDB streaming correctness test
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 180

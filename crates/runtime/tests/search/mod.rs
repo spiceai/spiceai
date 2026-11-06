@@ -249,6 +249,10 @@ impl VectorEngineOptions {
                         "${ env:AWS_S3_VECTORS_SECRET }".to_string(),
                     ),
                 ]);
+                params.extend(crate::utils::aws_session_token_param(
+                    "s3_vectors_aws_session_token",
+                    "AWS_S3_VECTORS_SESSION_TOKEN",
+                ));
                 match self {
                     // The fallback engine targets a pre-seeded index by ARN. `s3_vectors_arn` is
                     // mutually exclusive with `s3_vectors_bucket`/`s3_vectors_index`, and an

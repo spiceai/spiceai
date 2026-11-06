@@ -69,6 +69,7 @@ jobs:
   # etc.). `build` — which every test job depends on — is gated on this, so the
   # whole matrix cascades to "skipped" while the E2E Test CI gate still reports.
   check_changes:
+    environment: secret-free
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
     # Every job here is bounded, because on a `merge_group` run an unbounded one does not
@@ -88,6 +89,7 @@ jobs:
         uses: ./.github/actions/check-code-changes
 
   setup-matrix:
+    environment: secret-free
     name: Setup strategy matrix
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
@@ -271,13 +273,13 @@ jobs:
           if-no-files-found: ignore
 
   test-bigquery:
+    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
+    environment: ci
     name: BigQuery Regression Tests
     needs: build
     if: ${{ inputs.run_all_tests }}
     runs-on: spiceai-dev-runners
     timeout-minutes: 90
-    # Holds the BigQuery workload identity federation settings (`BIGQUERY_*` secrets).
-    environment: ci
     permissions:
       contents: read
       # Exchanged for Google Cloud access tokens for the BigQuery tests: workload identity federation.
@@ -370,6 +372,7 @@ jobs:
         run: rm -rf -- "$BIGQUERY_GATE_VENV"
 
   setup-model-matrix:
+    environment: secret-free
     name: Setup model strategy matrix
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
@@ -514,6 +517,7 @@ jobs:
         uses: ./.github/actions/stop-spice
 
   test_hf_model:
+    environment: ci
     name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     timeout-minutes: 10
     runs-on: ${{ matrix.target.runner }}
@@ -737,6 +741,7 @@ jobs:
           echo "Removed the job-scoped Hugging Face token."
 
   test_quickstart_dremio:
+    environment: secret-free
     name: 'Test Dremio quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     # run quickstart with external service dependency only on manual trigger
@@ -974,6 +979,7 @@ jobs:
           working-directory: test_app
 
   test_cold_start_unkeyed_append:
+    environment: ci
     name: 'Cold start: unkeyed Cayenne append loads without rewriting itself'
     # The nightly `testoperator run cold-start` workflow times every acceleration shape
     # against the previous release; this is its timing-free bound, cheap enough for the
@@ -1059,6 +1065,7 @@ jobs:
           working-directory: cold_start_app
 
   test_quickstart_data_postgres:
+    environment: secret-free
     name: 'Test PostgreSQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1220,6 +1227,7 @@ jobs:
           working-directory: test_app
 
   test_quickstart_data_mysql:
+    environment: secret-free
     name: 'Test MySQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1443,6 +1451,7 @@ jobs:
           working-directory: test_app
 
   test_quickstart_clickhouse:
+    environment: secret-free
     name: 'Test Clickhouse quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1565,6 +1574,7 @@ jobs:
           working-directory: test_app
 
   test_quickstart_duckdb:
+    environment: secret-free
     env:
       duckdb_version: v0.10.2
     name: 'Test DuckDB quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -1653,6 +1663,7 @@ jobs:
           working-directory: duckdb-app
 
   test_local_acceleration:
+    environment: secret-free
     name: 'Test acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }} (${{ matrix.acceleration.mode }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1798,6 +1809,7 @@ jobs:
           working-directory: test_app
 
   test_results_caching:
+    environment: secret-free
     name: 'Test results caching on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -1991,6 +2003,7 @@ jobs:
           working-directory: test_app
 
   test_results_caching_source_down:
+    environment: secret-free
     name: 'Test results caching with the source down'
     # Linux only: what it checks, that a cache miss reads the acceleration while the
     # source is unreadable, does not depend on the platform.
@@ -2153,6 +2166,7 @@ jobs:
           working-directory: test_app
 
   gh_connector_quickstart:
+    environment: secret-free
     name: 'Test GitHub connector on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -2248,6 +2262,7 @@ jobs:
           working-directory: test_app
 
   hf_connector_live:
+    environment: ci
     name: 'Test Hugging Face connector against the live Hub'
     # Reads pinned commits of public datasets through the Hub and compares every answer
     # with one recorded from DuckDB's own `hf://` reader (test/huggingface/check_live.py).
@@ -2293,6 +2308,7 @@ jobs:
           path: hf-live-results/
 
   mssql_connector_quickstart:
+    environment: secret-free
     name: 'Test MS SQL connector on ${{ matrix.target.name }}'
     # The Microsoft apt list below is the Ubuntu 24.04 repository. ubuntu-latest
     # moves on its own, so this Linux-only job stays on ubuntu-24.04.
@@ -2458,28 +2474,34 @@ jobs:
           echo "      mode: delta_lake" >> spicepod.yaml
           echo "      databricks_aws_access_key_id: \${ secrets:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }" >> spicepod.yaml
           echo "      databricks_aws_secret_access_key: \${ secrets:AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }" >> spicepod.yaml
+          echo "      databricks_aws_session_token: \${ secrets:AWS_DATABRICKS_DELTA_SESSION_TOKEN }" >> spicepod.yaml
           echo "      databricks_aws_region: us-west-2" >> spicepod.yaml
           echo "      databricks_endpoint: \${ secrets:DATABRICKS_ENDPOINT }" >> spicepod.yaml
-          echo "      databricks_token: \${ secrets:DATABRICKS_TOKEN }" >> spicepod.yaml
+          echo "      databricks_client_id: \${ secrets:DATABRICKS_OIDC_CLIENT_ID }" >> spicepod.yaml
+          echo "      databricks_token_audience: \${ secrets:DATABRICKS_OIDC_AUDIENCE }" >> spicepod.yaml
 
           cat spicepod.yaml
 
-      - name: Get Databricks token
-        id: databricks-token
-        uses: ./.github/actions/databricks-oidc-token
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta-new
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          host: ${{ vars.NEW_DATABRICKS_HOST }}
-          client-id: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
-          audience: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
 
       - name: Start spice runtime
         working-directory: test_app
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta-new.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta-new.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta-new.outputs.aws-session-token }}
           DATABRICKS_ENDPOINT: ${{ vars.NEW_DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ steps.databricks-token.outputs.token }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
         run: |
           spice run &> spice.log &
           # time to initialize added datasets
@@ -2514,6 +2536,7 @@ jobs:
           working-directory: test_app
 
   graceful_shutdown_test_append:
+    environment: secret-free
     name: '${{ matrix.spicepod }} acceleration and graceful shutdown on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -2754,6 +2777,7 @@ jobs:
           allow: ${{ env.PARQUET_RENAME_RACE_ALLOW }}
 
   graceful_shutdown_test_full:
+    environment: secret-free
     name: '${{ matrix.spicepod }} acceleration and graceful shutdown on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -2911,6 +2935,7 @@ jobs:
   # The runner for the scenario scripts in test/spicescript. Built beside spiced
   # rather than after it, so it adds nothing to the run's critical path.
   build_spicescript:
+    environment: ci
     name: Build spicescript
     needs: check_changes
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
@@ -3130,6 +3155,7 @@ jobs:
   # along with every job it summarises, so the required check reads `skipped`,
   # not a `success` nothing ran for (#13841).
   e2e-gate:
+    environment: secret-free
     name: E2E Test CI
     runs-on: ubuntu-latest
     if: ${{ !cancelled() && github.event_name != 'pull_request' }}

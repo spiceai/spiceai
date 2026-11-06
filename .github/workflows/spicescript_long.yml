@@ -24,8 +24,13 @@ permissions:
 
 jobs:
   long:
+    environment: ci
     name: 'spicescript: long'
     runs-on: spiceai-dev-runners
+    permissions:
+      actions: read
+      contents: read
+      id-token: write  # RustFS credentials
     # The scripts' own waits are about 15 minutes; the rest is starting
     # containers and building spicescript when no earlier run built it.
     timeout-minutes: 90
@@ -83,12 +88,21 @@ jobs:
           chmod +x spiced
           ./spiced --version
 
+      - name: Get RustFS credentials
+        id: rustfs
+        uses: ./.github/actions/rustfs-credentials
+        with:
+          endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          duration-seconds: '3600'
+          export-env: 'false'
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ vars.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ steps.rustfs.outputs.access-key-id }}
+          minio_secret_key: ${{ steps.rustfs.outputs.secret-access-key }}
+          minio_session_token: ${{ steps.rustfs.outputs.session-token }}
 
       - name: Download spicescript
         id: spicescript

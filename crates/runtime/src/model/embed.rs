@@ -16,7 +16,10 @@ limitations under the License.
 #![allow(clippy::implicit_hasher)]
 
 use crate::embeddings::params as embedding_params;
-use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
+use crate::token_providers::databricks::{
+    DatabricksM2MTokenProvider, DatabricksU2MTokenProvider, get_workload_identity_token_provider,
+    model_error,
+};
 use bytes::Bytes;
 use cache::CacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
@@ -208,6 +211,12 @@ pub async fn try_to_embedding(
             google(model_id, &typed, embeddings_cache.clone()).await
         }
         EmbeddingPrefix::Databricks => {
+            // Read before `params` moves into the typed params: federation params win over a key
+            // autoloaded from a secret store, but not over one the Spicepod writes.
+            let key_in_spicepod = llms::workload_identity::key_in_spicepod(
+                &params,
+                &["databricks_token", "databricks_client_secret"],
+            );
             let typed = embedding_params::databricks::DatabricksEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
@@ -217,8 +226,10 @@ pub async fn try_to_embedding(
             .await
             .map_err(params_err)?;
             databricks(
+                &component.name,
                 model_id,
                 &typed,
+                key_in_spicepod,
                 Arc::clone(&token_provider_registry),
                 embeddings_cache.clone(),
             )
@@ -544,8 +555,10 @@ async fn huggingface(
 }
 
 async fn databricks(
+    embedding_name: &str,
     model_id: Option<String>,
     params: &embedding_params::databricks::DatabricksEmbeddingParams,
+    key_in_spicepod: Option<&str>,
     token_provider_registry: Arc<TokenProviderRegistry>,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
@@ -567,6 +580,34 @@ async fn databricks(
     let user_agent = Some(data_components::databricks::user_agent());
     #[cfg(not(feature = "databricks"))]
     let user_agent: Option<&'static str> = None;
+
+    let embedding_error = |error| EmbedError::FailedToInstantiateEmbeddingModel {
+        source: Box::new(model_error(error)),
+    };
+    if let Some(identity) = params
+        .federation()
+        .workload_identity(key_in_spicepod)
+        .map_err(embedding_error)?
+    {
+        let token_provider = get_workload_identity_token_provider(
+            &format!("embedding '{embedding_name}' (databricks)"),
+            endpoint,
+            identity,
+            &token_provider_registry,
+        )
+        .await
+        .map_err(embedding_error)?;
+        return Ok(Arc::new(
+            llms::databricks::from_token_provider(
+                endpoint,
+                model_id.as_str(),
+                token_provider,
+                user_agent,
+                HealthCheck::Required,
+            )
+            .set_cache(embeddings_cache),
+        ) as Arc<dyn Embed>);
+    }
 
     match (token_opt, client_id, client_secret) {
         (Some(_), Some(_) | None, Some(_)) => {

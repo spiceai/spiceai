@@ -88,6 +88,24 @@ steps:
       body: SELECT c_name FROM (SELECT * FROM customer)
       headers: { Spice-Cache-Key: e2eci }
     expect: { status: 200, headers: { results-cache-status: HIT, vary: Spice-Cache-Key }, body-contains: Renamed }
+  # The key partitions entries per query and never makes two queries share
+  # one: another query under the same key is its own MISS, and the first
+  # query's entry is still there.
+  - http:
+      path: /v1/sql
+      body: SELECT c_name FROM customer WHERE c_custkey = -1
+      headers: { Spice-Cache-Key: e2eci }
+    expect: { status: 200, headers: { results-cache-status: MISS }, body-contains: '[]' }
+  - http:
+      path: /v1/sql
+      body: SELECT c_name FROM customer WHERE c_custkey = -1
+      headers: { Spice-Cache-Key: e2eci }
+    expect: { status: 200, headers: { results-cache-status: HIT }, body-contains: '[]' }
+  - http:
+      path: /v1/sql
+      body: SELECT c_name FROM (SELECT * FROM customer)
+      headers: { Spice-Cache-Key: e2eci }
+    expect: { status: 200, headers: { results-cache-status: HIT }, body-contains: Renamed }
 
   # Empty answers are cached like any other.
   - http: { path: /v1/sql, body: SELECT * FROM customer WHERE c_custkey = -1 }

@@ -917,11 +917,11 @@ impl DataConnectorFactory for GithubFactory {
             installation_id: installation_id.as_deref(),
         }) {
             Ok(app) => app,
-            Err(message) => {
+            Err(error) => {
                 let error = DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "github".to_string(),
                     connector_component,
-                    message,
+                    message: error.to_string(),
                 };
                 return Box::pin(async move { Err(Box::new(error) as _) });
             }
@@ -996,19 +996,18 @@ impl DataConnectorFactory for GithubFactory {
                     let component = github_component_label(&connector_component);
                     let (signer, load_message) = app_key::signer(app.service, &component)
                         .await
-                        .map_err(|error| match error {
-                            app_key::SignerError::Configuration(message) => {
+                        .map_err(|error| {
+                            if error.is_configuration() {
                                 DataConnectorError::InvalidConfigurationNoSource {
                                     dataconnector: "github".to_string(),
                                     connector_component: connector_component.clone(),
-                                    message,
+                                    message: error.to_string(),
                                 }
-                            }
-                            app_key::SignerError::Unavailable(source) => {
+                            } else {
                                 DataConnectorError::UnableToConnectInternal {
                                     dataconnector: "github".to_string(),
                                     connector_component: connector_component.clone(),
-                                    source,
+                                    source: Box::new(error),
                                 }
                             }
                         })?;
