@@ -12,6 +12,7 @@ sources:
 
 variants:
   cayenne: cayenne-file
+  duckdb: duckdb-file
 
 spicepod:
   version: v1

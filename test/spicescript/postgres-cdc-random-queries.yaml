@@ -3,14 +3,15 @@ description: >
   Random queries (as in random-queries.yaml) over PostgreSQL CDC accelerations
   after rounds of randomized changes at the source (updates to values and to
   NULL, deletes, inserts and key changes, in single statements and in one
-  transaction) answer as PostgreSQL answers over the same rows, on Cayenne, in file and memory mode.
+  transaction) answer as PostgreSQL answers over the same rows, on Cayenne
+  and DuckDB.
 
 sources:
   src: { kind: postgres }
 
 variants:
   cayenne: {}
-  cayenne-memory: { datasets: { '*': { acceleration: { mode: memory } } } }
+  duckdb: { datasets: { '*': { acceleration: { engine: duckdb, mode: memory, on_conflict: { id: upsert } } } } }
 
 spicepod:
   version: v1

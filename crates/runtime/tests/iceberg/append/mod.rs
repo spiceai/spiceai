@@ -1105,16 +1105,21 @@ fn key_vals(rows: Rows) -> Vec<(String, String)> {
     rows.into_iter().map(|(key, _, val)| (key, val)).collect()
 }
 
-/// Regression test for #15273: `SQLite` with `on_conflict: upsert` reads by time, so a late
-/// older version does not overwrite the newer stored one. A late row below the window start
-/// is not loaded, unlike on Cayenne.
-#[cfg(feature = "sqlite")]
+/// Regression test for #15273: `DuckDB` and `SQLite` with `on_conflict: upsert` read by time,
+/// so a late older version does not overwrite the newer stored one. A late row below the
+/// window start is not loaded, unlike on Cayenne.
+#[cfg(any(feature = "duckdb", feature = "sqlite"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_last_arrival_engine_reads_by_time_and_keeps_the_newer_version() -> anyhow::Result<()> {
     let _tracing = crate::init_tracing(Some(
         "integration=debug,data_components=debug,runtime_table=debug,info",
     ));
-    let engines = ["sqlite"];
+    let engines = [
+        #[cfg(feature = "duckdb")]
+        "duckdb",
+        #[cfg(feature = "sqlite")]
+        "sqlite",
+    ];
     for engine in engines {
         let lab = Lab::start(TimeKind::Timestamp).await?;
         // c1: k1..k100 at 10:00.

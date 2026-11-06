@@ -304,17 +304,18 @@ async fn cdc_with_embeddings_and_full_text_search_indexes_changed_row() -> anyho
         .await
 }
 
-/// Start the `docs` CDC dataset over a `Cayenne` `mode: file` acceleration at `db_path`.
+/// Start the `docs` CDC dataset over a `DuckDB` `mode: file` acceleration at `db_path`.
+#[cfg(feature = "duckdb")]
 async fn start_file_accelerated(db_path: &str) -> anyhow::Result<Arc<Runtime>> {
     use spicepod::{acceleration::Mode, param::Params};
 
     configure_test_datafusion();
     let mut dataset = docs_dataset(false, true);
     if let Some(acceleration) = dataset.acceleration.as_mut() {
-        acceleration.engine = Some("cayenne".to_string());
+        acceleration.engine = Some("duckdb".to_string());
         acceleration.mode = Mode::File;
         acceleration.params = Some(Params::from_string_map(HashMap::from([(
-            "cayenne_file_path".to_string(),
+            "duckdb_file".to_string(),
             db_path.to_string(),
         )])));
     }
@@ -334,9 +335,10 @@ async fn start_file_accelerated(db_path: &str) -> anyhow::Result<Arc<Runtime>> {
 }
 
 /// Regression test for #14618 on a stream-attached index: a `refresh_mode: changes` dataset
-/// over a `Cayenne` `mode: file` acceleration keeps its rows across a restart, while its
+/// over a `DuckDB` `mode: file` acceleration keeps its rows across a restart, while its
 /// in-memory full-text index starts empty. The index has to be rebuilt from the acceleration
 /// before the changes stream starts, or a search after the restart finds nothing.
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn cdc_full_text_search_finds_persisted_rows_after_a_restart() -> anyhow::Result<()> {
     let _tracing = init_tracing(Some("integration=debug,runtime=debug,info"));

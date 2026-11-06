@@ -238,11 +238,7 @@ impl SnapshotFixture {
         }
 
         let mut accel_params: HashMap<String, String> = HashMap::from([(
-            if self.engine == "cayenne" {
-                "cayenne_file_path".to_string()
-            } else {
-                format!("{}_file", self.engine)
-            },
+            format!("{}_file", self.engine),
             self.local_db_path.to_string_lossy().to_string(),
         )]);
         for (key, value) in extra_accel_params {
@@ -313,21 +309,8 @@ impl SnapshotFixture {
         Ok(SnapshotManager::try_new(
             TAXI_TRIPS_DATASET_NAME.to_string(),
             snapshot_behavior,
-            if self.engine == "cayenne" {
-                runtime_acceleration::snapshot::AccelerationLayout::cayenne(
-                    local_db_path.join("metadata"),
-                    local_db_path,
-                )
-            } else {
-                runtime_acceleration::snapshot::AccelerationLayout::file(local_db_path)
-            },
-            match self.engine {
-                "cayenne" => AccelerationEngine::Cayenne,
-                #[cfg(feature = "duckdb")]
-                _ => AccelerationEngine::DuckDB,
-                #[cfg(not(feature = "duckdb"))]
-                other => return Err(anyhow!("unsupported fixture engine {other}")),
-            },
+            runtime_acceleration::snapshot::AccelerationLayout::file(local_db_path),
+            AccelerationEngine::DuckDB,
         )
         .await
         .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager"))?
@@ -514,16 +497,7 @@ async fn load_runtime(rt: Arc<Runtime>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "duckdb")]
 async fn prepare_duckdb_fixture(test_name: &str) -> Result<SnapshotFixture> {
-    prepare_fixture(test_name, "duckdb").await
-}
-
-async fn prepare_cayenne_fixture(test_name: &str) -> Result<SnapshotFixture> {
-    prepare_fixture(test_name, "cayenne").await
-}
-
-async fn prepare_fixture(test_name: &str, engine: &'static str) -> Result<SnapshotFixture> {
     configure_test_datafusion();
 
     let context = SnapshotS3Context::new(test_name).await?;
@@ -543,11 +517,7 @@ async fn prepare_fixture(test_name: &str, engine: &'static str) -> Result<Snapsh
 
     let mut accel_params = HashMap::new();
     accel_params.insert(
-        if engine == "cayenne" {
-            "cayenne_file_path".to_string()
-        } else {
-            "duckdb_file".to_string()
-        },
+        "duckdb_file".to_string(),
         local_db_path.to_string_lossy().to_string(),
     );
 
@@ -557,7 +527,7 @@ async fn prepare_fixture(test_name: &str, engine: &'static str) -> Result<Snapsh
         &dataset_params,
         DatasetSnapshotBehavior::Enabled,
         &accel_params,
-        engine,
+        "duckdb",
         RefreshOnStartup::Auto,
     );
 
@@ -612,7 +582,7 @@ async fn prepare_fixture(test_name: &str, engine: &'static str) -> Result<Snapsh
         dataset_params,
         schema,
         baseline,
-        engine,
+        engine: "duckdb",
         initial_snapshot_count: snapshot_objects.len(),
     })
 }
@@ -716,11 +686,8 @@ fn remove_existing_local_files(path: &Path) {
         path_with_appended_suffix(path, "-shm"),
     ];
     for candidate in candidates {
-        if let Err(err) = if candidate.is_dir() {
-            std::fs::remove_dir_all(&candidate)
-        } else {
-            std::fs::remove_file(&candidate)
-        } && err.kind() != std::io::ErrorKind::NotFound
+        if let Err(err) = std::fs::remove_file(&candidate)
+            && err.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(
                 "Failed to remove local acceleration file {}: {err}",
@@ -783,13 +750,14 @@ async fn count_table_rows(runtime: &Arc<Runtime>, table: &str) -> Result<i64> {
         .ok_or_else(|| anyhow!("COUNT(*) column is not a BIGINT"))
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn snapshot_int_test1_cayenne_bootstrap_from_s3() -> Result<()> {
+async fn snapshot_int_test1_duckdb_bootstrap_from_s3() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_cayenne_fixture("snapshot_int_test1").await?;
+            let fixture = prepare_duckdb_fixture("snapshot_int_test1").await?;
 
             remove_existing_local_files(&fixture.local_db_path);
 
@@ -844,13 +812,14 @@ async fn snapshot_int_test1_cayenne_bootstrap_from_s3() -> Result<()> {
         .await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn snapshot_int_test2_cayenne_bootstrap_without_federation() -> Result<()> {
+async fn snapshot_int_test2_duckdb_bootstrap_without_federation() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_cayenne_fixture("snapshot_int_test2").await?;
+            let fixture = prepare_duckdb_fixture("snapshot_int_test2").await?;
 
             remove_existing_local_files(&fixture.local_db_path);
 
@@ -952,13 +921,14 @@ async fn snapshot_int_test3_sqlite_bootstrap_from_s3() -> Result<()> {
         .await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test4_existing_acceleration_skips_snapshot_download() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_cayenne_fixture("snapshot_int_test4").await?;
+            let fixture = prepare_duckdb_fixture("snapshot_int_test4").await?;
 
             let dataset = fixture.dataset(
                 DatasetSnapshotBehavior::Enabled,
@@ -1004,13 +974,14 @@ async fn snapshot_int_test4_existing_acceleration_skips_snapshot_download() -> R
         .await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test5_creates_and_uses_snapshot_on_restart() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_cayenne_fixture("snapshot_int_test5").await?;
+            let fixture = prepare_duckdb_fixture("snapshot_int_test5").await?;
 
             let metadata = fixture.context.metadata_json().await?;
             assert_eq!(
@@ -1098,13 +1069,14 @@ async fn snapshot_int_test5_creates_and_uses_snapshot_on_restart() -> Result<()>
         .await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_cayenne_fixture("snapshot_int_test6").await?;
+            let fixture = prepare_duckdb_fixture("snapshot_int_test6").await?;
             let schema = Arc::clone(fixture.schema());
             let runtime = fixture
                 .snapshots_only_runtime("snapshot_int_test6_concurrent")
@@ -1123,7 +1095,7 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
             let mut managers = Vec::with_capacity(10);
             for writer in 0..10 {
                 let local_db_path = writers_dir.path().join(format!("taxi_trips_{writer}.duckdb"));
-                copy_snapshot_directory(&fixture.local_db_path, &local_db_path)
+                fs::copy(&fixture.local_db_path, &local_db_path)
                     .await
                     .context("Copying the acceleration file for a writer")?;
                 // Always: this test is about concurrent creation, not the on_change skip.
@@ -1187,13 +1159,14 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
         .await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_cayenne_fixture("snapshot_int_test7").await?;
+            let fixture = prepare_duckdb_fixture("snapshot_int_test7").await?;
             let schema = Arc::clone(fixture.schema());
             let runtime = fixture
                 .snapshots_only_runtime("snapshot_int_test7_prepare")
@@ -1207,13 +1180,32 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
                 )
                 .await?;
 
-            crate::acceleration::query_cayenne_file(
-                &fixture.local_db_path,
-                TAXI_TRIPS_DATASET_NAME,
-                "INSERT OVERWRITE taxi_trips SELECT * REPLACE (COALESCE(passenger_count, 0) + 100 AS passenger_count) FROM taxi_trips",
+            let conn = Connection::open(&fixture.local_db_path)
+                .context("Opening DuckDB acceleration file for modification")?;
+            conn.execute("DROP TABLE IF EXISTS taxi_trips_modified", [])
+                .context("Cleaning up temporary snapshot modification table")?;
+            conn.execute(
+                "CREATE TABLE taxi_trips_modified AS SELECT * FROM taxi_trips",
+                [],
             )
-            .await
-            .context("Updating Cayenne acceleration to change snapshot contents")?;
+            .context("Creating temporary snapshot modification table")?;
+            conn.execute(
+                "UPDATE taxi_trips_modified SET passenger_count = COALESCE(passenger_count, 0) + 100",
+                [],
+            )
+            .context("Updating DuckDB acceleration file to change snapshot contents")?;
+            conn.execute("DROP VIEW IF EXISTS taxi_trips", [])
+                .context("Dropping existing taxi_trips view prior to replacement")?;
+            conn.execute("DROP TABLE IF EXISTS taxi_trips", [])
+                .context("Dropping existing taxi_trips table prior to replacement")?;
+            conn.execute(
+                "CREATE TABLE taxi_trips AS SELECT * FROM taxi_trips_modified",
+                [],
+            )
+            .context("Replacing taxi_trips table with modified data")?;
+            conn.execute("DROP TABLE taxi_trips_modified", [])
+                .context("Cleaning up temporary snapshot modification table")?;
+            drop(conn);
 
             // Snapshot objects are named to the second. Publishing the modified
             // snapshot within the second the original was published in would
@@ -1495,13 +1487,14 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
         .await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_cayenne_fixture("snapshot_int_test9").await?;
+            let fixture = prepare_duckdb_fixture("snapshot_int_test9").await?;
             let schema = Arc::clone(fixture.schema());
             let runtime = fixture
                 .snapshots_only_runtime("snapshot_int_test9_onchange")
@@ -1601,6 +1594,7 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
         .await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test10_onchange_policy_skips_interval_based_snapshots() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
@@ -1627,7 +1621,7 @@ async fn snapshot_int_test10_onchange_policy_skips_interval_based_snapshots() ->
 
             let mut accel_params = HashMap::new();
             accel_params.insert(
-                "cayenne_file_path".to_string(),
+                "duckdb_file".to_string(),
                 local_db_path.to_string_lossy().to_string(),
             );
 
@@ -1638,7 +1632,7 @@ async fn snapshot_int_test10_onchange_policy_skips_interval_based_snapshots() ->
                 &dataset_params,
                 DatasetSnapshotBehavior::CreateOnly,
                 &accel_params,
-                "cayenne",
+                "duckdb",
                 RefreshOnStartup::Auto,
             );
             if let Some(ref mut accel) = dataset.acceleration {
@@ -1688,6 +1682,7 @@ async fn snapshot_int_test10_onchange_policy_skips_interval_based_snapshots() ->
         .await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test11_interval_based_snapshots() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
@@ -1714,7 +1709,7 @@ async fn snapshot_int_test11_interval_based_snapshots() -> Result<()> {
 
             let mut accel_params = HashMap::new();
             accel_params.insert(
-                "cayenne_file_path".to_string(),
+                "duckdb_file".to_string(),
                 local_db_path.to_string_lossy().to_string(),
             );
 
@@ -1725,7 +1720,7 @@ async fn snapshot_int_test11_interval_based_snapshots() -> Result<()> {
                 &dataset_params,
                 DatasetSnapshotBehavior::CreateOnly,
                 &accel_params,
-                "cayenne",
+                "duckdb",
                 RefreshOnStartup::Auto,
             );
             if let Some(ref mut accel) = dataset.acceleration {
@@ -1775,6 +1770,7 @@ async fn snapshot_int_test11_interval_based_snapshots() -> Result<()> {
         .await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
@@ -1801,7 +1797,7 @@ async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> 
 
             let mut accel_params = HashMap::new();
             accel_params.insert(
-                "cayenne_file_path".to_string(),
+                "duckdb_file".to_string(),
                 local_db_path.to_string_lossy().to_string(),
             );
 
@@ -1812,7 +1808,7 @@ async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> 
                 &dataset_params,
                 DatasetSnapshotBehavior::CreateOnly,
                 &accel_params,
-                "cayenne",
+                "duckdb",
                 RefreshOnStartup::Auto,
             );
             dataset.time_column = Some("tpep_pickup_datetime".to_string());
@@ -1895,6 +1891,7 @@ async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> 
         .await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
@@ -1921,7 +1918,7 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
 
             let mut accel_params = HashMap::new();
             accel_params.insert(
-                "cayenne_file_path".to_string(),
+                "duckdb_file".to_string(),
                 local_db_path.to_string_lossy().to_string(),
             );
 
@@ -1932,7 +1929,7 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
                 &dataset_params,
                 DatasetSnapshotBehavior::CreateOnly,
                 &accel_params,
-                "cayenne",
+                "duckdb",
                 RefreshOnStartup::Auto,
             );
             if let Some(ref mut accel) = dataset.acceleration {
@@ -2026,13 +2023,14 @@ const FILE_CREATE_EXTRA_ROWS: usize = 5;
 /// checkpoint, `refresh_on_startup: auto` skips the startup refresh. The second
 /// arm grows the source and switches to `file_create`, so a bootstrap and a
 /// rebuild-from-source produce different row counts.
+#[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test14_file_create_skips_snapshot_bootstrap() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {
-            let fixture = prepare_cayenne_fixture("snapshot_int_test14").await?;
+            let fixture = prepare_duckdb_fixture("snapshot_int_test14").await?;
             let source_path = PathBuf::from(
                 fixture
                     .dataset_from
@@ -2929,22 +2927,4 @@ async fn snapshot_int_test_cayenne_bootstrap_serves_lookups_from_its_index() -> 
             Ok(())
         })
         .await
-}
-
-/// Copy a stopped file-mode Cayenne acceleration, including its metastore.
-async fn copy_snapshot_directory(source: &Path, destination: &Path) -> Result<()> {
-    let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
-    while let Some((source, destination)) = pending.pop() {
-        fs::create_dir_all(&destination).await?;
-        let mut entries = fs::read_dir(&source).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let destination = destination.join(entry.file_name());
-            if entry.file_type().await?.is_dir() {
-                pending.push((entry.path(), destination));
-            } else {
-                fs::copy(entry.path(), destination).await?;
-            }
-        }
-    }
-    Ok(())
 }

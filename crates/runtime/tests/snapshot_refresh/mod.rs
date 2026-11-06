@@ -66,6 +66,8 @@ use crate::utils::{register_test_connectors, runtime_ready_check, test_request_c
 use crate::{init_tracing, run_query};
 
 mod cayenne;
+#[cfg(feature = "duckdb")]
+mod duckdb;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 
@@ -79,6 +81,8 @@ const SNAPSHOT_REGION: &str = "us-west-2";
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum EngineKind {
     Cayenne,
+    #[cfg(feature = "duckdb")]
+    DuckDB,
     #[cfg(feature = "sqlite")]
     Sqlite,
 }
@@ -87,6 +91,8 @@ impl EngineKind {
     fn engine_name(self) -> &'static str {
         match self {
             Self::Cayenne => "cayenne",
+            #[cfg(feature = "duckdb")]
+            Self::DuckDB => "duckdb",
             #[cfg(feature = "sqlite")]
             Self::Sqlite => "sqlite",
         }
@@ -95,6 +101,8 @@ impl EngineKind {
     fn file_extension(self) -> &'static str {
         match self {
             Self::Cayenne => "cayenne",
+            #[cfg(feature = "duckdb")]
+            Self::DuckDB => "duckdb",
             #[cfg(feature = "sqlite")]
             Self::Sqlite => "sqlite",
         }
@@ -249,6 +257,13 @@ impl SnapshotRefreshFixture {
                 params.insert(
                     "cayenne_metadata_dir".to_string(),
                     metadata_dir.to_string_lossy().into_owned(),
+                );
+            }
+            #[cfg(feature = "duckdb")]
+            EngineKind::DuckDB => {
+                params.insert(
+                    "duckdb_file".to_string(),
+                    local_db_path.to_string_lossy().into_owned(),
                 );
             }
             #[cfg(feature = "sqlite")]

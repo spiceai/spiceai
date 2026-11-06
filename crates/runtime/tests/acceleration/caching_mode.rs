@@ -34,14 +34,14 @@ limitations under the License.
 //!
 //! ## Accelerator Support
 //!
-//! All accelerators (`Cayenne`, Cayenne, Arrow/MemTable) support caching mode with
+//! All accelerators (`DuckDB`, Cayenne, Arrow/MemTable) support caching mode with
 //! the same behavior - data is cached per unique filter combination.
 //!
 //! ## Tests
 //!
 //! - `test_caching_mode_filter_propagation`: Basic cache miss and hit workflow
 //! - `test_caching_mode_multi_filter_limitation`: Verifies overwrite behavior (for Arrow)
-//! - `test_caching_mode_multi_filter_ideal`: Multi-filter caching with `Cayenne`
+//! - `test_caching_mode_multi_filter_ideal`: Multi-filter caching with `DuckDB`
 //! - `test_caching_mode_multi_filter_cayenne`: Multi-filter caching with Cayenne (SQLite+Vortex)
 //! - `test_caching_mode_background_refresh_on_miss`: Background refresh triggered on cache miss
 //! - `test_caching_mode_background_refresh_on_stale`: Background refresh triggered when data becomes stale (TTL expiration)
@@ -281,7 +281,7 @@ async fn test_caching_mode_filter_propagation() -> Result<(), anyhow::Error> {
 /// due to the `ColumnReference` sorting limitation in datafusion-table-providers.
 /// This is expected and acceptable since Arrow is primarily for testing.
 ///
-/// For production use with `Cayenne` or Cayenne accelerators, multi-filter caching
+/// For production use with `DuckDB` or Cayenne accelerators, multi-filter caching
 /// works correctly with upsert behavior.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error> {
@@ -488,7 +488,7 @@ async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error
         .await
 }
 
-/// Test verifying ideal multi-filter caching behavior with `Cayenne`.
+/// Test verifying ideal multi-filter caching behavior with `DuckDB`.
 ///
 /// This test verifies that multiple filter combinations can be cached simultaneously:
 /// 1. Query with filter A → cache miss → fetch → cache stores A
@@ -496,7 +496,7 @@ async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error
 /// 3. Query with filter A → cache hit → served from cache (no HTTP fetch)
 /// 4. Query with filter B → cache hit → served from cache (no HTTP fetch)
 ///
-/// Uses `Cayenne` accelerator which supports upsert-based multi-filter caching.
+/// Uses `DuckDB` accelerator which supports upsert-based multi-filter caching.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -522,7 +522,7 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
             ));
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("cayenne".to_string()),
+                engine: Some("duckdb".to_string()),
                 mode: Mode::File,
                 refresh_mode: Some(RefreshMode::Caching),
                 refresh_check_interval: Some("30s".to_string()),
@@ -713,7 +713,7 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
 ///
 /// Uses Cayenne accelerator which supports upsert-based multi-filter caching.
 ///
-/// NOTE: Currently SQLite/Cayenne caching mode has similar issues to `Cayenne` - queries return empty results.
+/// NOTE: Currently SQLite/Cayenne caching mode has similar issues to `DuckDB` - queries return empty results.
 /// Investigation needed. Test runs when sqlite feature is enabled but is currently failing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "sqlite")]
@@ -1950,6 +1950,7 @@ async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyho
 /// 1. Parent HTTP dataset fetches from source and stores in parent accelerator
 /// 2. Localpod child accelerator automatically receives the same data
 /// 3. Queries to localpod are served from the in-memory child accelerator
+#[cfg(feature = "duckdb")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_localpod_caching_synchronization() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -1958,7 +1959,7 @@ async fn test_localpod_caching_synchronization() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            // Create parent HTTP dataset with file-mode Cayenne caching
+            // Create parent HTTP dataset with file-mode DuckDB caching
             let origin = start_people_search_origin().await;
             let mut parent_dataset = Dataset::new(&origin.url, "tvmaze_file");
             parent_dataset.params = Some(Params::from_string_map(
@@ -1974,18 +1975,18 @@ async fn test_localpod_caching_synchronization() -> Result<(), anyhow::Error> {
             ));
             parent_dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("cayenne".to_string()),
+                engine: Some("duckdb".to_string()),
                 mode: Mode::Memory, // Using memory mode for test simplicity
                 refresh_mode: Some(RefreshMode::Caching),
                 refresh_check_interval: Some("30s".to_string()),
                 ..Acceleration::default()
             });
 
-            // Create localpod dataset pointing to the parent, with in-memory Cayenne caching
+            // Create localpod dataset pointing to the parent, with in-memory DuckDB caching
             let mut localpod_dataset = Dataset::new("localpod:tvmaze_file", "tvmaze");
             localpod_dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("cayenne".to_string()),
+                engine: Some("duckdb".to_string()),
                 mode: Mode::Memory,
                 refresh_mode: Some(RefreshMode::Caching),
                 refresh_check_interval: Some("30s".to_string()),
@@ -2096,6 +2097,7 @@ async fn test_localpod_caching_synchronization() -> Result<(), anyhow::Error> {
 ///
 /// This test verifies the `initialize_child_from_parent` functionality that copies existing
 /// parent data to the child accelerator during registration.
+#[cfg(feature = "duckdb")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_localpod_caching_initialization_from_existing_parent_data()
 -> Result<(), anyhow::Error> {
@@ -2108,7 +2110,7 @@ async fn test_localpod_caching_initialization_from_existing_parent_data()
             // PHASE 1: Set up parent dataset and populate it with data
             eprintln!("PHASE 1: Setting up parent dataset and populating with data...");
 
-            // Create parent HTTP dataset with Cayenne caching (memory mode for test)
+            // Create parent HTTP dataset with DuckDB caching (memory mode for test)
             let origin = start_people_search_origin().await;
             let mut parent_dataset = Dataset::new(&origin.url, "tvmaze_parent");
             parent_dataset.params = Some(Params::from_string_map(
@@ -2124,7 +2126,7 @@ async fn test_localpod_caching_initialization_from_existing_parent_data()
             ));
             parent_dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("cayenne".to_string()),
+                engine: Some("duckdb".to_string()),
                 mode: Mode::Memory,
                 refresh_mode: Some(RefreshMode::Caching),
                 refresh_check_interval: Some("30s".to_string()),
@@ -2205,7 +2207,7 @@ async fn test_localpod_caching_initialization_from_existing_parent_data()
             let mut localpod_dataset = Dataset::new("localpod:tvmaze_parent", "tvmaze_child");
             localpod_dataset.acceleration = Some(Acceleration {
                 enabled: true,
-                engine: Some("cayenne".to_string()),
+                engine: Some("duckdb".to_string()),
                 mode: Mode::Memory,
                 refresh_mode: Some(RefreshMode::Caching),
                 refresh_check_interval: Some("30s".to_string()),

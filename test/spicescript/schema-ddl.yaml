@@ -13,7 +13,7 @@ sources:
   src: { kind: postgres }
 
 matrix:
-  engine: [cayenne]
+  engine: [duckdb, cayenne]
 
 variants:
   block: {}

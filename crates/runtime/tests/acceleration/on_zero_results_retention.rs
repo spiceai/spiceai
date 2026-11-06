@@ -78,6 +78,7 @@ async fn accelerator_ids(rt: &Arc<Runtime>, table: &str) -> Vec<i64> {
     ids(&batches)
 }
 
+#[cfg(feature = "duckdb")]
 fn events_dataset(dir: &Path, name: &str, refresh_sql: Option<&str>) -> Dataset {
     let mut dataset = Dataset::new(format!("file://{}", dir.join("events.csv").display()), name);
     dataset.params = Some(Params::from_string_map(
@@ -85,7 +86,7 @@ fn events_dataset(dir: &Path, name: &str, refresh_sql: Option<&str>) -> Dataset 
     ));
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("cayenne".to_string()),
+        engine: Some("duckdb".to_string()),
         on_zero_results: ZeroResultsAction::UseSource,
         refresh_sql: refresh_sql.map(ToString::to_string),
         retention_sql: Some(format!("DELETE FROM {name} WHERE deleted = true")),
@@ -158,7 +159,7 @@ fn cayenne_time_dataset(source: &Path, name: &str, scheduled_ticker: bool) -> Da
     // than Int64. Cayenne's scan-time keep builder rejects numeric columns
     // without a unix scale (`data_type_to_timestamp_format(..., None)`).
     // `time_format` is Timestamp because that is the inferred Arrow type;
-    // ISO8601 is only valid while the column stays Utf8. The Cayenne fixture
+    // ISO8601 is only valid while the column stays Utf8. The DuckDB fixture
     // can stay numeric.
     dataset.time_column = Some("ts".to_string());
     dataset.time_format = Some(TimeFormat::Timestamp);
@@ -198,8 +199,9 @@ fn arrow_write_time_events_dataset(dir: &Path, name: &str) -> Dataset {
     dataset
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn cayenne_retention_sql_does_not_resurrect_via_fallback() -> anyhow::Result<()> {
+async fn duckdb_retention_sql_does_not_resurrect_via_fallback() -> anyhow::Result<()> {
     register_test_connectors().await;
     test_request_context()
         .scope(async {

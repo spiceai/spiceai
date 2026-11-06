@@ -10,7 +10,7 @@ sources:
   src: { kind: postgres }
 
 matrix:
-  engine: [cayenne, sqlite]
+  engine: [cayenne, duckdb, sqlite]
 
 variants:
   writer:

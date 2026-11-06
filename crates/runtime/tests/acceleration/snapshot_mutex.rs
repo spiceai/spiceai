@@ -158,26 +158,14 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
     let local_snapshot_file = temp_root.join("acceleration.db");
 
     tokio::fs::create_dir_all(&snapshot_dir).await?;
-    let metadata_dir = temp_root.join("metadata");
-    let data_dir = local_snapshot_file.clone();
-    tokio::fs::create_dir_all(&metadata_dir).await?;
-    let catalog = Arc::new(cayenne::CayenneCatalog::new(format!(
-        "sqlite://{}",
-        metadata_dir.join("cayenne.db").display()
-    ))?) as Arc<dyn cayenne::MetadataCatalog>;
-    catalog.init().await?;
-    let ctx = datafusion::prelude::SessionContext::new();
-    let _snapshot_table = cayenne::CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-        .create(cayenne::metadata::CreateTableOptions {
-            table_name: "snapshot_mutex_test".to_string(),
-            schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
-            primary_key: vec![],
-            on_conflict: None,
-            base_path: data_dir.display().to_string(),
-            partition_column: None,
-            vortex_config: cayenne::metadata::VortexConfig::default(),
-        })
-        .await?;
+    // A real DuckDB database: the snapshot opens the acceleration file to
+    // checkpoint its write-ahead log before copying it, and refuses a file it
+    // cannot open.
+    let db_path = local_snapshot_file.clone();
+    tokio::task::spawn_blocking(move || {
+        duckdb::Connection::open(&db_path)?.execute_batch("CREATE TABLE t(id INTEGER)")
+    })
+    .await??;
 
     let snapshots = Snapshots {
         enabled: true,
@@ -228,8 +216,8 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
     let snapshot_manager = SnapshotManager::try_new(
         "snapshot_mutex_test".to_string(),
         snapshot_behavior,
-        runtime_acceleration::snapshot::AccelerationLayout::cayenne(metadata_dir, data_dir),
-        AccelerationEngine::Cayenne,
+        runtime_acceleration::snapshot::AccelerationLayout::file(local_snapshot_file.clone()),
+        AccelerationEngine::DuckDB,
     )
     .await
     .expect("Failed to create snapshot manager");

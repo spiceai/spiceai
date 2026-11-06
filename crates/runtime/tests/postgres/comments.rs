@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Integration tests verifying that `PostgreSQL` table and column comments are
 //! accessible via `obj_description` and `col_description` UDFs when the dataset
-//! is loaded with `Cayenne` acceleration.
+//! is loaded with `DuckDB` acceleration.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -45,7 +45,7 @@ fn commented_dataset(port: usize) -> Dataset {
     ));
     ds.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("cayenne".to_string()),
+        engine: Some("duckdb".to_string()),
         refresh_mode: Some(RefreshMode::Full),
         ..Acceleration::default()
     });
@@ -126,9 +126,9 @@ async fn start_runtime(dataset: Dataset) -> Result<Arc<runtime::Runtime>, anyhow
 }
 
 /// `obj_description('orders')` returns the `PostgreSQL` table comment when the
-/// dataset is accelerated with `Cayenne`.
+/// dataset is accelerated with `DuckDB`.
 #[tokio::test]
-async fn test_postgres_obj_description_with_cayenne_acceleration() -> Result<(), anyhow::Error> {
+async fn test_postgres_obj_description_with_duckdb_acceleration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -159,9 +159,9 @@ async fn test_postgres_obj_description_with_cayenne_acceleration() -> Result<(),
 }
 
 /// `col_description('orders', N)` returns `PostgreSQL` column comments by
-/// 1-based position when the dataset is accelerated with `Cayenne`.
+/// 1-based position when the dataset is accelerated with `DuckDB`.
 #[tokio::test]
-async fn test_postgres_col_description_with_cayenne_acceleration() -> Result<(), anyhow::Error> {
+async fn test_postgres_col_description_with_duckdb_acceleration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()

@@ -583,14 +583,13 @@ async fn first_snapshot_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
 const RELOAD: &str = "spice_test_rustfs_snapshot_source_reload";
 const MOVED: &str = "spice_test_rustfs_snapshot_source_moved";
 
-/// Publishes a Cayenne snapshot of `modules` to `prefix` and copies it to the reader
+/// Publishes a `DuckDB` snapshot of `modules` to `prefix` and copies it to the reader
 /// bucket, returning the writer.
 async fn publish_and_replicate(
     rustfs: Rustfs,
     prefix: &str,
     modules: &str,
     dir: &Path,
-    engine: &str,
 ) -> Result<Arc<Runtime>> {
     let modules_csv = dir.join("modules.csv");
     std::fs::write(&modules_csv, INITIAL_CSV)?;
@@ -599,7 +598,7 @@ async fn publish_and_replicate(
             .with_app(
                 AppBuilder::new("snapshot_source_writer")
                     .with_snapshots(writer_snapshots(rustfs, prefix))
-                    .with_dataset(writer_dataset(modules, &modules_csv, engine, dir))
+                    .with_dataset(writer_dataset(modules, &modules_csv, "duckdb", dir))
                     .build(),
             )
             .build()
@@ -649,7 +648,7 @@ async fn loads_a_snapshot_dataset_that_a_reload_adds() -> Result<()> {
 async fn reload_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     let prefix = unique("snapshots");
     let dir = TempDir::new()?;
-    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path(), "cayenne").await?;
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path()).await?;
 
     let reader = Arc::new(
         Runtime::builder()
@@ -697,7 +696,7 @@ async fn a_moved_dataset_never_serves_the_previous_locations_rows() -> Result<()
 async fn moved_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     let prefix = unique("snapshots");
     let dir = TempDir::new()?;
-    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path(), "duckdb").await?;
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path()).await?;
     writer.shutdown().await;
 
     // The first location, restored and served.
@@ -911,7 +910,7 @@ async fn replaced_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
         ));
     }
 
-    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path(), "cayenne").await?;
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path()).await?;
     for status in other_statuses_than_ready(&reader, &table, Duration::from_secs(5)).await {
         failures.push(format!(
             "after the snapshot was published, '{modules}' reported {status}"
@@ -1044,7 +1043,7 @@ async fn restore_held_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     let mut reader_load = tokio::spawn(Arc::clone(&reader).load_components());
     wait_for_error(&reader, &table, "has no snapshot to load yet").await?;
 
-    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path(), "cayenne").await?;
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path()).await?;
     tokio::time::timeout(Duration::from_secs(60), hold.wait_until_restore_started())
         .await
         .context("the reader did not start restoring the published snapshot")?;
@@ -1435,7 +1434,7 @@ async fn refuses_cayenne_paths_for_another_engines_snapshots() -> Result<()> {
 async fn other_engine_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     let prefix = unique("snapshots");
     let dir = TempDir::new()?;
-    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path(), "duckdb").await?;
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path()).await?;
     writer.shutdown().await;
 
     let mut dataset = reader_dataset(rustfs, modules, &prefix);
@@ -1614,7 +1613,7 @@ async fn metrics_scenario(
     let prefix = unique("snapshots");
     let dir = TempDir::new()?;
     let table = datafusion::common::TableReference::bare(modules);
-    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path(), "cayenne").await?;
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path()).await?;
 
     // So an unreachable store fails a poll within the test.
     let mut dataset = reader_dataset(rustfs, modules, &prefix);

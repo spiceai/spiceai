@@ -19,6 +19,7 @@ matrix:
 variants:
   federated: {}
   cayenne: cayenne-file
+  duckdb: duckdb-file
   arrow: arrow
 
 spicepod:

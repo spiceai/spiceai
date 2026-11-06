@@ -21,7 +21,7 @@ limitations under the License.
 //!
 //! These tests deliberately exercise the *full* pipeline (auth principal ->
 //! `RequestContext` -> `Query::run_internal` -> `TableProvider::scan` ->
-//! `CachingAccelerationScanExec::execute` -> `Cayenne`) because the unit tests
+//! `CachingAccelerationScanExec::execute` -> `DuckDB`) because the unit tests
 //! in `runtime_table::accelerated::caching` cannot reach the two failure modes that
 //! were caught only by manual end-to-end testing:
 //!
@@ -30,7 +30,7 @@ limitations under the License.
 //!    `Unsupported` (or that simply fails to push down a predicate) would
 //!    let rows from another principal's namespace leak through to the
 //!    caller. The fix is a strict `FilterExec` re-application on top of
-//!    the accelerator scan; without it, `Cayenne` silently serves another
+//!    the accelerator scan; without it, `DuckDB` silently serves another
 //!    principal's cached row.
 //!
 //! 2. **`DataFusion` does not propagate Tokio task-locals across
@@ -130,7 +130,7 @@ fn principal_request_context(api_key: &str) -> Arc<RequestContext> {
     ctx
 }
 
-fn make_caching_dataset(base_url: &str, cayenne_path: &str) -> Dataset {
+fn make_caching_dataset(base_url: &str, duckdb_file: &str) -> Dataset {
     let mut dataset = Dataset::new(base_url, "http_data");
     dataset.params = Some(Params::from_string_map(
         vec![
@@ -142,10 +142,10 @@ fn make_caching_dataset(base_url: &str, cayenne_path: &str) -> Dataset {
     ));
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("cayenne".to_string()),
+        engine: Some("duckdb".to_string()),
         mode: Mode::File,
         refresh_mode: Some(RefreshMode::Caching),
-        params: get_params(&Mode::File, Some(cayenne_path.to_string()), "cayenne"),
+        params: get_params(&Mode::File, Some(duckdb_file.to_string()), "duckdb"),
         ..Acceleration::default()
     });
     dataset
@@ -227,7 +227,7 @@ async fn collect_served_at(rt: &Runtime, ctx: &Arc<RequestContext>) -> usize {
 }
 
 /// End-to-end isolation test for caching-mode acceleration with two
-/// distinct API-key principals against an HTTP source backed by `Cayenne`
+/// distinct API-key principals against an HTTP source backed by `DuckDB`
 /// (file mode).
 ///
 /// Walks the canonical four-step interleaving:
@@ -255,7 +255,7 @@ async fn caching_accelerator_isolates_per_principal_e2e() -> Result<(), anyhow::
     let base_url = format!("http://{addr}");
 
     let temp_dir = tempfile::tempdir()?;
-    let cayenne_path = temp_dir
+    let duckdb_path = temp_dir
         .path()
         .join("per_principal_cache.duckdb")
         .to_string_lossy()
@@ -274,7 +274,7 @@ async fn caching_accelerator_isolates_per_principal_e2e() -> Result<(), anyhow::
 
     let result: Result<(), anyhow::Error> = admin_ctx
         .scope(async {
-            let dataset = make_caching_dataset(&base_url, &cayenne_path);
+            let dataset = make_caching_dataset(&base_url, &duckdb_path);
             let mut app = AppBuilder::new("test_caching_per_principal")
                 .with_dataset(dataset)
                 .build();
@@ -411,7 +411,7 @@ async fn caching_accelerator_hides_namespace_column_from_user_schema() -> Result
     let base_url = format!("http://{addr}");
 
     let temp_dir = tempfile::tempdir()?;
-    let cayenne_path = temp_dir
+    let duckdb_path = temp_dir
         .path()
         .join("hidden_column.duckdb")
         .to_string_lossy()
@@ -425,7 +425,7 @@ async fn caching_accelerator_hides_namespace_column_from_user_schema() -> Result
 
     let result: Result<(), anyhow::Error> = admin_ctx
         .scope(async {
-            let dataset = make_caching_dataset(&base_url, &cayenne_path);
+            let dataset = make_caching_dataset(&base_url, &duckdb_path);
             let mut app = AppBuilder::new("test_caching_hidden_column")
                 .with_dataset(dataset)
                 .build();

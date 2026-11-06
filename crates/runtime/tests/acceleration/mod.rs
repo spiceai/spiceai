@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 mod caching_mode;
 mod caching_mode_constraints;
+#[cfg(feature = "duckdb")]
 mod caching_mode_per_principal;
+#[cfg(feature = "duckdb")]
 mod caching_mode_post_filter;
 mod caching_mode_request_method;
 mod caching_mode_stale_if_error;
@@ -53,8 +55,9 @@ mod file_swap_duckdb;
 mod file_watcher;
 mod hash_index;
 mod localpod_sync;
-#[cfg(all(feature = "postgres-accel", feature = "sqlite"))]
+#[cfg(all(feature = "postgres-accel", feature = "duckdb", feature = "sqlite"))]
 mod on_conflict;
+#[cfg(any(feature = "duckdb", feature = "sqlite"))]
 mod pk_insert_semantics;
 #[cfg(feature = "sqlite")]
 mod sqlite_builtin_pushdown;
@@ -65,14 +68,17 @@ mod sqlite_query_errors;
 
 mod newest_by_time;
 mod on_conflict_cayenne;
+#[cfg(feature = "duckdb")]
 mod on_conflict_options;
 mod on_zero_results_retention;
+#[cfg(any(feature = "duckdb", feature = "sqlite"))]
 mod on_zero_results_subqueries;
 mod partition_by_arrow;
 mod partition_by_cayenne;
 #[cfg(feature = "postgres-accel")]
 mod query_push_down;
 mod refresh;
+#[cfg(any(feature = "duckdb", feature = "sqlite"))]
 mod reload_file_accelerated;
 mod retention_arrow;
 mod retention_cayenne;
@@ -163,11 +169,7 @@ pub(crate) fn has_vortex_file(dir: &std::path::Path) -> bool {
 }
 
 pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
-    let param_name = if engine == "cayenne" {
-        "cayenne_file_path".to_string()
-    } else {
-        format!("{engine}_file")
-    };
+    let param_name = format!("{engine}_file");
     if mode == &Mode::File {
         return Some(Params::from_string_map(
             vec![(param_name, file.unwrap_or_default())]
@@ -284,24 +286,4 @@ async fn wait_for_checkpoints(
             result.map(|_| ())
         }
     }
-}
-
-/// Read a persisted Cayenne table through a fresh catalog and provider.
-pub(crate) async fn query_cayenne_file(
-    data_dir: &std::path::Path,
-    table: &str,
-    sql: &str,
-) -> anyhow::Result<Vec<arrow::array::RecordBatch>> {
-    use cayenne::{CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog};
-    let catalog = Arc::new(CayenneCatalog::new(format!(
-        "sqlite://{}",
-        data_dir.join("metadata/cayenne.db").display()
-    ))?) as Arc<dyn MetadataCatalog>;
-    catalog.init().await?;
-    let ctx = datafusion::prelude::SessionContext::new();
-    let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
-        .open(table)
-        .await?;
-    ctx.register_table(table, Arc::new(provider))?;
-    Ok(ctx.sql(sql).await?.collect().await?)
 }

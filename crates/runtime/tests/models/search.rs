@@ -43,6 +43,7 @@ use spicepod::component::dataset::Dataset;
 use spicepod::component::embeddings::EmbeddingChunkConfig;
 use spicepod::param::Params;
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig};
+#[cfg(feature = "duckdb")]
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -1370,7 +1371,7 @@ async fn test_rrf_search() -> Result<(), anyhow::Error> {
 
 /// Regression test for <https://github.com/spiceai/spiceai/issues/9621>
 ///
-/// This test ensures that RRF queries work correctly with `Cayenne` acceleration.
+/// This test ensures that RRF queries work correctly with `DuckDB` acceleration.
 #[tokio::test]
 async fn test_rrf_recency_unboosting_disjoint_regression() -> Result<(), anyhow::Error> {
     let left_path = format!(
@@ -1441,9 +1442,10 @@ async fn test_rrf_recency_unboosting_disjoint_regression() -> Result<(), anyhow:
 
 /// Regression test for <https://github.com/spiceai/spiceai/issues/9621>
 ///
-/// This test ensures that RRF queries work correctly with `Cayenne` acceleration.
+/// This test ensures that RRF queries work correctly with `DuckDB` acceleration.
+#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn test_rrf_search_cayenne_acceleration() -> Result<(), anyhow::Error> {
+async fn test_rrf_search_duckdb_acceleration() -> Result<(), anyhow::Error> {
     let mut ds = get_mega_science_dataset(
         Some("qs"),
         Some(
@@ -1457,7 +1459,7 @@ async fn test_rrf_search_cayenne_acceleration() -> Result<(), anyhow::Error> {
     );
     ds.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("cayenne".to_string()),
+        engine: Some("duckdb".to_string()),
         ..Default::default()
     });
 
@@ -1478,7 +1480,7 @@ async fn test_rrf_search_cayenne_acceleration() -> Result<(), anyhow::Error> {
                     "SELECT id, question, trunc(_fused_score, 3) FROM rrf(text_search(qs, 'second'), vector_search(qs, 'second')) order by _fused_score desc, id asc LIMIT 4",
                 ),
             ),
-            // Explicit join key with Cayenne acceleration
+            // Explicit join key with DuckDB acceleration
             SearchTestCase::new(
                 "hybrid_rrf_duckdb_explicit_join",
                 SearchTestType::from_sql(

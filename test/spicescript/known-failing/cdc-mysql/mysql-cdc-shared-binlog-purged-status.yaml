@@ -12,7 +12,7 @@ sources:
   src: { kind: mysql }
 
 matrix:
-  engine: [cayenne]
+  engine: [cayenne, duckdb]
 
 
 spicepod:

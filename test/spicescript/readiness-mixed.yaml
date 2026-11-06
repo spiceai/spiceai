@@ -11,6 +11,7 @@ sources:
 
 variants:
   cayenne: {}
+  duckdb: { datasets: { '*': { acceleration: { engine: duckdb } } } }
 
 spicepod:
   version: v1

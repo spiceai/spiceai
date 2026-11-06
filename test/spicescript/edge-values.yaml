@@ -14,6 +14,7 @@ sources:
 variants:
   federated: {}
   cayenne: cayenne-file
+  duckdb: duckdb-file
   sqlite: sqlite-file
   arrow: arrow
 

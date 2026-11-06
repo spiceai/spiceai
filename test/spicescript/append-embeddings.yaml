@@ -54,7 +54,7 @@ sources:
     ready: python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/')"
 
 matrix:
-  engine: [cayenne, arrow]
+  engine: [cayenne, arrow, duckdb]
 
 variants:
   no-key: {}

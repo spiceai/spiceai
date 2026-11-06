@@ -18,10 +18,10 @@ limitations under the License.
 //!
 //! A real `PostgreSQL` table is seeded with a composite primary key and a variety of
 //! secondary indexes — unique, non-unique, partial, expression, and a clustered
-//! (DESC) index. The dataset is then accelerated with `Cayenne`, exercising the full
+//! (DESC) index. The dataset is then accelerated with `DuckDB`, exercising the full
 //! always-on pipeline end-to-end: the `pg_catalog` inference query (the riskiest
 //! SQL) must run on the real server, and the inferred settings must be accepted by
-//! the accelerator without error. For `Cayenne` + full refresh, inferred physical
+//! the accelerator without error. For `DuckDB` + full refresh, inferred physical
 //! constraints (primary key / indexes) are intentionally *not* applied (its
 //! versioned internal-table rebuild rejects them on the second refresh); only the
 //! inferred sort order flows through — so the test also triggers a second refresh,
@@ -50,7 +50,7 @@ use crate::{
     utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
 };
 
-/// Build an `inventory` dataset accelerated with `Cayenne` (full refresh). Schema
+/// Build an `inventory` dataset accelerated with `DuckDB` (full refresh). Schema
 /// inference is always on, so there is no level to configure.
 fn inventory_dataset(port: usize) -> Dataset {
     let mut ds = Dataset::new("postgres:inventory".to_string(), "inventory".to_string());
@@ -62,7 +62,7 @@ fn inventory_dataset(port: usize) -> Dataset {
     ));
     ds.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("cayenne".to_string()),
+        engine: Some("duckdb".to_string()),
         refresh_mode: Some(RefreshMode::Full),
         ..Acceleration::default()
     });
@@ -187,10 +187,10 @@ async fn refresh_dataset(rt: &runtime::Runtime, name: &str) -> Result<(), anyhow
 
 /// The rich-index table loads end-to-end and returns correct data — proving the
 /// always-on `pg_catalog` inference query runs on the real server and the inferred
-/// settings that apply to `Cayenne` + full refresh (the sort order; physical
+/// settings that apply to `DuckDB` + full refresh (the sort order; physical
 /// constraints are intentionally skipped for this engine/mode) are accepted.
 ///
-/// A second, manually-triggered refresh is part of the test: `Cayenne` verifies
+/// A second, manually-triggered refresh is part of the test: `DuckDB` verifies
 /// declared constraints against the internal table left by the previous load, so a
 /// wrongly-applied inferred primary key or index only fails on the SECOND refresh —
 /// the initial load alone cannot catch it (this is the merge-queue regression from
@@ -210,7 +210,7 @@ async fn test_schema_inference_loads_and_queries() -> Result<(), anyhow::Error> 
 
             // The whole inference pipeline must succeed end-to-end: the pg_catalog
             // inference query runs on the real server, and the inferred settings
-            // applied for Cayenne + full refresh are accepted by the accelerator. A
+            // applied for DuckDB + full refresh are accepted by the accelerator. A
             // correct row count proves the dataset loaded without any of those steps
             // erroring. (Precise value-level mapping is covered by unit tests.)
             let results = run_query(&rt, "SELECT COUNT(*) AS n FROM inventory").await?;
@@ -239,7 +239,7 @@ async fn test_schema_inference_loads_and_queries() -> Result<(), anyhow::Error> 
                 &active
             );
 
-            // Second refresh: Cayenne rebuilds its internal table and verifies the
+            // Second refresh: DuckDB rebuilds its internal table and verifies the
             // declared constraints against the previous one — this is the step that
             // rejects wrongly-inferred physical constraints, so it must succeed and
             // still return correct data.

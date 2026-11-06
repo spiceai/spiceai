@@ -48,6 +48,7 @@ use spicepod::semantic::Column;
 
 use super::common::{get_mongodb_client, make_mongodb_dataset, start_mongodb_docker_container};
 
+#[cfg(feature = "duckdb")]
 use super::common::{
     get_mongodb_replica_set_client, make_mongodb_change_stream_dataset,
     start_mongodb_replica_set_docker_container,
@@ -320,6 +321,7 @@ async fn no_accel_collection_with_documents_registers_immediately() -> Result<()
 /// Collection does not exist (replica set).  `read_provider` returns a
 /// retriable `EmptyCollection` error; the connector retries until the
 /// collection is created and populated.  CDC picks up live changes afterward.
+#[cfg(feature = "duckdb")]
 #[tokio::test(flavor = "multi_thread")]
 async fn changes_accel_collection_not_found_then_created_with_docs() -> anyhow::Result<()> {
     let _tracing = init_tracing(Some(
@@ -384,6 +386,7 @@ async fn changes_accel_collection_not_found_then_created_with_docs() -> anyhow::
 /// Collection exists but is empty (replica set).  `read_provider` returns a
 /// retriable `EmptyCollection` error; the connector retries until documents are
 /// inserted and then starts the change stream from the initial snapshot.
+#[cfg(feature = "duckdb")]
 #[tokio::test(flavor = "multi_thread")]
 async fn changes_accel_empty_collection_then_docs_added() -> anyhow::Result<()> {
     let _tracing = init_tracing(Some(
@@ -451,6 +454,7 @@ async fn changes_accel_empty_collection_then_docs_added() -> anyhow::Result<()> 
 /// Collection has documents when the runtime starts (replica set).  The full
 /// happy path: initial snapshot loads existing documents and live CDC events
 /// are applied for subsequent inserts, updates, and deletes.
+#[cfg(feature = "duckdb")]
 #[tokio::test(flavor = "multi_thread")]
 async fn changes_accel_collection_with_documents_snapshot_and_cdc() -> anyhow::Result<()> {
     let _tracing = init_tracing(Some(
@@ -742,6 +746,7 @@ async fn no_accel_declared_schema_collection_with_documents_uses_merged_schema()
 
 /// Collection not found (replica set), declared schema — registers immediately;
 /// CDC picks up documents once they are inserted.
+#[cfg(feature = "duckdb")]
 #[tokio::test(flavor = "multi_thread")]
 async fn changes_accel_declared_schema_collection_not_found_registers_immediately()
 -> anyhow::Result<()> {
@@ -808,6 +813,7 @@ async fn changes_accel_declared_schema_collection_not_found_registers_immediatel
 
 /// Collection empty (replica set), declared schema — registers immediately;
 /// CDC picks up documents once they are inserted.
+#[cfg(feature = "duckdb")]
 #[tokio::test(flavor = "multi_thread")]
 async fn changes_accel_declared_schema_empty_collection_registers_immediately() -> anyhow::Result<()>
 {
@@ -879,6 +885,7 @@ async fn changes_accel_declared_schema_empty_collection_registers_immediately() 
 
 /// Collection has documents (replica set), declared schema — initial snapshot
 /// uses merged schema; CDC applies live changes.
+#[cfg(feature = "duckdb")]
 #[tokio::test(flavor = "multi_thread")]
 async fn changes_accel_declared_schema_collection_with_documents_uses_merged_schema()
 -> anyhow::Result<()> {

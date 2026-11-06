@@ -6,7 +6,7 @@ description: >
   does: under retention_sql applied at write time (no scheduled check,
   Arrow), time retention applied at scan time with and without a scheduled
   check (Cayenne), and both policies at once, NULL times and flags included
-  (Cayenne).
+  (DuckDB).
 
 sources:
   src: { kind: postgres }
@@ -23,7 +23,7 @@ spicepod:
       time_column: ts
       acceleration:
         enabled: true
-        engine: cayenne
+        engine: duckdb
         on_zero_results: use_source
         refresh_sql: SELECT * FROM c WHERE id <= 4
         refresh_data_window: 10000d

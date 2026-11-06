@@ -1328,43 +1328,47 @@ async fn test_acceleration_refresh_arrow_full_variant() -> Result<(), anyhow::Er
     test_refresh_full_for_engine("arrow").await
 }
 
-// Cayenne memory-mode refreshes
+// DuckDB (feature-gated)
+#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn test_acceleration_refresh_cayenne_memory_append_variant() -> Result<(), anyhow::Error> {
+async fn test_acceleration_refresh_duckdb_append_variant() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_append_for_engine("cayenne").await
+    test_refresh_append_for_engine("duckdb").await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn test_acceleration_refresh_cayenne_memory_append_upsert_history()
--> Result<(), anyhow::Error> {
+async fn test_acceleration_refresh_duckdb_append_upsert_history() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    test_upsert_history_for_engine("cayenne").await
+    test_upsert_history_for_engine("duckdb").await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn test_acceleration_refresh_cayenne_memory_full_variant() -> Result<(), anyhow::Error> {
+async fn test_acceleration_refresh_duckdb_append_timestamp() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    test_refresh_full_for_engine("cayenne").await
+    test_time_format_for_engine("duckdb", TimeFormatCase::Timestamp).await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn test_acceleration_refresh_cayenne_memory_append_timestamp() -> Result<(), anyhow::Error> {
+async fn test_acceleration_refresh_duckdb_append_unix_seconds() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    test_time_format_for_engine("cayenne", TimeFormatCase::Timestamp).await
+    test_time_format_for_engine("duckdb", TimeFormatCase::UnixSeconds).await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn test_acceleration_refresh_cayenne_memory_append_unix_seconds() -> Result<(), anyhow::Error>
-{
+async fn test_acceleration_refresh_duckdb_append_iso8601() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    test_time_format_for_engine("cayenne", TimeFormatCase::UnixSeconds).await
+    test_time_format_for_engine("duckdb", TimeFormatCase::Iso8601).await
 }
 
+#[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn test_acceleration_refresh_cayenne_memory_append_iso8601() -> Result<(), anyhow::Error> {
+async fn test_acceleration_refresh_duckdb_full_variant() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    test_time_format_for_engine("cayenne", TimeFormatCase::Iso8601).await
+    test_refresh_full_for_engine("duckdb").await
 }
 
 // SQLite (feature-gated)

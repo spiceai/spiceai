@@ -112,11 +112,11 @@ fn caching_dataset(base_url: &str, db_path: &str) -> Dataset {
     ];
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("cayenne".to_string()),
+        engine: Some("duckdb".to_string()),
         mode: Mode::File,
         refresh_mode: Some(RefreshMode::Caching),
         params: Some(Params::from_string_map(
-            [("cayenne_file_path".to_string(), db_path.to_string())]
+            [("duckdb_file".to_string(), db_path.to_string())]
                 .into_iter()
                 .collect(),
         )),
