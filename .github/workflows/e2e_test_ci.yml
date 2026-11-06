@@ -2711,25 +2711,34 @@ jobs:
           # Allow filesystem to sync after process exits
           sleep 2
 
-      - name: Verify local DuckDB database
+      - name: Verify the Cayenne acceleration was persisted
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
-          ls -la .spice/data
+          ls -laR .spice/data
 
-          if [ -f .spice/data/accelerated_duckdb.db ]; then
-            echo "Verification successful: accelerated_duckdb.db exists."
+          # A file-mode Cayenne acceleration keeps its metastore in
+          # .spice/data/metadata/cayenne.db and a directory per dataset. Small
+          # tables can live entirely in the metastore, so the dataset directories
+          # may hold no data files. A SQLite -wal file left beside the metastore is
+          # replayed when it is next opened, so it is not checked here; the restart
+          # below checks that every dataset loads again.
+          if [ -f .spice/data/metadata/cayenne.db ]; then
+            echo "Verification successful: the Cayenne metastore exists."
           else
-            echo "Verification failed: accelerated_duckdb.db does not exist."
+            echo "Verification failed: .spice/data/metadata/cayenne.db does not exist."
             exit 1
           fi
 
-          if [ ! -f .spice/data/accelerated_duckdb.db.wal ]; then
-            echo "Verification successful: accelerated_duckdb.db.wal does not exist."
-          else
-            echo "Verification failed: accelerated_duckdb.db.wal exists."
-            ls -la .spice/data/accelerated_duckdb.db.wal
-            exit 1
-          fi
+          missing=0
+          for dataset in $(grep -E '^    name:' spicepod.yaml | awk '{print $2}'); do
+            if [ -d ".spice/data/$dataset" ]; then
+              echo "Verification successful: .spice/data/$dataset exists."
+            else
+              echo "Verification failed: .spice/data/$dataset does not exist."
+              missing=1
+            fi
+          done
+          exit "$missing"
 
       - name: Stop the append simulator
         if: always()
@@ -2877,25 +2886,34 @@ jobs:
           SPICE_STOP_GRACE=600 bash "$GITHUB_WORKSPACE/.github/actions/stop-spice/stop_spice.sh"
           sleep 2
 
-      - name: Verify local DuckDB database
+      - name: Verify the Cayenne acceleration was persisted
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
-          ls -la .spice/data
+          ls -laR .spice/data
 
-          if [ -f .spice/data/accelerated_duckdb.db ]; then
-            echo "Verification successful: accelerated_duckdb.db exists."
+          # A file-mode Cayenne acceleration keeps its metastore in
+          # .spice/data/metadata/cayenne.db and a directory per dataset. Small
+          # tables can live entirely in the metastore, so the dataset directories
+          # may hold no data files. A SQLite -wal file left beside the metastore is
+          # replayed when it is next opened, so it is not checked here; the restart
+          # below checks that every dataset loads again.
+          if [ -f .spice/data/metadata/cayenne.db ]; then
+            echo "Verification successful: the Cayenne metastore exists."
           else
-            echo "Verification failed: accelerated_duckdb.db does not exist."
+            echo "Verification failed: .spice/data/metadata/cayenne.db does not exist."
             exit 1
           fi
 
-          if [ ! -f .spice/data/accelerated_duckdb.db.wal ]; then
-            echo "Verification successful: accelerated_duckdb.db.wal does not exist."
-          else
-            echo "Verification failed: accelerated_duckdb.db.wal exists."
-            ls -la .spice/data/accelerated_duckdb.db.wal
-            exit 1
-          fi
+          missing=0
+          for dataset in $(grep -E '^    name:' spicepod.yaml | awk '{print $2}'); do
+            if [ -d ".spice/data/$dataset" ]; then
+              echo "Verification successful: .spice/data/$dataset exists."
+            else
+              echo "Verification failed: .spice/data/$dataset does not exist."
+              missing=1
+            fi
+          done
+          exit "$missing"
 
       - name: Check logs
         if: always()
