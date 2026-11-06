@@ -9,7 +9,7 @@ Used by publish_release.yml:
               its sha256, and publishes the release at the built commit, which
               creates the tag there.
 
-The tag is created only by publishing, so a ruleset can protect release tags.
+The tag is created only by publishing.
 A published release is never changed. An asset that already exists is accepted
 only when its sha256 matches, so re-running a failed job resumes the upload.
 """
@@ -237,12 +237,11 @@ def is_latest(api, repo, tag, prerelease):
     return True
 
 
-def publish(api, publish_api, repo, tag, sha, files, notes, prerelease):
+def publish(api, repo, tag, sha, files, notes, prerelease):
     """Attach `files` ({name: (path, sha256)}) to the tag's release and publish it at sha.
 
-    publish_api publishes the draft, which creates the tag; with a ruleset on
-    release tags it carries the token of the ruleset's bypass actor.
-    Returns whether the release was made the latest release.
+    Publishing the draft creates the tag. Returns whether the release was made
+    the latest release.
     """
     release = find_release(api, repo, tag)
     title, body = title_and_body(truncate_body(notes, repo, tag), tag)
@@ -324,7 +323,7 @@ def publish(api, publish_api, repo, tag, sha, files, notes, prerelease):
         update["body"] = body
     if not (release.get("name") or "").strip():
         update["name"] = title
-    publish_api.patch(f"repos/{repo}/releases/{release['id']}", update)
+    api.patch(f"repos/{repo}/releases/{release['id']}", update)
 
     created = tag_commit(api, repo, tag)
     if created != sha:
@@ -388,8 +387,7 @@ def main(argv=None):
         if not notes:
             notes = f"This is the release candidate {args.tag[1:]}"
         require_tag_free_or_at(api, args.repo, args.tag, args.sha)
-        publish_token = os.getenv("RELEASE_PUBLISH_TOKEN") or token
-        latest = publish(api, Api(publish_token), args.repo, args.tag, args.sha, files, notes, args.prerelease == "true")
+        latest = publish(api, args.repo, args.tag, args.sha, files, notes, args.prerelease == "true")
         write_output("make_latest", "true" if latest else "false")
         return 0
     except PublishError as e:

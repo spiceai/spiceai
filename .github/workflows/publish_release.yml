@@ -10,8 +10,7 @@ name: publish_release
 #      the release at the built commit, which creates the tag there;
 #   2. `images` builds the Docker images from the published binaries, and its
 #      two push jobs (the multi-arch image and the CUDA image) push them.
-# Only publishing creates a release tag, so a ruleset can protect `v*` tags
-# with the release App as its one bypass actor. Nothing already published is
+# Only publishing creates a release tag. Nothing already published is
 # replaced. To retry a failed step, re-run the failed jobs of the same run.
 on:
   workflow_dispatch:
@@ -89,7 +88,6 @@ jobs:
     permissions:
       contents: write
       actions: read
-      id-token: write  # Release App token
     outputs:
       make_latest: ${{ steps.publish.outputs.make_latest }}
       spiced_sha256_amd64: ${{ steps.sha256.outputs.amd64 }}
@@ -111,27 +109,12 @@ jobs:
           github-token: ${{ github.token }}
           run-id: ${{ needs.resolve.outputs.build_run_id }}
 
-      # Publishing creates the tag. A ruleset on `v*` tags lets only the release
-      # App create them, and the App's key signs a token only for a job in this
-      # environment. Until that App is configured, the job token publishes.
-      - name: Get the release App token
-        id: release-app
-        if: vars.RELEASE_GITHUB_APP_ID != ''
-        uses: ./.github/actions/key-vault-app-token
-        with:
-          app-id: ${{ vars.RELEASE_GITHUB_APP_ID }}
-          installation-id: ${{ vars.RELEASE_GITHUB_INSTALLATION_ID }}
-          key-id: ${{ vars.RELEASE_KEY_ID }}
-          azure-client-id: ${{ vars.RELEASE_AZURE_CLIENT_ID }}
-          azure-tenant-id: ${{ vars.RELEASE_AZURE_TENANT_ID }}
-          repositories: spiceai
-          permissions: '{"contents": "write"}'
-
+      # Publishing the draft creates the tag at the built commit, with the job
+      # token's `contents: write`.
       - name: Publish the release
         id: publish
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          RELEASE_PUBLISH_TOKEN: ${{ steps.release-app.outputs.token }}
         run: |
           python3 ./.github/scripts/publish_release.py --repo "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" \
             publish --dir release --sums release/SHA256SUMS \

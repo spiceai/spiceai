@@ -110,7 +110,7 @@ class PublishTests(unittest.TestCase):
 
     def test_creates_and_publishes_a_release_when_there_is_no_draft(self):
         api = FakeApi(releases=[{"id": 1, "tag_name": "v2.4.1", "draft": False, "prerelease": False}])
-        latest = publish_release.publish(api, api, REPO, "v2.4.2", SHA, self.files, "# Spice v2.4.2\n\nNotes", False)
+        latest = publish_release.publish(api, REPO, "v2.4.2", SHA, self.files, "# Spice v2.4.2\n\nNotes", False)
 
         self.assertTrue(latest)
         release = api.releases[-1]
@@ -122,7 +122,7 @@ class PublishTests(unittest.TestCase):
 
     def test_keeps_the_title_and_notes_of_an_endgame_draft(self):
         api = FakeApi(releases=[{"id": 7, "tag_name": "v2.4.2", "draft": True, "prerelease": False, "name": "Draft title", "body": "Draft notes"}])
-        publish_release.publish(api, api, REPO, "v2.4.2", SHA, self.files, "# Checked-in\n\nOther", False)
+        publish_release.publish(api, REPO, "v2.4.2", SHA, self.files, "# Checked-in\n\nOther", False)
 
         self.assertEqual(api.patches, [{"draft": False, "tag_name": "v2.4.2", "target_commitish": SHA, "prerelease": False, "make_latest": "true"}])
         self.assertEqual(api.releases[0]["name"], "Draft title")
@@ -130,7 +130,7 @@ class PublishTests(unittest.TestCase):
 
     def test_fills_an_empty_draft_from_the_notes(self):
         api = FakeApi(releases=[{"id": 7, "tag_name": "v2.4.2", "draft": True, "prerelease": False}])
-        publish_release.publish(api, api, REPO, "v2.4.2", SHA, self.files, "# Spice v2.4.2\n\nNotes", True)
+        publish_release.publish(api, REPO, "v2.4.2", SHA, self.files, "# Spice v2.4.2\n\nNotes", True)
 
         self.assertEqual(
             api.patches,
@@ -139,7 +139,7 @@ class PublishTests(unittest.TestCase):
 
     def test_resumes_an_upload_and_skips_assets_already_attached(self):
         api = FakeApi(releases=[{"id": 7, "tag_name": "v2.4.2", "draft": True, "prerelease": False, "assets": [self.asset("spice_linux_x86_64.tar.gz")]}])
-        publish_release.publish(api, api, REPO, "v2.4.2", SHA, self.files, "notes", False)
+        publish_release.publish(api, REPO, "v2.4.2", SHA, self.files, "notes", False)
 
         self.assertEqual(api.uploads, ["spiced_linux_x86_64.tar.gz"])
         self.assertEqual(len(api.patches), 1)
@@ -147,7 +147,7 @@ class PublishTests(unittest.TestCase):
     def test_replaces_an_incomplete_upload_on_a_draft(self):
         broken = {"id": 55, "name": "spiced_linux_x86_64.tar.gz", "state": "starter", "digest": None}
         api = FakeApi(releases=[{"id": 7, "tag_name": "v2.4.2", "draft": True, "prerelease": False, "assets": [broken]}])
-        publish_release.publish(api, api, REPO, "v2.4.2", SHA, self.files, "notes", False)
+        publish_release.publish(api, REPO, "v2.4.2", SHA, self.files, "notes", False)
 
         self.assertEqual(api.deleted, [55])
         self.assertEqual(sorted(api.uploads), sorted(self.files))
@@ -156,7 +156,7 @@ class PublishTests(unittest.TestCase):
         other = "0" * 64
         api = FakeApi(releases=[{"id": 7, "tag_name": "v2.4.2", "draft": True, "prerelease": False, "assets": [self.asset("spiced_linux_x86_64.tar.gz", other)]}])
         with self.assertRaises(PublishError) as ctx:
-            publish_release.publish(api, api, REPO, "v2.4.2", SHA, self.files, "notes", False)
+            publish_release.publish(api, REPO, "v2.4.2", SHA, self.files, "notes", False)
 
         self.assertIn(f"already has spiced_linux_x86_64.tar.gz with sha256 {other}", str(ctx.exception))
         self.assertEqual(api.uploads, [])
@@ -165,7 +165,7 @@ class PublishTests(unittest.TestCase):
     def test_refuses_a_draft_with_assets_from_elsewhere(self):
         api = FakeApi(releases=[{"id": 7, "tag_name": "v2.4.2", "draft": True, "prerelease": False, "assets": [{"id": 3, "name": "extra.tar.gz", "state": "uploaded", "digest": "sha256:" + "1" * 64}]}])
         with self.assertRaises(PublishError) as ctx:
-            publish_release.publish(api, api, REPO, "v2.4.2", SHA, self.files, "notes", False)
+            publish_release.publish(api, REPO, "v2.4.2", SHA, self.files, "notes", False)
 
         self.assertIn("assets that are not in this build: extra.tar.gz", str(ctx.exception))
         self.assertEqual(api.patches, [])
@@ -174,7 +174,7 @@ class PublishTests(unittest.TestCase):
         api = FakeApi(releases=[{"id": 7, "tag_name": "v2.4.2", "draft": True, "prerelease": False}])
         api.corrupt_uploads = True
         with self.assertRaises(PublishError) as ctx:
-            publish_release.publish(api, api, REPO, "v2.4.2", SHA, self.files, "notes", False)
+            publish_release.publish(api, REPO, "v2.4.2", SHA, self.files, "notes", False)
 
         self.assertIn("GitHub reports sha256", str(ctx.exception))
         self.assertEqual(api.patches, [])
@@ -182,7 +182,7 @@ class PublishTests(unittest.TestCase):
     def test_never_adds_to_a_published_release(self):
         api = FakeApi(releases=[{"id": 7, "tag_name": "v2.4.2", "draft": False, "prerelease": False, "assets": [self.asset("spice_linux_x86_64.tar.gz")]}])
         with self.assertRaises(PublishError) as ctx:
-            publish_release.publish(api, api, REPO, "v2.4.2", SHA, self.files, "notes", False)
+            publish_release.publish(api, REPO, "v2.4.2", SHA, self.files, "notes", False)
 
         self.assertIn("already published without spiced_linux_x86_64.tar.gz", str(ctx.exception))
         self.assertEqual(api.uploads, [])
@@ -191,22 +191,18 @@ class PublishTests(unittest.TestCase):
         assets = [self.asset(name, asset_id=i) for i, name in enumerate(self.files)]
         api = FakeApi(releases=[{"id": 7, "tag_name": "v2.4.2", "draft": False, "prerelease": False, "assets": assets}])
         api.objects["git/ref/tags/v2.4.2"] = {"object": {"type": "commit", "sha": SHA}}
-        latest = publish_release.publish(api, api, REPO, "v2.4.2", SHA, self.files, "notes", False)
+        latest = publish_release.publish(api, REPO, "v2.4.2", SHA, self.files, "notes", False)
 
         self.assertTrue(latest)
         self.assertEqual(api.uploads, [])
         self.assertEqual(api.patches, [])
 
-    def test_publishes_with_the_publish_token_and_creates_the_tag_at_the_built_commit(self):
+    def test_publishing_creates_the_tag_at_the_built_commit(self):
+        # A draft written by hand targets the branch, whose head can move.
         api = FakeApi(releases=[{"id": 7, "tag_name": "v2.4.2", "draft": True, "prerelease": False, "target_commitish": "release/2.4", "name": "T", "body": "B"}])
-        publisher = FakeApi()
-        publisher.releases = api.releases
-        publisher.objects = api.objects
-        publish_release.publish(api, publisher, REPO, "v2.4.2", SHA, self.files, "notes", False)
+        publish_release.publish(api, REPO, "v2.4.2", SHA, self.files, "notes", False)
 
-        # Only the publish itself, which creates the tag, uses the publish token.
-        self.assertEqual(api.patches, [])
-        self.assertEqual(publisher.patches, [{"draft": False, "tag_name": "v2.4.2", "target_commitish": SHA, "prerelease": False, "make_latest": "true"}])
+        self.assertEqual(api.patches, [{"draft": False, "tag_name": "v2.4.2", "target_commitish": SHA, "prerelease": False, "make_latest": "true"}])
         self.assertEqual(api.objects["git/ref/tags/v2.4.2"], {"object": {"type": "commit", "sha": SHA}})
 
     def test_fails_when_the_published_tag_is_not_at_the_built_commit(self):
@@ -214,14 +210,14 @@ class PublishTests(unittest.TestCase):
         # The tag appeared at another commit after the pre-check, so publishing did not create it.
         api.objects["git/ref/tags/v2.4.2"] = {"object": {"type": "commit", "sha": "d" * 40}}
         with self.assertRaises(PublishError) as ctx:
-            publish_release.publish(api, api, REPO, "v2.4.2", SHA, self.files, "notes", False)
+            publish_release.publish(api, REPO, "v2.4.2", SHA, self.files, "notes", False)
 
         self.assertIn(f"the tag points at {'d' * 40}, not at the built commit {SHA}", str(ctx.exception))
 
     def test_refuses_two_releases_with_the_tag(self):
         api = FakeApi(releases=[{"id": 1, "tag_name": "v2.4.2", "draft": True, "prerelease": False}, {"id": 2, "tag_name": "v2.4.2", "draft": True, "prerelease": False}])
         with self.assertRaises(PublishError) as ctx:
-            publish_release.publish(api, api, REPO, "v2.4.2", SHA, self.files, "notes", False)
+            publish_release.publish(api, REPO, "v2.4.2", SHA, self.files, "notes", False)
 
         self.assertIn("More than one release has tag v2.4.2 (ids 1, 2)", str(ctx.exception))
 

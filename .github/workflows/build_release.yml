@@ -5,7 +5,7 @@ name: build_release
 # GitHub-hosted runners and keeps them as artifacts of this run with a
 # SHA256SUMS manifest. It creates no tag and publishes nothing. publish_release
 # publishes them after approval, and creates the release tag at the commit
-# this run built, so release tags can be protected by a ruleset.
+# this run built.
 on:
   push:
     # Release branches build for the same reason trunk does: the `build` job uploads
