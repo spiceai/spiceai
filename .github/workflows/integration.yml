@@ -156,7 +156,7 @@ jobs:
     runs-on: spiceai-dev-runners
     permissions:
       contents: read
-      id-token: write  # RustFS credentials
+      id-token: write  # RustFS and Databricks credentials
     # Slowest successful run from 2026-08-20 to 2026-09-25 (UTC), after the archive
     # step was consolidated to one `nextest archive` invocation: 151.4 min
     # (run 34988348747, merge_group, 2026-09-15), p99 115 min over 880 `push`
@@ -171,6 +171,21 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+
+      # The Spark Connect tests, which only `extended_tests` builds compile, need a Databricks
+      # cluster that takes about 7 minutes to start. Requesting the start here lets it come
+      # up while the archive builds. The test jobs wait for it, and report a cluster that
+      # cannot start, so a failure here does not stop the build.
+      - name: Start the Databricks Spark cluster
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.event.inputs.run_all_tests == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
+          DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+        run: bash .github/scripts/databricks_cluster.sh start
 
       # Cache Cargo dependencies. Saved by the "Save Cargo registry" step at the
       # end of this job, and never from the merge queue (see there).
@@ -358,11 +373,12 @@ jobs:
     runs-on: spiceai-dev-runners
     environment: ci
     # Slowest successful job from 2026-08-20 to 2026-09-25 (UTC): 30.7 min (run
-    # 34948795744, merge_group, 2026-09-15), p99 27.8 min. The two bounded steps
-    # below sum to 60, and everything else in the job (image pulls, the archive
-    # download, ODPI-C) has taken at most 6.0 min in the same window, so this
-    # sits above both and the step bounds are what fire first.
-    timeout-minutes: 90
+    # 34948795744, merge_group, 2026-09-15), p99 27.8 min. The bounded steps below
+    # sum to 84 (14 of it the Databricks wait, which runs only with run_all_tests),
+    # and everything else in the job (image pulls, the archive download, ODPI-C) has
+    # taken at most 6.0 min in the same window, so this sits above both and the step
+    # bounds are what fire first.
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix:
@@ -509,6 +525,19 @@ jobs:
           aws-region: us-east-1
           output-env-credentials: false
           output-credentials: true
+
+      # The build job requested the cluster's start; a 7-minute start is longer than the
+      # Spark Connect tests wait. 12 minutes covers a start requested here instead.
+      - name: Wait for the Databricks Spark cluster
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.event.inputs.run_all_tests == 'true'
+        timeout-minutes: 14
+        env:
+          DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
+          DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+          DATABRICKS_CLUSTER_WAIT_SECONDS: '720'
+        run: bash .github/scripts/databricks_cluster.sh wait
 
       - name: Run integration test
         if: needs.check_changes.outputs.relevant_changes == 'true'
