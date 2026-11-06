@@ -78,7 +78,6 @@ mod cache;
 mod catalog;
 mod cayenne;
 mod cayenne_catalog_ddl;
-#[cfg(feature = "duckdb")]
 mod clickbench;
 mod clickhouse;
 mod cluster;

@@ -67,6 +67,8 @@ async fn iceberg_integration_test_cayenne_acceleration() -> Result<(), anyhow::E
     let _tracing = init_tracing(None);
     test_request_context()
         .scope(async {
+            let acceleration_dir =
+                tempfile::tempdir().context("Creating the Cayenne acceleration directory")?;
             let mut dataset = make_iceberg_dataset("tpch_sf1", "customer", "customer")?;
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
@@ -74,7 +76,7 @@ async fn iceberg_integration_test_cayenne_acceleration() -> Result<(), anyhow::E
                 mode: Mode::File,
                 params: get_params(
                     &Mode::File,
-                    Some("./iceberg_duckdb_simple.db".to_string()),
+                    Some(acceleration_dir.path().to_string_lossy().into_owned()),
                     "cayenne",
                 ),
                 ..Acceleration::default()
@@ -102,6 +104,8 @@ async fn iceberg_integration_test_cayenne_acceleration_restart() -> Result<(), a
     let _tracing = init_tracing(None);
     test_request_context()
         .scope(async {
+            let acceleration_dir =
+                tempfile::tempdir().context("Creating the Cayenne acceleration directory both runtimes share")?;
             let mut dataset = make_iceberg_dataset("tpch_sf1", "customer", "customer")?;
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
@@ -109,7 +113,7 @@ async fn iceberg_integration_test_cayenne_acceleration_restart() -> Result<(), a
                 mode: Mode::File,
                 params: get_params(
                     &Mode::File,
-                    Some("./iceberg_duckdb_restart.db".to_string()),
+                    Some(acceleration_dir.path().to_string_lossy().into_owned()),
                     "cayenne",
                 ),
                 ..Acceleration::default()
