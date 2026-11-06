@@ -467,14 +467,11 @@ fn exact_sum_u64_in_chunks(values: &[u64], chunk_len: usize) -> u128 {
     total
 }
 
-/// The `Int64` / `UInt64` input of a [`CheckedSumGroups`].
-trait CheckedSumInput: ArrowPrimitiveType + Send + Sized {
+/// The `Int64` / `UInt64` input of a [`CheckedSumGroups`]. A value widens to
+/// its `i128` amount with `Into`, and a total narrows back to the `SUM` result
+/// with `TryFrom`, which fails when the total is not representable.
+trait CheckedSumInput: ArrowPrimitiveType<Native: Into<i128> + TryFrom<i128>> + Send + Sized {
     fn values_of(array: &ArrayRef) -> Result<&PrimitiveArray<Self>>;
-
-    fn widen(value: Self::Native) -> i128;
-
-    /// The `SUM` result for `total`, or `None` when it is not representable.
-    fn narrow(total: i128) -> Option<Self::Native>;
 
     /// Whether a partial total from another partition is a total this input
     /// type can produce. The row accumulator rejects the same values on merge.
@@ -486,14 +483,6 @@ trait CheckedSumInput: ArrowPrimitiveType + Send + Sized {
 impl CheckedSumInput for Int64Type {
     fn values_of(array: &ArrayRef) -> Result<&PrimitiveArray<Self>> {
         int64_values(array)
-    }
-
-    fn widen(value: i64) -> i128 {
-        i128::from(value)
-    }
-
-    fn narrow(total: i128) -> Option<i64> {
-        i64::try_from(total).ok()
     }
 
     fn partial_in_range(_partial: i128) -> bool {
@@ -508,14 +497,6 @@ impl CheckedSumInput for Int64Type {
 impl CheckedSumInput for UInt64Type {
     fn values_of(array: &ArrayRef) -> Result<&PrimitiveArray<Self>> {
         uint64_values(array)
-    }
-
-    fn widen(value: u64) -> i128 {
-        i128::from(value)
-    }
-
-    fn narrow(total: i128) -> Option<u64> {
-        u64::try_from(total).ok()
     }
 
     fn partial_in_range(partial: i128) -> bool {
@@ -628,7 +609,7 @@ impl<T: CheckedSumInput> GroupsAccumulator for CheckedSumGroups<T> {
             group_indices,
             opt_filter,
             total_num_groups,
-            |value| Some(T::widen(value)),
+            |value| Some(value.into()),
         )
     }
 
@@ -650,7 +631,7 @@ impl<T: CheckedSumInput> GroupsAccumulator for CheckedSumGroups<T> {
         // A group that has seen no value holds 0, so every total narrows.
         let totals = sums
             .into_iter()
-            .map(|sum| T::narrow(sum).ok_or_else(T::overflow))
+            .map(|sum| T::Native::try_from(sum).map_err(|_| T::overflow()))
             .collect::<Result<Vec<_>>>()?;
         Ok(Arc::new(PrimitiveArray::<T>::try_new(
             totals.into(),
@@ -672,11 +653,7 @@ impl<T: CheckedSumInput> GroupsAccumulator for CheckedSumGroups<T> {
         opt_filter: Option<&BooleanArray>,
     ) -> Result<Vec<ArrayRef>> {
         let values = T::values_of(first_array(values)?)?;
-        let sums: Vec<i128> = values
-            .values()
-            .iter()
-            .map(|&value| T::widen(value))
-            .collect();
+        let sums: Vec<i128> = values.values().iter().map(|&value| value.into()).collect();
         let nulls = match opt_filter {
             None => values.nulls().cloned(),
             Some(filter) => {

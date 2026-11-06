@@ -396,9 +396,7 @@ fn register_int64_partitions(ctx: &SessionContext, name: &str, partitions: &[&[O
             vec![batch]
         })
         .collect();
-    let table = MemTable::try_new(schema, batches).expect("partitioned table");
-    ctx.register_table(name, Arc::new(table))
-        .expect("register partitioned table");
+    register_partitions(ctx, name, schema, batches);
 }
 
 async fn plan_and_collect(ctx: &SessionContext, sql: &str) -> (String, Vec<RecordBatch>) {
