@@ -17,13 +17,19 @@ limitations under the License.
 use std::process::Command;
 
 fn main() {
-    let git_hash: String = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .map_or_else(
-            |_| "unknown".to_string(),
-            |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        );
+    println!("cargo:rustc-env=GIT_COMMIT_HASH={}", git_commit_hash());
+}
 
-    println!("cargo:rustc-env=GIT_COMMIT_HASH={git_hash}");
+/// The commit being built, abbreviated to a fixed 10 characters: `--short` alone
+/// scales with the repository's object count, so a shallow CI checkout would
+/// print a shorter hash than a full clone of the same commit.
+fn git_commit_hash() -> String {
+    Command::new("git")
+        .args(["rev-parse", "--short=10", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|hash| !hash.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }

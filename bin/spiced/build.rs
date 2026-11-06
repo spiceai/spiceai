@@ -28,15 +28,18 @@ fn main() {
         return;
     }
 
-    let git_hash: String = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .map_or_else(
-            |_| "unknown".to_string(),
-            |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        );
-
-    println!("cargo:rustc-env=GIT_COMMIT_HASH={git_hash}");
+    // A fixed 10 characters: `--short` alone scales with the repository's object
+    // count, so a shallow CI checkout would print a shorter hash than a full clone
+    // of the same commit.
+    println!(
+        "cargo:rustc-env=GIT_COMMIT_HASH={}",
+        git_rev_parse(&["--short=10", "HEAD"])
+    );
+    // The full hash, for anonymous telemetry: a prefix is ambiguous to join on.
+    println!(
+        "cargo:rustc-env=GIT_COMMIT_SHA={}",
+        git_rev_parse(&["HEAD"])
+    );
     println!("cargo:rustc-env=SPICED_BUILD_PROFILE={}", build_profile());
     println!("cargo:rustc-env=SPICED_BUILD_FEATURES={}", build_features());
 
@@ -51,6 +54,19 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rustc-link-arg-bins=-Wl,-exported_symbol,__mh_execute_header");
     }
+}
+
+/// `git rev-parse` of the commit being built, or `unknown` outside a git checkout.
+fn git_rev_parse(args: &[&str]) -> String {
+    Command::new("git")
+        .arg("rev-parse")
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|hash| !hash.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// The cargo profile the binary is being built with.
