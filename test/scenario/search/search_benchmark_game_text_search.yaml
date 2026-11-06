@@ -1,0 +1,41 @@
+# Full-text search latency on 5M English Wikipedia articles, with the queries of
+# https://github.com/quickwit-oss/search-benchmark-game, for the spicepods in
+# test/spicepods/scenario/sf1/search/search_benchmark_game/. Queries use the Tantivy query syntax.
+# There is one entry for each query type, so bench reports one latency distribution per type.
+name: search_benchmark_game_text_search
+
+queries:
+  # Any of the terms, for example `griffith observatory`.
+  - name: union_top10
+    sql: SELECT _id, _score FROM text_search(corpus, $1, 10)
+    parameters_from: SELECT text FROM test_queries WHERE query_type = 'union' ORDER BY _id
+
+  # All of the terms, for example `+griffith +observatory`.
+  - name: intersection_top10
+    sql: SELECT _id, _score FROM text_search(corpus, $1, 10)
+    parameters_from: SELECT text FROM test_queries WHERE query_type = 'intersection' ORDER BY _id
+
+  # The terms in order, for example `"griffith observatory"`.
+  - name: phrase_top10
+    sql: SELECT _id, _score FROM text_search(corpus, $1, 10)
+    parameters_from: SELECT text FROM test_queries WHERE query_type = 'phrase' ORDER BY _id
+
+  # Some required terms, for example `+climate policy`.
+  - name: intersection_union_top10
+    sql: SELECT _id, _score FROM text_search(corpus, $1, 10)
+    parameters_from: SELECT text FROM test_queries WHERE query_type = 'intersection_union' ORDER BY _id
+
+  # A required term and an excluded term, for example `+griffith -university`.
+  - name: negated_top10
+    sql: SELECT _id, _score FROM text_search(corpus, $1, 10)
+    parameters_from: SELECT text FROM test_queries WHERE query_type = 'negated' ORDER BY _id
+
+  # One term (`the`).
+  - name: term_top10
+    sql: SELECT _id, _score FROM text_search(corpus, $1, 10)
+    parameters_from: SELECT text FROM test_queries WHERE query_type = 'term' ORDER BY _id
+
+  # A required phrase and a required term (`+"the who" +uk`).
+  - name: two_phase_critic_top10
+    sql: SELECT _id, _score FROM text_search(corpus, $1, 10)
+    parameters_from: SELECT text FROM test_queries WHERE query_type = 'two-phase-critic' ORDER BY _id
