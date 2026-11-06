@@ -58,7 +58,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-      id-token: write  # RustFS credentials
+      id-token: write  # RustFS, AWS and OpenAI credentials
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -151,6 +151,15 @@ jobs:
           aws-region: us-east-1
           output-env-credentials: false
           output-credentials: true
+
+      # spiced reads this token as the `OPENAI_API_KEY` secret and holds it until the job ends. It
+      # expires about 300 s after it is minted, so the step below must end within that time.
+      - name: Mint an OpenAI access token
+        uses: ./.github/actions/openai-token
+        with:
+          identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+          service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+          audience: ${{ secrets.OPENAI_WIF_AUDIENCE }}
 
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         env:

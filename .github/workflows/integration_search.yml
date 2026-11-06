@@ -21,6 +21,8 @@ permissions:
   pull-requests: write
   # Approves the snapshot PR's held pull_request runs.
   actions: write
+  # Exchanged for the short-lived AWS and OpenAI credentials.
+  id-token: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -50,7 +52,6 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-
       # The step below builds the tests before it runs them, so the credentials last as long as
       # the job's default 6-hour limit.
       - name: Assume the S3 Vectors role
@@ -64,6 +65,14 @@ jobs:
           output-env-credentials: false
           output-credentials: true
 
+      # The tests hold this token until they end. It expires about 300 s after it is minted,
+      # so the step below must end within that time.
+      - name: Mint an OpenAI access token
+        uses: ./.github/actions/openai-token
+        with:
+          identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+          service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+          audience: ${{ secrets.OPENAI_WIF_AUDIENCE }}
 
       - name: Run search integration tests
         env:
@@ -78,7 +87,7 @@ jobs:
           # falls back to (its zero-row acceleration never populates the index itself).
           AWS_S3_VECTORS_FALLBACK_INDEX_ARN: ${{ vars.AWS_S3_VECTORS_FALLBACK_INDEX_ARN }}
         run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
+          if [ -z "${SPICE_OPENAI_API_KEY:-}" ] ; then
             echo "Error: OpenAI API key is not defined."
             exit 1
           fi
