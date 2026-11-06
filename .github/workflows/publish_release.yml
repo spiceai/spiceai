@@ -5,7 +5,7 @@ name: publish_release
 # build_release release build of that version is green. Set `commit` to
 # publish an earlier commit of the branch instead, when the branch has moved
 # since its build with no change to the released code. Every job that
-# publishes runs in `release-publish` and needs its own approval:
+# publishes runs in `github-publish` and needs its own approval:
 #   1. `publish` attaches the binaries of that run to the tag's draft release,
 #      or a new one, checking each against the run's SHA256SUMS, and publishes
 #      the release at the built commit, which creates the tag there;
@@ -96,7 +96,7 @@ jobs:
     needs: resolve
     runs-on: ubuntu-24.04
     # One required reviewer, who cannot be the person who started this run.
-    environment: release-publish
+    environment: github-publish
     permissions:
       contents: write
       actions: read

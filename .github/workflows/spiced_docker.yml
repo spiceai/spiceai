@@ -3,7 +3,7 @@ name: spiced_docker
 # Builds the release Docker images from the binaries of a published GitHub
 # release and pushes them. publish_release calls it after the release is
 # published; it has no trigger of its own. The build jobs hold no credentials.
-# The push jobs run in `release-publish`, the environment the Docker Hub
+# The push jobs run in `github-publish`, the environment the Docker Hub
 # connection trusts, and each needs its own approval there: an environment
 # without reviewers could be used by any workflow to push images.
 on:
@@ -210,7 +210,7 @@ jobs:
   publish:
     needs: [setup, build-amd64, build-arm64]
     runs-on: ubuntu-24.04
-    environment: release-publish
+    environment: github-publish
     permissions:
       contents: read
       packages: write
@@ -271,7 +271,7 @@ jobs:
   publish-cuda:
     needs: [setup, build-cuda]
     runs-on: ubuntu-24.04
-    environment: release-publish
+    environment: github-publish
     permissions:
       contents: read
       packages: write
