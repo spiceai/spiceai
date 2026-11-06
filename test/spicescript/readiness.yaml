@@ -26,7 +26,8 @@ spicepod:
       name: slow
       params: ${sources.src.params}
       ready_state: '${matrix.ready_state}'
-      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file }
+      # Reload from the source on every start, also over existing data.
+      acceleration: { enabled: true, engine: '${matrix.engine}', mode: file, refresh_on_startup: always }
 
 defaults:
   # A cluster buckets each acceleration on this column (--cluster).
@@ -74,3 +75,7 @@ steps:
   - query: SELECT * FROM slow
     expect: { same-as: loaded }
     eventually: 4s
+  # Then the reload finishes and serves the changed row.
+  - query: SELECT * FROM slow
+    oracle-sql: SELECT * FROM t
+    eventually: 60s
