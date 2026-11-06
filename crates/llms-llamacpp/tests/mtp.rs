@@ -193,6 +193,13 @@ async fn a_second_request_drafts_as_on_a_fresh_context() {
                 after_another.0[step].clone(),
                 fresh.0[step].clone(),
             ));
+        } else {
+            // the same drafts at every step make the same steps, so the whole replies match,
+            // including the drafts the final step accepted, which no later step's token follows
+            assert_eq!(
+                after_another.1, fresh.1,
+                "the reply to {text:?}, whose drafts match at every step"
+            );
         }
     }
     assert!(
@@ -383,6 +390,12 @@ async fn a_reused_prefix_drafts_as_on_a_fresh_context() {
         first_difference, None,
         "turn 2's drafts after turn 1 {:?}\nread whole on a fresh context {:?}",
         reused.0, fresh.0
+    );
+    // the same drafts at every step make the same steps, so the whole replies match, including
+    // the drafts the final step accepted, which no later step's token follows
+    assert_eq!(
+        reused.1, fresh.1,
+        "turn 2's reply, whose drafts match at every step"
     );
 }
 
