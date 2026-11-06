@@ -46,6 +46,9 @@ pub struct Spiced {
     pub dir: PathBuf,
     env: BTreeMap<String, String>,
     http: u16,
+    /// Serves HTTP on every interface, not only loopback, for a container
+    /// that cannot reach this machine's loopback.
+    http_on_every_interface: bool,
     flight: u16,
     metrics: u16,
     otel: u16,
@@ -95,6 +98,27 @@ pub enum Key {
     Given(String),
 }
 
+/// The `--http` address `spiced` listens on.
+fn http_listen(every_interface: bool, port: impl std::fmt::Display) -> String {
+    let host = if every_interface {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    };
+    format!("{host}:{port}")
+}
+
+/// Whether `command_line` is a `spiced` this tool started serving HTTP on
+/// `port`, on either address [`Spiced::start`] passes.
+pub fn serves_http_on(command_line: &str, port: impl std::fmt::Display + Copy) -> bool {
+    let args: Vec<&str> = command_line.split_whitespace().collect();
+    [false, true].into_iter().any(|every| {
+        let address = http_listen(every, port);
+        args.windows(2)
+            .any(|pair| pair[0] == "--http" && pair[1] == address)
+    })
+}
+
 impl Spiced {
     pub fn new(binary: PathBuf, dir: PathBuf, env: BTreeMap<String, String>) -> Result<Self> {
         std::fs::create_dir_all(&dir)?;
@@ -103,6 +127,7 @@ impl Spiced {
             dir,
             env,
             http: free_port()?,
+            http_on_every_interface: false,
             flight: free_port()?,
             metrics: free_port()?,
             otel: free_port()?,
@@ -133,6 +158,13 @@ impl Spiced {
     /// (`${instance.http_port}`) so that a container can reach it.
     pub fn set_http_port(&mut self, port: u16) {
         self.http = port;
+    }
+
+    /// Serves HTTP on every interface (`0.0.0.0`) rather than only loopback,
+    /// so a container behind a rootless Docker daemon, which reaches this
+    /// machine only at its routable address, can post to it.
+    pub fn set_http_on_every_interface(&mut self, every: bool) {
+        self.http_on_every_interface = every;
     }
 
     fn scheme(&self) -> &'static str {
@@ -250,7 +282,10 @@ impl Spiced {
         };
         let child = command
             .arg("--telemetry-enabled=false")
-            .args(["--http", &format!("127.0.0.1:{}", self.http)])
+            .args([
+                "--http",
+                &http_listen(self.http_on_every_interface, self.http),
+            ])
             .args(["--flight", &format!("127.0.0.1:{}", self.flight)])
             .args(["--metrics", &format!("127.0.0.1:{}", self.metrics)])
             .args(["--open_telemetry", &format!("127.0.0.1:{}", self.otel)])
@@ -1051,5 +1086,35 @@ mod not_yet_loaded_tests {
         assert_eq!(not_yet_loaded("[]", &declared), ["a", "u", "b"]);
         assert!(not_yet_loaded("[]", &[]).is_empty());
         assert!(declared_datasets("not: [yaml").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod http_listen_tests {
+    use super::{http_listen, serves_http_on};
+
+    #[test]
+    fn listens_on_loopback_unless_asked_for_every_interface() {
+        assert_eq!(http_listen(false, 29141), "127.0.0.1:29141");
+        assert_eq!(http_listen(true, 29141), "0.0.0.0:29141");
+    }
+
+    #[test]
+    fn recognizes_its_spiced_on_either_address_and_nothing_else() {
+        let loopback =
+            "spiced --telemetry-enabled=false --http 127.0.0.1:29141 --flight 127.0.0.1:29142";
+        let every =
+            "spiced --telemetry-enabled=false --http 0.0.0.0:29141 --flight 127.0.0.1:29142";
+        assert!(serves_http_on(loopback, 29141));
+        assert!(serves_http_on(every, "29141"));
+        // Another port, another host, or the port given to another flag.
+        assert!(!serves_http_on(loopback, 29143));
+        // A port that is only a prefix of the one served.
+        assert!(!serves_http_on(loopback, 2914));
+        assert!(!serves_http_on("spiced --http 10.0.0.5:29141", 29141));
+        assert!(!serves_http_on(
+            "spiced --http 127.0.0.1:1 --flight 127.0.0.1:29142",
+            29142
+        ));
     }
 }

@@ -833,6 +833,46 @@ fn runner_label() -> HashMap<&'static str, String> {
     HashMap::from([(RUNNER_LABEL, std::process::id().to_string())])
 }
 
+/// Whether the Docker daemon runs rootless. Its `host` network is then
+/// `RootlessKit`'s namespace, not this machine's: a container there still
+/// reaches other containers' published ports at 127.0.0.1, because the daemon
+/// listens for them inside that namespace too, but nothing that listens only
+/// on this machine's loopback, such as `spiced`.
+pub async fn daemon_is_rootless() -> bool {
+    static ROOTLESS: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+    *ROOTLESS
+        .get_or_init(|| async {
+            let Ok(docker) = Docker::connect_with_local_defaults() else {
+                return false;
+            };
+            docker
+                .info()
+                .await
+                .ok()
+                .and_then(|info| info.security_options)
+                .is_some_and(|options| options.iter().any(|o| o == "name=rootless"))
+        })
+        .await
+}
+
+/// This machine's address on the interface its default route leaves by. A
+/// rootless daemon's containers reach a listener on it through the daemon's
+/// outbound NAT, which never leads to this machine's loopback.
+pub fn routable_address() -> Result<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
+    // Connecting a UDP socket sends nothing; it only chooses the route.
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737), so no real host is ever named.
+    socket
+        .connect(("192.0.2.1", 9))
+        .context("Failed to find this machine's routable address: no default route")?;
+    let ip = socket.local_addr()?.ip();
+    anyhow::ensure!(
+        !ip.is_unspecified() && !ip.is_loopback(),
+        "Failed to find this machine's routable address: the default route leaves from {ip}"
+    );
+    Ok(ip)
+}
+
 pub fn free_port() -> Result<u16> {
     const LOW: u16 = 20000;
     const HIGH: u16 = 32768;

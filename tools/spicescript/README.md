@@ -234,7 +234,10 @@ file_format: parquet }`.
 **Placeholders**: `${sources.<name>.<field>}`, `${matrix.<key>}`,
 `${variant.name}`, `${instance.name}`, `${instance.dir}`, `${instance.port}`
 (a free port for the script's own use), `${instance.http_port}` (the port
-`spiced` serves HTTP on, for a container that posts to it), `${script.dir}`, `${pki.dir}` (this run's node mTLS CA and certificates: `ca.crt`, `scheduler.crt`/`.key`, `executor.crt`/`.key`, generated when the run starts).
+`spiced` serves HTTP on, for a container that posts to it), `${instance.host_from_container}` (the
+host such a container reaches `spiced` at: `host.docker.internal`, or this machine's routable address
+when a rootless Docker daemon runs a `host-network` source, since its containers cannot reach this
+machine's loopback; `spiced` then serves HTTP on every interface), `${script.dir}`, `${pki.dir}` (this run's node mTLS CA and certificates: `ca.crt`, `scheduler.crt`/`.key`, `executor.crt`/`.key`, generated when the run starts).
 Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 
 ### Steps

@@ -144,7 +144,9 @@ pub struct SourceSpec {
     /// other sources). Elsewhere Docker reaches the host through
     /// `host.docker.internal`, and on Linux that name is mapped to the host's
     /// loopback, so `${sources.<name>.host_from_container}` (that name) works
-    /// either way.
+    /// either way. A rootless daemon's host network is its own namespace:
+    /// other sources' ports are still at that name, but `spiced` is only at
+    /// `${instance.host_from_container}`.
     #[serde(default)]
     pub host_network: bool,
 }
