@@ -1,5 +1,11 @@
-name: build_and_release
+name: build_release
 
+# Builds the binaries. A release build is a dispatch with `release_version`
+# on the release branch: it builds every release binary, CUDA included, on
+# GitHub-hosted runners and keeps them as artifacts of this run with a
+# SHA256SUMS manifest. It creates no tag and publishes nothing. publish_release
+# publishes them after approval, and creates the release tag at the commit
+# this run built.
 on:
   push:
     # Release branches build for the same reason trunk does: the `build` job uploads
@@ -7,13 +13,10 @@ on:
     # `testoperator dispatch` has for a branch's binary. Without it the dispatch
     # walks back ten commits, finds nothing, and the branch silently loses its
     # benchmark coverage. `setup-matrix` already recognizes release branches; only
-    # the trigger was missing. Releasing stays tag-gated — the `publish` job runs
-    # for `refs/tags/v*` alone.
+    # the trigger was missing.
     branches:
       - trunk
       - release/**
-    tags:
-      - v*
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
@@ -35,6 +38,11 @@ on:
 
   workflow_dispatch:
     inputs:
+      release_version:
+        description: 'Release build of this version, without the leading v (e.g. 2.4.2). Must match version.txt; builds every platform. Empty for a test build.'
+        required: false
+        type: string
+        default: ''
       platform_option:
         description: 'Which option do you want to run on? (Default is ALL)'
         required: false
@@ -67,6 +75,8 @@ on:
         default: 'release'
 
 env:
+  # Checked against version.txt by get_release_version.py; empty except on a release build.
+  RELEASE_VERSION: ${{ inputs.release_version }}
   # CI performance optimizations
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_NET_RETRY: 10
@@ -74,15 +84,12 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
-# A tag build publishes the release named by the tag. If the tag moves while a
-# build is running, the newer run cancels the older one, so the release and its
-# images come from one build. Every other run gets a group of its own, so trunk
-# and release-branch pushes still build every commit. Concurrency groups are
-# shared by every workflow in the repository, so this name differs from
-# build_and_release_cuda's.
+# A newer release build of a version cancels an older one still running, so
+# publish_release finds one build of the commit it releases. Every other run
+# gets a group of its own, so trunk and release-branch pushes build every commit.
 concurrency:
-  group: ${{ github.ref_type == 'tag' && format('build-release-{0}', github.ref) || format('{0}-{1}', github.workflow, github.run_id) }}
-  cancel-in-progress: ${{ github.ref_type == 'tag' }}
+  group: ${{ inputs.release_version && format('build-release-v{0}', inputs.release_version) || format('{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ inputs.release_version && true || false }}
 
 jobs:
   setup-matrix:
@@ -98,8 +105,9 @@ jobs:
         id: setup-matrix
         with:
           script: |
-            // Check if this is a tagged release (uses GitHub hosted runners, no minio)
-            const isTaggedRelease = context.ref.startsWith('refs/tags/v');
+            // A release build (GitHub-hosted runners, no MinIO, every platform) is a
+            // dispatch with `release_version`.
+            const isRelease = (context.payload.inputs?.release_version ?? '') !== '';
 
             // Check if this is a release branch (uses spiceai runners with minio)
             const isReleaseBranch = context.ref.startsWith('refs/heads/release-') ||
@@ -108,19 +116,19 @@ jobs:
             // Check if this is a manual workflow dispatch
             const isManualDispatch = context.eventName === 'workflow_dispatch';
 
-            // Include Windows and Linux ARM only for tagged releases, release branches, or manual dispatch (exclude trunk pushes)
-            const includeWindowsAndLinuxArm = isTaggedRelease || isReleaseBranch || isManualDispatch;
+            // Include Windows and Linux ARM only for release builds, release branches, or manual dispatch (exclude trunk pushes)
+            const includeWindowsAndLinuxArm = isRelease || isReleaseBranch || isManualDispatch;
 
-            // Tagged releases use hosted macOS; every other macOS build uses `spiceai-macos-large`.
+            // Release builds use hosted macOS; every other macOS build uses `spiceai-macos-large`.
             // Trunk pushes stay on it too: the `spiceai-macos` minis share each host between
             // several runner instances, and a release build there can run past the job's
             // 360-minute bound without finishing (#14557). The `concurrency` group on `build`
             // bounds trunk pushes to one running macOS build at a time instead.
-            const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos-large";
-            const linuxRunner = isTaggedRelease ? "ubuntu-24.04" : "spiceai-dev-runners";
+            const macosRunner = isRelease ? "macos-15" : "spiceai-macos-large";
+            const linuxRunner = isRelease ? "ubuntu-24.04" : "spiceai-dev-runners";
 
-            // Use minio for spiceai runners (trunk, release branches, manual dispatch on non-tagged)
-            const useMinio = !isTaggedRelease;
+            // Use minio for spiceai runners (trunk, release branches, manual test builds)
+            const useMinio = !isRelease;
 
             const matrix = [
               {
@@ -130,7 +138,7 @@ jobs:
                 target_arch: "x86_64",
                 tags: ["default", "odbc"],
                 use_minio: useMinio,
-                is_tagged_release: isTaggedRelease,
+                is_release: isRelease,
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
                 runner: macosRunner,
@@ -138,20 +146,20 @@ jobs:
                 target_arch: "aarch64",
                 tags: ["default", "metal"],
                 use_minio: false,
-                is_tagged_release: isTaggedRelease,
+                is_release: isRelease,
               }
             ];
 
-            // Add Linux ARM and Windows only for tagged releases, release branches, or manual dispatch
+            // Add Linux ARM and Windows only for release builds, release branches, or manual dispatch
             if (includeWindowsAndLinuxArm) {
               matrix.push({
                 name: "Linux aarch64",
-                runner: isTaggedRelease ? "hosted-linux-arm-runner" : "hosted-linux-arm-runner",
+                runner: isRelease ? "hosted-linux-arm-runner" : "hosted-linux-arm-runner",
                 target_os: "linux",
                 target_arch: "aarch64",
                 tags: ["default"],
                 use_minio: false,
-                is_tagged_release: isTaggedRelease,
+                is_release: isRelease,
               });
               matrix.push({
                 name: "Windows x64",
@@ -160,7 +168,7 @@ jobs:
                 target_arch: "x86_64",
                 tags: ["default"],
                 use_minio: false,
-                is_tagged_release: isTaggedRelease,
+                is_release: isRelease,
               });
             }
 
@@ -168,6 +176,12 @@ jobs:
             if (isManualDispatch) {
               const platform_option = context.payload.inputs.platform_option;
               const tag_option = context.payload.inputs.tag_option;
+
+              // A release build holds every release binary, so it takes no filter.
+              if (isRelease && (platform_option !== 'all' || tag_option !== 'all')) {
+                core.setFailed(`A release build builds every platform and build tag, so platform_option and tag_option must be 'all', not '${platform_option}' and '${tag_option}'.`);
+                return [];
+              }
 
               // Filter by platform
               let filtered = matrix;
@@ -208,8 +222,8 @@ jobs:
       cancel-in-progress: false
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
-      # Internal builds include PostgreSQL acceleration for benchmarks; tagged releases omit it.
-      SPICED_FEATURES: ${{ matrix.target.is_tagged_release && 'release,models' || 'release,models,postgres-accel' }}
+      # Internal builds include PostgreSQL acceleration for benchmarks; release builds omit it.
+      SPICED_FEATURES: ${{ matrix.target.is_release && 'release,models' || 'release,models,postgres-accel' }}
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_NET_GIT_FETCH_WITH_CLI: true
@@ -508,120 +522,68 @@ jobs:
           source_path: spice_linux_x86_64.tar.gz
           destination_path: spice-minio/artifacts/spice/linux-x86_64/${{ github.sha }}/
 
-  publish:
-    environment: github-publish
-    name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
-    needs: build
-    if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
-    env:
-      ARTIFACT_DIR: ./release
-
-    strategy:
-      matrix:
-        include:
-          - target_os: linux
-            target_arch: x86_64
-          - target_os: linux
-            target_arch: aarch64
-          - target_os: darwin
-            target_arch: aarch64
-          - target_os: windows
-            target_arch: x86_64
-
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Set REL_VERSION from version.txt
-        run: python3 ./.github/scripts/get_release_version.py
-
-      - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        with:
-          name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        with:
-          name: spice.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        with:
-          name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      # macOS metal variant
-      - name: download artifacts - spiced_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'darwin'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        with:
-          name: spiced_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: lists artifacts
-        run: ls -l ${{ env.ARTIFACT_DIR }}
-
-      - name: publish ${{ matrix.target_os }}/${{ matrix.target_arch }} binaries to github
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Parse repository to get owner and repo names
-          OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
-          REPO_NAME="${GITHUB_REPOSITORY#*/}"
-          # Get the list of files
-          RELEASE_ARTIFACT=(${ARTIFACT_DIR}/*)
-          # Delete existing release artifact
-          python ./.github/scripts/github_release.py delete \
-            --owner $OWNER_NAME --repo $REPO_NAME \
-            --tag "v${{ env.REL_VERSION }}" \
-            ${RELEASE_ARTIFACT[*]}
-          # Pass the notes by path, not by value: a release body over 128 KiB
-          # exceeds MAX_ARG_STRLEN and the exec fails with E2BIG (exit 126)
-          # after every build has already succeeded.
-          if [ "$HAS_RELEASE_NOTES" = "true" ]; then
-            BODY_ARGS=(--body-file "./docs/release_notes/v${{ env.REL_VERSION }}.md")
-          else
-            BODY_ARGS=(--body "This is the release candidate ${{ env.REL_VERSION }}")
-          fi
-          echo "Uploading Spice.ai Binaries to GitHub Release"
-          python ./.github/scripts/github_release.py upload \
-            --owner $OWNER_NAME --repo $REPO_NAME \
-            --tag "v${{ env.REL_VERSION }}" \
-            --release-name "v${{ env.REL_VERSION }}" \
-            "${BODY_ARGS[@]}" \
-            --prerelease "$PRE_RELEASE" \
-            ${RELEASE_ARTIFACT[*]}
-
-  # A release's images are built from the binaries the `publish` jobs above
-  # attach to its GitHub release, so they can only be built after those jobs
-  # finish. The `release: published` event fires when the tag is created, hours
-  # too early, which is why spiced_docker no longer listens for it.
-  #
-  # Stable releases are built here too. Marking a release 'latest' still fires
-  # spiced_docker's `release: edited` trigger, but that alone misses two cases:
-  # a release marked 'latest' before its binaries exist (that run 404s), and a
-  # release created already 'latest', which fires no `edited` event at all.
-  # The called run applies ':latest' only when GitHub already marks the release
-  # latest (`tag_latest` defaults to auto), so a release that is not the latest
-  # one never takes the tag from here.
-  docker-release:
-    name: Docker images for the release
-    needs: publish
-    if: startsWith(github.ref, 'refs/tags/v')
+  # The CUDA binaries of a release are built in this run, so one run holds every
+  # binary publish_release needs. Trunk pushes build CUDA in
+  # build_and_release_cuda's own runs.
+  build-cuda:
+    name: Build CUDA binaries
+    if: inputs.release_version
     permissions:
-      contents: write
-      packages: write
-      id-token: write
-    uses: ./.github/workflows/spiced_docker.yml
+      contents: read
+    uses: ./.github/workflows/build_and_release_cuda.yml
     with:
-      release_tag: ${{ github.ref_name }}
-      publish: true
-    secrets: inherit
+      release_version: ${{ inputs.release_version }}
+
+  # publish_release checks every artifact against this manifest before it
+  # publishes, and publishes exactly the files it lists. It finds this run by
+  # the manifest's artifact name, which carries the version. A release build
+  # that misses a binary fails here, so publish_release never finds it.
+  checksums:
+    environment: secret-free
+    name: Record release checksums
+    needs: [build, build-cuda]
+    if: inputs.release_version
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Write SHA256SUMS
+        working-directory: release
+        run: |
+          set -euo pipefail
+          # The ODBC build is for internal testing and has never been a release asset.
+          assets=(
+            spice_linux_x86_64.tar.gz
+            spice_linux_aarch64.tar.gz
+            spice_darwin_aarch64.tar.gz
+            spice.exe_windows_x86_64.tar.gz
+            spiced_linux_x86_64.tar.gz
+            spiced_linux_aarch64.tar.gz
+            spiced_darwin_aarch64.tar.gz
+            spiced_metal_darwin_aarch64.tar.gz
+            spiced_cuda_80_linux_x86_64.tar.gz
+            spiced_cuda_86_linux_x86_64.tar.gz
+            spiced_cuda_87_linux_x86_64.tar.gz
+            spiced_cuda_89_linux_x86_64.tar.gz
+            spiced_cuda_90_linux_x86_64.tar.gz
+          )
+          missing=()
+          for asset in "${assets[@]}"; do
+            [ -f "$asset" ] || missing+=("$asset")
+          done
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::This run did not build ${missing[*]}, so it cannot be published. Start the release build again."
+            exit 1
+          fi
+          sha256sum "${assets[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-v${{ inputs.release_version }}-sha256sums
+          path: release/SHA256SUMS
+          if-no-files-found: error
