@@ -4,7 +4,7 @@ name: file[parquet]-mixed[cayenne[file]+sqlite[file]]
 datasets:
   - from: file:data/customer.parquet
     name: customer
-    acceleration: &acceleration_duckdb
+    acceleration: &acceleration_cayenne
       enabled: true
       engine: cayenne
       mode: file
@@ -16,13 +16,13 @@ datasets:
       mode: file
   - from: file:data/nation.parquet
     name: nation
-    acceleration: *acceleration_duckdb
+    acceleration: *acceleration_cayenne
   - from: file:data/orders.parquet
     name: orders
-    acceleration: *acceleration_duckdb
+    acceleration: *acceleration_cayenne
   - from: file:data/part.parquet
     name: part
-    acceleration: *acceleration_duckdb
+    acceleration: *acceleration_cayenne
   - from: file:data/partsupp.parquet
     name: partsupp
     acceleration: *acceleration_sqlite

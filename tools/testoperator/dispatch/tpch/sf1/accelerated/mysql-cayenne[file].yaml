@@ -1,6 +1,6 @@
-# Validates query results over data loaded from MySQL into DuckDB, which the
+# Validates query results over data loaded from MySQL into Cayenne, which the
 # integration tests check only by row count and two integer columns. Weekly and
-# bench only: the DuckDB accelerator itself is benchmarked from file[parquet].
+# bench only: the Cayenne accelerator itself is benchmarked from file[parquet].
 schedule: weekly
 tests:
   bench:

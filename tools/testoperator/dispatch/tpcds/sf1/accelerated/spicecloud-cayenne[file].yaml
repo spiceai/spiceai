@@ -1,5 +1,5 @@
-# Validates query results over data loaded from Spice Cloud into DuckDB, a load
-# no other automated test makes. Weekly and bench only: the DuckDB accelerator
+# Validates query results over data loaded from Spice Cloud into Cayenne, a load
+# no other automated test makes. Weekly and bench only: the Cayenne accelerator
 # itself is benchmarked from file[parquet].
 schedule: weekly
 tests:

@@ -1,6 +1,6 @@
-# Validates query results over data loaded from Databricks into DuckDB, a load
+# Validates query results over data loaded from Databricks into Cayenne, a load
 # no other automated test makes. Weekly and bench only, as Databricks bills per
-# use: the DuckDB accelerator itself is benchmarked from file[parquet].
+# use: the Cayenne accelerator itself is benchmarked from file[parquet].
 schedule: weekly
 tests:
   bench:
