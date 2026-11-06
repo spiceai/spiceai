@@ -283,10 +283,7 @@ impl Secrets {
     /// consulted last — a user-declared store holding the same key wins.
     /// `entry` keeps a spicepod store of the same name authoritative over the
     /// built-in.
-    fn append_builtin_stores_into(
-        &self,
-        stores: &mut IndexMap<String, Arc<dyn SecretStore>>,
-    ) {
+    fn append_builtin_stores_into(&self, stores: &mut IndexMap<String, Arc<dyn SecretStore>>) {
         for (name, store) in &self.builtin_stores {
             stores
                 .entry(name.clone())
