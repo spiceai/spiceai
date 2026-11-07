@@ -807,6 +807,8 @@ pub struct Runtime {
     tool_loads: Arc<init::model::LoadTasks>,
     /// Names of the SQL functions registered for `as_sql` tools.
     tool_udfs: Arc<parking_lot::Mutex<HashSet<String>>>,
+    /// The installed app's `row_id` keys, read by `/v1/search` and `vector_search`.
+    search_primary_keys: runtime_search::search_engine::ExplicitPrimaryKeys,
     /// Startup view registrations still waiting, cancelled when a Spicepod change replaces or removes the view.
     view_loads: Arc<init::view_loads::ViewLoads>,
 

@@ -403,6 +403,7 @@ impl Runtime {
         }
 
         *self.app.write().await = Some(Arc::clone(&new_app));
+        self.search_primary_keys.update(Arc::clone(&self.app)).await;
 
         // After the swap: `auto` and `all` resolve against the installed app's `tools:`.
         if let Some((changed_tools, changed_function_tools, loaded_models)) = models_to_reload {
@@ -1063,5 +1064,38 @@ mod tests {
             .with_dataset(accelerated_dataset("events", "cayenne"))
             .build();
         assert_eq!(reload_deprecated_engines_warning(&current, &migrated), None);
+    }
+
+    /// `/v1/search` and `vector_search` read the `row_id` keys of the installed app.
+    #[tokio::test]
+    async fn a_reload_updates_the_search_primary_keys() {
+        let docs: spicepod::component::dataset::Dataset = serde_json::from_value(serde_json::json!({
+            "from": "file:data.csv",
+            "name": "docs",
+            "columns": [{"name": "body", "full_text_search": {"enabled": true, "row_id": "id"}}],
+        }))
+        .expect("a valid dataset");
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        let docs_ref = datafusion::common::TableReference::parse_str("docs")
+            .resolve(
+                crate::datafusion::SPICE_DEFAULT_CATALOG,
+                crate::datafusion::SPICE_DEFAULT_SCHEMA,
+            )
+            .into();
+
+        assert!(
+            Arc::clone(&rt)
+                .apply_app(Arc::new(
+                    app::AppBuilder::new("search_keys")
+                        .with_dataset(docs)
+                        .build()
+                ))
+                .await
+        );
+
+        assert_eq!(
+            rt.search_primary_keys.get(&docs_ref),
+            Some(vec!["id".to_string()])
+        );
     }
 }

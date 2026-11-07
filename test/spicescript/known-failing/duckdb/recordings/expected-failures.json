@@ -34,14 +34,6 @@
     },
     {
       "run": "duckdb-types-known",
-      "who": "duckdb",
-      "key": "query: SELECT id, t_interval FROM iv ORDER BY id #2",
-      "kind": "error",
-      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: could not decode the HTTP JSON answer as Flight's schema; body: [{\"id\":1,\"t_interval\":\"1.000000000 secs\"},{\"id\":2,\"t_interval\":\"2.000000000 secs\"},{\"id\":3,\"t_interval\":\"0 secs\"},{\"id\":4,\"t_interval\":null}]: Not yet implement",
-      "group": "duckdb"
-    },
-    {
-      "run": "duckdb-types-known",
       "who": "federated",
       "key": "query: SELECT id, t_interval FROM iv ORDER BY id #2",
       "kind": "error",

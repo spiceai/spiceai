@@ -396,9 +396,7 @@ fn register_int64_partitions(ctx: &SessionContext, name: &str, partitions: &[&[O
             vec![batch]
         })
         .collect();
-    let table = MemTable::try_new(schema, batches).expect("partitioned table");
-    ctx.register_table(name, Arc::new(table))
-        .expect("register partitioned table");
+    register_partitions(ctx, name, schema, batches);
 }
 
 async fn plan_and_collect(ctx: &SessionContext, sql: &str) -> (String, Vec<RecordBatch>) {
@@ -519,6 +517,212 @@ async fn checked_multiparts_int64_sum_cancels_and_overflows_on_merge() {
         render_rows(&cancel_overflow),
         vec![i64::MAX.to_string()],
         "MAX+MAX and -MAX across partitions must cancel to MAX\nplan:\n{cancel_overflow_plan}"
+    );
+}
+
+/// Partial aggregation decides after the first batch and, with 1 group per
+/// 1 row, skips the rest, so later rows reach the final aggregate through
+/// `convert_to_state`. Two partitions force `Partial` and `FinalPartitioned`.
+async fn skip_partial_aggregation_after_one_row(ctx: &SessionContext) {
+    for setting in [
+        "SET datafusion.execution.target_partitions = 2",
+        "SET datafusion.execution.skip_partial_aggregation_probe_rows_threshold = 1",
+        "SET datafusion.execution.skip_partial_aggregation_probe_ratio_threshold = 0.1",
+    ] {
+        ctx.sql(setting)
+            .await
+            .unwrap_or_else(|error| panic!("`{setting}`: {error}"))
+            .collect()
+            .await
+            .unwrap_or_else(|error| panic!("apply `{setting}`: {error}"));
+    }
+}
+
+fn skipped_aggregation_rows(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    let skipped = plan
+        .metrics()
+        .and_then(|metrics| metrics.sum_by_name("skipped_aggregation_rows"));
+    let own = if let Some(value) = skipped {
+        value.as_usize()
+    } else {
+        0
+    };
+    own + plan
+        .children()
+        .into_iter()
+        .map(skipped_aggregation_rows)
+        .sum::<usize>()
+}
+
+/// Runs `sql` and returns its rows and the rows partial aggregation skipped.
+async fn collect_counting_skipped_rows(ctx: &SessionContext, sql: &str) -> (Vec<String>, usize) {
+    let plan = ctx
+        .sql(sql)
+        .await
+        .expect("plan sql")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .unwrap_or_else(|error| panic!("collect `{sql}`: {error}"));
+    (render_rows(&batches), skipped_aggregation_rows(&plan))
+}
+
+/// Two partitions of three 250-row batches: 1,500 rows in 300 groups. `v`
+/// mixes signs at ~10^13, is NULL every seventh row and in all of group 0;
+/// `u` is unsigned and NULL every eleventh row; `keep` is NULL every
+/// thirteenth row and false every fifth row and in all of group 1.
+fn group_by_partitions() -> (Arc<Schema>, Vec<Vec<RecordBatch>>) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("g", DataType::Int64, false),
+        Field::new("v", DataType::Int64, true),
+        Field::new("u", DataType::UInt64, true),
+        Field::new("keep", DataType::Boolean, true),
+    ]));
+    let partitions = (0..2_i64)
+        .map(|partition| {
+            (0..3_i64)
+                .map(|batch| {
+                    let first = (partition * 3 + batch) * 250;
+                    let rows: Vec<i64> = (first..first + 250).collect();
+                    let g = Int64Array::from_iter_values(rows.iter().map(|row| row % 300));
+                    let v = Int64Array::from_iter(rows.iter().map(|row| {
+                        (row % 7 != 0 && row % 300 != 0)
+                            .then_some(((row * 7_919) % 20_011 - 10_005) * 1_000_000_007)
+                    }));
+                    let u = UInt64Array::from_iter(rows.iter().map(|row| {
+                        let row = u64::try_from(*row).expect("row numbers are non-negative");
+                        (!row.is_multiple_of(11)).then_some(row * 3_000_000_019)
+                    }));
+                    let keep = arrow::array::BooleanArray::from_iter(
+                        rows.iter()
+                            .map(|row| (row % 13 != 0).then_some(row % 5 != 0 && row % 300 != 1)),
+                    );
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![
+                            Arc::new(g) as ArrayRef,
+                            Arc::new(v),
+                            Arc::new(u),
+                            Arc::new(keep),
+                        ],
+                    )
+                    .expect("group-by batch")
+                })
+                .collect()
+        })
+        .collect();
+    (schema, partitions)
+}
+
+fn register_partitions(
+    ctx: &SessionContext,
+    name: &str,
+    schema: Arc<Schema>,
+    partitions: Vec<Vec<RecordBatch>>,
+) {
+    let table = MemTable::try_new(schema, partitions).expect("partitioned table");
+    ctx.register_table(name, Arc::new(table))
+        .expect("register partitioned table");
+}
+
+#[tokio::test]
+async fn checked_group_by_sum_matches_builtin_sum_when_partial_aggregation_is_skipped() {
+    let sql = "SELECT g, SUM(v), SUM(v) FILTER (WHERE keep), SUM(u) \
+               FROM t_groups GROUP BY g ORDER BY g";
+    let checked = checked_session();
+    skip_partial_aggregation_after_one_row(&checked).await;
+    let vanilla = vanilla_session();
+    for ctx in [&checked, &vanilla] {
+        let (schema, partitions) = group_by_partitions();
+        register_partitions(ctx, "t_groups", schema, partitions);
+    }
+
+    let (rows, skipped) = collect_counting_skipped_rows(&checked, sql).await;
+    let expected = render_rows(
+        &vanilla
+            .sql(sql)
+            .await
+            .expect("plan built-in SUM")
+            .collect()
+            .await
+            .expect("run built-in SUM"),
+    );
+    assert_eq!(rows.len(), 300, "one row per group");
+    assert_eq!(rows[0], expected[0]);
+    assert!(
+        rows[0].starts_with("0 NULL "),
+        "group 0 has no v, got {}",
+        rows[0]
+    );
+    assert!(
+        rows[1].contains(" NULL "),
+        "group 1 keeps no row in the FILTER sum, got {}",
+        rows[1]
+    );
+    assert_eq!(rows, expected, "checked SUM must match the built-in SUM");
+    assert!(
+        skipped > 0 && skipped < 1_500,
+        "partial aggregation must skip the rows after its first batches, skipped {skipped}"
+    );
+}
+
+/// A partition per value list, each value list split into a first batch of
+/// one row in group 1 and a second batch carrying the values in group 0.
+fn skipped_rows_partitions(values: &[&[i64]]) -> (Arc<Schema>, Vec<Vec<RecordBatch>>) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("g", DataType::Int64, false),
+        Field::new("big", DataType::Int64, true),
+    ]));
+    let batch = |groups: Vec<i64>, values: Vec<i64>| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(groups)) as ArrayRef,
+                Arc::new(Int64Array::from(values)),
+            ],
+        )
+        .expect("skipped-rows batch")
+    };
+    let partitions = values
+        .iter()
+        .map(|values| {
+            vec![
+                batch(vec![1], vec![1]),
+                batch(vec![0; values.len()], values.to_vec()),
+            ]
+        })
+        .collect();
+    (schema, partitions)
+}
+
+#[tokio::test]
+async fn checked_group_by_sum_cancels_and_overflows_across_skipped_partial_aggregation() {
+    let ctx = checked_session();
+    skip_partial_aggregation_after_one_row(&ctx).await;
+
+    let (schema, partitions) = skipped_rows_partitions(&[&[i64::MAX, i64::MAX], &[-i64::MAX]]);
+    register_partitions(&ctx, "t_skip_cancel", schema, partitions);
+    let cancel_sql = "SELECT g, SUM(big) FROM t_skip_cancel GROUP BY g ORDER BY g";
+    let (rows, skipped) = collect_counting_skipped_rows(&ctx, cancel_sql).await;
+    assert_eq!(
+        rows,
+        vec![format!("0 {}", i64::MAX), "1 2".to_string()],
+        "MAX+MAX and -MAX in skipped rows must cancel to MAX"
+    );
+    assert_eq!(
+        skipped, 3,
+        "the three group-0 rows skip partial aggregation"
+    );
+
+    let (schema, partitions) = skipped_rows_partitions(&[&[i64::MAX], &[i64::MAX]]);
+    register_partitions(&ctx, "t_skip_overflow", schema, partitions);
+    let overflow_sql = "SELECT g, SUM(big) FROM t_skip_overflow GROUP BY g ORDER BY g";
+    let (plan, error) = plan_and_error(&ctx, overflow_sql).await;
+    assert!(
+        contains_overflow(&error),
+        "MAX+MAX in skipped rows must overflow, got {error}\nplan:\n{plan}"
     );
 }
 
