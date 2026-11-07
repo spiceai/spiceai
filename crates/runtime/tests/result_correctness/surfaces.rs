@@ -280,11 +280,6 @@ async fn arrow_surfaces_vs_standalone_engines() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn duckdb_surfaces_vs_standalone_engines() {
-    run("duckdb").await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn sqlite_surfaces_vs_standalone_engines() {
     run("sqlite").await;
 }

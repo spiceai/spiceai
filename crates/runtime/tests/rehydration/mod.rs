@@ -189,8 +189,13 @@ async fn execute_spill_to_disk_and_rehydration(
     rt.shutdown().await;
     drop(rt);
 
-    // Restart the runtime with updated app definition that includes primary key and indexes
+    // Restart the runtime with updated app definition that includes primary key and indexes.
+    // Cayenne cannot adopt a new primary key in place, so it drops the acceleration and
+    // reloads it from the source; wait for that reload before querying.
     let rt = init_spice_app(port, engine, db_file_path, true).await?;
+    if engine == "cayenne" {
+        runtime_ready_check(&rt).await;
+    }
     let restart2_items = run_query(test_query, &rt).await?;
     let restart2_items_pretty =
         arrow::util::pretty::pretty_format_batches(&restart2_items).expect("pretty format");
@@ -199,8 +204,9 @@ async fn execute_spill_to_disk_and_rehydration(
     rt.shutdown().await;
     drop(rt);
 
-    // Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent
-    let rt = init_spice_app(port, engine, db_file_path, false).await?;
+    // Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent.
+    // The same app definition as the previous restart, so the acceleration is served from disk unchanged.
+    let rt = init_spice_app(port, engine, db_file_path, true).await?;
     federated_dataset_container.stop().await?;
     let restart3_items = run_query(test_query, &rt).await?;
     let restart3_items_pretty =
@@ -242,19 +248,16 @@ async fn get_locally_persisted_records(
     db_file_path: &Path,
     query: &str,
 ) -> Result<Vec<RecordBatch>, anyhow::Error> {
-    let query_result = match engine {
-        "cayenne" => {
-            return crate::acceleration::query_cayenne_file(db_file_path, "lineitem", query).await;
-        }
+    match engine {
+        "cayenne" => crate::acceleration::query_cayenne_file(db_file_path, "lineitem", query).await,
         #[cfg(feature = "sqlite")]
-        "sqlite" => sqlite::query_local_db(&db_file_path.to_string_lossy(), query).await?,
-        _ => Err(anyhow::anyhow!("Unsupported engine: {engine}"))?,
-    };
-
-    query_result
-        .try_collect::<Vec<RecordBatch>>()
-        .await
-        .map_err(|e| anyhow::anyhow!("Unable to collect query results: {e}"))
+        "sqlite" => sqlite::query_local_db(&db_file_path.to_string_lossy(), query)
+            .await?
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .map_err(|e| anyhow::anyhow!("Unable to collect query results: {e}")),
+        _ => Err(anyhow::anyhow!("Unsupported engine: {engine}")),
+    }
 }
 
 fn resolve_local_db_file_path(engine: &str, db_file_path: Option<&str>) -> PathBuf {

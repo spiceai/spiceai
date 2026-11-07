@@ -194,10 +194,10 @@ mod utils;
 mod view;
 
 mod management;
-// MySQL is required for the rehydration tests (source container); the
-// local-db verification covers whichever persistent engines are enabled.
 mod podswatcher;
-#[cfg(all(feature = "mysql", any(feature = "duckdb", feature = "sqlite")))]
+// MySQL is required for the rehydration tests (source container); they cover Cayenne,
+// and SQLite when that feature is enabled.
+#[cfg(feature = "mysql")]
 mod rehydration;
 mod shutdown;
 
