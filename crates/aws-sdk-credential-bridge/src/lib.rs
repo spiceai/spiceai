@@ -17,17 +17,19 @@ limitations under the License.
 mod credential_provider;
 pub mod object_store_builder;
 
-use std::sync::{Arc, LazyLock};
+pub use aws_identity::{apn_app_name, default_aws_config, identity_token, named_chain};
+
+use std::sync::Arc;
 use std::time::Duration;
 
 use aws_config::Region;
+use aws_config::SdkConfig;
 use aws_config::ecs::EcsCredentialsProvider;
 use aws_config::environment::EnvironmentVariableCredentialsProvider;
 use aws_config::imds::credentials::ImdsCredentialsProvider;
 use aws_config::meta::credentials::CredentialsProviderChain;
 use aws_config::provider_config::ProviderConfig;
 use aws_config::web_identity_token::WebIdentityTokenCredentialsProvider;
-use aws_config::{AppName, BehaviorVersion, SdkConfig};
 use aws_credential_types::provider::error::CredentialsError;
 use aws_sdk_s3::{config::ProvideCredentials, error::ConnectorError};
 use aws_smithy_runtime_api::client::runtime_components::BuildError;
@@ -37,30 +39,6 @@ use object_store_spawn::SpawnedReqwestConnector;
 use tokio::{runtime::Handle, sync::OnceCell, time::sleep};
 use url::Url;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
-
-/// The APN user-agent string for Spice.
-///
-/// This is set on all AWS SDK configurations to identify Spice as an AWS Partner Network (APN)
-/// application in the user-agent header of AWS API requests.
-///
-/// The `AppName::new` call is infallible for this input: the name contains only alphanumeric
-/// characters plus `.` and `-`, all of which are permitted. The name is truncated to 50
-/// characters to stay within the AWS SDK's recommended limit.
-static APN_APP_NAME: LazyLock<AppName> = LazyLock::new(|| {
-    let version = env!("CARGO_PKG_VERSION");
-    let mut name = format!("Spice-{version}");
-    name.truncate(50);
-    match AppName::new(name) {
-        Ok(name) => name,
-        Err(_) => unreachable!("Spice version string should always be a valid AppName"),
-    }
-});
-
-/// Returns the APN [`AppName`] for Spice, suitable for use in AWS SDK configurations.
-#[must_use]
-pub fn apn_app_name() -> &'static AppName {
-    &APN_APP_NAME
-}
 
 #[derive(Debug, snafu::Snafu)]
 pub enum Error {
@@ -98,20 +76,23 @@ pub enum LoadError {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Returns a default AWS SDK configuration with the latest behavior version and
-/// the Spice APN user-agent.
-///
-/// This is a convenience function to ensure all AWS SDK configuration uses
-/// the same behavior version and APN identification consistently across the codebase.
-#[must_use]
-pub fn default_aws_config() -> aws_config::ConfigLoader {
-    aws_config::defaults(BehaviorVersion::v2026_01_12()).app_name(APN_APP_NAME.clone())
-}
-
-#[must_use]
+/// The default configuration for `region`, with the credential chain every AWS component uses:
+/// the AWS SDKs' default order, named link by link, with the identity of a GitHub Actions job
+/// after web identity (see [`named_chain::default_named_chain`]). Without a region the SDK's own
+/// default chain resolves one along with the credentials.
 fn default_aws_config_for_region(region: Option<&str>) -> aws_config::ConfigLoader {
     match region {
-        Some(region) => default_aws_config().region(Region::new(region.to_string())),
+        Some(region) => {
+            let region = Region::new(region.to_string());
+            let provider_config = ProviderConfig::default().with_region(Some(region.clone()));
+            default_aws_config()
+                .region(region.clone())
+                .credentials_provider(named_chain::default_named_chain(
+                    &provider_config,
+                    Some(region),
+                    None,
+                ))
+        }
         None => default_aws_config(),
     }
 }
@@ -1018,7 +999,7 @@ mod tests {
 
     #[test]
     fn test_apn_app_name_is_valid() {
-        let name: &AppName = &APN_APP_NAME;
+        let name: &aws_config::AppName = apn_app_name();
         let name_str: &str = name.as_ref();
         assert!(
             name_str.starts_with("Spice-"),

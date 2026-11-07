@@ -1,0 +1,26 @@
+[package]
+description = "The AWS credential chain every AWS component of Spice uses, named link by link, and the workload's AWS identity as an identity token"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "aws-identity"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
+aws-sdk-sts.workspace = true
+aws-smithy-runtime-api.workspace = true
+secrecy.workspace = true
+token_provider = { path = "../token_provider" }
+util = { workspace = true, default-features = false, features = [] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -41,11 +41,52 @@ macro_rules! extract_secret {
     };
 }
 
+/// Why a Bedrock client could not be built: no AWS credentials, with the message that says how to
+/// give some, or another failure.
+#[cfg(feature = "bedrock")]
+#[derive(Debug)]
+pub(super) enum BedrockClientError {
+    NoCredentials(String),
+    Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+#[cfg(feature = "bedrock")]
+impl From<Box<dyn std::error::Error + Send + Sync>> for BedrockClientError {
+    fn from(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Self::Other(error)
+    }
+}
+
+/// `error` as a model's loading error. No credentials is not `FailedToLoadModel`, which presents
+/// the cause as a bug to report.
+#[cfg(feature = "bedrock")]
+pub(super) fn bedrock_client_error(error: BedrockClientError) -> llms::chat::Error {
+    match error {
+        BedrockClientError::NoCredentials(message) => llms::chat::Error::FailedToAuthenticate {
+            source: message.into(),
+        },
+        BedrockClientError::Other(source) => llms::chat::Error::FailedToLoadModel { source },
+    }
+}
+
+/// The message for a Bedrock model or embedding with no AWS credentials: `reason` lists each
+/// source tried and what it said.
+#[cfg(feature = "bedrock")]
+pub(super) fn bedrock_no_credential_message(component: &str, reason: &str) -> String {
+    format!(
+        "Failed to authenticate {component}: {reason}. On EKS, use IRSA or Pod Identity; in GitHub Actions, set `AWS_ROLE_ARN` and `permissions: id-token: write`; locally, sign in with the AWS CLI or set `aws_access_key_id`. See: https://spiceai.org/docs/components/models/bedrock"
+    )
+}
+
+/// A Bedrock client for `component`, such as `model 'claude' (bedrock)`, as its `params`
+/// configure it. The AWS credentials are found once here: the load log names where they came
+/// from, and when there are none, the error says what was tried before any request.
 #[cfg(feature = "bedrock")]
 pub(super) async fn create_bedrock_client(
+    component: &str,
     params: &HashMap<String, SecretString>,
     credential_provider_name: &'static str,
-) -> Result<BedrockClient, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<BedrockClient, BedrockClientError> {
     // Extract credentials from params
     let region = extract_secret!(params, "aws_region")
         .map(std::string::ToString::to_string)
@@ -61,11 +102,21 @@ pub(super) async fn create_bedrock_client(
         extract_secret!(params, "aws_session_token").map(std::string::ToString::to_string);
 
     let iam_role_source = extract_secret!(params, "aws_iam_role_source");
+    let static_keys = access_key_id.is_some() && secret_access_key.is_some();
+    let static_source = if static_keys {
+        "the access key in `aws_access_key_id`"
+    } else {
+        match iam_role_source {
+            Some("metadata") => "instance or container metadata (`aws_iam_role_source: metadata`)",
+            Some("env") => "environment keys (`aws_iam_role_source: env`)",
+            _ => "the configured AWS credentials",
+        }
+    };
 
     // Use common credential initialization from aws-sdk-credential-bridge
     let mut config_builder = aws_sdk_credential_bridge::initiate_config_with_credentials(
         credential_provider_name,
-        region,
+        region.clone(),
         access_key_id,
         secret_access_key,
         session_token,
@@ -76,6 +127,18 @@ pub(super) async fn create_bedrock_client(
     // Set profile if provided (additional config not handled by initiate_config_with_credentials)
     if let Some(profile) = extract_secret!(params, "aws_profile") {
         config_builder = config_builder.profile_name(profile);
+        if !static_keys && matches!(iam_role_source, None | Some("auto")) {
+            // The credential chain reads the profile it was built with.
+            let region = aws_config::Region::new(region.clone());
+            config_builder = config_builder.credentials_provider(
+                aws_sdk_credential_bridge::named_chain::default_named_chain(
+                    &aws_config::provider_config::ProviderConfig::default()
+                        .with_region(Some(region.clone())),
+                    Some(region),
+                    Some(profile),
+                ),
+            );
+        }
     }
 
     let mut rate_limit_builder = RateControllerBuilder::default();
@@ -108,5 +171,19 @@ pub(super) async fn create_bedrock_client(
     rate_limit_builder = rate_limit_builder.with_max_concurrent_requests(max_concurrent_requests);
 
     let config = config_builder.load().await;
+    if let Some(provider) = config.credentials_provider() {
+        match aws_sdk_credential_bridge::named_chain::credential_source(&provider, static_source)
+            .await
+        {
+            Ok(source) => {
+                tracing::info!("Authenticated {component} with AWS credentials from {source}.");
+            }
+            Err(reason) => {
+                return Err(BedrockClientError::NoCredentials(
+                    bedrock_no_credential_message(component, &reason),
+                ));
+            }
+        }
+    }
     Ok(BedrockClient::new(&config, rate_limit_builder.build()))
 }

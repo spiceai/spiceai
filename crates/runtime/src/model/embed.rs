@@ -217,6 +217,13 @@ pub async fn try_to_embedding(
                 &params,
                 &["databricks_token", "databricks_client_secret"],
             );
+            // The `databricks_*` params the Spicepod sets, as opposed to ones autoloaded from the
+            // environment (`DATABRICKS_CLIENT_ID`, ...): a value the Spicepod sets always wins.
+            let in_spicepod: HashMap<String, SecretString> = params
+                .iter()
+                .filter(|(key, _)| key.starts_with("databricks_"))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
             let typed = embedding_params::databricks::DatabricksEmbeddingParams::try_from_params_with_secret_sources(
                 &component_name,
                 params,
@@ -228,6 +235,7 @@ pub async fn try_to_embedding(
             databricks(
                 &component.name,
                 model_id,
+                &in_spicepod,
                 &typed,
                 key_in_spicepod,
                 Arc::clone(&token_provider_registry),
@@ -245,7 +253,7 @@ pub async fn try_to_embedding(
             )
             .await
             .map_err(params_err)?;
-            bedrock(model_id, &typed, embeddings_cache.clone()).await
+            bedrock(&component.name, model_id, &typed, embeddings_cache.clone()).await
         }
         #[cfg(not(feature = "bedrock"))]
         EmbeddingPrefix::Bedrock => Err(EmbedError::UnknownModelSource {
@@ -380,6 +388,7 @@ async fn google(
 
 #[cfg(feature = "bedrock")]
 async fn bedrock(
+    embedding_name: &str,
     model_id: Option<String>,
     params: &embedding_params::bedrock::BedrockEmbeddingParams,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
@@ -391,9 +400,18 @@ async fn bedrock(
     };
 
     let runtime_params = params.runtime_params();
-    let client = super::util::create_bedrock_client(&runtime_params, "bedrock-embed")
-        .await
-        .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel { source: e })?;
+    let client = super::util::create_bedrock_client(
+        &format!("embedding '{embedding_name}' (bedrock)"),
+        &runtime_params,
+        "bedrock-embed",
+    )
+    .await
+    .map_err(|error| EmbedError::FailedToInstantiateEmbeddingModel {
+        source: match error {
+            super::util::BedrockClientError::NoCredentials(message) => message.into(),
+            super::util::BedrockClientError::Other(source) => source,
+        },
+    })?;
 
     if model_id.starts_with("amazon.titan-embed") {
         let normalize = params.normalize.unwrap_or(true);
@@ -514,6 +532,7 @@ async fn huggingface(
 async fn databricks(
     embedding_name: &str,
     model_id: Option<String>,
+    raw_params: &HashMap<String, SecretString>,
     params: &embedding_params::databricks::DatabricksEmbeddingParams,
     key_in_spicepod: Option<&str>,
     token_provider_registry: Arc<TokenProviderRegistry>,
@@ -527,7 +546,11 @@ async fn databricks(
     };
 
     let token_opt = params.token.as_ref().map(ExposeSecret::expose_secret);
-    let client_id = params.client_id.as_deref();
+    let client_id = crate::token_providers::databricks::component_client_id(
+        raw_params,
+        params.client_id.as_ref(),
+        params.client_secret.as_ref(),
+    );
     let client_secret = params
         .client_secret
         .as_ref()
@@ -542,8 +565,14 @@ async fn databricks(
         source: Box::new(model_error(error)),
     };
     if let Some(identity) = params
-        .federation()
-        .workload_identity(key_in_spicepod)
+        .federation(
+            raw_params,
+            crate::token_providers::databricks::in_github_actions(),
+        )
+        .workload_identity(
+            key_in_spicepod,
+            params.token.is_some() || params.client_secret.is_some(),
+        )
         .map_err(embedding_error)?
     {
         let token_provider = get_workload_identity_token_provider(
@@ -572,11 +601,18 @@ async fn databricks(
                 source: "Either `databricks_token` or `databricks_client_id` and `databricks_client_secret` should be provided, not both.".into(),
             })
         }
-        (Some(_), Some(_), None)|(None, None, None) => {
+        (Some(_), Some(_), None) => {
             Err(EmbedError::FailedToInstantiateEmbeddingModel {
                 source: "Either `databricks_token` or `databricks_client_id` and `databricks_client_secret` should be provided.".into(),
             })
         }
+        (None, None, None) => Err(EmbedError::FailedToInstantiateEmbeddingModel {
+            source: format!(
+                "Found no credential for embedding '{embedding_name}' (databricks). {}. See: https://spiceai.org/docs/components/embeddings/databricks",
+                crate::token_providers::databricks::NO_CREDENTIAL_MESSAGE
+            )
+            .into(),
+        }),
         (None, None, Some(_client_secret)) => {
             Err(EmbedError::FailedToInstantiateEmbeddingModel {
                 source: "If `databricks_client_secret` is provided, `databricks_client_id` must also be provided.".into(),
@@ -727,15 +763,6 @@ async fn azure(
         ));
     }
 
-    if api_key.is_none() && entra_token.is_none() {
-        return Err(EmbedError::FailedToInstantiateEmbeddingModel {
-            source: format!(
-                "Azure embedding model '{component_name}' requires `azure_api_key`, `azure_entra_token`, or a Microsoft Entra workload identity: `azure_tenant_id` and `azure_client_id`, or on AKS a pod labeled `azure.workload.identity/use: \"true\"`. See https://spiceai.org/docs/components/embeddings/azure for details."
-            )
-            .into(),
-        });
-    }
-
     Ok(Arc::new(
         OpenaiEmbed::new(
             llms::openai::new_azure_client(
@@ -775,6 +802,16 @@ async fn openai(
     {
         let embed = OpenaiEmbed::new(client, Some(usage_tier.into())).set_cache(embeddings_cache);
         return with_tokenizer_file(embed, component, secrets).await;
+    }
+    if params.api_key.is_none() && llms::workload_identity::is_openai_api(params.endpoint.as_str())
+    {
+        return Err(EmbedError::FailedToInstantiateEmbeddingModel {
+            source: llms::workload_identity::openai_no_credential_message(&format!(
+                "embedding '{}' (openai)",
+                component.name
+            ))
+            .into(),
+        });
     }
 
     let embed = OpenaiEmbed::new(

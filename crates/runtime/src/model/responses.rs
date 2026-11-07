@@ -234,6 +234,14 @@ async fn openai(
     {
         return Ok(Arc::new(client) as Arc<dyn Responses>);
     }
+    if api_key.is_none() && llms::workload_identity::is_openai_api(params.endpoint.as_str()) {
+        return Err(LlmError::FailedToAuthenticate {
+            source: llms::workload_identity::openai_no_credential_message(&format!(
+                "model '{model_name}' (openai)"
+            ))
+            .into(),
+        });
+    }
 
     Ok(Arc::new(llms::openai::new_openai_client(
         model, api_base, api_key, org_id, project_id, usage_tier,

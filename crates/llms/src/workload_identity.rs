@@ -26,9 +26,10 @@ use crate::config::HostedModelConfig;
 use crate::openai::{AzureTokenConfig, ChatBackend, Openai, UsageTier};
 use secrecy::SecretString;
 use token_provider::TokenProvider;
+use token_provider::google_metadata::GoogleMetadataIdentity;
 use token_provider::workload_identity::{
-    ANTHROPIC_AUDIENCE, ENTRA_AUDIENCE, Exchange, SubjectTokenSource, WorkloadIdentityError,
-    WorkloadIdentityTokenProvider,
+    ANTHROPIC_AUDIENCE, ENTRA_AUDIENCE, Exchange, IdentityTokenSource, OPENAI_AUDIENCE,
+    SubjectTokenSource, WorkloadIdentityError, WorkloadIdentityTokenProvider,
 };
 
 const OPENAI_DOCS: &str = "https://spiceai.org/docs/components/models/openai";
@@ -109,7 +110,9 @@ pub struct OpenAiFederation<'a> {
     pub usage_tier: UsageTier,
 }
 
-/// The `anthropic_*` federation params of a model.
+/// The `anthropic_*` federation params of a model. Each defaults to the variable the Anthropic
+/// SDKs read (`ANTHROPIC_FEDERATION_RULE_ID`, ...), which `settings_from` names when any of them
+/// came from there.
 pub struct AnthropicFederation<'a> {
     pub federation_rule_id: Option<&'a str>,
     pub organization_id: Option<&'a str>,
@@ -117,6 +120,9 @@ pub struct AnthropicFederation<'a> {
     pub workspace_id: Option<&'a str>,
     pub identity_token_audience: Option<&'a str>,
     pub identity_token_file: Option<&'a str>,
+    /// Where the federation settings came from, as the load line names it, such as
+    /// ``"the `anthropic_*` params"``.
+    pub settings_from: &'static str,
 }
 
 /// The `azure_*` federation params of a model or embedding, and the settings of the client
@@ -231,7 +237,8 @@ fn validate<'a, const N: usize>(
     Ok(Some(values))
 }
 
-/// The error for federation params with no identity token to exchange.
+/// The error for federation params with no identity token to exchange, when there is no file
+/// and no GitHub Actions job to get one from.
 fn no_identity_token(file_param: &'static str, docs: &str) -> FederationError {
     FederationError::Config {
         param: file_param,
@@ -241,9 +248,72 @@ fn no_identity_token(file_param: &'static str, docs: &str) -> FederationError {
     }
 }
 
-/// Where the identity token comes from: the file the model names, or the GitHub Actions job it
-/// runs in.
-fn subject_token_source(
+/// The message for federation params with no identity token from a file, a GitHub Actions job or
+/// the workload's cloud identity, which `tried` lists with what each said. It ends without a
+/// period, so a caller can add where to read more.
+#[must_use]
+pub fn no_identity_token_message(file_param: &str, tried: &str) -> String {
+    format!(
+        "Workload identity federation has no identity token: `{file_param}` is not set, this is not a GitHub Actions job with `permissions: id-token: write`, and no cloud identity answered: {tried}. Set `{file_param}` to the file the platform keeps the token in, such as a Kubernetes projected service account token, or run where the workload has an AWS, Google Cloud or Azure identity"
+    )
+}
+
+/// The error for an audience set beside a token file, whose audience is set where it is issued.
+fn audience_beside_file(
+    audience_param: &'static str,
+    file_param: &'static str,
+    docs: &str,
+) -> FederationError {
+    FederationError::Config {
+        param: audience_param,
+        message: format!(
+            "`{audience_param}` applies only to an identity token Spice requests, from GitHub Actions or the workload's cloud identity, but the identity token comes from `{file_param}`, whose audience is set where it is issued. Remove one of them. See: {docs}"
+        ),
+    }
+}
+
+/// The workload's cloud identity as a source of identity tokens for `audience`, trying AWS (when
+/// the AWS credential chain finds credentials), then the Google Cloud metadata server, then the
+/// workload's Microsoft Entra identity. `component` names what the tokens authenticate.
+///
+/// # Errors
+///
+/// When none answers, with what each said, as a clause.
+pub async fn cloud_identity(component: &str, audience: &str) -> Result<SubjectTokenSource, String> {
+    let aws = match aws_identity::identity_token::AwsWebIdentityToken::detect(audience).await {
+        Ok(source) => return Ok(SubjectTokenSource::Requested(Arc::new(source))),
+        Err(reason) => reason
+            .strip_prefix("found no AWS credentials. Tried ")
+            .map_or(reason.clone(), |tried| {
+                format!("no credentials from {tried}")
+            }),
+    };
+    let google = match GoogleMetadataIdentity::from_env(audience) {
+        Ok(source) => match source.fetch().await {
+            Ok(_) => return Ok(SubjectTokenSource::Requested(Arc::new(source))),
+            Err(reason) => reason,
+        },
+        Err(reason) => reason,
+    };
+    let azure = match azure_credential::AzureIdentityToken::detect(
+        component,
+        audience,
+        &azure_credential::AzureIdentityEnvironment::from_process(),
+    )
+    .await
+    {
+        Ok(source) => return Ok(SubjectTokenSource::Requested(Arc::new(source))),
+        Err(reason) => reason,
+    };
+    Err(format!(
+        "AWS ({aws}), Google Cloud ({google}) and Azure ({azure})"
+    ))
+}
+
+/// Where the identity token of an `OpenAI` or Anthropic model comes from: the file it names,
+/// else the GitHub Actions job it runs in, else the workload's cloud identity.
+async fn subject_token_source(
+    component: &str,
     file: Option<&str>,
     audience: &str,
     file_param: &'static str,
@@ -252,8 +322,33 @@ fn subject_token_source(
     if let Some(file) = file.filter(|file| !file.is_empty()) {
         return Ok(SubjectTokenSource::File(PathBuf::from(file)));
     }
-    SubjectTokenSource::github_actions_from_env(audience)
-        .map_err(|_| no_identity_token(file_param, docs))
+    if let Ok(source) = SubjectTokenSource::github_actions_from_env(audience) {
+        return Ok(source);
+    }
+    cloud_identity(component, audience)
+        .await
+        .map_err(|tried| FederationError::Config {
+            param: file_param,
+            message: format!(
+                "{}. See: {docs}",
+                no_identity_token_message(file_param, &tried)
+            ),
+        })
+}
+
+/// The info line logged when an `OpenAI` or Anthropic model has authenticated with workload
+/// identity federation: where its settings and identity token came from, never the IDs.
+#[must_use]
+pub fn federation_message(
+    component: &str,
+    account: &str,
+    settings_from: &str,
+    source: &SubjectTokenSource,
+) -> String {
+    format!(
+        "Authenticated {component} as {account} through workload identity federation, with the federation settings from {settings_from} and the identity token from {}.",
+        source.describe()
+    )
 }
 
 async fn token_provider(
@@ -274,38 +369,55 @@ async fn openai_token_provider(
     federation: &OpenAiFederation<'_>,
     key_param: Option<&'static str>,
 ) -> Result<Option<Arc<dyn TokenProvider>>, FederationError> {
-    let Some([provider_id, service_account_id, audience]) = validate(
+    let Some([provider_id, service_account_id]) = validate(
         [
             (
                 "openai_identity_provider_id",
                 federation.identity_provider_id,
             ),
             ("openai_service_account_id", federation.service_account_id),
-            (
-                "openai_identity_token_audience",
-                federation.identity_token_audience,
-            ),
         ],
-        &[federation.identity_token_file],
+        &[
+            federation.identity_token_audience,
+            federation.identity_token_file,
+        ],
         key_param,
         OPENAI_DOCS,
     )?
     else {
         return Ok(None);
     };
+    let file = non_empty(federation.identity_token_file);
+    let audience = non_empty(federation.identity_token_audience);
+    if file.is_some() && audience.is_some() {
+        return Err(audience_beside_file(
+            "openai_identity_token_audience",
+            "openai_identity_token_file",
+            OPENAI_DOCS,
+        ));
+    }
     let source = subject_token_source(
-        federation.identity_token_file,
-        audience,
+        component,
+        file,
+        audience.unwrap_or(OPENAI_AUDIENCE),
         "openai_identity_token_file",
         OPENAI_DOCS,
-    )?;
-    token_provider(
+    )
+    .await?;
+    let message = federation_message(
+        component,
+        "an OpenAI service account",
+        "the `openai_*` params",
+        &source,
+    );
+    let provider = token_provider(
         component,
         source,
         Exchange::openai(provider_id, service_account_id),
     )
-    .await
-    .map(Some)
+    .await?;
+    tracing::info!("{message}");
+    Ok(Some(provider))
 }
 
 /// The client of an `OpenAI` model or embedding configured for workload identity federation,
@@ -374,27 +486,41 @@ pub async fn anthropic_token_provider(
     else {
         return Ok(None);
     };
-    let audience = federation
-        .identity_token_audience
-        .filter(|audience| !audience.is_empty())
-        .unwrap_or(ANTHROPIC_AUDIENCE);
+    let file = non_empty(federation.identity_token_file);
+    let audience = non_empty(federation.identity_token_audience);
+    if file.is_some() && audience.is_some() {
+        return Err(audience_beside_file(
+            "anthropic_identity_token_audience",
+            "anthropic_identity_token_file",
+            ANTHROPIC_DOCS,
+        ));
+    }
     let source = subject_token_source(
-        federation.identity_token_file,
-        audience,
+        component,
+        file,
+        audience.unwrap_or(ANTHROPIC_AUDIENCE),
         "anthropic_identity_token_file",
         ANTHROPIC_DOCS,
-    )?;
+    )
+    .await?;
     let workspace_id = federation
         .workspace_id
         .filter(|id| !id.is_empty())
         .map(str::to_string);
-    token_provider(
+    let message = federation_message(
+        component,
+        "an Anthropic service account",
+        federation.settings_from,
+        &source,
+    );
+    let provider = token_provider(
         component,
         source,
         Exchange::anthropic(rule_id, organization_id, service_account_id, workspace_id),
     )
-    .await
-    .map(Some)
+    .await?;
+    tracing::info!("{message}");
+    Ok(Some(provider))
 }
 
 /// Where each part of an Azure model's workload identity came from: a param or an environment
@@ -509,17 +635,12 @@ fn azure_exchange(
     } else {
         None
     };
-    if !explicit {
-        // A model that sets no federation param uses only a whole identity from the
-        // environment; without a tenant and client it is a model with no credential.
-        if tenant.is_none() || client.is_none() {
-            return Ok(None);
-        }
-        if file.is_none() && github.is_none() {
-            return Err(FederationError::IncompleteIdentity(format!(
-                "Found `AZURE_TENANT_ID` and `AZURE_CLIENT_ID` but no workload identity token: `AZURE_FEDERATED_TOKEN_FILE` is not set, and this is not a GitHub Actions job with `permissions: id-token: write`. On AKS, label the pod `azure.workload.identity/use: \"true\"` so the workload identity webhook mounts the token; elsewhere, set `azure_federated_token_file` or `azure_api_key`. See: {AZURE_DOCS}"
-            )));
-        }
+    if !explicit && (tenant.is_none() || client.is_none() || (file.is_none() && github.is_none())) {
+        // A model that sets no federation param uses only a whole workload identity from the
+        // environment. Anything less is left to the Azure credential chain (a managed identity,
+        // user-assigned when `AZURE_CLIENT_ID` names one, then the Azure CLI), as the Azure SDKs
+        // do.
+        return Ok(None);
     }
     let Some([tenant, client]) = validate(
         [("azure_tenant_id", tenant), ("azure_client_id", client)],
@@ -565,8 +686,78 @@ fn azure_exchange(
     }))
 }
 
+/// Whether `endpoint` is `OpenAI`'s own API, which a request without a credential cannot reach,
+/// as opposed to a compatible server that may need none.
+#[must_use]
+pub fn is_openai_api(endpoint: &str) -> bool {
+    reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "api.openai.com")
+}
+
+/// The message for an `OpenAI` model or embedding with no key and no federation params.
+#[must_use]
+pub fn openai_no_credential_message(component: &str) -> String {
+    format!(
+        "Found no credential for {component}: set `openai_api_key`, or workload identity federation with `openai_identity_provider_id` and `openai_service_account_id`. See: {OPENAI_DOCS}"
+    )
+}
+
+/// The message for an Anthropic model with no key, auth token or federation settings.
+#[must_use]
+pub fn anthropic_no_credential_message(component: &str) -> String {
+    format!(
+        "Found no credential for {component}: set `anthropic_api_key` or `anthropic_auth_token`, or workload identity federation with `anthropic_federation_rule_id`, `anthropic_organization_id` and `anthropic_service_account_id`, or the `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID` and `ANTHROPIC_SERVICE_ACCOUNT_ID` variables the Anthropic SDKs read. See: {ANTHROPIC_DOCS}"
+    )
+}
+
+/// Where an Anthropic model's federation settings came from, as the load line names it: the
+/// `anthropic_*` params the Spicepod sets (`in_spicepod`), the `ANTHROPIC_*` variables or secrets
+/// autoloaded for the ones it leaves out (`autoloaded`), or both.
+#[must_use]
+pub fn anthropic_settings_from(in_spicepod: bool, autoloaded: bool) -> &'static str {
+    match (in_spicepod, autoloaded) {
+        (false, true) => "`ANTHROPIC_*` from the environment or a secret store",
+        (true, true) => {
+            "the `anthropic_*` params and `ANTHROPIC_*` from the environment or a secret store"
+        }
+        _ => "the `anthropic_*` params",
+    }
+}
+
+/// The message for an Azure model that has no key and no Microsoft Entra identity that answered:
+/// `tried` lists each identity tried and what it said.
+#[must_use]
+pub fn azure_no_credential_message(component: &str, tried: &str) -> String {
+    format!(
+        "Found no credential for {component}: it sets no `azure_api_key` or `azure_entra_token`, and no Microsoft Entra identity answered. Tried {tried}. Set `azure_api_key`, or give the workload an identity: on AKS, label the pod `azure.workload.identity/use: \"true\"`; on an Azure VM, App Service or Container Apps, assign it a managed identity; locally, run `az login`. See: {AZURE_DOCS}"
+    )
+}
+
+/// `error`, finding an Azure model's identity in the Azure credential chain, as the model's
+/// loading error.
+fn azure_chain_error(component: &str, error: azure_credential::ResolveError) -> FederationError {
+    use azure_credential::ResolveError;
+    match error {
+        ResolveError::IncompleteWorkloadIdentity { missing } => {
+            FederationError::IncompleteIdentity(format!(
+                "Found `AZURE_FEDERATED_TOKEN_FILE` for {component}, but {missing} not set. On AKS, label the pod `azure.workload.identity/use: \"true\"` and annotate its service account with `azure.workload.identity/client-id`, so the workload identity webhook sets all three. See: {AZURE_DOCS}"
+            ))
+        }
+        ResolveError::InvalidIdentity { source } => FederationError::IncompleteIdentity(format!(
+            "Invalid `AZURE_TENANT_ID` or `AZURE_AUTHORITY_HOST`: {source} See: {AZURE_DOCS}"
+        )),
+        ResolveError::AccessToken { source } => FederationError::Exchange(source),
+        ResolveError::NoIdentity { tried } => {
+            FederationError::IncompleteIdentity(azure_no_credential_message(component, &tried))
+        }
+    }
+}
+
 /// The client of an Azure `OpenAI` model or embedding configured for workload identity
-/// federation (see [`azure_exchange`]), which sends the current Microsoft Entra token of a
+/// federation (see [`azure_exchange`]), or, when it has no key, authenticating as the identity
+/// the Azure credential chain finds, which sends the current Microsoft Entra token of a
 /// refreshing provider, or `None` when the model is not configured for it. `component` names the
 /// model or embedding in the logs, such as `model 'gpt' (azure)`.
 ///
@@ -583,12 +774,12 @@ pub async fn azure_federated_client(
     environment: &AzureEnvironment,
     chat_backend: ChatBackend,
 ) -> Result<Option<Openai<AzureTokenConfig>>, FederationError> {
-    let Some(plan) = azure_exchange(federation, key_param, has_key, environment, |audience| {
+    let plan = azure_exchange(federation, key_param, has_key, environment, |audience| {
         SubjectTokenSource::github_actions_from_env(audience).ok()
-    })?
-    else {
+    })?;
+    if plan.is_none() && has_key {
         return Ok(None);
-    };
+    }
     let Some(endpoint) = non_empty(federation.endpoint) else {
         return Err(FederationError::Config {
             param: "endpoint",
@@ -597,8 +788,31 @@ pub async fn azure_federated_client(
             ),
         });
     };
-    let token = token_provider(component, plan.source, plan.exchange).await?;
-    tracing::info!("{}", azure_identity_message(component, &plan.origin));
+    let token = if let Some(plan) = plan {
+        let token = token_provider(component, plan.source, plan.exchange).await?;
+        tracing::info!("{}", azure_identity_message(component, &plan.origin));
+        token
+    } else {
+        let (authority, scope) = azure_cloud(federation.endpoint);
+        let target = azure_credential::EntraTarget {
+            authority: environment
+                .authority_host
+                .clone()
+                .unwrap_or_else(|| authority.to_string()),
+            scope: scope.to_string(),
+        };
+        let resolved = azure_credential::resolve(
+            component,
+            &target,
+            &azure_credential::AzureIdentityEnvironment::from_process(),
+        )
+        .await
+        .map_err(|error| azure_chain_error(component, error))?;
+        tracing::info!("Authenticated {component} as {}.", resolved.description);
+        resolved
+            .identity
+            .into_token_provider(component, resolved.first_token)
+    };
     Ok(Some(crate::openai::new_azure_client_with_token_provider(
         model.to_string(),
         endpoint,
@@ -638,6 +852,7 @@ mod tests {
             workspace_id: None,
             identity_token_audience: None,
             identity_token_file: None,
+            settings_from: "the `anthropic_*` params",
         }
     }
 
@@ -683,7 +898,7 @@ mod tests {
         .expect_err("a missing service account");
         assert_eq!(
             message(error),
-            "Invalid value for parameter openai_service_account_id. Workload identity federation needs `openai_identity_provider_id`, `openai_service_account_id`, `openai_identity_token_audience`, and `openai_service_account_id` is not set. See: https://spiceai.org/docs/components/models/openai"
+            "Invalid value for parameter openai_service_account_id. Workload identity federation needs `openai_identity_provider_id`, `openai_service_account_id`, and `openai_service_account_id` is not set. See: https://spiceai.org/docs/components/models/openai"
         );
 
         let error =
@@ -843,14 +1058,23 @@ mod tests {
     }
 
     #[test]
-    fn an_aks_identity_without_its_token_names_what_is_missing() {
+    fn an_aks_identity_without_its_token_is_left_to_the_azure_credential_chain() {
         let unlabeled_pod = AzureEnvironment {
             federated_token_file: None,
             ..aks()
         };
+        // `AZURE_CLIENT_ID` without a token may name a user-assigned managed identity, which the
+        // Azure credential chain tries next, as the Azure SDKs do.
         assert_eq!(
             azure_plan(&azure(None, None, None), None, false, &unlabeled_pod, false),
-            Err("Found `AZURE_TENANT_ID` and `AZURE_CLIENT_ID` but no workload identity token: `AZURE_FEDERATED_TOKEN_FILE` is not set, and this is not a GitHub Actions job with `permissions: id-token: write`. On AKS, label the pod `azure.workload.identity/use: \"true\"` so the workload identity webhook mounts the token; elsewhere, set `azure_federated_token_file` or `azure_api_key`. See: https://spiceai.org/docs/components/models/azure".to_string())
+            Ok(None)
+        );
+        assert_eq!(
+            azure_no_credential_message(
+                "model 'gpt' (azure)",
+                "a workload identity (`AZURE_FEDERATED_TOKEN_FILE` is not set), a managed identity (no answer within 3s) and the Azure CLI (az: command not found)"
+            ),
+            "Found no credential for model 'gpt' (azure): it sets no `azure_api_key` or `azure_entra_token`, and no Microsoft Entra identity answered. Tried a workload identity (`AZURE_FEDERATED_TOKEN_FILE` is not set), a managed identity (no answer within 3s) and the Azure CLI (az: command not found). Set `azure_api_key`, or give the workload an identity: on AKS, label the pod `azure.workload.identity/use: \"true\"`; on an Azure VM, App Service or Container Apps, assign it a managed identity; locally, run `az login`. See: https://spiceai.org/docs/components/models/azure"
         );
         // In a GitHub Actions job, the job's identity token completes it.
         let plan = azure_plan(&azure(None, None, None), None, false, &unlabeled_pod, true)
@@ -1075,5 +1299,62 @@ mod tests {
         assert_eq!(openai_api_key_in_spicepod(&raw), None);
         raw.insert("openai_api_key".to_string(), SecretString::from("sk"));
         assert_eq!(openai_api_key_in_spicepod(&raw), Some("openai_api_key"));
+    }
+
+    #[tokio::test]
+    async fn an_audience_beside_a_token_file_is_rejected_for_openai_and_anthropic() {
+        let federation = OpenAiFederation {
+            identity_token_file: Some("/var/run/secrets/tokens/openai"),
+            ..openai(
+                Some("idp_1"),
+                Some("user-1"),
+                Some("https://api.openai.com/v1"),
+            )
+        };
+        assert_eq!(
+            message(
+                openai_token_provider("model 'gpt' (openai)", &federation, None)
+                    .await
+                    .expect_err("an audience beside a token file")
+            ),
+            "Invalid value for parameter openai_identity_token_audience. `openai_identity_token_audience` applies only to an identity token Spice requests, from GitHub Actions or the workload's cloud identity, but the identity token comes from `openai_identity_token_file`, whose audience is set where it is issued. Remove one of them. See: https://spiceai.org/docs/components/models/openai"
+        );
+        let federation = AnthropicFederation {
+            identity_token_audience: Some("https://api.anthropic.com"),
+            identity_token_file: Some("/var/run/secrets/tokens/anthropic"),
+            ..anthropic(Some("00000000-0000-0000-0000-000000000000"))
+        };
+        assert_eq!(
+            message(
+                anthropic_token_provider("model 'claude' (anthropic)", &federation, None)
+                    .await
+                    .expect_err("an audience beside a token file")
+            ),
+            "Invalid value for parameter anthropic_identity_token_audience. `anthropic_identity_token_audience` applies only to an identity token Spice requests, from GitHub Actions or the workload's cloud identity, but the identity token comes from `anthropic_identity_token_file`, whose audience is set where it is issued. Remove one of them. See: https://spiceai.org/docs/components/models/anthropic"
+        );
+    }
+
+    #[test]
+    fn the_load_line_names_where_the_settings_and_the_token_came_from() {
+        assert_eq!(
+            federation_message(
+                "model 'claude' (anthropic)",
+                "an Anthropic service account",
+                "the `ANTHROPIC_*` environment variables",
+                &SubjectTokenSource::File(PathBuf::from("/var/run/secrets/tokens/anthropic")),
+            ),
+            "Authenticated model 'claude' (anthropic) as an Anthropic service account through workload identity federation, with the federation settings from the `ANTHROPIC_*` environment variables and the identity token from the file '/var/run/secrets/tokens/anthropic'."
+        );
+    }
+
+    #[test]
+    fn no_identity_token_names_every_source_tried() {
+        assert_eq!(
+            no_identity_token_message(
+                "openai_identity_token_file",
+                "AWS (no credentials from environment keys (not set)), Google Cloud (no metadata server answered within 1s) and Azure (a managed identity (no answer within 3s))",
+            ),
+            "Workload identity federation has no identity token: `openai_identity_token_file` is not set, this is not a GitHub Actions job with `permissions: id-token: write`, and no cloud identity answered: AWS (no credentials from environment keys (not set)), Google Cloud (no metadata server answered within 1s) and Azure (a managed identity (no answer within 3s)). Set `openai_identity_token_file` to the file the platform keeps the token in, such as a Kubernetes projected service account token, or run where the workload has an AWS, Google Cloud or Azure identity"
+        );
     }
 }
