@@ -137,6 +137,18 @@ impl ScalarUDFImpl for CheckedSumWiden {
         Ok(checked_sum_state_type())
     }
 
+    /// The argument as written, casts included. The default name leaves casts
+    /// out, so `SUM(x + 1)` and `SUM(CAST(x AS INT) + 1)` over a SMALLINT `x`
+    /// would name their wide `SUM`s alike.
+    fn schema_name(&self, args: &[Expr]) -> Result<String> {
+        let args = args
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(format!("{}({args})", self.name()))
+    }
+
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
         let [value] = args.arg_fields else {
             return plan_err!("{} expects one argument", self.name());

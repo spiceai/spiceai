@@ -98,6 +98,10 @@ SELECT i + 9223372034707292160 + 1 FROM t WHERE id = 1;
 statement error overflow
 SELECT (CAST(9223372036854775807 AS BIGINT) + 1) * 0;
 
+# A plain `A + NULL` would fold to NULL and drop the overflow in `A`.
+statement error overflow
+SELECT CAST(CAST(big + 1 AS INT) AS BIGINT) + CAST(NULL AS SMALLINT) FROM t WHERE id = 1;
+
 # SUM(x + k) for several k is one wide SUM and one COUNT of x; the totals are
 # exact, beside the query's own SUM(x) and COUNT(x) too.
 query III

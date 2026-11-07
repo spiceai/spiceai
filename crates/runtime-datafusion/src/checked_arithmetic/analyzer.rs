@@ -20,14 +20,15 @@ limitations under the License.
 //! still see the original operators. The leftover local expressions cannot be
 //! folded by `SimplifyExpressions` with wrapping kernels.
 //!
-//! A `+` or `-` whose operands' values keep every result inside its type stays
-//! as written: the wrapping kernel cannot wrap there, so it returns what the
-//! checked one would. `CAST(smallint_column AS BIGINT) + 1` is the common case.
+//! A `+` or `-` stays as written when its operands' values keep every result
+//! inside its type and neither operand can raise an error. The wrapping kernel
+//! cannot wrap there, so it returns what the checked one would; and
+//! `DataFusion` simplifies some plain operators by dropping an operand
+//! (`A + NULL` to `NULL`, `A * 0` to `0`), which may only drop one that has no
+//! error to raise. `CAST(smallint_column AS BIGINT) + 1` is the common case.
 //! Left a plain `+`, it is still the `SUM(x + 1), SUM(x + 2), ...` shape that
 //! `DataFusion` rewrites to one `SUM(x)` and one `COUNT(x)` (see
-//! [`CheckedSum`](super::CheckedSum)). A `*` is always checked, even where it
-//! cannot overflow: `DataFusion` simplifies a plain `A * 0` to `0`, which drops
-//! any error `A` raises (an overflow, a failed cast).
+//! [`CheckedSum`](super::CheckedSum)). A `*` is always checked.
 
 use std::sync::Arc;
 
@@ -101,11 +102,54 @@ fn rewrite_integer_arith(expr: Expr, schema: &DFSchema) -> Transformed<Expr> {
     };
     if left_type != right_type
         || !is_integer_arith_type(&left_type)
-        || cannot_overflow(op, &left, &right, &left_type, schema)
+        || stays_plain(op, &left, &right, &left_type, schema)
     {
         return Transformed::no(Expr::BinaryExpr(BinaryExpr { left, op, right }));
     }
     Transformed::yes(udf.call(vec![*left, *right]))
+}
+
+/// Whether `left op right` can stay the plain operator: it cannot leave
+/// `data_type` and neither operand can raise an error (see the module
+/// documentation).
+fn stays_plain(
+    op: Operator,
+    left: &Expr,
+    right: &Expr,
+    data_type: &DataType,
+    schema: &DFSchema,
+) -> bool {
+    cannot_overflow(op, left, right, data_type, schema)
+        && raises_no_error(left, schema)
+        && raises_no_error(right, schema)
+}
+
+/// Whether evaluating `expr` cannot fail: a column, a literal, a `TRY_CAST`,
+/// a cast that every value of its operand fits, or a `+` / `-` that cannot
+/// overflow, over expressions that cannot fail either.
+fn raises_no_error(expr: &Expr, schema: &DFSchema) -> bool {
+    match expr {
+        Expr::Column(_) | Expr::Literal(..) => true,
+        Expr::Alias(alias) => raises_no_error(&alias.expr, schema),
+        Expr::TryCast(TryCast { expr: operand, .. }) => raises_no_error(operand, schema),
+        Expr::Cast(Cast {
+            expr: operand,
+            field,
+        }) => {
+            raises_no_error(operand, schema)
+                && type_range(field.data_type())
+                    .zip(value_range(operand, schema))
+                    .is_some_and(|(bounds, range)| bounds.contains(range))
+        }
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            raises_no_error(left, schema)
+                && raises_no_error(right, schema)
+                && expr
+                    .get_type(schema)
+                    .is_ok_and(|data_type| cannot_overflow(*op, left, right, &data_type, schema))
+        }
+        _ => false,
+    }
 }
 
 /// Whether `left op right` is a `+` or `-` that stays inside `data_type` for

@@ -1796,6 +1796,31 @@ async fn sums_of_a_column_plus_literals_share_one_sum_and_one_count() {
     }
 }
 
+/// Two widenings of one column that a column name shows alike (`s` and
+/// `CAST(s AS INT)`, both read as BIGINT) get wide aggregates of their own.
+#[tokio::test]
+async fn sums_over_two_casts_of_one_column_plus_literals_plan() {
+    let ctx = checked_session();
+    let smallints = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("s", DataType::Int16, true)])),
+        vec![Arc::new(arrow::array::Int16Array::from(vec![Some(1), Some(2), None])) as ArrayRef],
+    )
+    .expect("smallint batch");
+    register_table(&ctx, "s16", smallints);
+    let sql =
+        "SELECT SUM(s + 1), SUM(s + 2), SUM(CAST(s AS INT) + 3), SUM(CAST(s AS INT) + 4) FROM s16";
+    let plan = optimized_plan(&ctx, sql).await.display_indent().to_string();
+    assert_plan_ran(&plan, sql, &[CHECKED_SUM_PLUS_COUNT_UDF_NAME]);
+    let batches = ctx
+        .sql(sql)
+        .await
+        .unwrap_or_else(|error| panic!("`{sql}` plans: {error}"))
+        .collect()
+        .await
+        .unwrap_or_else(|error| panic!("`{sql}` runs: {error}"));
+    assert_eq!(render_rows(&batches), vec!["5 7 9 11"], "`{sql}`");
+}
+
 /// The rewrite keeps checked `SUM`'s answer to a total that is not an `Int64`.
 #[tokio::test]
 async fn sums_of_a_column_plus_literals_error_when_the_total_overflows() {
@@ -1876,6 +1901,15 @@ async fn only_an_operator_that_can_overflow_gets_the_checked_kernel() {
         ("SELECT i + 9223372036854775807 FROM t", 1),
         // `DataFusion` folds a plain `A * 0` to 0, dropping errors in `A`.
         ("SELECT i * 2, (big + 1) * 0 FROM t", 3),
+        // A plain `A + NULL` folds to NULL: an operand that can fail (an
+        // overflow, a narrowing cast) keeps the operator checked.
+        (
+            "SELECT CAST(CAST(big + 1 AS INT) AS BIGINT) + CAST(NULL AS SMALLINT) FROM t",
+            2,
+        ),
+        ("SELECT CAST(i AS SMALLINT) + 1 FROM t", 1),
+        // A `TRY_CAST` cannot fail.
+        ("SELECT TRY_CAST(i AS BIGINT) + 1 FROM t", 0),
     ] {
         let plan = optimized_plan(&ctx, sql).await.display_indent().to_string();
         let found: usize = [
