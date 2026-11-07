@@ -1043,7 +1043,6 @@ mod tests {
         "clickbench/sf1/accelerated/s3[parquet]-cayenne[memory].yaml",
         "clickbench/sf1/accelerated/s3[parquet]-postgres.yaml",
         "clickbench/sf1/accelerated/s3[parquet]-sqlite[memory].yaml",
-        "clickbench/sf1/accelerated/s3[parquet]-turso[file].yaml",
         "tpch/sf1/federated/glue[csv].yaml",
         "tpch/sf1/federated/iceberg[hadoop].yaml",
         "tpch/sf1/federated/mssql.yaml",

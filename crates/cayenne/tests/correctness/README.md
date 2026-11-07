@@ -7,7 +7,7 @@ ordered rows when `ORDER BY`+`LIMIT` apply) and that each side **honors its own
 query's `ORDER BY`** (see [Row order](#row-order)) between:
 
 1. **Standalone engines outside Spice** — raw embedded crates used as oracles  
-   (`duckdb`, `rusqlite`, `chdb-rust`)
+   (`duckdb-oracle` via ADBC, `rusqlite`, `chdb-rust`)
 2. **Spice accelerators** — Cayenne, DuckDB accelerator, SQLite accelerator
 
 They measure correctness only. Numeric compare uses existing float tolerance.
@@ -16,7 +16,7 @@ They measure correctness only. Numeric compare uses existing float tolerance.
 
 | Label | What it is | How it is linked |
 |-------|------------|------------------|
-| `standalone-duckdb` | DuckDB **outside** Spice | `duckdb` crate (`query_arrow`) |
+| `standalone-duckdb` | DuckDB **outside** Spice | installed libduckdb via `duckdb-oracle` (ADBC) |
 | `standalone-sqlite` | SQLite **outside** Spice | `rusqlite` (not Spice SQLite accel) |
 | `standalone-chdb` | chDB **outside** Spice | `chdb-rust` |
 | `spice-cayenne` | Cayenne accelerator | `CayenneTableProvider` |
@@ -148,6 +148,11 @@ Classic Q1.1–Q4.3; pure-Rust deterministic star schema. Scale:
 
 ## How to run
 
+DuckDB oracles load an installed libduckdb (1.5.0 or newer) through ADBC.
+Follow [duckdb-oracle setup](../../../duckdb-oracle/README.md) and export
+`ADBC_DRIVER_PATH` to the directory containing `duckdb.toml` before running
+these tests. A missing library is a test failure.
+
 ```bash
 # Inventory
 cargo test -p cayenne --test integration result_correctness_inventory_test::
@@ -156,9 +161,7 @@ cargo test -p cayenne --test integration result_correctness_inventory_test::
 cargo test -p cayenne --features result-correctness-duckdb \
   --test integration result_correctness_standalone_engines_test::
 
-# Cayenne ↔ standalone DuckDB. `--test-threads=1` is required, not stylistic:
-# parallel runs have hit allocator aborts in the bundled DuckDB crate, which fail
-# in a way that reads like a correctness mismatch.
+# Cayenne ↔ standalone DuckDB, with one fixture-generation workload at a time.
 CAYENNE_PARITY_TPCH_SF=1 CAYENNE_PARITY_TPCDS_SF=1 CAYENNE_PARITY_CHBENCH_SF=1 \
   cargo test -p cayenne --features result-correctness-duckdb \
   --test integration result_correctness_vs_duckdb_test:: -- --test-threads=1

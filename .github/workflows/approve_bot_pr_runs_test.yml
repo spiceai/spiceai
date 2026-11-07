@@ -33,9 +33,13 @@ permissions: {}
 
 jobs:
   test-approve-bot-pr-runs:
+    environment: secret-free
     name: Unit tests for approve_bot_pr_runs.sh
     runs-on: spiceai-dev-runners
     timeout-minutes: 5
+    # Self-hosted pool: skip PRs from forks so an approved fork run does not
+    # execute here. Non-PR events and same-repo PRs still run.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     # A checkout plus a local bash script against a stub `gh`, so the job reads
     # the repository and nothing else.
     permissions:

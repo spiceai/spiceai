@@ -405,6 +405,28 @@ mod tests {
             .build()
     }
 
+    /// A dataset that still selects the removed `duckdb` vector engine fails to load with
+    /// the line the runtime logs for it, naming the dataset and the Cayenne fix.
+    #[test]
+    fn a_dataset_selecting_the_duckdb_vector_engine_fails_to_load() {
+        let mut spicepod_dataset =
+            spicepod::component::dataset::Dataset::new("file:data.csv", "docs");
+        spicepod_dataset.vectors = Some(VectorStore {
+            enabled: true,
+            engine: Some("duckdb".to_string()),
+            ..Default::default()
+        });
+
+        let Err(err) = DatasetBuilder::try_from(spicepod_dataset) else {
+            panic!("a dataset selecting the duckdb vector engine must fail to load");
+        };
+        assert!(
+            matches!(err, crate::Error::DatasetVectorEngineRemoved { .. }),
+            "unexpected error: {err}"
+        );
+        insta::assert_snapshot!("dataset_duckdb_vector_engine_removed", err.to_string());
+    }
+
     #[tokio::test]
     async fn test_dataset_level_search_engine_configuration_is_preserved() {
         let app = AppBuilder::new("test").build();

@@ -73,24 +73,6 @@
       "group": "append-and-retention"
     }
   ],
-  "append-iso-offset": [
-    {
-      "run": "append-iso-offset",
-      "who": "keyed",
-      "key": "query: SELECT * FROM events #3",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: RowCountMismatch { expected: 5, actual: 4 }",
-      "group": "append-and-retention"
-    },
-    {
-      "run": "append-iso-offset",
-      "who": "zulu",
-      "key": "query: SELECT * FROM events #3",
-      "kind": "wrong-answer",
-      "signature": "answer differs from the expected one: RowCountMismatch { expected: 5, actual: 4 }",
-      "group": "append-and-retention"
-    }
-  ],
   "append-negative-epoch": [
     {
       "run": "append-negative-epoch",
@@ -134,6 +116,24 @@
       "key": "query: SELECT * FROM events #2",
       "kind": "wrong-answer",
       "signature": "answer differs from the expected one: RowCountMismatch { expected: 4, actual: 3 }",
+      "group": "append-and-retention"
+    }
+  ],
+  "append-upsert-same-time": [
+    {
+      "run": "append-upsert-same-time",
+      "who": "duckdb",
+      "key": "query: SELECT id, ts, v FROM events ORDER BY id #3",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"new\\\"\", actual: \"\\\"old\\\"\" }",
+      "group": "append-and-retention"
+    },
+    {
+      "run": "append-upsert-same-time",
+      "who": "sqlite",
+      "key": "query: SELECT id, ts, v FROM events ORDER BY id #3",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"v\", row_number: 1, expected: \"\\\"new\\\"\", actual: \"\\\"old\\\"\" }",
       "group": "append-and-retention"
     }
   ],

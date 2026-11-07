@@ -19,9 +19,13 @@ use std::sync::Arc;
 
 use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
 use crate::{configure_test_datafusion, init_tracing};
+use adbc_core::Database as _;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
-use data_components::duckdb::install_and_load_extension;
+use data_components::adbc_helpers::{
+    check_duckdb_version, driver_entrypoint, load_adbc_database, managed_duckdb_options,
+};
+use data_components::ducklake::execute_sql;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
@@ -32,6 +36,8 @@ use spicepod::param::Params;
 use tempfile::TempDir;
 
 /// Run `EXPLAIN` and return pretty-formatted output for snapshot comparison.
+/// The join context hashes the lake's connection string, a temporary path
+/// that differs on every run, so it is replaced with a placeholder.
 async fn explain_plan(rt: &Runtime, sql: &str) -> String {
     let result = rt
         .datafusion()
@@ -41,64 +47,88 @@ async fn explain_plan(rt: &Runtime, sql: &str) -> String {
         .await
         .expect("EXPLAIN should succeed");
     let batches: Vec<RecordBatch> = result.data.try_collect().await.expect("collect");
-    arrow::util::pretty::pretty_format_batches(&batches)
+    let plan = arrow::util::pretty::pretty_format_batches(&batches)
         .expect("format")
-        .to_string()
+        .to_string();
+    regex::Regex::new(r"compute_context=ducklake:[0-9a-f]{16}")
+        .expect("valid regex")
+        .replace_all(&plan, "compute_context=ducklake:<HASH>")
+        .into_owned()
 }
 
 /// Opens an in-memory `DuckDB` connection with the `ducklake` extension loaded
 /// and the lake at `metadata_path` attached under `alias`.
-fn attach_ducklake(alias: &str, metadata_path: &str, data_path: &str) -> duckdb::Connection {
-    let db = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
-    install_and_load_extension(&db, "ducklake").expect("install and load ducklake");
-
+fn attach_ducklake(
+    alias: &str,
+    metadata_path: &str,
+    data_path: &str,
+) -> (
+    adbc_driver_manager::ManagedDatabase,
+    adbc_driver_manager::ManagedConnection,
+) {
+    let database = load_adbc_database(
+        "duckdb",
+        driver_entrypoint("duckdb"),
+        managed_duckdb_options(":memory:", false),
+    )
+    .expect("open installed DuckDB");
+    check_duckdb_version(&database, "ducklake").expect("supported version");
+    let mut db = database.new_connection().expect("connect");
+    data_components::ducklake::install_ducklake_extensions(&mut db).expect("install extensions");
     let escaped_metadata = metadata_path.replace('\'', "''");
     let escaped_data = data_path.replace('\'', "''");
-    let attach_sql =
-        format!("ATTACH 'ducklake:{escaped_metadata}' AS {alias} (DATA_PATH '{escaped_data}')");
-    db.execute(&attach_sql, []).expect("attach ducklake");
-
-    db
+    execute_sql(
+        &mut db,
+        &format!("ATTACH 'ducklake:{escaped_metadata}' AS {alias} (DATA_PATH '{escaped_data}')"),
+    )
+    .expect("attach ducklake");
+    (database, db)
 }
 
 /// Bootstrap a `DuckLake` catalog at the given metadata path with test tables.
 ///
 /// Creates tables: `orders`, `customers`, `products` under the `main` schema.
 fn bootstrap_ducklake(metadata_path: &str, data_path: &str) {
-    let db = attach_ducklake("test_lake", metadata_path, data_path);
+    let (_database, mut db) = attach_ducklake("test_lake", metadata_path, data_path);
 
-    db.execute(
+    execute_sql(
+        &mut db,
         "CREATE TABLE test_lake.main.orders (id INTEGER, customer_id INTEGER, total DOUBLE)",
-        [],
     )
     .expect("create orders");
-    db.execute(
+    execute_sql(
+        &mut db,
         "INSERT INTO test_lake.main.orders VALUES (1, 10, 99.99), (2, 20, 149.50), (3, 10, 25.00)",
-        [],
     )
     .expect("insert orders");
 
-    db.execute(
+    execute_sql(
+        &mut db,
         "CREATE TABLE test_lake.main.customers (id INTEGER, name VARCHAR)",
-        [],
     )
     .expect("create customers");
-    db.execute(
+    execute_sql(
+        &mut db,
         "INSERT INTO test_lake.main.customers VALUES (10, 'Alice'), (20, 'Bob')",
-        [],
     )
     .expect("insert customers");
 
-    db.execute(
+    execute_sql(
+        &mut db,
         "CREATE TABLE test_lake.main.products (id INTEGER, name VARCHAR, price DOUBLE)",
-        [],
     )
     .expect("create products");
-    db.execute(
+    execute_sql(
+        &mut db,
         "INSERT INTO test_lake.main.products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99)",
-        [],
     )
     .expect("insert products");
+}
+
+async fn bootstrap_ducklake_async(metadata: String, data: String) {
+    tokio::task::spawn_blocking(move || bootstrap_ducklake(&metadata, &data))
+        .await
+        .expect("bootstrap task");
 }
 
 fn make_ducklake_catalog_params(metadata_path: &str) -> Params {
@@ -120,7 +150,7 @@ async fn ducklake_catalog_include_filter() -> Result<(), anyhow::Error> {
     let data_path = tmp_dir.path().join("data").display().to_string();
     std::fs::create_dir_all(&data_path)?;
 
-    bootstrap_ducklake(&metadata_path, &data_path);
+    bootstrap_ducklake_async(metadata_path.clone(), data_path.clone()).await;
 
     test_request_context()
         .scope(async {
@@ -215,7 +245,7 @@ async fn ducklake_catalog_no_filter() -> Result<(), anyhow::Error> {
     let data_path = tmp_dir.path().join("data_all").display().to_string();
     std::fs::create_dir_all(&data_path)?;
 
-    bootstrap_ducklake(&metadata_path, &data_path);
+    bootstrap_ducklake_async(metadata_path.clone(), data_path.clone()).await;
 
     test_request_context()
         .scope(async {
@@ -321,7 +351,7 @@ async fn ducklake_catalog_include_glob_pattern() -> Result<(), anyhow::Error> {
     let data_path = tmp_dir.path().join("data_glob").display().to_string();
     std::fs::create_dir_all(&data_path)?;
 
-    bootstrap_ducklake(&metadata_path, &data_path);
+    bootstrap_ducklake_async(metadata_path.clone(), data_path.clone()).await;
 
     test_request_context()
         .scope(async {
@@ -394,7 +424,7 @@ async fn ducklake_standalone_dataset() -> Result<(), anyhow::Error> {
     let data_path = tmp_dir.path().join("data_standalone").display().to_string();
     std::fs::create_dir_all(&data_path)?;
 
-    bootstrap_ducklake(&metadata_path, &data_path);
+    bootstrap_ducklake_async(metadata_path.clone(), data_path.clone()).await;
 
     test_request_context()
         .scope(async {
@@ -468,7 +498,7 @@ async fn ducklake_standalone_read_write_insert() -> Result<(), anyhow::Error> {
         .to_string();
     std::fs::create_dir_all(&data_path)?;
 
-    bootstrap_ducklake(&metadata_path, &data_path);
+    bootstrap_ducklake_async(metadata_path.clone(), data_path.clone()).await;
 
     test_request_context()
         .scope(async {
@@ -553,6 +583,163 @@ async fn ducklake_standalone_read_write_insert() -> Result<(), anyhow::Error> {
         .await
 }
 
+/// Runs a write statement and returns the row count it reports.
+async fn run_write(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
+    let result = rt
+        .datafusion()
+        .query_builder(sql)
+        .build()
+        .run()
+        .await
+        .map_err(|e| anyhow::anyhow!("`{sql}` failed: {e}"))?;
+    result
+        .data
+        .try_collect()
+        .await
+        .map_err(|e| anyhow::anyhow!("`{sql}` failed: {e}"))
+}
+
+/// Tests the write path of a standalone `DuckLake` dataset beyond a single
+/// append: the row counts appends report (including none), and a write whose
+/// input fails while it streams leaving the table as it was and the dataset
+/// writable. Spice accepts only `INSERT INTO`, so overwrite is not reachable.
+#[tokio::test]
+async fn ducklake_standalone_append_counts_and_failed_write() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("runtime=DEBUG,data_components=DEBUG"));
+    register_test_connectors().await;
+
+    let tmp_dir = TempDir::new()?;
+    let metadata_path = tmp_dir
+        .path()
+        .join("test_standalone_writes.ducklake")
+        .display()
+        .to_string();
+    let data_path = tmp_dir
+        .path()
+        .join("data_standalone_writes")
+        .display()
+        .to_string();
+    std::fs::create_dir_all(&data_path)?;
+
+    bootstrap_ducklake_async(metadata_path.clone(), data_path.clone()).await;
+
+    test_request_context()
+        .scope(async {
+            let mut dataset =
+                Dataset::new("ducklake:main.orders".to_string(), "my_orders".to_string());
+            dataset.params = Some(Params::from_string_map(HashMap::from([(
+                "ducklake_connection_string".to_string(),
+                metadata_path.clone(),
+            )])));
+            dataset.access = AccessMode::ReadWrite;
+
+            let app = AppBuilder::new("ducklake_standalone_writes_test")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            let cloned_rt = Arc::clone(&rt);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    panic!("Timeout waiting for components to load");
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let rows = || async {
+                let result = rt
+                    .datafusion()
+                    .query_builder("SELECT id, customer_id, total FROM my_orders ORDER BY id")
+                    .build()
+                    .run()
+                    .await?;
+                let batches: Vec<RecordBatch> = result.data.try_collect().await?;
+                Ok::<_, anyhow::Error>(batches)
+            };
+
+            // An append reports the rows it wrote.
+            let count = run_write(
+                &rt,
+                "INSERT INTO my_orders (id, customer_id, total) VALUES (4, 30, 75.25), (5, 40, 1.5)",
+            )
+            .await?;
+            assert_batches_eq!(
+                &["+-------+", "| count |", "+-------+", "| 2     |", "+-------+",],
+                &count
+            );
+
+            // A write whose input fails while it streams commits nothing. The
+            // series is evaluated by Spice, not pushed to DuckDB (where integer
+            // division by zero returns NULL), and divides by zero only on its
+            // last row, so earlier batches reach the staging table first.
+            let failed = run_write(
+                &rt,
+                "INSERT INTO my_orders SELECT 100000 + value, 1, CAST(10 / (20000 - value) AS DOUBLE) FROM generate_series(1, 20000)",
+            )
+            .await;
+            assert!(
+                failed
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains("Divide by zero")),
+                "expected the failing write to report division by zero, got {failed:?}"
+            );
+            assert_batches_eq!(
+                &[
+                    "+----+-------------+-------+",
+                    "| id | customer_id | total |",
+                    "+----+-------------+-------+",
+                    "| 1  | 10          | 99.99 |",
+                    "| 2  | 20          | 149.5 |",
+                    "| 3  | 10          | 25.0  |",
+                    "| 4  | 30          | 75.25 |",
+                    "| 5  | 40          | 1.5   |",
+                    "+----+-------------+-------+",
+                ],
+                &rows().await?
+            );
+
+            // An append with no rows reports 0 and changes nothing.
+            let count = run_write(
+                &rt,
+                "INSERT INTO my_orders SELECT id, customer_id, total FROM my_orders WHERE false",
+            )
+            .await?;
+            assert_batches_eq!(
+                &["+-------+", "| count |", "+-------+", "| 0     |", "+-------+",],
+                &count
+            );
+
+            // Writing still works after the rolled-back write.
+            run_write(
+                &rt,
+                "INSERT INTO my_orders (id, customer_id, total) VALUES (7, 70, 7.0)",
+            )
+            .await?;
+            assert_batches_eq!(
+                &[
+                    "+----+-------------+-------+",
+                    "| id | customer_id | total |",
+                    "+----+-------------+-------+",
+                    "| 1  | 10          | 99.99 |",
+                    "| 2  | 20          | 149.5 |",
+                    "| 3  | 10          | 25.0  |",
+                    "| 4  | 30          | 75.25 |",
+                    "| 5  | 40          | 1.5   |",
+                    "| 7  | 70          | 7.0   |",
+                    "+----+-------------+-------+",
+                ],
+                &rows().await?
+            );
+
+            Ok(())
+        })
+        .await
+}
+
 /// Tests that INSERT works on a `DuckLake` catalog table when `access: read_write` is set.
 #[tokio::test]
 async fn ducklake_catalog_read_write_insert() -> Result<(), anyhow::Error> {
@@ -568,7 +755,7 @@ async fn ducklake_catalog_read_write_insert() -> Result<(), anyhow::Error> {
     let data_path = tmp_dir.path().join("data_rw").display().to_string();
     std::fs::create_dir_all(&data_path)?;
 
-    bootstrap_ducklake(&metadata_path, &data_path);
+    bootstrap_ducklake_async(metadata_path.clone(), data_path.clone()).await;
 
     test_request_context()
         .scope(async {
@@ -672,17 +859,17 @@ async fn ducklake_catalog_read_write_insert() -> Result<(), anyhow::Error> {
 /// assert the exact set of tables `information_schema` reports, so adding a
 /// table to the shared fixture would change what they see.
 fn bootstrap_ducklake_names(metadata_path: &str, data_path: &str) {
-    let db = attach_ducklake("name_lake", metadata_path, data_path);
+    let (_database, mut db) = attach_ducklake("name_lake", metadata_path, data_path);
 
-    db.execute(
+    execute_sql(
+        &mut db,
         "CREATE TABLE name_lake.main.names (id INTEGER, name VARCHAR)",
-        [],
     )
     .expect("create names");
-    db.execute(
+    execute_sql(
+        &mut db,
         "INSERT INTO name_lake.main.names VALUES \
          (1, '  padded  '), (2, 'xyhelloyx'), (3, 'Alpha'), (4, NULL)",
-        [],
     )
     .expect("insert names");
 }
@@ -723,7 +910,9 @@ async fn ducklake_catalog_route_installs_the_duckdb_dialect() -> Result<(), anyh
     let data_path = tmp_dir.path().join("data_names").display().to_string();
     std::fs::create_dir_all(&data_path)?;
 
-    bootstrap_ducklake_names(&metadata_path, &data_path);
+    let metadata = metadata_path.clone();
+    let data = data_path.clone();
+    tokio::task::spawn_blocking(move || bootstrap_ducklake_names(&metadata, &data)).await?;
 
     test_request_context()
         .scope(async {

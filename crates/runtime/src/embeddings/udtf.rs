@@ -385,20 +385,6 @@ impl VectorSearchTableFunc {
             }
         }
 
-        #[cfg(feature = "duckdb")]
-        {
-            use search::index::duckdb::DuckDBVectorIndex;
-            if let Some((duckdb_indexes, _)) =
-                find_index_in_table_provider::<DuckDBVectorIndex>(tbl)
-            {
-                vector_indexes.extend(
-                    duckdb_indexes
-                        .into_iter()
-                        .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
-                );
-            }
-        }
-
         // Chunked search indexes (used by both S3 Vectors and Elasticsearch engines
         // when chunking is enabled) are discovered once here to avoid registering
         // the same `ChunkedSearchIndex` twice when both features are enabled.

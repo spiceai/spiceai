@@ -54,6 +54,7 @@ fn spec(name: String) -> ContainerSpec {
         ports: vec![9000],
         healthcheck: Some(healthcheck("curl -fs http://127.0.0.1:9000/health")),
         network: None,
+        alias: None,
     }
 }
 

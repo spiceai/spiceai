@@ -2008,8 +2008,8 @@ impl Runtime {
     /// the name the component prints as, so two names that print alike, such
     /// as `"s1.t1"` and `s1.t1`, share one table in a store of any engine, and
     /// Cayenne finds a table by that name in a metastore other datasets may
-    /// share; `DuckDB`, `SQLite`, and Turso also read names that differ only in
-    /// case as one table.
+    /// share; `DuckDB` and `SQLite` also read names that differ only in case as
+    /// one table.
     async fn component_sharing_table(
         self: &Arc<Self>,
         dataset: &Dataset,
@@ -2248,7 +2248,6 @@ fn shares_table_with(shared: &SharedTable) -> String {
     let engine_name = match engine {
         Engine::DuckDB => "DuckDB".to_string(),
         Engine::Sqlite => "SQLite".to_string(),
-        Engine::Turso => "Turso".to_string(),
         Engine::Cayenne => "Cayenne".to_string(),
         other => format!("`{other}`"),
     };

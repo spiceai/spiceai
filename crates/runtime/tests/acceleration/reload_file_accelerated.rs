@@ -24,10 +24,10 @@ limitations under the License.
 //! checkpoint and schedules nothing, while readiness — decided from the path —
 //! never arrives.
 //!
-//! The `DuckDB` `mode: file` and `SQLite` arms reach the reload with a usable
-//! file either way, and are here to keep the assertions honest: an on-disk read
-//! that cannot pass for an unaffected engine proves nothing about an affected
-//! one.
+//! The `DuckDB` `mode: file` and `SQLite` `mode: file_create` arms check that
+//! their engines reach the reload with a usable file. Cayenne's `file_create`
+//! arm is `test/spicescript/cron-and-reload.yaml`, which drives the reload
+//! through a watched Spicepod.
 
 use anyhow::anyhow;
 use app::{App, AppBuilder};
@@ -281,66 +281,6 @@ async fn test_reload_changed_sqlite_file_create_dataset() -> Result<(), anyhow::
             )
             .await
             .map(|_| ())
-        })
-        .await
-}
-
-/// The Turso counterpart of [`rows_on_disk`].
-#[cfg(feature = "turso")]
-async fn turso_rows_on_disk(db_file: &Path, table: &str) -> Result<i64, anyhow::Error> {
-    let db_path = db_file.to_string_lossy().to_string();
-    let pool = data_components::turso::TursoConnectionPool::new(&db_path)
-        .await
-        .map_err(|e| anyhow!("failed to open {db_path}: {e}"))?;
-    let conn = pool
-        .connect()
-        .await
-        .map_err(|e| anyhow!("failed to connect to {db_path}: {e}"))?;
-
-    let mut rows = conn
-        .query(&format!("select count(*) from \"{table}\""), ())
-        .await
-        .map_err(|e| anyhow!("count query failed: {e}"))?;
-    let row = rows
-        .next()
-        .await
-        .map_err(|e| anyhow!("reading the count failed: {e}"))?
-        .ok_or_else(|| anyhow!("count query returned no rows"))?;
-
-    match row
-        .get_value(0)
-        .map_err(|e| anyhow!("reading the count column failed: {e}"))?
-    {
-        turso::Value::Integer(count) => Ok(count),
-        other => Err(anyhow!("count column is not an integer: {other:?}")),
-    }
-}
-
-#[cfg(feature = "turso")]
-#[tokio::test]
-async fn test_reload_changed_turso_file_create_dataset() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    register_test_connectors().await;
-
-    test_request_context()
-        .scope_retry(3, || async {
-            let expected = i64::try_from(ROWS_AFTER)?;
-            let (_dir, db_file) = reload_changed_file_accelerated_dataset(
-                "test_reload_changed_turso_file_create",
-                "turso",
-                &Mode::FileCreate,
-                expected,
-            )
-            .await?;
-
-            let on_disk = turso_rows_on_disk(&db_file, "reloaded").await?;
-            if on_disk != expected {
-                return Err(anyhow!(
-                    "the acceleration file at {} holds {on_disk} rows, expected {expected}: the reloaded data went somewhere else",
-                    db_file.display()
-                ));
-            }
-            Ok(())
         })
         .await
 }

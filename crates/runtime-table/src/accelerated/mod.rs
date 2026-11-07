@@ -75,6 +75,7 @@ mod caching_scan_tests;
 pub mod checkpoint_primary_key;
 pub mod fallback_retention;
 pub use fallback_retention::{Error as FallbackRetentionKeepError, FallbackRetentionKeep};
+pub(crate) mod exact_string_time;
 pub mod federation;
 pub(crate) mod index_rebuild;
 pub mod partition_scope;

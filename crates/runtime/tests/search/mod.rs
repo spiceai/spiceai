@@ -212,7 +212,6 @@ const S3_VECTORS_FALLBACK_ARN_ENV: &str = "AWS_S3_VECTORS_FALLBACK_INDEX_ARN";
 #[serde(rename_all = "snake_case")]
 enum VectorEngineOptions {
     NoVectorEngine,
-    DuckDb,
     S3Vectors,
     /// S3 Vectors backed by a long-lived, never-deleted index, used to exercise the warm-tier
     /// fallback path: when the warm tier is empty, searches fall through to this persisted index.
@@ -223,7 +222,6 @@ impl fmt::Display for VectorEngineOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             VectorEngineOptions::NoVectorEngine => "no_vector_engine",
-            VectorEngineOptions::DuckDb => "duckdb",
             VectorEngineOptions::S3Vectors => "s3_vectors",
             VectorEngineOptions::S3VectorsFallback => "s3_vectors_fallback",
         };
@@ -238,11 +236,6 @@ impl VectorEngineOptions {
                 enabled: false,
                 ..Default::default()
             },
-            VectorEngineOptions::DuckDb => VectorStore {
-                enabled: true,
-                engine: Some("duckdb".to_string()),
-                ..Default::default()
-            },
             VectorEngineOptions::S3Vectors | VectorEngineOptions::S3VectorsFallback => {
                 let mut params = HashMap::from([
                     ("s3_vectors_aws_region".to_string(), "us-east-2".to_string()),
@@ -255,6 +248,10 @@ impl VectorEngineOptions {
                         "${ env:AWS_S3_VECTORS_SECRET }".to_string(),
                     ),
                 ]);
+                params.extend(crate::utils::aws_session_token_param(
+                    "s3_vectors_aws_session_token",
+                    "AWS_S3_VECTORS_SESSION_TOKEN",
+                ));
                 match self {
                     // The fallback engine targets a pre-seeded index by ARN. `s3_vectors_arn` is
                     // mutually exclusive with `s3_vectors_bucket`/`s3_vectors_index`, and an
@@ -353,7 +350,6 @@ impl EmbeddingModels {
 async fn test_megascience_permutations(
     #[values(
         VectorEngineOptions::NoVectorEngine,
-        VectorEngineOptions::DuckDb,
         VectorEngineOptions::S3Vectors,
         VectorEngineOptions::S3VectorsFallback
     )]
@@ -589,16 +585,6 @@ fn validate_combination(
     if matches!(text_engine, TextEngineOptions::Elasticsearch) && !column_config.is_fts() {
         return Err(
             "Elasticsearch text engine only applies to FTS column configurations".to_string(),
-        );
-    }
-    if matches!(&vector_engine, VectorEngineOptions::DuckDb)
-        && !matches!(
-            &acceleration_opt,
-            AccelerationOptions::DuckDb | AccelerationOptions::DuckDbFile
-        )
-    {
-        return Err(
-            "DuckDB vector engine requires DuckDB acceleration (duckdb or duckdb_file)".to_string(),
         );
     }
     if matches!(&vector_engine, VectorEngineOptions::S3Vectors)

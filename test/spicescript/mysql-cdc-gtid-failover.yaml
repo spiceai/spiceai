@@ -1,0 +1,117 @@
+name: mysql-cdc-gtid-failover
+description: >
+  A MySQL changes-mode acceleration follows its source through a failover. The
+  dataset is accelerated from a GTID primary, spiced stops (cleanly or killed),
+  the replica is promoted and the dataset pointed at it, rows change on the new
+  primary, and after the restart the acceleration resumes by GTID and matches
+  the new primary row for row. The two servers' binlog coordinates are
+  unrelated: `rotate: flush` moves the old primary to a later binlog file than
+  any the new primary has written.
+
+sources:
+  primary: { kind: mysql, version: '8.4' }
+  replica: { kind: mysql, version: '8.4' }
+
+matrix:
+  # kill-late: killed after the checkpoint interval, so the persisted position
+  # is the old primary's latest.
+  exit: [stop, kill, kill-late]
+  rotate: [none, flush]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mysql-cdc-gtid-failover
+  datasets:
+    - from: mysql:t
+      name: t
+      params: ${sources.primary.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: changes
+        primary_key: id
+
+steps:
+  # The replica replays the primary's whole history, CREATE DATABASE included,
+  # so it starts without the instance database (dropped outside its binlog).
+  - source-exec:
+      replica: |
+        SET GLOBAL server_id = 2;
+        SET SESSION sql_log_bin = 0;
+        DROP DATABASE ${sources.replica.namespace};
+        SET SESSION sql_log_bin = 1;
+        CHANGE REPLICATION SOURCE TO
+          SOURCE_HOST = '${sources.primary.peer_host}',
+          SOURCE_PORT = ${sources.primary.peer_port},
+          SOURCE_USER = 'root',
+          SOURCE_PASSWORD = 'spicescript',
+          SOURCE_SSL = 1,
+          SOURCE_AUTO_POSITION = 1;
+        START REPLICA;
+  - source-exec:
+      primary: |
+        CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(32) NOT NULL);
+        INSERT INTO t
+          WITH RECURSIVE seq (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 100)
+          SELECT i, CONCAT('a', i) FROM seq;
+  - start: {}
+  - query: SELECT * FROM t
+    expect: { oracle: primary }
+    eventually: 60s
+
+  # Rows streamed while spiced runs, so its checkpoint names a position in the
+  # primary's binlog. FLUSH BINARY LOGS is not replicated, so the replica's
+  # files do not move with the primary's.
+  - source-exec:
+      primary: FLUSH BINARY LOGS; FLUSH BINARY LOGS; FLUSH BINARY LOGS;
+    when: { rotate: flush }
+  - source-exec:
+      primary: |
+        INSERT INTO t
+          WITH RECURSIVE seq (i) AS (SELECT 101 UNION ALL SELECT i + 1 FROM seq WHERE i < 200)
+          SELECT i, CONCAT('b', i) FROM seq;
+        UPDATE t SET v = 'u1' WHERE id <= 20;
+  - query: SELECT * FROM t
+    expect: { oracle: primary }
+    eventually: 60s
+  - source-query:
+      replica: SELECT COUNT(*), SUM(v = 'u1') FROM t
+    expect: { rows: [['200', '20']] }
+    eventually: 60s
+
+  - stop: {}
+    when: { exit: stop }
+  - kill-spiced: {}
+    when: { exit: kill }
+  # Past the 10 s default `replication_checkpoint_interval`, so the killed
+  # process has persisted the position of the rows above.
+  - sleep: 15s
+    when: { exit: kill-late }
+  - kill-spiced: {}
+    when: { exit: kill-late }
+
+  # Failover: the primary goes away and the replica becomes the source.
+  - stop-source: primary
+  - source-exec:
+      replica: STOP REPLICA; RESET REPLICA ALL;
+  - source-exec:
+      replica: |
+        INSERT INTO t
+          WITH RECURSIVE seq (i) AS (SELECT 201 UNION ALL SELECT i + 1 FROM seq WHERE i < 300)
+          SELECT i, CONCAT('c', i) FROM seq;
+        UPDATE t SET v = 'u2' WHERE id BETWEEN 30 AND 39;
+        DELETE FROM t WHERE id BETWEEN 50 AND 59;
+
+  - start:
+      patch:
+        datasets: { t: { params: '${sources.replica.params}' } }
+  - assert-log:
+      contains: ['resuming from persisted GTID position']
+  - query: SELECT * FROM t
+    expect: { oracle: replica }
+    eventually: 60s
+  - query: SELECT COUNT(*) AS n FROM t
+    expect: { rows: [['290']] }
+    eventually: 30s

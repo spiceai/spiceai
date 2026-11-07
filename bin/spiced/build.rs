@@ -39,6 +39,18 @@ fn main() {
     println!("cargo:rustc-env=GIT_COMMIT_HASH={git_hash}");
     println!("cargo:rustc-env=SPICED_BUILD_PROFILE={}", build_profile());
     println!("cargo:rustc-env=SPICED_BUILD_FEATURES={}", build_features());
+
+    // macOS exports every global symbol of an executable, and dyld binds a weak
+    // definition (a C++ template instantiation, an inline function, a vtable)
+    // to the first image that exports it. `duckdb:` and `ducklake:` load the
+    // installed libduckdb through ADBC, so the bundled DuckDB's and ICU's
+    // exports would replace parts of that library with code from another
+    // DuckDB release and corrupt its state. Export nothing, as the Linux build
+    // does: the bundled DuckDB links its extensions statically and needs no
+    // exports of its own.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rustc-link-arg-bins=-Wl,-exported_symbol,__mh_execute_header");
+    }
 }
 
 /// The cargo profile the binary is being built with.

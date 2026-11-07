@@ -1883,6 +1883,10 @@ pub(crate) async fn create_table_provider(
         agg_pushdown_optimization,
     );
 
+    // DuckDB evaluates the `UPDATE` and `DELETE` the writer renders.
+    let write_provider =
+        runtime_datafusion::checked_arithmetic::with_plain_arithmetic_writes(write_provider);
+
     let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
         write_provider,
         read_provider,

@@ -371,8 +371,8 @@ steps:
     oracle-sql: SELECT id, amount FROM orders_next
 
   # A memory acceleration of an engine that keeps every memory-mode dataset in
-  # one instance starts from the source too: DuckDB and Turso pointed at
-  # another source, and SQLite dropped and created again. Each appends on
+  # one instance starts from the source too: DuckDB pointed at another
+  # source, and SQLite dropped and created again. Each appends on
   # `ts`, and `new`'s rows are older than `old`'s, so an append that resumed
   # after `old`'s newest row would load none of them.
   - generate:
@@ -441,20 +441,6 @@ steps:
   - spice-exec: "CREATE TABLE m2 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'memory', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds')"
     only: a
   - query: SELECT id, ts FROM m2
-    only: a
-    eventually: 60s
-    expect: { oracle: ref }
-    oracle-sql: SELECT id, ts FROM new
-  - spice-exec: "CREATE TABLE m3 WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'turso', acceleration.mode = 'memory', acceleration.refresh_mode = 'append', time_column = 'ts', time_format = 'unix_seconds')"
-    only: a
-  - query: SELECT id, ts FROM m3
-    only: a
-    eventually: 60s
-    expect: { oracle: ref }
-    oracle-sql: SELECT id, ts FROM old
-  - spice-exec: "ALTER TABLE m3 SET (from = 'file://${sources.lake.path}/new/')"
-    only: a
-  - query: SELECT id, ts FROM m3
     only: a
     eventually: 60s
     expect: { oracle: ref }
@@ -754,8 +740,8 @@ steps:
 
   # Two names that differ only in case would share one table in an engine
   # that does not keep such tables apart, so the statement that defines the
-  # second is refused, and the first keeps its rows: SQLite and Turso in a
-  # file, and DuckDB in memory.
+  # second is refused, and the first keeps its rows: SQLite in a file, and
+  # DuckDB in memory.
   - spice-exec: "CREATE TABLE \"C1\" WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'file')"
     only: a
   - query: SELECT id, ts FROM "C1"
@@ -767,21 +753,6 @@ steps:
     only: a
     expect-error: "dataset 'C1' keeps its acceleration data in the same SQLite file"
   - query: SELECT id, ts FROM "C1"
-    only: a
-    consistently: 5s
-    expect: { oracle: ref }
-    oracle-sql: SELECT id, ts FROM old
-  - spice-exec: "CREATE TABLE \"C2\" WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'turso', acceleration.mode = 'file')"
-    only: a
-  - query: SELECT id, ts FROM "C2"
-    only: a
-    eventually: 60s
-    expect: { oracle: ref }
-    oracle-sql: SELECT id, ts FROM old
-  - spice-exec: "CREATE TABLE c2 WITH (from = 'file://${sources.lake.path}/new/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'turso', acceleration.mode = 'file')"
-    only: a
-    expect-error: "dataset 'C2' keeps its acceleration data in the same Turso file"
-  - query: SELECT id, ts FROM "C2"
     only: a
     consistently: 5s
     expect: { oracle: ref }
@@ -888,13 +859,6 @@ steps:
   - spice-exec: "CREATE TABLE e2 WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'sqlite', acceleration.mode = 'file')"
     only: fresh
   - query: SELECT id, ts FROM e2
-    only: fresh
-    eventually: 60s
-    expect: { oracle: ref }
-    oracle-sql: SELECT id, ts FROM old
-  - spice-exec: "CREATE TABLE e3 WITH (from = 'file://${sources.lake.path}/old/', file_format = 'csv', acceleration.enabled = true, acceleration.engine = 'turso', acceleration.mode = 'file')"
-    only: fresh
-  - query: SELECT id, ts FROM e3
     only: fresh
     eventually: 60s
     expect: { oracle: ref }

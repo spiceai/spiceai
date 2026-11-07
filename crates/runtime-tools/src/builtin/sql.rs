@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use datafusion_ddl::component_options::{
     UNREADABLE_STATEMENT, recorded_text, redact_values, unreadable_parts,
@@ -25,8 +24,7 @@ use std::{
 };
 
 use crate::builtin::function_tool::current_principal_allows_write;
-use crate::utils::{parameters, write_to_json_string};
-use futures::TryStreamExt;
+use crate::utils::{MAX_TOOL_RESULT_BYTES, parameters, stream_to_json_string};
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 use schemars::JsonSchema;
@@ -113,15 +111,10 @@ impl SpiceModelTool for SqlTool {
                 query_request = query_request.allow_tables(allowlist.clone());
             }
 
-            let batches = self
-                .df
-                .execute_query(query_request)
-                .await?
-                .try_collect::<Vec<RecordBatch>>()
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-
-            Ok(Value::String(write_to_json_string(&batches)?))
+            let stream = self.df.execute_query(query_request).await?;
+            Ok(Value::String(
+                stream_to_json_string(stream, MAX_TOOL_RESULT_BYTES).await?,
+            ))
         }
         .instrument(span.clone())
         .await;

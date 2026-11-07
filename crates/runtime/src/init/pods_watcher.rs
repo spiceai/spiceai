@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use app::{App, AppBuilder};
 use spicepod::component::{
@@ -286,8 +286,8 @@ impl Runtime {
     }
 
     /// Hot-apply a new [`App`] to the running runtime, reconciling catalogs,
-    /// datasets, views, models, functions, and (without the `models` feature)
-    /// workers against the currently-loaded app.
+    /// datasets, views, tools, functions, models, and (with the `models`
+    /// feature) workers against the currently-loaded app.
     ///
     /// This is the diff-based reconcile the pods watcher performs when a
     /// spicepod file changes on disk, and the one a Spice Cloud deployment takes
@@ -357,6 +357,7 @@ impl Runtime {
         current_app: Option<&Arc<App>>,
         new_app: Arc<App>,
     ) -> bool {
+        let mut models_to_reload = None;
         if let Some(current_app) = current_app {
             if *current_app == new_app {
                 return false;
@@ -387,20 +388,53 @@ impl Runtime {
             Arc::clone(&self)
                 .apply_view_diff(current_app, &new_app, &reloaded_datasets)
                 .await;
-            self.apply_model_diff(current_app, &new_app).await;
+            // Tools and functions first: a model gets its tools when it loads.
+            let changed_tools = self.apply_tool_diff(current_app, &new_app).await;
             crate::datafusion::udf::apply_function_diff(&self, current_app, &new_app).await;
+            let changed_function_tools = changed_function_tools(current_app, &new_app);
+            let loaded_models = self.apply_model_diff(current_app, &new_app).await;
+            models_to_reload = Some((changed_tools, changed_function_tools, loaded_models));
 
-            if !cfg!(feature = "models") {
+            if cfg!(feature = "models") {
                 Arc::clone(&self)
                     .apply_worker_diff(current_app, &new_app)
                     .await;
             }
         }
 
-        *self.app.write().await = Some(new_app);
+        *self.app.write().await = Some(Arc::clone(&new_app));
+
+        // After the swap: `auto` and `all` resolve against the installed app's `tools:`.
+        if let Some((changed_tools, changed_function_tools, loaded_models)) = models_to_reload {
+            self.reload_models_using_tools(
+                &new_app,
+                &changed_tools,
+                &changed_function_tools,
+                &loaded_models,
+            )
+            .await;
+        }
 
         true
     }
+}
+
+/// Names of the functions exposed as tools that `new_app` adds, removes or changes.
+fn changed_function_tools(current_app: &App, new_app: &App) -> HashSet<String> {
+    let enabled_changed =
+        current_app.runtime.functions.enabled != new_app.runtime.functions.enabled;
+    current_app
+        .functions
+        .iter()
+        .chain(&new_app.functions)
+        .filter(|f| f.as_tool)
+        .filter(|f| {
+            enabled_changed
+                || current_app.functions.iter().find(|c| c.name == f.name)
+                    != new_app.functions.iter().find(|n| n.name == f.name)
+        })
+        .map(|f| f.name.clone())
+        .collect()
 }
 
 #[cfg(test)]

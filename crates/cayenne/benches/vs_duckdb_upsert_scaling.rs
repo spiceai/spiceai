@@ -6,15 +6,15 @@
 //
 //     https://www.apache.org/licenses/LICENSE-2.0
 
-//! PK upsert scaling: Cayenne vs DuckDB across preloaded table sizes.
+//! PK upsert scaling: Cayenne vs `DuckDB` across preloaded table sizes.
 //!
 //! Companion to `vs_duckdb_upsert.rs` (which fixes `TABLE_ROWS = 10_000`).
 //! This bench sweeps `TABLE_ROWS` through `{10_000, 100_000, 3_000_000}`
 //! with a fixed 100 % conflict rate so every incoming row hits the
 //! existing keyspace. The intent is to make the byte-budget keyset cap
-//! behavior visible *against DuckDB*: Cayenne should stay flatter while the
+//! behavior visible *against `DuckDB`*: Cayenne should stay flatter while the
 //! keyset fits the `PK_KEYSET_CACHE_MAX_BYTES` budget, then grow once the cap
-//! disables caching for larger or wider keysets. DuckDB's PK btree gives
+//! disables caching for larger or wider keysets. `DuckDB`'s PK btree gives
 //! O(log N) per-row lookup that is roughly flat in N.
 //!
 //! ## What this bench measures
@@ -32,7 +32,7 @@
 //! - `duckdb/N=...`
 //!
 //! Expected shape:
-//! - DuckDB stays roughly flat (`O(INCOMING_ROWS · log N)`).
+//! - `DuckDB` stays roughly flat (`O(INCOMING_ROWS · log N)`).
 //! - Cayenne stays flatter while the keyset fits the byte budget, then grows
 //!   linearly with `N` after `store_cached_pk_keyset` drops the cache.
 //!
@@ -76,7 +76,7 @@ use common::{
 const TABLE_ROW_COUNTS: &[usize] = &[10_000, 100_000, 3_000_000];
 
 /// Fixed incoming-batch size. Matches `vs_duckdb_upsert.rs` so the
-/// `N=10000` data points are directly comparable to the conflict_100pct
+/// `N=10000` data points are directly comparable to the `conflict_100pct`
 /// lane there.
 const INCOMING_ROWS: usize = 2_000;
 

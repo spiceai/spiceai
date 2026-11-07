@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 //! Copies of a downloaded GGUF changed in one place: a metadata key renamed in place, keeping
-//! its length, or one tensor added after the others. Either way llama.cpp reads every other
-//! byte of the copy as it reads the original.
+//! its length, tokens of its vocabulary respelled, or one tensor added after the others. Either
+//! way llama.cpp reads every other byte of the copy as it reads the original.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -104,6 +104,71 @@ pub(crate) fn copy_with_tensor(source: &Path, dir: &Path, name: &str, ne: [u64; 
     std::io::copy(&mut source, &mut out).expect("the data copies");
     zeros(&mut out, offset - data_len);
     zeros(&mut out, ne[0] * ne[1] * 2);
+    out.flush().expect("the copy writes");
+    copy
+}
+
+/// Copies `source` into `dir`, under the same file name, with tokens of its vocabulary
+/// respelled: each `(from, to)` names a token in `tokenizer.ggml.tokens` by its text and gives
+/// the text it takes. The tensors and every other byte of the metadata are copied unchanged;
+/// the data moves with the vocabulary's new length, and each tensor keeps its offset in it.
+pub(crate) fn copy_with_tokens(source: &Path, dir: &Path, respell: &[(&str, &str)]) -> PathBuf {
+    let header = header(source);
+    let layout = layout(&header);
+    let n_kv = read_u64(&header, 16);
+    let (mut at, mut tokens) = (24, None);
+    for _ in 0..n_kv {
+        let (key, after) = string(&header, at);
+        let kind = read_u32(&header, after);
+        let next = skip_value(&header, kind, after + 4);
+        if key == "tokenizer.ggml.tokens" {
+            tokens = Some((after + 4, next));
+        }
+        at = next;
+    }
+    let (value, value_end) = tokens.expect("the GGUF has a vocabulary");
+    assert_eq!(read_u32(&header, value), STRING, "its tokens are strings");
+    // The array's element type and count, then each token, its length then its bytes, which
+    // are copied as they are unless the token is respelled.
+    let mut array = header[value..value + 12].to_vec();
+    let mut respelled = 0;
+    let mut item = value + 12;
+    for _ in 0..read_u64(&header, value + 4) {
+        let len = usize::try_from(read_u64(&header, item)).expect("a token's length fits");
+        let bytes = &header[item + 8..item + 8 + len];
+        let bytes = match respell.iter().find(|(from, _)| from.as_bytes() == bytes) {
+            Some((_, to)) => {
+                respelled += 1;
+                to.as_bytes()
+            }
+            None => bytes,
+        };
+        array.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        array.extend_from_slice(bytes);
+        item += 8 + len;
+    }
+    assert_eq!(
+        respelled,
+        respell.len(),
+        "each token to respell is in the vocabulary once"
+    );
+
+    let copy = dir.join(source.file_name().expect("the GGUF has a file name"));
+    let mut out = std::io::BufWriter::new(std::fs::File::create(&copy).expect("the copy opens"));
+    out.write_all(&header[..value]).expect("the copy writes");
+    out.write_all(&array).expect("the copy writes");
+    out.write_all(&header[value_end..layout.infos_end])
+        .expect("the copy writes");
+    let infos_end = (layout.infos_end - (value_end - value) + array.len()) as u64;
+    zeros(
+        &mut out,
+        infos_end.next_multiple_of(layout.alignment) - infos_end,
+    );
+    let mut source = std::fs::File::open(source).expect("the GGUF opens");
+    source
+        .seek(SeekFrom::Start(layout.data_start))
+        .expect("the GGUF seeks");
+    std::io::copy(&mut source, &mut out).expect("the data copies");
     out.flush().expect("the copy writes");
     copy
 }
