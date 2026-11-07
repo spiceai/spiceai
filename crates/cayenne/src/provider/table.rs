@@ -43594,12 +43594,25 @@ impl TableProvider for CayenneTableProvider {
         // the scan after it holds `write_lock` — the #13828 pattern for UPDATE.
         // Wrapped so a partitioned sink can `prepare` every partition before
         // writing any (a later partition's PK collision must change none).
+        // Upsert-only: the table keeps the last version of each key and the
+        // statement moves no row to another key (partitioned tables keep the
+        // delete leg: a row can change partition), so the insert
+        // leg supersedes every matched row in the same commit that makes the
+        // replacement visible (no torn "rows missing" window for readers).
+        let metadata = self.metadata();
+        let upsert_only = !metadata.primary_key.is_empty()
+            && matches!(metadata.on_conflict, Some(OnConflict::Upsert(_)))
+            && metadata.partition_column.is_none()
+            && !assigned
+                .iter()
+                .any(|col| metadata.primary_key.iter().any(|pk| pk == col));
         let exec = Arc::new(super::update_exec::CayenneUpdateExec::new(
             plan,
             self.clone_for_write(),
             session_state,
             filters,
             check.map(|check| Arc::new(check) as Arc<dyn data_components::update::UpdateValidator>),
+            upsert_only,
         ));
         Ok(Arc::new(
             data_components::update::PreparableUpdateExec::wrap(exec),
@@ -70448,6 +70461,79 @@ mod tests {
         assert_eq!(scan_id_values(&provider).await, vec![(7, 10), (8, 20)]);
     }
 
+    /// A plain append under an outer `write_lock` hold (autocommit `UPDATE`)
+    /// publishes in its own task once its staging WAL is written. Cancelling the
+    /// caller then must not release the table lock while that publish runs:
+    /// compaction could move the snapshot the WAL targets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_append_under_a_held_write_lock_keeps_the_lock_until_published() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_append_only_table("held_lock_cancelled_append", ctx.runtime_env()).await;
+        let provider = Arc::new(provider);
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let staging = std::path::PathBuf::from(&provider.metadata().path)
+            .join(&provider.metadata().table_id)
+            .join(crate::provider::constants::STAGING_DIR_NAME);
+        let wal_written = || {
+            std::fs::read_dir(&staging).is_ok_and(|entries| {
+                entries.filter_map(std::result::Result::ok).any(|entry| {
+                    entry
+                        .path()
+                        .join(crate::provider::constants::STAGING_WAL_FILENAME)
+                        .exists()
+                })
+            })
+        };
+
+        // Park the append's publish on the listing fence, after its WAL is written.
+        let fence = provider.lock_listing_fence_write_owned().await;
+        let writer = {
+            let provider = Arc::clone(&provider);
+            tokio::spawn(async move {
+                let outer = Arc::new(provider.write_lock_arc().lock_owned().await);
+                crate::provider::write_lock_held::scope(
+                    outer,
+                    insert_batch(&provider, id_value_batch(schema, &[7], &[10])),
+                )
+                .await;
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !wal_written() {
+            assert!(!writer.is_finished(), "append finished before its WAL");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "append never wrote its staging WAL"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        writer.abort();
+        assert!(
+            writer.await.expect_err("aborted writer").is_cancelled(),
+            "the caller must be cancelled while its publish is parked"
+        );
+        assert!(
+            provider.write_lock_arc().try_lock().is_err(),
+            "the in-flight publish must keep the table write lock after its caller is cancelled"
+        );
+
+        drop(fence);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while provider.write_lock_arc().try_lock().is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the publish never released the table write lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 10)],
+            "the cancelled append commits once staged"
+        );
+    }
+
     /// A partitioned sink calls `prepare` on every partition before executing
     /// any. Those prepared rows used to be written as-is, so two same-key
     /// `value = value + 1` plans that both prepared against V1 both wrote V2.
@@ -83378,4 +83464,5 @@ mod tests {
 
     mod layered_upsert_state;
     mod repeated_keys;
+    mod update_visibility;
 }
