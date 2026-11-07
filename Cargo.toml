@@ -211,17 +211,17 @@ ahash = "0.8.12"
 anyhow = "1.0.103"
 async-channel = "1.9"
 arc-swap = "1.7"
-arrow = { version = "59.3.0", features = ["prettyprint"] }
-arrow-array = "59.3.0"
-arrow-buffer = "59.3.0"
-arrow-cast = "59.3.0"
-arrow-csv = "59.3.0"
-arrow-flight = "59.3.0"
-arrow-ipc = "59.3.0"
-arrow-json = "59.3.0"
+arrow = { version = "59.3.2", features = ["prettyprint"] }
+arrow-array = "59.3.2"
+arrow-buffer = "59.3.2"
+arrow-cast = "59.3.2"
+arrow-csv = "59.3.2"
+arrow-flight = "59.3.2"
+arrow-ipc = "59.3.2"
+arrow-json = "59.3.2"
 arrow-odbc = "25.3" # 25.2+ accepts arrow ">=29, <60", so it resolves to the workspace Arrow 59
-arrow-row = "59.3.0"
-arrow-schema = "59.3.0"
+arrow-row = "59.3.2"
+arrow-schema = "59.3.2"
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "c1bf4a090c50e18f27663b008dac4c108e49b994", features = [
     "byot",
     "embedding",
@@ -256,9 +256,9 @@ aws-smithy-runtime-api = "1.11.6"
 aws-smithy-types = "1.4.5"
 axum = { version = "0.8", features = ["macros"] }
 backoff = { path = "crates/backoff" }
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "432924cd9644117729c7e010efc60a8cec8f0119" } # branch: spiceai-55
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "432924cd9644117729c7e010efc60a8cec8f0119" }
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "432924cd9644117729c7e010efc60a8cec8f0119" }
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "6e7a8775a6deb99c2ebf924f1ff5b3111d38e615" } # branch: spiceai-55
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "6e7a8775a6deb99c2ebf924f1ff5b3111d38e615" }
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "6e7a8775a6deb99c2ebf924f1ff5b3111d38e615" }
 base64 = "0.22.1"
 bb8 = "0.9"
 bb8-postgres = "0.9"
@@ -398,7 +398,7 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = [
     "experimental_metrics_custom_reader",
 ] }
 parking_lot = "0.12"
-parquet = "59.3.0"
+parquet = "59.3.2"
 paste = "1.0.15"
 pem = "3.0.4"
 percent-encoding = "2.3.1"
@@ -680,23 +680,23 @@ iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev 
 # [patch.crates-io] block higher up in this file. Keeping those here would be
 # a duplicate-key error.
 
-# arrow-rs 59.3 with spice patches (spiceai-59-patches)
-arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "36fc2c9a9f34e530385c2028adde690c24ab5ef3" }        # branch: spiceai-59 (arrow 59.3.0)
-arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "36fc2c9a9f34e530385c2028adde690c24ab5ef3" }  # branch: spiceai-59 (arrow 59.3.0)
-arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "36fc2c9a9f34e530385c2028adde690c24ab5ef3" }  # branch: spiceai-59 (arrow 59.3.0)
-arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "36fc2c9a9f34e530385c2028adde690c24ab5ef3" } # branch: spiceai-59 (arrow 59.3.0)
-arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "36fc2c9a9f34e530385c2028adde690c24ab5ef3" }   # branch: spiceai-59 (arrow 59.3.0)
-arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "36fc2c9a9f34e530385c2028adde690c24ab5ef3" }    # branch: spiceai-59 (arrow 59.3.0)
-arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "36fc2c9a9f34e530385c2028adde690c24ab5ef3" }   # branch: spiceai-59 (arrow 59.3.0)
-arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "36fc2c9a9f34e530385c2028adde690c24ab5ef3" } # branch: spiceai-59 (arrow 59.3.0)
-arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "36fc2c9a9f34e530385c2028adde690c24ab5ef3" }    # branch: spiceai-59 (arrow 59.3.0)
-arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "36fc2c9a9f34e530385c2028adde690c24ab5ef3" }   # branch: spiceai-59 (arrow 59.3.0)
-arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "36fc2c9a9f34e530385c2028adde690c24ab5ef3" }    # branch: spiceai-59 (arrow 59.3.0)
-arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "36fc2c9a9f34e530385c2028adde690c24ab5ef3" }    # branch: spiceai-59 (arrow 59.3.0)
-arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "36fc2c9a9f34e530385c2028adde690c24ab5ef3" } # branch: spiceai-59 (arrow 59.3.0)
-arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "36fc2c9a9f34e530385c2028adde690c24ab5ef3" } # branch: spiceai-59 (arrow 59.3.0)
-arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "36fc2c9a9f34e530385c2028adde690c24ab5ef3" } # branch: spiceai-59 (arrow 59.3.0)
-parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "36fc2c9a9f34e530385c2028adde690c24ab5ef3" }      # branch: spiceai-59 (arrow 59.3.0)
+# arrow-rs 59.3.2 with spice patches (spiceai-59.3.2)
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" }        # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
+arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" }  # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" }  # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" } # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" }   # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
+arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" }    # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" }   # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" } # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" }    # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" }   # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" }    # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" }    # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" } # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" } # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" } # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "510ef234e1444f2c4aaf748d0c905787738afa7a" }      # branch: spiceai-59.3.2 (arrow 59.3.2 + spice patches)
 
 vortex = { git = "https://github.com/spiceai/vortex.git", rev = "e5566746d966da8a9da901573083fdf222fcc0f6" } # branch: spiceai-55 (vortex 0.86.1)
 vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "e5566746d966da8a9da901573083fdf222fcc0f6" } # branch: spiceai-55 (vortex 0.86.1)

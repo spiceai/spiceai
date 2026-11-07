@@ -4,5 +4,6 @@
   "append-null-time": 5,
   "append-same-time": 6,
   "append-upsert-same-time": 4,
-  "retention-epoch-formats": 57
+  "retention-epoch-formats": 57,
+  "retention-sql-filtered-read": 4
 }

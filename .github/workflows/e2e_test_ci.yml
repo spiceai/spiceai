@@ -1080,7 +1080,6 @@ jobs:
           [
             {},
             { engine: arrow, mode: memory },
-            { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
             { engine: cayenne, mode: file },
           ]
@@ -1242,7 +1241,6 @@ jobs:
           [
             {},
             { engine: arrow, mode: memory },
-            { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
             { engine: cayenne, mode: file },
           ]
@@ -1678,8 +1676,6 @@ jobs:
             { engine: arrow, mode: memory },
             { engine: cayenne, mode: memory },
             { engine: cayenne, mode: file },
-            { engine: duckdb, mode: memory },
-            { engine: duckdb, mode: file },
             { engine: sqlite, mode: memory },
             { engine: sqlite, mode: file },
           ]
@@ -2474,6 +2470,7 @@ jobs:
           echo "      mode: delta_lake" >> spicepod.yaml
           echo "      databricks_aws_access_key_id: \${ secrets:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }" >> spicepod.yaml
           echo "      databricks_aws_secret_access_key: \${ secrets:AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }" >> spicepod.yaml
+          echo "      databricks_aws_session_token: \${ secrets:AWS_DATABRICKS_DELTA_SESSION_TOKEN }" >> spicepod.yaml
           echo "      databricks_aws_region: us-west-2" >> spicepod.yaml
           echo "      databricks_endpoint: \${ secrets:DATABRICKS_ENDPOINT }" >> spicepod.yaml
           echo "      databricks_client_id: \${ secrets:DATABRICKS_OIDC_CLIENT_ID }" >> spicepod.yaml
@@ -2481,12 +2478,23 @@ jobs:
 
           cat spicepod.yaml
 
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta-new
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
       - name: Start spice runtime
         working-directory: test_app
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta-new.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta-new.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta-new.outputs.aws-session-token }}
           DATABRICKS_ENDPOINT: ${{ vars.NEW_DATABRICKS_HOST }}
           DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
           DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
@@ -2555,9 +2563,9 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
         spicepod:
           [
-            duckdb_append_with_pk_and_indexes.yaml,
-            duckdb_append_with_pk.yaml,
-            duckdb_append_with_indexes.yaml,
+            cayenne_append_with_pk_and_indexes.yaml,
+            cayenne_append_with_pk.yaml,
+            cayenne_append_with_indexes.yaml,
           ]
         # run only on "Linux x64"
         exclude:
@@ -2703,25 +2711,34 @@ jobs:
           # Allow filesystem to sync after process exits
           sleep 2
 
-      - name: Verify local DuckDB database
+      - name: Verify the Cayenne acceleration was persisted
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
-          ls -la .spice/data
+          ls -laR .spice/data
 
-          if [ -f .spice/data/accelerated_duckdb.db ]; then
-            echo "Verification successful: accelerated_duckdb.db exists."
+          # A file-mode Cayenne acceleration keeps its metastore in
+          # .spice/data/metadata/cayenne.db and a directory per dataset. Small
+          # tables can live entirely in the metastore, so the dataset directories
+          # may hold no data files. A SQLite -wal file left beside the metastore is
+          # replayed when it is next opened, so it is not checked here; the restart
+          # below checks that every dataset loads again.
+          if [ -f .spice/data/metadata/cayenne.db ]; then
+            echo "Verification successful: the Cayenne metastore exists."
           else
-            echo "Verification failed: accelerated_duckdb.db does not exist."
+            echo "Verification failed: .spice/data/metadata/cayenne.db does not exist."
             exit 1
           fi
 
-          if [ ! -f .spice/data/accelerated_duckdb.db.wal ]; then
-            echo "Verification successful: accelerated_duckdb.db.wal does not exist."
-          else
-            echo "Verification failed: accelerated_duckdb.db.wal exists."
-            ls -la .spice/data/accelerated_duckdb.db.wal
-            exit 1
-          fi
+          missing=0
+          for dataset in $(grep -E '^    name:' spicepod.yaml | awk '{print $2}'); do
+            if [ -d ".spice/data/$dataset" ]; then
+              echo "Verification successful: .spice/data/$dataset exists."
+            else
+              echo "Verification failed: .spice/data/$dataset does not exist."
+              missing=1
+            fi
+          done
+          exit "$missing"
 
       - name: Stop the append simulator
         if: always()
@@ -2779,9 +2796,9 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
         spicepod:
           [
-            duckdb_full_with_pk_and_indexes.yaml,
-            duckdb_full_with_pk.yaml,
-            duckdb_full_with_indexes.yaml,
+            cayenne_full_with_pk_and_indexes.yaml,
+            cayenne_full_with_pk.yaml,
+            cayenne_full_with_indexes.yaml,
           ]
         # run only on "Linux x64"
         exclude:
@@ -2869,25 +2886,34 @@ jobs:
           SPICE_STOP_GRACE=600 bash "$GITHUB_WORKSPACE/.github/actions/stop-spice/stop_spice.sh"
           sleep 2
 
-      - name: Verify local DuckDB database
+      - name: Verify the Cayenne acceleration was persisted
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
-          ls -la .spice/data
+          ls -laR .spice/data
 
-          if [ -f .spice/data/accelerated_duckdb.db ]; then
-            echo "Verification successful: accelerated_duckdb.db exists."
+          # A file-mode Cayenne acceleration keeps its metastore in
+          # .spice/data/metadata/cayenne.db and a directory per dataset. Small
+          # tables can live entirely in the metastore, so the dataset directories
+          # may hold no data files. A SQLite -wal file left beside the metastore is
+          # replayed when it is next opened, so it is not checked here; the restart
+          # below checks that every dataset loads again.
+          if [ -f .spice/data/metadata/cayenne.db ]; then
+            echo "Verification successful: the Cayenne metastore exists."
           else
-            echo "Verification failed: accelerated_duckdb.db does not exist."
+            echo "Verification failed: .spice/data/metadata/cayenne.db does not exist."
             exit 1
           fi
 
-          if [ ! -f .spice/data/accelerated_duckdb.db.wal ]; then
-            echo "Verification successful: accelerated_duckdb.db.wal does not exist."
-          else
-            echo "Verification failed: accelerated_duckdb.db.wal exists."
-            ls -la .spice/data/accelerated_duckdb.db.wal
-            exit 1
-          fi
+          missing=0
+          for dataset in $(grep -E '^    name:' spicepod.yaml | awk '{print $2}'); do
+            if [ -d ".spice/data/$dataset" ]; then
+              echo "Verification successful: .spice/data/$dataset exists."
+            else
+              echo "Verification failed: .spice/data/$dataset does not exist."
+              missing=1
+            fi
+          done
+          exit "$missing"
 
       - name: Check logs
         if: always()
@@ -2969,8 +2995,11 @@ jobs:
     environment: ci
     permissions:
       contents: read
-      id-token: write  # RustFS credentials
+      id-token: write  # RustFS credentials, and the tokens of the live scripts
     timeout-minutes: 60
+    env:
+      HAS_OPENAI_WIF: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID != '' }}
+      HAS_ANTHROPIC_WIF: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -2991,6 +3020,9 @@ jobs:
           # release test/duckdb_versions.json lists; this one runs the scripts
           # with DuckDB sources again on each older listed release.
           - { name: 'spicescript: older DuckDB releases', partition: 1/1, older_duckdb: true }
+          # test/spicescript/live: real providers through static credential params, with
+          # tokens minted from this job's GitHub OIDC token just before the run.
+          - { name: 'spicescript: live', live: true }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -3070,7 +3102,7 @@ jobs:
       # and downloads each release it needs into ~/.cache/spicescript, so no
       # `--from` is passed here. The token is for the releases API's rate limit.
       - name: Run scenario scripts
-        if: ${{ !matrix.older_duckdb }}
+        if: ${{ !matrix.older_duckdb && !matrix.live }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -3082,6 +3114,55 @@ jobs:
             --results "$RUNNER_TEMP/spicescript-results.json" \
             --log-capture "$RUNNER_TEMP/spicescript-logs" \
             ${{ matrix.args }}
+
+      # Each minted token expires about 5 minutes later, so all are minted right before the
+      # one run, which runs the scripts side by side.
+      - name: Mint an OpenAI access token
+        if: ${{ matrix.live && env.HAS_OPENAI_WIF == 'true' }}
+        uses: ./.github/actions/openai-token
+        with:
+          identity-provider-id: ${{ secrets.OPENAI_IDENTITY_PROVIDER_ID }}
+          service-account-id: ${{ secrets.OPENAI_SERVICE_ACCOUNT_ID }}
+          audience: ${{ secrets.OPENAI_WIF_AUDIENCE }}
+
+      - name: Mint an Anthropic access token
+        if: ${{ matrix.live && env.HAS_ANTHROPIC_WIF == 'true' }}
+        uses: ./.github/actions/anthropic-token
+        with:
+          federation-rule-id: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
+          organization-id: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
+          service-account-id: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          workspace-id: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+
+      - name: Assume the Databricks Delta role
+        id: aws-databricks-delta
+        if: ${{ matrix.live }}
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ROLE_ARN }}
+          role-session-name: gha-databricks-delta-${{ github.run_id }}
+          aws-region: us-east-1
+          output-env-credentials: false
+          output-credentials: true
+
+      - name: Run live scripts
+        if: ${{ !cancelled() && matrix.live }}
+        env:
+          DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
+          DATABRICKS_OIDC_CLIENT_ID: ${{ vars.DATABRICKS_OIDC_CLIENT_ID }}
+          DATABRICKS_OIDC_AUDIENCE: ${{ vars.DATABRICKS_OIDC_AUDIENCE }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ steps.aws-databricks-delta.outputs.aws-access-key-id }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ steps.aws-databricks-delta.outputs.aws-secret-access-key }}
+          AWS_DATABRICKS_DELTA_SESSION_TOKEN: ${{ steps.aws-databricks-delta.outputs.aws-session-token }}
+        run: |
+          DATABRICKS_TOKEN="$(bash .github/scripts/databricks_oidc_token.sh)"
+          export DATABRICKS_TOKEN
+          "${{ steps.spicescript.outputs.path }}" --jobs 3 \
+            --spiced "$(command -v spiced)" \
+            --work-dir "$RUNNER_TEMP/spicescript" \
+            --results "$RUNNER_TEMP/spicescript-results.json" \
+            --log-capture "$RUNNER_TEMP/spicescript-logs" \
+            test/spicescript/live
 
       # The combinations whose source is DuckDB or DuckLake (matrix keys
       # backend, src and source), then the DuckDB and DuckLake scripts without

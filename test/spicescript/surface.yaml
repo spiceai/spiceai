@@ -13,7 +13,6 @@ variants:
   federated: {}
   arrow: arrow
   cayenne: cayenne-file
-  duckdb: duckdb-file
   sqlite: sqlite-file
 
 spicepod:
