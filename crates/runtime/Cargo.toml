@@ -233,13 +233,12 @@ tracing.workspace = true
 tracing-futures.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
-turso-shared = { workspace = true }
 twox-hash.workspace = true
 typetag = "0.2.22"
 url.workspace = true
 util = { path = "../util", features = ["datafusion", "http"] }
 utoipa = { workspace = true, features = ["axum_extras"], optional = true }
-utoipa-swagger-ui = { version = "9", features = [
+utoipa-swagger-ui = { version = "10", features = [
     "axum",
     "vendored",
 ], optional = true }
@@ -306,10 +305,8 @@ connector-oracle = { path = "../data-connectors/connector-oracle" }
 accelerator-postgres = { path = "../accelerators/accelerator-postgres" }
 runtime-checkpoint-postgres = { path = "../runtime-checkpoint-postgres" }
 accelerator-sqlite = { path = "../accelerators/accelerator-sqlite" }
-accelerator-turso = { path = "../accelerators/accelerator-turso" }
 accelerator-duckdb = { path = "../accelerators/accelerator-duckdb" }
 accelerator-cayenne = { path = "../accelerators/accelerator-cayenne" }
-turso.workspace = true
 connector-postgres = { path = "../data-connectors/connector-postgres" }
 connector-scylladb = { path = "../data-connectors/connector-scylladb" }
 tokio-postgres = { workspace = true }
@@ -364,14 +361,14 @@ elasticsearch = [
     "runtime-search/elasticsearch",
 ]
 duckdb = [
+    "dep:adbc_core",
+    "dep:adbc_driver_manager",
     "dep:duckdb",
     "dep:runtime-checkpoint-duckdb",
     "db_connection_pool/duckdb",
     "data_components/duckdb",
     "datafusion-optimizer-rules/duckdb",
     "runtime-acceleration/duckdb",
-    "search/duckdb",
-    "runtime-search/duckdb",
 ]
 # Test-only marker: the DynamoDB connector now lives in `connector-dynamodb` (a
 # dev-dependency, registered unconditionally by `do_register_test_connectors`).
@@ -458,14 +455,6 @@ sqlite = [
     "data_components/sqlite",
     "dep:rusqlite",
     "runtime-acceleration/sqlite",
-]
-turso = [
-    "dep:tokio-rusqlite",
-    "db_connection_pool/sqlite",
-    "data_components/sqlite",
-    "data_components/turso",
-    "dep:rusqlite",
-    "runtime-acceleration/turso",
 ]
 vortex = []
 

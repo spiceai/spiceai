@@ -104,6 +104,7 @@ env:
 
 jobs:
   verus-verify:
+    environment: secret-free
     # Crate-agnostic on purpose: this is the single required-check context
     # for every crate that opted into `[package.metadata.verus]`. Adding a
     # crate updates the verify loop and the path filter, not the job name.

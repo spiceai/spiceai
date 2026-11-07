@@ -48,6 +48,9 @@ pub struct ContainerSpec {
     /// A Docker network to join (created if missing), so containers of one
     /// source can reach each other by name.
     pub network: Option<String>,
+    /// Another name peers on `network` reach the container by. A container
+    /// name can outgrow the 63 characters a host name label may hold.
+    pub alias: Option<String>,
 }
 
 pub struct Container {
@@ -172,14 +175,19 @@ impl Container {
                 let mut config = config.clone();
                 // Under another name, keep the original as an alias on the
                 // container's network, so its peers still find it by it.
-                if name != spec.name
+                let aliases: Vec<String> = (name != spec.name)
+                    .then(|| spec.name.clone())
+                    .into_iter()
+                    .chain(spec.alias.clone())
+                    .collect();
+                if !aliases.is_empty()
                     && let Some(network) = spec.network.as_deref().filter(|n| *n != "host")
                 {
                     config.networking_config = Some(NetworkingConfig {
                         endpoints_config: HashMap::from([(
                             network.to_string(),
                             EndpointSettings {
-                                aliases: Some(vec![spec.name.clone()]),
+                                aliases: Some(aliases),
                                 ..Default::default()
                             },
                         )]),
@@ -1113,10 +1121,18 @@ mod pull_tests {
         pull_broke_off, pull_error_text, pull_image, pull_with_retries, registry_credentials,
     };
 
-    /// `docker login` to Docker Hub as `user` with password `s3cr3t`, as the
-    /// Docker CLI stores it.
-    const HUB_LOGIN: &str =
-        r#"{"auths":{"https://index.docker.io/v1/":{"auth":"dXNlcjpzM2NyM3Q="}}}"#;
+    /// Made-up Docker Hub login used only by these tests. It is sent only to
+    /// the fake Docker daemon below on `127.0.0.1`, never to a real registry.
+    const HUB_USER: &str = "user";
+    const HUB_PASSWORD: &str = "s3cr3t";
+
+    /// The test login in a Docker CLI `config.json`, as `docker login` stores
+    /// it: `auth` is the base64 encoding of `{username}:{password}`.
+    fn hub_login_config() -> String {
+        let auth =
+            base64::engine::general_purpose::STANDARD.encode(format!("{HUB_USER}:{HUB_PASSWORD}"));
+        format!(r#"{{"auths":{{"https://index.docker.io/v1/":{{"auth":"{auth}"}}}}}}"#)
+    }
 
     /// A Docker API that answers every request with `body` after the
     /// headers of a `200 OK`, then closes the connection, and keeps each
@@ -1160,8 +1176,8 @@ mod pull_tests {
 
     fn hub_login() -> DockerCredentials {
         DockerCredentials {
-            username: Some("user".into()),
-            password: Some("s3cr3t".into()),
+            username: Some(HUB_USER.into()),
+            password: Some(HUB_PASSWORD.into()),
             serveraddress: Some("https://index.docker.io/v1/".into()),
             ..Default::default()
         }
@@ -1175,7 +1191,7 @@ mod pull_tests {
             "clickhouse/clickhouse-server:24.8",
         ] {
             assert_eq!(
-                registry_credentials(HUB_LOGIN, image),
+                registry_credentials(&hub_login_config(), image),
                 Some(hub_login()),
                 "{image}"
             );
@@ -1186,11 +1202,11 @@ mod pull_tests {
         let ghcr = r#"{"auths":{"ghcr.io":{"username":"bot","password":"token"}}}"#;
         assert_eq!(registry_credentials(ghcr, "mongo:8.0"), None);
         assert_eq!(
-            registry_credentials(HUB_LOGIN, "ghcr.io/spiceai/image:1"),
+            registry_credentials(&hub_login_config(), "ghcr.io/spiceai/image:1"),
             None
         );
         assert_eq!(
-            registry_credentials(HUB_LOGIN, "localhost:5000/image"),
+            registry_credentials(&hub_login_config(), "localhost:5000/image"),
             None
         );
         assert_eq!(
@@ -1227,8 +1243,8 @@ mod pull_tests {
                 .expect("base64"),
         )
         .expect("JSON");
-        assert_eq!(login["username"], "user");
-        assert_eq!(login["password"], "s3cr3t");
+        assert_eq!(login["username"], HUB_USER);
+        assert_eq!(login["password"], HUB_PASSWORD);
         assert_eq!(login["serveraddress"], "https://index.docker.io/v1/");
         // Without a login the header is empty: Docker pulls anonymously.
         assert!(sent[1].is_empty(), "{sent:?}");

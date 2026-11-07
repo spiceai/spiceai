@@ -10,6 +10,10 @@ pub struct Protocol {
     k: usize,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent finite-state protocol facts and witness flags"
+)]
 struct Request {
     base: Head,
     etag: usize,
@@ -26,6 +30,9 @@ struct Request {
     /// Resolution found no retained evidence past the horizon: the commit
     /// outcome is reported unknown and the attempt is never retried.
     unknown: bool,
+    /// The identical resend was delivered and failed its condition; recorded
+    /// only by the control that reads the failure as rejection.
+    resend_failed: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[expect(
@@ -93,6 +100,7 @@ pub enum Action {
     Deliver(usize, usize, usize),
     Resolve(usize),
     Unreadable(usize),
+    FailedResend(usize),
     Response(usize),
     Ack(usize),
     Copy(usize),
@@ -343,6 +351,9 @@ impl Model for Protocol {
                         if r.success && !state.restored[r.id - 1] {
                             action.push(Response(w));
                         }
+                        if r.resend_failed {
+                            action.push(Action::FailedResend(w));
+                        }
                     }
                     if r.answer == 1 && state.ack & (1 << w) == 0 {
                         action.push(Ack(w));
@@ -459,6 +470,7 @@ impl Model for Protocol {
                     success: false,
                     unreadable: false,
                     unknown: false,
+                    resend_failed: false,
                 };
                 next.requests[w].push(r);
                 if self.has("no-observed") && (state.pos + 1).is_multiple_of(self.k) {
@@ -491,7 +503,15 @@ impl Model for Protocol {
                     next.floor = r.floor;
                     next.folded |= r.floor > 0;
                     next.requests[w][i].success = true;
+                } else if q == 1 && self.has("failed-resend-rejects") {
+                    next.requests[w][i].resend_failed = true;
                 }
+            }
+            Action::FailedResend(w) => {
+                // The control reads the resend's failed condition as rejection,
+                // although the original may already have landed or still be in flight.
+                let i = state.requests[w].len() - 1;
+                next.requests[w][i].answer = 2;
             }
             Action::Unreadable(w) => {
                 // A failed head read supplies neither acceptance nor rejection evidence.

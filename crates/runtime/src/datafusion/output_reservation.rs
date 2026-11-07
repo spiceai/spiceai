@@ -29,12 +29,13 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, AsArray, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
+    Array, AsArray, Int32Array, Int64Array, LargeStringArray, OffsetSizeTrait, StringArray,
+    StringViewArray,
 };
 use arrow::datatypes::{
-    ArrowPrimitiveType, DataType, Date32Type, FieldRef, Int32Type, Int64Type, IntervalMonthDayNano,
-    TimeUnit, TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType,
+    ArrowNativeType, ArrowPrimitiveType, DataType, Date32Type, FieldRef, Int32Type, Int64Type,
+    IntervalMonthDayNano, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
+    TimestampNanosecondType, TimestampSecondType,
 };
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::{ExprSchema, Result, ScalarValue};
@@ -381,20 +382,96 @@ fn clamp_negative_pad_lengths(args: &mut [ColumnarValue]) {
     }
 }
 
-/// `array_repeat(element, n)`: `n` copies of the element.
+/// `array_repeat(element, n)`: `n` copies of the element, plus the 8-byte take
+/// index the function builds for each value it copies. A list element is
+/// copied value by value, so it needs one index per value of the list.
 fn array_repeat_bytes(args: &[ColumnarValue], rows: usize) -> u128 {
     let [element, count] = args else { return 0 };
     let Some(count) = Ints::new(count) else {
         return 0;
     };
-    let strings = StrLens::new(element);
-    let width = value_width(&element.data_type());
-    sum_rows(rows, |row| {
-        let element_bytes = strings
-            .as_ref()
-            .map_or(width, |strings| strings.get(row).max(1));
-        count.count(row).saturating_mul(element_bytes)
-    })
+    let copy_bytes = |element: &dyn Array, row: usize| {
+        let indices = match element.data_type() {
+            DataType::List(_) => list_range(element.as_list::<i32>().value_offsets(), row).len(),
+            DataType::LargeList(_) => {
+                list_range(element.as_list::<i64>().value_offsets(), row).len()
+            }
+            _ => 1,
+        };
+        value_bytes(element, row).saturating_add((indices as u128).saturating_mul(8))
+    };
+    match element {
+        ColumnarValue::Array(element) => sum_rows(rows, |row| {
+            count
+                .count(row)
+                .saturating_mul(copy_bytes(element.as_ref(), row))
+        }),
+        ColumnarValue::Scalar(scalar) => {
+            let Ok(element) = scalar.to_array() else {
+                return 0;
+            };
+            let copy_bytes = copy_bytes(element.as_ref(), 0);
+            sum_rows(rows, |row| count.count(row).saturating_mul(copy_bytes))
+        }
+    }
+}
+
+/// A lower bound of the bytes the value at `row` takes in an array of its
+/// type: lists, maps and structs count their nested values.
+fn value_bytes(array: &dyn Array, row: usize) -> u128 {
+    if let Some(width) = array.data_type().primitive_width() {
+        return width as u128;
+    }
+    let nested = |values: &dyn Array, range: std::ops::Range<usize>| {
+        if let Some(width) = values.data_type().primitive_width() {
+            return (range.len() as u128).saturating_mul(width as u128);
+        }
+        range.fold(0, |total: u128, value| {
+            total.saturating_add(value_bytes(values, value))
+        })
+    };
+    match array.data_type() {
+        DataType::Utf8 => 4 + array.as_string::<i32>().value(row).len() as u128,
+        DataType::LargeUtf8 => 8 + array.as_string::<i64>().value(row).len() as u128,
+        DataType::Utf8View => 16 + array.as_string_view().value(row).len() as u128,
+        DataType::Binary => 4 + array.as_binary::<i32>().value(row).len() as u128,
+        DataType::LargeBinary => 8 + array.as_binary::<i64>().value(row).len() as u128,
+        DataType::BinaryView => 16 + array.as_binary_view().value(row).len() as u128,
+        DataType::FixedSizeBinary(width) => u128::try_from(*width).unwrap_or(0),
+        DataType::List(_) => {
+            let list = array.as_list::<i32>();
+            4 + nested(
+                list.values().as_ref(),
+                list_range(list.value_offsets(), row),
+            )
+        }
+        DataType::LargeList(_) => {
+            let list = array.as_list::<i64>();
+            8 + nested(
+                list.values().as_ref(),
+                list_range(list.value_offsets(), row),
+            )
+        }
+        DataType::Map(..) => {
+            let map = array.as_map();
+            4 + nested(map.entries(), list_range(map.value_offsets(), row))
+        }
+        DataType::FixedSizeList(..) => {
+            let list = array.as_fixed_size_list();
+            let start = list.value_offset(row).as_usize();
+            let len = list.value_length().as_usize();
+            nested(list.values().as_ref(), start..start + len)
+        }
+        DataType::Struct(_) => array.as_struct().columns().iter().fold(0, |total, column| {
+            total.saturating_add(value_bytes(column.as_ref(), row))
+        }),
+        DataType::Dictionary(key, _) => value_width(key),
+        _ => 0,
+    }
+}
+
+fn list_range<O: OffsetSizeTrait>(offsets: &[O], row: usize) -> std::ops::Range<usize> {
+    offsets[row].as_usize()..offsets[row + 1].as_usize()
 }
 
 /// `array_resize(array, n[, value])`: `n` elements per row.
@@ -595,14 +672,14 @@ mod tests {
     use std::sync::Arc;
 
     use crate::dataaccelerator::AcceleratorEngineRegistry;
-    use arrow::array::{AsArray, Int64Array};
-    use arrow::datatypes::{Int32Type, Int64Type};
+    use arrow::array::{ArrayRef, AsArray, Int64Array, ListArray, StringArray, StructArray};
+    use arrow::datatypes::{DataType, Field, Int32Type, Int64Type};
     use arrow::util::pretty::pretty_format_batches;
     use datafusion::common::ScalarValue;
     use datafusion::error::DataFusionError;
     use datafusion::logical_expr::ColumnarValue;
 
-    use super::{clamp_negative_pad_lengths, pad_bytes};
+    use super::{array_repeat_bytes, clamp_negative_pad_lengths, pad_bytes};
 
     use crate::datafusion::builder::DataFusionBuilder;
     use crate::status;
@@ -646,6 +723,19 @@ mod tests {
             (
                 "array_repeat",
                 format!("SELECT cardinality(array_repeat(v, 8388608 + v - v)) {one_row}"),
+            ),
+            (
+                "array_repeat",
+                format!(
+                    "SELECT cardinality(array_repeat(range(v - v, 1024), 4096 + v - v)) {one_row}"
+                ),
+            ),
+            (
+                "array_repeat",
+                format!(
+                    "SELECT cardinality(array_repeat(CAST(repeat('a', 1024 + v - v) AS BYTEA), \
+                     65536 + v - v)) {one_row}"
+                ),
             ),
             (
                 "array_resize",
@@ -776,6 +866,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn array_repeat_sizing_counts_element_values_and_take_indices() {
+        let count = ColumnarValue::Scalar(ScalarValue::Int64(Some(10)));
+        let list = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![
+            Some(1),
+            Some(2),
+            Some(3),
+        ])]);
+        let strukt = StructArray::from(vec![
+            (
+                Arc::new(Field::new("a", DataType::Int64, true)),
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("b", DataType::Utf8, true)),
+                Arc::new(StringArray::from(vec!["xy"])) as ArrayRef,
+            ),
+        ]);
+        let cases = [
+            (ScalarValue::Int64(Some(1)), 10 * (8 + 8)),
+            (ScalarValue::Utf8(Some("abc".to_string())), 10 * (4 + 3 + 8)),
+            (ScalarValue::Boolean(Some(true)), 10 * 8),
+            (ScalarValue::Null, 10 * 8),
+            (ScalarValue::Binary(Some(vec![0; 5])), 10 * (4 + 5 + 8)),
+            (ScalarValue::List(Arc::new(list)), 10 * (4 + 3 * 8 + 3 * 8)),
+            (ScalarValue::Struct(Arc::new(strukt)), 10 * (8 + 4 + 2 + 8)),
+        ];
+        let (expected, charged): (Vec<_>, Vec<_>) = cases
+            .into_iter()
+            .map(|(element, bytes)| {
+                let data_type = element.data_type();
+                let charged =
+                    array_repeat_bytes(&[ColumnarValue::Scalar(element), count.clone()], 1);
+                ((data_type.clone(), bytes), (data_type, charged))
+            })
+            .unzip();
+        assert_eq!(charged, expected);
+
+        let lists = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(1), Some(2)]),
+            None,
+            Some(vec![Some(3)]),
+        ]);
+        let counts = Int64Array::from(vec![Some(2), Some(5), Some(3)]);
+        assert_eq!(
+            array_repeat_bytes(
+                &[
+                    ColumnarValue::Array(Arc::new(lists)),
+                    ColumnarValue::Array(Arc::new(counts)),
+                ],
+                3
+            ),
+            2 * (4 + 2 * 8 + 2 * 8) + 5 * 4 + 3 * (4 + 8 + 8)
+        );
+    }
+
     #[tokio::test]
     async fn argument_sized_functions_within_the_limit_return_their_results() {
         let df = session();
@@ -783,7 +929,8 @@ mod tests {
             .ctx
             .sql(
                 "SELECT repeat('ab', 3 + v - v) AS r, lpad('x', 4 + v - v, 'yz') AS l, \
-                 rpad('x', 4 + v - v) AS p, array_repeat(v, 2) AS a, array_resize([v], 3, 0) AS z, \
+                 rpad('x', 4 + v - v) AS p, array_repeat(v, 2) AS a, array_repeat([v, v], 2) AS b, \
+                 array_resize([v], 3, 0) AS z, \
                  range(v - v, 3) AS g, generate_series(v, 3) AS s \
                  FROM (SELECT value AS v FROM generate_series(1, 2)) t ORDER BY v",
             )

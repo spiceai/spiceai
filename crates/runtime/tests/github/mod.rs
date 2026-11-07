@@ -213,61 +213,6 @@ async fn org_github_secret_available(test_name: &str) -> bool {
     github_secret_available("GITHUB_ORG_TOKEN", test_name).await
 }
 
-async fn github_app_secrets_available(test_name: &str) -> bool {
-    for secret in [
-        "GITHUB_CLIENT_ID",
-        "GITHUB_INSTALLATION_ID",
-        "GITHUB_PRIVATE_KEY",
-    ] {
-        if !github_secret_available(secret, test_name).await {
-            return false;
-        }
-    }
-    true
-}
-
-fn make_github_app_dataset(
-    kind: &GithubDatasetType,
-    query_mode: &str,
-    additional_params: Option<HashMap<String, String>>,
-) -> Dataset {
-    let mut dataset = match kind {
-        GithubDatasetType::RepoSpecific {
-            owner,
-            repo,
-            query_type,
-        } => Dataset::new(
-            format!("github:github.com/{owner}/{repo}/{query_type}"),
-            format!("{repo}_{query_type}_{query_mode}"),
-        ),
-        GithubDatasetType::OrgSpecific { org, query_type } => Dataset::new(
-            format!("github:github.com/{org}/{query_type}"),
-            format!("{org}_{query_type}_{query_mode}"),
-        ),
-    };
-
-    let mut params = HashMap::from([
-        ("github_query_mode".to_string(), query_mode.to_string()),
-        (
-            "github_client_id".to_string(),
-            github_secret_reference("GITHUB_CLIENT_ID"),
-        ),
-        (
-            "github_installation_id".to_string(),
-            github_secret_reference("GITHUB_INSTALLATION_ID"),
-        ),
-        (
-            "github_private_key".to_string(),
-            github_secret_reference("GITHUB_PRIVATE_KEY"),
-        ),
-    ]);
-
-    params.extend(additional_params.unwrap_or_default());
-
-    dataset.params = Some(DatasetParams::from_string_map(params));
-    dataset
-}
-
 fn collect_string_values(result_batches: &[RecordBatch], column_index: usize) -> Vec<String> {
     result_batches
         .iter()
@@ -2211,220 +2156,6 @@ async fn test_github_workflow_runs() -> Result<(), String> {
         .await
 }
 
-#[tokio::test]
-async fn test_github_app_commits_ref_filter() -> Result<(), String> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    if !github_app_secrets_available("test_github_app_commits_ref_filter").await {
-        return Ok(());
-    }
-    register_test_connectors().await;
-
-    test_request_context()
-        .scope(async {
-            let app = AppBuilder::new("github_app_integration_test")
-                .with_dataset(make_github_app_dataset(
-                    &GithubDatasetType::RepoSpecific {
-                        owner: "spiceai".to_string(),
-                        repo: "spiceai".to_string(),
-                        query_type: "commits".to_string(),
-                    },
-                    "auto",
-                    None,
-                ))
-                .build();
-
-            configure_test_datafusion();
-            let mut rt = Runtime::builder().with_app(app).build().await;
-
-            load_github_datasets(&rt).await?;
-
-            let github_app_commits_ref_filter_query = format!(
-                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref = 'trunk' LIMIT {GITHUB_COMMITS_PAGINATION_LIMIT}"
-            );
-
-            run_query_and_check_results(
-                &mut rt,
-                "test_github_app_commits_ref_filter",
-                &github_app_commits_ref_filter_query,
-                false,
-                Some(Box::new(|result_batches: Vec<RecordBatch>| {
-                    let row_count = result_batches
-                        .iter()
-                        .map(RecordBatch::num_rows)
-                        .sum::<usize>();
-                    for batch in &result_batches {
-                        assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
-                    }
-                    assert_crosses_commits_pagination_boundary(row_count);
-                    assert_all_string_values(&result_batches, 0, "trunk");
-
-                    let shas = collect_string_values(&result_batches, 1);
-                    assert_eq!(shas.len(), row_count, "shas: {shas:?}");
-                    assert!(
-                        shas.iter().all(|sha| !sha.is_empty()),
-                        "expected non-empty shas, got {shas:?}"
-                    );
-                })),
-            )
-            .await?;
-
-            let github_app_commits_slash_ref_filter_query = format!(
-                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref = 'release/1.11' LIMIT {GITHUB_COMMITS_PAGINATION_LIMIT}"
-            );
-
-            run_query_and_check_results(
-                &mut rt,
-                "test_github_app_commits_slash_ref_filter",
-                &github_app_commits_slash_ref_filter_query,
-                false,
-                Some(Box::new(|result_batches: Vec<RecordBatch>| {
-                    let row_count = result_batches
-                        .iter()
-                        .map(RecordBatch::num_rows)
-                        .sum::<usize>();
-                    for batch in &result_batches {
-                        assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
-                    }
-                    assert_positive_row_count_at_most_pagination_limit(row_count);
-                    assert_all_string_values(&result_batches, 0, "release/1.11");
-
-                    let shas = collect_string_values(&result_batches, 1);
-                    assert_eq!(shas.len(), row_count, "shas: {shas:?}");
-                    assert!(
-                        shas.iter().all(|sha| !sha.is_empty()),
-                        "expected non-empty shas, got {shas:?}"
-                    );
-                })),
-            )
-            .await?;
-
-            let github_app_commits_dynamic_ref_filter_query = format!(
-                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref != 'trunk' LIMIT {GITHUB_COMMITS_PAGINATION_LIMIT}"
-            );
-
-            run_query_and_check_results(
-                &mut rt,
-                "test_github_app_commits_dynamic_ref_filter",
-                &github_app_commits_dynamic_ref_filter_query,
-                false,
-                Some(Box::new(|result_batches: Vec<RecordBatch>| {
-                    let row_count = result_batches
-                        .iter()
-                        .map(RecordBatch::num_rows)
-                        .sum::<usize>();
-                    for batch in &result_batches {
-                        assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
-                    }
-                    assert_positive_row_count_at_most_pagination_limit(row_count);
-                    assert_no_string_values(&result_batches, 0, "trunk");
-
-                    let shas = collect_string_values(&result_batches, 1);
-                    assert_eq!(shas.len(), row_count, "shas: {shas:?}");
-                    assert!(
-                        shas.iter().all(|sha| !sha.is_empty()),
-                        "expected non-empty shas, got {shas:?}"
-                    );
-                })),
-            )
-            .await?;
-
-            Ok(())
-        })
-        .await
-}
-
-#[tokio::test]
-async fn test_github_app_files_ref_filter() -> Result<(), String> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    if !github_app_secrets_available("test_github_app_files_ref_filter").await {
-        return Ok(());
-    }
-    register_test_connectors().await;
-
-    test_request_context()
-        .scope(async {
-            let app = AppBuilder::new("github_app_integration_test")
-                .with_dataset(make_github_app_dataset(
-                    &GithubDatasetType::RepoSpecific {
-                        owner: "spiceai".to_string(),
-                        repo: "spiceai".to_string(),
-                        query_type: "files".to_string(),
-                    },
-                    "auto",
-                    None,
-                ))
-                .build();
-
-            configure_test_datafusion();
-            let mut rt = Runtime::builder().with_app(app).build().await;
-
-            load_github_datasets(&rt).await?;
-
-            run_query_and_check_results(
-                &mut rt,
-                "test_github_app_files_ref_filter",
-                "SELECT ref, path, download_url FROM spiceai_files_auto WHERE ref = 'trunk' AND path = 'README.md' LIMIT 1",
-                false,
-                Some(Box::new(|result_batches: Vec<RecordBatch>| {
-                    assert_github_file_ref_results(&result_batches, "trunk");
-                })),
-            )
-            .await?;
-
-            Ok(())
-        })
-        .await
-}
-
-#[tokio::test]
-async fn test_github_app_issues() -> Result<(), String> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-    if !github_app_secrets_available("test_github_app_issues").await {
-        return Ok(());
-    }
-    register_test_connectors().await;
-
-    test_request_context()
-        .scope(async {
-            let app = AppBuilder::new("github_app_integration_test")
-                .with_dataset(make_github_app_dataset(
-                    &GithubDatasetType::RepoSpecific {
-                        owner: "spiceai".to_string(),
-                        repo: "spiceai".to_string(),
-                        query_type: "issues".to_string(),
-                    },
-                    "auto",
-                    None,
-                ))
-                .build();
-
-            configure_test_datafusion();
-            let mut rt = Runtime::builder().with_app(app).build().await;
-
-            load_github_datasets(&rt).await?;
-
-            run_query_and_check_results(
-                &mut rt,
-                "test_github_app_issues",
-                "SELECT * FROM spiceai_issues_auto LIMIT 10",
-                false,
-                Some(Box::new(|result_batches: Vec<RecordBatch>| {
-                    let mut row_count = 0;
-                    for batch in result_batches {
-                        let batch: RecordBatch = batch;
-                        assert_eq!(batch.num_columns(), 23, "num_cols: {}", batch.num_columns());
-                        row_count += batch.num_rows();
-                    }
-                    assert!(row_count > 0, "expected at least 1 row, got {row_count}");
-                })),
-            )
-            .await?;
-
-            Ok(())
-        })
-        .await
-}
-
 fn spiceai_accelerated(resource: &str, extra: HashMap<String, String>) -> Dataset {
     let mut params = HashMap::from([("max_concurrent_requests".to_string(), "10".to_string())]);
     params.extend(extra);
@@ -2905,6 +2636,95 @@ async fn test_github_spiceai_commits() -> Result<(), String> {
             assert_column_is_constant(&commit_batches, "ref", &totals_after.default_branch);
             assert_unique_string_column(&commit_batches, "sha");
 
+            Ok(())
+        })
+        .await
+}
+
+/// A GitHub App whose private key Azure Key Vault holds reads the same organization members as
+/// a token minted for the same App installation. The connector signs the App JWT through Key
+/// Vault as the job's Microsoft Entra workload identity, so no private key is read anywhere.
+#[tokio::test]
+async fn test_github_app_key_vault_members_match_the_token() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let test_name = "test_github_app_key_vault_members_match_the_token";
+    for secret in [
+        "GITHUB_ORG_TOKEN",
+        "GITHUB_APP_KMS_CLIENT_ID",
+        "GITHUB_APP_KMS_INSTALLATION_ID",
+        "GITHUB_APP_KMS_KEY",
+        "AZURE_TENANT_ID",
+        "AZURE_CLIENT_ID",
+    ] {
+        if !github_secret_available(secret, test_name).await {
+            return Ok(());
+        }
+    }
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let members = |name: &str, params: &[(&str, &str)]| {
+                let mut dataset = Dataset::new("github:github.com/spiceai/members", name);
+                dataset.params = Some(DatasetParams::from_string_map(
+                    params
+                        .iter()
+                        .map(|(param, secret)| {
+                            ((*param).to_string(), github_secret_reference(secret))
+                        })
+                        .collect(),
+                ));
+                dataset
+            };
+            let app = AppBuilder::new("github_app_key_vault_integration_test")
+                .with_dataset(members(
+                    "members_token",
+                    &[("github_token", "GITHUB_ORG_TOKEN")],
+                ))
+                .with_dataset(members(
+                    "members_key_vault",
+                    &[
+                        ("github_client_id", "GITHUB_APP_KMS_CLIENT_ID"),
+                        ("github_installation_id", "GITHUB_APP_KMS_INSTALLATION_ID"),
+                        ("github_private_key_kms", "GITHUB_APP_KMS_KEY"),
+                    ],
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
+
+            load_github_datasets(&rt).await?;
+
+            let usernames: Arc<std::sync::Mutex<HashMap<&'static str, Vec<String>>>> =
+                Arc::default();
+            for dataset in ["members_token", "members_key_vault"] {
+                let usernames = Arc::clone(&usernames);
+                run_query_and_check_results(
+                    &mut rt,
+                    &format!("{test_name}_{dataset}"),
+                    &format!("SELECT username FROM {dataset} ORDER BY username"),
+                    false,
+                    Some(Box::new(move |result_batches: Vec<RecordBatch>| {
+                        usernames
+                            .lock()
+                            .expect("lock")
+                            .insert(dataset, collect_string_values(&result_batches, 0));
+                    })),
+                )
+                .await?;
+            }
+
+            let usernames = usernames.lock().expect("lock");
+            let token = &usernames["members_token"];
+            assert!(
+                !token.is_empty(),
+                "the token reads no members of spiceai, so the comparison would prove nothing"
+            );
+            assert_eq!(
+                &usernames["members_key_vault"], token,
+                "the App signing through Key Vault and the token of the same installation read different members"
+            );
             Ok(())
         })
         .await

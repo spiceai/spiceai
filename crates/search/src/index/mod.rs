@@ -27,8 +27,6 @@ use spice_table::Index;
 
 pub mod chunking;
 pub mod compound;
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
 #[cfg(feature = "llms")]
@@ -60,8 +58,6 @@ pub use vector_table::VectorScanTableProvider;
 
 #[cfg(feature = "text_search")]
 use crate::generation::text_search::index::FullTextDatabaseIndex;
-#[cfg(feature = "duckdb")]
-use crate::index::duckdb::DuckDBVectorIndex;
 #[cfg(feature = "elasticsearch")]
 use crate::index::elasticsearch::{ElasticsearchIndex, ElasticsearchTextIndex};
 #[cfg(feature = "s3_vectors")]
@@ -108,10 +104,6 @@ pub fn derived_columns_from_vector_index(
 ) -> Option<Vec<String>> {
     #[cfg(feature = "elasticsearch")]
     if let Some(vec) = index.as_any().downcast_ref::<ElasticsearchIndex>() {
-        return Some(vec.derived_columns());
-    }
-    #[cfg(feature = "duckdb")]
-    if let Some(vec) = index.as_any().downcast_ref::<DuckDBVectorIndex>() {
         return Some(vec.derived_columns());
     }
     #[cfg(feature = "s3_vectors")]
@@ -163,10 +155,6 @@ pub fn as_search_index(index: &Arc<dyn Index + Send + Sync>) -> Option<&dyn Sear
     if let Some(idx) = index.as_any().downcast_ref::<FullTextDatabaseIndex>() {
         return Some(idx as &dyn SearchIndex);
     }
-    #[cfg(feature = "duckdb")]
-    if let Some(idx) = index.as_any().downcast_ref::<DuckDBVectorIndex>() {
-        return Some(idx as &dyn SearchIndex);
-    }
     #[cfg(feature = "s3_vectors")]
     if let Some(idx) = index.as_any().downcast_ref::<S3Vector>() {
         return Some(idx as &dyn SearchIndex);
@@ -207,7 +195,7 @@ pub fn as_search_index(index: &Arc<dyn Index + Send + Sync>) -> Option<&dyn Sear
 /// through [`SearchIndex::query_table_provider`], which may build a transient index
 /// structure (e.g. HNSW) over the stored embeddings.
 ///
-/// Implementations: [`NativeVectorIndex`], [`crate::index::duckdb::DuckDBVectorIndex`]
+/// Implementations: [`NativeVectorIndex`]
 pub trait VectorIndex: SearchIndex {
     /// A [`LogicalPlan`] enumerating the contents of the index (primary keys + embedding
     /// vectors). Required only for the **external-store model** — implementations that

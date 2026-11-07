@@ -20,10 +20,266 @@ limitations under the License.
 //! This module provides a catalog provider that connects to a `DuckLake` catalog using `DuckDB`
 //! with the `ducklake` extension.
 
-use crate::duckdb::install_and_load_extension;
+use crate::adbc_helpers::{
+    AdbcInitError, DUCKDB_DRIVER, ManagedDuckDbError, check_duckdb_version, driver_entrypoint,
+    load_adbc_database, managed_duckdb_options,
+};
+use adbc_core::{Connection as _, Database as _, Statement as _};
+use adbc_driver_manager::{ManagedConnection, ManagedDatabase};
+use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
+use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
+    ADBCPool, AdbcConnectionPoolBuilder,
+};
+use std::sync::Arc;
+
+/// The installed `DuckDB` database shared by a `DuckLake` catalog's connections.
+pub struct DuckLakePool {
+    resources: Option<(Arc<ADBCPool<ManagedDatabase>>, ManagedDatabase)>,
+}
+
+/// Errors accessing a `DuckLake` database or its query results.
+#[derive(Debug, snafu::Snafu)]
+pub enum Error {
+    #[snafu(display("The DuckLake connector has already been closed"))]
+    Closed,
+    #[snafu(display("Failed to use the DuckLake connection: {message}"))]
+    Connection { message: String },
+    #[snafu(display("Failed to read DuckLake metadata: {message}"))]
+    Metadata { message: &'static str },
+    #[snafu(display("Stream terminated before all data was sent to {table}; rolling back"))]
+    StreamTerminated { table: String },
+}
+
+impl DuckLakePool {
+    /// Creates a pool sharing one database. Call on a blocking thread.
+    ///
+    /// # Errors
+    /// Returns a connection pool initialization error.
+    pub fn new(
+        database: ManagedDatabase,
+        joins: JoinPushDown,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
+        let pool = Arc::new(
+            AdbcConnectionPoolBuilder::new(database.clone())
+                .with_join_push_down(joins)
+                .build()?,
+        );
+        Ok(Arc::new(Self {
+            resources: Some((pool, database)),
+        }))
+    }
+
+    /// Returns the shared pool for read providers.
+    ///
+    /// # Errors
+    /// Returns an error if the connector is closed.
+    pub fn adbc_pool(&self) -> Result<Arc<ADBCPool<ManagedDatabase>>, Error> {
+        self.resources
+            .as_ref()
+            .map(|(pool, _)| Arc::clone(pool))
+            .ok_or(Error::Closed)
+    }
+
+    /// Opens a dedicated connection for a write transaction. Call on a blocking thread.
+    /// A failed rollback cannot return this connection to the reader pool.
+    ///
+    /// # Errors
+    /// Returns a connection initialization error.
+    pub fn connect(&self) -> Result<ManagedConnection, Box<dyn std::error::Error + Send + Sync>> {
+        let (_, database) = self.resources.as_ref().ok_or(Error::Closed)?;
+        Ok(database.new_connection()?)
+    }
+}
+
+impl Drop for DuckLakePool {
+    fn drop(&mut self) {
+        if let Some(resources) = self.resources.take() {
+            crate::adbc_helpers::offload_adbc_drop(resources);
+        }
+    }
+}
+
+/// Initializes one installed `DuckDB` database and attaches the lake once.
+/// Call on a blocking thread.
+///
+/// # Errors
+/// Returns driver, version, extension, credential, or attachment errors.
+pub fn create_ducklake_pool(
+    path: Option<&str>,
+    read_only: bool,
+    connection_string: &str,
+    catalog_name: &str,
+    automatic_migration: bool,
+    s3: &DuckLakeS3Params,
+) -> Result<Arc<DuckLakePool>, Box<dyn std::error::Error + Send + Sync>> {
+    let path = path.unwrap_or(":memory:");
+    let database = load_adbc_database(
+        DUCKDB_DRIVER,
+        driver_entrypoint(DUCKDB_DRIVER),
+        managed_duckdb_options(path, read_only && path != ":memory:"),
+    )
+    .map_err(|source| match source {
+        source @ AdbcInitError::LoadDriver { .. } => Box::new(ManagedDuckDbError::MissingLibrary {
+            connector: "ducklake",
+            source,
+        })
+            as Box<dyn std::error::Error + Send + Sync>,
+        source => Box::new(source),
+    })?;
+    check_duckdb_version(&database, "ducklake")?;
+    // All connections share attachments and secrets in this database. Pools
+    // that open the same file and attach the same lake under the same name
+    // resolve the same tables, so a join between them runs in either one. The
+    // context is a hash because the connection string can hold a password,
+    // and the context appears in query plans.
+    let pool = DuckLakePool::new(
+        database,
+        JoinPushDown::AllowedFor(join_context(path, connection_string, catalog_name)),
+    )?;
+    let mut connection = pool.connect()?;
+    install_ducklake_extensions(&mut connection)?;
+    if let Some(sql) = build_ducklake_s3_secret_sql(s3) {
+        execute_sql(&mut connection, &sql)?;
+    }
+    execute_sql(
+        &mut connection,
+        &build_ducklake_attach_sql(connection_string, catalog_name, automatic_migration),
+    )?;
+    Ok(pool)
+}
+
+/// The join context of a pool over `path` with `connection_string` attached
+/// as `catalog_name`: `ducklake:` and a hash of the three.
+fn join_context(path: &str, connection_string: &str, catalog_name: &str) -> String {
+    use std::hash::Hasher as _;
+    let mut hasher = twox_hash::XxHash64::with_seed(0);
+    for part in [path, connection_string, catalog_name] {
+        hasher.write(part.as_bytes());
+        // Separates the parts, so ("ab", "c") and ("a", "bc") differ.
+        hasher.write_u8(0);
+    }
+    format!("ducklake:{:016x}", hasher.finish())
+}
+
+/// Executes a statement through an ADBC connection on a blocking thread.
+///
+/// # Errors
+/// Returns the statement or execution error.
+pub fn execute_sql(
+    connection: &mut ManagedConnection,
+    sql: &str,
+) -> adbc_core::error::Result<Option<i64>> {
+    let mut statement = connection.new_statement()?;
+    statement.set_sql_query(sql)?;
+    statement.execute_update()
+}
 
 pub mod provider;
 pub mod writer;
+
+/// Reads a single string column through ADBC. Call on a blocking thread.
+///
+/// # Errors
+/// Returns connection, query, or Arrow conversion errors.
+pub fn query_strings(
+    pool: &Arc<DuckLakePool>,
+    sql: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    query_connection_strings(&mut pool.connect()?, sql)
+}
+
+fn query_connection_strings(
+    connection: &mut ManagedConnection,
+    sql: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    use arrow::array::{Array as _, LargeStringArray, StringArray};
+    let mut statement = connection.new_statement()?;
+    statement.set_sql_query(sql)?;
+    let mut names = Vec::new();
+    for batch in statement.execute()? {
+        let batch = batch?;
+        if batch.num_columns() != 1 {
+            return Err(Error::Metadata {
+                message: "DuckDB returned an invalid metadata result",
+            }
+            .into());
+        }
+        let column = batch.column(0);
+        for row in 0..batch.num_rows() {
+            if column.is_null(row) {
+                return Err(Error::Metadata {
+                    message: "DuckDB returned a NULL metadata name",
+                }
+                .into());
+            }
+            let name = if let Some(values) = column.as_any().downcast_ref::<StringArray>() {
+                values.value(row)
+            } else if let Some(values) = column.as_any().downcast_ref::<LargeStringArray>() {
+                values.value(row)
+            } else {
+                return Err(Error::Metadata {
+                    message: "DuckDB returned a non-string metadata name",
+                }
+                .into());
+            };
+            names.push(name.to_owned());
+        }
+    }
+    Ok(names)
+}
+
+/// Installs and loads the extensions used by `DuckLake`. Call on a blocking thread.
+/// Shares the on-disk install lock with bundled `DuckDB` installations.
+///
+/// # Errors
+/// Returns extension installation or loading errors.
+pub fn install_ducklake_extensions(
+    connection: &mut ManagedConnection,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let setting = |connection: &mut ManagedConnection, name: &str| {
+        query_connection_strings(connection, &format!("SELECT current_setting('{name}')"))
+            .ok()
+            .and_then(|values| values.into_iter().next())
+            .filter(|value| !value.is_empty())
+    };
+    let home = setting(connection, "home_directory")
+        .map(std::path::PathBuf::from)
+        .or_else(util::home_dir::home_dir);
+    let directory = match setting(connection, "extension_directory") {
+        Some(directory) => match directory.strip_prefix('~') {
+            Some(rest) => home.map(|home| {
+                let mut expanded = home.into_os_string();
+                expanded.push(rest);
+                std::path::PathBuf::from(expanded)
+            }),
+            None => Some(std::path::PathBuf::from(directory)),
+        },
+        None => home.map(|home| home.join(".duckdb").join("extensions")),
+    };
+    let _directory_lock = directory.and_then(|directory| {
+        let path = directory.join("spice-install.lock");
+        std::fs::create_dir_all(&directory)
+            .and_then(|()| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&path)
+            })
+            .or_else(|_| std::fs::File::open(&path))
+            .and_then(|file| file.lock().map(|()| file))
+            .ok()
+    });
+    for extension in ["ducklake", "httpfs"] {
+        execute_sql(connection, &format!("INSTALL {extension}"))?;
+        execute_sql(connection, &format!("LOAD {extension}"))?;
+    }
+    Ok(())
+}
 
 /// S3 credential parameters for `DuckLake` connectors.
 ///
@@ -41,26 +297,6 @@ pub struct DuckLakeS3Params {
     pub session_token: Option<String>,
     pub endpoint: Option<String>,
     pub allow_http: bool,
-}
-
-/// Installs and loads `httpfs` in `DuckDB`, then optionally creates an S3 secret
-/// from explicit parameters. If no explicit credentials are given, `DuckDB` uses
-/// its `credential_chain` provider which reads standard `AWS_*` environment variables.
-///
-/// # Errors
-///
-/// Returns a `duckdb::Error` if extension installation or secret creation fails.
-pub fn configure_duckdb_httpfs(
-    conn: &duckdb::Connection,
-    s3: &DuckLakeS3Params,
-) -> Result<(), duckdb::Error> {
-    install_and_load_extension(conn, "httpfs")?;
-
-    if let Some(secret_sql) = build_ducklake_s3_secret_sql(s3) {
-        conn.execute(&secret_sql, [])?;
-    }
-
-    Ok(())
 }
 
 /// Whether a configured session token will be dropped rather than sent to `DuckDB`.

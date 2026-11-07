@@ -303,7 +303,7 @@ fn apply_inferred_sort(
         Engine::DuckDB => "on_refresh_sort_columns",
         Engine::Arrow => "arrow_sort_columns",
         Engine::Cayenne => "cayenne_sort_columns",
-        // Sqlite / Turso / PostgreSQL accelerators have no sort param.
+        // Sqlite / PostgreSQL accelerators have no sort param.
         _ => return false,
     };
 

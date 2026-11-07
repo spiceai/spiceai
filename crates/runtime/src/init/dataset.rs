@@ -2587,13 +2587,6 @@ impl Runtime {
                 name: accelerator_engine.to_string(),
             })?;
 
-        // Warn if Turso engine is being used
-        if accelerator_engine == crate::component::dataset::acceleration::Engine::Turso {
-            tracing::warn!(
-                "Turso data accelerator (Alpha) is in preview and should not be used in production."
-            );
-        }
-
         // The accelerated refresh task will set the dataset status to `Ready` once it finishes loading.
         self.status
             .update_dataset(&ds.name, status::ComponentStatus::Refreshing);

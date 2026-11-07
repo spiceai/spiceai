@@ -24,6 +24,7 @@ concurrency:
 
 jobs:
   differential:
+    environment: ci
     name: Spice's Hugging Face cache against the hf CLI
     # The check builds and runs the change's code on persistent self-hosted runners in a public
     # repository, so a pull request from a fork or from Dependabot runs it only once a maintainer
@@ -42,7 +43,7 @@ jobs:
       # The dev runner image has no C toolchain, and rustc links through cc.
       - uses: ./.github/actions/setup-cc
       # The dev runner image has python3 but no pip.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
       - name: Install the hf CLI

@@ -56,7 +56,7 @@ use datafusion::{
     dataframe::DataFrame,
     datasource::TableProvider,
     error::DataFusionError,
-    logical_expr::{Expr, Operator, col},
+    logical_expr::{Expr, col},
     physical_plan::stream::RecordBatchStreamAdapter,
 };
 use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
@@ -215,10 +215,10 @@ pub(crate) fn indexes_from_federated(
 /// An external-store vector/search index (e.g. S3 Vectors, Elasticsearch) is only ever attached
 /// via `IndexLayer` on the *federated/read* side (`EmbeddingConnector::wrap_table` wraps
 /// the source connector, not the accelerator) — `collect_indexes_from_provider(accelerator)` alone
-/// finds nothing for these. The `DuckDB` vector engine is the opposite: it wraps the *accelerator*
-/// itself (`wrap_accelerator_with_duckdb_vector_indexes`), not the federated side. Both are checked
-/// here, deduplicating by pointer identity (mirroring `collect_indexes_from_provider`'s own dedup)
-/// in case an index is ever reachable through both paths.
+/// finds nothing for these, while an index layered over the *accelerator* itself is found only
+/// there. Both are checked here, deduplicating by pointer identity (mirroring
+/// `collect_indexes_from_provider`'s own dedup) in case an index is ever reachable through both
+/// paths.
 pub(crate) fn collect_all_indexes(
     accelerator: &Arc<dyn datafusion::catalog::TableProvider>,
     federated: &FederatedTable,
@@ -691,8 +691,8 @@ enum StoredRowsFrom {
     /// Nothing: a full load overwrites the stored rows, and an append into an empty
     /// acceleration has none.
     None,
-    /// The stored rows after the high-water mark the source filter used, matching its
-    /// strict `>`.
+    /// The stored rows from the high-water mark the source filter used, compared the
+    /// way that filter compares (`convert_high_water_mark`).
     AfterMark(u128),
     /// The stored rows at or after the lowest time the incoming rows can hold.
     AtOrAfter(u128),
@@ -880,6 +880,17 @@ impl RefreshTask {
         &self,
         refresh: &Refresh,
     ) -> Result<RefreshOutcome, RetryError<super::Error>> {
+        // `changes` streams are applied by their own worker and `disabled` never
+        // refreshes. Overrides are checked before a refresh is queued, so reaching here
+        // in either mode is a bug in a caller: fail the refresh, without retries, rather
+        // than panic the worker.
+        if matches!(refresh.mode, RefreshMode::Disabled | RefreshMode::Changes) {
+            return Err(RetryError::permanent(super::Error::RefreshModeCannotRun {
+                dataset_name: self.dataset_name.to_string(),
+                mode: super::refresh::refresh_mode_name(refresh.mode),
+            }));
+        }
+
         // Snapshot polling owns its status and metrics and reads no source, including
         // the timestamp queries used to measure a source-consuming refresh's lag.
         if refresh.mode == RefreshMode::Snapshot {
@@ -980,10 +991,10 @@ impl RefreshTask {
             #[expect(clippy::match_same_arms)] // Caching will have different behavior in future
             match refresh.mode {
                 RefreshMode::Disabled => {
-                    unreachable!("Refresh cannot be called when acceleration is disabled")
+                    unreachable!("run_once rejects disabled mode")
                 }
                 RefreshMode::Full | RefreshMode::Append => &metrics::REFRESH_DURATION_MS,
-                RefreshMode::Changes => unreachable!("changes are handled upstream"),
+                RefreshMode::Changes => unreachable!("run_once rejects changes mode"),
                 RefreshMode::Caching => &metrics::REFRESH_DURATION_MS,
                 RefreshMode::Snapshot => &metrics::REFRESH_DURATION_MS,
             },
@@ -1001,7 +1012,7 @@ impl RefreshTask {
         let mut append_cursor_to_save: Option<String> = None;
         let get_data_update_result = match refresh.mode {
             RefreshMode::Disabled => {
-                unreachable!("Refresh cannot be called when acceleration is disabled")
+                unreachable!("run_once rejects disabled mode")
             }
             // A full refresh of a dataset whose append refresh follows its source's
             // commits reads the source pinned to its current commit and saves it, so the
@@ -1037,7 +1048,7 @@ impl RefreshTask {
                 }
                 Err(e) => Err(e),
             },
-            RefreshMode::Changes => unreachable!("changes are handled upstream"),
+            RefreshMode::Changes => unreachable!("run_once rejects changes mode"),
             RefreshMode::Caching => {
                 // For caching mode, identify and refresh stale rows based on _fetched_at and TTL
                 return self
@@ -1530,9 +1541,11 @@ impl RefreshTask {
                 // already-loaded rows it brings back (#12492).
                 filters.push(converter.convert_high_water_mark(timestamp));
             } else if let Some(period) = refresh.period {
-                filters.push(
-                    converter.convert(get_timestamp(SystemTime::now() - period), Operator::Gt),
-                );
+                filters.push(window_filter(
+                    converter,
+                    get_timestamp(SystemTime::now() - period),
+                    &refresh,
+                ));
             }
         }
 
@@ -2535,11 +2548,11 @@ impl RefreshTask {
     fn update_type_for(mode: RefreshMode) -> UpdateType {
         match mode {
             RefreshMode::Disabled => {
-                unreachable!("Refresh cannot be called when acceleration is disabled")
+                unreachable!("run_once rejects disabled mode")
             }
             RefreshMode::Full => UpdateType::Overwrite,
             RefreshMode::Append => UpdateType::Append,
-            RefreshMode::Changes => unreachable!("changes are handled upstream"),
+            RefreshMode::Changes => unreachable!("run_once rejects changes mode"),
             RefreshMode::Caching => UpdateType::Overwrite,
             RefreshMode::Snapshot => {
                 unreachable!("snapshot mode is handled by refresh_from_snapshot")
@@ -2563,7 +2576,20 @@ impl RefreshTask {
         let effective_sql = match refresh.override_sql_raw.as_ref().map(|s| {
             refresh_sql::parse_refresh_sql(dataset_name.clone(), s, federated_provider.schema())
         }) {
-            Some(Ok((mut parsed, _schema))) => {
+            Some(Ok((mut parsed, schema))) => {
+                // As at dataset setup: rows read without the time column would be
+                // written with a NULL time, which an append reads again next time.
+                if let Err(e) =
+                    refresh.validate_time_format_inner(&dataset_name.to_string(), &schema, false)
+                {
+                    return Err(RetryError::permanent(
+                        super::Error::FailedToRefreshDataset {
+                            source: DataFusionError::Plan(format!(
+                                "Invalid override refresh_sql: {e}"
+                            )),
+                        },
+                    ));
+                }
                 if let Some(base) = &refresh.sql {
                     parsed.set_partition_filters(base.partition_filters().map(<[_]>::to_vec));
                 }
@@ -3570,6 +3596,54 @@ pub async fn read_first_refresh_batch(
         batch?;
     }
     Ok(())
+}
+
+/// The `refresh_data_window` load filter: rows newer than `start_in_nanos`.
+///
+/// A day-granular partition column is bounded by `start`'s day (see
+/// [`TimestampFilterConvert::convert_window_start`]). When the window stands in for
+/// `retention_period`, rows with a NULL `time_column` are kept as well, matching
+/// retention, which never deletes them.
+fn window_filter(
+    converter: &TimestampFilterConvert,
+    start_in_nanos: u128,
+    refresh: &Refresh,
+) -> Expr {
+    let window = converter.convert_window_start(start_in_nanos);
+    match (&refresh.time_column, refresh.period_keeps_null_time) {
+        (Some(time_column), true) => window.or(ident(time_column).is_null()),
+        _ => window,
+    }
+}
+
+#[cfg(test)]
+mod window_filter_tests {
+    use super::{Refresh, RefreshMode, window_filter};
+    use util::timestamp_filter::{TimestampFilterConvert, TimestampFormat};
+
+    fn converter() -> TimestampFilterConvert {
+        TimestampFilterConvert::new("ts".to_string(), TimestampFormat::Timestamp, None, None)
+    }
+
+    #[test]
+    fn a_retention_driven_window_keeps_null_time_rows() {
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("ts".to_string())
+            .period_keeps_null_time(true);
+        assert_eq!(
+            window_filter(&converter(), 1_620_000_000_000_000_000, &refresh).to_string(),
+            "CAST(ts AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None) OR ts IS NULL",
+        );
+    }
+
+    #[test]
+    fn an_explicit_refresh_data_window_still_drops_null_time_rows() {
+        let refresh = Refresh::new(RefreshMode::Full).time_column("ts".to_string());
+        assert_eq!(
+            window_filter(&converter(), 1_620_000_000_000_000_000, &refresh).to_string(),
+            "CAST(ts AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
+        );
+    }
 }
 
 /// Returns true when `candidate` is structurally compatible with `expected`

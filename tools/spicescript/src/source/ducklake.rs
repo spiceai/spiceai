@@ -20,12 +20,17 @@ limitations under the License.
 //!
 //! Each instance gets its own lake: a Postgres database for the catalog and a
 //! directory for the data files, with tables in its `main` schema. Statements
-//! and oracle queries run through the `duckdb` CLI of the release Spice
-//! embeds (fetched once; `SPICESCRIPT_DUCKLAKE_DUCKDB` names another): a
-//! newer release writes a lake format Spice cannot attach.
+//! and oracle queries run through the `duckdb` CLI of one release, whose
+//! library `spiced` loads to read the lake, since a release cannot attach a
+//! lake a newer one wrote: the source's `version`, else `--duckdb-version`,
+//! else the newest release `test/duckdb_versions.json` lists (fetched once;
+//! `SPICESCRIPT_DUCKLAKE_DUCKDB` names another CLI). The catalog runs the
+//! default PostgreSQL image.
 //!
 //! `${sources.<name>.params}` holds `ducklake_connection_string`, so a dataset
-//! reads `ducklake:main.<table>`. Stopping the source stops the catalog.
+//! reads `ducklake:main.<table>`. `.library_dir` is the library's directory,
+//! which the runner puts on `spiced`'s library search path, as for `duckdb`
+//! sources. Stopping the source stops the catalog.
 
 use std::path::PathBuf;
 
@@ -42,6 +47,7 @@ pub struct DuckLake {
     /// loaded.
     dir: PathBuf,
     duckdb: String,
+    library: String,
 }
 
 impl DuckLake {
@@ -52,14 +58,13 @@ impl DuckLake {
         dir: PathBuf,
     ) -> Result<Self> {
         std::fs::create_dir_all(&dir)?;
-        let catalog = Postgres::start(name, run_id, version).await?;
-        let duckdb =
-            super::duckdb_cli::embedded(&std::env::current_dir()?, "SPICESCRIPT_DUCKLAKE_DUCKDB")
-                .await?;
+        let catalog = Postgres::start(name, run_id, None).await?;
+        let version = duckdb_cli::version(version)?;
         Ok(Self {
             catalog,
             dir: std::fs::canonicalize(&dir)?,
-            duckdb,
+            duckdb: duckdb_cli::cli(&version, "SPICESCRIPT_DUCKLAKE_DUCKDB").await?,
+            library: duckdb_cli::library(&version).await?,
         })
     }
 
@@ -115,9 +120,16 @@ impl Source for DuckLake {
         self.duckdb(namespace, "SELECT 1", "", true)
             .await
             .with_context(|| format!("Failed to create the DuckLake lake for '{namespace}'"))?;
-        Ok(Namespace::params(
+        let mut result = Namespace::params(
             json!({ "ducklake_connection_string": self.connection_string(namespace)? }),
-        ))
+        );
+        let library_dir = std::path::Path::new(&self.library)
+            .parent()
+            .with_context(|| format!("DuckDB library has no parent directory: {}", self.library))?;
+        result
+            .extra
+            .insert("library_dir".into(), json!(library_dir));
+        Ok(result)
     }
 
     async fn exec(&self, namespace: &str, sql: &str) -> Result<()> {

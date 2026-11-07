@@ -56,8 +56,6 @@ use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestCo
 use search::index::SearchIndex;
 use search::index::chunking::ChunkedSearchIndex;
 use search::index::compound::CompoundVectorIndex;
-#[cfg(feature = "duckdb")]
-use search::index::duckdb::DuckDBVectorIndex;
 use search::index::native_vector::NativeVectorIndex;
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
@@ -76,7 +74,7 @@ use crate::types::VectorSearchResult;
 pub struct SearchEngine<E: TableProviderExplorer> {
     pub df: Arc<dyn QueryEngine>,
 
-    explicit_primary_keys: HashMap<TableReference, Vec<String>>,
+    explicit_primary_keys: ExplicitPrimaryKeys,
 
     search_cache: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
 
@@ -86,7 +84,7 @@ pub struct SearchEngine<E: TableProviderExplorer> {
 impl<E: TableProviderExplorer> SearchEngine<E> {
     pub fn new(
         df: Arc<dyn QueryEngine>,
-        explicit_primary_keys: HashMap<TableReference, Vec<String>>,
+        explicit_primary_keys: ExplicitPrimaryKeys,
         explorer: E,
     ) -> Self {
         SearchEngine {
@@ -172,17 +170,6 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
             if let Some((indexes, _)) = self
                 .explorer
                 .find_index::<ElasticsearchIndex>(&table_provider)
-            {
-                embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
-            }
-        }
-
-        #[cfg(feature = "duckdb")]
-        {
-            use search::index::duckdb::DuckDBVectorIndex;
-            if let Some((indexes, _)) = self
-                .explorer
-                .find_index::<DuckDBVectorIndex>(&table_provider)
             {
                 embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
             }
@@ -291,15 +278,6 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
         #[cfg(feature = "s3_vectors")]
         if let Some((indexes, _)) = self.explorer.find_index::<S3Vector>(tbl)
-            && let Some(index) = indexes
-                .into_iter()
-                .find(|idx| idx.search_column() == embedding_column)
-        {
-            return Some(Arc::new(index.clone()) as Arc<dyn SearchIndex>);
-        }
-
-        #[cfg(feature = "duckdb")]
-        if let Some((indexes, _)) = self.explorer.find_index::<DuckDBVectorIndex>(tbl)
             && let Some(index) = indexes
                 .into_iter()
                 .find(|idx| idx.search_column() == embedding_column)
@@ -490,9 +468,11 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                 } else {
                     None
                 };
+            // A client key partitions the search key; it never replaces it.
+            let search_cache_key = CacheKey::Search(&search_key);
             let cache_key = match scoped_user_cache_key.as_deref() {
-                Some(cache_key) => CacheKey::ClientSupplied(cache_key),
-                _ => CacheKey::Search(&search_key),
+                Some(cache_key) => CacheKey::ClientSupplied(cache_key, &search_cache_key),
+                _ => search_cache_key,
             };
 
             let raw_cache_key = {
@@ -510,7 +490,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                 })
                 .await;
             match (cache_control, cached) {
-                (CacheControl::NoCache, _) => {
+                (CacheControl::NoCache | CacheControl::Revalidate(_), _) => {
                     tracing::trace!("Search cache bypass");
                     let read_started_at = Instant::now();
                     let results = self.search(req).await?;
@@ -610,7 +590,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
         let search_result = async {
             tracing::info!(target: "task_history", tables = tables.iter().join(","), limit = %limit, "labels");
-            let table_primary_keys = get_primary_keys_with_overrides(&self.df, &tables, &self.explicit_primary_keys)
+            let table_primary_keys = get_primary_keys_with_overrides(&self.df, &tables, &self.explicit_primary_keys.snapshot())
                 .await?;
 
             // Stringify the WHERE filter once; per-table work only rebinds it to each schema.
@@ -942,6 +922,49 @@ async fn get_primary_keys_with_overrides(
         }
     }
     Ok(tbl_to_pks)
+}
+
+/// The primary keys that the installed app declares for its datasets and views (`row_id`).
+/// Clones share one set, which [`Self::update`] replaces when the app changes.
+#[derive(Clone, Debug, Default)]
+pub struct ExplicitPrimaryKeys(Arc<std::sync::RwLock<HashMap<TableReference, Vec<String>>>>);
+
+impl ExplicitPrimaryKeys {
+    /// Replaces the keys with those of the app in `app`.
+    pub async fn update(&self, app: Arc<tokio::sync::RwLock<Option<Arc<app::App>>>>) {
+        let keys = parse_explicit_primary_keys(app).await;
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = keys;
+    }
+
+    #[must_use]
+    pub fn get(&self, table: &TableReference) -> Option<Vec<String>> {
+        self.read().get(table).cloned()
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> HashMap<TableReference, Vec<String>> {
+        self.read().clone()
+    }
+
+    #[must_use]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<TableReference, Vec<String>>> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl From<HashMap<TableReference, Vec<String>>> for ExplicitPrimaryKeys {
+    fn from(keys: HashMap<TableReference, Vec<String>>) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(keys)))
+    }
 }
 
 /// Compute the primary keys for each table in the app.

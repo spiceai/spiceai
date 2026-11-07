@@ -18,6 +18,13 @@ inputs:
   minio_secret_key:
     description: 'MinIO secret key. See minio_access_key.'
     required: false
+  minio_session_token:
+    description: >-
+      Session token of temporary MinIO credentials. With it, the credentials go only to the
+      cache server, which the pre-flight below starts and which serves the rest of the job.
+      They are not exported to later steps, where the token would join any other AWS keys a
+      step sets.
+    required: false
 
 runs:
   using: 'composite'
@@ -30,6 +37,7 @@ runs:
       env:
         MINIO_ACCESS_KEY: ${{ inputs.minio_access_key }}
         MINIO_SECRET_KEY: ${{ inputs.minio_secret_key }}
+        MINIO_SESSION_TOKEN: ${{ inputs.minio_session_token }}
         SPICEIO_ENDPOINT: ${{ inputs.spiceio_endpoint }}
       run: |
         echo "SCCACHE_DIRECT=true" >> $GITHUB_ENV
@@ -91,6 +99,8 @@ runs:
         # both of those still need them.
         if [[ "${RUNNER_OS}" == "macOS" && -n "${SPICEIO_ENDPOINT}" ]]; then
           echo "Compiler cache signs no requests on this path; leaving credentials out of the job environment."
+        elif [[ -n "${MINIO_ACCESS_KEY}" && -n "${MINIO_SECRET_KEY}" && -n "${MINIO_SESSION_TOKEN}" ]]; then
+          echo "Temporary credentials go to the cache server only; leaving them out of the job environment."
         elif [[ -n "${MINIO_ACCESS_KEY}" && -n "${MINIO_SECRET_KEY}" ]]; then
           echo "AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}" >> $GITHUB_ENV
           echo "AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_KEY}" >> $GITHUB_ENV
@@ -189,8 +199,17 @@ runs:
       if: (runner.os == 'Linux' && inputs.minio_endpoint != '') || (runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != ''))
       shell: bash
       # Invoked through `bash` rather than as `./…` so the step does not depend on
-      # the script's executable bit surviving a checkout on every platform.
-      run: bash "$GITHUB_ACTION_PATH/verify_compiler_cache.sh"
+      # the script's executable bit surviving a checkout on every platform. The probe
+      # starts the cache server, so temporary credentials reach the server here.
+      env:
+        MINIO_ACCESS_KEY: ${{ inputs.minio_access_key }}
+        MINIO_SECRET_KEY: ${{ inputs.minio_secret_key }}
+        MINIO_SESSION_TOKEN: ${{ inputs.minio_session_token }}
+      run: |
+        if [[ -n "${MINIO_SESSION_TOKEN}" ]]; then
+          export AWS_ACCESS_KEY_ID="${MINIO_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MINIO_SECRET_KEY}" AWS_SESSION_TOKEN="${MINIO_SESSION_TOKEN}"
+        fi
+        bash "$GITHUB_ACTION_PATH/verify_compiler_cache.sh"
 
     - name: Confirm the compiler cache answers before wrapping rustc (Windows)
       if: runner.os == 'Windows' && inputs.minio_endpoint != ''
