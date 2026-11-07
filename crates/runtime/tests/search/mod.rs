@@ -406,6 +406,7 @@ async fn test_megascience_permutations(
     // Give the (non-fallback) S3 Vectors engine a unique per-permutation index name so parallel
     // runs don't clobber each other. The fallback engine deliberately keeps the ARN-identified,
     // long-lived index it set in `to_vector_store`, so a prior run's vectors remain to fall back to.
+    // S3 Vectors index names allow lowercase letters, digits, hyphens and dots, not underscores.
     if matches!(vector_engine, VectorEngineOptions::S3Vectors)
         && let Some(params) = vector_store.params.as_mut()
     {
@@ -413,7 +414,7 @@ async fn test_megascience_permutations(
             "s3_vectors_index".to_string(),
             ParamValue::String(format!(
                 "{}-{}-{}-{}",
-                acceleration_opt,
+                acceleration_opt.to_string().replace('_', "-"),
                 table_option.to_string().replace('_', "-"),
                 column_config.to_string().replace('_', "-"),
                 rand::random::<u8>() % 11
