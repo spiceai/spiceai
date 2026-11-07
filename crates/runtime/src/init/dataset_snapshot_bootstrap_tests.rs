@@ -12,17 +12,13 @@ limitations under the License.
 */
 
 use super::*;
-use accelerator_sqlite as _;
+use accelerator_cayenne as _;
 use arrow::array::Int64Array;
-use runtime_acceleration::snapshot::{
-    AccelerationEngine, AccelerationLayout, ForceCreate, SnapshotBehavior, SnapshotManager,
-};
 use spicepod::component::{
     dataset::Dataset as PodDataset,
     snapshot::{BootstrapOnFailureBehavior, Snapshots},
 };
 use spicepod::param::Params;
-use tokio::sync::Mutex;
 
 struct Fixture {
     directory: tempfile::TempDir,
@@ -33,6 +29,9 @@ impl Fixture {
     fn new(behavior: BootstrapOnFailureBehavior) -> Self {
         let directory = tempfile::tempdir().expect("test directory");
         std::fs::write(directory.path().join("rows.csv"), "id\n1\n2\n3\n").expect("source CSV");
+        // The writer publishes one row the reader's three-row source does not have, so
+        // a reader that serves it is serving the snapshot.
+        std::fs::write(directory.path().join("writer.csv"), "id\n42\n").expect("writer CSV");
         std::fs::create_dir(directory.path().join("snapshots")).expect("snapshot directory");
         let snapshots = Snapshots {
             enabled: true,
@@ -58,16 +57,16 @@ impl Fixture {
         if reader {
             dataset.acceleration = Some(spicepod::acceleration::Acceleration {
                 enabled: true,
-                engine: Some("sqlite".to_string()),
+                engine: Some("cayenne".to_string()),
                 mode: spicepod::acceleration::Mode::File,
                 refresh_mode: Some(spicepod::acceleration::RefreshMode::Snapshot),
                 refresh_check_interval: Some("100ms".to_string()),
                 snapshots: spicepod::acceleration::SnapshotBehavior::BootstrapOnly,
                 params: Some(Params::from_string_map(HashMap::from([(
-                    "sqlite_file".to_string(),
+                    "cayenne_file_path".to_string(),
                     self.directory
                         .path()
-                        .join("reader.db")
+                        .join("reader")
                         .to_string_lossy()
                         .into_owned(),
                 )]))),
@@ -90,46 +89,46 @@ impl Fixture {
         builder.build()
     }
 
-    async fn publish(&self, runtime: &Runtime) {
-        let path = self.directory.path().join("writer.db");
-        let writer_path = path.clone();
-        tokio::task::spawn_blocking(move || {
-            let connection = rusqlite::Connection::open(writer_path).expect("writer database");
-            connection
-                .execute_batch("CREATE TABLE orders AS SELECT CAST(42 AS INTEGER) AS id")
-                .expect("writer rows");
-        })
-        .await
-        .expect("writer task");
-        let manager = SnapshotManager::try_new(
-            "orders".to_string(),
-            SnapshotBehavior::Enabled(
-                Arc::new(self.snapshots.clone()),
-                Arc::downgrade(&runtime.secrets()),
-                tokio::runtime::Handle::current(),
-                spicepod::acceleration::SnapshotsCompaction::Disabled,
-            ),
-            AccelerationLayout::File { path },
-            AccelerationEngine::Sqlite,
+    /// Publishes a snapshot of the one-row `writer.csv` as `orders`, from a writer
+    /// runtime that accelerates it into Cayenne, and waits until the snapshot
+    /// location records it as the current snapshot.
+    async fn publish(&self) {
+        let writer_app = app::AppBuilder::new("snapshot_bootstrap_writer")
+            .with_snapshots(self.snapshots.clone())
+            .with_dataset(cayenne_dataset(
+                self.directory.path(),
+                "writer.csv",
+                "writer",
+                spicepod::acceleration::Acceleration {
+                    snapshots: spicepod::acceleration::SnapshotBehavior::CreateOnly,
+                    ..Default::default()
+                },
+            ))
+            .build();
+        let writer = Arc::new(Runtime::builder().with_app(writer_app).build().await);
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            Arc::clone(&writer).load_components(),
         )
         .await
-        .expect("snapshot manager");
-        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "id",
-            arrow_schema::DataType::Int64,
-            true,
-        )]));
-        manager
-            .create_snapshot(
-                &schema,
-                Arc::new(Mutex::new(())).lock_owned().await,
-                None,
-                Some(1),
-                ForceCreate(true),
-            )
-            .await
-            .expect("publish snapshot")
-            .expect("snapshot created");
+        .expect("the writer must finish loading");
+        let metadata = self.directory.path().join("snapshots/metadata.json");
+        assert!(
+            test_framework::utils::wait_until_true(Duration::from_secs(15), || async {
+                let Ok(contents) = tokio::fs::read_to_string(&metadata).await else {
+                    return false;
+                };
+                serde_json::from_str::<serde_json::Value>(&contents)
+                    .ok()
+                    .and_then(|metadata| metadata.get("orders")?.get("current-snapshot-id")?.as_u64())
+                    .is_some()
+            })
+            .await,
+            "the writer must publish a current snapshot of orders to {} (files: {:?})",
+            metadata.display(),
+            walk(&self.directory.path().join("snapshots")),
+        );
+        writer.shutdown().await;
     }
 }
 
@@ -171,7 +170,7 @@ async fn snapshot_bootstrap_does_not_block_startup_and_default_warn_recovers() {
     assert!(!runtime.initial_load_in_flight());
     wait_for_count(&runtime, "unrelated", 3).await;
     assert!(
-        !fixture.directory.path().join("reader.db").exists(),
+        !fixture.directory.path().join("reader").exists(),
         "the engine must not open the reader file before the snapshot is restored"
     );
     assert_eq!(
@@ -181,7 +180,7 @@ async fn snapshot_bootstrap_does_not_block_startup_and_default_warn_recovers() {
             .get(&TableReference::bare("orders")),
         Some(&status::ComponentStatus::Initializing)
     );
-    fixture.publish(&runtime).await;
+    fixture.publish().await;
     wait_for_count(&runtime, "orders", 1).await;
     let batches = runtime
         .datafusion()
@@ -203,17 +202,6 @@ async fn snapshot_bootstrap_does_not_block_startup_and_default_warn_recovers() {
         "the reader must serve the published snapshot, not its three-row source"
     );
     runtime.shutdown().await;
-    drop(runtime);
-    let path = fixture.directory.path().join("reader.db");
-    tokio::task::spawn_blocking(move || {
-        let connection = rusqlite::Connection::open(path).expect("restored database reopens");
-        let id: i64 = connection
-            .query_row("SELECT id FROM orders", [], |row| row.get(0))
-            .expect("restored database has no stale WAL");
-        assert_eq!(id, 42);
-    })
-    .await
-    .expect("reopen task");
 }
 
 #[tokio::test]
@@ -248,7 +236,7 @@ async fn snapshot_bootstrap_does_not_block_consecutive_applies() {
             .any(|dataset| dataset.name == "orders"),
         "the waiting reader must be visible in the applied app"
     );
-    fixture.publish(&runtime).await;
+    fixture.publish().await;
     wait_for_count(&runtime, "orders", 1).await;
     runtime.status.mark_shutdown();
 }
@@ -284,7 +272,7 @@ async fn snapshot_bootstrap_is_cancelled_on_shutdown() {
         .await,
         "shutdown cancels the pending bootstrap"
     );
-    assert!(!fixture.directory.path().join("reader.db").exists());
+    assert!(!fixture.directory.path().join("reader").exists());
 }
 
 #[tokio::test]
@@ -300,10 +288,10 @@ async fn snapshot_bootstrap_on_registration_serves_source_until_publication() {
     Arc::clone(&runtime).load_datasets().await;
     wait_for_count(&runtime, "orders", 3).await;
     assert!(
-        !fixture.directory.path().join("reader.db").exists(),
+        !fixture.directory.path().join("reader").exists(),
         "source fallback must not create an acceleration file"
     );
-    fixture.publish(&runtime).await;
+    fixture.publish().await;
     wait_for_count(&runtime, "orders", 1).await;
     runtime.shutdown().await;
 }
@@ -317,7 +305,7 @@ async fn snapshot_bootstrap_keeps_serving_during_path_change() {
             .build()
             .await,
     );
-    fixture.publish(&runtime).await;
+    fixture.publish().await;
     Arc::clone(&runtime).load_datasets().await;
     wait_for_count(&runtime, "orders", 1).await;
     let snapshots = fixture.directory.path().join("snapshots");
@@ -334,11 +322,11 @@ async fn snapshot_bootstrap_keeps_serving_during_path_change() {
         .as_mut()
         .expect("acceleration")
         .params = Some(Params::from_string_map(HashMap::from([(
-        "sqlite_file".to_string(),
+        "cayenne_file_path".to_string(),
         fixture
             .directory
             .path()
-            .join("replacement.db")
+            .join("replacement")
             .to_string_lossy()
             .into_owned(),
     )])));
@@ -350,7 +338,7 @@ async fn snapshot_bootstrap_keeps_serving_during_path_change() {
     .expect("path change must not wait for snapshot storage");
     wait_for_count(&runtime, "orders", 1).await;
     assert!(!bootstrap_is_finished(&runtime, "orders").await);
-    assert!(!fixture.directory.path().join("replacement.db").exists());
+    assert!(!fixture.directory.path().join("replacement").exists());
     tokio::fs::rename(&offline, &snapshots)
         .await
         .expect("snapshot store recovers");
@@ -361,7 +349,7 @@ async fn snapshot_bootstrap_keeps_serving_during_path_change() {
         .await,
         "replacement bootstrap must finish after storage recovers"
     );
-    assert!(fixture.directory.path().join("replacement.db").exists());
+    assert!(fixture.directory.path().join("replacement").exists());
     wait_for_count(&runtime, "orders", 1).await;
     runtime.shutdown().await;
 }
@@ -376,7 +364,7 @@ fn app_with_reader_path(fixture: &Fixture, file: &str) -> App {
         .as_mut()
         .expect("acceleration")
         .params = Some(Params::from_string_map(HashMap::from([(
-        "sqlite_file".to_string(),
+        "cayenne_file_path".to_string(),
         fixture
             .directory
             .path()
@@ -399,7 +387,7 @@ async fn snapshot_bootstrap_keeps_serving_during_consecutive_path_changes() {
             .build()
             .await,
     );
-    fixture.publish(&runtime).await;
+    fixture.publish().await;
     Arc::clone(&runtime).load_datasets().await;
     wait_for_count(&runtime, "orders", 1).await;
     let snapshots = fixture.directory.path().join("snapshots");
@@ -408,7 +396,7 @@ async fn snapshot_bootstrap_keeps_serving_during_consecutive_path_changes() {
         .await
         .expect("snapshot store unavailable");
 
-    for file in ["replacement.db", "replacement2.db"] {
+    for file in ["replacement", "replacement2"] {
         tokio::time::timeout(
             Duration::from_secs(5),
             Arc::clone(&runtime).apply_app(Arc::new(app_with_reader_path(&fixture, file))),
@@ -417,14 +405,14 @@ async fn snapshot_bootstrap_keeps_serving_during_consecutive_path_changes() {
         .expect("path change must not wait for snapshot storage");
         wait_for_count(&runtime, "orders", 1).await;
     }
-    assert!(!fixture.directory.path().join("replacement2.db").exists());
+    assert!(!fixture.directory.path().join("replacement2").exists());
 
     tokio::fs::rename(&offline, &snapshots)
         .await
         .expect("snapshot store recovers");
     assert!(
         test_framework::utils::wait_until_true(Duration::from_secs(15), || async {
-            fixture.directory.path().join("replacement2.db").exists()
+            fixture.directory.path().join("replacement2").exists()
         })
         .await,
         "the latest replacement must restore after storage recovers"
@@ -448,10 +436,10 @@ async fn snapshot_bootstrap_removed_reader_does_not_register_after_publication()
         .apply_app(Arc::new(fixture.app(false, true)))
         .await;
     assert!(bootstrap_is_finished(&runtime, "orders").await);
-    fixture.publish(&runtime).await;
+    fixture.publish().await;
     wait_for_count(&runtime, "unrelated2", 3).await;
     assert!(!runtime.df.table_exists(&TableReference::bare("orders")));
-    assert!(!fixture.directory.path().join("reader.db").exists());
+    assert!(!fixture.directory.path().join("reader").exists());
     runtime.shutdown().await;
 }
 
@@ -476,11 +464,11 @@ fn walk(root: &std::path::Path) -> Vec<String> {
     files
 }
 
-/// A file-mode `SQLite` dataset over `csv`, accelerated into `sqlite_file`.
-fn sqlite_dataset(
+/// A file-mode Cayenne dataset over `csv`, accelerated into the directory `cayenne_dir`.
+fn cayenne_dataset(
     directory: &std::path::Path,
     csv: &str,
-    sqlite_file: &str,
+    cayenne_dir: &str,
     acceleration: spicepod::acceleration::Acceleration,
 ) -> PodDataset {
     let mut dataset = PodDataset::new(format!("file:{}", directory.join(csv).display()), "orders");
@@ -490,11 +478,11 @@ fn sqlite_dataset(
     )])));
     dataset.acceleration = Some(spicepod::acceleration::Acceleration {
         enabled: true,
-        engine: Some("sqlite".to_string()),
+        engine: Some("cayenne".to_string()),
         mode: spicepod::acceleration::Mode::File,
         params: Some(Params::from_string_map(HashMap::from([(
-            "sqlite_file".to_string(),
-            directory.join(sqlite_file).to_string_lossy().into_owned(),
+            "cayenne_file_path".to_string(),
+            directory.join(cayenne_dir).to_string_lossy().into_owned(),
         )]))),
         ..acceleration
     });
@@ -514,10 +502,10 @@ async fn shutdown_releases_the_snapshot_writer_lease() {
             }),
             ..Default::default()
         })
-        .with_dataset(sqlite_dataset(
+        .with_dataset(cayenne_dataset(
             directory.path(),
             "rows.csv",
-            "writer.db",
+            "writer",
             spicepod::acceleration::Acceleration {
                 snapshots: spicepod::acceleration::SnapshotBehavior::CreateOnly,
                 ..Default::default()
@@ -577,10 +565,10 @@ async fn runtime_state_location_holds_snapshots_without_a_snapshots_section() {
 
     let writer_app = app::AppBuilder::new("snapshot_writer")
         .with_runtime(runtime_config.clone())
-        .with_dataset(sqlite_dataset(
+        .with_dataset(cayenne_dataset(
             directory.path(),
             "rows.csv",
-            "writer.db",
+            "writer",
             spicepod::acceleration::Acceleration {
                 snapshots: spicepod::acceleration::SnapshotBehavior::Enabled,
                 ..Default::default()
@@ -642,10 +630,10 @@ async fn runtime_state_location_holds_snapshots_without_a_snapshots_section() {
 
     let reader_app = app::AppBuilder::new("snapshot_reader")
         .with_runtime(runtime_config)
-        .with_dataset(sqlite_dataset(
+        .with_dataset(cayenne_dataset(
             directory.path(),
             "reader_rows.csv",
-            "reader.db",
+            "reader",
             spicepod::acceleration::Acceleration {
                 refresh_mode: Some(spicepod::acceleration::RefreshMode::Snapshot),
                 refresh_check_interval: Some("100ms".to_string()),

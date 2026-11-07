@@ -4166,34 +4166,32 @@ mod tests {
 
         #[test]
         fn other_engines_are_told_on_conflict_is_removed_in_3_0() {
-            for engine in ["arrow", "sqlite"] {
-                let mut acceleration = acceleration(engine, Some("upsert"));
-                for (mode, refresh_mode) in [
-                    (Mode::File, None),
-                    (Mode::File, Some(RefreshMode::Changes)),
-                    (Mode::FileUpdate, None),
-                    (Mode::FileUpdate, Some(RefreshMode::Changes)),
-                    (Mode::Memory, None),
-                    (Mode::Memory, Some(RefreshMode::Full)),
-                    (Mode::Memory, Some(RefreshMode::Append)),
-                ] {
-                    acceleration.mode = mode;
-                    acceleration.refresh_mode = refresh_mode;
-                    assert_eq!(
-                        deprecated_on_conflict_warning(
-                            "orders",
-                            &acceleration,
-                            refresh_mode.unwrap_or(RefreshMode::Full),
-                        ),
-                        "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it."
-                    );
-                }
+            let mut acceleration = acceleration("arrow", Some("upsert"));
+            for (mode, refresh_mode) in [
+                (Mode::File, None),
+                (Mode::File, Some(RefreshMode::Changes)),
+                (Mode::FileUpdate, None),
+                (Mode::FileUpdate, Some(RefreshMode::Changes)),
+                (Mode::Memory, None),
+                (Mode::Memory, Some(RefreshMode::Full)),
+                (Mode::Memory, Some(RefreshMode::Append)),
+            ] {
+                acceleration.mode = mode;
+                acceleration.refresh_mode = refresh_mode;
+                assert_eq!(
+                    deprecated_on_conflict_warning(
+                        "orders",
+                        &acceleration,
+                        refresh_mode.unwrap_or(RefreshMode::Full),
+                    ),
+                    "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it."
+                );
             }
         }
 
         #[test]
         fn changes_recommend_persistent_cayenne() {
-            let mut acceleration = acceleration("sqlite", Some("upsert"));
+            let mut acceleration = acceleration("arrow", Some("upsert"));
             assert_eq!(acceleration.mode, Mode::Memory);
             for (mode, refresh_mode) in [
                 (Mode::Memory, None),
@@ -4463,7 +4461,7 @@ mod tests {
         for (acceleration, named) in [
             (
                 spicepod::acceleration::Acceleration {
-                    engine: Some("sqlite".to_string()),
+                    engine: Some("arrow".to_string()),
                     ..durable_write_back_acceleration()
                 },
                 "acceleration.engine: cayenne",
@@ -7098,6 +7096,6 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
 }
 
 #[cfg(test)]
-#[cfg(all(feature = "snapshots", feature = "sqlite"))]
+#[cfg(feature = "snapshots")]
 #[path = "dataset_snapshot_bootstrap_tests.rs"]
 mod snapshot_bootstrap_tests;

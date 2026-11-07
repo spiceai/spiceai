@@ -482,9 +482,9 @@ mod tests {
         let unknown = acceleration(Some("not_an_engine"));
         // A removed engine fails the component's load with its own error instead.
         let removed = acceleration(Some("duckdb"));
-        let disabled_sqlite = spicepod::acceleration::Acceleration {
+        let disabled_arrow = spicepod::acceleration::Acceleration {
             enabled: false,
-            ..acceleration(Some("sqlite"))
+            ..acceleration(Some("arrow"))
         };
         assert_eq!(
             deprecated_acceleration_engines_warning([
@@ -492,7 +492,7 @@ mod tests {
                 (AcceleratedComponent::Dataset, "b", &vortex),
                 (AcceleratedComponent::View, "c", &default),
                 (AcceleratedComponent::Dataset, "d", &unknown),
-                (AcceleratedComponent::Dataset, "e", &disabled_sqlite),
+                (AcceleratedComponent::Dataset, "e", &disabled_arrow),
                 (AcceleratedComponent::Dataset, "f", &removed),
             ]),
             None
@@ -501,13 +501,13 @@ mod tests {
 
     #[test]
     fn a_control_character_in_the_name_cannot_break_the_deprecated_engine_line_in_two() {
-        let sqlite = acceleration(Some("sqlite"));
+        let arrow = acceleration(Some("arrow"));
         let warning = deprecated_acceleration_engines_warning([(
             AcceleratedComponent::Dataset,
             "api\nWARN forged",
-            &sqlite,
+            &arrow,
         )])
-        .expect("sqlite is deprecated");
+        .expect("arrow is deprecated");
         assert!(
             !warning.contains('\n'),
             "the message must stay one line: {warning}"

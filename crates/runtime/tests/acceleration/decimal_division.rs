@@ -14,13 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Decimal `/` on a `DuckDB` acceleration must match local `DataFusion`
-//! evaluation, not the `DOUBLE` that `DuckDB` answers for `//`.
-//!
-//! A `DECIMAL(38, 10)` whose magnitude is past `2^53` is the witness: the
-//! integer digits of `amt/3` change when the divide is pushed down as `//`
-//! and the double is cast back to a decimal. Integer `/` must still be
-//! integer division (`n/2` of 7 is 3) and still federate as `//`.
+//! Decimal `/` on a `SQLite` acceleration stays out of the pushed-down SQL and
+//! matches local `DataFusion` evaluation, and integer `/` stays integer
+//! division (`n/2` of 7 is 3).
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -121,12 +117,6 @@ const DECIMAL_SQL: &str =
     "SELECT id, amt/3 AS a3, price/7 AS p7 FROM {table} WHERE id IN (1, 5, 8) ORDER BY id";
 const INTEGER_SQL: &str = "SELECT n/2 AS half FROM {table} WHERE id = 1";
 
-/// Digits `DuckDB` returns when `amt/3` for id=5 is evaluated as a `DOUBLE`
-/// and cast back to a decimal. The exact answer's integer digits are
-/// `33333333333333333333`.
-const DOUBLE_GARBAGE_ID5: &str = "33333333333333333440";
-const EXACT_ID5: &str = "33333333333333333333";
-const EXACT_ID8: &str = "4115226300411522630";
 const TRUNCATING_PRICE: &str = "0.014285";
 const ROUNDED_PRICE: &str = "0.014286";
 

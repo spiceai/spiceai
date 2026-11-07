@@ -20,8 +20,8 @@ limitations under the License.
 //! A writer runtime publishes snapshots of accelerated datasets to one bucket. The
 //! test copies the snapshot prefix to a second bucket with identical keys, the way S3
 //! replication does (#14425), and a reader runtime whose datasets name only that
-//! location and `file_format: snapshot` serves each dataset in the engine that created
-//! its snapshots, then follows the newer snapshots the writer publishes. The object
+//! location and `file_format: snapshot` serves each dataset from its Cayenne
+//! snapshots, then follows the newer snapshots the writer publishes. The object
 //! store is a local rustfs container, as in `s3_location_pruning`.
 //!
 //! A snapshot dataset keeps its local copy under the working directory's
@@ -265,31 +265,25 @@ fn writer_snapshots(rustfs: Rustfs, prefix: &str) -> Snapshots {
 
 /// An accelerated dataset over a local CSV file that publishes a snapshot after every
 /// refresh.
-fn writer_dataset(name: &str, csv: &Path, engine: &str, dir: &Path) -> Dataset {
+fn writer_dataset(name: &str, csv: &Path, dir: &Path) -> Dataset {
     let mut dataset = Dataset::new(format!("file://{}", csv.display()), name);
     dataset.params = Some(Params::from_string_map(HashMap::from([
         ("file_format".to_string(), "csv".to_string()),
         ("csv_has_header".to_string(), "true".to_string()),
     ])));
-    let engine_params = match engine {
-        "sqlite" => HashMap::from([(
-            "sqlite_file".to_string(),
-            dir.join(format!("{name}.sqlite")).display().to_string(),
-        )]),
-        _ => HashMap::from([
-            (
-                "cayenne_file_path".to_string(),
-                dir.join(format!("{name}_data")).display().to_string(),
-            ),
-            (
-                "cayenne_metadata_dir".to_string(),
-                dir.join(format!("{name}_metadata")).display().to_string(),
-            ),
-        ]),
-    };
+    let engine_params = HashMap::from([
+        (
+            "cayenne_file_path".to_string(),
+            dir.join(format!("{name}_data")).display().to_string(),
+        ),
+        (
+            "cayenne_metadata_dir".to_string(),
+            dir.join(format!("{name}_metadata")).display().to_string(),
+        ),
+    ]);
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some(engine.to_string()),
+        engine: Some("cayenne".to_string()),
         mode: Mode::File,
         params: Some(Params::from_string_map(engine_params)),
         refresh_mode: Some(RefreshMode::Full),
@@ -315,9 +309,8 @@ fn reader_dataset(rustfs: Rustfs, name: &str, prefix: &str) -> Dataset {
     dataset
 }
 
-/// The entries of the working directory's `.spice/data` that belong to `dataset`: the
-/// `<dataset>-<location hash>.<engine>` file of a single-file engine, and Cayenne's
-/// `<dataset>` data directory.
+/// The entries of the working directory's `.spice/data` that belong to `dataset`,
+/// such as Cayenne's `<dataset>` data directory.
 fn local_copies(dataset: &str) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(Path::new(".spice").join("data")) else {
         return Vec::new();
@@ -378,10 +371,10 @@ async fn load(rt: &Arc<Runtime>) -> Result<()> {
 }
 
 /// A reader configured with nothing but the location and `file_format: snapshot`
-/// serves a Cayenne and a `SQLite` snapshot, each in the engine that created it, from
+/// serves the writer's Cayenne snapshots, each in its own local copy, from
 /// a copy of the writer's snapshots in another bucket, and follows newer snapshots.
 #[tokio::test]
-async fn reads_replicated_snapshots_in_the_engine_that_created_them() -> Result<()> {
+async fn reads_and_follows_replicated_snapshots() -> Result<()> {
     let _tracing = init_tracing(Some("integration=debug,runtime=info,info"));
     let modules = unique("modules");
     let orders = unique("orders");
@@ -405,8 +398,8 @@ async fn replicated_snapshots_scenario(rustfs: Rustfs, modules: &str, orders: &s
 
     let writer_app = AppBuilder::new("snapshot_source_writer")
         .with_snapshots(writer_snapshots(rustfs, &prefix))
-        .with_dataset(writer_dataset(modules, &modules_csv, "cayenne", dir.path()))
-        .with_dataset(writer_dataset(orders, &orders_csv, "sqlite", dir.path()))
+        .with_dataset(writer_dataset(modules, &modules_csv, dir.path()))
+        .with_dataset(writer_dataset(orders, &orders_csv, dir.path()))
         .build();
     let reader_app = AppBuilder::new("snapshot_source_reader")
         .with_dataset(reader_dataset(rustfs, modules, &prefix))
@@ -431,22 +424,17 @@ async fn replicated_snapshots_scenario(rustfs: Rustfs, modules: &str, orders: &s
             "'{table}' serves the writer's rows"
         );
     }
-    // Each snapshot is restored into the engine that created it: Cayenne data in the
-    // dataset's data directory, SQLite in a file named for the dataset and location.
-    let modules_copies = local_copies(modules);
-    assert!(
-        modules_copies
-            .iter()
-            .any(|path| path.is_dir() && path.ends_with(modules)),
-        "{modules_copies:?}"
-    );
-    let orders_copies = local_copies(orders);
-    assert!(
-        orders_copies.iter().any(|path| path
-            .extension()
-            .is_some_and(|extension| extension == "sqlite")),
-        "{orders_copies:?}"
-    );
+    // Each snapshot is restored into its own Cayenne data directory, named for the
+    // dataset.
+    for table in [modules, orders] {
+        let copies = local_copies(table);
+        assert!(
+            copies
+                .iter()
+                .any(|path| path.is_dir() && path.ends_with(table)),
+            "{copies:?}"
+        );
+    }
 
     let insert = run_query(
         &reader,
@@ -559,7 +547,7 @@ async fn first_snapshot_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
             .with_app(
                 AppBuilder::new("snapshot_source_late_writer")
                     .with_snapshots(writer_snapshots(rustfs, &prefix))
-                    .with_dataset(writer_dataset(modules, &modules_csv, "cayenne", dir.path()))
+                    .with_dataset(writer_dataset(modules, &modules_csv, dir.path()))
                     .build(),
             )
             .build()
@@ -590,7 +578,6 @@ async fn publish_and_replicate(
     prefix: &str,
     modules: &str,
     dir: &Path,
-    engine: &str,
 ) -> Result<Arc<Runtime>> {
     let modules_csv = dir.join("modules.csv");
     std::fs::write(&modules_csv, INITIAL_CSV)?;
@@ -599,7 +586,7 @@ async fn publish_and_replicate(
             .with_app(
                 AppBuilder::new("snapshot_source_writer")
                     .with_snapshots(writer_snapshots(rustfs, prefix))
-                    .with_dataset(writer_dataset(modules, &modules_csv, engine, dir))
+                    .with_dataset(writer_dataset(modules, &modules_csv, dir))
                     .build(),
             )
             .build()
@@ -649,7 +636,7 @@ async fn loads_a_snapshot_dataset_that_a_reload_adds() -> Result<()> {
 async fn reload_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     let prefix = unique("snapshots");
     let dir = TempDir::new()?;
-    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path(), "cayenne").await?;
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path()).await?;
 
     let reader = Arc::new(
         Runtime::builder()
@@ -697,7 +684,7 @@ async fn a_moved_dataset_never_serves_the_previous_locations_rows() -> Result<()
 async fn moved_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     let prefix = unique("snapshots");
     let dir = TempDir::new()?;
-    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path(), "sqlite").await?;
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path()).await?;
     writer.shutdown().await;
 
     // The first location, restored and served.
@@ -783,7 +770,7 @@ async fn projected_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     let dir = TempDir::new()?;
     let modules_csv = dir.path().join("modules.csv");
     std::fs::write(&modules_csv, INITIAL_CSV)?;
-    let mut projected = writer_dataset(modules, &modules_csv, "sqlite", dir.path());
+    let mut projected = writer_dataset(modules, &modules_csv, dir.path());
     if let Some(acceleration) = projected.acceleration.as_mut() {
         acceleration.refresh_sql = Some(format!("SELECT id FROM {modules}"));
     }
@@ -911,7 +898,7 @@ async fn replaced_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
         ));
     }
 
-    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path(), "cayenne").await?;
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path()).await?;
     for status in other_statuses_than_ready(&reader, &table, Duration::from_secs(5)).await {
         failures.push(format!(
             "after the snapshot was published, '{modules}' reported {status}"
@@ -1044,7 +1031,7 @@ async fn restore_held_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     let mut reader_load = tokio::spawn(Arc::clone(&reader).load_components());
     wait_for_error(&reader, &table, "has no snapshot to load yet").await?;
 
-    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path(), "cayenne").await?;
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path()).await?;
     tokio::time::timeout(Duration::from_secs(60), hold.wait_until_restore_started())
         .await
         .context("the reader did not start restoring the published snapshot")?;
@@ -1154,7 +1141,7 @@ async fn custom_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
             .with_app(
                 AppBuilder::new("snapshot_source_custom_paths_writer")
                     .with_snapshots(writer_snapshots(rustfs, &prefix))
-                    .with_dataset(writer_dataset(modules, &modules_csv, "cayenne", dir.path()))
+                    .with_dataset(writer_dataset(modules, &modules_csv, dir.path()))
                     .build(),
             )
             .build()
@@ -1307,7 +1294,7 @@ async fn reclaim_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     let modules_csv = dir.path().join("modules.csv");
     std::fs::write(&modules_csv, csv_with_rows(3))?;
     // Files, not inlined rows: an inlined snapshot has no directory to reclaim.
-    let mut writer_modules = writer_dataset(modules, &modules_csv, "cayenne", dir.path());
+    let mut writer_modules = writer_dataset(modules, &modules_csv, dir.path());
     if let Some(acceleration) = writer_modules.acceleration.as_mut() {
         let mut params = acceleration
             .params
@@ -1411,86 +1398,6 @@ async fn reclaim_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
 
     reader.shutdown().await;
     writer.shutdown().await;
-    Ok(())
-}
-
-const OTHER_ENGINE_PATHS: &str = "spice_test_rustfs_snapshot_source_other_engine_paths";
-
-/// A snapshot dataset that sets a Cayenne path but reads another engine's snapshots is
-/// refused, by name, rather than silently keeping its copy under `.spice/data`.
-#[tokio::test]
-async fn refuses_cayenne_paths_for_another_engines_snapshots() -> Result<()> {
-    let _tracing = init_tracing(Some("integration=debug,runtime=info,info"));
-    let modules = unique("modules");
-    test_request_context()
-        .scope(async {
-            let (rustfs, container) = start_rustfs(OTHER_ENGINE_PATHS).await?;
-            let result = other_engine_paths_scenario(rustfs, &modules).await;
-            remove_local_copies(&[&modules]);
-            container.remove_after(result).await
-        })
-        .await
-}
-
-async fn other_engine_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
-    let prefix = unique("snapshots");
-    let dir = TempDir::new()?;
-    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path(), "sqlite").await?;
-    writer.shutdown().await;
-
-    let mut dataset = reader_dataset(rustfs, modules, &prefix);
-    if let Some(acceleration) = dataset.acceleration.as_mut() {
-        acceleration.params = Some(Params::from_string_map(HashMap::from([(
-            "cayenne_file_path".to_string(),
-            dir.path().join("reader").display().to_string(),
-        )])));
-    }
-    let reader = Arc::new(
-        Runtime::builder()
-            .with_app(
-                AppBuilder::new("snapshot_source_other_engine_paths_reader")
-                    .with_dataset(dataset)
-                    .build(),
-            )
-            .build()
-            .await,
-    );
-    let load = tokio::spawn(Arc::clone(&reader).load_components());
-
-    let table = datafusion::common::TableReference::bare(modules);
-    let expected = format!(
-        "Dataset '{modules}' reads snapshots from 's3://{READER_BUCKET}/{prefix}/' that were created with the 'sqlite' engine, so `acceleration.params.cayenne_file_path`, which sets where a Cayenne copy is kept, does not apply"
-    );
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut status = None;
-    while Instant::now() < deadline {
-        status = reader.status().get_dataset_status(&table);
-        if status
-            .as_ref()
-            .and_then(ComponentStatus::error_message)
-            .is_some_and(|message| message.contains(&expected))
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let message = status
-        .as_ref()
-        .and_then(ComponentStatus::error_message)
-        .unwrap_or_default()
-        .to_string();
-    assert!(
-        message.contains(&expected),
-        "the dataset is refused, naming the param, got {status:?}"
-    );
-    assert_eq!(
-        local_copies(modules),
-        Vec::<PathBuf>::new(),
-        "nothing is restored under `.spice/data`"
-    );
-
-    load.abort();
-    reader.shutdown().await;
     Ok(())
 }
 
@@ -1614,7 +1521,7 @@ async fn metrics_scenario(
     let prefix = unique("snapshots");
     let dir = TempDir::new()?;
     let table = datafusion::common::TableReference::bare(modules);
-    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path(), "cayenne").await?;
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path()).await?;
 
     // So an unreachable store fails a poll within the test.
     let mut dataset = reader_dataset(rustfs, modules, &prefix);
