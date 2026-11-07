@@ -38,6 +38,7 @@ concurrency:
 
 jobs:
   test-build-disk-preflight:
+    environment: secret-free
     name: Unit tests for the build disk preflight
     # GitHub-hosted on purpose: this is a sub-second check and must not queue
     # behind the self-hosted pool whose full disks it exists to report.

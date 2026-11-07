@@ -36,6 +36,7 @@ concurrency:
 
 jobs:
   test-restack-script:
+    environment: secret-free
     name: Unit tests for the restack helper (${{ matrix.os }})
     # Both platforms, because the helper has to tell GNU tools from BSD ones:
     # stat's format flag differs, BSD chmod has no --, and a check that reads the
