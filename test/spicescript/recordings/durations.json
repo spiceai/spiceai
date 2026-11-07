@@ -27,6 +27,7 @@
   "config-errors": 3,
   "conflict-batches": 17,
   "connector-errors": 44,
+  "count-distinct-nested": 120,
   "cron-and-reload": 15,
   "csv-header-binding": 32,
   "databricks-credentials": 1,
