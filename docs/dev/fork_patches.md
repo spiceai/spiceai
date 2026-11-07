@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `66e6f7f4a734608f5d612d1869e636b155e7862d` | `spiceai-55` |
+| [datafusion](#datafusion) | `c766690ae1a0a7dab5a223a6ac57b98ad9d725e7` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `6e7a8775a6deb99c2ebf924f1ff5b3111d38e615` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `300acfcfb51abfa9c477f57bff3e0529ec4f5f1a` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `d323656c3bebc04fdce2ebc1cec31081f53b100d` | `spiceai-55` |
@@ -232,7 +232,7 @@ every join's output cooperative. On top of #280, #281 reads a sort key over a
 `SELECT DISTINCT` that the list does not show from a `SELECT` above it, #282 refuses a
 derived table whose outputs PostgreSQL shortens to one name, #276 keeps an ungrouped
 `COUNT` that eager aggregation pushes below a join at 0 when the join emits no rows, and #285
-keeps that count's field non-nullable. The pin is the merge commit of #285. These commits descend
+keeps that count's field non-nullable. On top of #285, #283 bounds grouped top-k preallocation and #287 stores a compacted copy of each nested `COUNT(DISTINCT …)` value. The pin is the merge commit of #287. These commits descend
 from #268's merge commit, so the existing patches remain in the commit ancestry. None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
@@ -364,6 +364,8 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | At end of input, the ordered partial and final aggregate tables emit the remaining groups with one `EmitTo::All` and hand the result out in `batch_size` slices (`aggregate_hash_table/common_ordered.rs`; spiceai/datafusion#277, the end-of-input part of apache/datafusion#25312 and #25984) | The remaining groups are emitted as repeated `EmitTo::First(batch_size)`, each renumbering every group still held, so an aggregate on ordered or constant-prefix input spends time quadratic in its group count emitting: TPC-DS Q78, whose `d_year` is constant under `d_year = 2000`, spent 4.3 s of `emitting_time` at SF-10 | silent (perf) | `crates/runtime-datafusion/src/fork_backport_guards.rs::an_ordered_aggregate_emits_its_remaining_groups_once`; in the fork, `aggregates::tests::ordered_aggregate_drains_remaining_groups_in_batch_size_slices` |
 | Unparser: a union input's own `ORDER BY` and `LIMIT` stay inside that input's derived table instead of being written on the union's query after its last operand, and each input keeps its own quantifier and statement clauses (fork PR #261) | The input's bound applies to the whole `UNION ALL`, so `u UNION ALL (SELECT … FROM v ORDER BY a DESC LIMIT 1)` federated to `DuckDB` returns one row instead of `u`'s rows plus one ([#14737](https://github.com/spiceai/spiceai/issues/14737)) | silent (wrong data) | `crates/runtime/tests/duckdb/mod.rs::duckdb_federated_union_keeps_each_inputs_own_bound` (`runtime::integration`, run by `integration.yml`). In the fork, the `test_union_input_*` cases in `datafusion/sql/tests/cases/plan_to_sql.rs` |
 | `HashJoinExec`, `SortMergeJoinExec`, `NestedLoopJoinExec` and `CrossJoinExec` wrap their output streams in `coop::cooperative`, so each output batch spends the cooperative budget (spiceai/datafusion#279, #280) | A join with a high fan-out yields many output batches per input batch without polling an input, so the task running it never yields: a query that times out or whose client disconnects keeps its CPU busy until the join finishes the input it holds, up to ~26 s measured on a nested-loop join ([#15741](https://github.com/spiceai/spiceai/issues/15741)) | silent (CPU / hang) | `crates/runtime-datafusion/src/fork_backport_guards.rs::every_join_yields_to_the_scheduler`; in the fork, `physical-plan/src/joins/cancellation_tests.rs` and `core/tests/execution/coop.rs::nested_loop_join_agg_yields` and `::cross_join_agg_yields` |
+| Grouped top-k preallocation is bounded by a constant instead of `LIMIT` (`TopKHashTable`/`TopKHeap`/`PriorityMap` in the aggregates path; spiceai/datafusion#283) | `TopKHashTable`/`TopKHeap`/`PriorityMap` preallocate proportional to `LIMIT` (unchecked multiply), so a huge `LIMIT` over a small input OOMs outside the memory pool | silent (query failure / memory) | **GAP** — see [Open gaps](#open-gaps) |
+| `COUNT(DISTINCT …)` over a list, struct, map or other nested value stores a compacted copy of each value it first inserts, in `DistinctCountAccumulator` and `SlidingDistinctCountAccumulator`, so a stored value no longer shares the buffers of the batch it was read from (`functions-aggregate/src/count.rs`; spiceai/datafusion#287) | With two or more `COUNT(DISTINCT …)` in a query (no single-distinct rewrite), every distinct nested value is a one-row slice that keeps its whole batch alive and is charged for it, so the reservation grows with rows × batch size: two `COUNT(DISTINCT)` over 50,000 three-element lists asked for 56.8 GB and failed with `ResourcesExhausted`, federated and accelerated alike, grouped or not | silent (query failure / memory) | `crates/runtime-datafusion/src/fork_backport_guards.rs::several_count_distinct_over_nested_values_charge_each_value_once` (lists, structs and a grouped variant under a 256 MiB pool with spilling disabled); in the fork, `count::tests::*_size_charges_each_value_once` and `sqllogictest/test_files/count_distinct_nested_memory.slt` |
 
 ## arrow-rs
 
@@ -908,7 +910,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**59 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**60 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -992,34 +994,40 @@ They are not equal in consequence; this is the order to close them in.
    (spiceai/llama.cpp#33) would be an abort with one graph slot if lost, covered by
    the fork's `test-meta-shared-views`; a guard here would need a model split by
    tensor across devices, and Spice's default of two graph slots does not reach it.
-9. `orc-rust` in-codec decode allowance — losing it lets one compressed metadata
+9. `datafusion` grouped top-k preallocation bounded by a constant instead of
+   `LIMIT` (`TopKHashTable`/`TopKHeap`/`PriorityMap`; spiceai/datafusion#283) —
+   without it a huge `LIMIT` over a small input OOMs outside the memory pool
+   (unchecked multiply). A guard needs a top-k plan with a pathological `LIMIT`
+   and a memory ceiling the pool enforces; today the fork's aggregate tests cover
+   the bound.
+10. `orc-rust` in-codec decode allowance — losing it lets one compressed metadata
    chunk decode in full before the stream is rejected. A guard needs a memory
    measurement around one ORC open; the rejection itself is guarded.
 
 **Blocked, not merely undone.** These have been looked at and cannot be closed by
 writing a test; each says what would unblock it:
 
-10. `snowflake-rs` (five rows) — no host override, private response types. Needs a
+11. `snowflake-rs` (five rows) — no host override, private response types. Needs a
    live account, or an upstream change letting the base URL be set.
-11. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
+12. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
    race, so any test of it is a timing test. Upstream has since removed the code
    path and the lock (vortex-data/vortex#8919); if a run confirms that, drop the row
    rather than guard it.
-12. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
+13. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
    there is no behaviour of ours to assert on.
-13. `datafusion-table-providers` upsert split per run of unrepeated keys (table-providers
+14. `datafusion-table-providers` upsert split per run of unrepeated keys (table-providers
    PR #89) — the write path it adds can invalidate `DuckDB` 1.4.4, so a guard that runs it
    in CI could fail on that crash rather than on the patch until `DuckDB` carries
    duckdb/duckdb#20804
    ([#14643](https://github.com/spiceai/spiceai/issues/14643)). Once it does, a load of a
    dataset that repeats a key across record batches, checking the last copy, closes it.
-14. `datafusion-table-providers` nested `SQLite` columns stored as JSON (table-providers
+15. `datafusion-table-providers` nested `SQLite` columns stored as JSON (table-providers
    PR #90) — the read side is spiceai/datafusion-federation#92, still open. The federation
    pin that takes it should add a `SQLite` round trip of a list of structs.
 
 **Reported late rather than wrongly.** The right answer, after an avoidable wait:
 
-15. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
+16. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
    `endpoint` is retried through the whole backoff budget before reporting, so a
    configuration error looks like a slow provider. What changes is *when* the
    error arrives, and asserting that is a timing test.
@@ -1027,7 +1035,7 @@ writing a test; each says what would unblock it:
 **Diagnostics only.** The query is unaffected; what is lost is the ability to see
 how it ran:
 
-16. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
+17. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
    upstream's; `EXPLAIN FORMAT TREE` is not carried) — plain `EXPLAIN` is guarded
    through the cluster harness, and `ANALYZE` is not issued through it by anything. Closing this needs the
    harness to submit the statement rather than build its text as a label.
@@ -1038,7 +1046,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-17. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+18. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `mistral.rs`/`candle` i-quant MoE kernels; `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `mistral.rs` `deepseek41` and `glm5-next` decode kernels (spiceai/mistral.rs#49), which
     no suite here trends yet — their evidence is the DGX Spark decode A/B in that PR;
@@ -1061,7 +1069,7 @@ without becoming a flaky timing test:
 **Unoptimised builds only.** No query answers anything differently; what is lost
 is stack headroom in a debug build (release builds were not measured):
 
-18. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
+19. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
     it keeps the unparser's opt-level-0 frame from growing with #233 and #234, which
     without it push the fork's `roundtrip_statement` past the 2 MiB default test
     thread (it needs 2,112 KiB without the refactor, 1,984 KiB with it). This repo's
