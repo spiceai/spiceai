@@ -10,6 +10,17 @@ target/lint/spicescript test/spicescript/snapshots \
   --spiced target/lint/spiced --record-durations
 ```
 
+`known-failing/snapshot-readers/` holds scenarios that reproduce open snapshot
+reader bugs. Run that directory with `--max-wait 30s`; each script must keep
+failing as `recordings/expected-failures.json` records (`--record-failures`
+rewrites it). A script moves up to this directory once its bug is fixed.
+
+| Scenario | Bug |
+| --- | --- |
+| `cayenne-snapshot-reader-path-change` | A reader whose `cayenne_file_path` changes while the snapshot store is down stops answering until the store is back. |
+| `snapshot-source-moved-location` | A `file_format: snapshot` dataset moved to a location whose snapshot it cannot restore serves the previous location's rows (#16098). |
+| `snapshot-source-projected-publisher` | Snapshots of a publisher whose `refresh_sql` drops columns are served instead of refused, and newer snapshots are then rejected (#16099). |
+
 Docker and the AWS CLI are required for the PostgreSQL and RustFS sources.
 The publication-failure scenario also uses a Python container; its fault
 fixture uses the standard library to sign S3 requests and changes only the

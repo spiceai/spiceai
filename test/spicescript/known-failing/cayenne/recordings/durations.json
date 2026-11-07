@@ -4,7 +4,6 @@
   "cayenne-file-durability-date-key": 84,
   "cayenne-partition-key-move": 37,
   "cayenne-partitioned-append-key-only": 19,
-  "cayenne-snapshot-reader-path-change": 7,
   "cayenne-torn-reads": 52,
   "cayenne-writes-known": 90,
   "maintained-aggregates-served": 6,
