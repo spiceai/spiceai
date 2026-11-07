@@ -5,14 +5,14 @@ description: "Query: tpcds_q55"
 +----------+--------------------+------------+
 | brand_id | brand              | ext_price  |
 +----------+--------------------+------------+
-| 2001001  | amalgimporto #1    | 6796395.30 |
-| 2002001  | importoimporto #1  | 6776489.21 |
-| 5004001  | edu packscholar #1 | 6669431.59 |
-| 3003001  | exportiexporti #1  | 6591845.01 |
-| 4003001  | exportiedu pack #1 | 6550640.41 |
-| 3001001  | amalgexporti #1    | 6471618.61 |
-| 1001001  | amalgamalg #1      | 5997329.69 |
-| 5002001  | importoscholar #1  | 5989339.33 |
-| 2003001  | exportiimporto #1  | 5935849.21 |
-| 4001001  | amalgedu pack #1   | 5829912.15 |
+| 5004001  | edu packscholar #1 | 6843993.23 |
+| 2001001  | amalgimporto #1    | 6765043.14 |
+| 2002001  | importoimporto #1  | 6697607.72 |
+| 3001001  | amalgexporti #1    | 6407309.25 |
+| 3003001  | exportiexporti #1  | 6246238.21 |
+| 4003001  | exportiedu pack #1 | 6221726.03 |
+| 2003001  | exportiimporto #1  | 5904502.18 |
+| 1001001  | amalgamalg #1      | 5875494.59 |
+| 5002001  | importoscholar #1  | 5869967.12 |
+| 1004001  | edu packamalg #1   | 5785884.33 |
 +----------+--------------------+------------+
