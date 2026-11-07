@@ -26,11 +26,13 @@ use crate::adbc_helpers::{
 };
 use adbc_core::{Connection as _, Database as _, Statement as _};
 use adbc_driver_manager::{ManagedConnection, ManagedDatabase};
+use connection::MetadataConnection;
 use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The installed `DuckDB` database shared by a `DuckLake` catalog's connections.
 pub struct DuckLakePool {
@@ -130,8 +132,8 @@ pub fn create_ducklake_pool(
     // All connections share attachments and secrets in this database. Pools
     // that open the same file and attach the same lake under the same name
     // resolve the same tables, so a join between them runs in either one. The
-    // context is a hash because the connection string can hold a password,
-    // and the context appears in query plans.
+    // context appears in query plans, so it is a hash, of a connection string
+    // without its password.
     let pool = DuckLakePool::new(
         database,
         JoinPushDown::AllowedFor(join_context(path, connection_string, catalog_name)),
@@ -148,17 +150,45 @@ pub fn create_ducklake_pool(
     Ok(pool)
 }
 
-/// The join context of a pool over `path` with `connection_string` attached
-/// as `catalog_name`: `ducklake:` and a hash of the three.
+/// The join context of a pool over `path` with the lake at
+/// `connection_string` attached as `catalog_name`: `ducklake:` and a hash of
+/// what [`write_join_identity`] writes.
 fn join_context(path: &str, connection_string: &str, catalog_name: &str) -> String {
     use std::hash::Hasher as _;
     let mut hasher = twox_hash::XxHash64::with_seed(0);
-    for part in [path, connection_string, catalog_name] {
-        hasher.write(part.as_bytes());
-        // Separates the parts, so ("ab", "c") and ("a", "bc") differ.
-        hasher.write_u8(0);
-    }
+    write_join_identity(&mut hasher, path, connection_string, catalog_name);
     format!("ducklake:{:016x}", hasher.finish())
+}
+
+/// Writes what identifies a pool's lake to `hasher`: the file the pool opens,
+/// the metadata connection string without its password, and the name the
+/// lake is attached as. A password chooses no lake, and the context appears
+/// in query plans, so the password is left out. A `PostgreSQL` or `MySQL`
+/// string whose password cannot be held apart is replaced by a number no
+/// other pool gets, so that pool pushes joins down only between its own
+/// tables.
+fn write_join_identity(
+    hasher: &mut impl std::hash::Hasher,
+    path: &str,
+    connection_string: &str,
+    catalog_name: &str,
+) {
+    static UNREADABLE_POOLS: AtomicU64 = AtomicU64::new(0);
+    hasher.write(path.as_bytes());
+    // Separates the parts, so ("ab", "c") and ("a", "bc") differ.
+    hasher.write_u8(0);
+    match MetadataConnection::parse(connection_string) {
+        Ok(metadata) => hasher.write(metadata.path.as_bytes()),
+        Err(_) => {
+            // No UTF-8 string holds the byte 0xff, so this is no connection
+            // string's identity.
+            hasher.write_u8(0xff);
+            hasher.write_u64(UNREADABLE_POOLS.fetch_add(1, Ordering::Relaxed));
+        }
+    }
+    hasher.write_u8(0);
+    hasher.write(catalog_name.as_bytes());
+    hasher.write_u8(0);
 }
 
 /// Executes a statement through an ADBC connection on a blocking thread.
@@ -174,6 +204,7 @@ pub fn execute_sql(
     statement.execute_update()
 }
 
+pub mod connection;
 pub mod provider;
 pub mod writer;
 
@@ -552,6 +583,185 @@ mod tests {
         assert_eq!(
             build_ducklake_attach_sql("s3://b/o'brien.ducklake", "my\"lake", true),
             "ATTACH 'ducklake:s3://b/o''brien.ducklake' AS \"my\"\"lake\" (AUTOMATIC_MIGRATION TRUE)"
+        );
+    }
+
+    /// Collects the bytes a join context is computed from.
+    #[derive(Default)]
+    struct Recorded(Vec<u8>);
+
+    impl std::hash::Hasher for Recorded {
+        fn finish(&self) -> u64 {
+            0
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.extend_from_slice(bytes);
+        }
+    }
+
+    fn hashed(path: &str, connection_string: &str, catalog_name: &str) -> Vec<u8> {
+        let mut recorded = Recorded::default();
+        super::write_join_identity(&mut recorded, path, connection_string, catalog_name);
+        recorded.0
+    }
+
+    fn holds(bytes: &[u8], text: &str) -> bool {
+        bytes
+            .windows(text.len())
+            .any(|window| window == text.as_bytes())
+    }
+
+    /// Pools whose metadata connection strings differ only in the password
+    /// attach the same lake, so they share a join context, and the password
+    /// never reaches the hasher: not as written, and not decoded.
+    #[test]
+    fn the_join_context_leaves_the_password_out() {
+        for (a, b, secrets) in [
+            (
+                "postgres:dbname=lake host=127.0.0.1 port=5432 user=spice password=correct-horse-1",
+                "postgres:dbname=lake host=127.0.0.1 port=5432 user=spice password=battery-staple-2",
+                &["correct-horse-1", "battery-staple-2"][..],
+            ),
+            (
+                r"postgres:password = 'it\'s-secret one' dbname=lake user=spice",
+                r"postgres:password = 'it\'s-secret two' dbname=lake user=spice",
+                &[r"it\'s-secret", "it's-secret"][..],
+            ),
+            (
+                "postgres:postgresql://spice:p%40ss-one@127.0.0.1:5432/lake",
+                "postgres:postgresql://spice:p%40ss-two@127.0.0.1:5432/lake",
+                &["p%40ss-", "p@ss-"][..],
+            ),
+            (
+                "postgresql://spice@127.0.0.1:5432/lake?password=query-one&sslmode=disable",
+                "postgresql://spice@127.0.0.1:5432/lake?password=query-two&sslmode=disable",
+                &["query-one", "query-two"][..],
+            ),
+            (
+                r#"mysql:host=127.0.0.1 user=spice passwd="my secret one" database=lake"#,
+                r#"mysql:host=127.0.0.1 user=spice passwd="my secret two" database=lake"#,
+                &["my secret"][..],
+            ),
+            (
+                "mysql:password=mysql-one host=127.0.0.1 database=lake",
+                "mysql:password=mysql-two host=127.0.0.1 database=lake",
+                &["mysql-one", "mysql-two"][..],
+            ),
+            // A password emptied by a later pair is still a secret.
+            (
+                "postgres:dbname=lake user=spice password=overridden-one password=",
+                "postgres:dbname=lake user=spice",
+                &["overridden-one"][..],
+            ),
+        ] {
+            assert_eq!(
+                super::join_context(":memory:", a, "lake"),
+                super::join_context(":memory:", b, "lake"),
+                "{a}"
+            );
+            for s in [a, b] {
+                let bytes = hashed(":memory:", s, "lake");
+                for secret in secrets {
+                    assert!(!holds(&bytes, secret), "{secret} reached the hasher: {s}");
+                }
+            }
+        }
+    }
+
+    /// A connection string without a password reaches the hasher as written,
+    /// so its join context is the one it always had.
+    #[test]
+    fn a_connection_string_without_a_password_keeps_its_join_context() {
+        for s in [
+            "metadata.ducklake",
+            "s3://bucket/lake/metadata.ducklake",
+            "sqlite:metadata.sqlite",
+            "postgres:dbname=lake host=127.0.0.1 port=5432 user=spice",
+            "postgres:postgresql://spice@127.0.0.1:5432/lake",
+            "mysql:host=127.0.0.1 database=lake",
+        ] {
+            assert_eq!(
+                hashed("lake.db", s, "lake"),
+                format!("lake.db\0{s}\0lake\0").into_bytes(),
+                "{s}"
+            );
+        }
+        // Computed from the same bytes by an XxHash64 written apart from this
+        // crate, which also reproduces the contexts a trunk build printed.
+        assert_eq!(
+            super::join_context(":memory:", "metadata.ducklake", "ducklake"),
+            "ducklake:35e31303b41f39cb"
+        );
+        assert_eq!(
+            super::join_context(
+                "lake.db",
+                "postgres:dbname=lake host=127.0.0.1 port=5432 user=spice",
+                "lake"
+            ),
+            "ducklake:faf513d2ca296302"
+        );
+    }
+
+    /// Everything but the password still tells lakes apart: a join between
+    /// pools over different lakes, or attached under different names, is
+    /// never pushed down to one of them.
+    #[test]
+    fn pools_over_different_lakes_keep_different_join_contexts() {
+        let base = "postgres:dbname=lake host=h1 port=5432 user=spice password=p";
+        let context = super::join_context(":memory:", base, "lake");
+        for (path, connection_string, catalog_name) in [
+            ("lake.db", base, "lake"),
+            (":memory:", base, "other"),
+            (
+                ":memory:",
+                "postgres:dbname=other host=h1 port=5432 user=spice password=p",
+                "lake",
+            ),
+            (
+                ":memory:",
+                "postgres:dbname=lake host=h2 port=5432 user=spice password=p",
+                "lake",
+            ),
+            (
+                ":memory:",
+                "postgres:dbname=lake host=h1 port=5433 user=spice password=p",
+                "lake",
+            ),
+            (
+                ":memory:",
+                "postgres:dbname=lake host=h1 port=5432 user=other password=p",
+                "lake",
+            ),
+            (
+                ":memory:",
+                "mysql:dbname=lake host=h1 port=5432 user=spice password=p",
+                "lake",
+            ),
+        ] {
+            assert_ne!(
+                super::join_context(path, connection_string, catalog_name),
+                context,
+                "{path} {connection_string} {catalog_name}"
+            );
+        }
+    }
+
+    /// A string whose password cannot be held apart never reaches the hasher;
+    /// a number of the pool's own does, so each such pool has its own join
+    /// context and pushes joins down only between its own tables.
+    #[test]
+    fn an_unreadable_connection_string_gets_a_join_context_of_its_own() {
+        let s = "postgres:dbname=lake user=spice password='unterminated-secret";
+        let bytes = hashed(":memory:", s, "lake");
+        assert!(!holds(&bytes, "unterminated-secret"));
+        assert!(!holds(&bytes, "dbname=lake"));
+        assert_eq!(bytes.len(), ":memory:\0".len() + 1 + 8 + "\0lake\0".len());
+        assert!(bytes.starts_with(b":memory:\0\xff"));
+        assert!(bytes.ends_with(b"\0lake\0"));
+        assert_ne!(
+            super::join_context(":memory:", s, "lake"),
+            super::join_context(":memory:", s, "lake")
         );
     }
 }
