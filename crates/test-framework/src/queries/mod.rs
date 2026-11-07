@@ -763,10 +763,8 @@ pub enum QueryOverrides {
     SQLite,
     PostgreSQL,
     MySQL,
-    Dremio,
     Spark,
     ODBCAthena,
-    ODBCDatabricks,
     DuckDB,
     DuckDBOnZeroResults,
     Snowflake,
@@ -797,7 +795,6 @@ impl QueryOverrides {
             "sqlite" => Some(Self::SQLite),
             "postgres" => Some(Self::PostgreSQL),
             "mysql" => Some(Self::MySQL),
-            "dremio" => Some(Self::Dremio),
             "spark" => Some(Self::Spark),
             "odbc_athena" => Some(Self::ODBCAthena),
             "duckdb" => Some(Self::DuckDB),
@@ -823,10 +820,6 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             queries, 2,  // https://github.com/spiceai/spiceai/issues/8379
             4,  // https://github.com/spiceai/spiceai/issues/2077
             20  // https://github.com/spiceai/spiceai/issues/2078
-        ),
-        Some(QueryOverrides::ODBCDatabricks) => remove_tpch_query!(
-            queries,
-            2 // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
         ),
         Some(QueryOverrides::Spark) => remove_tpch_query!(
             queries,
@@ -1263,32 +1256,6 @@ pub fn get_tpcds_test_queries(
             38, 87, // https://github.com/spiceai/spiceai/issues/5247
             6, 32, 92 // https://github.com/spiceai/spiceai/issues/5246
         ),
-        Some(QueryOverrides::ODBCDatabricks) => {
-            let queries: Vec<Query> = remove_tpcds_query!(
-                queries, 6, 8, 13, 14, 23, 24, 32, 36, 38, 39, 44, 47, 49, 57, 67, 70, 86, 87, 91,
-                92
-            );
-
-            add_tpcds_query_overrides!(
-                queries,
-                "odbc_databricks",
-                6,
-                32,
-                36,
-                44,
-                47,
-                49,
-                57,
-                67,
-                70,
-                86,
-                92
-            )
-        }
-        Some(QueryOverrides::Dremio) => remove_tpcds_query!(
-            queries, 8, 38, 87, // LEFT SEMI, and LEFT ANTI
-            64  // OUT_OF_MEMORY ERROR https://github.com/spiceai/spiceai/issues/8765
-        ),
         Some(QueryOverrides::Arrow) => remove_tpcds_query!(
             queries, 72 // 'offset overflow' https://github.com/spiceai/spiceai/issues/4216
         ),
@@ -1322,13 +1289,6 @@ pub fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Que
             // Column aliases cannot appear with expressions in ORDER BY in Postgres: https://www.postgresql.org/docs/current/queries-order.html
             // expressions can appear with other expressions, so re-write the query to fit
             Some(generate_clickbench_query_overrides!("postgres", 43))
-        }
-        Some(QueryOverrides::Dremio) => {
-            // Column aliases cannot appear with expressions in ORDER BY in Postgres: https://www.postgresql.org/docs/current/queries-order.html
-            // expressions can appear with other expressions, so re-write the query to fit
-            Some(generate_clickbench_query_overrides!(
-                "dremio", 21, 22, 23, 24
-            ))
         }
         Some(QueryOverrides::DuckDB) => {
             // specific to the DuckDB accelerator when used with on_zero_results: use_source

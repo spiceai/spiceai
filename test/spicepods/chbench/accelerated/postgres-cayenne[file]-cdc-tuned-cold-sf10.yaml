@@ -11,7 +11,8 @@ name: postgres-cayenne[file]-cdc-tuned-cold-sf10
 # registers the store on the promotion, scan, and delete paths itself (no anchor dataset).
 # Locally: run MinIO (`docker run -p 9000:9000 minio/minio server /data`), create the
 # `benchmarks` bucket, and export S3_ENDPOINT=http://localhost:9000 S3_KEY/S3_SECRET before
-# starting spiced/testoperator. In CI the HTAP run workflow provides them from TEST_MINIO_*.
+# starting spiced/testoperator. In CI the HTAP run workflow provides them, with
+# S3_SESSION_TOKEN, as temporary RustFS credentials.
 runtime:
   params:
     cdc_prefetch_buffer: '16384'
@@ -76,6 +77,7 @@ datasets:
         cayenne_datalake_s3_endpoint: ${secrets:S3_ENDPOINT}
         cayenne_datalake_s3_key: ${secrets:S3_KEY}
         cayenne_datalake_s3_secret: ${secrets:S3_SECRET}
+        cayenne_datalake_s3_session_token: ${secrets:S3_SESSION_TOKEN}
         cayenne_datalake_s3_allow_http: 'true'
         # Expert overrides (mechanics; auto-tuned once the size trigger lands):
         cayenne_datalake_warm_max_bytes: '268435456' # 256 MB — low so SF10 promotes
