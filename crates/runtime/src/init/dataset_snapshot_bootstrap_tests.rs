@@ -120,7 +120,9 @@ impl Fixture {
                 };
                 serde_json::from_str::<serde_json::Value>(&contents)
                     .ok()
-                    .and_then(|metadata| metadata.get("orders")?.get("current-snapshot-id")?.as_u64())
+                    .and_then(|metadata| {
+                        metadata.get("orders")?.get("current-snapshot-id")?.as_u64()
+                    })
                     .is_some()
             })
             .await,
