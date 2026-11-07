@@ -28,12 +28,28 @@ pub enum MetadataDatabase {
 
 /// A `DuckLake` metadata connection string, as `ducklake_connection_string`
 /// sets it, with its password held apart.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct MetadataConnection {
     /// The connection string without its password.
     pub path: String,
     /// The password, and the database it is for.
     pub password: Option<(MetadataDatabase, String)>,
+}
+
+/// Leaves the password out, so formatting a connection never prints it.
+impl std::fmt::Debug for MetadataConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetadataConnection")
+            .field("path", &self.path)
+            .field(
+                "password",
+                &self
+                    .password
+                    .as_ref()
+                    .map(|(database, _)| (database, "<redacted>")),
+            )
+            .finish()
+    }
 }
 
 /// Why a `PostgreSQL` or `MySQL` metadata connection string cannot be read:
@@ -208,18 +224,17 @@ fn is_space(c: char) -> bool {
 }
 
 /// Reads a key or value that opened with `quote` into `out`, through its
-/// closing quote, where a backslash escapes the next character. Returns the
-/// byte offset after the closing quote.
+/// closing quote, where a backslash escapes the next character.
 fn read_quoted(
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
     quote: char,
     out: &mut String,
-) -> Result<usize, &'static str> {
+) -> Result<(), &'static str> {
     loop {
-        match chars.next().ok_or(UNTERMINATED_QUOTE)? {
-            (_, '\\') => out.push(chars.next().ok_or(UNTERMINATED_QUOTE)?.1),
-            (i, c) if c == quote => return Ok(i + c.len_utf8()),
-            (_, c) => out.push(c),
+        match chars.next().ok_or(UNTERMINATED_QUOTE)?.1 {
+            '\\' => out.push(chars.next().ok_or(UNTERMINATED_QUOTE)?.1),
+            c if c == quote => return Ok(()),
+            c => out.push(c),
         }
     }
 }
@@ -250,24 +265,18 @@ fn pairs(s: &str, syntax: Syntax) -> Result<Vec<Pair>, &'static str> {
         }
         while chars.next_if(|&(_, c)| is_space(c)).is_some() {}
         let mut value = String::new();
-        let end = if chars.next_if(|&(_, c)| c == quote).is_some() {
-            read_quoted(&mut chars, quote, &mut value)?
+        if chars.next_if(|&(_, c)| c == quote).is_some() {
+            read_quoted(&mut chars, quote, &mut value)?;
         } else {
-            let mut end = s.len();
-            while let Some(&(i, c)) = chars.peek() {
-                if is_space(c) {
-                    end = i;
-                    break;
-                }
-                chars.next();
+            while let Some((_, c)) = chars.next_if(|&(_, c)| !is_space(c)) {
                 if c == '\\' && syntax == Syntax::Libpq {
                     value.push(chars.next().ok_or(TRAILING_BACKSLASH)?.1);
                 } else {
                     value.push(c);
                 }
             }
-            end
-        };
+        }
+        let end = chars.peek().map_or(s.len(), |&(i, _)| i);
         result.push(Pair {
             key,
             value,
@@ -648,18 +657,42 @@ mod tests {
     /// `password` or `passwd`, in any case, is the password.
     #[test]
     fn a_quoted_mysql_key_is_read() {
-        for key in [r#""password""#, r#""PASSWD""#, r#""pass\"wd""#] {
-            let s = format!("mysql:{key}=quoted-secret-1 host=127.0.0.1 port=33306 user=root");
-            let expected = if key.contains('\\') {
-                (s.clone(), None)
-            } else {
-                (
-                    "mysql:host=127.0.0.1 port=33306 user=root".to_string(),
-                    Some("quoted-secret-1".to_string()),
-                )
-            };
-            assert_eq!(split(&s), expected, "{key}");
+        for (s, path, password) in [
+            (
+                r#"mysql:"password"=quoted-secret-1 host=127.0.0.1 user=root"#,
+                "mysql:host=127.0.0.1 user=root",
+                Some("quoted-secret-1"),
+            ),
+            (
+                r#"mysql:"PASSWD"="quoted secret 2" host=127.0.0.1 user=root"#,
+                "mysql:host=127.0.0.1 user=root",
+                Some("quoted secret 2"),
+            ),
+            // An escaped quote is part of the key, which is then no password.
+            (
+                r#"mysql:"pass\"wd"=not-a-password host=127.0.0.1"#,
+                r#"mysql:"pass\"wd"=not-a-password host=127.0.0.1"#,
+                None,
+            ),
+        ] {
+            assert_eq!(
+                split(s),
+                (path.to_string(), password.map(ToString::to_string)),
+                "{s}"
+            );
         }
+    }
+
+    /// Formatting a connection names the database its password is for, but
+    /// never prints the password.
+    #[test]
+    fn debug_leaves_the_password_out() {
+        let connection =
+            MetadataConnection::parse("postgres:dbname=x password=hunter2").expect("readable");
+        assert_eq!(
+            format!("{connection:?}"),
+            r#"MetadataConnection { path: "postgres:dbname=x", password: Some((Postgres, "<redacted>")) }"#
+        );
     }
 
     /// A string without a password, and any other database's string, is

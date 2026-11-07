@@ -152,42 +152,40 @@ pub fn create_ducklake_pool(
 
 /// The join context of a pool over `path` with the lake at
 /// `connection_string` attached as `catalog_name`: `ducklake:` and a hash of
-/// what [`write_join_identity`] writes.
+/// its [`join_identity`].
 fn join_context(path: &str, connection_string: &str, catalog_name: &str) -> String {
-    use std::hash::Hasher as _;
-    let mut hasher = twox_hash::XxHash64::with_seed(0);
-    write_join_identity(&mut hasher, path, connection_string, catalog_name);
-    format!("ducklake:{:016x}", hasher.finish())
+    let identity = join_identity(path, connection_string, catalog_name);
+    format!(
+        "ducklake:{:016x}",
+        twox_hash::XxHash64::oneshot(0, &identity)
+    )
 }
 
-/// Writes what identifies a pool's lake to `hasher`: the file the pool opens,
-/// the metadata connection string without its password, and the name the
-/// lake is attached as. A password chooses no lake, and the context appears
-/// in query plans, so the password is left out. A `PostgreSQL` or `MySQL`
-/// string whose password cannot be held apart is replaced by a number no
-/// other pool gets, so that pool pushes joins down only between its own
-/// tables.
-fn write_join_identity(
-    hasher: &mut impl std::hash::Hasher,
-    path: &str,
-    connection_string: &str,
-    catalog_name: &str,
-) {
+/// What identifies a pool's lake: the file the pool opens, the metadata
+/// connection string without its password, and the name the lake is attached
+/// as. A password chooses no lake, and the context appears in query plans, so
+/// the password is left out. A `PostgreSQL` or `MySQL` string whose password
+/// cannot be held apart is replaced by a number no other pool gets, so that
+/// pool pushes joins down only between its own tables.
+fn join_identity(path: &str, connection_string: &str, catalog_name: &str) -> Vec<u8> {
     static UNREADABLE_POOLS: AtomicU64 = AtomicU64::new(0);
-    hasher.write(path.as_bytes());
+    let mut identity = Vec::new();
+    identity.extend_from_slice(path.as_bytes());
     // Separates the parts, so ("ab", "c") and ("a", "bc") differ.
-    hasher.write_u8(0);
+    identity.push(0);
     if let Ok(metadata) = MetadataConnection::parse(connection_string) {
-        hasher.write(metadata.path.as_bytes());
+        identity.extend_from_slice(metadata.path.as_bytes());
     } else {
         // No UTF-8 string holds the byte 0xff, so this is no connection
         // string's identity.
-        hasher.write_u8(0xff);
-        hasher.write_u64(UNREADABLE_POOLS.fetch_add(1, Ordering::Relaxed));
+        identity.push(0xff);
+        let pool = UNREADABLE_POOLS.fetch_add(1, Ordering::Relaxed);
+        identity.extend_from_slice(&pool.to_le_bytes());
     }
-    hasher.write_u8(0);
-    hasher.write(catalog_name.as_bytes());
-    hasher.write_u8(0);
+    identity.push(0);
+    identity.extend_from_slice(catalog_name.as_bytes());
+    identity.push(0);
+    identity
 }
 
 /// Executes a statement through an ADBC connection on a blocking thread.
@@ -585,24 +583,8 @@ mod tests {
         );
     }
 
-    /// Collects the bytes a join context is computed from.
-    #[derive(Default)]
-    struct Recorded(Vec<u8>);
-
-    impl std::hash::Hasher for Recorded {
-        fn finish(&self) -> u64 {
-            0
-        }
-
-        fn write(&mut self, bytes: &[u8]) {
-            self.0.extend_from_slice(bytes);
-        }
-    }
-
     fn hashed(path: &str, connection_string: &str, catalog_name: &str) -> Vec<u8> {
-        let mut recorded = Recorded::default();
-        super::write_join_identity(&mut recorded, path, connection_string, catalog_name);
-        recorded.0
+        super::join_identity(path, connection_string, catalog_name)
     }
 
     fn holds(bytes: &[u8], text: &str) -> bool {
@@ -777,11 +759,12 @@ mod tests {
     fn an_unreadable_connection_string_gets_a_join_context_of_its_own() {
         let s = "postgres:dbname=lake user=spice password='unterminated-secret";
         let bytes = hashed(":memory:", s, "lake");
-        assert!(!holds(&bytes, "unterminated-secret"));
-        assert!(!holds(&bytes, "dbname=lake"));
-        assert_eq!(bytes.len(), ":memory:\0".len() + 1 + 8 + "\0lake\0".len());
-        assert!(bytes.starts_with(b":memory:\0\xff"));
-        assert!(bytes.ends_with(b"\0lake\0"));
+        // The path, the marker, 8 bytes of the pool's number, and the name.
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(
+            [&bytes[..10], &bytes[18..]].concat(),
+            b":memory:\0\xff\0lake\0"
+        );
         assert_ne!(
             super::join_context(":memory:", s, "lake"),
             super::join_context(":memory:", s, "lake")
