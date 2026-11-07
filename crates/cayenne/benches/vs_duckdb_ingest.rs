@@ -18,9 +18,8 @@
 //!
 //! Both engines materialize to local disk (Cayenne to a temp directory,
 //! `DuckDB` to a temp `.duckdb` file) so the comparison is file-mode vs
-//! file-mode — see `tools/testoperator/dispatch/perf-cayenne-vs-duckdb/README.md`
-//! for why that's the only fair pairing (Cayenne does not support
-//! in-memory mode).
+//! file-mode: comparing Cayenne on disk against an in-memory `DuckDB` would
+//! not measure the same work.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::cast_possible_wrap)]
